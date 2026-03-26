@@ -80,6 +80,8 @@ impl CrcDelta {
             domain_metadata,
             set_transactions,
             in_commit_timestamp_opt: self.in_commit_timestamp,
+            // For CREATE TABLE, the added histogram IS the total histogram (no prior files).
+            file_size_histogram: self.file_stats.added_histogram,
             ..Default::default()
         })
     }
@@ -135,7 +137,7 @@ impl Crc {
         // clears the previous value.
         self.in_commit_timestamp_opt = delta.in_commit_timestamp;
 
-        // Bail if already Untrackable -- nothing can recover missing file stats.
+        // Bail if already Untrackable -- nothing can recover missing file stats or histograms.
         if self.file_stats_validity == FileStatsValidity::Untrackable {
             return;
         }
@@ -144,6 +146,7 @@ impl Crc {
         // so that Untrackable can never transition to Indeterminate below.
         if delta.has_missing_file_size {
             self.file_stats_validity = FileStatsValidity::Untrackable;
+            self.file_size_histogram = None;
             return;
         }
 
@@ -158,16 +161,38 @@ impl Crc {
             .is_some_and(FileStatsDelta::is_incremental_safe);
         if !is_safe {
             self.file_stats_validity = FileStatsValidity::Indeterminate;
+            self.file_size_histogram = None;
             return;
         }
         self.num_files += delta.file_stats.net_files;
         self.table_size_bytes += delta.file_stats.net_bytes;
+
+        // Histogram: merge base + added - removed.
+        // Only update if the base CRC has a histogram AND the delta provides both histograms.
+        // If the merge fails (e.g. negative counts from corrupted data) or the delta is missing
+        // either histogram, drop it rather than leaving stale data.
+        if let (Some(base_hist), Some(added), Some(removed)) = (
+            self.file_size_histogram.as_ref(),
+            &delta.file_stats.added_histogram,
+            &delta.file_stats.removed_histogram,
+        ) {
+            match base_hist.try_add(added).and_then(|h| h.try_sub(removed)) {
+                Ok(merged) => self.file_size_histogram = Some(merged),
+                Err(_) => self.file_size_histogram = None,
+            }
+        } else if self.file_size_histogram.is_some() {
+            // The base had a histogram but the delta couldn't provide add/remove histograms
+            // (e.g. forward log replay). Drop it rather than leaving a stale value.
+            self.file_size_histogram = None;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use rstest::rstest;
 
     use super::*;
     use crate::actions::{DomainMetadata, Metadata, Protocol};
@@ -187,6 +212,7 @@ mod tests {
             file_stats: FileStatsDelta {
                 net_files,
                 net_bytes,
+                ..Default::default()
             },
             operation: Some("WRITE".to_string()),
             ..Default::default()
@@ -622,5 +648,166 @@ mod tests {
         let crc = delta.into_crc_for_version_zero().unwrap();
         // Empty map, not None -- we always know the full state at version zero.
         assert_eq!(crc.set_transactions, Some(HashMap::new()));
+    }
+
+    // ===== Histogram tests =====
+
+    use crate::crc::FileSizeHistogram;
+
+    /// Helper: creates a CRC with a histogram containing the given file sizes.
+    fn base_crc_with_histogram(file_sizes: &[i64]) -> Crc {
+        let mut hist = FileSizeHistogram::create_default();
+        for &size in file_sizes {
+            hist.insert(size).unwrap();
+        }
+        Crc {
+            table_size_bytes: file_sizes.iter().sum(),
+            num_files: file_sizes.len() as i64,
+            num_metadata: 1,
+            num_protocol: 1,
+            file_size_histogram: Some(hist),
+            ..Default::default()
+        }
+    }
+
+    /// Helper: creates a write delta with histogram data for adds and removes.
+    fn write_delta_with_histograms(add_sizes: &[i64], remove_sizes: &[i64]) -> CrcDelta {
+        let mut added = FileSizeHistogram::create_default();
+        for &size in add_sizes {
+            added.insert(size).unwrap();
+        }
+        let mut removed = FileSizeHistogram::create_default();
+        for &size in remove_sizes {
+            removed.insert(size).unwrap();
+        }
+        let net_files = add_sizes.len() as i64 - remove_sizes.len() as i64;
+        let net_bytes: i64 = add_sizes.iter().sum::<i64>() - remove_sizes.iter().sum::<i64>();
+        CrcDelta {
+            file_stats: FileStatsDelta {
+                net_files,
+                net_bytes,
+                added_histogram: Some(added),
+                removed_histogram: Some(removed),
+            },
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn apply_merges_histogram_when_both_present() {
+        // Base: 3 files [100, 200, 300] all in bin 0
+        let mut crc = base_crc_with_histogram(&[100, 200, 300]);
+        // Delta: add [500], remove [200]
+        let delta = write_delta_with_histograms(&[500], &[200]);
+        crc.apply(delta);
+
+        let hist = crc.file_size_histogram.as_ref().unwrap();
+        // Bin 0: was 3 files/600 bytes, +1 file/+500 bytes, -1 file/-200 bytes = 3 files/900 bytes
+        assert_eq!(hist.file_counts[0], 3);
+        assert_eq!(hist.total_bytes[0], 900);
+    }
+
+    #[rstest]
+    #[case::base_none_delta_none(None, None, None)]
+    #[case::base_some_delta_both_none(Some(vec![100i64, 200]), None, None)]
+    #[case::base_some_delta_added_only(Some(vec![100i64, 200]), Some(vec![500i64]), None)]
+    #[case::base_some_delta_removed_only(Some(vec![100i64, 200]), None, Some(vec![100i64]))]
+    fn apply_drops_histogram_when_delta_missing_histograms(
+        #[case] base_files: Option<Vec<i64>>,
+        #[case] added_sizes: Option<Vec<i64>>,
+        #[case] removed_sizes: Option<Vec<i64>>,
+    ) {
+        let mut crc = match &base_files {
+            Some(sizes) => base_crc_with_histogram(sizes),
+            None => base_crc(),
+        };
+        let added_histogram = added_sizes.map(|sizes| {
+            let mut h = FileSizeHistogram::create_default();
+            for s in &sizes {
+                h.insert(*s).unwrap();
+            }
+            h
+        });
+        let removed_histogram = removed_sizes.map(|sizes| {
+            let mut h = FileSizeHistogram::create_default();
+            for s in &sizes {
+                h.insert(*s).unwrap();
+            }
+            h
+        });
+        let delta = CrcDelta {
+            file_stats: FileStatsDelta {
+                net_files: 1,
+                net_bytes: 100,
+                added_histogram,
+                removed_histogram,
+            },
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
+        };
+        crc.apply(delta);
+        assert!(
+            crc.file_size_histogram.is_none(),
+            "histogram should be None when delta can't provide both add/remove histograms"
+        );
+    }
+
+    #[test]
+    fn apply_drops_histogram_on_indeterminate() {
+        let mut crc = base_crc_with_histogram(&[100, 200]);
+        let unsafe_delta = CrcDelta {
+            operation: Some("ANALYZE STATS".to_string()),
+            ..write_delta(1, 100)
+        };
+        crc.apply(unsafe_delta);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
+        assert!(crc.file_size_histogram.is_none());
+    }
+
+    #[test]
+    fn apply_drops_histogram_on_untrackable() {
+        let mut crc = base_crc_with_histogram(&[100, 200]);
+        let delta = CrcDelta {
+            has_missing_file_size: true,
+            ..write_delta(1, 100)
+        };
+        crc.apply(delta);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
+        assert!(crc.file_size_histogram.is_none());
+    }
+
+    #[test]
+    fn into_crc_for_version_zero_includes_histogram() {
+        let mut added = FileSizeHistogram::create_default();
+        added.insert(500).unwrap();
+        added.insert(1000).unwrap();
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            file_stats: FileStatsDelta {
+                net_files: 2,
+                net_bytes: 1500,
+                added_histogram: Some(added),
+                removed_histogram: Some(FileSizeHistogram::create_default()),
+            },
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        let hist = crc.file_size_histogram.as_ref().unwrap();
+        assert_eq!(hist.file_counts[0], 2);
+        assert_eq!(hist.total_bytes[0], 1500);
+    }
+
+    #[test]
+    fn into_crc_for_version_zero_without_histogram() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            ..write_delta(0, 0)
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        assert!(crc.file_size_histogram.is_none());
     }
 }
