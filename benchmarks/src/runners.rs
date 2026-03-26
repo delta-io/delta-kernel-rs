@@ -159,8 +159,6 @@ fn resolve_engine(
 pub struct ReadMetadataRunner {
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn Engine>,
-    #[allow(dead_code)] // Held to keep the tokio runtime alive for the engine's handle
-    runtime: Arc<tokio::runtime::Runtime>,
     name: String,
     config: ReadConfig,
     thread_pool: Option<rayon::ThreadPool>, // None for serial configuration, Some for parallel configuration
@@ -220,7 +218,6 @@ impl ReadMetadataRunner {
         Ok(Self {
             snapshot,
             engine,
-            runtime,
             name,
             config,
             thread_pool,
@@ -594,59 +591,71 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Test that a TableInfo with catalogManagedInfo can still be read via the local engine
-    /// path (simulates UC-resolved table pointing to local data).
+    /// Tests read metadata with a UC-loaded snapshot using an in-memory object store and
+    /// in-memory commits client. V0 is a published commit; v1 is a staged (unpublished) commit
+    /// resolved through `UCCatalog::load_snapshot`.
     #[test]
-    fn test_read_metadata_with_uc_table_info() {
-        let table_url = Url::from_file_path(format!(
-            "{}/../kernel/tests/data/basic_partitioned",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .unwrap();
+    fn test_read_metadata_with_in_memory_uc_snapshot() {
+        use object_store::memory::InMemory;
+        use object_store::path::Path;
+        use object_store::ObjectStore;
+        use uc_client::commits_client::{InMemoryCommitsClient, TableData};
+        use uc_client::models::commits::Commit;
 
-        let json = format!(
-            r#"{{
-                "name": "basic_partitioned",
-                "description": "UC-managed table resolved to local path",
-                "tablePath": "{}",
-                "catalogManagedInfo": {{"tableName": "main.default.basic_partitioned"}},
-                "schema": {{
-                    "type": "struct",
-                    "fields": [
-                        {{"name": "letter",  "type": "string", "nullable": true, "metadata": {{}}}},
-                        {{"name": "number",  "type": "long",   "nullable": true, "metadata": {{}}}},
-                        {{"name": "a_float", "type": "double", "nullable": true, "metadata": {{}}}}
-                    ]
-                }},
-                "protocol": {{"minReaderVersion": 1, "minWriterVersion": 2}},
-                "logInfo": {{
-                    "numAddFiles": 6, "numRemoveFiles": 0, "sizeInBytes": 4505,
-                    "numCommits": 2, "numActions": 10
-                }},
-                "properties": {{}},
-                "dataLayout": {{"numPartitionColumns": 1, "numDistinctPartitions": 5}},
-                "tags": []
-            }}"#,
-            table_url,
-        );
-        let table_info: TableInfo = serde_json::from_str(&json).expect("valid TableInfo JSON");
-        assert!(table_info.catalog_managed_info.is_some());
+        let table_root = "memory:///uc_table/";
+        let table_id = "test-table-id";
+        let staged_filename = "00000000000000000001.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json";
 
-        // Build engine and snapshot directly (no live UC endpoint needed for local data)
+        let store = Arc::new(InMemory::new());
         let runtime = test_runtime();
-        let engine =
-            resolve_engine(&table_info, runtime.clone()).expect("engine setup should succeed");
-        let snapshot = Snapshot::builder_for(table_info.resolved_table_root())
-            .build(engine.as_ref())
-            .expect("snapshot should build");
+
+        // v0: published commit with protocol + metadata
+        let v0 = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1000}}"#;
+        runtime
+            .block_on(store.put(
+                &Path::from("uc_table/_delta_log/00000000000000000000.json"),
+                v0.into(),
+            ))
+            .expect("put v0");
+
+        // v1: staged commit with an add action
+        let v1 = r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":100,"modificationTime":2000,"dataChange":true}}"#;
+        runtime
+            .block_on(store.put(
+                &Path::from(format!(
+                    "uc_table/_delta_log/_staged_commits/{staged_filename}"
+                )),
+                v1.into(),
+            ))
+            .expect("put v1 staged");
+
+        // Set up in-memory commits client with v0 published, v1 staged
+        let commits_client = InMemoryCommitsClient::new();
+        commits_client.insert_table(
+            table_id,
+            TableData {
+                max_ratified_version: 1,
+                catalog_commits: vec![Commit::new(1, 2000, staged_filename, 100, 2000)],
+            },
+        );
+
+        let engine = build_engine(store, runtime.clone());
+        let snapshot = runtime
+            .block_on(
+                UCCatalog::new(&commits_client)
+                    .load_snapshot(table_id, table_root, engine.as_ref()),
+            )
+            .expect("UC snapshot load should succeed");
+
+        assert_eq!(snapshot.version(), 1);
 
         let runner = ReadMetadataRunner {
             snapshot,
             engine,
-            runtime,
-            name: "basic_partitioned/uc_read/readMetadata/serial".to_string(),
+            name: "uc_in_memory/readMetadata/serial".to_string(),
             config: serial_config(),
-            thread_pool: None, // None for serial configuration, Some for parallel configuration
+            thread_pool: None,
             predicate: None,
         };
         assert!(runner.execute().is_ok());
