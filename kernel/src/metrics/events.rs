@@ -44,6 +44,7 @@ pub enum MetricEvent {
         num_checkpoint_files: u64,
         num_compaction_files: u64,
     },
+
     /// Protocol and metadata loading completed.
     ProtocolMetadataLoaded {
         operation_id: MetricId,
