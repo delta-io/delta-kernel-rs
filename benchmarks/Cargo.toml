@@ -35,6 +35,7 @@ url = { version = "2", features = ["serde"] }
 [dev-dependencies]
 criterion = "0.5"
 rstest = "0.23"
+uc-client = { path = "../uc-client", features = ["test-utils"] }
 
 [[bench]]
 name = "workload_bench"
