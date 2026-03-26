@@ -93,19 +93,8 @@ pub fn validate_read_result(
             if let Some(expected_file_count) = exp.file_count {
                 if read_result.file_count != expected_file_count {
                     debug!(
-                        "File count mismatch: expected {}, got {}",
+                        "File count mismatch: expected {}, got {}. Note: different data skipping implementations may lead to mismatches",
                         expected_file_count, read_result.file_count
-                    );
-                }
-            }
-
-            // Log files_skipped mismatch. We don't do predicate pushdown, so files_skipped
-            // is always 0 for us. This is for data skipping validation.
-            if let Some(expected_files_skipped) = exp.files_skipped {
-                if expected_files_skipped > 0 {
-                    debug!(
-                        "Files skipped mismatch: expected {}, got 0 (no predicate pushdown)",
-                        expected_files_skipped
                     );
                 }
             }
