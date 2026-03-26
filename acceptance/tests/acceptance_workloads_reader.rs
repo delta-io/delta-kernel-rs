@@ -784,6 +784,9 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
     let spec_path_abs = std::fs::canonicalize(&spec_path_raw)
         .unwrap_or_else(|_| std::path::PathBuf::from(&spec_path_raw));
     let spec_path_str = spec_path_abs.to_string_lossy().to_string();
+    // Normalize Windows backslashes to forward slashes for pattern matching
+    #[cfg(windows)]
+    let spec_path_str = spec_path_str.replace('\\', "/");
 
     // Check expected kernel failures FIRST (path matching only - these need to
     // actually run to assert kernel still fails). Skip list checked second.
