@@ -193,31 +193,38 @@ impl ScanLogReplayProcessor {
             state_info.physical_stats_schema.clone()
         };
 
-        let output_schema = scan_row_schema_with_stats_parsed(stats_schema_for_transform.clone());
+        // Compute physical partition schema for partition-based data skipping.
+        // Disabled when skip_stats is enabled (no predicate evaluation at all).
+        let partition_schema = if skip_stats {
+            None
+        } else {
+            state_info.logical_schema.physical_partition_schema()
+        };
 
-        // Create data skipping filter that reads stats_parsed from the transformed batch.
-        // This avoids double JSON parsing - the transform parses JSON once, then data skipping
-        // reads the already-parsed stats_parsed column from the transform output.
+        let output_schema = scan_row_schema_with_stats_parsed(
+            stats_schema_for_transform.clone(),
+            partition_schema.as_ref(),
+        );
+
+        // Create data skipping filter that reads stats_parsed and partitionValues_parsed from the
+        // transformed batch. This avoids double JSON parsing - the transform parses JSON once, then
+        // data skipping reads the already-parsed columns from the transform output.
         // Disabled when skip_stats is enabled.
         let data_skipping_filter = if skip_stats {
             None
+        } else if state_info.physical_stats_schema.is_some() || partition_schema.is_some() {
+            DataSkippingFilter::new(
+                engine,
+                physical_predicate.as_ref().map(|(p, _)| p.clone()),
+                state_info.physical_stats_schema.as_ref(),
+                column_expr_ref!("stats_parsed"),
+                partition_schema.as_ref(),
+                column_expr_ref!("partitionValues_parsed"),
+                output_schema.clone(),
+                Some(metrics.clone()),
+            )
         } else {
-            state_info
-                .physical_stats_schema
-                .as_ref()
-                .and_then(|physical_stats_schema| {
-                    DataSkippingFilter::new(
-                        engine,
-                        // these are all cheap arc clones
-                        physical_predicate.as_ref().map(|(p, _)| p.clone()),
-                        Some(physical_stats_schema),
-                        column_expr_ref!("stats_parsed"),
-                        None, // no partition schema yet
-                        column_expr_ref!("partitionValues_parsed"),
-                        output_schema.clone(),
-                        Some(metrics.clone()),
-                    )
-                })
+            None
         };
 
         Ok(Self {
@@ -226,13 +233,25 @@ impl ScanLogReplayProcessor {
             // Log transform: always parse JSON (no stats_parsed in JSON commit files)
             log_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema.clone(),
-                get_add_transform_expr(stats_schema_for_transform.clone(), false, skip_stats),
+                get_add_transform_expr(
+                    stats_schema_for_transform.clone(),
+                    false,
+                    skip_stats,
+                    partition_schema.as_ref(),
+                    false, // log batches never have partitionValues_parsed
+                ),
                 output_schema.clone().into(),
             )?,
             // Checkpoint transform: read stats_parsed directly when available, otherwise parse JSON
             checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema,
-                get_add_transform_expr(stats_schema_for_transform, has_stats_parsed, skip_stats),
+                get_add_transform_expr(
+                    stats_schema_for_transform,
+                    has_stats_parsed,
+                    skip_stats,
+                    partition_schema.as_ref(),
+                    has_partition_values_parsed,
+                ),
                 output_schema.into(),
             )?,
             seen_file_keys,
@@ -589,24 +608,34 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     ]))
 });
 
-/// Build the scan row schema with optional stats_parsed column.
+/// Build the scan row schema with optional stats_parsed and partitionValues_parsed columns.
 ///
 /// When `stats_schema` is provided, adds a `stats_parsed` struct column with that schema.
-fn scan_row_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaRef {
-    match stats_schema {
-        Some(schema) => {
-            let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
-            fields.push(StructField::nullable(
-                "stats_parsed",
-                schema.as_ref().clone(),
-            ));
-            Arc::new(StructType::new_unchecked(fields))
-        }
-        None => SCAN_ROW_SCHEMA.clone(),
+/// When `partition_schema` is provided, adds a `partitionValues_parsed` struct column.
+fn scan_row_schema_with_stats_parsed(
+    stats_schema: Option<SchemaRef>,
+    partition_schema: Option<&SchemaRef>,
+) -> SchemaRef {
+    if stats_schema.is_none() && partition_schema.is_none() {
+        return SCAN_ROW_SCHEMA.clone();
     }
+    let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
+    if let Some(schema) = stats_schema {
+        fields.push(StructField::nullable(
+            "stats_parsed",
+            schema.as_ref().clone(),
+        ));
+    }
+    if let Some(schema) = partition_schema {
+        fields.push(StructField::nullable(
+            "partitionValues_parsed",
+            schema.as_ref().clone(),
+        ));
+    }
+    Arc::new(StructType::new_unchecked(fields))
 }
 
-/// Build the add transform expression with optional stats parsing.
+/// Build the add transform expression with optional stats and partition value parsing.
 ///
 /// # Parameters
 /// - `physical_stats_schema`: Schema for parsing stats from JSON and for output (physical column
@@ -614,13 +643,20 @@ fn scan_row_schema_with_stats_parsed(stats_schema: Option<SchemaRef>) -> SchemaR
 /// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column.
 /// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
 ///   raw stats JSON string from checkpoint parquet files.
+/// - `partition_schema`: Schema of typed partition columns, or None if no partition value output
+///   is needed.
+/// - `has_partition_values_parsed`: Whether checkpoint has pre-parsed partitionValues_parsed
+///   column.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_schema` is Some.
+/// The transform includes `partitionValues_parsed` only when `partition_schema` is Some.
 /// Stats are output using physical column names.
 fn get_add_transform_expr(
     physical_stats_schema: Option<SchemaRef>,
     has_stats_parsed: bool,
     skip_stats: bool,
+    partition_schema: Option<&SchemaRef>,
+    has_partition_values_parsed: bool,
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
         Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
@@ -652,6 +688,18 @@ fn get_add_transform_expr(
             Expression::parse_json(column_expr!("add.stats"), stats_schema)
         };
         fields.push(Arc::new(stats_parsed_expr));
+    }
+
+    // Add partitionValues_parsed when partition schema is provided
+    if partition_schema.is_some() {
+        let partition_expr = if has_partition_values_parsed {
+            // Checkpoint has partitionValues_parsed column - read directly
+            column_expr!("add.partitionValues_parsed")
+        } else {
+            // Convert Map<String, String> to typed struct using the partition schema
+            Expression::map_to_struct(column_expr!("add.partitionValues"))
+        };
+        fields.push(Arc::new(partition_expr));
     }
 
     Arc::new(Expression::struct_from(fields))

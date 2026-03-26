@@ -1126,11 +1126,15 @@ impl LogSegment {
         needed: &StructType,
         context: &str,
     ) -> bool {
+        let mut has_needed_fields = false;
+        let mut any_overlap = false;
         for needed_field in needed.fields() {
+            has_needed_fields = true;
             let Some(available_field) = available.field(needed_field.name()) else {
                 // Field missing in checkpoint - that's OK, it will be null
                 continue;
             };
+            any_overlap = true;
 
             match (available_field.data_type(), needed_field.data_type()) {
                 // Both are structs: recurse
@@ -1167,7 +1171,10 @@ impl LogSegment {
                 }
             }
         }
-        true
+        // If needed is non-empty but no fields overlap with available, stats are not useful
+        // for the requested columns (e.g. predicate only references partition columns which
+        // don't appear in the checkpoint's data-column stats). Fall back to JSON parsing.
+        !has_needed_fields || any_overlap
     }
 
     /// Checks if a checkpoint schema contains a usable `add.partitionValues_parsed` field.

@@ -329,6 +329,39 @@ impl LogicalSchema {
             .map(|f| (f.physical_name(self.column_mapping_mode), f.data_type()))
     }
 
+    /// Returns the physical schema for partition columns, or `None` if there are no partition
+    /// columns or none of the partition columns are found in the logical schema.
+    ///
+    /// Field names are physical column names (respecting column mapping mode), and field types are
+    /// the actual partition column data types with their original nullability.
+    pub(crate) fn physical_partition_schema(&self) -> Option<SchemaRef> {
+        if self.partition_columns.is_empty() {
+            return None;
+        }
+        let partition_fields: Vec<StructField> = self
+            .partition_columns
+            .iter()
+            .filter_map(|col_name| {
+                let field = self.schema.field(col_name);
+                if field.is_none() {
+                    debug!("Partition column '{col_name}' not found in logical schema");
+                }
+                field
+            })
+            .map(|field| {
+                StructField::new(
+                    field.physical_name(self.column_mapping_mode).to_owned(),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )
+            })
+            .collect();
+        if partition_fields.is_empty() {
+            return None;
+        }
+        Some(Arc::new(StructType::new_unchecked(partition_fields)))
+    }
+
     /// Compute the physical write schema for this table schema.
     ///
     /// `include_partition_cols`: if false, partition columns are excluded from the result
