@@ -870,47 +870,6 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
 // Set transaction CRC expiration
 // ============================================================================
 
-/// Helper that creates a table with an optional `setTransactionRetentionDuration` property
-/// and commits a set transaction for "my-app" at version 1, then writes a CRC file so the
-/// CRC fast path kicks in on reload. Returns a fresh snapshot loaded from disk.
-fn create_table_with_txn_retention_and_crc(
-    table_path: &str,
-    engine: &dyn Engine,
-    retention: Option<&str>,
-) -> DeltaResult<Arc<Snapshot>> {
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
-
-    // v0: create the table with optional retention property
-    let mut builder = create_table(table_path, schema, "test_engine");
-    if let Some(r) = retention {
-        builder = builder.with_table_properties([("delta.setTransactionRetentionDuration", r)]);
-    }
-    let committed = builder
-        .build(engine, Box::new(FileSystemCommitter::new()))?
-        .commit(engine)?
-        .unwrap_committed();
-
-    // v1: commit a set transaction for "my-app" (lastUpdated = now)
-    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
-    let committed = snapshot_v0
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
-        .with_operation("WRITE".to_string())
-        .with_transaction_id("my-app".to_string(), 1)
-        .commit(engine)?
-        .unwrap_committed();
-
-    // Write CRC at v1 so the fast path is used on reload
-    let snapshot_v1 = committed.post_commit_snapshot().unwrap();
-    snapshot_v1.write_checksum(engine)?;
-
-    let snapshot = Snapshot::builder_for(table_path).build(engine)?;
-    assert_eq!(snapshot.version(), 1);
-    Ok(snapshot)
-}
-
 /// Tests the CRC fast path for set transaction expiration filtering. Since `lastUpdated` is set
 /// to now, "interval 0 seconds" yields `expiration_timestamp = now`, so `last_updated <= now`
 /// holds and the txn expires. A large retention or no retention should keep the txn visible.
@@ -924,8 +883,36 @@ async fn test_set_txn_expiration_via_crc_fast_path(
     #[case] expected: Option<i64>,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot =
-        create_table_with_txn_retention_and_crc(&table_path, engine.as_ref(), retention)?;
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+
+    // v0: create the table with optional retention property
+    let mut builder = create_table(&table_path, schema, "test_engine");
+    if let Some(r) = retention {
+        builder = builder.with_table_properties([("delta.setTransactionRetentionDuration", r)]);
+    }
+    let committed = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // v1: commit a set transaction for "my-app" (lastUpdated = now)
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
+    let committed = snapshot_v0
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_transaction_id("my-app".to_string(), 1)
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // Write CRC at v1 so the fast path is used on reload
+    let snapshot_v1 = committed.post_commit_snapshot().unwrap();
+    snapshot_v1.write_checksum(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 1);
 
     // Verify CRC was loaded from disk
     assert!(snapshot.get_current_crc_if_loaded_for_testing().is_some());
@@ -942,9 +929,7 @@ async fn test_set_txn_expiration_via_crc_fast_path(
 }
 
 /// Verifies that a set transaction with null `last_updated` never expires, even with the most
-/// aggressive retention ("interval 0 seconds"). Uses `create_table` for the table setup and
-/// `add_commit` to write a raw txn action that omits `lastUpdated`, then verifies via log
-/// replay (CRC won't cover the new commit since no CRC is written after v0).
+/// aggressive retention ("interval 0 seconds").
 #[tokio::test]
 async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;

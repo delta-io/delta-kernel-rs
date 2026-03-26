@@ -17,8 +17,8 @@ pub(crate) fn is_set_txn_expired(
     last_updated: Option<i64>,
 ) -> bool {
     matches!(
-        expiration_timestamp.zip(last_updated),
-        Some((exp_ts, last_updated)) if last_updated <= exp_ts
+        (expiration_timestamp, last_updated),
+        (Some(exp_ts), Some(lu)) if lu <= exp_ts
     )
 }
 
