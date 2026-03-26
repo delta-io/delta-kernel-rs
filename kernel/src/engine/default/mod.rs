@@ -24,8 +24,8 @@ use super::arrow_expression::ArrowEvaluationHandler;
 use crate::metrics::MetricsReporter;
 use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
-use crate::transaction::WriteContext;
 use crate::table_properties::ParquetWriterConfig;
+use crate::transaction::WriteContext;
 use crate::{
     DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler, ParquetHandler,
     StorageHandler,

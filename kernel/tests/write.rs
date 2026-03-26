@@ -46,8 +46,8 @@ use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
-use delta_kernel::FileMeta;
 use delta_kernel::table_properties::{ParquetCompression, ParquetWriterConfig};
+use delta_kernel::FileMeta;
 
 use test_utils::create_default_engine_mt_executor;
 use test_utils::{
