@@ -22,7 +22,8 @@ use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
-    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
+    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
+    STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
@@ -1047,7 +1048,7 @@ impl<S> Transaction<S> {
         // stats_parsed column.
         let base_eval = Arc::new(make_eval(false)?);
         let stats_parsed_eval = Arc::new(make_eval(true)?);
-        let stats_parsed_col = ColumnName::new(["stats_parsed"]);
+        let stats_parsed_col = ColumnName::new([STATS_PARSED_NAME]);
 
         Ok(remove_files_metadata.map(move |file_metadata_batch| {
             let data = file_metadata_batch.data();
@@ -1096,7 +1097,7 @@ fn build_remove_transform(
         // so the evaluator emits [coalesced_stats, tags] in place of the original stats field.
         let coalesce_stats = Expression::coalesce([
             Expression::column(["stats"]),
-            Expression::unary(ToJson, Expression::column(["stats_parsed"])),
+            Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
         ]);
         transform = transform
             .with_replaced_field("stats", coalesce_stats.into())
@@ -1104,7 +1105,7 @@ fn build_remove_transform(
                 Some("stats"),
                 Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
             )
-            .with_dropped_field_if_exists("stats_parsed");
+            .with_dropped_field_if_exists(STATS_PARSED_NAME);
     } else {
         // tags inserted after stats; stats passes through unchanged
         transform = transform.with_inserted_field(
