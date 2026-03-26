@@ -1595,7 +1595,6 @@ mod tests {
         );
     }
 
-
     /// visit_rows must accept all Arrow string representations (Utf8/StringArray,
     /// LargeUtf8/LargeStringArray, Utf8View/StringViewArray) when the visitor declares
     /// DataType::STRING.
