@@ -1478,6 +1478,7 @@ mod scan_metadata_completed_tests {
         0
     )]
     #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 2, 0)]
+    #[case::with_removes("./tests/data/with_checkpoint_no_last_checkpoint/", None, 2, 1, 1, 0)]
     #[case::partition_filter(
         "./tests/data/basic_partitioned/",
         Some(Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))),

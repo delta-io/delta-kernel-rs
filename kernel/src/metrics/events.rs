@@ -44,7 +44,6 @@ pub enum MetricEvent {
         num_checkpoint_files: u64,
         num_compaction_files: u64,
     },
-
     /// Protocol and metadata loading completed.
     ProtocolMetadataLoaded {
         operation_id: MetricId,
@@ -81,12 +80,12 @@ pub enum MetricEvent {
 
     /// Scan metadata iteration completed.
     ///
-    /// Emitted when the scan metadata iterator is exhausted or dropped. This event captures
-    /// metrics about the log replay process, including file counts and timing information.
+    /// Emitted when the scan metadata iterator is exhausted. This event captures metrics about the
+    /// log replay process, including file counts and timing information.
     ScanMetadataCompleted {
         /// Unique ID to correlate this scan with other events.
         operation_id: MetricId,
-        /// Total duration from scan start to iterator exhaustion/drop.
+        /// Total duration from scan start to iterator exhaustion.
         total_duration: Duration,
         /// Add files that entered the deduplication visitor. This excludes files filtered by
         /// data skipping before deduplication. For the total number of add actions in the log,

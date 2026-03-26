@@ -136,7 +136,9 @@ pub(crate) struct OnComplete<I, F: FnOnce()> {
 impl<I, F: FnOnce()> Drop for OnComplete<I, F> {
     fn drop(&mut self) {
         if self.on_complete.is_some() {
-            tracing::info!("Iterator dropped before exhaustion; completion callback not called");
+            tracing::debug!(
+                "OnComplete iterator dropped before exhaustion; completion callback not called"
+            );
         }
     }
 }
@@ -147,6 +149,10 @@ where
     F: FnOnce(),
 {
     type Item = I::Item;
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.inner.next() {
