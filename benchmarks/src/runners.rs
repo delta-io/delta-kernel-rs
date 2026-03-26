@@ -210,11 +210,10 @@ impl ReadMetadataRunner {
                 if *num_threads == 0 {
                     return Err("num_threads in ReadConfig must be greater than 0".into());
                 }
-                Some(
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(*num_threads)
-                        .build()?,
-                )
+                let thread_pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(*num_threads)
+                    .build()?;
+                Some(thread_pool)
             }
             ParallelScan::Disabled => None,
         };
@@ -406,7 +405,11 @@ mod tests {
     use crate::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo};
 
     fn test_runtime() -> Arc<tokio::runtime::Runtime> {
-        Arc::new(tokio::runtime::Runtime::new().expect("failed to create runtime"))
+        use std::sync::LazyLock;
+        static RT: LazyLock<Arc<tokio::runtime::Runtime>> = LazyLock::new(|| {
+            Arc::new(tokio::runtime::Runtime::new().expect("failed to create runtime"))
+        });
+        RT.clone()
     }
 
     fn test_table_info() -> TableInfo {
