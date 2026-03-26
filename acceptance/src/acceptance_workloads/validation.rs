@@ -87,14 +87,47 @@ pub fn validate_read_result(
     expected: &ReadExpected,
 ) -> Result<(), String> {
     match (result, expected) {
-        (Ok(read_result), ReadExpected::Success { expected: _ }) => {
+        (Ok(read_result), ReadExpected::Success { expected: exp }) => {
+            // Log file count mismatch (not a failure since data skipping implementations may be
+            // different)
+            if let Some(expected_file_count) = exp.file_count {
+                if read_result.file_count != expected_file_count {
+                    debug!(
+                        "File count mismatch: expected {}, got {}",
+                        expected_file_count, read_result.file_count
+                    );
+                }
+            }
+
+            // Log files_skipped mismatch. We don't do predicate pushdown, so files_skipped
+            // is always 0 for us. This is for data skipping validation.
+            if let Some(expected_files_skipped) = exp.files_skipped {
+                if expected_files_skipped > 0 {
+                    debug!(
+                        "Files skipped mismatch: expected {}, got 0 (no predicate pushdown)",
+                        expected_files_skipped
+                    );
+                }
+            }
+
+            // Validate data content
             let expected_data = read_expected_data(expected_dir)?;
 
             let schema = ArrowSchema::try_from_kernel(read_result.schema.as_ref())
                 .map_err(|e| e.to_string())?;
             let schema = std::sync::Arc::new(schema);
             assert_data_matches(read_result.batches, &schema, expected_data)
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+
+            // Validate row count against spec's expected row counts
+            if read_result.row_count != exp.row_count {
+                return Err(format!(
+                    "Row count mismatch: expected {}, got {}",
+                    exp.row_count, read_result.row_count
+                ));
+            }
+
+            Ok(())
         }
         (Err(kernel_err), ReadExpected::Error { error }) => {
             debug!(
