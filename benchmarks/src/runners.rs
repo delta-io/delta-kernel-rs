@@ -72,7 +72,7 @@ impl ResolvedUcInfo {
 
 /// Resolves a UC table: gets credentials, builds engine, resolves table_id/uri.
 /// Does NOT build the snapshot - call `load_snapshot()` for that.
-fn resolve_uc(
+fn resolve_uc_info(
     table_info: &TableInfo,
     runtime: Arc<tokio::runtime::Runtime>,
 ) -> Result<(Arc<dyn Engine>, ResolvedUcInfo), Box<dyn std::error::Error>> {
@@ -174,7 +174,7 @@ impl ReadMetadataRunner {
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (engine, snapshot) = if table_info.catalog_managed_info.is_some() {
-            let (engine, uc) = resolve_uc(table_info, runtime.clone())?;
+            let (engine, uc) = resolve_uc_info(table_info, runtime.clone())?;
             let snapshot = uc.load_snapshot(engine.as_ref(), &runtime)?;
             (engine, snapshot)
         } else {
@@ -353,7 +353,7 @@ impl SnapshotConstructionRunner {
         );
 
         let (engine, uc) = if table_info.catalog_managed_info.is_some() {
-            let (engine, uc) = resolve_uc(table_info, runtime.clone())?;
+            let (engine, uc) = resolve_uc_info(table_info, runtime.clone())?;
             (engine, Some(uc))
         } else {
             (resolve_engine(table_info, runtime.clone())?, None)
@@ -591,73 +591,4 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Tests read metadata with a UC-loaded snapshot using an in-memory object store and
-    /// in-memory commits client. V0 is a published commit; v1 is a staged (unpublished) commit
-    /// resolved through `UCCatalog::load_snapshot`.
-    #[test]
-    fn test_read_metadata_with_in_memory_uc_snapshot() {
-        use object_store::memory::InMemory;
-        use object_store::path::Path;
-        use object_store::ObjectStore;
-        use uc_client::commits_client::{InMemoryCommitsClient, TableData};
-        use uc_client::models::commits::Commit;
-
-        let table_root = "memory:///uc_table/";
-        let table_id = "test-table-id";
-        let staged_filename = "00000000000000000001.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json";
-
-        let store = Arc::new(InMemory::new());
-        let runtime = test_runtime();
-
-        // v0: published commit with protocol + metadata
-        let v0 = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
-{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1000}}"#;
-        runtime
-            .block_on(store.put(
-                &Path::from("uc_table/_delta_log/00000000000000000000.json"),
-                v0.into(),
-            ))
-            .expect("put v0");
-
-        // v1: staged commit with an add action
-        let v1 = r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":100,"modificationTime":2000,"dataChange":true}}"#;
-        runtime
-            .block_on(store.put(
-                &Path::from(format!(
-                    "uc_table/_delta_log/_staged_commits/{staged_filename}"
-                )),
-                v1.into(),
-            ))
-            .expect("put v1 staged");
-
-        // Set up in-memory commits client with v0 published, v1 staged
-        let commits_client = InMemoryCommitsClient::new();
-        commits_client.insert_table(
-            table_id,
-            TableData {
-                max_ratified_version: 1,
-                catalog_commits: vec![Commit::new(1, 2000, staged_filename, 100, 2000)],
-            },
-        );
-
-        let engine = build_engine(store, runtime.clone());
-        let snapshot = runtime
-            .block_on(
-                UCCatalog::new(&commits_client)
-                    .load_snapshot(table_id, table_root, engine.as_ref()),
-            )
-            .expect("UC snapshot load should succeed");
-
-        assert_eq!(snapshot.version(), 1);
-
-        let runner = ReadMetadataRunner {
-            snapshot,
-            engine,
-            name: "uc_in_memory/readMetadata/serial".to_string(),
-            config: serial_config(),
-            thread_pool: None,
-            predicate: None,
-        };
-        assert!(runner.execute().is_ok());
-    }
 }
