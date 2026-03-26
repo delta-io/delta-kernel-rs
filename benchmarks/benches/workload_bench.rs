@@ -24,6 +24,10 @@ fn workload_benchmarks(c: &mut Criterion) {
     };
 
     let reporter = Arc::new(CountingReporter::new());
+    let runtime = Arc::new(
+        tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"),
+    );
+
     for workload in &workloads {
         match &workload.spec {
             Spec::Read(read_spec) => {
@@ -35,6 +39,7 @@ fn workload_benchmarks(c: &mut Criterion) {
                             read_spec,
                             operation,
                             config,
+                            runtime.clone(),
                         )
                         .expect("Failed to create read runner");
                         run_benchmark(c, runner.as_ref(), &reporter);
@@ -46,6 +51,7 @@ fn workload_benchmarks(c: &mut Criterion) {
                     &workload.table_info,
                     &workload.case_name,
                     snapshot_construction_spec,
+                    runtime.clone(),
                 )
                 .expect("Failed to create snapshot construction runner");
                 run_benchmark(c, &runner, &reporter);

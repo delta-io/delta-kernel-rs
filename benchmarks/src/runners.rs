@@ -39,9 +39,11 @@ pub trait WorkloadRunner {
 // Engine + snapshot setup (resolved from TableInfo + env vars)
 // ---------------------------------------------------------------------------
 
-fn build_engine(store: Arc<dyn object_store::ObjectStore>) -> Arc<dyn Engine> {
-    let executor = TokioMultiThreadExecutor::new_owned_runtime(None, None)
-        .expect("Failed to create tokio runtime");
+fn build_engine(
+    store: Arc<dyn object_store::ObjectStore>,
+    runtime: Arc<tokio::runtime::Runtime>,
+) -> Arc<dyn Engine> {
+    let executor = TokioMultiThreadExecutor::new(runtime.handle().clone());
     Arc::new(
         DefaultEngine::builder(store)
             .with_task_executor(Arc::new(executor))
@@ -50,20 +52,20 @@ fn build_engine(store: Arc<dyn object_store::ObjectStore>) -> Arc<dyn Engine> {
 }
 
 /// Pre-resolved UC state for building snapshots via UCCatalog.
-struct ResolvedUc {
+struct ResolvedUcInfo {
     table_id: String,
     table_uri: String,
     commits_client: UCCommitsRestClient,
-    rt: tokio::runtime::Runtime,
 }
 
-impl ResolvedUc {
+impl ResolvedUcInfo {
     fn load_snapshot(
         &self,
         engine: &dyn Engine,
+        runtime: &tokio::runtime::Runtime,
     ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
         let catalog = UCCatalog::new(&self.commits_client);
-        self.rt
+        runtime
             .block_on(catalog.load_snapshot(&self.table_id, &self.table_uri, engine))
             .map_err(|e| format!("UC snapshot failed: {e}").into())
     }
@@ -73,7 +75,8 @@ impl ResolvedUc {
 /// Does NOT build the snapshot - call `load_snapshot()` for that.
 fn resolve_uc(
     table_info: &TableInfo,
-) -> Result<(Arc<dyn Engine>, ResolvedUc), Box<dyn std::error::Error>> {
+    runtime: Arc<tokio::runtime::Runtime>,
+) -> Result<(Arc<dyn Engine>, ResolvedUcInfo), Box<dyn std::error::Error>> {
     let cm = table_info
         .catalog_managed_info
         .as_ref()
@@ -81,12 +84,11 @@ fn resolve_uc(
     let endpoint = std::env::var("UC_WORKSPACE").map_err(|_| "UC_WORKSPACE required")?;
     let token = std::env::var("UC_TOKEN").map_err(|_| "UC_TOKEN required")?;
 
-    let rt = tokio::runtime::Runtime::new()?;
     let config = ClientConfig::build(&endpoint, &token).build()?;
     let client = UCClient::new(config.clone())?;
     let commits_client = UCCommitsRestClient::new(config)?;
 
-    let (table_id, table_uri, aws) = rt.block_on(async {
+    let (table_id, table_uri, aws) = runtime.block_on(async {
         let table = client.get_table(&cm.table_name).await?;
         let creds = client
             .get_credentials(&table.table_id, Operation::Read)
@@ -109,18 +111,20 @@ fn resolve_uc(
     ];
     let (store, _) = object_store::parse_url_opts(&table_url, options)?;
 
-    let engine = build_engine(store.into());
-    let uc = ResolvedUc {
+    let engine = build_engine(store.into(), runtime);
+    let uc = ResolvedUcInfo {
         table_id,
         table_uri,
         commits_client,
-        rt,
     };
     Ok((engine, uc))
 }
 
 /// Builds an engine from table_path scheme + env vars (S3 or local).
-fn resolve_engine(table_info: &TableInfo) -> Result<Arc<dyn Engine>, Box<dyn std::error::Error>> {
+fn resolve_engine(
+    table_info: &TableInfo,
+    runtime: Arc<tokio::runtime::Runtime>,
+) -> Result<Arc<dyn Engine>, Box<dyn std::error::Error>> {
     let url = table_info.resolved_table_root();
     match url.scheme() {
         "s3" | "s3a" => {
@@ -139,9 +143,9 @@ fn resolve_engine(table_info: &TableInfo) -> Result<Arc<dyn Engine>, Box<dyn std
                 opts.push(("session_token", v));
             }
             let (store, _) = object_store::parse_url_opts(&url, opts)?;
-            Ok(build_engine(store.into()))
+            Ok(build_engine(store.into(), runtime))
         }
-        "file" | "" => Ok(build_engine(Arc::new(LocalFileSystem::new()))),
+        "file" | "" => Ok(build_engine(Arc::new(LocalFileSystem::new()), runtime)),
         scheme => Err(format!(
             "Unsupported scheme '{scheme}': only s3://, s3a://, and file:// are supported"
         )
@@ -156,6 +160,8 @@ fn resolve_engine(table_info: &TableInfo) -> Result<Arc<dyn Engine>, Box<dyn std
 pub struct ReadMetadataRunner {
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn Engine>,
+    #[allow(dead_code)] // Held to keep the tokio runtime alive for the engine's handle
+    runtime: Arc<tokio::runtime::Runtime>,
     name: String,
     config: ReadConfig,
     thread_pool: Option<rayon::ThreadPool>, // None for serial configuration, Some for parallel configuration
@@ -168,13 +174,14 @@ impl ReadMetadataRunner {
         case_name: &str,
         read_spec: &ReadSpec,
         config: ReadConfig,
+        runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (engine, snapshot) = if table_info.catalog_managed_info.is_some() {
-            let (engine, uc) = resolve_uc(table_info)?;
-            let snapshot = uc.load_snapshot(engine.as_ref())?;
+            let (engine, uc) = resolve_uc(table_info, runtime.clone())?;
+            let snapshot = uc.load_snapshot(engine.as_ref(), &runtime)?;
             (engine, snapshot)
         } else {
-            let engine = resolve_engine(table_info)?;
+            let engine = resolve_engine(table_info, runtime.clone())?;
             let mut builder = Snapshot::builder_for(table_info.resolved_table_root());
             if let Some(tt) = &read_spec.time_travel {
                 builder = builder.at_version(tt.as_version()?);
@@ -215,6 +222,7 @@ impl ReadMetadataRunner {
         Ok(Self {
             snapshot,
             engine,
+            runtime,
             name,
             config,
             thread_pool,
@@ -312,10 +320,11 @@ pub fn create_read_runner(
     read_spec: &ReadSpec,
     operation: ReadOperation,
     config: ReadConfig,
+    runtime: Arc<tokio::runtime::Runtime>,
 ) -> Result<Box<dyn WorkloadRunner>, Box<dyn std::error::Error>> {
     match operation {
         ReadOperation::ReadMetadata => Ok(Box::new(ReadMetadataRunner::setup(
-            table_info, case_name, read_spec, config,
+            table_info, case_name, read_spec, config, runtime,
         )?)),
         ReadOperation::ReadData => Err("ReadDataRunner not yet implemented".into()),
     }
@@ -327,9 +336,10 @@ pub fn create_read_runner(
 
 pub struct SnapshotConstructionRunner {
     engine: Arc<dyn Engine>,
+    runtime: Arc<tokio::runtime::Runtime>,
     url: Url,
     version: Option<u64>,
-    uc: Option<ResolvedUc>,
+    uc: Option<ResolvedUcInfo>,
     name: String,
 }
 
@@ -338,6 +348,7 @@ impl SnapshotConstructionRunner {
         table_info: &TableInfo,
         case_name: &str,
         snapshot_spec: &SnapshotConstructionSpec,
+        runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let name = format!(
             "{}/{}/{}",
@@ -352,14 +363,15 @@ impl SnapshotConstructionRunner {
         };
 
         let (engine, uc) = if table_info.catalog_managed_info.is_some() {
-            let (engine, uc) = resolve_uc(table_info)?;
+            let (engine, uc) = resolve_uc(table_info, runtime.clone())?;
             (engine, Some(uc))
         } else {
-            (resolve_engine(table_info)?, None)
+            (resolve_engine(table_info, runtime.clone())?, None)
         };
 
         Ok(Self {
             engine,
+            runtime,
             url: table_info.resolved_table_root(),
             version: snapshot_spec.version,
             uc,
@@ -371,7 +383,7 @@ impl SnapshotConstructionRunner {
 impl WorkloadRunner for SnapshotConstructionRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = if let Some(uc) = &self.uc {
-            uc.load_snapshot(self.engine.as_ref())?
+            uc.load_snapshot(self.engine.as_ref(), &self.runtime)?
         } else {
             let mut builder = Snapshot::builder_for(self.url.clone());
             if let Some(v) = self.version {
@@ -392,6 +404,10 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 mod tests {
     use super::*;
     use crate::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo};
+
+    fn test_runtime() -> Arc<tokio::runtime::Runtime> {
+        Arc::new(tokio::runtime::Runtime::new().expect("failed to create runtime"))
+    }
 
     fn test_table_info() -> TableInfo {
         let path = format!(
@@ -458,6 +474,7 @@ mod tests {
             "testCase",
             &test_read_spec(),
             serial_config(),
+            test_runtime(),
         )
         .expect("setup should succeed");
         assert_eq!(
@@ -474,6 +491,7 @@ mod tests {
             "testCase",
             &test_read_spec(),
             parallel_config(),
+            test_runtime(),
         )
         .expect("setup should succeed");
         assert_eq!(
@@ -496,6 +514,7 @@ mod tests {
             &test_table_info(),
             "testCase",
             &test_snapshot_spec(),
+            test_runtime(),
         );
         assert!(runner.is_ok());
     }
@@ -506,6 +525,7 @@ mod tests {
             &test_table_info(),
             "testCase",
             &test_snapshot_spec(),
+            test_runtime(),
         )
         .expect("setup should succeed");
         assert_eq!(
@@ -520,6 +540,7 @@ mod tests {
             &test_table_info(),
             "testCase",
             &test_snapshot_spec(),
+            test_runtime(),
         )
         .expect("setup should succeed");
         assert!(runner.execute().is_ok());
@@ -533,6 +554,7 @@ mod tests {
             &test_read_spec(),
             ReadOperation::ReadMetadata,
             serial_config(),
+            test_runtime(),
         )
         .expect("create_read_runner should succeed");
         assert!(runner.execute().is_ok());
@@ -542,9 +564,14 @@ mod tests {
     fn test_read_metadata_runner_with_valid_predicate() {
         let mut spec = test_read_spec();
         spec.predicate = Some("letter = 'a'".to_string());
-        let runner =
-            ReadMetadataRunner::setup(&test_table_info(), "test_case", &spec, serial_config())
-                .expect("setup should succeed");
+        let runner = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &spec,
+            serial_config(),
+            test_runtime(),
+        )
+        .expect("setup should succeed");
         assert!(runner.execute().is_ok());
     }
 
@@ -552,8 +579,13 @@ mod tests {
     fn test_read_metadata_runner_with_invalid_predicate() {
         let mut spec = test_read_spec();
         spec.predicate = Some("a LIKE '%foo'".to_string());
-        let result =
-            ReadMetadataRunner::setup(&test_table_info(), "test_case", &spec, serial_config());
+        let result = ReadMetadataRunner::setup(
+            &test_table_info(),
+            "test_case",
+            &spec,
+            serial_config(),
+            test_runtime(),
+        );
         assert!(result.is_err());
     }
 
@@ -565,6 +597,7 @@ mod tests {
             &test_read_spec(),
             ReadOperation::ReadData,
             serial_config(),
+            test_runtime(),
         );
         assert!(result.is_err());
     }
@@ -608,7 +641,9 @@ mod tests {
         assert!(table_info.catalog_managed_info.is_some());
 
         // Build engine and snapshot directly (no live UC endpoint needed for local data)
-        let engine = resolve_engine(&table_info).expect("engine setup should succeed");
+        let runtime = test_runtime();
+        let engine =
+            resolve_engine(&table_info, runtime.clone()).expect("engine setup should succeed");
         let snapshot = Snapshot::builder_for(table_info.resolved_table_root())
             .build(engine.as_ref())
             .expect("snapshot should build");
@@ -616,6 +651,7 @@ mod tests {
         let runner = ReadMetadataRunner {
             snapshot,
             engine,
+            runtime,
             name: "basic_partitioned/uc_read/readMetadata/serial".to_string(),
             config: serial_config(),
             thread_pool: None, // None for serial configuration, Some for parallel configuration
