@@ -388,20 +388,30 @@ impl<S> Transaction<S> {
             .chain(dv_update_actions);
 
         // Step 7: Commit via the committer
-        // Block FileSystemCommitter for catalog-managed tables (including create-table with catalog features)
+        // Enforce that committer type matches table type for catalog-managed tables.
+        // A non-catalog committer cannot commit to a catalog-managed table, and a catalog
+        // committer cannot commit to a non-catalog-managed table. This is a kernel-level
+        // policy to prevent accidental misuse -- the Delta protocol spec requires catalog
+        // committers for catalog-managed tables but is silent on the reverse direction.
         #[cfg(feature = "catalog-managed")]
-        if !self.committer.is_catalog_committer()
-            && self
+        {
+            let is_catalog_committer = self.committer.is_catalog_committer();
+            let is_catalog_managed = self
                 .read_snapshot
                 .table_configuration()
-                .is_catalog_managed()
-        {
-            return Err(Error::generic(
-                "A catalog committer must be used to commit to catalog-managed tables. Please \
-                    provide a catalog committer via Snapshot::transaction().",
-            ));
+                .is_catalog_managed();
+            if is_catalog_committer != is_catalog_managed {
+                let msg = if is_catalog_managed {
+                    "A catalog committer must be used to commit to catalog-managed tables. \
+                     Please provide a catalog committer via Snapshot::transaction()."
+                } else {
+                    "A catalog committer cannot be used to commit to non-catalog-managed tables."
+                };
+                return Err(Error::generic(msg));
+            }
         }
         let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
+        let table_config = self.read_snapshot.table_configuration();
         let commit_metadata = CommitMetadata::new(
             log_root,
             commit_version,
@@ -410,6 +420,11 @@ impl<S> Transaction<S> {
                 .log_segment()
                 .listed
                 .max_published_version,
+            // Note: these reflect the read snapshot's protocol/metadata. For create-table,
+            // these match the committed state. When protocol/metadata evolution is added,
+            // this must be updated to carry the post-commit state instead.
+            table_config.protocol().clone(),
+            table_config.metadata().clone(),
         );
         match self
             .committer
@@ -1314,6 +1329,9 @@ mod tests {
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::ObjectStore as _;
     use crate::schema::MapType;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
@@ -1349,6 +1367,33 @@ mod tests {
         }
         fn is_catalog_committer(&self) -> bool {
             false
+        }
+        fn publish(
+            &self,
+            _engine: &dyn Engine,
+            _publish_metadata: PublishMetadata,
+        ) -> DeltaResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A mock catalog committer, used to test catalog committer validation.
+    #[cfg(feature = "catalog-managed")]
+    struct MockCatalogCommitter;
+
+    #[cfg(feature = "catalog-managed")]
+    impl Committer for MockCatalogCommitter {
+        fn commit(
+            &self,
+            _engine: &dyn Engine,
+            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            _commit_metadata: CommitMetadata,
+        ) -> DeltaResult<CommitResponse> {
+            // This won't be reached in tests — the validation error fires before commit.
+            Ok(CommitResponse::Conflict { version: 0 })
+        }
+        fn is_catalog_committer(&self) -> bool {
+            true
         }
         fn publish(
             &self,
@@ -2309,5 +2354,63 @@ mod tests {
             result.is_ok(),
             "Stats validation should be skipped without clustering, got: {result:?}"
         );
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[test]
+    fn disallow_catalog_committer_for_non_catalog_managed_table() {
+        let storage = Arc::new(InMemory::new());
+        let table_root = url::Url::parse("memory:///").unwrap();
+        let engine = crate::engine::default::DefaultEngineBuilder::new(storage.clone()).build();
+
+        // Create a non-catalog-managed table (no catalogManaged feature)
+        let actions = [
+            r#"{"commitInfo":{"timestamp":12345678900,"inCommitTimestamp":12345678900}}"#,
+            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["inCommitTimestamp"]}}"#,
+            r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true"},"createdTime":1234567890}}"#,
+        ].join("\n");
+
+        let commit_path = Path::from("_delta_log/00000000000000000000.json");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(storage.put(&commit_path, actions.into()))
+            .unwrap();
+
+        let snapshot = Snapshot::builder_for(table_root)
+            .build(&engine)
+            .unwrap();
+
+        // Try to commit with a catalog committer to a non-catalog-managed table
+        let committer = Box::new(MockCatalogCommitter);
+        let err = snapshot
+            .transaction(committer, &engine)
+            .unwrap()
+            .commit(&engine)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Generic(e) if e.contains("A catalog committer cannot be used to commit to non-catalog-managed tables")
+        ));
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[test]
+    fn disallow_catalog_committer_for_non_catalog_managed_create_table() {
+        let storage = Arc::new(InMemory::new());
+        let engine = crate::engine::default::DefaultEngineBuilder::new(storage).build();
+
+        // Create a non-catalog-managed table using a catalog committer
+        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![
+            crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, false),
+        ]));
+        let committer = Box::new(MockCatalogCommitter);
+        let err = create_table("memory:///", schema, "test-engine")
+            .build(&engine, committer)
+            .unwrap()
+            .commit(&engine)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Generic(e) if e.contains("A catalog committer cannot be used to commit to non-catalog-managed tables")
+        ));
     }
 }
