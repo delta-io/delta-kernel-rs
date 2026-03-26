@@ -39,14 +39,12 @@ pub struct MutableScanBuilder;
 
 /// A predicate that can be used to skip data when scanning.
 ///
-/// When invoking [`scan`], The engine provides a pointer to the (engine's native) predicate, along
-/// with a visitor function that can be invoked to recursively visit the predicate. This engine
-/// state must be valid until the call to [`scan`] returns. Inside that method, the kernel allocates
-/// visitor state, which becomes the second argument to the predicate visitor invocation along with
-/// the engine-provided predicate pointer. The visitor state is valid for the lifetime of the
-/// predicate visitor invocation. Thanks to this double indirection, engine and kernel each retain
-/// ownership of their respective objects, with no need to coordinate memory lifetimes with the
-/// other.
+/// Used by [`scan`] and [`scan_builder_with_predicate`]. The engine provides a pointer to its
+/// native predicate along with a visitor function that recursively visits it. This engine state
+/// must remain valid for the duration of the call. The kernel allocates visitor state internally,
+/// which becomes the second argument to the visitor invocation. Thanks to this double indirection,
+/// engine and kernel each retain ownership of their respective objects with no need to coordinate
+/// memory lifetimes.
 #[repr(C)]
 pub struct EnginePredicate {
     pub predicate: *mut c_void,
@@ -56,15 +54,11 @@ pub struct EnginePredicate {
 
 /// A schema for columns to select from the snapshot.
 ///
-/// This allows engines to specify which columns they want to read for projection pushdown or to
-/// specify metadata columns. The engine provides a pointer to its native schema representation
-/// along with a visitor function. The kernel uses this to build a kernel
-/// [`delta_kernel::schema::Schema`] that specifies the projection. Inside [`scan`] the kernel
-/// allocates visitor state, which becomes the second argument to the schema visitor invocation
-/// along with the engine-provided schema pointer. The visitor state is valid for the lifetime of
-/// the schema visitor invocation. Thanks to this double indirection, engine and kernel each retain
-/// ownership of their respective objects, with no need to coordinate memory lifetimes with the
-/// other.
+/// Used by [`scan`] and [`scan_builder_with_schema`] for projection pushdown or to specify
+/// metadata columns. The engine provides a pointer to its native schema representation along with
+/// a visitor function. The kernel allocates visitor state internally, which becomes the second
+/// argument to the schema visitor invocation. Thanks to this double indirection, engine and kernel
+/// each retain ownership of their respective objects with no need to coordinate memory lifetimes.
 #[repr(C)]
 pub struct EngineSchema {
     pub schema: *mut c_void,
@@ -200,42 +194,37 @@ pub unsafe extern "C" fn scan_builder(
 
 /// Apply a predicate to a [`MutableScanBuilder`] for data skipping and row-level filtering.
 ///
-/// Consumes the `builder` handle and returns a new handle. If the visitor produces no
-/// predicate, `None` is passed to [`ScanBuilder::with_predicate`] and the builder is returned
-/// effectively unchanged. This operation is infallible.
+/// Consumes the `builder` handle and returns a new handle. The `builder` handle must not be used
+/// after this call. If the visitor produces no predicate, `None` is passed to
+/// [`ScanBuilder::with_predicate`] and the builder is returned effectively unchanged. This
+/// operation is infallible.
 ///
 /// # Safety
 ///
-/// `builder` and `engine` must be valid handles. `predicate` must be a valid, non-null
-/// [`EnginePredicate`] whose `visitor` and `predicate` fields are safe to call and read.
+/// `builder` must be a valid handle that is not used again after this call. `predicate` must be a
+/// valid, non-null [`EnginePredicate`] whose `visitor` and `predicate` fields are safe to call and
+/// read.
 #[no_mangle]
 pub unsafe extern "C" fn scan_builder_with_predicate(
     builder: Handle<MutableScanBuilder>,
-    engine: Handle<SharedExternEngine>,
     predicate: &mut EnginePredicate,
-) -> ExternResult<Handle<MutableScanBuilder>> {
-    let engine = unsafe { engine.as_ref() };
-    scan_builder_with_predicate_impl(builder, predicate).into_extern_result(&engine)
-}
-
-fn scan_builder_with_predicate_impl(
-    builder: Handle<MutableScanBuilder>,
-    predicate: &mut EnginePredicate,
-) -> DeltaResult<Handle<MutableScanBuilder>> {
+) -> Handle<MutableScanBuilder> {
     let builder = unsafe { builder.into_inner() };
-    Ok(Box::new(apply_predicate(*builder, predicate)).into())
+    Box::new(apply_predicate(*builder, predicate)).into()
 }
 
 /// Apply a column projection schema to a [`MutableScanBuilder`].
 ///
-/// Consumes the `builder` handle and returns a new handle with the schema applied. Returns an
-/// error if the schema visitor produces an invalid schema, such as a non-struct root or
-/// unconsumed field IDs.
+/// Consumes the `builder` handle and returns a new handle with the schema applied. The `builder`
+/// handle must not be used after this call. Returns an error if the schema visitor produces an
+/// invalid schema, such as a non-struct root or unconsumed field IDs. On error, the builder is
+/// dropped.
 ///
 /// # Safety
 ///
-/// `builder` and `engine` must be valid handles. `schema` must be a valid, non-null
-/// [`EngineSchema`] whose `visitor` and `schema` fields are safe to call and read.
+/// `builder` and `engine` must be valid handles. The `builder` handle must not be used after this
+/// call. `schema` must be a valid, non-null [`EngineSchema`] whose `visitor` and `schema` fields
+/// are safe to call and read.
 #[no_mangle]
 pub unsafe extern "C" fn scan_builder_with_schema(
     builder: Handle<MutableScanBuilder>,
@@ -336,7 +325,7 @@ pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handl
 /// pruning.
 ///
 /// If you need the predicate itself (not just its presence), use [`scan_remaining_filter`]
-/// instead to avoid a redundant allocation.
+/// instead to avoid cloning the predicate handle.
 ///
 /// # Safety
 ///
@@ -356,8 +345,8 @@ pub unsafe extern "C" fn scan_has_remaining_filter(scan: Handle<SharedScan>) -> 
 /// to a static skip-all, or it was fully resolved during file pruning.
 ///
 /// Returns [`OptionalValue::Some`] containing an owned [`SharedPredicate`] handle that the caller
-/// must eventually free with [`crate::expressions::free_kernel_predicate`], or [`OptionalValue::None`] if no remaining
-/// filter exists.
+/// must eventually free with [`crate::expressions::free_kernel_predicate`], or
+/// [`OptionalValue::None`] if no remaining filter exists.
 ///
 /// # Safety
 ///
@@ -872,13 +861,7 @@ mod scan_builder_tests {
             predicate: std::ptr::null_mut(),
             visitor: visit_id_lt_10,
         };
-        let builder = unsafe {
-            ok_or_panic(scan_builder_with_predicate(
-                builder,
-                engine.shallow_copy(),
-                &mut predicate,
-            ))
-        };
+        let builder = unsafe { scan_builder_with_predicate(builder, &mut predicate) };
         let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
         // Predicate does not reduce columns -- full schema is still returned
         let schema = unsafe { scan_logical_schema(scan.shallow_copy()) };
@@ -927,13 +910,7 @@ mod scan_builder_tests {
             predicate: std::ptr::null_mut(),
             visitor: visit_id_lt_10,
         };
-        let builder = unsafe {
-            ok_or_panic(scan_builder_with_predicate(
-                builder,
-                engine.shallow_copy(),
-                &mut predicate,
-            ))
-        };
+        let builder = unsafe { scan_builder_with_predicate(builder, &mut predicate) };
         let mut schema_arg = EngineSchema {
             schema: std::ptr::null_mut(),
             visitor: visit_id_only_schema,
@@ -986,13 +963,7 @@ mod scan_builder_tests {
             predicate: std::ptr::null_mut(),
             visitor: visit_id_lt_10,
         };
-        let builder = unsafe {
-            ok_or_panic(scan_builder_with_predicate(
-                builder,
-                engine.shallow_copy(),
-                &mut predicate,
-            ))
-        };
+        let builder = unsafe { scan_builder_with_predicate(builder, &mut predicate) };
         let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
         let has_filter = unsafe { scan_has_remaining_filter(scan.shallow_copy()) };
         assert!(has_filter);
@@ -1023,11 +994,7 @@ mod scan_builder_tests {
             visitor: visit_id_lt_10,
         };
         let builder = unsafe {
-            ok_or_panic(scan_builder_with_predicate(
-                scan_builder(snapshot.shallow_copy()),
-                engine.shallow_copy(),
-                &mut predicate,
-            ))
+            scan_builder_with_predicate(scan_builder(snapshot.shallow_copy()), &mut predicate)
         };
         let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
         let result = unsafe { scan_remaining_filter(scan.shallow_copy()) };
@@ -1077,13 +1044,7 @@ mod scan_builder_tests {
             predicate: std::ptr::null_mut(),
             visitor: visit_id_lt_10,
         };
-        let builder = unsafe {
-            ok_or_panic(scan_builder_with_predicate(
-                builder,
-                engine.shallow_copy(),
-                &mut predicate,
-            ))
-        };
+        let builder = unsafe { scan_builder_with_predicate(builder, &mut predicate) };
         let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
         // Projection to `{id}` regardless of application order
         let schema = unsafe { scan_logical_schema(scan.shallow_copy()) };
