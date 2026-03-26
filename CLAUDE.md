@@ -98,7 +98,9 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
 - **Unit tests** test internal APIs and module internals. It is fine to use public APIs
   like `create_table` in a unit test as setup (e.g. to create a table for testing reads,
   writes, or state loading).
-- **Integration tests** exercise only public APIs end-to-end.
+- **Integration tests** exercise only public APIs end-to-end. See `kernel/tests/README.md`
+  for a catalog of available test tables (schema, protocol, features, and which tests use
+  them). Consult it before creating new test data to avoid duplication.
 - Consider how the feature interacts with Delta table features (see Protocol TLDR below).
 - Consider write paths: normal commits, checkpointing, CRC files, log compaction files.
 - Consider read paths: loading a snapshot from scratch at latest version, at a specific
@@ -199,6 +201,32 @@ Breaking change examples: `feat!: make_physical takes column mapping and sets pa
 **Description:** follow the template in `.github/PULL_REQUEST_TEMPLATE.md`. Error on the
 side of simplicity -- don't list every change. Focus on key API changes, functionality,
 and data flow. Keep it concise.
+
+### CI Jobs and Github Actions
+
+**Supply chain security:** every `cargo` command in CI that resolves dependencies MUST use
+`--locked` to enforce the committed `Cargo.lock`. This prevents CI from silently picking up
+a newer (potentially compromised) transitive dependency. If `Cargo.lock` is out of sync with
+`Cargo.toml`, the build fails immediately, forcing dependency changes to be explicit and
+reviewable. See the top-level comment in `build.yml` for full rationale. Commands exempt from
+`--locked`: `cargo fmt` (no dep resolution), `cargo msrv verify/show` (wrapper tool),
+`cargo miri setup` (tooling setup).
+
+Ensure that when writing any github action you are considering safety including thinking of
+and mitigating common attack vectors such expression injection and pull request target attacks.
+
+Example:
+```yaml
+# The code below is vulnerable to expression injection
+run: |
+    echo "Comment: ${{ github.event.comment.body }}"
+
+# To mitigate instead use environment variables
+env:
+    COMMENT_BODY: ${{ github.event.comment.body }}
+run: |
+    echo "Comment: $COMMENT_BODY"
+```
 
 ## Deep Context
 

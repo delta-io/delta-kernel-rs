@@ -1,0 +1,47 @@
+# This is copied from https://github.com/tecolicom/actions-use-homebrew-tools/
+# which is Copyright 2022 Office TECOLI, LLC
+
+name: install-and-cache homebrew tools
+description: 'GitHub Action to install and cache homebrew tools'
+branding:
+  color: orange
+  icon:  type
+
+inputs:
+  tools:   { required: false, type: string }
+  key:     { required: false, type: string }
+  path:    { required: false, type: string }
+  cache:   { required: false, type: string, default: yes }
+  verbose: { required: false, type: boolean, default: false }
+
+outputs:
+  cache-hit:
+    value: ${{ steps.update.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+
+    - id: setup
+      shell: bash
+      run: |
+        : setup use-homebrew-tools
+        given_key="${{ inputs.key }}"
+        brew_version="$(brew --version)"
+        echo "$brew_version"
+        version_key="$( echo "$brew_version" | (md5sum||md5) | awk '{print $1}' )"
+        key="${given_key:+$given_key-}${version_key}"
+        sed 's/^ *//' << END >> $GITHUB_OUTPUT
+            command=brew install
+            prefix=$(brew --prefix)
+            key=$key
+        END
+
+    - id: update
+      uses: ./.github/actions/install-and-cache
+      with:
+        run:     ${{ steps.setup.outputs.command }} ${{ inputs.tools }}
+        path:    ${{ steps.setup.outputs.prefix }} ${{ inputs.path }}
+        key:     ${{ steps.setup.outputs.key }}
+        cache:   ${{ inputs.cache }}
+        verbose: ${{ inputs.verbose }}

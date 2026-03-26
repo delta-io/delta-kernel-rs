@@ -25,6 +25,9 @@ pub(crate) use timestamp_ntz::{
 mod column_mapping;
 mod timestamp_ntz;
 
+/// Minimum reader/writer protocol version that the kernel can handle.
+pub const MIN_VALID_RW_VERSION: i32 = 1;
+
 /// Maximum reader protocol version that the kernel can handle.
 pub const MAX_VALID_READER_VERSION: i32 = 3;
 

@@ -676,8 +676,8 @@ mod tests {
             non_file_actions: 5,
             predicate_filtered: 0,
         },
-        // Data skipping predicate filters 4 files (101 -> 97)
-        // add_files_seen counts files AFTER data skipping
+        // Data skipping predicate filters 4 files (101 -> 97).
+        // add_files_seen counts files AFTER data skipping.
         expected_parallel_metrics: Some(ExpectedMetrics {
             add_files_seen: 97,
             active_add_files: 97,
@@ -687,17 +687,21 @@ mod tests {
         }),
     })]
     #[case::partition_pruning(ParallelLogReplayCase {
-        // Tests partition pruning filtering based on partition column values
-        // Table is partitioned by 'letter' with partitions: a, b, c, e, null
-        // Predicate letter='a' prunes 4 files (b, c, e, null), leaving 2 letter=a files
+        // Tests partition pruning filtering based on partition column values.
+        // Table is partitioned by 'letter' with partitions: a, b, c, e, null.
+        // Predicate letter='a' prunes 4 files (b, c, e, null), leaving 2 letter=a files.
+        // All 4 non-matching files are pruned by the columnar DataSkippingFilter. The is_add
+        // guard (OR(NOT is_add, pred)) only protects Remove/non-file rows, not Adds with null
+        // partition values -- those are correctly filtered since is_add=true for them.
         path: "basic_partitioned",
         predicate: Some({
             use crate::expressions::{column_expr, Expression as Expr};
             Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))
         }),
         expected_sequential_metrics: ExpectedMetrics {
-            // All 6 files are seen, then partition pruning filters 4
-            add_files_seen: 6,
+            // Columnar filter prunes all 4 non-matching files (b, c, e, null) before the
+            // visitor. The is_add guard protects Removes but not null-partition Adds.
+            add_files_seen: 2,
             active_add_files: 2,
             remove_files_seen: 0,
             non_file_actions: 4,

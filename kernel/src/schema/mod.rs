@@ -1018,6 +1018,23 @@ impl StructType {
         Self::try_new(self.fields().filter(|f| predicate(f)).cloned())
     }
 
+    /// Returns an optional [`StructType`] containing only the top-level fields for which
+    /// `predicate` returns `true`.
+    ///
+    /// This is a convenience wrapper around [`StructType::with_fields_filtered`] for callers
+    /// that treat an empty top-level struct as "no schema".
+    pub fn with_fields_filtered_nonempty(
+        &self,
+        predicate: impl Fn(&StructField) -> bool,
+    ) -> DeltaResult<Option<Self>> {
+        let filtered = self.with_fields_filtered(predicate)?;
+        if filtered.num_fields() == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(filtered))
+        }
+    }
+
     /// Returns a StructType with the named field replaced.
     /// Returns an error if field doesn't exist.
     pub fn with_field_replaced(
@@ -1470,12 +1487,12 @@ impl PrimitiveType {
 
     /// Returns `true` if this primitive type can be widened to the `target` type.
     ///
-    /// Widening rules (based on Parquet reader behavior):
-    /// - Integer widening: byte → short → int → long
-    /// - Float widening: float → double
-    ///
-    /// Note: These widening rules assume the parquet reader supports reading narrower types
-    /// as wider types. This should be documented as a requirement in the `ParquetHandler` trait.
+    /// Widening rules:
+    /// - Integer widening: byte -> short -> int -> long (Delta protocol type widening)
+    /// - Float widening: float -> double (Delta protocol type widening)
+    /// - Timestamp interchangeability: Timestamp <-> TimestampNtz (both are i64 microseconds
+    ///   since epoch, differing only in timezone semantics; this is a physical read
+    ///   accommodation, not a Delta protocol type widening rule)
     pub(crate) fn can_widen_to(&self, target: &Self) -> bool {
         use PrimitiveType::*;
         matches!(
@@ -1492,6 +1509,38 @@ impl PrimitiveType {
                 | (Timestamp, TimestampNtz)
                 | (TimestampNtz, Timestamp)
         )
+    }
+
+    /// Returns `true` if `self` is a physical integer type that some checkpoint writers
+    /// produce when they omit Parquet logical type annotations for date or timestamp columns.
+    ///
+    /// Specifically:
+    /// - Integer -> Date (int32 stored without DATE annotation)
+    /// - Long -> Timestamp/TimestampNtz (int64 stored without TIMESTAMP annotation)
+    ///
+    /// These are **not** Delta protocol type widening rules and must not be used outside of
+    /// checkpoint compatibility checks.
+    ///
+    /// NOTE: The Arrow-level equivalent lives in `check_cast_compat` in
+    /// `engine/ensure_data_types.rs`. Changes here must be mirrored there.
+    pub(crate) fn is_checkpoint_cast_compatible(&self, target: &Self) -> bool {
+        matches!(
+            (self, target),
+            (Self::Integer, Self::Date) | (Self::Long, Self::Timestamp | Self::TimestampNtz)
+        )
+    }
+
+    /// Returns `true` if this primitive type is compatible with `target` for reading
+    /// `stats_parsed` columns from checkpoint parquet files.
+    ///
+    /// This is a superset of [`can_widen_to`]: it includes all Delta protocol type widening
+    /// rules plus physical Parquet encoding accommodations for checkpoint interop (see
+    /// [`is_checkpoint_cast_compatible`]).
+    ///
+    /// [`can_widen_to`]: PrimitiveType::can_widen_to
+    /// [`is_checkpoint_cast_compatible`]: PrimitiveType::is_checkpoint_cast_compatible
+    pub(crate) fn is_stats_type_compatible_with(&self, target: &Self) -> bool {
+        self == target || self.can_widen_to(target) || self.is_checkpoint_cast_compatible(target)
     }
 }
 

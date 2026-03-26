@@ -16,6 +16,7 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
+use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
@@ -599,103 +600,93 @@ impl LogSegment {
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
     ///
     /// This function analyzes the checkpoint to determine:
-    /// 1. The schema containing file actions (for future stats_parsed detection)
+    /// 1. The file actions schema (for stats_parsed / partitionValues_parsed detection)
     /// 2. Sidecar file references if this is a V2 checkpoint
     ///
     /// The logic is:
-    /// - JSON checkpoint: Always V2, extract sidecars and read first sidecar's schema
-    /// - Parquet checkpoint: Check hint/footer for sidecar column
-    ///   - No sidecar column: V1, use footer schema
-    ///   - Has sidecar column: V2, extract sidecars and read first sidecar's schema
-    ///
-    /// Note: `self.checkpoint_schema` from `_last_checkpoint` hint is the main checkpoint
-    /// parquet schema. For V1 this is what we want. For V2 we need the sidecar schema.
+    /// - No checkpoint parts: return (None, [])
+    /// - Multi-part (always V1, no sidecars): return checkpoint schema directly
+    /// - UUID-named JSON (always V2): extract sidecars, read first sidecar's schema
+    /// - Classic-named or UUID-named parquet (V1 or V2): read checkpoint schema from
+    ///   hint or footer, then check for sidecar column to distinguish
+    ///   - Has sidecar column (V2): extract sidecars, read first sidecar's schema
+    ///   - No sidecar column (V1): use checkpoint schema directly
     fn get_file_actions_schema_and_sidecars(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
-        // Only process single-part checkpoints (multi-part are always V1, no sidecars)
-        let checkpoint = match self.listed.checkpoint_parts.first() {
-            Some(cp) if self.listed.checkpoint_parts.len() == 1 => cp,
-            _ => return Ok((None, vec![])),
-        };
-
-        // Cached hint schema for determining V1 vs V2 without footer read.
-        // hint_schema is Option<&SchemaRef> where SchemaRef = Arc<StructType>.
+        // Hint schema from `_last_checkpoint` avoids footer reads when available.
         let hint_schema = self.checkpoint_schema.as_ref();
 
-        match checkpoint.extension.as_str() {
-            "json" => {
-                // JSON checkpoint is always V2, extract sidecars
-                let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
+        // All parts of a multi-part checkpoint belong to the same table version and follow
+        // the same V1 spec, so reading any one part's schema is sufficient.
+        let Some(checkpoint) = self.listed.checkpoint_parts.first() else {
+            return Ok((None, vec![]));
+        };
 
-                // For V2, read first sidecar's schema (contains file actions)
-                let file_actions_schema = match sidecar_files.first() {
-                    Some(first) => {
-                        Some(engine.parquet_handler().read_parquet_footer(first)?.schema)
-                    }
-                    None => None,
-                };
-                Ok((file_actions_schema, sidecar_files))
+        match &checkpoint.file_type {
+            MultiPartCheckpoint { .. } => {
+                // Multi-part checkpoints are always V1 and never have sidecars.
+                let schema = Self::read_checkpoint_schema(engine, checkpoint, hint_schema)?;
+                Ok((Some(schema), vec![]))
             }
-            "parquet" => {
-                // Check hint first to avoid unnecessary footer reads
-                let has_sidecars_in_hint = hint_schema.map(|s| s.field(SIDECAR_NAME).is_some());
-
-                match has_sidecars_in_hint {
-                    Some(false) => {
-                        // Hint says V1 checkpoint (no sidecars)
-                        // Use hint schema as the file actions schema
-                        Ok((hint_schema.cloned(), vec![]))
-                    }
-                    Some(true) => {
-                        // Hint says V2 checkpoint, extract sidecars
-                        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
-                        // For V2, read first sidecar's schema if sidecars exist.
-                        // If no sidecars, V2 checkpoint may still have add actions in main file
-                        // (like V1), so fall back to hint schema for stats_parsed check.
-                        let file_actions_schema = match sidecar_files.first() {
-                            Some(first) => {
-                                Some(engine.parquet_handler().read_parquet_footer(first)?.schema)
-                            }
-                            None => hint_schema.cloned(),
-                        };
-                        Ok((file_actions_schema, sidecar_files))
-                    }
-                    None => {
-                        // No hint, need to read parquet footer
-                        let footer = engine
-                            .parquet_handler()
-                            .read_parquet_footer(&checkpoint.location)?;
-
-                        if footer.schema.field(SIDECAR_NAME).is_some() {
-                            // V2 parquet checkpoint
-                            let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
-                            // For V2, read first sidecar's schema if sidecars exist.
-                            // If no sidecars, V2 checkpoint may still have add actions in main file
-                            // (like V1), so fall back to footer schema for stats_parsed check.
-                            let file_actions_schema = match sidecar_files.first() {
-                                Some(first) => Some(
-                                    engine.parquet_handler().read_parquet_footer(first)?.schema,
-                                ),
-                                None => Some(footer.schema),
-                            };
-                            Ok((file_actions_schema, sidecar_files))
-                        } else {
-                            // V1 parquet checkpoint
-                            Ok((Some(footer.schema), vec![]))
-                        }
-                    }
+            UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
+                // JSON checkpoint is always V2. No checkpoint schema is available since JSON
+                // checkpoints don't have a parquet footer to read.
+                self.read_sidecar_schema_and_files(engine, checkpoint, None)
+            }
+            SinglePartCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
+                // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
+                // Check for sidecar column to distinguish.
+                let checkpoint_schema =
+                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema)?;
+                if checkpoint_schema.field(SIDECAR_NAME).is_some() {
+                    self.read_sidecar_schema_and_files(engine, checkpoint, Some(&checkpoint_schema))
+                } else {
+                    Ok((Some(checkpoint_schema), vec![]))
                 }
             }
             _ => Ok((None, vec![])),
         }
     }
 
+    /// Returns the checkpoint's parquet schema, using the hint from `_last_checkpoint` if
+    /// available or reading the parquet footer otherwise.
+    fn read_checkpoint_schema(
+        engine: &dyn Engine,
+        checkpoint: &ParsedLogPath<FileMeta>,
+        hint_schema: Option<&SchemaRef>,
+    ) -> DeltaResult<SchemaRef> {
+        match hint_schema {
+            Some(schema) => Ok(schema.clone()),
+            None => Ok(engine
+                .parquet_handler()
+                .read_parquet_footer(&checkpoint.location)?
+                .schema),
+        }
+    }
+
+    /// Extracts sidecar file references and reads the file actions schema from the first
+    /// sidecar's parquet footer. If no sidecars exist, falls back to `checkpoint_schema`
+    /// since V2 checkpoints may store add actions directly in the main file.
+    fn read_sidecar_schema_and_files(
+        &self,
+        engine: &dyn Engine,
+        checkpoint: &ParsedLogPath<FileMeta>,
+        checkpoint_schema: Option<&SchemaRef>,
+    ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
+        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
+        let file_actions_schema = match sidecar_files.first() {
+            Some(first) => Some(engine.parquet_handler().read_parquet_footer(first)?.schema),
+            None => checkpoint_schema.cloned(),
+        };
+        Ok((file_actions_schema, sidecar_files))
+    }
+
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
     ///
-    /// For single-part checkpoints that need file actions, this function:
-    /// 1. Determines the files actions schema (for future stats_parsed detection)
+    /// For checkpoints that need file actions, this function:
+    /// 1. Determines the file actions schema (for stats_parsed / partitionValues_parsed detection)
     /// 2. Extracts sidecar file references if present (V2 checkpoints)
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
     ///
@@ -712,10 +703,6 @@ impl LogSegment {
     > {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
-        // Extract file actions schema and sidecar files
-        // Only process sidecars when:
-        // 1. We need file actions (add/remove) - sidecars only contain file actions
-        // 2. Single-part checkpoint - multi-part checkpoints are always V1 (no sidecars)
         let (file_actions_schema, sidecar_files) = if need_file_actions {
             self.get_file_actions_schema_and_sidecars(engine)?
         } else {
@@ -1125,10 +1112,12 @@ impl LogSegment {
         true
     }
 
-    /// Recursively checks if two struct types have compatible field types for stats parsing.
+    /// Recursively checks if two struct types have compatible field types.
     ///
-    /// For each field in `needed` (stats schema), if it exists in `available` (checkpoint):
-    /// - Primitive types: must be compatible via `can_read_as` (allows type widening)
+    /// Used by both `stats_parsed` and `partitionValues_parsed` compatibility checks.
+    /// For each field in `needed`, if it exists in `available` (checkpoint):
+    /// - Primitive types: must be compatible via [`PrimitiveType::is_stats_type_compatible_with`]
+    ///   (allows type widening and Parquet physical type reinterpretation)
     /// - Nested structs: recursively check inner fields
     /// - Missing fields in checkpoint: OK (will return null when accessed)
     /// - Extra fields in checkpoint: OK (ignored)
@@ -1155,9 +1144,16 @@ impl LogSegment {
                         return false;
                     }
                 }
-                // Non-struct types: use can_read_as for type compatibility
+                // Non-struct types: use stats-specific rules for primitives and standard
+                // schema rules otherwise.
                 (avail_type, need_type) => {
-                    if avail_type.can_read_as(need_type).is_err() {
+                    let compatible = match (avail_type, need_type) {
+                        (DataType::Primitive(a), DataType::Primitive(b)) => {
+                            a.is_stats_type_compatible_with(b)
+                        }
+                        (a, b) => a.can_read_as(b).is_ok(),
+                    };
+                    if !compatible {
                         debug!(
                             "stats_parsed not compatible: incompatible type for '{}' in {}: \
                              checkpoint has {:?}, stats schema needs {:?}",

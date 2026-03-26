@@ -130,6 +130,23 @@ impl StateInfo {
             logical_stats_schema,
         })
     }
+
+    /// Returns a conservative initial capacity for the dedup `HashSet` in
+    /// [`ScanLogReplayProcessor`].
+    ///
+    /// The exact file count is not available at this point, so the hint is
+    /// derived from whether stats are enabled: stats are only computed for
+    /// non-trivial tables, so their presence is a reasonable proxy for table
+    /// size. Using 4096 vs 512 as the two tiers eliminates the first 12-14
+    /// hashbrown doubling events for medium/large tables while staying cheap
+    /// for small ones.
+    pub(crate) fn dedup_capacity_hint(&self) -> usize {
+        if self.physical_stats_schema.is_some() {
+            4096
+        } else {
+            512
+        }
+    }
 }
 
 #[cfg(test)]
