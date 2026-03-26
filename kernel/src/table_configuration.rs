@@ -26,7 +26,7 @@ use crate::table_features::{
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
     FeatureType, KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES,
     LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -548,6 +548,13 @@ impl TableConfiguration {
 
     /// Internal helper for read operations (Scan, Cdf)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
+        require!(
+            self.protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {}",
+                self.protocol.min_reader_version()
+            ))
+        );
         // Version check: kernel supports reader versions 1..=MAX_VALID_READER_VERSION
         if self.protocol.min_reader_version() > MAX_VALID_READER_VERSION {
             return Err(Error::unsupported(format!(
@@ -566,6 +573,14 @@ impl TableConfiguration {
 
     /// Internal helper for write operations
     fn ensure_write_supported(&self) -> DeltaResult<()> {
+        // Version check: kernel supports writer versions MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
+        require!(
+            self.protocol.min_writer_version() >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {}",
+                self.protocol.min_writer_version()
+            ))
+        );
         // Version check: kernel supports writer versions 1..=MAX_VALID_WRITER_VERSION
         if self.protocol.min_writer_version() > MAX_VALID_WRITER_VERSION {
             return Err(Error::unsupported(format!(
@@ -709,7 +724,7 @@ impl TableConfiguration {
 
                 reader_supported && writer_supported
             }
-            FeatureType::Unknown => false,
+            FeatureType::Unknown => Self::has_feature(self.protocol.writer_features(), feature),
         }
     }
 
@@ -886,6 +901,31 @@ mod test {
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_feature_supported(&TableFeature::DeletionVectors));
         assert!(table_config.is_feature_enabled(&TableFeature::DeletionVectors));
+    }
+
+    #[rstest]
+    #[case(-1, 2, Operation::Scan)]
+    #[case(1, -1, Operation::Write)]
+    fn reject_protocol_version_below_minimum(
+        #[case] rv: i32,
+        #[case] wv: i32,
+        #[case] op: Operation,
+    ) {
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol =
+            Protocol::new_unchecked(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST);
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let expected = if rv < 1 {
+            format!("Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}")
+        } else {
+            format!("Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}")
+        };
+        assert_result_error_with_message(table_config.ensure_operation_supported(op), &expected);
     }
 
     #[test]
@@ -1296,16 +1336,89 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_is_feature_supported_returns_false_for_unknown_feature() {
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
-        assert!(!config.is_feature_supported(&TableFeature::unknown("futureFeature")));
+    #[derive(Debug, Clone, Copy)]
+    enum UnknownFeatureShape {
+        NotListed,
+        WriterOnly,
+        ReaderWriter,
     }
 
-    #[test]
-    fn test_is_feature_enabled_returns_false_for_unknown_feature() {
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
-        assert!(!config.is_feature_enabled(&TableFeature::unknown("futureFeature")));
+    fn create_unknown_feature_config(
+        shape: UnknownFeatureShape,
+    ) -> (TableFeature, TableConfiguration) {
+        const UNKNOWN: &str = "futureFeature";
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                "value",
+                DataType::INTEGER,
+            )])),
+            vec![],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let reader_features = match shape {
+            UnknownFeatureShape::ReaderWriter => vec![UNKNOWN],
+            _ => vec![],
+        };
+        let writer_features = match shape {
+            UnknownFeatureShape::NotListed => vec![],
+            _ => vec![UNKNOWN],
+        };
+        let protocol = Protocol::try_new_modern(reader_features, writer_features).unwrap();
+
+        let tc = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        (TableFeature::unknown(UNKNOWN), tc)
+    }
+
+    #[rstest]
+    #[case::not_listed(UnknownFeatureShape::NotListed, false)]
+    #[case::writer_only(UnknownFeatureShape::WriterOnly, true)]
+    #[case::reader_writer(UnknownFeatureShape::ReaderWriter, true)]
+    fn test_unknown_feature_protocol_support(
+        #[case] shape: UnknownFeatureShape,
+        #[case] expected_supported: bool,
+    ) {
+        let (unknown, config) = create_unknown_feature_config(shape);
+        assert_eq!(config.is_feature_supported(&unknown), expected_supported);
+    }
+
+    #[rstest]
+    #[case::not_listed(UnknownFeatureShape::NotListed, false)]
+    #[case::writer_only(UnknownFeatureShape::WriterOnly, true)]
+    #[case::reader_writer(UnknownFeatureShape::ReaderWriter, true)]
+    fn test_unknown_feature_protocol_enablement(
+        #[case] shape: UnknownFeatureShape,
+        #[case] expected_enabled: bool,
+    ) {
+        let (unknown, config) = create_unknown_feature_config(shape);
+        assert_eq!(config.is_feature_enabled(&unknown), expected_enabled);
+    }
+
+    #[rstest]
+    fn test_unknown_feature_capabilities(
+        #[values(
+            UnknownFeatureShape::NotListed,
+            UnknownFeatureShape::WriterOnly,
+            UnknownFeatureShape::ReaderWriter
+        )]
+        shape: UnknownFeatureShape,
+        #[values(Operation::Scan, Operation::Cdf, Operation::Write)] operation: Operation,
+    ) {
+        let (_, config) = create_unknown_feature_config(shape);
+        let expected_ok = match shape {
+            UnknownFeatureShape::NotListed => true,
+            UnknownFeatureShape::WriterOnly => operation != Operation::Write,
+            UnknownFeatureShape::ReaderWriter => false,
+        };
+        assert_eq!(
+            config.ensure_operation_supported(operation).is_ok(),
+            expected_ok
+        );
     }
 
     #[test]

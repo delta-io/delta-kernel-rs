@@ -1194,6 +1194,9 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     )
     .await?;
 
+    let cp1_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_1}")).await;
+    let cp2_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_2}")).await;
+
     let checkpoint_one_file = log_root.join(checkpoint_part_1)?.to_string();
     let checkpoint_two_file = log_root.join(checkpoint_part_2)?.to_string();
 
@@ -1202,8 +1205,8 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![
-                create_log_path(&checkpoint_one_file),
-                create_log_path(&checkpoint_two_file),
+                create_log_path_with_size(&checkpoint_one_file, cp1_size),
+                create_log_path_with_size(&checkpoint_two_file, cp2_size),
             ],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
@@ -2664,6 +2667,91 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
         "Should use hint schema directly"
     );
     assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
+
+    Ok(())
+}
+
+// Multi-part V1 checkpoint returns file_actions_schema with stats_parsed from hint or footer.
+#[rstest]
+#[case::with_hint(true)]
+#[case::without_hint(false)]
+#[tokio::test]
+async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+    let checkpoint_part_1 = "00000000000000000001.checkpoint.0000000001.0000000002.parquet";
+    let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
+
+    // Build a V1 checkpoint schema with stats_parsed containing an integer column.
+    let stats_parsed = StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(
+            "minValues",
+            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
+        ),
+        StructField::nullable(
+            "maxValues",
+            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
+        ),
+    ]);
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", stats_parsed),
+    ]);
+    let remove_schema =
+        StructType::new_unchecked([StructField::nullable("path", DataType::STRING)]);
+    let v1_schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable(ADD_NAME, add_schema),
+        StructField::nullable(REMOVE_NAME, remove_schema),
+    ]));
+
+    add_checkpoint_to_store(
+        &store,
+        add_batch_simple(v1_schema.clone()),
+        checkpoint_part_1,
+    )
+    .await?;
+    add_checkpoint_to_store(
+        &store,
+        add_batch_simple(v1_schema.clone()),
+        checkpoint_part_2,
+    )
+    .await?;
+
+    let cp1_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_1}")).await;
+    let cp2_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_2}")).await;
+
+    let cp1_file = log_root.join(checkpoint_part_1)?.to_string();
+    let cp2_file = log_root.join(checkpoint_part_2)?.to_string();
+
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![
+                create_log_path_with_size(&cp1_file, cp1_size),
+                create_log_path_with_size(&cp2_file, cp2_size),
+            ],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000002.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        use_hint.then(|| v1_schema.clone() as SchemaRef),
+    )?;
+
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    let schema = schema.expect("Multi-part V1 should return file actions schema");
+
+    // Verify stats_parsed is detectable in the returned schema.
+    let add_field = schema.field(ADD_NAME).expect("should have add field");
+    let DataType::Struct(add_struct) = add_field.data_type() else {
+        panic!("add field should be a struct type");
+    };
+    assert!(
+        add_struct.field("stats_parsed").is_some(),
+        "Returned schema should include stats_parsed for data skipping"
+    );
+    assert!(sidecars.is_empty(), "Multi-part V1 should have no sidecars");
 
     Ok(())
 }
