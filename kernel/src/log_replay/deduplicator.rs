@@ -2,33 +2,67 @@
 //!
 //! The [`Deduplicator`] trait supports two deduplication strategies:
 //!
-//! - **JSON commit files** (`is_log_batch = true`): Tracks (path, dv_unique_id) and updates
-//!   the seen set as files are encountered. Implementation: [`FileActionDeduplicator`]
+//! - **JSON commit files** (`is_log_batch = true`): Tracks (path, dv) and updates the seen set
+//!   as files are encountered. Implementation: [`FileActionDeduplicator`]
 //!
-//! - **Checkpoint files** (`is_log_batch = false`): Uses (path, dv_unique_id) to filter actions
-//!   against a read-only seen set pre-populated from the commit log phase.
+//! - **Checkpoint files** (`is_log_batch = false`): Uses (path, dv) to filter actions against a
+//!   read-only seen set pre-populated from the commit log phase.
 //!   Implementation: [`CheckpointDeduplicator`]
 //!
 //! [`FileActionDeduplicator`]: crate::log_replay::FileActionDeduplicator
 
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::engine_data::{GetData, TypedGetData};
 use std::collections::hash_map::RandomState;
+use std::hash::Hash;
 
-use crate::log_replay::{FileActionKey, FileActionKeyRef};
+use crate::engine_data::{GetData, TypedGetData};
+use crate::log_replay::FileActionKey;
 use crate::DeltaResult;
 
-/// A file action extracted from a batch row, carrying a borrowed path and an optional owned
-/// deletion vector unique ID. Keeping the path borrowed avoids a heap allocation for files
-/// that turn out to be duplicates and never need to be inserted into the seen set.
+/// Borrowed view of a deletion vector, used as part of [`ExtractedFileAction`] for zero-copy
+/// dedup lookups. All fields are borrowed from column data; no heap allocation is needed.
+#[derive(Debug, Hash)]
+pub(crate) struct DvKeyRef<'a> {
+    pub(crate) storage_type: &'a str,
+    pub(crate) path_or_inline_dv: &'a str,
+    pub(crate) offset: Option<i32>,
+}
+
+/// A file action extracted from a batch row. All fields are borrowed from column data —
+/// no heap allocations are needed until the action is confirmed new and inserted into the seen
+/// set.
 pub(crate) struct ExtractedFileAction<'a> {
     /// Borrowed path from the action batch column data.
     pub(crate) path: &'a str,
-    /// Deletion vector unique ID, if present. Owned because it is built from a `format!`
-    /// of three separate DV fields; there is no single column to borrow from.
-    pub(crate) dv_unique_id: Option<String>,
+    /// Borrowed deletion vector fields, if present.
+    pub(crate) dv: Option<DvKeyRef<'a>>,
     /// `true` for add actions, `false` for remove actions.
     pub(crate) is_add: bool,
+}
+
+/// Hashes only the dedup-key fields (path and dv), ignoring `is_add`.
+///
+/// Must be consistent with [`FileActionKey`]'s derived `Hash` so that equivalent keys
+/// produce the same hash in [`hashbrown::HashSet`] lookups.
+impl Hash for ExtractedFileAction<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.path.hash(state);
+        self.dv.hash(state);
+    }
+}
+
+impl hashbrown::Equivalent<FileActionKey> for ExtractedFileAction<'_> {
+    fn equivalent(&self, key: &FileActionKey) -> bool {
+        self.path == key.path
+            && match (&self.dv, &key.dv) {
+                (None, None) => true,
+                (Some(r), Some(o)) => {
+                    r.storage_type == o.storage_type
+                        && r.path_or_inline_dv == o.path_or_inline_dv
+                        && r.offset == o.offset
+                }
+                _ => false,
+            }
+    }
 }
 
 pub(crate) trait Deduplicator {
@@ -59,32 +93,33 @@ pub(crate) trait Deduplicator {
     /// (read-only).
     fn is_log_batch(&self) -> bool;
 
-    /// Extracts the deletion vector unique ID if it exists.
+    /// Extracts the deletion vector fields as a borrowed [`DvKeyRef`] if a DV is present.
     ///
-    /// This function retrieves the necessary fields for constructing a deletion vector unique ID
-    /// by accessing `getters` at `dv_start_index` and the following two indices. Specifically:
-    /// - `dv_start_index` retrieves the storage type (`deletionVector.storageType`).
-    /// - `dv_start_index + 1` retrieves the path or inline deletion vector (`deletionVector.pathOrInlineDv`).
-    /// - `dv_start_index + 2` retrieves the optional offset (`deletionVector.offset`).
-    fn extract_dv_unique_id<'a>(
+    /// Reads three consecutive getter columns starting at `dv_start_index`:
+    /// - `dv_start_index` — `deletionVector.storageType`
+    /// - `dv_start_index + 1` — `deletionVector.pathOrInlineDv`
+    /// - `dv_start_index + 2` — `deletionVector.offset` (optional)
+    ///
+    /// All returned fields borrow from `getters`, so no heap allocation occurs.
+    fn extract_dv_key<'a>(
         &self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
         dv_start_index: usize,
-    ) -> DeltaResult<Option<String>> {
+    ) -> DeltaResult<Option<DvKeyRef<'a>>> {
         let Some(storage_type) =
             getters[dv_start_index].get_opt(i, "deletionVector.storageType")?
         else {
             return Ok(None);
         };
-        let path_or_inline = getters[dv_start_index + 1].get(i, "deletionVector.pathOrInlineDv")?;
+        let path_or_inline_dv =
+            getters[dv_start_index + 1].get(i, "deletionVector.pathOrInlineDv")?;
         let offset = getters[dv_start_index + 2].get_opt(i, "deletionVector.offset")?;
-
-        Ok(Some(DeletionVectorDescriptor::unique_id_from_parts(
+        Ok(Some(DvKeyRef {
             storage_type,
-            path_or_inline,
+            path_or_inline_dv,
             offset,
-        )))
+        }))
     }
 }
 
@@ -128,20 +163,17 @@ impl Deduplicator for CheckpointDeduplicator<'_> {
         let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? else {
             return Ok(None);
         };
-        let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
+        let dv = self.extract_dv_key(i, getters, self.add_dv_start_index)?;
         Ok(Some(ExtractedFileAction {
             path,
-            dv_unique_id,
+            dv,
             is_add: true,
         }))
     }
 
     /// Read-only check against seen set. Returns `true` if file should be filtered out.
     fn check_and_record_seen(&mut self, action: ExtractedFileAction<'_>) -> bool {
-        self.seen_file_keys.contains(&FileActionKeyRef::new(
-            action.path,
-            action.dv_unique_id.as_deref(),
-        ))
+        self.seen_file_keys.contains(&action)
     }
 
     /// Always `false` - checkpoint batches never update the seen set.
