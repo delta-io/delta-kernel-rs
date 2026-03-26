@@ -1190,8 +1190,14 @@ mod tests {
 
         // Add file keys with and without DV info
         let key1 = crate::log_replay::FileActionKey::new("file1.parquet", None);
-        let key2 = crate::log_replay::FileActionKey::new("file2.parquet", Some("dv-1".to_string()));
-        let key3 = crate::log_replay::FileActionKey::new("file3.parquet", Some("dv-2".to_string()));
+        let key2 = crate::log_replay::FileActionKey::new(
+            "file2.parquet",
+            Some(crate::log_replay::DvKey::new("u", "dv-1", None)),
+        );
+        let key3 = crate::log_replay::FileActionKey::new(
+            "file3.parquet",
+            Some(crate::log_replay::DvKey::new("u", "dv-2", None)),
+        );
         processor.seen_file_keys.insert(key1.clone());
         processor.seen_file_keys.insert(key2.clone());
         processor.seen_file_keys.insert(key3.clone());
