@@ -1,0 +1,61 @@
+name: semver-label
+
+# Apply or remove the breaking-change label based on the outcome of the semver-checks workflow.
+# This must be a separate workflow from semver-checks.yml: label writes require pull-requests:write,
+# which is unavailable in pull_request workflows triggered by fork PRs. workflow_run always runs
+# in the base-repo context with full write permissions, and never executes PR code.
+on:
+  workflow_run:
+    workflows: ["semver-checks"]
+    types: [completed]
+
+jobs:
+  update_label_if_needed:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    # Label updates only apply to PRs; merge_group runs have no associated PR to label.
+    if: github.event.workflow_run.event == 'pull_request'
+    steps:
+      # Resolve PR number from the triggering workflow run's branch. For fork PRs the branch
+      # must be prefixed with `<owner>:` so gh pr view can locate it.
+      # Pattern from: https://github.com/orgs/community/discussions/25220#discussioncomment-11316244
+      - name: Find PR number
+        id: pr-context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_TARGET_REPO: ${{ github.repository }}
+          PR_BRANCH: |-
+            ${{
+              (github.event.workflow_run.head_repository.owner.login != github.event.workflow_run.repository.owner.login)
+                && format('{0}:{1}', github.event.workflow_run.head_repository.owner.login, github.event.workflow_run.head_branch)
+                || github.event.workflow_run.head_branch
+            }}
+        run: |
+          gh pr view --repo "${PR_TARGET_REPO}" "${PR_BRANCH}" \
+            --json 'number' --jq '"number=\(.number)"' \
+            >> "${GITHUB_OUTPUT}"
+
+      - name: Update breaking-change label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.number }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          # The semver check step uses continue-on-error so the job stays green for breaking
+          # changes. The workflow-level conclusion is therefore always "success" and cannot
+          # distinguish a breaking change from a clean run. Instead, query the step-level
+          # conclusion directly: the Jobs API preserves the original step outcome ("failure")
+          # even when continue-on-error prevented it from failing the job.
+          STEP_CONCLUSION=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(.name == "check_if_pr_breaks_semver") | .steps[] | select(.name == "Run semver check") | .conclusion')
+
+          if [[ "$STEP_CONCLUSION" == "failure" ]]; then
+            gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "breaking-change"
+          elif [[ "$STEP_CONCLUSION" == "success" ]]; then
+            # Remove the label only if it is currently present; gh pr edit fails on absent labels.
+            CURRENT_LABELS=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name]')
+            if echo "$CURRENT_LABELS" | jq -e '.[] | select(. == "breaking-change")' > /dev/null 2>&1; then
+              gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label "breaking-change"
+            fi
+          fi
