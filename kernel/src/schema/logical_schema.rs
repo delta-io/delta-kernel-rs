@@ -181,10 +181,7 @@ impl LogicalSchema {
     /// mapping is active, each path component is replaced with its physical name annotation.
     /// Returns an error if any path component is not found in the schema or lacks the required
     /// annotation.
-    pub(crate) fn get_physical_column_name(
-        &self,
-        col: &ColumnName,
-    ) -> DeltaResult<ColumnName> {
+    pub(crate) fn get_physical_column_name(&self, col: &ColumnName) -> DeltaResult<ColumnName> {
         get_any_level_column_physical_name(&self.schema, col, self.column_mapping_mode)
     }
 
