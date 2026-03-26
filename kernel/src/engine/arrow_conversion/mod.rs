@@ -431,6 +431,9 @@ mod tests {
         // Arrow conversion still works — produces Null type
         let arrow_field = ArrowField::try_from_kernel(&field)?;
         assert_eq!(arrow_field.data_type(), &ArrowDataType::Null);
+
+        // Void is always-null by definition, so nullable=false is semantically
+        // contradictory. We tolerate it on reads to avoid breaking existing tables.
         assert!(!arrow_field.is_nullable());
 
         Ok(())
