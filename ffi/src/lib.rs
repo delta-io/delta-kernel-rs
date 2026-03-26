@@ -1080,6 +1080,38 @@ pub unsafe extern "C" fn get_partition_columns(
     iter.into()
 }
 
+/// Visit each metadata configuration (key/value pair) for the specified snapshot by invoking the provided
+/// `visitor` callback once per entry.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle, a valid `engine_context` as an
+/// opaque pointer passed to each `visitor` invocation, and a valid `visitor` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_metadata_configuration(
+    snapshot: Handle<SharedSnapshot>,
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+    ),
+) {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .table_configuration()
+        .metadata()
+        .configuration()
+        .iter()
+        .for_each(|(key, value)| {
+            visitor(
+                engine_context,
+                kernel_string_slice!(key),
+                kernel_string_slice!(value),
+            );
+        });
+}
+
 type StringIter = dyn Iterator<Item = String> + Send;
 
 #[handle_descriptor(target=StringIter, mutable=true, sized=false)]
@@ -1185,12 +1217,15 @@ mod tests {
     };
     use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel::engine::default::DefaultEngineBuilder;
-    use object_store::memory::InMemory;
-    use object_store::path::Path;
-    use object_store::ObjectStore;
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::ObjectStore;
+    use rstest::rstest;
     use serde_json::Value;
+    use std::collections::HashMap;
     use test_utils::{
-        actions_to_string, actions_to_string_partitioned, add_commit, TestAction, METADATA,
+        actions_to_string, actions_to_string_partitioned, actions_to_string_with_metadata,
+        add_commit, TestAction, METADATA, METADATA_WITH_TABLE_PROPERTIES,
     };
 
     #[no_mangle]
@@ -1230,7 +1265,9 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
         add_commit(
+            table_root,
             storage.as_ref(),
             0,
             actions_to_string(vec![TestAction::Metadata]),
@@ -1238,18 +1275,21 @@ mod tests {
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let path = "memory:///";
 
         // Test getting latest snapshot
-        let snapshot1 =
-            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+        let snapshot1 = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
         let version1 = unsafe { version(snapshot1.shallow_copy()) };
         assert_eq!(version1, 0);
 
         // Test getting snapshot at version
         let snapshot2 = unsafe {
             ok_or_panic(snapshot_at_version(
-                kernel_string_slice!(path),
+                kernel_string_slice!(table_root),
                 engine.shallow_copy(),
                 0,
             ))
@@ -1258,17 +1298,76 @@ mod tests {
         assert_eq!(version2, 0);
 
         // Test getting non-existent snapshot
-        let snapshot_at_non_existent_version =
-            unsafe { snapshot_at_version(kernel_string_slice!(path), engine.shallow_copy(), 1) };
+        let snapshot_at_non_existent_version = unsafe {
+            snapshot_at_version(kernel_string_slice!(table_root), engine.shallow_copy(), 1)
+        };
         assert_extern_result_error_with_message(snapshot_at_non_existent_version, KernelError::GenericError, "Generic delta kernel error: LogSegment end version 0 not the same as the specified end version 1");
 
-        let table_root = unsafe { snapshot_table_root(snapshot1.shallow_copy(), allocate_str) };
-        assert!(table_root.is_some());
-        let s = recover_string(table_root.unwrap());
-        assert_eq!(&s, path);
+        let snapshot_table_root_str =
+            unsafe { snapshot_table_root(snapshot1.shallow_copy(), allocate_str) };
+        assert!(snapshot_table_root_str.is_some());
+        let s = recover_string(snapshot_table_root_str.unwrap());
+        assert_eq!(&s, table_root);
 
         unsafe { free_snapshot(snapshot1) }
         unsafe { free_snapshot(snapshot2) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case(
+        METADATA_WITH_TABLE_PROPERTIES,
+        HashMap::from([
+            (String::from("delta.appendOnly"), String::from("true")),
+            (String::from("custom.key"), String::from("custom_value")),
+        ])
+    )]
+    #[case(METADATA, HashMap::new())]
+    #[tokio::test]
+    async fn test_visit_metadata_configuration(
+        #[case] metadata: &str,
+        #[case] expected: HashMap<String, String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string_with_metadata(vec![TestAction::Metadata], metadata),
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        extern "C" fn collect_property(
+            engine_context: NullableCvoid,
+            key: KernelStringSlice,
+            value: KernelStringSlice,
+        ) {
+            let map =
+                unsafe { &mut *(engine_context.unwrap().as_ptr() as *mut HashMap<String, String>) };
+            let k = unsafe { String::try_from_slice(&key) }.unwrap();
+            let v = unsafe { String::try_from_slice(&value) }.unwrap();
+            map.insert(k, v);
+        }
+
+        let mut collected: HashMap<String, String> = HashMap::new();
+        let ctx = NonNull::new(&mut collected as *mut _ as *mut c_void);
+        unsafe { visit_metadata_configuration(snap.shallow_copy(), ctx, collect_property) };
+
+        assert_eq!(collected, expected);
+
+        unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
         Ok(())
     }
@@ -1277,6 +1376,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_snapshot_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
 
         // Create a minimal table history: initial metadata+protocol (no commitInfo), then some
         // add/remove commits.
@@ -1285,8 +1385,9 @@ mod tests {
             .skip(1) // skip commitInfo
             .collect::<Vec<_>>()
             .join("\n");
-        add_commit(storage.as_ref(), 0, protocol_and_metadata).await?;
+        add_commit(table_root, storage.as_ref(), 0, protocol_and_metadata).await?;
         add_commit(
+            table_root,
             storage.as_ref(),
             1,
             actions_to_string(vec![
@@ -1296,6 +1397,7 @@ mod tests {
         )
         .await?;
         add_commit(
+            table_root,
             storage.as_ref(),
             2,
             actions_to_string(vec![
@@ -1313,9 +1415,12 @@ mod tests {
             .build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
-        let path = "memory:///";
-        let snapshot =
-            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+        let snapshot = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
 
         let did_checkpoint = unsafe {
             ok_or_panic(checkpoint_snapshot(
@@ -1353,12 +1458,15 @@ mod tests {
     #[cfg(feature = "default-engine-base")]
     #[test]
     fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {
-        use object_store::local::LocalFileSystem;
+        use delta_kernel::object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
         let tmp_dir = tempdir()?;
         let tmp_path = tmp_dir.path();
-        let storage = Arc::new(LocalFileSystem::new_with_prefix(tmp_path)?);
+        let table_root = tmp_path
+            .to_str()
+            .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?;
+        let storage = Arc::new(LocalFileSystem::new());
 
         // Create a minimal table history: initial metadata+protocol (no commitInfo), then some
         // add/remove commits.
@@ -1368,14 +1476,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let table_url = url::Url::from_directory_path(tmp_path).unwrap();
-
         // Use a temporary runtime for async setup, then drop it before FFI calls
         {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
-                add_commit(storage.as_ref(), 0, protocol_and_metadata).await?;
+                add_commit(&table_root, storage.as_ref(), 0, protocol_and_metadata).await?;
                 add_commit(
+                    &table_root,
                     storage.as_ref(),
                     1,
                     actions_to_string(vec![
@@ -1385,6 +1492,7 @@ mod tests {
                 )
                 .await?;
                 add_commit(
+                    &table_root,
                     storage.as_ref(),
                     2,
                     actions_to_string(vec![
@@ -1398,14 +1506,21 @@ mod tests {
         } // runtime dropped here, before FFI calls
 
         // Build engine using FFI APIs
-        let path = table_url.as_str();
-        let builder =
-            unsafe { ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err)) };
+        let builder = unsafe {
+            ok_or_panic(get_engine_builder(
+                kernel_string_slice!(table_root),
+                allocate_err,
+            ))
+        };
         unsafe { set_builder_with_multithreaded_executor(builder.as_mut().unwrap(), 2, 0) };
         let engine = unsafe { ok_or_panic(builder_build(builder)) };
 
-        let snapshot =
-            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+        let snapshot = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
 
         let did_checkpoint = unsafe {
             ok_or_panic(checkpoint_snapshot(
@@ -1423,7 +1538,10 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_partition_cols() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
+
         add_commit(
+            table_root,
             storage.as_ref(),
             0,
             actions_to_string_partitioned(vec![TestAction::Metadata]),
@@ -1431,10 +1549,13 @@ mod tests {
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let path = "memory:///";
 
-        let snapshot =
-            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+        let snapshot = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
 
         let partition_count = unsafe { get_partition_column_count(snapshot.shallow_copy()) };
         assert_eq!(partition_count, 1, "Should have one partition");
@@ -1459,7 +1580,10 @@ mod tests {
     #[tokio::test]
     async fn allocate_null_err_okay() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+
         add_commit(
+            table_root,
             storage.as_ref(),
             0,
             actions_to_string(vec![TestAction::Metadata]),
@@ -1467,11 +1591,11 @@ mod tests {
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_null_err);
-        let path = "memory:///";
 
         // Get a non-existent snapshot, this will call allocate_null_err
-        let snapshot_at_non_existent_version =
-            unsafe { snapshot_at_version(kernel_string_slice!(path), engine.shallow_copy(), 1) };
+        let snapshot_at_non_existent_version = unsafe {
+            snapshot_at_version(kernel_string_slice!(table_root), engine.shallow_copy(), 1)
+        };
         assert!(snapshot_at_non_existent_version.is_err());
 
         unsafe { free_engine(engine) }
@@ -1483,13 +1607,17 @@ mod tests {
     async fn test_snapshot_log_tail() -> Result<(), Box<dyn std::error::Error>> {
         use test_utils::add_staged_commit;
         let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
+
         add_commit(
+            table_root,
             storage.as_ref(),
             0,
             actions_to_string(vec![TestAction::Metadata]),
         )
         .await?;
         let commit1 = add_staged_commit(
+            table_root,
             storage.as_ref(),
             1,
             actions_to_string(vec![TestAction::Add("path1".into())]),
@@ -1497,11 +1625,10 @@ mod tests {
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let path = "memory:///";
 
         let commit1_path = format!(
             "{}_delta_log/_staged_commits/{}",
-            path,
+            table_root,
             commit1.filename().unwrap()
         );
         let log_path =
@@ -1513,7 +1640,7 @@ mod tests {
         };
         let snapshot = unsafe {
             ok_or_panic(snapshot_with_log_tail(
-                kernel_string_slice!(path),
+                kernel_string_slice!(table_root),
                 engine.shallow_copy(),
                 log_tail.clone(),
             ))
@@ -1524,7 +1651,7 @@ mod tests {
         // Test getting snapshot at version
         let snapshot2 = unsafe {
             ok_or_panic(snapshot_at_version_with_log_tail(
-                kernel_string_slice!(path),
+                kernel_string_slice!(table_root),
                 engine.shallow_copy(),
                 1,
                 log_tail,

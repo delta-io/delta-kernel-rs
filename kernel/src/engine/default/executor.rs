@@ -54,6 +54,7 @@ pub mod tokio {
     use super::TaskExecutor;
     use futures::TryFutureExt;
     use futures::{future::BoxFuture, Future};
+    use std::mem::ManuallyDrop;
     use std::sync::mpsc::channel;
     use tokio::runtime::{EnterGuard, Handle, RuntimeFlavor};
 
@@ -61,11 +62,30 @@ pub mod tokio {
 
     /// A [`TaskExecutor`] that uses the tokio single-threaded runtime in a
     /// background thread to service tasks.
+    ///
+    /// On drop, the background thread is joined to ensure the runtime is fully
+    /// shut down before the executor is destroyed.
     #[derive(Debug)]
     pub struct TokioBackgroundExecutor {
-        sender: tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>,
+        sender: ManuallyDrop<tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>>,
         handle: Handle,
-        _thread: std::thread::JoinHandle<()>,
+        /// `Option` because `join` takes ownership; we `take` it in `Drop` to move the
+        /// handle out. Never `None` outside of `Drop`.
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for TokioBackgroundExecutor {
+        fn drop(&mut self) {
+            // SAFETY: The inner `Sender` has not been dropped yet because this is
+            // the only drop site and `Drop::drop` runs exactly once.
+            // Drop sender first to close the channel, signaling the background
+            // thread to exit its recv loop.
+            unsafe { ManuallyDrop::drop(&mut self.sender) };
+            // Join the thread so that runtime shutdown completes before we return.
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
     }
 
     impl Default for TokioBackgroundExecutor {
@@ -93,9 +113,9 @@ pub mod tokio {
             });
             let handle = handle_receiver.recv().unwrap();
             Self {
-                sender,
+                sender: ManuallyDrop::new(sender),
                 handle,
-                _thread: thread,
+                thread: Some(thread),
             }
         }
     }

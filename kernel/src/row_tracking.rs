@@ -2,7 +2,6 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::DomainMetadata;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
@@ -46,16 +45,11 @@ impl RowTrackingDomainMetadata {
         snapshot: &Snapshot,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        Ok(
-            domain_metadata_configuration(
-                snapshot.log_segment(),
-                ROW_TRACKING_DOMAIN_NAME,
-                engine,
-            )?
-            .map(|domain_metadata| serde_json::from_str::<Self>(&domain_metadata))
+        Ok(snapshot
+            .get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
+            .map(|config| serde_json::from_str::<Self>(&config))
             .transpose()?
-            .map(|metadata| metadata.row_id_high_water_mark),
-        )
+            .map(|metadata| metadata.row_id_high_water_mark))
     }
 }
 

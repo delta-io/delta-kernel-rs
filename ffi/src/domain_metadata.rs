@@ -95,8 +95,8 @@ mod tests {
     };
     use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice, snapshot};
     use delta_kernel::engine::default::DefaultEngineBuilder;
+    use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::DeltaResult;
-    use object_store::memory::InMemory;
     use serde_json::json;
     use std::collections::HashMap;
     use std::ptr::NonNull;
@@ -109,7 +109,7 @@ mod tests {
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let path = "memory:///";
+        let table_root = "memory:///test_table/";
 
         // commit0
         // - domain1: not removed
@@ -149,7 +149,7 @@ mod tests {
             .map(|json| json.to_string())
             .join("\n");
 
-        add_commit(storage.clone().as_ref(), 0, commit)
+        add_commit(table_root, storage.clone().as_ref(), 0, commit)
             .await
             .unwrap();
 
@@ -183,10 +183,16 @@ mod tests {
         .map(|json| json.to_string())
         .join("\n");
 
-        add_commit(storage.as_ref(), 1, commit).await.unwrap();
+        add_commit(table_root, storage.as_ref(), 1, commit)
+            .await
+            .unwrap();
 
-        let snapshot =
-            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+        let snapshot = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
 
         let get_domain_metadata_helper = |domain: &str| unsafe {
             get_domain_metadata(

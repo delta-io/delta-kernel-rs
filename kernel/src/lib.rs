@@ -88,6 +88,10 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
+// Public under test-utils so integration tests can inspect CRC state via Snapshot::get_current_crc_if_loaded_for_testing.
+#[cfg(feature = "test-utils")]
+pub mod crc;
+#[cfg(not(feature = "test-utils"))]
 pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
@@ -104,7 +108,7 @@ pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
-pub(crate) mod transforms;
+pub mod transforms;
 
 pub use log_path::LogPath;
 
@@ -147,16 +151,12 @@ pub mod last_checkpoint_hint;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod last_checkpoint_hint;
 
-pub(crate) mod listed_log_files;
+pub(crate) mod log_segment_files;
 
 #[cfg(feature = "internal-api")]
 pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
-
-// Benchmarking infrastructure (only public for benchmarks and tests)
-#[cfg(any(test, feature = "internal-api"))]
-pub mod benchmarks;
 
 #[cfg(feature = "internal-api")]
 pub mod parallel;
@@ -166,7 +166,9 @@ pub(crate) mod parallel;
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;
-pub use engine_data::{EngineData, FilteredEngineData, RowVisitor};
+pub use engine_data::{
+    EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
+};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
@@ -174,9 +176,9 @@ pub use metrics::MetricsReporter;
 pub use snapshot::Snapshot;
 pub use snapshot::SnapshotRef;
 
-use expressions::literal_expression_transform::LiteralExpressionTransform;
+use expressions::literal_expression_transform;
 use expressions::Scalar;
-use schema::{SchemaTransform, StructField, StructType};
+use schema::{StructField, StructType};
 
 #[cfg(any(
     feature = "default-engine-native-tls",
@@ -493,9 +495,7 @@ trait EvaluationHandlerExtension: EvaluationHandler {
         let null_row = self.null_row(null_row_schema.clone())?;
 
         // Convert schema and leaf values to an expression
-        let mut schema_transform = LiteralExpressionTransform::new(values);
-        schema_transform.transform_struct(schema.as_ref());
-        let row_expr = schema_transform.try_into_expr()?;
+        let row_expr = literal_expression_transform(schema.as_ref(), values)?;
 
         let eval =
             self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into())?;
@@ -564,6 +564,12 @@ pub trait StorageHandler: AsAny {
     /// it must return Err(Error::FileAlreadyExists).
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
 
+    /// Write data to the specified path.
+    ///
+    /// If `overwrite` is false and the file already exists, this must return
+    /// `Err(Error::FileAlreadyExists)`.
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()>;
+
     /// Perform a HEAD request for the given file at a Url, returning the file metadata.
     ///
     /// If the file does not exist, this must return an `Err` with [`Error::FileNotFound`].
@@ -598,6 +604,8 @@ pub trait JsonHandler: AsAny {
     ///    iter: [EngineData(3), EngineData(1, 2)]
     ///    iter: [EngineData(1), EngineData(3, 2)]
     ///    iter: [EngineData(2, 1, 3)]
+    ///
+    /// Additionally, engines may not merge engine data across file boundaries.
     ///
     /// # Parameters
     ///
@@ -788,6 +796,8 @@ pub trait ParquetHandler: AsAny {
     ///    iter: [EngineData(3), EngineData(1, 2)]
     ///    iter: [EngineData(1), EngineData(3, 2)]
     ///    iter: [EngineData(2, 1, 3)]
+    ///
+    /// Additionally, engines must not merge engine data across file boundaries.
     ///
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey
     fn read_parquet_files(

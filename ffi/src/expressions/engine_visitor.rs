@@ -8,9 +8,10 @@ use crate::{handle::Handle, kernel_string_slice, KernelStringSlice, SharedSchema
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     ColumnName, Expression, ExpressionRef, JunctionPredicate, JunctionPredicateOp, MapData,
-    OpaqueExpression, OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef,
-    ParseJsonExpression, Predicate, Scalar, StructData, Transform, UnaryExpression,
-    UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    MapToStructExpression, OpaqueExpression, OpaqueExpressionOpRef, OpaquePredicate,
+    OpaquePredicateOpRef, ParseJsonExpression, Predicate, Scalar, StructData, Transform,
+    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
+    VariadicExpressionOp,
 };
 
 use std::ffi::c_void;
@@ -148,6 +149,10 @@ pub struct EngineExpressionVisitor {
     /// The sub-expression (JSON string) will be in a _one_ item list identified by `child_list_id`.
     /// The `output_schema` handle specifies the schema to parse the JSON into.
     pub visit_parse_json: VisitParseJsonFn,
+    /// Visits the `MapToStruct` expression belonging to the list identified by `sibling_list_id`.
+    /// The sub-expression (map column) will be in a _one_ item list identified by `child_list_id`.
+    /// The output struct schema is determined by the evaluator's result type.
+    pub visit_map_to_struct: VisitUnaryFn,
     /// Visits the `LessThan` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_lt: VisitBinaryFn,
@@ -599,7 +604,7 @@ fn visit_expression_impl(
     match expression {
         Expression::Literal(scalar) => visit_expression_scalar(visitor, scalar, sibling_list_id),
         Expression::Column(name) => visit_expression_column(visitor, name, sibling_list_id),
-        Expression::Struct(exprs) => visit_expression_struct(visitor, exprs, sibling_list_id),
+        Expression::Struct(exprs, _) => visit_expression_struct(visitor, exprs, sibling_list_id),
         Expression::Transform(transform) => {
             visit_expression_transform(visitor, transform, sibling_list_id)
         }
@@ -651,6 +656,11 @@ fn visit_expression_impl(
                 child_list_id,
                 schema_handle
             );
+        }
+        Expression::MapToStruct(MapToStructExpression { map_expr }) => {
+            let child_list_id = call!(visitor, make_field_list, 1);
+            visit_expression_impl(visitor, map_expr, child_list_id);
+            call!(visitor, visit_map_to_struct, sibling_list_id, child_list_id);
         }
         Expression::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }

@@ -1,8 +1,9 @@
 //! Utility functions for the variant type and variant-related table features.
 
-use crate::schema::{SchemaTransform, StructType};
+use crate::schema::{Schema, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
+use crate::transforms::SchemaTransform;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 use std::borrow::Cow;
@@ -11,17 +12,18 @@ use std::borrow::Cow;
 #[derive(Debug, Default)]
 pub(crate) struct UsesVariant(bool);
 
-impl UsesVariant {
-    pub(crate) fn found(&self) -> bool {
-        self.0
-    }
-}
-
 impl<'a> SchemaTransform<'a> for UsesVariant {
     fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
         self.0 = true;
         None
     }
+}
+
+/// Checks if any column in the schema (including nested columns) has VARIANT type.
+pub(crate) fn schema_contains_variant_type(schema: &Schema) -> bool {
+    let mut visitor = UsesVariant(false);
+    let _ = visitor.transform_struct(schema);
+    visitor.0
 }
 
 pub(crate) fn validate_variant_type_feature_support(tc: &TableConfiguration) -> DeltaResult<()> {
@@ -31,10 +33,8 @@ pub(crate) fn validate_variant_type_feature_support(tc: &TableConfiguration) -> 
     if !protocol.has_table_feature(&TableFeature::VariantType)
         && !protocol.has_table_feature(&TableFeature::VariantTypePreview)
     {
-        let mut uses_variant = UsesVariant::default();
-        let _ = uses_variant.transform_struct(&tc.schema());
         require!(
-            !uses_variant.found(),
+            !schema_contains_variant_type(&tc.logical_schema()),
             Error::unsupported(
                 "Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features"
             )

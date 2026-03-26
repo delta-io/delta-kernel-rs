@@ -89,7 +89,7 @@ where
             StatusCode::UNAUTHORIZED => Err(Error::AuthenticationFailed),
             StatusCode::NOT_FOUND => Err(Error::ApiError {
                 status: status.as_u16(),
-                message: format!("Resource not found: {}", error_body),
+                message: format!("Resource not found: {error_body}"),
             }),
             _ => Err(Error::ApiError {
                 status: status.as_u16(),
