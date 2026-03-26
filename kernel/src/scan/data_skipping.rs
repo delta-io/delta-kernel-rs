@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
@@ -370,6 +371,23 @@ fn collect_junction_preds(
     Pred::junction(op, preds)
 }
 
+/// Adjusts a comparison value before comparing against a max stat, to account for existing
+/// Delta writers truncating timestamp JSON stats to millisecond precision. Truncation floors
+/// to the millisecond, so the stored max can be up to 999us less than the actual maximum
+/// (`actual_max <= stored_max + 999`). We subtract 999us from the comparison value to avoid
+/// incorrectly pruning files.
+///
+/// Non-timestamp values pass through unchanged.
+fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Cow<'_, Scalar> {
+    match val {
+        Scalar::Timestamp(micros) => Cow::Owned(Scalar::Timestamp(micros.saturating_sub(999))),
+        Scalar::TimestampNtz(micros) => {
+            Cow::Owned(Scalar::TimestampNtz(micros.saturating_sub(999)))
+        }
+        _ => Cow::Borrowed(val),
+    }
+}
+
 /// Rewrites user predicates into stats-based predicates for data skipping.
 ///
 /// For data columns, rewrites to `stats_parsed.minValues.*`/`stats_parsed.maxValues.*`/
@@ -416,18 +434,33 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     }
 
     /// Retrieves the maximum value of a column. For partition columns, returns the exact
-    /// partition value. For data columns, excludes timestamps due to millisecond truncation.
-    // TODO(#1002): we currently don't support file skipping on timestamp columns' max stat since
-    // they are truncated to milliseconds in add.stats.
-    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
+    /// partition value.
+    fn get_max_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
         if self.is_partition_column(col) {
             Some(joined_column_expr!("partitionValues_parsed", col))
         } else {
-            match data_type {
-                &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => None,
-                _ => Some(Expr::from(column_name!("stats_parsed.maxValues").join(col))),
-            }
+            Some(Expr::from(column_name!("stats_parsed.maxValues").join(col)))
         }
+    }
+
+    /// Compares a column's max stat against a literal value, adjusting for timestamp
+    /// truncation on non-partition columns. Partition values are exact and not subject to
+    /// JSON stats truncation, so no adjustment is needed. For data columns, the comparison
+    /// value is adjusted by [`adjust_scalar_for_max_stat_truncation`].
+    fn partial_cmp_max_stat(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        ord: Ordering,
+        inverted: bool,
+    ) -> Option<Pred> {
+        let max = self.get_max_stat(col, &val.data_type())?;
+        let adjusted = if self.is_partition_column(col) {
+            Cow::Borrowed(val)
+        } else {
+            adjust_scalar_for_max_stat_truncation(val)
+        };
+        self.eval_partial_cmp(ord, max, &adjusted, inverted)
     }
 
     /// Retrieves the null count of a column. Partition columns don't have nullCount stats.
@@ -553,14 +586,11 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
         Some(joined_column_expr!("minValues", col))
     }
 
-    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
+    fn get_max_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
         if self.is_partition_column(col) {
             return None;
         }
-        match data_type {
-            &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => None,
-            _ => Some(joined_column_expr!("maxValues", col)),
-        }
+        Some(joined_column_expr!("maxValues", col))
     }
 
     fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Expr> {
@@ -572,6 +602,23 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
 
     fn get_rowcount_stat(&self) -> Option<Expr> {
         Some(column_expr!("numRecords"))
+    }
+
+    /// Compares a column's max stat against a literal value, adjusting for timestamp
+    /// truncation. See [`adjust_scalar_for_max_stat_truncation`].
+    ///
+    /// No partition column guard needed: `get_max_stat` returns `None` for partition columns,
+    /// so their exact values never reach the adjustment.
+    fn partial_cmp_max_stat(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        ord: Ordering,
+        inverted: bool,
+    ) -> Option<Pred> {
+        let max = self.get_max_stat(col, &val.data_type())?;
+        let adjusted = adjust_scalar_for_max_stat_truncation(val);
+        self.eval_partial_cmp(ord, max, &adjusted, inverted)
     }
 
     /// Wraps a stat column comparison with an IS NULL guard.
