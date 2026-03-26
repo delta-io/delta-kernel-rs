@@ -4,16 +4,13 @@ use url::Url;
 
 use crate::config::ClientConfig;
 use crate::http::{build_http_client, execute_with_retry, handle_response};
-use unity_catalog_client_api::{CommitRequest, CommitsRequest, CommitsResponse};
-
-pub use unity_catalog_client_api::clients::{CommitClient, GetCommitsClient};
+use unity_catalog_client_api::{
+    CommitClient, CommitRequest, CommitsRequest, CommitsResponse, GetCommitsClient,
+};
 
 /// Placeholder for deserializing empty JSON responses from void-returning endpoints.
 #[derive(Deserialize)]
 struct EmptyResponse {}
-
-#[cfg(any(test, feature = "test-utils"))]
-pub use unity_catalog_client_api::{InMemoryCommitsClient, TableData};
 
 /// REST implementation of [CommitClient] and [GetCommitsClient].
 #[derive(Debug, Clone)]

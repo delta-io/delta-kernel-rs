@@ -1,3 +1,6 @@
+// TODO(https://github.com/delta-io/delta-kernel-rs/issues/2251): Replace UCClient with
+// trait-based clients (GetTableClient, GetCredentialsClient) once those traits are added
+// to unity-catalog-client-api.
 use reqwest::StatusCode;
 use tracing::instrument;
 use url::Url;

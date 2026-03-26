@@ -19,8 +19,7 @@
 //! }
 //! ```
 
-pub mod client;
-pub mod commits_client;
+pub mod clients;
 pub mod config;
 pub mod error;
 pub mod http;
@@ -29,18 +28,16 @@ pub mod models;
 #[cfg(test)]
 mod tests;
 
-pub use client::UCClient;
-pub use commits_client::{CommitClient, GetCommitsClient, UCCommitsRestClient};
+pub use clients::{CommitClient, GetCommitsClient, UCClient, UCCommitsRestClient};
 pub use config::{ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};
 
 #[cfg(any(test, feature = "test-utils"))]
-pub use commits_client::{InMemoryCommitsClient, TableData};
+pub use clients::{InMemoryCommitsClient, TableData};
 
 #[doc(hidden)]
 pub mod prelude {
-    pub use crate::client::UCClient;
-    pub use crate::commits_client::{CommitClient, GetCommitsClient, UCCommitsRestClient};
+    pub use crate::clients::{CommitClient, GetCommitsClient, UCClient, UCCommitsRestClient};
     pub use crate::models::tables::TablesResponse;
     pub use crate::models::{Commit, CommitsRequest, CommitsResponse};
     pub use unity_catalog_client_api::{Operation, TemporaryTableCredentials};
