@@ -68,5 +68,5 @@ jobs:
         # note that this won't run on proc macro/derive crates, so don't need to include
         # delta_kernel_derive etc.
         run: |
-          cargo semver-checks --locked -p delta_kernel -p delta_kernel_ffi --all-features \
+          cargo semver-checks -p delta_kernel -p delta_kernel_ffi --all-features \
             --baseline-rev "$BASELINE_REV"
