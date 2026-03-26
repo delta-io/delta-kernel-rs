@@ -90,7 +90,7 @@ Built-in tags (with current table assignments - for the most up-to-date table as
   - Tables: `1MAddsNoData0Chkpts`
 
 
-You can also add custom tags locally to any `tableInfo.json` to group tables relevant to your work, then pass that tag via `BENCH_TAGS` without modifying any code:
+You can also add custom tags to the `tags` field of any local `tableInfo.json` to group tables relevant to your work, then pass that tag via `BENCH_TAGS` without modifying any code:
 
 ```bash
 BENCH_TAGS=my-feature cargo bench -p delta_kernel_benchmarks
