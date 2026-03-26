@@ -14,7 +14,7 @@
 //! deduplication with `FileActionDeduplicator` which tracks unique files across log batches
 //! to minimize memory usage for tables with extensive history.
 use crate::engine_data::GetData;
-use crate::log_replay::deduplicator::{Deduplicator, ExtractedFileAction};
+use crate::log_replay::deduplicator::{Deduplicator, DvKeyRef, ExtractedFileAction};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::{DeltaResult, EngineData};
 
@@ -25,41 +25,52 @@ use tracing::debug;
 
 pub(crate) mod deduplicator;
 
+/// Owned deletion vector key stored inside [`FileActionKey`] in the seen-file set.
+///
+/// Fields are stored separately rather than as a pre-formatted string, so that
+/// [`ExtractedFileAction`] can borrow them directly from column data and perform
+/// zero-copy lookups without any `format!` call.
+#[derive(Debug, Hash, Eq, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DvKey {
+    pub(crate) storage_type: String,
+    pub(crate) path_or_inline_dv: String,
+    pub(crate) offset: Option<i32>,
+}
+
+impl DvKey {
+    pub(crate) fn new(
+        storage_type: impl Into<String>,
+        path_or_inline_dv: impl Into<String>,
+        offset: Option<i32>,
+    ) -> Self {
+        Self {
+            storage_type: storage_type.into(),
+            path_or_inline_dv: path_or_inline_dv.into(),
+            offset,
+        }
+    }
+}
+
+impl From<DvKeyRef<'_>> for DvKey {
+    fn from(r: DvKeyRef<'_>) -> Self {
+        Self::new(r.storage_type, r.path_or_inline_dv, r.offset)
+    }
+}
+
 /// The subset of file action fields that uniquely identifies it in the log, used for deduplication
 /// of adds and removes during log replay.
 #[derive(Debug, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize, Clone)]
 pub struct FileActionKey {
     pub(crate) path: String,
-    pub(crate) dv_unique_id: Option<String>,
+    pub(crate) dv: Option<DvKey>,
 }
 
 impl FileActionKey {
-    pub(crate) fn new(path: impl Into<String>, dv_unique_id: Option<String>) -> Self {
-        let path = path.into();
-        Self { path, dv_unique_id }
-    }
-}
-
-/// Borrowed view of a [`FileActionKey`] used for zero-copy lookups in the seen-file HashSet.
-///
-/// `String` and `str` hash and compare identically for the same contents, so a
-/// `FileActionKeyRef` with the same path and DV unique ID as a stored [`FileActionKey`]
-/// will match it in the set without requiring any heap allocation.
-#[derive(Hash)]
-pub(crate) struct FileActionKeyRef<'a> {
-    path: &'a str,
-    dv_unique_id: Option<&'a str>,
-}
-
-impl<'a> FileActionKeyRef<'a> {
-    pub(crate) fn new(path: &'a str, dv_unique_id: Option<&'a str>) -> Self {
-        Self { path, dv_unique_id }
-    }
-}
-
-impl hashbrown::Equivalent<FileActionKey> for FileActionKeyRef<'_> {
-    fn equivalent(&self, key: &FileActionKey) -> bool {
-        self.path == key.path && self.dv_unique_id == key.dv_unique_id.as_deref()
+    pub(crate) fn new(path: impl Into<String>, dv: Option<DvKey>) -> Self {
+        Self {
+            path: path.into(),
+            dv,
+        }
     }
 }
 
@@ -126,24 +137,23 @@ impl Deduplicator for FileActionDeduplicator<'_> {
     /// Note: each (add.path + add.dv_unique_id()) pair has a unique Add + Remove pair in the log.
     /// For example: <https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json>
     fn check_and_record_seen(&mut self, action: ExtractedFileAction<'_>) -> bool {
-        let borrowed = FileActionKeyRef::new(action.path, action.dv_unique_id.as_deref());
-        if self.seen_file_keys.contains(&borrowed) {
+        if self.seen_file_keys.contains(&action) {
             debug!(
                 "Ignoring duplicate ({}, {:?}) in scan, is log {}",
-                action.path, action.dv_unique_id, self.is_log_batch
+                action.path, action.dv, self.is_log_batch
             );
             true
         } else {
             debug!(
                 "Including ({}, {:?}) in scan, is log {}",
-                action.path, action.dv_unique_id, self.is_log_batch
+                action.path, action.dv, self.is_log_batch
             );
             if self.is_log_batch {
                 // Remember file actions from this batch so we can ignore duplicates as we process
                 // batches from older commit and/or checkpoint files. We don't track checkpoint
                 // batches because they are already the oldest actions and never replace anything.
                 self.seen_file_keys
-                    .insert(FileActionKey::new(action.path, action.dv_unique_id));
+                    .insert(FileActionKey::new(action.path, action.dv.map(DvKey::from)));
             }
             false
         }
@@ -169,10 +179,10 @@ impl Deduplicator for FileActionDeduplicator<'_> {
     ) -> DeltaResult<Option<ExtractedFileAction<'a>>> {
         // Try to extract an add action by the required path column
         if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
-            let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
+            let dv = self.extract_dv_key(i, getters, self.add_dv_start_index)?;
             return Ok(Some(ExtractedFileAction {
                 path,
-                dv_unique_id,
+                dv,
                 is_add: true,
             }));
         }
@@ -184,10 +194,10 @@ impl Deduplicator for FileActionDeduplicator<'_> {
 
         // Try to extract a remove action by the required path column
         if let Some(path) = getters[self.remove_path_index].get_str(i, "remove.path")? {
-            let dv_unique_id = self.extract_dv_unique_id(i, getters, self.remove_dv_start_index)?;
+            let dv = self.extract_dv_key(i, getters, self.remove_dv_start_index)?;
             return Ok(Some(ExtractedFileAction {
                 path,
-                dv_unique_id,
+                dv,
                 is_add: false,
             }));
         }
@@ -390,7 +400,7 @@ pub(crate) trait HasSelectionVector {
 
 #[cfg(test)]
 mod tests {
-    use super::deduplicator::{CheckpointDeduplicator, ExtractedFileAction};
+    use super::deduplicator::{CheckpointDeduplicator, DvKeyRef, ExtractedFileAction};
     use super::*;
     use crate::engine_data::GetData;
     use crate::DeltaResult;
@@ -464,7 +474,11 @@ mod tests {
     fn key_to_action(key: &FileActionKey, is_add: bool) -> ExtractedFileAction<'_> {
         ExtractedFileAction {
             path: key.path.as_str(),
-            dv_unique_id: key.dv_unique_id.clone(),
+            dv: key.dv.as_ref().map(|dv| DvKeyRef {
+                storage_type: dv.storage_type.as_str(),
+                path_or_inline_dv: dv.path_or_inline_dv.as_str(),
+                offset: dv.offset,
+            }),
             is_add,
         }
     }
@@ -504,7 +518,7 @@ mod tests {
         assert!(result.is_some());
         let action = result.unwrap();
         assert_eq!(action.path, "file1.parquet");
-        assert!(action.dv_unique_id.is_none());
+        assert!(action.dv.is_none());
         assert!(action.is_add);
 
         Ok(())
@@ -543,10 +557,10 @@ mod tests {
 
         assert!(result.is_some());
         let action = result.unwrap();
-        assert!(matches!(
-            action.dv_unique_id.as_deref(),
-            Some("s3path/to/dv@100")
-        ));
+        let dv = action.dv.unwrap();
+        assert_eq!(dv.storage_type, "s3");
+        assert_eq!(dv.path_or_inline_dv, "path/to/dv");
+        assert_eq!(dv.offset, Some(100));
         assert!(action.is_add);
 
         Ok(())
@@ -597,7 +611,7 @@ mod tests {
 
         let key1 = FileActionKey::new("file1.parquet", None);
         let key2 = FileActionKey::new("file2.parquet", None);
-        let key_with_dv = FileActionKey::new("file1.parquet", Some("dv1".to_string()));
+        let key_with_dv = FileActionKey::new("file1.parquet", Some(DvKey::new("u", "dv1", None)));
 
         // Test with log batch (should record keys)
         {
@@ -665,7 +679,7 @@ mod tests {
         assert!(result.is_some());
         let action = result.unwrap();
         assert_eq!(action.path, "checkpoint_file.parquet");
-        assert!(action.dv_unique_id.is_none());
+        assert!(action.dv.is_none());
         assert!(action.is_add);
 
         Ok(())
@@ -687,10 +701,10 @@ mod tests {
         assert!(result.is_some());
         let action = result.unwrap();
         assert_eq!(action.path, "file_with_dv.parquet");
-        assert!(matches!(
-            action.dv_unique_id.as_deref(),
-            Some("s3path/to/dv@100")
-        ));
+        let dv = action.dv.unwrap();
+        assert_eq!(dv.storage_type, "s3");
+        assert_eq!(dv.path_or_inline_dv, "path/to/dv");
+        assert_eq!(dv.offset, Some(100));
         assert!(action.is_add);
 
         Ok(())
@@ -704,7 +718,7 @@ mod tests {
         seen.insert(FileActionKey::new("modified_in_commit.parquet", None));
         seen.insert(FileActionKey::new(
             "modified_with_dv.parquet",
-            Some("dv123".to_string()),
+            Some(DvKey::new("u", "dv123", None)),
         ));
 
         let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2)?;
@@ -717,8 +731,10 @@ mod tests {
         );
 
         // File with DV modified in commit - should be filtered
-        let commit_modified_dv =
-            FileActionKey::new("modified_with_dv.parquet", Some("dv123".to_string()));
+        let commit_modified_dv = FileActionKey::new(
+            "modified_with_dv.parquet",
+            Some(DvKey::new("u", "dv123", None)),
+        );
         assert!(
             deduplicator.check_and_record_seen(key_to_action(&commit_modified_dv, true)),
             "Files with DVs seen in commits should be filtered from checkpoint"
