@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use criterion::{criterion_group, criterion_main, Criterion};
 
 use delta_kernel_benchmarks::models::{
@@ -15,6 +17,10 @@ fn workload_benchmarks(c: &mut Criterion) {
         Err(e) => panic!("Failed to load workloads: {e}"),
     };
 
+    let runtime = Arc::new(
+        tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"),
+    );
+
     for workload in &workloads {
         match &workload.spec {
             Spec::Read(read_spec) => {
@@ -26,6 +32,7 @@ fn workload_benchmarks(c: &mut Criterion) {
                             read_spec,
                             operation,
                             config,
+                            runtime.clone(),
                         )
                         .expect("Failed to create read runner");
                         c.bench_function(runner.name(), |b| {
@@ -39,6 +46,7 @@ fn workload_benchmarks(c: &mut Criterion) {
                     &workload.table_info,
                     &workload.case_name,
                     snapshot_construction_spec,
+                    runtime.clone(),
                 )
                 .expect("Failed to create snapshot construction runner");
                 c.bench_function(runner.name(), |b| {
