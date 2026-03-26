@@ -148,6 +148,7 @@ impl FileSizeHistogram {
     /// The bin index is the largest `i` such that `sorted_bin_boundaries[i] <= file_size`.
     /// Files larger than the maximum boundary are placed in the last bin.
     fn get_bin_index(&self, file_size: i64) -> usize {
+        debug_assert!(file_size >= 0);
         match self.sorted_bin_boundaries.binary_search(&file_size) {
             Ok(idx) => idx,
             // binary_search returns Err(insertion_point) where insertion_point is where the
@@ -220,7 +221,7 @@ impl FileSizeHistogram {
         })
     }
 
-    /// Subtracts another histogram element-wise. Both must have the same bin boundaries.
+    /// Subtracts another histogram element-wise from this histogram. Both must have the same bin boundaries.
     ///
     /// Returns an error if any bin would have negative file counts or total bytes.
     pub(crate) fn try_sub(&self, other: &FileSizeHistogram) -> DeltaResult<FileSizeHistogram> {
