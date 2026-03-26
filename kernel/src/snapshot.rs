@@ -511,6 +511,7 @@ impl Snapshot {
         self: Arc<Self>,
         start_version: Version,
         end_version: Version,
+        _i: u32,
     ) -> DeltaResult<LogCompactionWriter> {
         LogCompactionWriter::try_new(self, start_version, end_version)
     }
@@ -1730,7 +1731,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
         // Test creating a log compaction writer
-        let writer = snapshot.clone().log_compaction_writer(0, 1).unwrap();
+        let writer = snapshot.clone().log_compaction_writer(0, 1, 0).unwrap();
         let path = writer.compaction_path();
 
         // Verify the path format is correct
@@ -1738,11 +1739,11 @@ mod tests {
         assert!(path.to_string().ends_with(expected_filename));
 
         // Test invalid version range (start >= end)
-        let result = snapshot.clone().log_compaction_writer(2, 1);
+        let result = snapshot.clone().log_compaction_writer(2, 1, 0);
         assert_result_error_with_message(result, "Invalid version range");
 
         // Test equal version range (also invalid)
-        let result = snapshot.log_compaction_writer(1, 1);
+        let result = snapshot.log_compaction_writer(1, 1, 0);
         assert_result_error_with_message(result, "Invalid version range");
     }
 

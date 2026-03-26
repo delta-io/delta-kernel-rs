@@ -77,7 +77,7 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
 
     // Create snapshot and log compaction writer
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut writer = snapshot.log_compaction_writer(0, 2)?;
+    let mut writer = snapshot.log_compaction_writer(0, 2, 0)?;
 
     // Get compaction data iterator
     let mut compaction_data = writer.compaction_data(&engine)?;
@@ -274,7 +274,7 @@ async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut writer = snapshot.log_compaction_writer(0, 3)?;
+    let mut writer = snapshot.log_compaction_writer(0, 3, 0)?;
 
     let mut compaction_data = writer.compaction_data(&engine)?;
     let compaction_path = writer.compaction_path().clone();
