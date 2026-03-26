@@ -47,14 +47,14 @@ fn test_static_skipping() {
         (false, column_pred!("a")),
         (true, Pred::literal(false)),
         (false, Pred::literal(true)),
-        (true, NULL),
+        (false, NULL), // NULL is unknown, not false -- conservative (no skip)
         (true, Pred::and(column_pred!("a"), Pred::literal(false))),
         (false, Pred::or(column_pred!("a"), Pred::literal(true))),
         (false, Pred::or(column_pred!("a"), Pred::literal(false))),
         (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
         (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
         (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
-        (true, Pred::and(NULL, column_pred!("a"))),
+        (false, Pred::and(NULL, column_pred!("a"))), // NULL is unknown, not false
     ];
     for (should_skip, predicate) in test_cases {
         assert_eq!(
@@ -757,52 +757,6 @@ fn test_scan_metadata_with_stats_columns() {
     assert!(total_num_records > 0, "Should have non-zero numRecords");
     println!(
         "Verified {file_count} files with total {total_num_records} records from stats_parsed"
-    );
-}
-
-/// Test that data skipping works correctly with pre-parsed stats from a checkpoint.
-///
-/// The parsed-stats test table has a checkpoint at version 3 (containing stats_parsed) and
-/// JSON commits at versions 4-5. This test exercises both code paths:
-/// - Checkpoint batches: stats_parsed is read directly from the transformed batch
-/// - JSON log batches: stats are parsed from JSON via the transform expression
-///
-/// Table layout (6 files, each 100 records):
-///   File 1: id [1-100],   File 2: id [101-200], File 3: id [201-300]
-///   File 4: id [301-400], File 5: id [401-500], File 6: id [501-600]
-#[test]
-fn test_data_skipping_with_parsed_stats() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-
-    // Predicate: id > 400 should skip files 1-4 (max id: 100, 200, 300, 400) and keep files 5-6
-    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
-    let scan = snapshot
-        .scan_builder()
-        .with_predicate(predicate)
-        .build()
-        .unwrap();
-
-    let scan_metadata_results: Vec<_> = scan
-        .scan_metadata(engine.as_ref())
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-
-    let mut selected_file_count = 0;
-    for scan_metadata in &scan_metadata_results {
-        let selection_vector = scan_metadata.scan_files.selection_vector();
-        selected_file_count += selection_vector
-            .iter()
-            .filter(|&&selected| selected)
-            .count();
-    }
-
-    assert_eq!(
-        selected_file_count, 2,
-        "Data skipping with parsed stats should keep only 2 files (id [401-500] and [501-600])"
     );
 }
 

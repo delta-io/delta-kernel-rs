@@ -1,36 +1,25 @@
 //! Utility functions for loading workload specifications
 
 use crate::models::{Spec, TableInfo, Workload};
-use flate2::read::GzDecoder;
-use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
-use tar::Archive;
 
 // Environment variable used to filter benchmarks by tag (e.g. `BENCH_TAGS=base,feature_x`).
 pub const BENCH_TAGS_ENV_VAR: &str = "BENCH_TAGS";
 
-// Workload extraction configuration
-const WORKLOAD_TAR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads.tar.gz");
-const OUTPUT_FOLDER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads");
-const DONE_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/workloads/.done");
-const TABLE_INFO_FILE_NAME: &str = "table_info.json";
+const OUTPUT_FOLDER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/workloads");
+const TABLE_INFO_FILE_NAME: &str = "tableInfo.json";
 const SPECS_DIR_NAME: &str = "specs";
 const BENCHMARKS_DIR_NAME: &str = "benchmarks";
 const DELTA_DIR_NAME: &str = "delta";
 
-/// Loads all workload specifications from OUTPUT_FOLDER, optionally filtered by BENCH_TAGS
+/// Loads all workload specifications from `OUTPUT_FOLDER`, optionally filtered by `BENCH_TAGS`.
 ///
-/// On first run, extracts from WORKLOAD_TAR if it exists.
-/// Uses a .done file to avoid re-extracting on subsequent runs
+/// Workloads are downloaded and extracted into `OUTPUT_FOLDER` at build time by `build.rs`.
 ///
 /// If the `BENCH_TAGS` environment variable is set (e.g. `BENCH_TAGS=base`),
-/// only workloads whose `table_info.json` has at least one matching tag are returned
-/// If `BENCH_TAGS` is unset or empty, all workloads are returned
+/// only workloads whose `table_info.json` has at least one matching tag are returned.
+/// If `BENCH_TAGS` is unset or empty, all workloads are returned.
 pub fn load_all_workloads() -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
-    if !workload_specs_exist() {
-        extract_workload_specs()?;
-    }
-
     let spec_dir = PathBuf::from(OUTPUT_FOLDER);
     let benchmarks_dir = spec_dir.join(BENCHMARKS_DIR_NAME);
     let table_directories = find_table_directories(&benchmarks_dir)?;
@@ -45,8 +34,8 @@ pub fn load_all_workloads() -> Result<Vec<Workload>, Box<dyn std::error::Error>>
     Ok(all_workloads)
 }
 
-/// Reads the BENCH_TAGS environment variable and returns the set of tags
-/// Returns None if unset or empty (meaning we should run all workloads)
+/// Reads the `BENCH_TAGS` environment variable and returns the set of tags
+/// Returns `None` if unset or empty (meaning we should run all workloads)
 fn get_required_tags() -> Option<Vec<String>> {
     std::env::var(BENCH_TAGS_ENV_VAR)
         .ok()
@@ -54,63 +43,7 @@ fn get_required_tags() -> Option<Vec<String>> {
         .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
 }
 
-/// Returns true if table_tags has ANY tag in common with required, where required is the set of tags specified with BENCH_TAGS
-fn matches_tags(table_tags: &[String], required: &[String]) -> bool {
-    required.iter().any(|r| table_tags.contains(r))
-}
-
-/// Checks if workload specs have already been extracted by looking for the .done file
-/// If the .done file exists, we don't need to extract the workload specs again
-///
-/// TODO(#1939): the usage of this function is a naive check;
-/// currently, the .done file must be manually deleted to force re-extraction of workload specs
-fn workload_specs_exist() -> bool {
-    Path::new(DONE_FILE).exists()
-}
-
-/// Extracts workload specs from WORKLOAD_TAR into OUTPUT_FOLDER and writes a .done file on success
-fn extract_workload_specs() -> Result<(), Box<dyn std::error::Error>> {
-    let tar_path = Path::new(WORKLOAD_TAR);
-
-    if !tar_path.exists() {
-        return Err(format!("Workload tarball not found at {WORKLOAD_TAR}").into());
-    }
-
-    extract_tarball(tar_path)?;
-    write_done_file()?;
-
-    Ok(())
-}
-
-/// Extracts a tarball at path into OUTPUT_FOLDER
-/// This is used to extract WORKLOAD_TAR into OUTPUT_FOLDER
-fn extract_tarball(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)?;
-    let tarball = GzDecoder::new(BufReader::new(file));
-    let mut archive = Archive::new(tarball);
-
-    std::fs::create_dir_all(OUTPUT_FOLDER)
-        .map_err(|e| format!("Failed to create output directory: {e}"))?;
-
-    archive
-        .unpack(OUTPUT_FOLDER)
-        .map_err(|e| format!("Failed to unpack tarball: {e}"))?;
-
-    Ok(())
-}
-
-/// Writes DONE_FILE to mark that workload specs have been successfully extracted
-/// See TODO(#1939) for `workload_specs_exist` above; this file must be manually deleted to force re-extraction
-fn write_done_file() -> Result<(), Box<dyn std::error::Error>> {
-    let mut done_file = std::fs::File::create(DONE_FILE)
-        .map_err(|e| format!("Failed to create .done file: {e}"))?;
-
-    write!(done_file, "done").map_err(|e| format!("Failed to write .done file: {e}"))?;
-
-    Ok(())
-}
-
-/// Returns all subdirectories of `base_dir`. In practice this is called with base_dir = OUTPUT_FOLDER/BENCHMARKS_DIR_NAME,
+/// Returns all subdirectories of `base_dir`. In practice this is called with `base_dir` = `OUTPUT_FOLDER`/`BENCHMARKS_DIR_NAME`,
 /// Each subdirectory returned represents a table to be benchmarked and contains the table itself, specs, and table info
 fn find_table_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let entries = std::fs::read_dir(base_dir)
@@ -132,9 +65,11 @@ fn find_table_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::
 /// Loads all workload specs for a single table, or returns an empty vec if required_tags is set
 /// and the table has no matching tags.
 ///
-/// Reads table info from TABLE_INFO_FILE_NAME at the root of table_dir,
-/// then loads each JSON spec from table_dir/SPECS_DIR_NAME
-/// If required_tags is None, all tables are included
+/// Reads table info from `TABLE_INFO_FILE_NAME` at the root of `table_dir`,
+/// then loads each JSON spec from `table_dir`/`SPECS_DIR_NAME`.
+///
+/// If `required_tags` is `None`, all tables are included (no tables will be skipped in this function)
+/// Otherwise, a specific table is included (not skipped by this function) if any of its tags appear in `required_tags` (uses union semantics)
 fn load_specs_from_table(
     table_dir: &Path,
     required_tags: Option<&Vec<String>>,
@@ -156,7 +91,7 @@ fn load_specs_from_table(
 
     // Skip this table if BENCH_TAGS is set and none of its tags match
     if let Some(tags) = required_tags {
-        if !matches_tags(&table_info.tags, tags) {
+        if !table_info.matches_tags(tags) {
             return Ok(vec![]);
         }
     }
@@ -229,66 +164,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_matches_tags_or_semantics() {
-        let table_tags = vec!["ci".to_string(), "checkpoints".to_string()];
-
-        assert!(matches_tags(&table_tags, &["ci".to_string()]));
-        assert!(matches_tags(&table_tags, &["checkpoints".to_string()]));
-        assert!(matches_tags(
-            &table_tags,
-            &["ci".to_string(), "large".to_string()]
-        ));
-    }
-
-    #[test]
-    fn test_matches_tags_no_match() {
-        let table_tags = vec!["large".to_string()];
-        assert!(!matches_tags(
-            &table_tags,
-            &["ci".to_string(), "checkpoints".to_string()]
-        ));
-    }
-
-    #[test]
-    fn test_matches_tags_empty_table_tags() {
-        let table_tags: Vec<String> = vec![];
-        assert!(!matches_tags(&table_tags, &["ci".to_string()]));
-    }
-
-    #[test]
-    fn test_get_required_tags_unset() {
+    fn test_get_required_tags() {
+        // These cases must run sequentially b/c env vars conflict when these tests are separate (as they run in parallel)
         std::env::remove_var(BENCH_TAGS_ENV_VAR);
         assert!(get_required_tags().is_none());
-    }
 
-    #[test]
-    fn test_get_required_tags_empty() {
         std::env::set_var(BENCH_TAGS_ENV_VAR, "");
         assert!(get_required_tags().is_none());
-        std::env::remove_var(BENCH_TAGS_ENV_VAR);
-    }
 
-    #[test]
-    fn test_get_required_tags_single() {
         std::env::set_var(BENCH_TAGS_ENV_VAR, "ci");
-        let tags = get_required_tags().unwrap();
-        assert_eq!(tags, vec!["ci"]);
-        std::env::remove_var(BENCH_TAGS_ENV_VAR);
-    }
+        assert_eq!(get_required_tags().unwrap(), vec!["ci"]);
 
-    #[test]
-    fn test_get_required_tags_multiple() {
         std::env::set_var(BENCH_TAGS_ENV_VAR, "ci,checkpoints,v2");
-        let tags = get_required_tags().unwrap();
-        assert_eq!(tags, vec!["ci", "checkpoints", "v2"]);
-        std::env::remove_var(BENCH_TAGS_ENV_VAR);
-    }
+        assert_eq!(
+            get_required_tags().unwrap(),
+            vec!["ci", "checkpoints", "v2"]
+        );
 
-    #[test]
-    fn test_get_required_tags_with_whitespace() {
         std::env::set_var(BENCH_TAGS_ENV_VAR, " ci , checkpoints ");
-        let tags = get_required_tags().unwrap();
-        assert_eq!(tags, vec!["ci", "checkpoints"]);
+        assert_eq!(get_required_tags().unwrap(), vec!["ci", "checkpoints"]);
+
         std::env::remove_var(BENCH_TAGS_ENV_VAR);
     }
 }

@@ -221,7 +221,7 @@ impl EngineData for ArrowEngineData {
         // This is used to guide our depth-first extraction. If the list contains any non-leaf,
         // duplicate, or missing column references, the extracted column list will be too
         // short (error out below).
-        let mut column_map = HashMap::new();
+        let mut column_map = HashMap::with_capacity(leaf_columns.len() * 2);
 
         for (column, data_type) in leaf_columns.iter().zip(leaf_types.iter()) {
             column_map.insert(column.clone(), ColumnState::AwaitingGetter(data_type));
