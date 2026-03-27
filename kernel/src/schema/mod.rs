@@ -779,6 +779,7 @@ impl StructType {
     ///
     /// Returns `None` if the column path is empty, a field is not found, or an intermediate
     /// field is not a struct type.
+    #[allow(dead_code)] // Used by internal-api consumers (e.g. benchmarks/tests) but not every build profile.
     #[internal_api]
     pub(crate) fn resolve_column(&self, col: &ColumnName) -> Option<&StructField> {
         self.walk_column_fields(col).ok()?.into_iter().last()
