@@ -10,7 +10,7 @@ use itertools::Itertools;
 use tracing::{debug, info};
 use url::Url;
 
-use crate::metrics::{MetricEvent, MetricId};
+use crate::metrics::MetricId;
 use crate::scan::metrics::ScanMetrics;
 use crate::utils::IteratorExt;
 
@@ -786,18 +786,7 @@ impl Scan {
         };
 
         let on_complete = move || {
-            let event = MetricEvent::ScanMetadataCompleted {
-                operation_id,
-                total_duration: start.elapsed(),
-                num_add_files_seen: metrics.num_add_files_seen(),
-                num_active_add_files: metrics.num_active_add_files(),
-                num_remove_files_seen: metrics.num_remove_files_seen(),
-                num_non_file_actions: metrics.num_non_file_actions(),
-                num_predicate_filtered: metrics.num_predicate_filtered(),
-                peak_hash_set_size: metrics.peak_hash_set_size(),
-                dedup_visitor_time_ms: metrics.dedup_visitor_time_ns() / 1_000_000,
-                predicate_eval_time_ms: metrics.predicate_eval_time_ns() / 1_000_000,
-            };
+            let event = metrics.to_event(operation_id, start.elapsed());
             info!(%event);
             if let Some(r) = reporter {
                 r.report(event);

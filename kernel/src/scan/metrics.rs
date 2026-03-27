@@ -1,8 +1,11 @@
 //! Metrics for scan log replay operations.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use tracing::info;
+
+use crate::metrics::{MetricEvent, MetricId};
 
 /// Metrics collected during scan log replay. Metrics are updated and read using relaxed ordering
 /// to keep updates fast across parallel executing threads.
@@ -121,43 +124,19 @@ impl ScanMetrics {
         );
     }
 
-    /// Get the number of add files seen during add/remove deduplication.
-    pub(crate) fn num_add_files_seen(&self) -> u64 {
-        self.num_add_files_seen.load(Ordering::Relaxed)
-    }
-
-    /// Get the number of active add files that survived log replay.
-    pub(crate) fn num_active_add_files(&self) -> u64 {
-        self.num_active_add_files.load(Ordering::Relaxed)
-    }
-
-    /// Get the number of remove files seen.
-    pub(crate) fn num_remove_files_seen(&self) -> u64 {
-        self.num_remove_files_seen.load(Ordering::Relaxed)
-    }
-
-    /// Get the number of non-file actions seen.
-    pub(crate) fn num_non_file_actions(&self) -> u64 {
-        self.num_non_file_actions.load(Ordering::Relaxed)
-    }
-
-    /// Get the number of files filtered by predicates.
-    pub(crate) fn num_predicate_filtered(&self) -> u64 {
-        self.num_predicate_filtered.load(Ordering::Relaxed)
-    }
-
-    /// Get the peak size of the deduplication hash set.
-    pub(crate) fn peak_hash_set_size(&self) -> usize {
-        self.peak_hash_set_size.load(Ordering::Relaxed)
-    }
-
-    /// Get the time spent in the deduplication visitor (nanoseconds).
-    pub(crate) fn dedup_visitor_time_ns(&self) -> u64 {
-        self.dedup_visitor_time_ns.load(Ordering::Relaxed)
-    }
-
-    /// Get the time spent evaluating predicates (nanoseconds).
-    pub(crate) fn predicate_eval_time_ns(&self) -> u64 {
-        self.predicate_eval_time_ns.load(Ordering::Relaxed)
+    /// Snapshot all counters into a `MetricEvent::ScanMetadataCompleted`.
+    pub(crate) fn to_event(&self, operation_id: MetricId, total_duration: Duration) -> MetricEvent {
+        MetricEvent::ScanMetadataCompleted {
+            operation_id,
+            total_duration,
+            num_add_files_seen: self.num_add_files_seen.load(Ordering::Relaxed),
+            num_active_add_files: self.num_active_add_files.load(Ordering::Relaxed),
+            num_remove_files_seen: self.num_remove_files_seen.load(Ordering::Relaxed),
+            num_non_file_actions: self.num_non_file_actions.load(Ordering::Relaxed),
+            num_predicate_filtered: self.num_predicate_filtered.load(Ordering::Relaxed),
+            peak_hash_set_size: self.peak_hash_set_size.load(Ordering::Relaxed),
+            dedup_visitor_time_ms: self.dedup_visitor_time_ns.load(Ordering::Relaxed) / 1_000_000,
+            predicate_eval_time_ms: self.predicate_eval_time_ns.load(Ordering::Relaxed) / 1_000_000,
+        }
     }
 }
