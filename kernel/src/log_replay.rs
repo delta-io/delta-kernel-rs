@@ -14,7 +14,7 @@
 //! deduplication with `FileActionDeduplicator` which tracks unique files across log batches
 //! to minimize memory usage for tables with extensive history.
 use crate::engine_data::GetData;
-use crate::log_replay::deduplicator::{Deduplicator, DvKeyRef, ExtractedFileAction};
+use crate::log_replay::deduplicator::{Deduplicator, DvUniqueIdRef, ExtractedFileAction};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::{DeltaResult, EngineData};
 
@@ -26,52 +26,44 @@ use tracing::debug;
 
 pub(crate) mod deduplicator;
 
-/// Owned deletion vector key stored inside [`FileActionKey`] in the seen-file set.
+/// Owned deletion vector identity stored inside [`FileActionKey`] in the seen-file set.
 ///
-/// Fields are stored separately rather than as a pre-formatted string, so that
-/// [`ExtractedFileAction`] can borrow them directly from column data and perform
-/// zero-copy lookups without any `format!` call.
+/// Each variant encodes exactly the fields required by that storage type, making illegal
+/// combinations (e.g. an inline DV with an offset) unrepresentable.
+///
+/// `None` offset for `Uuid`/`Path` DVs is normalized to `0` on construction, matching
+/// the Delta Kernel Java behavior (`checkArgument(offset.isPresent(), ...)` defaults absent
+/// offsets to 0 when reading).
 #[derive(Debug, Hash, Eq, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct DvKey {
-    pub(crate) storage_type: String,
-    pub(crate) path_or_inline_dv: String,
-    pub(crate) offset: Option<i32>,
+pub(crate) enum DvUniqueId {
+    /// Inline DV: the bitmap is base85-encoded directly in `pathOrInlineDv`. No offset.
+    Inline(String),
+    /// UUID-based DV: stored in a file relative to the table directory.
+    Uuid(String, i32),
+    /// Absolute-path DV: stored at an absolute path.
+    Path(String, i32),
 }
 
-impl DvKey {
-    pub(crate) fn new(
-        storage_type: impl Into<String>,
-        path_or_inline_dv: impl Into<String>,
-        offset: Option<i32>,
-    ) -> Self {
-        Self {
-            storage_type: storage_type.into(),
-            path_or_inline_dv: path_or_inline_dv.into(),
-            offset,
+impl From<DvUniqueIdRef<'_>> for DvUniqueId {
+    fn from(r: DvUniqueIdRef<'_>) -> Self {
+        match r {
+            DvUniqueIdRef::Inline(s) => DvUniqueId::Inline(s.to_owned()),
+            DvUniqueIdRef::Uuid(s, o) => DvUniqueId::Uuid(s.to_owned(), o),
+            DvUniqueIdRef::Path(s, o) => DvUniqueId::Path(s.to_owned(), o),
         }
-    }
-}
-
-impl From<DvKeyRef<'_>> for DvKey {
-    fn from(r: DvKeyRef<'_>) -> Self {
-        Self::new(r.storage_type, r.path_or_inline_dv, r.offset)
     }
 }
 
 /// The subset of file action fields that uniquely identifies it in the log, used for deduplication
 /// of adds and removes during log replay.
-///
-/// The deletion vector key is boxed to keep `FileActionKey` small: most files have no DV, so
-/// `Option<Box<DvKey>>` is pointer-sized when `None`, while `Option<DvKey>` would always inline
-/// the full `DvKey` struct (~56 bytes) regardless.
 #[derive(Debug, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize, Clone)]
 pub struct FileActionKey {
     pub(crate) path: String,
-    pub(crate) dv: Option<Box<DvKey>>,
+    pub(crate) dv: Option<DvUniqueId>,
 }
 
 impl FileActionKey {
-    pub(crate) fn new(path: impl Into<String>, dv: Option<Box<DvKey>>) -> Self {
+    pub(crate) fn new(path: impl Into<String>, dv: Option<DvUniqueId>) -> Self {
         Self {
             path: path.into(),
             dv,
@@ -159,7 +151,7 @@ impl Deduplicator for FileActionDeduplicator<'_> {
                 // batches because they are already the oldest actions and never replace anything.
                 self.seen_file_keys.insert(FileActionKey::new(
                     action.path,
-                    action.dv.map(|dv| Box::new(DvKey::from(dv))),
+                    action.dv.map(DvUniqueId::from),
                 ));
             }
             false
@@ -407,7 +399,7 @@ pub(crate) trait HasSelectionVector {
 
 #[cfg(test)]
 mod tests {
-    use super::deduplicator::{CheckpointDeduplicator, DvKeyRef, ExtractedFileAction};
+    use super::deduplicator::{CheckpointDeduplicator, DvUniqueIdRef, ExtractedFileAction};
     use super::*;
     use crate::engine_data::GetData;
     use crate::DeltaResult;
@@ -481,10 +473,10 @@ mod tests {
     fn key_to_action(key: &FileActionKey, is_add: bool) -> ExtractedFileAction<'_> {
         ExtractedFileAction {
             path: key.path.as_str(),
-            dv: key.dv.as_ref().map(|dv| DvKeyRef {
-                storage_type: dv.storage_type.as_str(),
-                path_or_inline_dv: dv.path_or_inline_dv.as_str(),
-                offset: dv.offset,
+            dv: key.dv.as_ref().map(|dv| match dv {
+                DvUniqueId::Inline(s) => DvUniqueIdRef::Inline(s.as_str()),
+                DvUniqueId::Uuid(s, o) => DvUniqueIdRef::Uuid(s.as_str(), *o),
+                DvUniqueId::Path(s, o) => DvUniqueIdRef::Path(s.as_str(), *o),
             }),
             is_add,
         }
@@ -556,7 +548,7 @@ mod tests {
 
         let mut mock_dv = MockGetData::new();
         mock_dv.add_string(0, "add.path", "file_with_dv.parquet");
-        mock_dv.add_string(0, "deletionVector.storageType", "s3");
+        mock_dv.add_string(0, "deletionVector.storageType", "u");
         mock_dv.add_string(0, "deletionVector.pathOrInlineDv", "path/to/dv");
         mock_dv.add_int(0, "deletionVector.offset", 100);
         let getters = create_getters_with_mocks(Some(&mock_dv), None);
@@ -564,10 +556,10 @@ mod tests {
 
         assert!(result.is_some());
         let action = result.unwrap();
-        let dv = action.dv.unwrap();
-        assert_eq!(dv.storage_type, "s3");
-        assert_eq!(dv.path_or_inline_dv, "path/to/dv");
-        assert_eq!(dv.offset, Some(100));
+        assert!(
+            matches!(action.dv, Some(DvUniqueIdRef::Uuid(p, 100)) if p == "path/to/dv"),
+            "expected Uuid dv with path 'path/to/dv' and offset 100"
+        );
         assert!(action.is_add);
 
         Ok(())
@@ -618,10 +610,8 @@ mod tests {
 
         let key1 = FileActionKey::new("file1.parquet", None);
         let key2 = FileActionKey::new("file2.parquet", None);
-        let key_with_dv = FileActionKey::new(
-            "file1.parquet",
-            Some(Box::new(DvKey::new("u", "dv1", None))),
-        );
+        let key_with_dv =
+            FileActionKey::new("file1.parquet", Some(DvUniqueId::Uuid("dv1".to_owned(), 0)));
 
         // Test with log batch (should record keys)
         {
@@ -702,7 +692,7 @@ mod tests {
 
         let mut mock_dv = MockGetData::new();
         mock_dv.add_string(0, "add.path", "file_with_dv.parquet");
-        mock_dv.add_string(0, "deletionVector.storageType", "s3");
+        mock_dv.add_string(0, "deletionVector.storageType", "u");
         mock_dv.add_string(0, "deletionVector.pathOrInlineDv", "path/to/dv");
         mock_dv.add_int(0, "deletionVector.offset", 100);
         let getters = create_getters_with_mocks(Some(&mock_dv), None);
@@ -711,10 +701,10 @@ mod tests {
         assert!(result.is_some());
         let action = result.unwrap();
         assert_eq!(action.path, "file_with_dv.parquet");
-        let dv = action.dv.unwrap();
-        assert_eq!(dv.storage_type, "s3");
-        assert_eq!(dv.path_or_inline_dv, "path/to/dv");
-        assert_eq!(dv.offset, Some(100));
+        assert!(
+            matches!(action.dv, Some(DvUniqueIdRef::Uuid(p, 100)) if p == "path/to/dv"),
+            "expected Uuid dv with path 'path/to/dv' and offset 100"
+        );
         assert!(action.is_add);
 
         Ok(())
@@ -728,7 +718,7 @@ mod tests {
         seen.insert(FileActionKey::new("modified_in_commit.parquet", None));
         seen.insert(FileActionKey::new(
             "modified_with_dv.parquet",
-            Some(Box::new(DvKey::new("u", "dv123", None))),
+            Some(DvUniqueId::Uuid("dv123".to_owned(), 0)),
         ));
 
         let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2)?;
@@ -743,7 +733,7 @@ mod tests {
         // File with DV modified in commit - should be filtered
         let commit_modified_dv = FileActionKey::new(
             "modified_with_dv.parquet",
-            Some(Box::new(DvKey::new("u", "dv123", None))),
+            Some(DvUniqueId::Uuid("dv123".to_owned(), 0)),
         );
         assert!(
             deduplicator.check_and_record_seen(key_to_action(&commit_modified_dv, true)),
