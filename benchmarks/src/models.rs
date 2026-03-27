@@ -30,11 +30,11 @@ pub enum ParallelScan {
     Enabled { num_threads: usize },
 }
 
-/// Info needed to access a table via Unity Catalog credential vending
+/// Info needed to access a catalog-managed table via credential vending
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogManagedInfo {
-    pub table_name: String, // UC fully-qualified name: "catalog.schema.table"
+    pub table_name: String, // fully-qualified name: "catalog.schema.table"
 }
 
 /// Table info JSON files are located at the root of each table directory
@@ -52,8 +52,8 @@ pub struct TableInfo {
     /// absolute local paths. If `None`, the table is assumed to be in the `delta/` subdirectory
     /// next to `tableInfo.json`.
     pub table_path: Option<Url>,
-    /// Info needed to access a table via Unity Catalog credential vending.
-    /// When present, the engine is set up with UC credentials instead of local/S3 access.
+    /// Info needed to access a catalog-managed table via credential vending.
+    /// When present, the engine is set up with catalog credentials instead of local/S3 access.
     pub catalog_managed_info: Option<CatalogManagedInfo>,
     /// Schema at the latest version of the table, in Delta protocol JSON format
     /// e.g. `{"type": "struct", "fields": [...]}`
@@ -331,7 +331,7 @@ mod tests {
     #[rstest]
     #[case(
         r#"{
-            "name": "uc_table", "description": "A UC managed table",
+            "name": "catalog_table", "description": "A catalog-managed table",
             "catalogManagedInfo": {"tableName": "main.schema.table"},
             "schema": {"type": "struct", "fields": []},
             "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
