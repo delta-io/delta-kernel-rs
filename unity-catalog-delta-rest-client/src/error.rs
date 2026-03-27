@@ -40,6 +40,9 @@ pub enum Error {
     MaxRetriesExceeded,
 }
 
+/// A type alias for [`Result`] using [`enum@Error`].
+///
+/// [`Result`]: std::result::Result
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl From<Error> for unity_catalog_delta_client_api::Error {

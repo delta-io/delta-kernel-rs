@@ -9,7 +9,7 @@ members = [
     "test-utils",
     "feature-tests",
     "mem-test",
-    "unity-catalog-delta-client-rest-impl", # WIP: this is an experimental UC client for catalog-managed table work
+    "unity-catalog-delta-rest-client", # WIP: this is an experimental UC client for catalog-managed table work
     "delta-kernel-unity-catalog", # WIP: this is an experimental UC catalog implementation
     "unity-catalog-delta-client-api", # WIP: transport-agnostic UC client API traits
 ]

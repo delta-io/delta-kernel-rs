@@ -172,6 +172,8 @@ int main(int argc, char* argv[])
     if (snapshot_res.tag != OkHandleSharedSnapshot) {
       print_error("Failed to create snapshot.", (Error*)snapshot_res.err);
       free_error((Error*)snapshot_res.err);
+      free_engine(engine);
+      free_uc_commit_client(uc_client);
       return -1;
     }
 
@@ -184,6 +186,7 @@ int main(int argc, char* argv[])
     if (txn_res.tag != OkHandleExclusiveTransaction) {
         print_error("Failed to create transaction with UC committer", (Error*)txn_res.err);
         free_error((Error*)txn_res.err);
+        free_snapshot(snapshot);
         free_engine(engine);
         free_uc_commit_client(uc_client);
         return -1;
@@ -203,6 +206,7 @@ int main(int argc, char* argv[])
     if (txn_with_info_res.tag != OkHandleExclusiveTransaction) {
         print_error("Failed to set engine info", (Error*)txn_with_info_res.err);
         free_error((Error*)txn_with_info_res.err);
+        free_snapshot(snapshot);
         free_engine(engine);
         free_uc_commit_client(uc_client);
         return -1;
@@ -215,6 +219,7 @@ int main(int argc, char* argv[])
     if (commit_res.tag != Oku64) {
         print_error("Commit failed", (Error*)commit_res.err);
         free_error((Error*)commit_res.err);
+        free_snapshot(snapshot);
         free_engine(engine);
         free_uc_commit_client(uc_client);
         return -1;

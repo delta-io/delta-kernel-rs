@@ -1,5 +1,5 @@
 [package]
-name = "unity-catalog-delta-client-rest-impl"
+name = "unity-catalog-delta-rest-client"
 edition.workspace = true
 homepage.workspace = true
 keywords.workspace = true

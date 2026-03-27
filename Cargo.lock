@@ -1246,7 +1246,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unity-catalog-delta-client-api",
- "unity-catalog-delta-client-rest-impl",
+ "unity-catalog-delta-rest-client",
  "url",
  "uuid",
 ]
@@ -4473,7 +4473,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "unity-catalog-delta-client-rest-impl"
+name = "unity-catalog-delta-rest-client"
 version = "0.20.0"
 dependencies = [
  "chrono",

@@ -141,12 +141,12 @@ mod tests {
 
     use tracing::info;
     use unity_catalog_delta_client_api::{Commit, InMemoryCommitsClient, Operation, TableData};
-    use unity_catalog_delta_client_rest_impl::{UCClient, UCCommitsRestClient};
+    use unity_catalog_delta_rest_client::{UCClient, UCCommitsRestClient};
 
     use super::*;
 
     // We could just re-export UCClient's get_table to not require consumers to directly import
-    // unity_catalog_delta_client_rest_impl themselves.
+    // unity_catalog_delta_rest_client themselves.
     async fn get_table(
         client: &UCClient,
         table_name: &str,
@@ -174,7 +174,7 @@ mod tests {
 
         // build shared config
         let config =
-            unity_catalog_delta_client_rest_impl::ClientConfig::build(&endpoint, &token).build()?;
+            unity_catalog_delta_rest_client::ClientConfig::build(&endpoint, &token).build()?;
 
         // build clients
         let uc_client = UCClient::new(config.clone())?;
@@ -230,7 +230,7 @@ mod tests {
 
         // build shared config
         let config =
-            unity_catalog_delta_client_rest_impl::ClientConfig::build(&endpoint, &token).build()?;
+            unity_catalog_delta_rest_client::ClientConfig::build(&endpoint, &token).build()?;
 
         // build clients
         let client = UCClient::new(config.clone())?;

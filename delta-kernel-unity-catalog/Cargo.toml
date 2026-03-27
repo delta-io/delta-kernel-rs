@@ -32,6 +32,6 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 delta_kernel = { path = "../kernel", features = ["default-engine-rustls", "catalog-managed", "test-utils", "internal-api"] }
-unity-catalog-delta-client-rest-impl = { path = "../unity-catalog-delta-client-rest-impl", features = ["test-utils"] }
-unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api", features = ["test-utils"] }
+unity-catalog-delta-rest-client = { path = "../unity-catalog-delta-rest-client", features = ["test-utils"] }
+unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api" }
 tempfile = "3"

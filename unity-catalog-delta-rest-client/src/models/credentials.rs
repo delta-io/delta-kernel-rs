@@ -9,6 +9,7 @@ pub struct CredentialsRequest {
 }
 
 impl CredentialsRequest {
+    /// Create a new credentials request for the given table and operation.
     pub fn new(table_id: impl Into<String>, operation: Operation) -> Self {
         Self {
             table_id: table_id.into(),
