@@ -506,11 +506,10 @@ impl LogSegment {
                 crc_file.version, self.end_version
             ))
         );
-        // Convert to FileMeta with placeholder metadata (size=0, last_modified=0). This is
-        // safe because CRC files are only used downstream for version tracking and on-demand
-        // content reads via the URL. The `size` and `last_modified` fields are never accessed.
-        // (In contrast, commit files need real `last_modified` for CDF timestamps, and parquet
-        // files need real `size` to avoid extra HEAD requests on Azure.)
+        // Convert to FileMeta with placeholder metadata (size=0, last_modified=0).
+        // Only the URL matters for CRC files: downstream code uses it for version
+        // tracking and reading CRC content via `try_read_crc_file`. Neither `size`
+        // nor `last_modified` is ever accessed.
         let crc_file = ParsedLogPath {
             location: FileMeta {
                 location: crc_file.location,
