@@ -2570,7 +2570,10 @@ mod tests {
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
         let config = snapshot.metadata_configuration();
-        assert_eq!(config.get("io.unitycatalog.tableId"), Some(&"abc-123".to_string()));
+        assert_eq!(
+            config.get("io.unitycatalog.tableId"),
+            Some(&"abc-123".to_string())
+        );
         assert_eq!(config.get("myapp.setting"), Some(&"value".to_string()));
     }
 
@@ -2589,11 +2592,10 @@ mod tests {
 
     #[test]
     fn test_physical_to_logical_column_name_with_mapping() {
-        let field = StructField::new("user_id", crate::DataType::INTEGER, false)
-            .with_metadata([(
-                "delta.columnMapping.physicalName".to_string(),
-                MetadataValue::String("col-abc-123".to_string()),
-            )]);
+        let field = StructField::new("user_id", crate::DataType::INTEGER, false).with_metadata([(
+            "delta.columnMapping.physicalName".to_string(),
+            MetadataValue::String("col-abc-123".to_string()),
+        )]);
         let schema = crate::schema::StructType::new_unchecked(vec![field]);
 
         let physical_col = ColumnName::new(["col-abc-123"]);
@@ -2622,10 +2624,11 @@ mod tests {
 
     #[test]
     fn test_physical_to_logical_nested_struct_with_mapping() {
-        let inner_field = StructField::new("city", crate::DataType::STRING, true).with_metadata([(
-            "delta.columnMapping.physicalName".to_string(),
-            MetadataValue::String("col-inner-456".to_string()),
-        )]);
+        let inner_field =
+            StructField::new("city", crate::DataType::STRING, true).with_metadata([(
+                "delta.columnMapping.physicalName".to_string(),
+                MetadataValue::String("col-inner-456".to_string()),
+            )]);
         let inner_struct = StructType::new_unchecked(vec![inner_field]);
         let outer_field = StructField::new(
             "address",

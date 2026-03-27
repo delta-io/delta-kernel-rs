@@ -135,13 +135,11 @@ pub fn get_final_required_properties_for_uc(
         METASTORE_LAST_UPDATE_VERSION.to_string(),
         snapshot.version().to_string(),
     );
-    let timestamp = snapshot
-        .get_in_commit_timestamp(engine)?
-        .ok_or_else(|| {
-            delta_kernel::Error::generic(
-                "In-commit timestamp is required for UC catalog-managed tables but was not found",
-            )
-        })?;
+    let timestamp = snapshot.get_in_commit_timestamp(engine)?.ok_or_else(|| {
+        delta_kernel::Error::generic(
+            "In-commit timestamp is required for UC catalog-managed tables but was not found",
+        )
+    })?;
     properties.insert(
         METASTORE_LAST_COMMIT_TIMESTAMP.to_string(),
         timestamp.to_string(),
@@ -154,9 +152,7 @@ pub fn get_final_required_properties_for_uc(
             .map(|c| c.path().iter().map(|s| s.as_str()).collect())
             .collect();
         let json = serde_json::to_string(&column_arrays).map_err(|e| {
-            delta_kernel::Error::generic(format!(
-                "Failed to serialize clustering columns: {e}"
-            ))
+            delta_kernel::Error::generic(format!("Failed to serialize clustering columns: {e}"))
         })?;
         properties.insert("clusteringColumns".to_string(), json);
     }
@@ -297,7 +293,10 @@ mod tests {
             .expect("delta.lastCommitTimestamp should be present")
             .parse()
             .expect("timestamp should be a valid i64");
-        assert!(timestamp > 0, "ICT timestamp should be non-zero, got {timestamp}");
+        assert!(
+            timestamp > 0,
+            "ICT timestamp should be non-zero, got {timestamp}"
+        );
     }
 
     #[tokio::test]
