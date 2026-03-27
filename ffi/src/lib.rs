@@ -1669,8 +1669,10 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_with_old_snapshot() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
+        let path = "memory:///";
         // Create initial commit (version 0)
         add_commit(
+            path,
             storage.as_ref(),
             0,
             actions_to_string(vec![TestAction::Metadata]),
@@ -1678,7 +1680,6 @@ mod tests {
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let path = "memory:///";
 
         // Create initial snapshot at version 0
         let old_snapshot =
@@ -1688,12 +1689,14 @@ mod tests {
 
         // Add more commits to the table (version 1 and 2)
         add_commit(
+            path,
             storage.as_ref(),
             1,
             actions_to_string(vec![TestAction::Add("file1.parquet".into())]),
         )
         .await?;
         add_commit(
+            path,
             storage.as_ref(),
             2,
             actions_to_string(vec![TestAction::Add("file2.parquet".into())]),
@@ -1736,9 +1739,11 @@ mod tests {
     {
         use test_utils::add_staged_commit;
         let storage = Arc::new(InMemory::new());
+        let path = "memory:///";
 
         // Create initial commit (version 0)
         add_commit(
+            path,
             storage.as_ref(),
             0,
             actions_to_string(vec![TestAction::Metadata]),
@@ -1746,7 +1751,6 @@ mod tests {
         .await?;
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let path = "memory:///";
 
         // Create initial snapshot at version 0
         let old_snapshot =
@@ -1756,6 +1760,7 @@ mod tests {
 
         // Add staged commit (version 1)
         let commit1 = add_staged_commit(
+            path,
             storage.as_ref(),
             1,
             actions_to_string(vec![TestAction::Add("path1.parquet".into())]),
@@ -1764,6 +1769,7 @@ mod tests {
 
         // Add another staged commit (version 2)
         let commit2 = add_staged_commit(
+            path,
             storage.as_ref(),
             2,
             actions_to_string(vec![TestAction::Add("path2.parquet".into())]),
