@@ -5,6 +5,17 @@ use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData}
 use tracing::{debug, info};
 use unity_catalog_delta_client_api::{Commit, CommitClient, CommitRequest};
 
+/// Wire-format feature name for catalog-managed tables.
+const CATALOG_MANAGED_FEATURE: &str = "catalogManaged";
+/// Wire-format feature name for vacuum protocol check.
+const VACUUM_PROTOCOL_CHECK_FEATURE: &str = "vacuumProtocolCheck";
+/// Wire-format feature name for in-commit timestamps.
+const IN_COMMIT_TIMESTAMP_FEATURE: &str = "inCommitTimestamp";
+/// Metadata configuration key for the UC table ID.
+const UC_TABLE_ID_KEY: &str = "io.unitycatalog.tableId";
+/// Metadata configuration key to enable in-commit timestamps.
+const ENABLE_IN_COMMIT_TIMESTAMPS_KEY: &str = "delta.enableInCommitTimestamps";
+
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
 ///
@@ -34,12 +45,61 @@ impl<C: CommitClient> UCCommitter<C> {
         }
     }
 
-    /// Commit version 0 (table creation). Writes the version 0 commit file directly to the
-    /// published commit path.
-    // TODO: Validate commit metadata before writing. Ensure ICT is enabled and the UC table
-    // ID has not been tampered with.
+    /// Validates that the commit metadata contains all required properties for a UC
+    /// catalog-managed table creation. Returns an error if any required property is missing.
+    fn validate_version_0_properties(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
+        if !commit_metadata.has_writer_feature(CATALOG_MANAGED_FEATURE)
+            || !commit_metadata.has_reader_feature(CATALOG_MANAGED_FEATURE)
+        {
+            return Err(DeltaError::generic(
+                "UC catalog-managed table creation requires the 'catalogManaged' table feature \
+                 in both readerFeatures and writerFeatures",
+            ));
+        }
+        if !commit_metadata.has_writer_feature(VACUUM_PROTOCOL_CHECK_FEATURE) {
+            return Err(DeltaError::generic(
+                "UC catalog-managed table creation requires the 'vacuumProtocolCheck' table feature",
+            ));
+        }
+        if !commit_metadata.has_writer_feature(IN_COMMIT_TIMESTAMP_FEATURE) {
+            return Err(DeltaError::generic(
+                "UC catalog-managed table creation requires the 'inCommitTimestamp' table feature",
+            ));
+        }
+        let config = commit_metadata.metadata_configuration();
+        if !config.contains_key(UC_TABLE_ID_KEY) {
+            return Err(DeltaError::generic(format!(
+                "UC catalog-managed table creation requires '{UC_TABLE_ID_KEY}' in metadata configuration",
+            )));
+        }
+        if config.get(ENABLE_IN_COMMIT_TIMESTAMPS_KEY).map(String::as_str) != Some("true") {
+            return Err(DeltaError::generic(format!(
+                "UC catalog-managed table creation requires '{ENABLE_IN_COMMIT_TIMESTAMPS_KEY}=true' \
+                 in metadata configuration",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validates that catalog-managed status has not changed between the existing table state
+    /// and this commit. Prevents adding or removing catalog-managed status after table creation.
+    fn validate_no_catalog_managed_change(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
+        // For version >= 1, the table already exists. The commit_metadata carries the read
+        // snapshot's protocol. If the table is NOT catalog-managed, the UCCommitter should
+        // not be used. If the table IS catalog-managed, we verify the feature is still present.
+        if !commit_metadata.has_writer_feature(CATALOG_MANAGED_FEATURE) {
+            return Err(DeltaError::generic(
+                "UCCommitter requires the 'catalogManaged' table feature. The table's protocol \
+                 does not include this feature. Catalog-managed status cannot be changed after \
+                 table creation.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Commit version 0 (table creation). Validates that all required UC properties are present,
+    /// then writes the version 0 commit file directly to the published commit path.
     fn commit_version_0(
-        &self,
         engine: &dyn Engine,
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: &CommitMetadata,
@@ -49,6 +109,7 @@ impl<C: CommitClient> UCCommitter<C> {
             "commit_version_0 called with version {}",
             commit_metadata.version()
         );
+        Self::validate_version_0_properties(commit_metadata)?;
         let published_commit_path = commit_metadata.published_commit_path()?;
         match engine.json_handler().write_json_file(
             &published_commit_path,
@@ -68,7 +129,8 @@ impl<C: CommitClient> UCCommitter<C> {
         }
     }
 
-    /// Commit version >= 1. Writes a staged commit file and calls the UC commit API to ratify it.
+    /// Commit version >= 1. Validates catalog-managed status hasn't changed, writes a staged
+    /// commit file, and calls the UC commit API to ratify it.
     fn commit_version_non_zero(
         &self,
         engine: &dyn Engine,
@@ -82,6 +144,7 @@ impl<C: CommitClient> UCCommitter<C> {
             commit_metadata.version() != 0,
             "commit_version_non_zero called with version 0"
         );
+        Self::validate_no_catalog_managed_change(&commit_metadata)?;
         let staged_commit_path = commit_metadata.staged_commit_path()?;
         engine
             .json_handler()
@@ -186,11 +249,13 @@ impl<C: CommitClient + 'static> Committer for UCCommitter<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::fs;
+
     use delta_kernel::committer::{CatalogCommit, CommitMetadata};
     use delta_kernel::engine::default::DefaultEngine;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::Version;
-    use std::fs;
     use unity_catalog_delta_client_api::error::Result;
 
     struct MockCommitsClient;
@@ -201,11 +266,26 @@ mod tests {
         }
     }
 
+    /// Creates a valid catalog-managed CommitMetadata with all required UC features and properties.
+    fn catalog_managed_commit_metadata(table_root: url::Url, version: Version) -> CommitMetadata {
+        CommitMetadata::new_unchecked_with(
+            table_root,
+            version,
+            vec!["catalogManaged", "vacuumProtocolCheck"],
+            vec!["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"],
+            HashMap::from([
+                ("io.unitycatalog.tableId".to_string(), "test-table-id".to_string()),
+                ("delta.enableInCommitTimestamps".to_string(), "true".to_string()),
+            ]),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn commit_version_0_writes_published_commit() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
-        let commit_metadata = CommitMetadata::new_unchecked(table_root.clone(), 0).unwrap();
+        let commit_metadata = catalog_managed_commit_metadata(table_root.clone(), 0);
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
@@ -247,13 +327,105 @@ mod tests {
         fs::create_dir_all(&delta_log).unwrap();
         fs::write(delta_log.join("00000000000000000000.json"), "existing").unwrap();
 
-        let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
+        let commit_metadata = catalog_managed_commit_metadata(table_root, 0);
         let result = committer
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
             .unwrap();
         assert!(
             matches!(result, CommitResponse::Conflict { version: 0 }),
             "expected Conflict for version 0 when file exists, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn commit_version_0_rejects_missing_catalog_managed_feature() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
+        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
+
+        let err = committer
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("catalogManaged"),
+            "expected catalogManaged error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn commit_version_0_rejects_missing_table_id() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        // Has features but missing io.unitycatalog.tableId in config
+        let commit_metadata = CommitMetadata::new_unchecked_with(
+            table_root,
+            0,
+            vec!["catalogManaged", "vacuumProtocolCheck"],
+            vec!["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"],
+            HashMap::from([
+                ("delta.enableInCommitTimestamps".to_string(), "true".to_string()),
+            ]),
+        )
+        .unwrap();
+        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
+
+        let err = committer
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("io.unitycatalog.tableId"),
+            "expected tableId error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn commit_version_0_rejects_missing_ict_enablement() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        // Has features and tableId but missing delta.enableInCommitTimestamps=true
+        let commit_metadata = CommitMetadata::new_unchecked_with(
+            table_root,
+            0,
+            vec!["catalogManaged", "vacuumProtocolCheck"],
+            vec!["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"],
+            HashMap::from([
+                ("io.unitycatalog.tableId".to_string(), "test-id".to_string()),
+            ]),
+        )
+        .unwrap();
+        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
+
+        let err = committer
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("enableInCommitTimestamps"),
+            "expected ICT enablement error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn commit_version_non_zero_rejects_non_catalog_managed_table() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        // Version >= 1 but without catalogManaged feature (simulates downgrade attempt)
+        let commit_metadata = CommitMetadata::new_unchecked(table_root, 1).unwrap();
+        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+
+        let err = committer
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("catalogManaged"),
+            "expected catalogManaged error, got: {err}"
         );
     }
 
