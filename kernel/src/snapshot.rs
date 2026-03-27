@@ -36,6 +36,7 @@ use crate::{DeltaResult, Engine, Error, Version};
 mod builder;
 pub use builder::SnapshotBuilder;
 
+/// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
 
 /// File-level statistics for a table version.
@@ -501,7 +502,9 @@ impl Snapshot {
         let checkpoint_log_path = ParsedLogPath::try_from(file_meta)?.ok_or_else(|| {
             Error::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
-        let new_log_segment = self.log_segment.new_with_checkpoint(checkpoint_log_path)?;
+        let new_log_segment = self
+            .log_segment
+            .try_new_with_checkpoint(checkpoint_log_path)?;
         Ok(Arc::new(Snapshot::new_with_crc(
             new_log_segment,
             self.table_configuration().clone(),
@@ -780,9 +783,7 @@ impl Snapshot {
         match try_write_crc_file(engine, &crc_path.location, crc) {
             Ok(()) => {
                 info!("Wrote CRC file at {}", crc_path.location);
-                let new_log_segment = self
-                    .log_segment
-                    .new_with_crc_file(crc_path.into_filemeta())?;
+                let new_log_segment = self.log_segment.try_new_with_crc_file(crc_path)?;
                 let new_snapshot = Arc::new(Snapshot::new_with_crc(
                     new_log_segment,
                     self.table_configuration().clone(),

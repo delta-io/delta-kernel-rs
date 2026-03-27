@@ -449,13 +449,17 @@ impl LogSegment {
     }
 
     /// Creates a new LogSegment reflecting a checkpoint written at this segment's version.
-    /// The checkpoint must be at `end_version`.
-    pub(crate) fn new_with_checkpoint(&self, checkpoint: ParsedLogPath) -> DeltaResult<Self> {
+    /// The checkpoint must be at `end_version`. Kernel does not write multi-part checkpoints,
+    /// so the checkpoint must be a single file (classic parquet or V2 UUID).
+    pub(crate) fn try_new_with_checkpoint(&self, checkpoint: ParsedLogPath) -> DeltaResult<Self> {
         require!(
-            checkpoint.is_checkpoint(),
+            matches!(
+                checkpoint.file_type,
+                LogPathFileType::SinglePartCheckpoint | LogPathFileType::UuidCheckpoint
+            ),
             Error::internal_error(format!(
-                "Cannot update LogSegment with checkpoint. Path is not a checkpoint file. \
-                Path: {}, Type: {:?}.",
+                "Cannot update LogSegment with checkpoint. Path is not a single-file \
+                checkpoint. Path: {}, Type: {:?}.",
                 checkpoint.location.location, checkpoint.file_type
             ))
         );
@@ -468,9 +472,8 @@ impl LogSegment {
             ))
         );
 
-        let v = checkpoint.version;
         let mut new_log_segment = self.clone();
-        new_log_segment.checkpoint_version = Some(v);
+        new_log_segment.checkpoint_version = Some(checkpoint.version);
         new_log_segment.listed.checkpoint_parts = vec![checkpoint];
         // A snapshot at version N only contains commits and compactions at versions <= N,
         // so a checkpoint at N covers everything and we can clear them entirely.
@@ -486,13 +489,13 @@ impl LogSegment {
 
     /// Creates a new LogSegment with the given CRC file recorded as the latest.
     /// The CRC file must be at `end_version`.
-    pub(crate) fn new_with_crc_file(&self, crc_file: ParsedLogPath) -> DeltaResult<Self> {
+    pub(crate) fn try_new_with_crc_file(&self, crc_file: ParsedLogPath<Url>) -> DeltaResult<Self> {
         require!(
             crc_file.file_type == LogPathFileType::Crc,
             Error::internal_error(format!(
                 "Cannot update LogSegment with CRC. Path is not a CRC file. \
                 Path: {}, Type: {:?}.",
-                crc_file.location.location, crc_file.file_type
+                crc_file.location, crc_file.file_type
             ))
         );
         require!(
@@ -503,6 +506,22 @@ impl LogSegment {
                 crc_file.version, self.end_version
             ))
         );
+        // Convert to FileMeta with placeholder metadata (size=0, last_modified=0). This is
+        // safe because CRC files are only used downstream for version tracking and on-demand
+        // content reads via the URL. The `size` and `last_modified` fields are never accessed.
+        // (In contrast, commit files need real `last_modified` for CDF timestamps, and parquet
+        // files need real `size` to avoid extra HEAD requests on Azure.)
+        let crc_file = ParsedLogPath {
+            location: FileMeta {
+                location: crc_file.location,
+                last_modified: 0,
+                size: 0,
+            },
+            filename: crc_file.filename,
+            extension: crc_file.extension,
+            version: crc_file.version,
+            file_type: crc_file.file_type,
+        };
         let mut new_log_segment = self.clone();
         new_log_segment.listed.latest_crc_file = Some(crc_file);
         Ok(new_log_segment)

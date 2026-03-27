@@ -9,7 +9,7 @@ use delta_kernel::crc::{Crc, FileStatsValidity};
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::snapshot::{ChecksumWriteResult, FileStats, Snapshot};
+use delta_kernel::snapshot::{ChecksumWriteResult, FileStats, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Engine};
@@ -256,7 +256,7 @@ async fn test_post_commit_crc_chains_only_if_read_snapshot_has_crc(
 /// Writes the in-memory CRC to disk, reloads a fresh snapshot, and asserts that the
 /// round-tripped CRC matches the in-memory one. Returns the loaded CRC for further assertions.
 fn write_and_verify_crc(
-    snapshot: &Arc<Snapshot>,
+    snapshot: &SnapshotRef,
     table_path: &str,
     engine: &dyn delta_kernel::Engine,
 ) -> Crc {

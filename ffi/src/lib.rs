@@ -807,6 +807,8 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
 ///
 /// This writes the checkpoint parquet file and the `_last_checkpoint` file.
 ///
+// TODO: Expose the updated snapshot via a new FFI function that returns a snapshot handle.
+///
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles.
