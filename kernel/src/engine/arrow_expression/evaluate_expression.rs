@@ -16,7 +16,7 @@ use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
-use crate::arrow::compute::{and_kleene, is_not_null, is_null, not, or_kleene};
+use crate::arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
     Schema as ArrowSchema, TimeUnit,
@@ -381,6 +381,107 @@ pub fn evaluate_expression(
     }
 }
 
+/// Direction for casting between Arrow view and non-view string/binary types.
+#[derive(Clone, Copy)]
+enum ViewCast {
+    ToView,
+    ToNonView,
+}
+
+/// Casts list element types between view and non-view string/binary variants.
+///
+/// When [`ViewCast::ToView`], non-view string/binary element types are converted to their view
+/// equivalents (e.g. `List<Utf8>` -> `List<Utf8View>`). View container types (`ListView`,
+/// `LargeListView`) are preserved.
+///
+/// When [`ViewCast::ToNonView`], view element types are converted to their non-view equivalents
+/// (e.g. `List<Utf8View>` -> `List<Utf8>`). Additionally, view container types are always
+/// converted to their non-view equivalents (e.g. `ListView<Int32>` -> `List<Int32>`), even
+/// when the element type does not change.
+///
+/// Nested type conversion is not supported.
+fn cast_list_elements(
+    vals: &Arc<dyn Array>,
+    field: &Arc<ArrowField>,
+    dir: ViewCast,
+) -> DeltaResult<Arc<dyn Array>> {
+    let to_type = match dir {
+        ViewCast::ToView => match field.data_type() {
+            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => ArrowDataType::Utf8View,
+            ArrowDataType::Binary | ArrowDataType::LargeBinary => ArrowDataType::BinaryView,
+            _ => return Ok(vals.clone()),
+        },
+        ViewCast::ToNonView => match field.data_type() {
+            ArrowDataType::Utf8View => ArrowDataType::Utf8,
+            ArrowDataType::BinaryView => ArrowDataType::Binary,
+            other => {
+                if !matches!(
+                    vals.data_type(),
+                    ArrowDataType::ListView(_) | ArrowDataType::LargeListView(_)
+                ) {
+                    return Ok(vals.clone());
+                }
+                // Container is a view type but element is not -- preserve element type,
+                // cast only the container (ListView -> List, LargeListView -> LargeList).
+                other.clone()
+            }
+        },
+    };
+    let new_field = Arc::new(field.as_ref().clone().with_data_type(to_type));
+    let container = match (vals.data_type(), dir) {
+        (ArrowDataType::List(_), _) => ArrowDataType::List(new_field),
+        (ArrowDataType::LargeList(_), _) => ArrowDataType::LargeList(new_field),
+        (ArrowDataType::ListView(_), ViewCast::ToView) => ArrowDataType::ListView(new_field),
+        (ArrowDataType::ListView(_), ViewCast::ToNonView) => ArrowDataType::List(new_field),
+        (ArrowDataType::LargeListView(_), ViewCast::ToView) => {
+            ArrowDataType::LargeListView(new_field)
+        }
+        (ArrowDataType::LargeListView(_), ViewCast::ToNonView) => {
+            ArrowDataType::LargeList(new_field)
+        }
+        (dt, _) => {
+            return Err(Error::generic(format!(
+                "cast_list_elements: expected a list type, got {dt:?}"
+            )))
+        }
+    };
+    Ok(cast(vals, &container)?)
+}
+
+/// This function converts ArrowView types to their non-view type equivalents. This is used for [`evaluate_predicate`] conversion,  
+/// currently does not support nested conversion. This only supports limited conversions (see code for exactly which).
+fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
+    match vals.data_type() {
+        ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
+        ArrowDataType::LargeList(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
+        ArrowDataType::ListView(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
+        ArrowDataType::LargeListView(field) => {
+            cast_list_elements(&vals, field, ViewCast::ToNonView)
+        }
+        ArrowDataType::Utf8View => Ok(cast(&vals, &ArrowDataType::Utf8)?),
+        ArrowDataType::BinaryView => Ok(cast(&vals, &ArrowDataType::Binary)?),
+        _ => Ok(vals),
+    }
+}
+
+/// This function converts  Arrow types to their Arrow view type equivalents. This is used for [`evaluate_predicate`] conversion,  
+/// currently does not support nested conversion. This only supports limited conversions (see code for exactly which).  
+fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
+    match vals.data_type() {
+        ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToView),
+        ArrowDataType::LargeList(field) => cast_list_elements(&vals, field, ViewCast::ToView),
+        ArrowDataType::ListView(field) => cast_list_elements(&vals, field, ViewCast::ToView),
+        ArrowDataType::LargeListView(field) => cast_list_elements(&vals, field, ViewCast::ToView),
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => {
+            Ok(cast(&vals, &ArrowDataType::Utf8View)?)
+        }
+        ArrowDataType::Binary | ArrowDataType::LargeBinary => {
+            Ok(cast(&vals, &ArrowDataType::BinaryView)?)
+        }
+        _ => Ok(vals),
+    }
+}
+
 /// Evaluates a (possibly inverted) kernel predicate over a record batch
 pub fn evaluate_predicate(
     predicate: &Predicate,
@@ -425,11 +526,16 @@ pub fn evaluate_predicate(
             let eval_in = || match (left, right) {
                 (Expression::Literal(_), Expression::Column(_)) => {
                     let left = evaluate_expression(left, batch, None)?;
+                    let left = arrow_convert_to_non_view_type(left)?;
+
                     let right = evaluate_expression(right, batch, None)?;
+                    let right = arrow_convert_to_non_view_type(right)?;
                     if let Some(string_arr) = left.as_string_opt::<i32>() {
                         if let Some(list_arr) = right.as_list_opt::<i32>() {
-                            let result = in_list_utf8(string_arr, list_arr)?;
-                            return Ok(result);
+                            if list_arr.value_type() == ArrowDataType::Utf8 {
+                                let result = in_list_utf8(string_arr, list_arr)?;
+                                return Ok(result);
+                            }
                         }
                     }
 
@@ -491,6 +597,18 @@ pub fn evaluate_predicate(
 
             let left = evaluate_expression(left, batch, None)?;
             let right = evaluate_expression(right, batch, None)?;
+
+            // If the types differ (e.g. one side is a view type and the other is not),
+            // normalize both to view types since benchamrking results show that casting from non-view to view type is faster
+            // than casting from view type to non-view type.
+            let (left, right) = if left.data_type() == right.data_type() {
+                (left, right)
+            } else {
+                (
+                    arrow_convert_to_view_type(left)?,
+                    arrow_convert_to_view_type(right)?,
+                )
+            };
             Ok(eval_fn(&left, &right)?)
         }
         Junction(JunctionPredicate { op, preds }) => {
