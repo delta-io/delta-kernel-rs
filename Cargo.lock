@@ -1245,8 +1245,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "unity-catalog-client-api",
- "unity-catalog-client-rest-impl",
+ "unity-catalog-delta-client-api",
+ "unity-catalog-delta-client-rest-impl",
  "url",
  "uuid",
 ]
@@ -1341,7 +1341,7 @@ dependencies = [
  "tracing-core",
  "tracing-subscriber",
  "trybuild",
- "unity-catalog-client-api",
+ "unity-catalog-delta-client-api",
  "url",
 ]
 
@@ -4462,7 +4462,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
-name = "unity-catalog-client-api"
+name = "unity-catalog-delta-client-api"
 version = "0.20.0"
 dependencies = [
  "chrono",
@@ -4473,7 +4473,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "unity-catalog-client-rest-impl"
+name = "unity-catalog-delta-client-rest-impl"
 version = "0.20.0"
 dependencies = [
  "chrono",
@@ -4485,7 +4485,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "unity-catalog-client-api",
+ "unity-catalog-delta-client-api",
  "url",
 ]
 

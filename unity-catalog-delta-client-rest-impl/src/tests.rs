@@ -1,4 +1,4 @@
-use unity_catalog_client_api::{CommitsRequest, Operation};
+use unity_catalog_delta_client_api::{CommitsRequest, Operation};
 
 #[test]
 fn test_commits_request_builder() {

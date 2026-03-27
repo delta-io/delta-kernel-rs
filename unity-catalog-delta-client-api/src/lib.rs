@@ -16,7 +16,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! unity-catalog-client-api = { version = "...", features = ["test-utils"] }
+//! unity-catalog-delta-client-api = { version = "...", features = ["test-utils"] }
 //! ```
 
 pub mod clients;

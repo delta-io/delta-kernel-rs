@@ -4,7 +4,7 @@ use url::Url;
 
 use crate::config::ClientConfig;
 use crate::http::{build_http_client, execute_with_retry, handle_response};
-use unity_catalog_client_api::{
+use unity_catalog_delta_client_api::{
     CommitClient, CommitRequest, CommitsRequest, CommitsResponse, GetCommitsClient,
 };
 
@@ -45,7 +45,7 @@ impl GetCommitsClient for UCCommitsRestClient {
     async fn get_commits(
         &self,
         request: CommitsRequest,
-    ) -> unity_catalog_client_api::Result<CommitsResponse> {
+    ) -> unity_catalog_delta_client_api::Result<CommitsResponse> {
         let result: crate::error::Result<CommitsResponse> = async {
             let url = self.base_url.join("delta/preview/commits")?;
             let response = execute_with_retry(&self.config, || {
@@ -64,7 +64,7 @@ impl GetCommitsClient for UCCommitsRestClient {
 
 impl CommitClient for UCCommitsRestClient {
     #[instrument(skip(self))]
-    async fn commit(&self, request: CommitRequest) -> unity_catalog_client_api::Result<()> {
+    async fn commit(&self, request: CommitRequest) -> unity_catalog_delta_client_api::Result<()> {
         let result: crate::error::Result<()> = async {
             let url = self.base_url.join("delta/preview/commits")?;
             let response = execute_with_retry(&self.config, || {

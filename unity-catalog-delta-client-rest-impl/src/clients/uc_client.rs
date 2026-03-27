@@ -1,11 +1,11 @@
 // TODO(https://github.com/delta-io/delta-kernel-rs/issues/2251): Replace UCClient with
 // trait-based clients (GetTableClient, GetCredentialsClient) once those traits are added
-// to unity-catalog-client-api.
+// to unity-catalog-delta-client-api.
 use reqwest::StatusCode;
 use tracing::instrument;
 use url::Url;
 
-use unity_catalog_client_api::{Operation, TemporaryTableCredentials};
+use unity_catalog_delta_client_api::{Operation, TemporaryTableCredentials};
 
 use crate::config::ClientConfig;
 use crate::error::Result;
@@ -49,9 +49,10 @@ impl UCClient {
             execute_with_retry(&self.config, || self.http_client.get(url.clone()).send()).await?;
 
         match response.status() {
-            StatusCode::NOT_FOUND => {
-                Err(unity_catalog_client_api::Error::TableNotFound(table_name.to_string()).into())
-            }
+            StatusCode::NOT_FOUND => Err(unity_catalog_delta_client_api::Error::TableNotFound(
+                table_name.to_string(),
+            )
+            .into()),
             _ => handle_response(response).await,
         }
     }

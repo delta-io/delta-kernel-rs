@@ -9,9 +9,9 @@ members = [
     "test-utils",
     "feature-tests",
     "mem-test",
-    "unity-catalog-client-rest-impl", # WIP: this is an experimental UC client for catalog-managed table work
+    "unity-catalog-delta-client-rest-impl", # WIP: this is an experimental UC client for catalog-managed table work
     "delta-kernel-unity-catalog", # WIP: this is an experimental UC catalog implementation
-    "unity-catalog-client-api", # WIP: transport-agnostic UC client API traits
+    "unity-catalog-delta-client-api", # WIP: transport-agnostic UC client API traits
 ]
 # note that in addition to the members above, the workspace includes examples:
 # - inspect-table
