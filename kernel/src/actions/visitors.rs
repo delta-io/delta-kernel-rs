@@ -13,6 +13,7 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 use super::deletion_vector::DeletionVectorDescriptor;
+use super::set_transaction::is_set_txn_expired;
 use super::*;
 use crate::log_segment::DomainMetadataMap;
 
@@ -363,13 +364,8 @@ impl RowVisitor for SetTransactionVisitor {
                     .is_none_or(|requested| requested.eq(&app_id))
                 {
                     let txn = SetTransactionVisitor::visit_txn(i, app_id, getters)?;
-                    // Check retention: filter out transactions that are old
-                    // If last_updated is None, the transaction never expires
-                    match self.expiration_timestamp.zip(txn.last_updated) {
-                        Some((expiration_ts, last_updated)) if last_updated <= expiration_ts => {
-                            continue
-                        }
-                        _ => (),
+                    if is_set_txn_expired(self.expiration_timestamp, txn.last_updated) {
+                        continue;
                     }
                     if !self.set_transactions.contains_key(&txn.app_id) {
                         self.set_transactions.insert(txn.app_id.clone(), txn);
