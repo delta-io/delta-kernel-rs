@@ -586,23 +586,6 @@ pub fn evaluate_predicate(
                     let exists = ad.array_elements().contains(lit);
                     Ok(BooleanArray::from(vec![exists]))
                 }
-                // Column IN (literal_array) - check if each column value is in the set of literals
-                (Expression::Column(_), Expression::Literal(Scalar::Array(ad))) => {
-                    let col_array = evaluate_expression(left, batch, None)?;
-                    let elements = ad.array_elements();
-                    if elements.is_empty() {
-                        // Empty IN list: nothing matches
-                        return Ok(BooleanArray::from(vec![false; col_array.len()]));
-                    }
-                    // Build result by OR'ing equality checks for each literal
-                    let mut result = BooleanArray::from(vec![false; col_array.len()]);
-                    for scalar in elements {
-                        let scalar_array = scalar.to_array(col_array.len())?;
-                        let eq_result = eq(&col_array, &scalar_array)?;
-                        result = or_kleene(&result, &eq_result)?;
-                    }
-                    Ok(result)
-                }
                 (l, r) => Err(Error::invalid_expression(format!(
                     "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
                 ))),
