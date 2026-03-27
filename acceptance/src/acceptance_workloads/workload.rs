@@ -8,7 +8,6 @@ use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
-use delta_kernel::expressions::Predicate;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, Error, Version};
