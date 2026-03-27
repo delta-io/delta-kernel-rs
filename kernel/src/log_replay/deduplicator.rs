@@ -16,16 +16,20 @@ use std::hash::Hash;
 use hashbrown::HashSet;
 
 use crate::engine_data::{GetData, TypedGetData};
-use crate::log_replay::FileActionKey;
+use crate::log_replay::{DvUniqueId, FileActionKey};
 use crate::DeltaResult;
 
-/// Borrowed view of a deletion vector, used as part of [`ExtractedFileAction`] for zero-copy
-/// dedup lookups. All fields are borrowed from column data; no heap allocation is needed.
+/// Borrowed view of a deletion vector identity, used as part of [`ExtractedFileAction`] for
+/// zero-copy dedup lookups. All string data is borrowed from column data; no heap allocation
+/// is needed. Mirrors [`DvUniqueId`] but with `&str` instead of `String`.
 #[derive(Debug, Hash)]
-pub(crate) struct DvKeyRef<'a> {
-    pub(crate) storage_type: &'a str,
-    pub(crate) path_or_inline_dv: &'a str,
-    pub(crate) offset: Option<i32>,
+pub(crate) enum DvUniqueIdRef<'a> {
+    /// Inline DV: the bitmap is base85-encoded directly in the string. No offset.
+    Inline(&'a str),
+    /// UUID-based DV: stored in a file relative to the table directory.
+    Uuid(&'a str, i32),
+    /// Absolute-path DV: stored at an absolute path.
+    Path(&'a str, i32),
 }
 
 /// A file action extracted from a batch row. All fields are borrowed from column data —
@@ -34,8 +38,8 @@ pub(crate) struct DvKeyRef<'a> {
 pub(crate) struct ExtractedFileAction<'a> {
     /// Borrowed path from the action batch column data.
     pub(crate) path: &'a str,
-    /// Borrowed deletion vector fields, if present.
-    pub(crate) dv: Option<DvKeyRef<'a>>,
+    /// Borrowed deletion vector identity, if present.
+    pub(crate) dv: Option<DvUniqueIdRef<'a>>,
     /// `true` for add actions, `false` for remove actions.
     pub(crate) is_add: bool,
 }
@@ -56,10 +60,12 @@ impl hashbrown::Equivalent<FileActionKey> for ExtractedFileAction<'_> {
         self.path == key.path
             && match (&self.dv, &key.dv) {
                 (None, None) => true,
-                (Some(r), Some(o)) => {
-                    r.storage_type == o.storage_type
-                        && r.path_or_inline_dv == o.path_or_inline_dv
-                        && r.offset == o.offset
+                (Some(DvUniqueIdRef::Inline(s)), Some(DvUniqueId::Inline(o))) => s == o,
+                (Some(DvUniqueIdRef::Uuid(s, so)), Some(DvUniqueId::Uuid(o, oo))) => {
+                    s == o && so == oo
+                }
+                (Some(DvUniqueIdRef::Path(s, so)), Some(DvUniqueId::Path(o, oo))) => {
+                    s == o && so == oo
                 }
                 _ => false,
             }
@@ -94,33 +100,47 @@ pub(crate) trait Deduplicator {
     /// (read-only).
     fn is_log_batch(&self) -> bool;
 
-    /// Extracts the deletion vector fields as a borrowed [`DvKeyRef`] if a DV is present.
+    /// Extracts the deletion vector as a borrowed [`DvUniqueIdRef`] if a DV is present.
     ///
     /// Reads three consecutive getter columns starting at `dv_start_index`:
-    /// - `dv_start_index` — `deletionVector.storageType`
+    /// - `dv_start_index` — `deletionVector.storageType` (`"u"`, `"i"`, or `"p"`)
     /// - `dv_start_index + 1` — `deletionVector.pathOrInlineDv`
-    /// - `dv_start_index + 2` — `deletionVector.offset` (optional)
+    /// - `dv_start_index + 2` — `deletionVector.offset` (absent for inline; defaults to `0` otherwise)
     ///
-    /// All returned fields borrow from `getters`, so no heap allocation occurs.
+    /// All returned string fields borrow from `getters`, so no heap allocation occurs.
     fn extract_dv_key<'a>(
         &self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
         dv_start_index: usize,
-    ) -> DeltaResult<Option<DvKeyRef<'a>>> {
+    ) -> DeltaResult<Option<DvUniqueIdRef<'a>>> {
         let Some(storage_type) =
             getters[dv_start_index].get_opt(i, "deletionVector.storageType")?
         else {
             return Ok(None);
         };
-        let path_or_inline_dv =
-            getters[dv_start_index + 1].get(i, "deletionVector.pathOrInlineDv")?;
-        let offset = getters[dv_start_index + 2].get_opt(i, "deletionVector.offset")?;
-        Ok(Some(DvKeyRef {
-            storage_type,
-            path_or_inline_dv,
-            offset,
-        }))
+        let path = getters[dv_start_index + 1].get(i, "deletionVector.pathOrInlineDv")?;
+        let dv = match storage_type {
+            "i" => DvUniqueIdRef::Inline(path),
+            "u" => {
+                let offset = getters[dv_start_index + 2]
+                    .get_opt(i, "deletionVector.offset")?
+                    .unwrap_or(0);
+                DvUniqueIdRef::Uuid(path, offset)
+            }
+            "p" => {
+                let offset = getters[dv_start_index + 2]
+                    .get_opt(i, "deletionVector.offset")?
+                    .unwrap_or(0);
+                DvUniqueIdRef::Path(path, offset)
+            }
+            other => {
+                return Err(crate::Error::generic(format!(
+                    "unknown deletionVector.storageType: {other:?}"
+                )))
+            }
+        };
+        Ok(Some(dv))
     }
 }
 
