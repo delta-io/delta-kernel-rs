@@ -960,7 +960,7 @@ impl Snapshot {
     /// See also [`get_in_commit_timestamp`] for ICT-only semantics.
     ///
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
-    #[allow(unused)]
+    #[internal_api]
     pub(crate) fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         match self
             .table_configuration()
