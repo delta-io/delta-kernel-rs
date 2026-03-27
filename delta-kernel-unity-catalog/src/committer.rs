@@ -4,16 +4,10 @@ use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, Publish
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
 use unity_catalog_delta_client_api::{Commit, CommitClient, CommitRequest};
 
-/// Wire-format feature name for catalog-managed tables.
-const CATALOG_MANAGED_FEATURE: &str = "catalogManaged";
-/// Wire-format feature name for vacuum protocol check.
-const VACUUM_PROTOCOL_CHECK_FEATURE: &str = "vacuumProtocolCheck";
-/// Wire-format feature name for in-commit timestamps.
-const IN_COMMIT_TIMESTAMP_FEATURE: &str = "inCommitTimestamp";
-/// Metadata configuration key for the UC table ID.
-const UC_TABLE_ID_KEY: &str = "io.unitycatalog.tableId";
-/// Metadata configuration key to enable in-commit timestamps.
-const ENABLE_IN_COMMIT_TIMESTAMPS_KEY: &str = "delta.enableInCommitTimestamps";
+use crate::constants::{
+    CATALOG_MANAGED_FEATURE, ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_FEATURE,
+    UC_TABLE_ID_KEY, VACUUM_PROTOCOL_CHECK_FEATURE,
+};
 
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
@@ -55,9 +49,12 @@ impl<C: CommitClient> UCCommitter<C> {
                  in both readerFeatures and writerFeatures",
             ));
         }
-        if !commit_metadata.has_writer_feature(VACUUM_PROTOCOL_CHECK_FEATURE) {
+        if !commit_metadata.has_writer_feature(VACUUM_PROTOCOL_CHECK_FEATURE)
+            || !commit_metadata.has_reader_feature(VACUUM_PROTOCOL_CHECK_FEATURE)
+        {
             return Err(DeltaError::generic(
-                "UC catalog-managed table creation requires the 'vacuumProtocolCheck' table feature",
+                "UC catalog-managed table creation requires the 'vacuumProtocolCheck' table feature \
+                 in both readerFeatures and writerFeatures",
             ));
         }
         if !commit_metadata.has_writer_feature(IN_COMMIT_TIMESTAMP_FEATURE) {
@@ -71,9 +68,9 @@ impl<C: CommitClient> UCCommitter<C> {
                 "UC catalog-managed table creation requires '{UC_TABLE_ID_KEY}' in metadata configuration",
             )));
         }
-        if config.get(ENABLE_IN_COMMIT_TIMESTAMPS_KEY).map(String::as_str) != Some("true") {
+        if config.get(ENABLE_IN_COMMIT_TIMESTAMPS).map(String::as_str) != Some("true") {
             return Err(DeltaError::generic(format!(
-                "UC catalog-managed table creation requires '{ENABLE_IN_COMMIT_TIMESTAMPS_KEY}=true' \
+                "UC catalog-managed table creation requires '{ENABLE_IN_COMMIT_TIMESTAMPS}=true' \
                  in metadata configuration",
             )));
         }
@@ -87,11 +84,12 @@ impl<C: CommitClient> UCCommitter<C> {
         // snapshot's protocol. If the table is NOT catalog-managed, the UCCommitter should
         // not be used (kernel enforces this). If the table IS catalog-managed, we verify
         // the feature is still present (it cannot be removed once added).
-        if !commit_metadata.has_writer_feature(CATALOG_MANAGED_FEATURE) {
+        if !commit_metadata.has_writer_feature(CATALOG_MANAGED_FEATURE)
+            || !commit_metadata.has_reader_feature(CATALOG_MANAGED_FEATURE)
+        {
             return Err(DeltaError::generic(
-                "UCCommitter requires the 'catalogManaged' table feature. The table's protocol \
-                 does not include this feature. Catalog-managed status cannot be changed after \
-                 table creation.",
+                "UCCommitter requires the 'catalogManaged' table feature in both readerFeatures \
+                 and writerFeatures. Catalog-managed status cannot be changed after table creation.",
             ));
         }
         Ok(())

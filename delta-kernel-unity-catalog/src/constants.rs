@@ -20,3 +20,9 @@ pub(crate) const MIN_WRITER_VERSION_KEY: &str = "delta.minWriterVersion";
 pub(crate) const METASTORE_LAST_UPDATE_VERSION: &str = "delta.lastUpdateVersion";
 /// UC property for the last commit timestamp.
 pub(crate) const METASTORE_LAST_COMMIT_TIMESTAMP: &str = "delta.lastCommitTimestamp";
+/// Feature name for catalog-managed tables (wire format).
+pub(crate) const CATALOG_MANAGED_FEATURE: &str = "catalogManaged";
+/// Feature name for vacuum protocol check (wire format).
+pub(crate) const VACUUM_PROTOCOL_CHECK_FEATURE: &str = "vacuumProtocolCheck";
+/// Feature name for in-commit timestamps (wire format).
+pub(crate) const IN_COMMIT_TIMESTAMP_FEATURE: &str = "inCommitTimestamp";
