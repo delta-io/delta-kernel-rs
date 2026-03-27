@@ -1284,11 +1284,8 @@ mod tests {
 
     #[test]
     fn physical_to_logical_not_found() {
-        let schema = StructType::new_unchecked(vec![StructField::new(
-            "id",
-            DataType::INTEGER,
-            false,
-        )]);
+        let schema =
+            StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
         let physical_col = ColumnName::new(["nonexistent"]);
         let result =
             physical_to_logical_column_name(&schema, &physical_col, ColumnMappingMode::None);
@@ -1301,21 +1298,17 @@ mod tests {
 
     #[test]
     fn physical_to_logical_nested_struct_with_mapping() {
-        let inner_field =
-            StructField::new("city", DataType::STRING, true).with_metadata([(
-                "delta.columnMapping.physicalName".to_string(),
-                MetadataValue::String("col-inner-456".to_string()),
-            )]);
-        let inner_struct = StructType::new_unchecked(vec![inner_field]);
-        let outer_field = StructField::new(
-            "address",
-            DataType::Struct(Box::new(inner_struct)),
-            true,
-        )
-        .with_metadata([(
+        let inner_field = StructField::new("city", DataType::STRING, true).with_metadata([(
             "delta.columnMapping.physicalName".to_string(),
-            MetadataValue::String("col-outer-123".to_string()),
+            MetadataValue::String("col-inner-456".to_string()),
         )]);
+        let inner_struct = StructType::new_unchecked(vec![inner_field]);
+        let outer_field =
+            StructField::new("address", DataType::Struct(Box::new(inner_struct)), true)
+                .with_metadata([(
+                    "delta.columnMapping.physicalName".to_string(),
+                    MetadataValue::String("col-outer-123".to_string()),
+                )]);
         let schema = StructType::new_unchecked(vec![outer_field]);
 
         let physical_col = ColumnName::new(["col-outer-123", "col-inner-456"]);
@@ -1327,11 +1320,8 @@ mod tests {
 
     #[test]
     fn physical_to_logical_non_struct_intermediate_errors() {
-        let schema = StructType::new_unchecked(vec![StructField::new(
-            "id",
-            DataType::INTEGER,
-            false,
-        )]);
+        let schema =
+            StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
         let physical_col = ColumnName::new(["id", "nested"]);
         let result =
             physical_to_logical_column_name(&schema, &physical_col, ColumnMappingMode::None);

@@ -2541,5 +2541,4 @@ mod tests {
         );
         assert_eq!(config.get("myapp.setting"), Some(&"value".to_string()));
     }
-
 }
