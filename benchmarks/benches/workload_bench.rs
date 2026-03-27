@@ -24,9 +24,8 @@ fn workload_benchmarks(c: &mut Criterion) {
     };
 
     let reporter = Arc::new(CountingReporter::new());
-    let runtime = Arc::new(
-        tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"),
-    );
+    let runtime =
+        Arc::new(tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"));
 
     for workload in &workloads {
         match &workload.spec {
