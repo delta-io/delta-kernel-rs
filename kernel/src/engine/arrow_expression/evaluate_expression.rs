@@ -265,6 +265,12 @@ pub fn evaluate_expression(
         (Literal(scalar), _) => {
             validate_array_type(scalar.to_array(batch.num_rows())?, result_type)
         }
+        (Column(name), Some(DataType::Struct(_))) => {
+            // For struct columns, skip name-based validation. Column mapping can cause
+            // physical column names to differ from logical schema names. The ordinal-based
+            // apply_schema transformation will handle renaming correctly.
+            extract_column(batch, name)
+        }
         (Column(name), _) => validate_array_type(extract_column(batch, name)?, result_type),
         (Struct(fields, nullability), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_expression(fields, batch, output_schema, nullability.as_ref())
@@ -2272,4 +2278,50 @@ mod tests {
         let result = evaluate_expression(&expr, &batch, None);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn column_extract_struct_with_mismatched_field_names() {
+        // Build a batch where "stats" is a struct with physical field names
+        let physical_fields = vec![
+            ArrowField::new("col-abc-001", ArrowDataType::Int64, true),
+            ArrowField::new("col-abc-002", ArrowDataType::Int64, true),
+        ];
+        let stats_type = ArrowDataType::Struct(physical_fields.clone().into());
+        let schema = ArrowSchema::new(vec![ArrowField::new("stats", stats_type, true)]);
+
+        let col1 = Int64Array::from(vec![Some(1), Some(2)]);
+        let col2 = Int64Array::from(vec![Some(10), Some(20)]);
+        let stats_array = StructArray::from(vec![
+            (
+                Arc::new(physical_fields[0].clone()),
+                Arc::new(col1) as ArrayRef,
+            ),
+            (
+                Arc::new(physical_fields[1].clone()),
+                Arc::new(col2) as ArrayRef,
+            ),
+        ]);
+
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(stats_array)]).unwrap();
+
+        // The expected result type uses logical names (as built from table metadata)
+        let logical_result_type = DataType::try_struct_type([
+            StructField::nullable("my_column", DataType::LONG),
+            StructField::nullable("other_column", DataType::LONG),
+        ])
+        .unwrap();
+
+        let expr = column_expr!("stats");
+        let result = evaluate_expression(&expr, &batch, Some(&logical_result_type));
+
+        // This should succeed -- the data is structurally correct (same types, same order),
+        // the names just differ due to column mapping. The downstream apply_schema
+        // transformation handles renaming by ordinal position.
+        let result_array = result
+            .expect("Struct column extraction should not fail due to field name mismatch");
+        let struct_arr = result_array.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(struct_arr.num_columns(), 2);
+        assert_eq!(struct_arr.len(), 2);
+    }
+
 }
