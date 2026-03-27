@@ -26,26 +26,11 @@ use std::collections::HashMap;
 
 use delta_kernel::{Engine, Snapshot};
 
-/// Property key for the UC table ID, stored in Delta metadata configuration.
-const UC_TABLE_ID_KEY: &str = "io.unitycatalog.tableId";
-/// Property key to enable in-commit timestamps.
-const ENABLE_IN_COMMIT_TIMESTAMPS: &str = "delta.enableInCommitTimestamps";
-/// Feature supported value.
-const FEATURE_SUPPORTED: &str = "supported";
-/// The property key prefix for table feature signals.
-const FEATURE_PREFIX: &str = "delta.feature.";
-/// Feature signal key for catalog-managed tables.
-const CATALOG_MANAGED_FEATURE_KEY: &str = "delta.feature.catalogManaged";
-/// Feature signal key for vacuum protocol check.
-const VACUUM_PROTOCOL_CHECK_FEATURE_KEY: &str = "delta.feature.vacuumProtocolCheck";
-/// The property key for the minimum reader version.
-const MIN_READER_VERSION_KEY: &str = "delta.minReaderVersion";
-/// The property key for the minimum writer version.
-const MIN_WRITER_VERSION_KEY: &str = "delta.minWriterVersion";
-/// UC property for the last committed version.
-const METASTORE_LAST_UPDATE_VERSION: &str = "delta.lastUpdateVersion";
-/// UC property for the last commit timestamp.
-const METASTORE_LAST_COMMIT_TIMESTAMP: &str = "delta.lastCommitTimestamp";
+use crate::constants::{
+    CATALOG_MANAGED_FEATURE_KEY, ENABLE_IN_COMMIT_TIMESTAMPS, FEATURE_PREFIX, FEATURE_SUPPORTED,
+    METASTORE_LAST_COMMIT_TIMESTAMP, METASTORE_LAST_UPDATE_VERSION, MIN_READER_VERSION_KEY,
+    MIN_WRITER_VERSION_KEY, UC_TABLE_ID_KEY, VACUUM_PROTOCOL_CHECK_FEATURE_KEY,
+};
 
 /// Returns the table properties that must be written to disk (in `000.json`) for a UC catalog-managed table.
 ///
