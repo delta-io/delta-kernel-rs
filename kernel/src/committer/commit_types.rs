@@ -131,10 +131,22 @@ impl CommitMetadata {
     /// Uses a default modern protocol (empty features) and empty metadata.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_unchecked(table_root: Url, version: Version) -> DeltaResult<Self> {
+        Self::new_unchecked_with(table_root, version, vec![], vec![], HashMap::new())
+    }
+
+    /// Creates a new `CommitMetadata` with specific features and configuration. Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_unchecked_with(
+        table_root: Url,
+        version: Version,
+        reader_features: Vec<&str>,
+        writer_features: Vec<&str>,
+        configuration: HashMap<String, String>,
+    ) -> DeltaResult<Self> {
         let log_root = crate::path::LogRoot::new(table_root)?;
-        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new())?;
+        let protocol = Protocol::try_new_modern(reader_features, writer_features)?;
         let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new())?;
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, configuration)?;
         Ok(Self::new(log_root, version, 0, None, protocol, metadata))
     }
 }

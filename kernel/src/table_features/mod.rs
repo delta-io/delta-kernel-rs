@@ -436,7 +436,8 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    // ICT must be supported and active for catalog-managed tables.
+    feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     #[cfg(feature = "catalog-managed")]
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Write => Ok(()),
@@ -452,7 +453,7 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
 static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     #[cfg(feature = "catalog-managed")]
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Write => Ok(()),
