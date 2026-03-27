@@ -563,21 +563,18 @@ impl Snapshot {
     }
 
     /// The minimum reader version required to read this table.
-    #[internal_api]
-    pub(crate) fn min_reader_version(&self) -> i32 {
+    pub fn min_reader_version(&self) -> i32 {
         self.table_configuration().protocol().min_reader_version()
     }
 
     /// The minimum writer version required to write to this table.
-    #[internal_api]
-    pub(crate) fn min_writer_version(&self) -> i32 {
+    pub fn min_writer_version(&self) -> i32 {
         self.table_configuration().protocol().min_writer_version()
     }
 
     /// Get the reader feature names for this table's protocol, if using table features
     /// (reader version 3). Returns `None` for legacy protocols.
-    #[internal_api]
-    pub(crate) fn reader_features(&self) -> Option<Vec<&str>> {
+    pub fn reader_features(&self) -> Option<Vec<&str>> {
         self.table_configuration()
             .protocol()
             .reader_features()
@@ -586,8 +583,7 @@ impl Snapshot {
 
     /// Get the writer feature names for this table's protocol, if using table features
     /// (writer version 7). Returns `None` for legacy protocols.
-    #[internal_api]
-    pub(crate) fn writer_features(&self) -> Option<Vec<&str>> {
+    pub fn writer_features(&self) -> Option<Vec<&str>> {
         self.table_configuration()
             .protocol()
             .writer_features()
@@ -599,8 +595,7 @@ impl Snapshot {
     /// This returns the `Metadata.configuration` map as stored in the Delta log, containing
     /// user-defined properties, delta table properties (e.g., `delta.enableInCommitTimestamps`),
     /// and application-specific properties (e.g., `io.unitycatalog.tableId`).
-    #[internal_api]
-    pub(crate) fn metadata_configuration(&self) -> &HashMap<String, String> {
+    pub fn metadata_configuration(&self) -> &HashMap<String, String> {
         self.table_configuration().metadata().configuration()
     }
 
@@ -700,8 +695,7 @@ impl Snapshot {
     /// column name cannot be resolved to a logical name in the schema.
     ///
     /// [`ColumnName`]: crate::expressions::ColumnName
-    #[internal_api]
-    pub(crate) fn get_clustering_columns(
+    pub fn get_clustering_columns(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
