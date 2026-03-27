@@ -1237,6 +1237,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "delta-kernel-unity-catalog"
+version = "0.20.0"
+dependencies = [
+ "delta_kernel",
+ "itertools 0.14.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "unity-catalog-delta-client-api",
+ "unity-catalog-delta-rest-client",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "delta_kernel"
 version = "0.20.0"
 dependencies = [
@@ -1309,6 +1326,7 @@ name = "delta_kernel_ffi"
 version = "0.20.0"
 dependencies = [
  "cbindgen",
+ "delta-kernel-unity-catalog",
  "delta_kernel",
  "delta_kernel_ffi_macros",
  "itertools 0.14.0",
@@ -1325,8 +1343,7 @@ dependencies = [
  "tracing-core",
  "tracing-subscriber",
  "trybuild",
- "uc-catalog",
- "uc-client",
+ "unity-catalog-delta-client-api",
  "url",
 ]
 
@@ -4429,38 +4446,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 
 [[package]]
-name = "uc-catalog"
-version = "0.20.0"
-dependencies = [
- "delta_kernel",
- "itertools 0.14.0",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "uc-client",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "uc-client"
-version = "0.20.0"
-dependencies = [
- "chrono",
- "clap",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4477,6 +4462,34 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unity-catalog-delta-client-api"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "unity-catalog-delta-rest-client"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "unity-catalog-delta-client-api",
+ "url",
+]
 
 [[package]]
 name = "untrusted"

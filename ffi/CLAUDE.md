@@ -55,4 +55,5 @@ Feature flags:
 - `arrow` (default; currently maps to `arrow-57`)
 - `arrow-57`, `arrow-56`
 - `catalog-managed`
+- `delta-kernel-unity-catalog`
 - `tracing`
