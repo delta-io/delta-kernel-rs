@@ -50,7 +50,7 @@ use std::sync::{Arc, LazyLock};
 pub(crate) struct ActionReconciliationProcessor {
     /// Tracks file actions that have been seen during log replay to avoid duplicates.
     /// Contains (data file path, dv_unique_id) pairs as `FileActionKey` instances.
-    seen_file_keys: HashSet<FileActionKey>,
+    seen_file_keys: hashbrown::HashSet<FileActionKey>,
     /// Indicates whether a protocol action has been seen in the log.
     seen_protocol: bool,
     /// Indicates whether a metadata action has been seen in the log.
@@ -345,7 +345,7 @@ impl ActionReconciliationVisitor<'_> {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<'seen>(
-        seen_file_keys: &'seen mut HashSet<FileActionKey>,
+        seen_file_keys: &'seen mut hashbrown::HashSet<FileActionKey>,
         is_log_batch: bool,
         selection_vector: Vec<bool>,
         minimum_file_retention_timestamp: i64,
@@ -412,13 +412,13 @@ impl ActionReconciliationVisitor<'_> {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Option<bool>> {
         // Extract the file action and handle errors immediately
-        let Some((file_key, is_add)) = self.deduplicator.extract_file_action(i, getters, false)?
-        else {
+        let Some(action) = self.deduplicator.extract_file_action(i, getters, false)? else {
             return Ok(None); // No file action found, continue checking other types
         };
 
+        let is_add = action.is_add;
         // Check for valid, non-duplicate adds and non-expired removes
-        let is_valid = if self.deduplicator.check_and_record_seen(file_key) {
+        let is_valid = if self.deduplicator.check_and_record_seen(action) {
             false // duplicate!
         } else if is_add {
             self.add_actions_count += 1;
@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn test_action_reconciliation_visitor() -> DeltaResult<()> {
         let data = action_batch();
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = ActionReconciliationVisitor::new(
@@ -722,7 +722,7 @@ mod tests {
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = ActionReconciliationVisitor::new(
@@ -755,7 +755,7 @@ mod tests {
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = ActionReconciliationVisitor::new(
@@ -787,16 +787,16 @@ mod tests {
     fn test_action_reconciliation_visitor_file_actions_with_deletion_vectors() -> DeltaResult<()> {
         let json_strings: StringArray = vec![
             // Add action for file1 with deletion vector
-            r#"{"add":{"path":"file1","partitionValues":{},"size":635,"modificationTime":100,"dataChange":true,"deletionVector":{"storageType":"ONE","pathOrInlineDv":"dv1","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"add":{"path":"file1","partitionValues":{},"size":635,"modificationTime":100,"dataChange":true,"deletionVector":{"storageType":"u","pathOrInlineDv":"dv1","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
             // Remove action for file1 with a different deletion vector
-            r#"{"remove":{"path":"file1","deletionTimestamp":100,"dataChange":true,"deletionVector":{"storageType":"TWO","pathOrInlineDv":"dv2","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"remove":{"path":"file1","deletionTimestamp":100,"dataChange":true,"deletionVector":{"storageType":"u","pathOrInlineDv":"dv2","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
             // Remove action for file1 with another different deletion vector
-            r#"{"remove":{"path":"file1","deletionTimestamp":100,"dataChange":true,"deletionVector":{"storageType":"THREE","pathOrInlineDv":"dv3","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"remove":{"path":"file1","deletionTimestamp":100,"dataChange":true,"deletionVector":{"storageType":"u","pathOrInlineDv":"dv3","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
          ]
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = ActionReconciliationVisitor::new(
@@ -831,7 +831,7 @@ mod tests {
         let batch = parse_json_batch(json_strings);
 
         // Pre-populate with txn app1
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         seen_txns.insert("app1".to_string());
@@ -873,7 +873,7 @@ mod tests {
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = ActionReconciliationVisitor::new(
@@ -990,17 +990,17 @@ mod tests {
         // Batch 1: add actions with deletion vectors
         let batch1 = vec![
             // (file1, DV_ONE) New, should be included
-            r#"{"add":{"path":"file1","partitionValues":{},"size":635,"modificationTime":100,"dataChange":true,"deletionVector":{"storageType":"ONE","pathOrInlineDv":"dv1","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"add":{"path":"file1","partitionValues":{},"size":635,"modificationTime":100,"dataChange":true,"deletionVector":{"storageType":"u","pathOrInlineDv":"dv1","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
             // (file1, DV_TWO) New, should be included
-            r#"{"add":{"path":"file1","partitionValues":{},"size":635,"modificationTime":100,"dataChange":true,"deletionVector":{"storageType":"TWO","pathOrInlineDv":"dv2","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"add":{"path":"file1","partitionValues":{},"size":635,"modificationTime":100,"dataChange":true,"deletionVector":{"storageType":"u","pathOrInlineDv":"dv2","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
         ];
 
         // Batch 2: mixed actions with duplicate and new entries
         let batch2 = vec![
             // (file1, DV_ONE): Already seen, should be excluded
-            r#"{"remove":{"path":"file1","deletionTimestamp":100,"dataChange":true,"deletionVector":{"storageType":"ONE","pathOrInlineDv":"dv1","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"remove":{"path":"file1","deletionTimestamp":100,"dataChange":true,"deletionVector":{"storageType":"u","pathOrInlineDv":"dv1","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
             // (file1, DV_TWO): Already seen, should be excluded
-            r#"{"add":{"path":"file1","partitionValues":{},"size":635,"modificationTime":100,"dataChange":true,"deletionVector":{"storageType":"TWO","pathOrInlineDv":"dv2","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"add":{"path":"file1","partitionValues":{},"size":635,"modificationTime":100,"dataChange":true,"deletionVector":{"storageType":"u","pathOrInlineDv":"dv2","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
             // New file, should be included
             r#"{"remove":{"path":"file2","deletionTimestamp":100,"dataChange":true,"partitionValues":{}}}"#,
         ];
@@ -1033,7 +1033,7 @@ mod tests {
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = ActionReconciliationVisitor::new(
@@ -1191,7 +1191,7 @@ mod tests {
 
     /// Helper function to create a standard action reconciliation visitor for error testing
     fn create_test_visitor<'a>(
-        seen_file_keys: &'a mut HashSet<FileActionKey>,
+        seen_file_keys: &'a mut hashbrown::HashSet<FileActionKey>,
         seen_txns: &'a mut HashSet<String>,
         seen_domains: &'a mut HashSet<String>,
         txn_expiration_timestamp: Option<i64>,
@@ -1229,7 +1229,7 @@ mod tests {
     #[test]
     fn test_action_reconciliation_visitor_validation_and_type_errors() {
         // Test 1: Wrong getter count validation
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor =
@@ -1257,7 +1257,7 @@ mod tests {
         ];
 
         for (getter_index, field_name, error_type, expected_error_text) in test_cases {
-            let mut seen_file_keys = HashSet::new();
+            let mut seen_file_keys = hashbrown::HashSet::new();
             let mut seen_txns = HashSet::new();
             let mut seen_domains = HashSet::new();
             let mut visitor =
@@ -1277,7 +1277,7 @@ mod tests {
     #[test]
     fn test_action_reconciliation_visitor_complex_field_errors() {
         // Test txn.lastUpdated with retention enabled
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = create_test_visitor(
@@ -1308,7 +1308,7 @@ mod tests {
             .contains("lastUpdated is not of type i64"));
 
         // Test remove.deletionTimestamp
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::new();
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor =

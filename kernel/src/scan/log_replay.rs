@@ -1,5 +1,4 @@
 use std::clone::Clone;
-use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
@@ -74,7 +73,7 @@ pub struct SerializableScanState {
     /// Opaque internal state blob
     pub internal_state_blob: Vec<u8>,
     /// Set of file action keys that have already been processed.
-    pub seen_file_keys: HashSet<FileActionKey>,
+    pub seen_file_keys: std::collections::HashSet<FileActionKey>,
     /// Information about checkpoint reading for stats optimization
     pub(crate) checkpoint_info: CheckpointReadInfo,
 }
@@ -115,7 +114,7 @@ pub struct ScanLogReplayProcessor {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
-    seen_file_keys: HashSet<FileActionKey>,
+    seen_file_keys: hashbrown::HashSet<FileActionKey>,
     /// Skip reading file statistics.
     skip_stats: bool,
     /// Information about checkpoint reading for stats optimization
@@ -146,7 +145,7 @@ impl ScanLogReplayProcessor {
             engine,
             state_info,
             checkpoint_info,
-            HashSet::with_capacity(dedup_capacity),
+            hashbrown::HashSet::with_capacity(dedup_capacity),
             skip_stats,
         )
     }
@@ -166,7 +165,7 @@ impl ScanLogReplayProcessor {
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
         checkpoint_info: CheckpointReadInfo,
-        seen_file_keys: HashSet<FileActionKey>,
+        seen_file_keys: hashbrown::HashSet<FileActionKey>,
         skip_stats: bool,
     ) -> DeltaResult<Self> {
         let CheckpointReadInfo {
@@ -315,7 +314,7 @@ impl ScanLogReplayProcessor {
         Ok(SerializableScanState {
             predicate,
             internal_state_blob,
-            seen_file_keys: self.seen_file_keys,
+            seen_file_keys: self.seen_file_keys.into_iter().collect(),
             checkpoint_info: self.checkpoint_info,
         })
     }
@@ -370,7 +369,7 @@ impl ScanLogReplayProcessor {
             engine,
             state_info,
             state.checkpoint_info,
-            state.seen_file_keys,
+            state.seen_file_keys.into_iter().collect(),
             internal_state.skip_stats,
         )
     }
@@ -413,7 +412,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // The file extraction logic selects the appropriate indexes based on whether we found a valid path.
         // Remove getters are not included when visiting a non-log batch (checkpoint batch), so do
         // not try to extract remove actions in that case.
-        let Some((file_key, is_add)) = self.deduplicator.extract_file_action(
+        let Some(action) = self.deduplicator.extract_file_action(
             i,
             getters,
             !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
@@ -423,6 +422,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             return Ok(false);
         };
 
+        let is_add = action.is_add;
         if is_add {
             self.metrics.incr_add_files_seen()
         } else {
@@ -447,7 +447,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         };
 
         // Check both adds and removes (skipping already-seen), but only transform and return adds
-        if self.deduplicator.check_and_record_seen(file_key) || !is_add {
+        if self.deduplicator.check_and_record_seen(action) || !is_add {
             return Ok(false);
         }
         let base_row_id: Option<i64> =
@@ -1186,8 +1186,14 @@ mod tests {
 
         // Add file keys with and without DV info
         let key1 = crate::log_replay::FileActionKey::new("file1.parquet", None);
-        let key2 = crate::log_replay::FileActionKey::new("file2.parquet", Some("dv-1".to_string()));
-        let key3 = crate::log_replay::FileActionKey::new("file3.parquet", Some("dv-2".to_string()));
+        let key2 = crate::log_replay::FileActionKey::new(
+            "file2.parquet",
+            Some(crate::log_replay::DvUniqueId::Uuid("dv-1".to_owned(), 0)),
+        );
+        let key3 = crate::log_replay::FileActionKey::new(
+            "file3.parquet",
+            Some(crate::log_replay::DvUniqueId::Uuid("dv-2".to_owned(), 0)),
+        );
         processor.seen_file_keys.insert(key1.clone());
         processor.seen_file_keys.insert(key2.clone());
         processor.seen_file_keys.insert(key3.clone());
