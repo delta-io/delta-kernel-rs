@@ -8,6 +8,7 @@ version = "0.20.0"
 dependencies = [
  "datatest-stable",
  "delta_kernel",
+ "delta_kernel_benchmarks",
  "flate2",
  "futures",
  "itertools 0.14.0",
@@ -20,6 +21,7 @@ dependencies = [
  "test_utils",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "ureq",
  "url",
