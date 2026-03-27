@@ -93,6 +93,8 @@ impl std::fmt::Debug for Snapshot {
     }
 }
 
+const NO_COMMIT_FILE_ERROR: &str = "Last commit file not found in log segment";
+
 impl Snapshot {
     /// Create a new [`SnapshotBuilder`] to build a new [`Snapshot`] for a given table root. If you
     /// instead have an existing [`Snapshot`] you would like to do minimal work to update, consider
@@ -941,7 +943,45 @@ impl Snapshot {
                 let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
                 Ok(Some(ict))
             }
-            None => Err(Error::generic("Last commit file not found in log segment")),
+            None => Err(Error::generic(NO_COMMIT_FILE_ERROR)),
+        }
+    }
+
+    /// Get the timestamp for this snapshot's version, in milliseconds since the Unix epoch.
+    ///
+    /// When In-Commit Timestamps (ICT) are enabled, returns the ICT value from the commit's
+    /// `CommitInfo` action. Otherwise, falls back to the filesystem last-modified time of the
+    /// latest commit file.
+    ///
+    /// # Returns
+    /// - `Ok(timestamp)` - the timestamp in milliseconds since the Unix epoch
+    /// - `Err(...)` - commit file is missing, ICT state is invalid, or the ICT value cannot be read
+    ///
+    /// See also [`get_in_commit_timestamp`] for ICT-only semantics.
+    ///
+    /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
+    #[allow(unused)]
+    pub(crate) fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
+        match self
+            .table_configuration()
+            .in_commit_timestamp_enablement()?
+        {
+            InCommitTimestampEnablement::NotEnabled => {
+                let commit = self
+                    .log_segment()
+                    .listed
+                    .latest_commit_file()
+                    .as_ref()
+                    .ok_or_else(|| Error::generic(NO_COMMIT_FILE_ERROR))?;
+                Ok(commit.location.last_modified)
+            }
+            InCommitTimestampEnablement::Enabled { .. } => {
+                self.get_in_commit_timestamp(engine)?.ok_or_else(|| {
+                    Error::internal_error(
+                        "ICT is enabled but get_in_commit_timestamp returned None",
+                    )
+                })
+            }
         }
     }
 }
@@ -953,6 +993,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use rstest::rstest;
     use serde_json::json;
     use test_utils::{add_commit, delta_path_for_version};
 
@@ -1060,6 +1101,30 @@ mod tests {
         let protocol = create_protocol(ict_enabled, None);
         let metadata = create_metadata(None, None, None, ict_config, false);
         format!("{protocol}\n{metadata}")
+    }
+
+    fn create_snapshot_no_commit(
+        url: &Url,
+        table_cfg: TableConfiguration,
+    ) -> DeltaResult<Snapshot> {
+        // Create a log segment with only checkpoint and no commit file (simulating scenario
+        // where a checkpoint exists but the commit file has been cleaned up)
+        let checkpoint_parts = vec![ParsedLogPath::try_from(crate::FileMeta {
+            location: url.join("_delta_log/00000000000000000000.checkpoint.parquet")?,
+            last_modified: 0,
+            size: 100,
+        })?
+        .unwrap()];
+
+        let listed_files = LogSegmentFiles {
+            checkpoint_parts,
+            ..Default::default()
+        };
+
+        let log_segment =
+            LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
+
+        Ok(Snapshot::new(log_segment, table_cfg))
     }
 
     #[test]
@@ -1921,30 +1986,12 @@ mod tests {
             .at_version(0)
             .build(&engine)?;
 
-        // Create a log segment with only checkpoint and no commit file (simulating scenario
-        // where a checkpoint exists but the commit file has been cleaned up)
-        let checkpoint_parts = vec![ParsedLogPath::try_from(crate::FileMeta {
-            location: url.join("_delta_log/00000000000000000000.checkpoint.parquet")?,
-            last_modified: 0,
-            size: 100,
-        })?
-        .unwrap()];
-
-        let listed_files = LogSegmentFiles {
-            checkpoint_parts,
-            ..Default::default()
-        };
-
-        let log_segment =
-            LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
-        let table_config = snapshot.table_configuration().clone();
-
-        // Create snapshot without commit file in log segment
-        let snapshot_no_commit = Snapshot::new(log_segment, table_config);
+        let snapshot_no_commit =
+            create_snapshot_no_commit(&url, snapshot.table_configuration().clone())?;
 
         // Should return an error when commit file is missing
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
-        assert_result_error_with_message(result, "Last commit file not found in log segment");
+        assert_result_error_with_message(result, NO_COMMIT_FILE_ERROR);
 
         Ok(())
     }
@@ -2017,6 +2064,95 @@ mod tests {
         // We should successfully read ICT by falling back to storage
         let timestamp = snapshot.get_in_commit_timestamp(&engine)?;
         assert_eq!(timestamp, Some(expected_ict));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_timestamp_not_enabled_returns_fs_mtime() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+        let commit0_data = vec![
+            create_protocol(false, None),
+            create_metadata(None, None, None, None, false),
+        ];
+        commit(table_root, store.as_ref(), 0, commit0_data).await;
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+
+        let ts = snapshot.get_timestamp(&engine)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let two_days_ms = 2 * 24 * 60 * 60 * 1000_i64;
+        assert!(
+            ts >= now_ms - two_days_ms && ts <= now_ms,
+            "timestamp {ts} not within 2 days of now ({now_ms})"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_timestamp_ict_enabled() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+        let expected_ict = 1587968586999i64;
+        // commitInfo must be first when ICT is enabled (protocol requirement)
+        let commit0_data = vec![
+            create_commit_info(1587968586000, Some(expected_ict)),
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
+            create_metadata(
+                None,
+                None,
+                None,
+                Some(("0".to_string(), "1612345678".to_string())),
+                false,
+            ),
+        ];
+        commit(table_root, store.as_ref(), 0, commit0_data).await;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+
+        let result = snapshot.get_timestamp(&engine)?;
+        assert_eq!(result, expected_ict);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::ict_enabled(true)]
+    #[case::ict_disabled(false)]
+    #[tokio::test]
+    async fn test_get_timestamp_no_commit(#[case] ict_enabled: bool) -> DeltaResult<()> {
+        let url = Url::parse("memory:///")?;
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+        let ict_config = ict_enabled.then(|| ("0".to_string(), "1612345678".to_string()));
+        let reader_version = ict_enabled.then_some(TABLE_FEATURES_MIN_READER_VERSION as u32);
+        let commit_data = [
+            create_protocol(ict_enabled, reader_version),
+            create_metadata(
+                Some("test_id"),
+                Some("{\"type\":\"struct\",\"fields\":[]}"),
+                Some(1677811175819),
+                ict_config,
+                false,
+            ),
+        ];
+        commit(url.as_str(), store.as_ref(), 0, commit_data.to_vec()).await;
+
+        // Build snapshot to get table configuration
+        let snapshot = Snapshot::builder_for(url.as_str())
+            .at_version(0)
+            .build(&engine)?;
+
+        let snapshot_no_commit =
+            create_snapshot_no_commit(&url, snapshot.table_configuration().clone())?;
+
+        // Should return an error when commit file is missing
+        let result = snapshot_no_commit.get_timestamp(&engine);
+        assert_result_error_with_message(result, NO_COMMIT_FILE_ERROR);
 
         Ok(())
     }
