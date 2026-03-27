@@ -13,7 +13,7 @@ use tracing::debug;
 use url::Url;
 
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
-use crate::expressions::{SharedExpression, SharedPredicate};
+use crate::expressions::SharedExpression;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
@@ -30,12 +30,12 @@ pub struct SharedScan;
 #[handle_descriptor(target=ScanMetadata, mutable=false, sized=true)]
 pub struct SharedScanMetadata;
 
-/// An opaque, mutable handle owning a [`ScanBuilder`].
+/// An opaque, exclusive handle owning a [`ScanBuilder`].
 ///
 /// The caller must eventually either call [`scan_builder_build`] (which consumes the handle
 /// and produces a [`SharedScan`]) or [`free_scan_builder`] (which drops it without building).
 #[handle_descriptor(target=ScanBuilder, mutable=true, sized=true)]
-pub struct MutableScanBuilder;
+pub struct ExclusiveScanBuilder;
 
 /// A predicate that can be used to skip data when scanning.
 ///
@@ -137,14 +137,25 @@ pub unsafe extern "C" fn scan(
 
 /// Decode an [`EnginePredicate`] and apply it to a [`ScanBuilder`].
 ///
-/// Returns the updated builder. If the visitor produces no predicate, the builder is returned
-/// unchanged.
-fn apply_predicate(builder: ScanBuilder, predicate: &mut EnginePredicate) -> ScanBuilder {
+/// Decode an [`EnginePredicate`] and apply it to a [`ScanBuilder`].
+///
+/// Returns an error if the engine's visitor fails to produce a valid predicate (i.e. returns
+/// an invalid expression ID). A `None` result from the visitor indicates the engine-side
+/// predicate construction failed, which would silently produce a full-table scan if ignored.
+fn apply_predicate(
+    builder: ScanBuilder,
+    predicate: &mut EnginePredicate,
+) -> DeltaResult<ScanBuilder> {
     let mut visitor_state = KernelExpressionVisitorState::default();
     let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
-    let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id);
+    let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
+        delta_kernel::Error::generic(
+            "engine predicate visitor returned an invalid expression ID; \
+             predicate could not be decoded",
+        )
+    })?;
     debug!("Got predicate: {:#?}", predicate);
-    builder.with_predicate(predicate.map(Arc::new))
+    Ok(builder.with_predicate(Some(Arc::new(predicate))))
 }
 
 /// Decode an [`EngineSchema`] and apply it as a column projection to a [`ScanBuilder`].
@@ -165,7 +176,7 @@ fn scan_impl(
 ) -> DeltaResult<Handle<SharedScan>> {
     let mut scan_builder = snapshot.scan_builder();
     if let Some(predicate) = predicate {
-        scan_builder = apply_predicate(scan_builder, predicate);
+        scan_builder = apply_predicate(scan_builder, predicate)?;
     }
     if let Some(schema) = schema {
         scan_builder = apply_schema(scan_builder, schema)?;
@@ -187,33 +198,37 @@ fn scan_impl(
 #[no_mangle]
 pub unsafe extern "C" fn scan_builder(
     snapshot: Handle<SharedSnapshot>,
-) -> Handle<MutableScanBuilder> {
+) -> Handle<ExclusiveScanBuilder> {
     let snapshot = unsafe { snapshot.clone_as_arc() };
     Box::new(snapshot.scan_builder()).into()
 }
 
-/// Apply a predicate to a [`MutableScanBuilder`] for data skipping and row-level filtering.
+/// Apply a predicate to an [`ExclusiveScanBuilder`] for data skipping and row-level filtering.
 ///
-/// Consumes the `builder` handle and returns a new handle. The `builder` handle must not be used
-/// after this call. If the visitor produces no predicate, `None` is passed to
-/// [`ScanBuilder::with_predicate`] and the builder is returned effectively unchanged. This
-/// operation is infallible.
+/// Consumes the `builder` handle and returns a new handle with the predicate applied. The
+/// `builder` handle must not be used after this call. Returns an error if the engine's predicate
+/// visitor fails to produce a valid predicate (i.e. returns an invalid expression ID). On error,
+/// the builder is dropped.
 ///
 /// # Safety
 ///
-/// `builder` must be a valid handle that is not used again after this call. `predicate` must be a
-/// valid, non-null [`EnginePredicate`] whose `visitor` and `predicate` fields are safe to call and
-/// read.
+/// `builder` and `engine` must be valid handles. The `builder` handle must not be used after this
+/// call. `predicate` must be a valid, non-null [`EnginePredicate`] whose `visitor` and `predicate`
+/// fields are safe to call and read.
 #[no_mangle]
 pub unsafe extern "C" fn scan_builder_with_predicate(
-    builder: Handle<MutableScanBuilder>,
+    builder: Handle<ExclusiveScanBuilder>,
+    engine: Handle<SharedExternEngine>,
     predicate: &mut EnginePredicate,
-) -> Handle<MutableScanBuilder> {
+) -> ExternResult<Handle<ExclusiveScanBuilder>> {
+    let engine = unsafe { engine.as_ref() };
     let builder = unsafe { builder.into_inner() };
-    Box::new(apply_predicate(*builder, predicate)).into()
+    apply_predicate(*builder, predicate)
+        .map(|b| Box::new(b).into())
+        .into_extern_result(&engine)
 }
 
-/// Apply a column projection schema to a [`MutableScanBuilder`].
+/// Apply a column projection schema to an [`ExclusiveScanBuilder`].
 ///
 /// Consumes the `builder` handle and returns a new handle with the schema applied. The `builder`
 /// handle must not be used after this call. Returns an error if the schema visitor produces an
@@ -227,23 +242,23 @@ pub unsafe extern "C" fn scan_builder_with_predicate(
 /// are safe to call and read.
 #[no_mangle]
 pub unsafe extern "C" fn scan_builder_with_schema(
-    builder: Handle<MutableScanBuilder>,
+    builder: Handle<ExclusiveScanBuilder>,
     engine: Handle<SharedExternEngine>,
     schema: &mut EngineSchema,
-) -> ExternResult<Handle<MutableScanBuilder>> {
+) -> ExternResult<Handle<ExclusiveScanBuilder>> {
     let engine = unsafe { engine.as_ref() };
     scan_builder_with_schema_impl(builder, schema).into_extern_result(&engine)
 }
 
 fn scan_builder_with_schema_impl(
-    builder: Handle<MutableScanBuilder>,
+    builder: Handle<ExclusiveScanBuilder>,
     schema: &mut EngineSchema,
-) -> DeltaResult<Handle<MutableScanBuilder>> {
+) -> DeltaResult<Handle<ExclusiveScanBuilder>> {
     let builder = unsafe { builder.into_inner() };
     Ok(Box::new(apply_schema(*builder, schema)?).into())
 }
 
-/// Consume a [`MutableScanBuilder`] and produce a [`SharedScan`].
+/// Consume an [`ExclusiveScanBuilder`] and produce a [`SharedScan`].
 ///
 /// The `builder` handle is consumed and must not be used afterward. On error, the builder is
 /// dropped and an error is returned. It is the responsibility of the caller to free the returned
@@ -255,7 +270,7 @@ fn scan_builder_with_schema_impl(
 /// this call.
 #[no_mangle]
 pub unsafe extern "C" fn scan_builder_build(
-    builder: Handle<MutableScanBuilder>,
+    builder: Handle<ExclusiveScanBuilder>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedScan>> {
     let engine = unsafe { engine.as_ref() };
@@ -266,7 +281,7 @@ pub unsafe extern "C" fn scan_builder_build(
         .into_extern_result(&engine)
 }
 
-/// Free a [`MutableScanBuilder`] without building a scan.
+/// Free an [`ExclusiveScanBuilder`] without building a scan.
 ///
 /// Only call this if you will not call [`scan_builder_build`]. If you have already called
 /// [`scan_builder_build`], the builder handle was consumed and this must not be called.
@@ -275,7 +290,7 @@ pub unsafe extern "C" fn scan_builder_build(
 ///
 /// `builder` must be a valid handle that has not been previously consumed or freed.
 #[no_mangle]
-pub unsafe extern "C" fn free_scan_builder(builder: Handle<MutableScanBuilder>) {
+pub unsafe extern "C" fn free_scan_builder(builder: Handle<ExclusiveScanBuilder>) {
     builder.drop_handle();
 }
 
@@ -313,52 +328,6 @@ pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle
 pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
     let scan = unsafe { scan.as_ref() };
     scan.physical_schema().clone().into()
-}
-
-/// Returns `true` if the scan has a remaining (physical) predicate that the engine must evaluate
-/// at row level after reading data files.
-///
-/// This corresponds to [`Scan::physical_predicate`]: the predicate is present when a predicate was
-/// pushed down via [`scan_builder_with_predicate`] and the kernel produced a physical predicate
-/// after column-mapping. An absent predicate means either no predicate was pushed down, the
-/// predicate statically skips all files, or the predicate was entirely resolved by file-level
-/// pruning.
-///
-/// If you need the predicate itself (not just its presence), use [`scan_remaining_filter`]
-/// instead to avoid cloning the predicate handle.
-///
-/// # Safety
-///
-/// `scan` must be a valid [`SharedScan`] handle.
-#[no_mangle]
-pub unsafe extern "C" fn scan_has_remaining_filter(scan: Handle<SharedScan>) -> bool {
-    unsafe { scan.as_ref() }.physical_predicate().is_some()
-}
-
-/// Returns the remaining predicate that the engine must apply at row level after reading data
-/// files.
-///
-/// This is the physical predicate produced from the predicate pushed down via
-/// [`scan_builder_with_predicate`], after column mapping has been applied. It is present when a
-/// predicate was pushed down and the kernel was unable to resolve it entirely at file-selection
-/// level. An absent predicate means either no predicate was pushed down, the predicate resolves
-/// to a static skip-all, or it was fully resolved during file pruning.
-///
-/// Returns [`OptionalValue::Some`] containing an owned [`SharedPredicate`] handle that the caller
-/// must eventually free with [`crate::expressions::free_kernel_predicate`], or
-/// [`OptionalValue::None`] if no remaining filter exists.
-///
-/// # Safety
-///
-/// `scan` must be a valid [`SharedScan`] handle.
-#[no_mangle]
-pub unsafe extern "C" fn scan_remaining_filter(
-    scan: Handle<SharedScan>,
-) -> OptionalValue<Handle<SharedPredicate>> {
-    unsafe { scan.as_ref() }
-        .physical_predicate()
-        .map(Into::into)
-        .into()
 }
 
 // Intentionally opaque to the engine.
@@ -744,7 +713,6 @@ mod scan_builder_tests {
     use test_utils::{actions_to_string, add_commit, TestAction};
 
     use crate::error::KernelError;
-    use crate::expressions::free_kernel_predicate;
     use crate::expressions::kernel_visitor::{
         visit_expression_column, visit_expression_literal_int, visit_predicate_lt,
         KernelExpressionVisitorState,
@@ -755,13 +723,13 @@ mod scan_builder_tests {
     };
     use crate::{
         engine_to_handle, free_engine, free_schema, free_snapshot, kernel_string_slice,
-        snapshot as get_snapshot, ExternResult, OptionalValue, SharedExternEngine, SharedSnapshot,
+        snapshot as get_snapshot, ExternResult, SharedExternEngine, SharedSnapshot,
     };
 
     use super::{
         free_scan, free_scan_builder, scan_builder, scan_builder_build,
-        scan_builder_with_predicate, scan_builder_with_schema, scan_has_remaining_filter,
-        scan_logical_schema, scan_remaining_filter, EnginePredicate, EngineSchema,
+        scan_builder_with_predicate, scan_builder_with_schema, scan_logical_schema,
+        EnginePredicate, EngineSchema,
     };
 
     /// Builds an in-memory table with schema `{id: integer, val: string}` and returns handles
@@ -861,14 +829,18 @@ mod scan_builder_tests {
             predicate: std::ptr::null_mut(),
             visitor: visit_id_lt_10,
         };
-        let builder = unsafe { scan_builder_with_predicate(builder, &mut predicate) };
+        let builder = unsafe {
+            ok_or_panic(scan_builder_with_predicate(
+                builder,
+                engine.shallow_copy(),
+                &mut predicate,
+            ))
+        };
         let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
         // Predicate does not reduce columns -- full schema is still returned
         let schema = unsafe { scan_logical_schema(scan.shallow_copy()) };
         let schema_ref = unsafe { schema.as_ref() };
         assert_eq!(schema_ref.fields().count(), 2);
-        // Predicate was registered -- kernel will apply it at row level
-        assert!(unsafe { scan_has_remaining_filter(scan.shallow_copy()) });
         unsafe { free_schema(schema) };
         unsafe { free_scan(scan) };
         unsafe { free_snapshot(snapshot) };
@@ -910,7 +882,13 @@ mod scan_builder_tests {
             predicate: std::ptr::null_mut(),
             visitor: visit_id_lt_10,
         };
-        let builder = unsafe { scan_builder_with_predicate(builder, &mut predicate) };
+        let builder = unsafe {
+            ok_or_panic(scan_builder_with_predicate(
+                builder,
+                engine.shallow_copy(),
+                &mut predicate,
+            ))
+        };
         let mut schema_arg = EngineSchema {
             schema: std::ptr::null_mut(),
             visitor: visit_id_only_schema,
@@ -928,80 +906,7 @@ mod scan_builder_tests {
         let schema_ref = unsafe { schema.as_ref() };
         assert_eq!(schema_ref.fields().count(), 1);
         assert!(schema_ref.field("id").is_some());
-        // Predicate survives projection -- remaining filter must still be present
-        assert!(unsafe { scan_has_remaining_filter(scan.shallow_copy()) });
-        let remaining = unsafe { scan_remaining_filter(scan.shallow_copy()) };
-        assert!(matches!(remaining, OptionalValue::Some(_)));
-        if let OptionalValue::Some(pred_handle) = remaining {
-            unsafe { free_kernel_predicate(pred_handle) };
-        }
         unsafe { free_schema(schema) };
-        unsafe { free_scan(scan) };
-        unsafe { free_snapshot(snapshot) };
-        unsafe { free_engine(engine) };
-    }
-
-    #[tokio::test]
-    async fn test_scan_has_remaining_filter_no_predicate() {
-        // No predicate pushed down -> physical_predicate is None -> returns false
-        let (engine, snapshot) = setup_test_table().await;
-        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
-        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
-        let has_filter = unsafe { scan_has_remaining_filter(scan.shallow_copy()) };
-        assert!(!has_filter);
-        unsafe { free_scan(scan) };
-        unsafe { free_snapshot(snapshot) };
-        unsafe { free_engine(engine) };
-    }
-
-    #[tokio::test]
-    async fn test_scan_has_remaining_filter_with_predicate() {
-        // `id < 10` pushed down -> physical_predicate is Some -> returns true
-        let (engine, snapshot) = setup_test_table().await;
-        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
-        let mut predicate = EnginePredicate {
-            predicate: std::ptr::null_mut(),
-            visitor: visit_id_lt_10,
-        };
-        let builder = unsafe { scan_builder_with_predicate(builder, &mut predicate) };
-        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
-        let has_filter = unsafe { scan_has_remaining_filter(scan.shallow_copy()) };
-        assert!(has_filter);
-        unsafe { free_scan(scan) };
-        unsafe { free_snapshot(snapshot) };
-        unsafe { free_engine(engine) };
-    }
-
-    #[tokio::test]
-    async fn test_scan_remaining_filter_none_when_no_predicate() {
-        // No predicate -> None
-        let (engine, snapshot) = setup_test_table().await;
-        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
-        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
-        let result = unsafe { scan_remaining_filter(scan.shallow_copy()) };
-        assert!(matches!(result, OptionalValue::None));
-        unsafe { free_scan(scan) };
-        unsafe { free_snapshot(snapshot) };
-        unsafe { free_engine(engine) };
-    }
-
-    #[tokio::test]
-    async fn test_scan_remaining_filter_some_with_predicate() {
-        // `id < 10` pushed down -> Some; returned handle must be freeable
-        let (engine, snapshot) = setup_test_table().await;
-        let mut predicate = EnginePredicate {
-            predicate: std::ptr::null_mut(),
-            visitor: visit_id_lt_10,
-        };
-        let builder = unsafe {
-            scan_builder_with_predicate(scan_builder(snapshot.shallow_copy()), &mut predicate)
-        };
-        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
-        let result = unsafe { scan_remaining_filter(scan.shallow_copy()) };
-        assert!(matches!(result, OptionalValue::Some(_)));
-        if let OptionalValue::Some(pred_handle) = result {
-            unsafe { free_kernel_predicate(pred_handle) };
-        }
         unsafe { free_scan(scan) };
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
@@ -1044,19 +949,19 @@ mod scan_builder_tests {
             predicate: std::ptr::null_mut(),
             visitor: visit_id_lt_10,
         };
-        let builder = unsafe { scan_builder_with_predicate(builder, &mut predicate) };
+        let builder = unsafe {
+            ok_or_panic(scan_builder_with_predicate(
+                builder,
+                engine.shallow_copy(),
+                &mut predicate,
+            ))
+        };
         let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
         // Projection to `{id}` regardless of application order
         let schema = unsafe { scan_logical_schema(scan.shallow_copy()) };
         let schema_ref = unsafe { schema.as_ref() };
         assert_eq!(schema_ref.fields().count(), 1);
         assert!(schema_ref.field("id").is_some());
-        assert!(unsafe { scan_has_remaining_filter(scan.shallow_copy()) });
-        let remaining = unsafe { scan_remaining_filter(scan.shallow_copy()) };
-        assert!(matches!(remaining, OptionalValue::Some(_)));
-        if let OptionalValue::Some(pred_handle) = remaining {
-            unsafe { free_kernel_predicate(pred_handle) };
-        }
         unsafe { free_schema(schema) };
         unsafe { free_scan(scan) };
         unsafe { free_snapshot(snapshot) };
