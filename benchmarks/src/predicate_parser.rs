@@ -13,6 +13,30 @@
 //!
 //! Unsupported (returns error): `LIKE`, function calls (`HEX`, `size`, `length`),
 //! `TIME '...'` typed literals.
+//!
+//! # Type resolution
+//!
+//! This module uses bidirectional type checking to infer the correct types for literals and to
+//! verify that the resulting predicate is well-typed. Bidirectional type checking has two modes:
+//!
+//! 1) **Type synthesis**: Given an expression, try to infer its type. For example, given a schema
+//!    where `int_col` has type `Integer`, the column reference `int_col` synthesizes to `Integer`.
+//!    Synthesis returns `Some(type)` for unambiguous types, or `None` when the type is ambiguous.
+//!
+//! 2) **Type checking**: Given an expression and a target type, check that the expression can
+//!    resolve to that type. For example, the literal `5` can be checked against `Integer`, `Short`,
+//!    or `Long`, but not against `String`.
+//!
+//! The predicate parser uses synthesis and checking to correctly resolve the types of literals so
+//! that predicates are well-formed. Consider the predicate `double_col > 3.14`:
+//!
+//! 1) Synthesize the LHS `double_col`. The schema lookup determines the type is `Double`.
+//! 2) Synthesize the RHS `3.14`. The type is ambiguous (`Float` or `Double`), so synthesis
+//!    returns `None`.
+//! 3) Since LHS has a concrete type (`Double`) and RHS is ambiguous, use `Double` as the target.
+//! 4) Type check both sides against `Double`, producing `Column("double_col")` on the LHS and
+//!    `Scalar::Double(3.14)` on the RHS.
+//! 5) Return the resolved predicate: `Predicate::gt(Column("double_col"), Scalar::Double(3.14))`
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpressionOp, ColumnName, Expression, Predicate, Scalar,
@@ -99,7 +123,7 @@ pub fn parse_predicate(
 // Typed (bidirectional) conversion functions
 ////////////////////////////////////////////////////////////////////////
 
-/// Tries to infer an expression, returning both the Expression and its DataType.
+/// Tries to infer an expression's type, returning both the Expression and its DataType.
 ///
 /// Returns `Some((Expression, DataType))` for:
 /// - Column references: look up type in schema, return column expression
