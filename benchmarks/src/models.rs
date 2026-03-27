@@ -1,6 +1,6 @@
 //! Data models for workload specifications
 
-use delta_kernel::actions::Protocol;
+use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::schema::Schema;
 use serde::Deserialize;
 use url::Url;
@@ -62,6 +62,7 @@ pub struct TableInfo {
     pub data_layout: DataLayout,
     /// Tags for filtering which tables are benchmarked via `BENCH_TAGS`. Use `[]` if none.
     /// Built-in tag: `base` (run in CI). e.g. `["base", "my-feature"]`
+    #[serde(default)]
     pub tags: Vec<String>,
     /// Path to the directory containing the `tableInfo.json` file
     #[serde(skip, default)]
@@ -143,22 +144,51 @@ pub enum DataLayout {
     None {},
 }
 
+/// Time travel parameter. Either version or timestamp.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TimeTravel {
+    Version { version: u64 },
+    Timestamp { timestamp: String },
+}
+
+impl TimeTravel {
+    /// Returns the version if this is version-based time travel.
+    ///
+    /// Returns an error message for timestamp-based time travel, which is not yet supported.
+    pub fn as_version(&self) -> Result<u64, &'static str> {
+        match self {
+            TimeTravel::Version { version } => Ok(*version),
+            TimeTravel::Timestamp { .. } => Err("Timestamp-based time travel is not yet supported"),
+        }
+    }
+}
+
 /// Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
 /// There will be multiple specs for a given table
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Spec {
     Read(ReadSpec),
-    SnapshotConstruction(SnapshotConstructionSpec),
+    #[serde(alias = "snapshot_construction")]
+    SnapshotConstruction(Box<SnapshotConstructionSpec>),
 }
 
+/// Specification for a read workload.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReadSpec {
-    /// Version to read; if `None`, reads the latest version
-    pub version: Option<u64>,
+    // Time travel version or timestamp for the read
+    #[serde(flatten)]
+    pub time_travel: Option<TimeTravel>,
     /// SQL WHERE clause expression (e.g. "id < 500"). Parsed into a kernel `Predicate`
     /// and passed to the scan builder for data skipping.
     pub predicate: Option<String>,
+    // Column projections to read
+    pub columns: Option<Vec<String>>,
+    /// Expected outcome - either success with row count or error with code.
+    #[serde(flatten)]
+    pub expected: Option<ReadExpected>,
 }
 
 impl ReadSpec {
@@ -167,10 +197,16 @@ impl ReadSpec {
     }
 }
 
+/// Specification for a snapshot construction workload.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SnapshotConstructionSpec {
-    /// Version to construct the snapshot at; if `None`, uses the latest version
-    pub version: Option<u64>,
+    // Time travel version or timestamp for the read
+    #[serde(flatten)]
+    pub time_travel: Option<TimeTravel>,
+    /// Expected outcome - either success with protocol/metadata or error with code.
+    #[serde(flatten)]
+    pub expected: Option<SnapshotExpected>,
 }
 
 impl SnapshotConstructionSpec {
@@ -194,6 +230,47 @@ impl Spec {
         let spec: Spec = serde_json::from_str(&content)?;
         Ok(spec)
     }
+}
+
+/// Expected error outcome for a workload.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpectedError {
+    pub error_code: String,
+    pub error_message: Option<String>,
+}
+
+/// Expected success outcome for a read workload.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadExpectedSuccess {
+    pub row_count: u64,
+    pub file_count: Option<u64>,
+    pub files_skipped: Option<u64>,
+}
+
+/// Expected result for read operations - either success or error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ReadExpected {
+    Success { expected: ReadExpectedSuccess },
+    Error { error: ExpectedError },
+}
+
+/// Expected success outcome for a snapshot construction workload.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotExpectedSuccess {
+    pub protocol: Box<Protocol>,
+    pub metadata: Box<Metadata>,
+}
+
+/// Expected result for snapshot operations - either success or error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SnapshotExpected {
+    Success { expected: SnapshotExpectedSuccess },
+    Error { error: ExpectedError },
 }
 
 /// For Read specs, we will either run a read data operation or a read metadata operation
@@ -359,9 +436,15 @@ mod tests {
         let spec: Spec = serde_json::from_str(json).expect("Failed to deserialize spec");
         assert_eq!(spec.as_str(), expected_type);
         let version = match &spec {
-            Spec::Read(read_spec) => read_spec.version,
+            Spec::Read(read_spec) => match &read_spec.time_travel {
+                Some(TimeTravel::Version { version }) => Some(*version),
+                _ => None,
+            },
             Spec::SnapshotConstruction(snapshot_construction_spec) => {
-                snapshot_construction_spec.version
+                match &snapshot_construction_spec.time_travel {
+                    Some(TimeTravel::Version { version }) => Some(*version),
+                    _ => None,
+                }
             }
         };
 
