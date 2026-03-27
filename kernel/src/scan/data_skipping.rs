@@ -260,7 +260,6 @@ impl DataSkippingFilter {
         let batch_len = batch.len();
 
         let file_stats = self.stats_evaluator.evaluate(batch)?;
-        debug_assert_eq!(file_stats.len(), batch_len);
         require!(
             file_stats.len() == batch_len,
             Error::internal_error(format!(
@@ -271,7 +270,6 @@ impl DataSkippingFilter {
         );
 
         let skipping_predicate = self.skipping_evaluator.evaluate(&*file_stats)?;
-        debug_assert_eq!(skipping_predicate.len(), batch_len);
         require!(
             skipping_predicate.len() == batch_len,
             Error::internal_error(format!(

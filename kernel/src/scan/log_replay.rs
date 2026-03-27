@@ -792,7 +792,6 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             &self.checkpoint_transform
         };
         let transformed = transform.evaluate(actions.as_ref())?;
-        debug_assert_eq!(transformed.len(), actions.len());
         require!(
             transformed.len() == actions.len(),
             Error::internal_error(format!(
