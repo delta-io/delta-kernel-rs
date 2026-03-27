@@ -788,7 +788,7 @@ impl StructType {
 
     /// Resolves a column path through nested structs, returning a reference to the leaf field.
     ///
-    /// This is a convenience wrapper around [`Self::walk_column_fields`] that returns only the
+    /// This is a convenience wrapper around `walk_column_fields` that returns only the
     /// final field in the path.
     ///
     /// Returns `None` if the column path is empty, a field is not found, or an intermediate
