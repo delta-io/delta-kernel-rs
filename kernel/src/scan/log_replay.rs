@@ -854,9 +854,12 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 }
 
 /// Given an iterator of [`ActionsBatch`]s (batches of actions read from the log) and a predicate,
-/// returns an iterator of [`ScanMetadata`]s (which includes the files to be scanned as
-/// [`FilteredEngineData`] and transforms that must be applied to correctly read the data). Each row
-/// that is selected in the returned `engine_data` _must_ be processed to complete the scan.
+/// returns a tuple of:
+/// 1. An iterator of [`ScanMetadata`]s (which includes the files to be scanned as
+///    [`FilteredEngineData`] and transforms that must be applied to correctly read the data).
+/// 2. An `Arc<ScanMetrics>` containing metrics collected during log replay.
+///
+/// Each row that is selected in the returned `engine_data` _must_ be processed to complete the scan.
 /// Non-selected rows _must_ be ignored.
 ///
 /// When `skip_stats` is true, file statistics are not read from checkpoint parquet files and
@@ -871,11 +874,13 @@ pub(crate) fn scan_action_iter(
     state_info: Arc<StateInfo>,
     checkpoint_info: CheckpointReadInfo,
     skip_stats: bool,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-    Ok(
-        ScanLogReplayProcessor::new(engine, state_info, checkpoint_info, skip_stats)?
-            .process_actions_iter(action_iter),
-    )
+) -> DeltaResult<(
+    impl Iterator<Item = DeltaResult<ScanMetadata>>,
+    Arc<ScanMetrics>,
+)> {
+    let processor = ScanLogReplayProcessor::new(engine, state_info, checkpoint_info, skip_stats)?;
+    let metrics = processor.metrics.clone();
+    Ok((processor.process_actions_iter(action_iter), metrics))
 }
 
 #[cfg(test)]
@@ -1015,7 +1020,7 @@ mod tests {
             physical_stats_schema: None,
             physical_partition_schema: None,
         });
-        let iter = scan_action_iter(
+        let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
@@ -1043,7 +1048,7 @@ mod tests {
         let partition_cols = vec!["date".to_string()];
         let state_info = get_simple_state_info(schema, partition_cols).unwrap();
         let batch = vec![add_batch_with_partition_col()];
-        let iter = scan_action_iter(
+        let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
@@ -1128,7 +1133,7 @@ mod tests {
         );
 
         let batch = vec![add_batch_for_row_id(get_commit_schema().clone())];
-        let iter = scan_action_iter(
+        let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
@@ -1508,7 +1513,7 @@ mod tests {
         ]));
         let state_info = get_simple_state_info(schema, vec!["date".to_string()]).unwrap();
 
-        let iter = scan_action_iter(
+        let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
@@ -1598,7 +1603,7 @@ mod tests {
         } else {
             vec![add_batch_with_remove(get_commit_schema().clone())]
         };
-        let iter = scan_action_iter(
+        let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
