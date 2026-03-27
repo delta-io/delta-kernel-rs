@@ -5,8 +5,8 @@
 //! Results are discarded for benchmarking purposes.
 //!
 //! Engine and snapshot construction is handled internally based on `TableInfo`:
-//! - UC tables (`catalog_managed_info` set): credentials from `UC_WORKSPACE`/`UC_TOKEN` env vars,
-//!   snapshot via `UCCatalog::load_snapshot` (supports both CCv2 and regular UC tables)
+//! - Catalog-managed tables (`catalog_managed_info` set): credentials from `UC_WORKSPACE`/`UC_TOKEN`
+//!   env vars, snapshot via `UCCatalog::load_snapshot`
 //! - S3 tables (`table_path` with s3:// scheme): credentials from `AWS_*` env vars
 //! - Local tables: local filesystem engine
 
@@ -51,7 +51,7 @@ fn build_engine(
     )
 }
 
-/// Pre-resolved UC state for building snapshots via UCCatalog.
+/// Pre-resolved catalog state for building snapshots via UCCatalog.
 struct ResolvedUcInfo {
     table_id: String,
     table_uri: String,
@@ -67,11 +67,11 @@ impl ResolvedUcInfo {
         let catalog = UCCatalog::new(&self.commits_client);
         runtime
             .block_on(catalog.load_snapshot(&self.table_id, &self.table_uri, engine))
-            .map_err(|e| format!("UC snapshot failed: {e}").into())
+            .map_err(|e| format!("Catalog snapshot failed: {e}").into())
     }
 }
 
-/// Resolves a UC table: gets credentials, builds engine, resolves table_id/uri.
+/// Resolves a catalog-managed table: gets credentials, builds engine, resolves table_id/uri.
 /// Does NOT build the snapshot - call `load_snapshot()` for that.
 fn resolve_uc_info(
     table_info: &TableInfo,
@@ -80,7 +80,7 @@ fn resolve_uc_info(
     let cm = table_info
         .catalog_managed_info
         .as_ref()
-        .ok_or("not a UC table")?;
+        .ok_or("not a catalog-managed table")?;
     let endpoint = std::env::var("UC_WORKSPACE").map_err(|_| "UC_WORKSPACE required")?;
     let token = std::env::var("UC_TOKEN").map_err(|_| "UC_TOKEN required")?;
 
@@ -96,7 +96,7 @@ fn resolve_uc_info(
         let aws = creds
             .aws_temp_credentials
             .ok_or(uc_client::Error::UnsupportedOperation(
-                "UC credential vending returned no AWS credentials".into(),
+                "Credential vending returned no AWS credentials".into(),
             ))?;
         Ok::<_, uc_client::Error>((table.table_id, table.storage_location, aws))
     })?;
