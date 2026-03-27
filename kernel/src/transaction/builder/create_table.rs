@@ -28,8 +28,9 @@ use crate::table_features::{
     SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
-    ENABLE_IN_COMMIT_TIMESTAMPS,
+    CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
+    COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX, ENABLE_IN_COMMIT_TIMESTAMPS,
+    SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -68,6 +69,11 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     COLUMN_MAPPING_MODE,
     // InCommitTimestamp enablement property: triggers ICT auto-enablement
     ENABLE_IN_COMMIT_TIMESTAMPS,
+    // Checkpoint stats format properties
+    CHECKPOINT_WRITE_STATS_AS_JSON,
+    CHECKPOINT_WRITE_STATS_AS_STRUCT,
+    // Set transaction retention duration: controls expiration of txn identifiers
+    SET_TRANSACTION_RETENTION_DURATION,
     // As features are supported, add them here:
     // "delta.enableDeletionVectors",
 ];
