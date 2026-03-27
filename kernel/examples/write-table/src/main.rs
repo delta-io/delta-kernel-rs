@@ -35,7 +35,8 @@ struct Cli {
     #[command(flatten)]
     location_args: LocationArgs,
 
-    /// Path to a JSON file
+    /// Path to a JSON file containing an array of row objects to write (e.g. `[{"id": 1, "name": "Alice"}]`).
+    /// Rows are matched to the table schema by field name; missing fields are written as null.
     #[arg(long, short = 'i')]
     data: Option<String>,
 
@@ -90,10 +91,12 @@ async fn try_main() -> DeltaResult<()> {
     let snapshot = create_or_get_base_snapshot(&url, &engine, &cli.schema).await?;
 
     // Create sample data based on the schema
-    let sample_data = if let Some(input_path) = &cli.data {
-        read_json_data(input_path, &snapshot.schema())?
+    let (sample_data, num_rows) = if let Some(input_path) = &cli.data {
+        let data = read_json_data(input_path, &snapshot.schema())?;
+        let num_rows = data.record_batch().num_rows();
+        (data, num_rows)
     } else {
-        create_sample_data(&snapshot.schema(), cli.num_rows)?
+        (create_sample_data(&snapshot.schema(), cli.num_rows)?, cli.num_rows)
     };
 
     // Write sample data to the table
@@ -138,7 +141,7 @@ async fn try_main() -> DeltaResult<()> {
 
     let version = committed.commit_version();
     println!("✓ Committed transaction at version {version}");
-    println!("✓ Successfully wrote {} rows to the table", cli.num_rows);
+    println!("✓ Successfully wrote {num_rows} rows to the table");
 
     // Read and display the data
     read_and_display_data(&url, engine).await?;
