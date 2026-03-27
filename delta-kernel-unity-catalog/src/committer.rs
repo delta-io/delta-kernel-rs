@@ -272,8 +272,14 @@ mod tests {
             vec!["catalogManaged", "vacuumProtocolCheck"],
             vec!["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"],
             HashMap::from([
-                ("io.unitycatalog.tableId".to_string(), "test-table-id".to_string()),
-                ("delta.enableInCommitTimestamps".to_string(), "true".to_string()),
+                (
+                    "io.unitycatalog.tableId".to_string(),
+                    "test-table-id".to_string(),
+                ),
+                (
+                    "delta.enableInCommitTimestamps".to_string(),
+                    "true".to_string(),
+                ),
             ]),
         )
         .unwrap()
@@ -363,9 +369,10 @@ mod tests {
             0,
             vec!["catalogManaged", "vacuumProtocolCheck"],
             vec!["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"],
-            HashMap::from([
-                ("delta.enableInCommitTimestamps".to_string(), "true".to_string()),
-            ]),
+            HashMap::from([(
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            )]),
         )
         .unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
@@ -391,9 +398,7 @@ mod tests {
             0,
             vec!["catalogManaged", "vacuumProtocolCheck"],
             vec!["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"],
-            HashMap::from([
-                ("io.unitycatalog.tableId".to_string(), "test-id".to_string()),
-            ]),
+            HashMap::from([("io.unitycatalog.tableId".to_string(), "test-id".to_string())]),
         )
         .unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
