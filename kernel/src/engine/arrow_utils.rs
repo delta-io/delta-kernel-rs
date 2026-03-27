@@ -93,6 +93,7 @@ struct MatchedParquetField<'p, 'k> {
 /// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This
 /// returns a tuples of (mask_indices: Vec<parquet_schema_index>, reorder_indices:
 /// Vec<requested_index>). `mask_indices` is used for generating the mask for reading from the
+#[internal_api]
 pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
     Error::Arrow(crate::arrow::error::ArrowError::InvalidArgumentError(
         s.into(),
@@ -101,12 +102,14 @@ pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
 }
 
 /// Prepares to enumerate row indexes of rows in a parquet file, accounting for row group skipping.
+#[internal_api]
 pub(crate) struct RowIndexBuilder {
     row_group_row_index_ranges: Vec<Range<i64>>,
     row_group_ordinals: Option<Vec<usize>>,
 }
 
 impl RowIndexBuilder {
+    #[internal_api]
     pub(crate) fn new(row_groups: &[RowGroupMetaData]) -> Self {
         let mut row_group_row_index_ranges = Vec::with_capacity(row_groups.len());
         let mut offset = 0;
@@ -123,6 +126,7 @@ impl RowIndexBuilder {
 
     /// Only produce row indexes for the row groups specified by the ordinals that survived row
     /// group skipping. The ordinals must be in 0..num_row_groups.
+    #[internal_api]
     pub(crate) fn select_row_groups(&mut self, ordinals: &[usize]) {
         // NOTE: Don't apply the filtering until we actually build the iterator, because the
         // filtering is not idempotent and `with_row_groups` could be called more than once.
@@ -134,6 +138,7 @@ impl RowIndexBuilder {
     /// # Errors
     ///
     /// Returns an error if there are duplicate or out of bounds row group ordinals.
+    #[internal_api]
     pub(crate) fn build(self) -> DeltaResult<FlattenedRangeIterator<i64>> {
         let starting_offsets = match self.row_group_ordinals {
             Some(ordinals) => {
@@ -167,6 +172,7 @@ impl RowIndexBuilder {
 /// `row_indexes` are passed through to `reorder_struct_array`.
 /// `file_location` is used to populate file metadata columns if requested.
 /// If `target_schema` is provided, coerces the batch's field nullability to match it.
+#[internal_api]
 pub(crate) fn fixup_parquet_read(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
@@ -539,12 +545,14 @@ pub(crate) fn coerce_batch_nullability(
 /// output. The `transform` indicates what, if any, transforms are needed. See the docs for
 /// [`ReorderIndexTransform`] for the meaning.
 #[derive(Debug, PartialEq)]
+#[internal_api]
 pub(crate) struct ReorderIndex {
     pub(crate) index: usize,
     transform: ReorderIndexTransform,
 }
 
 #[derive(Debug, PartialEq)]
+#[internal_api]
 pub(crate) enum ReorderIndexTransform {
     /// For a non-nested type, indicates that we need to cast to the contained type
     Cast(ArrowDataType),
@@ -960,6 +968,7 @@ fn match_parquet_fields<'k, 'p>(
 /// file set to the index of the requested column in the parquet. `reorder_indices` is used for
 /// re-ordering. See the documentation for [`ReorderIndex`] to understand what each element in the
 /// returned array means.
+#[internal_api]
 pub(crate) fn get_requested_indices(
     requested_schema: &SchemaRef,
     parquet_schema: &ArrowSchemaRef,
@@ -976,6 +985,7 @@ pub(crate) fn get_requested_indices(
 
 /// Create a mask that will only select the specified indices from the parquet. `indices` can be
 /// computed from a [`Schema`] using [`get_requested_indices`]
+#[internal_api]
 pub(crate) fn generate_mask(
     _requested_schema: &SchemaRef,
     _parquet_schema: &ArrowSchemaRef,
@@ -1014,6 +1024,7 @@ fn ordering_needs_transform(requested_ordering: &[ReorderIndex]) -> bool {
 ///
 /// The function only checks if a RowIndex transform is present at the top-level, since metadata
 /// columns are not allowed to be nested.
+#[internal_api]
 pub(crate) fn ordering_needs_row_indexes(requested_ordering: &[ReorderIndex]) -> bool {
     requested_ordering
         .iter()
@@ -1434,6 +1445,7 @@ pub(crate) fn to_json_bytes(
 ///
 /// `reorder_indices` should be built once per schema via [`build_json_reorder_indices`] and
 /// reused for every batch from the same file.
+#[internal_api]
 pub(crate) fn fixup_json_read(
     batch: RecordBatch,
     reorder_indices: &[ReorderIndex],
@@ -1447,16 +1459,17 @@ pub(crate) fn fixup_json_read(
 ///
 /// The JSON reader is given a schema with metadata columns stripped (see [`json_arrow_schema`]).
 /// Its output therefore has non-metadata columns at contiguous indices 0..N in schema order.
-/// This function maps those source indices — and any metadata column specs — into a
-/// `Vec<ReorderIndex>` that [`reorder_struct_array`] can use to produce the final batch with
+/// This function maps those source indices -- and any metadata column specs -- into a
+/// `Vec<ReorderIndex>` that `reorder_struct_array` can use to produce the final batch with
 /// every column at its correct position.
 ///
 /// Build the index vec once per schema (e.g. once per file); apply it to every batch produced
-/// by the reader via [`reorder_struct_array`].
+/// by the reader via `reorder_struct_array`.
 ///
 /// # Companion function
 /// - Use [`json_arrow_schema`] to strip metadata columns before passing the schema to the JSON
 ///   reader.
+#[internal_api]
 pub(crate) fn build_json_reorder_indices(schema: &StructType) -> DeltaResult<Vec<ReorderIndex>> {
     // Real columns: position in reorder_indices IS the source column index (0..N in schema
     // order), and reorder_index.index carries the output position.
@@ -1490,8 +1503,9 @@ pub(crate) fn build_json_reorder_indices(schema: &StructType) -> DeltaResult<Vec
 /// omitting any fields annotated with [`MetadataColumnSpec`].
 ///
 /// Pass the returned schema to Arrow's JSON reader; then call [`build_json_reorder_indices`]
-/// once on the same schema and apply [`reorder_struct_array`] to each resulting batch to
+/// once on the same schema and apply `reorder_struct_array` to each resulting batch to
 /// insert the synthesized metadata columns at their correct positions.
+#[internal_api]
 pub(crate) fn json_arrow_schema(schema: &StructType) -> DeltaResult<ArrowSchema> {
     let json_fields = schema.with_fields_filtered(|f| f.get_metadata_column_spec().is_none())?;
     Ok(ArrowSchema::try_from_kernel(&json_fields)?)

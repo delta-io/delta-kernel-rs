@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit};
+use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
 use super::arrow_conversion::TryIntoArrow as _;
@@ -28,6 +29,7 @@ use crate::{
 /// will indicate what kind of compatibility they have, or an error if the types do not match. If
 /// there is a `struct` type included, we only ensure that the named fields that the kernel is
 /// asking for exist, and that for those fields the types match. Un-selected fields are ignored.
+#[internal_api]
 pub(crate) fn ensure_data_types(
     kernel_type: &DataType,
     arrow_type: &ArrowDataType,
@@ -45,6 +47,7 @@ struct EnsureDataTypes {
 
 /// Capture the compatibility between two data-types, as passed to [`ensure_data_types`]
 #[cfg_attr(test, derive(Debug, PartialEq))]
+#[internal_api]
 pub(crate) enum DataTypeCompat {
     /// The two types are the same
     Identical,

@@ -4,41 +4,43 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use delta_kernel_derive::internal_api;
-
-use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
-use crate::arrow::datatypes::{DataType, Field, Schema};
-use crate::object_store::path::Path;
-use crate::object_store::{DynObjectStore, ObjectStore};
-use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use crate::parquet::arrow::async_writer::AsyncArrowWriter;
-use crate::parquet::arrow::async_writer::ParquetObjectWriter;
+use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+use delta_kernel::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
+use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{DynObjectStore, ObjectStore};
+use delta_kernel::parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ParquetRecordBatchReaderBuilder,
+};
+use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
+use delta_kernel::parquet::arrow::async_reader::{
+    ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+};
+use delta_kernel::parquet::arrow::async_writer::AsyncArrowWriter;
+use delta_kernel::parquet::arrow::async_writer::ParquetObjectWriter;
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 
-use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
-use super::stats::collect_stats;
-use super::UrlExt;
-use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
-use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::{
+use crate::executor::TaskExecutor;
+use crate::file_stream::{FileOpenFuture, FileOpener, FileStream};
+use crate::stats::collect_stats;
+use crate::UrlExt;
+use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
     RowIndexBuilder,
 };
-use crate::engine::default::executor::TaskExecutor;
-use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::expressions::ColumnName;
-use crate::schema::{SchemaRef, StructType};
-use crate::{
+use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use delta_kernel::expressions::ColumnName;
+use delta_kernel::schema::{SchemaRef, StructType};
+use delta_kernel::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
     ParquetHandler, PredicateRef,
 };
 
-use crate::engine::{reader_options, writer_options};
+use delta_kernel::engine::{reader_options, writer_options};
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -63,8 +65,7 @@ impl DataFileMetadata {
     /// Convert DataFileMetadata into a record batch which matches the schema returned by
     /// [`add_files_schema`].
     ///
-    /// [`add_files_schema`]: crate::transaction::Transaction::add_files_schema
-    #[internal_api]
+    /// [`add_files_schema`]: delta_kernel::transaction::Transaction::add_files_schema
     pub(crate) fn as_record_batch(
         &self,
         partition_values: &HashMap<String, String>,
@@ -217,9 +218,9 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// is a generated UUIDv4).
     ///
     /// Note that the schema does not contain the dataChange column. In order to set `data_change` flag,
-    /// use [`crate::transaction::Transaction::with_data_change`].
+    /// use [`delta_kernel::transaction::Transaction::with_data_change`].
     ///
-    /// [add file metadata]: crate::transaction::Transaction::add_files_schema
+    /// [add file metadata]: delta_kernel::transaction::Transaction::add_files_schema
     pub async fn write_parquet_file(
         &self,
         path: &url::Url,
@@ -278,7 +279,7 @@ async fn read_parquet_files_impl(
                 schema,
                 predicate,
                 None,
-                super::DEFAULT_BATCH_SIZE,
+                crate::DEFAULT_BATCH_SIZE,
                 file,
             )
             .await
@@ -286,7 +287,7 @@ async fn read_parquet_files_impl(
     });
     // create a stream from that iterator which buffers up to `buffer_size` futures at a time
     let result_stream = stream::iter(file_futures)
-        .buffered(super::DEFAULT_BUFFER_SIZE)
+        .buffered(crate::DEFAULT_BUFFER_SIZE)
         .try_flatten()
         .map_ok(|record_batch| -> Box<dyn EngineData> {
             Box::new(ArrowEngineData::new(record_batch))
@@ -308,7 +309,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             physical_schema,
             predicate,
         );
-        super::stream_future_to_iter(self.task_executor.clone(), future)
+        crate::stream_future_to_iter(self.task_executor.clone(), future)
     }
 
     /// Writes engine data to a Parquet file at the specified location.
@@ -408,7 +409,7 @@ async fn open_parquet_file(
     let path = Path::from_url_path(file_meta.location.path())?;
 
     let mut reader = {
-        use crate::object_store::ObjectStoreScheme;
+        use delta_kernel::object_store::ObjectStoreScheme;
         // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
         // request which isn't supported by Azure. For now we just detect if the URL is
         // pointing to azure and if so, do a HEAD request so we can pass in file size to the
@@ -513,7 +514,14 @@ impl FileOpener for PresignedUrlOpener {
 
         Ok(Box::pin(async move {
             // fetch the file from the interweb
-            let reader = client.get(&file_location).send().await?.bytes().await?;
+            let reader = client
+                .get(&file_location)
+                .send()
+                .await
+                .map_err(Error::generic_err)?
+                .bytes()
+                .await
+                .map_err(Error::generic_err)?;
             let reader_options = reader_options();
             let metadata = ArrowReaderMetadata::load(&reader, reader_options.clone())?;
             let parquet_schema = metadata.schema();
@@ -569,26 +577,26 @@ mod tests {
     use std::path::PathBuf;
     use std::slice;
 
-    use crate::arrow::array::{
+    use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::DEFAULT_BATCH_SIZE;
+    use delta_kernel::arrow::array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
         Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
         TimestampMicrosecondArray,
     };
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use crate::engine::arrow_conversion::TryIntoKernel as _;
-    use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::DEFAULT_BATCH_SIZE;
-    use crate::object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
-    use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
-    use crate::schema::ColumnMetadataKey;
-    use crate::EngineData;
+    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
+    use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
+    use delta_kernel::schema::ColumnMetadataKey;
+    use delta_kernel::EngineData;
 
     use itertools::Itertools;
     use url::Url;
 
-    use crate::utils::current_time_ms;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use delta_kernel::utils::current_time_ms;
+    use test_utils::assert_result_error_with_message;
 
     use super::*;
 
@@ -627,7 +635,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_parquet_file_with_size() {
         let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+            "../kernel/tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
         )).unwrap();
         let file_size = std::fs::metadata(&path).unwrap().len();
         let url = Url::from_file_path(path).unwrap();
@@ -645,7 +653,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_parquet_file_without_size() {
         let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+            "../kernel/tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
         )).unwrap();
         let url = Url::from_file_path(path).unwrap();
         let file_meta = FileMeta {
@@ -664,7 +672,7 @@ mod tests {
         let store = Arc::new(LocalFileSystem::new());
 
         let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+            "../kernel/tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
         )).unwrap();
         let url = url::Url::from_file_path(path).unwrap();
         let location = Path::from_url_path(url.path()).unwrap();
@@ -752,7 +760,7 @@ mod tests {
 
         // Build expected schema dynamically based on stats
         let stats_field = Field::new("stats", stats.data_type().clone(), true);
-        let schema = Arc::new(crate::arrow::datatypes::Schema::new(vec![
+        let schema = Arc::new(delta_kernel::arrow::datatypes::Schema::new(vec![
             Field::new("path", ArrowDataType::Utf8, false),
             Field::new(
                 "partitionValues",
@@ -1292,8 +1300,8 @@ mod tests {
             .expect("Field ID should be accessible via ColumnMetadataKey::ParquetFieldId per lib.rs:836-837");
 
         match field_id {
-            crate::schema::MetadataValue::String(id) => assert_eq!(id, "42"),
-            crate::schema::MetadataValue::Number(id) => assert_eq!(*id, 42),
+            delta_kernel::schema::MetadataValue::String(id) => assert_eq!(id, "42"),
+            delta_kernel::schema::MetadataValue::Number(id) => assert_eq!(*id, 42),
             other => panic!("Expected String or Number, got {other:?}"),
         }
     }
@@ -1303,10 +1311,10 @@ mod tests {
     /// Per lib.rs:676-680, field IDs (via [`ColumnMetadataKey::ParquetFieldId`]) should take
     /// precedence over field names for column matching.
     ///
-    /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
+    /// [`ColumnMetadataKey::ParquetFieldId`]: delta_kernel::schema::ColumnMetadataKey::ParquetFieldId
     #[test]
     fn test_read_parquet_with_field_id_matching() {
-        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
+        use delta_kernel::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
 
         // Write parquet with field IDs using PARQUET_FIELD_ID_META_KEY (Parquet's native key)
         // The kernel will transform these to parquet.field.id when reading
@@ -1341,13 +1349,12 @@ mod tests {
         // Create kernel schema with DIFFERENT names but SAME field IDs
         let kernel_schema = Arc::new(
             StructType::try_new(vec![
-                StructField::new("user_id", crate::schema::DataType::LONG, false).with_metadata([
-                    (
+                StructField::new("user_id", delta_kernel::schema::DataType::LONG, false)
+                    .with_metadata([(
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(1),
-                    ),
-                ]),
-                StructField::new("user_name", crate::schema::DataType::STRING, false)
+                    )]),
+                StructField::new("user_name", delta_kernel::schema::DataType::STRING, false)
                     .with_metadata([(
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(2),
