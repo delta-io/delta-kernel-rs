@@ -696,6 +696,7 @@ fn get_indices(
                     if let DataType::Struct(ref requested_schema)
                     | DataType::Variant(ref requested_schema) = requested_field.data_type
                     {
+                        let mask_before = mask_indices.len();
                         let (parquet_advance, children) = get_indices(
                             parquet_index + parquet_offset,
                             requested_schema.as_ref(),
@@ -706,10 +707,16 @@ fn get_indices(
                         // struct will be counted by the `enumerate` call but doesn't count as
                         // an actual index.
                         parquet_offset += parquet_advance - 1;
-                        // note that we found this field
-                        found_fields.insert(requested_field.name());
-                        // push the child reorder on
-                        reorder_indices.push(ReorderIndex::nested(index, children));
+                        // If no leaf columns were selected (mask unchanged), the parquet
+                        // reader will omit this struct entirely. Let the post-loop missing
+                        // field logic handle it instead of creating a Nested entry that
+                        // would index into a column that doesn't exist. The recursive call
+                        // is still needed for the correct `parquet_advance` value;
+                        // `children` is intentionally discarded in this case.
+                        if mask_indices.len() > mask_before {
+                            found_fields.insert(requested_field.name());
+                            reorder_indices.push(ReorderIndex::nested(index, children));
+                        }
                     } else {
                         return Err(Error::unexpected_column_type(field.name()));
                     }
@@ -2546,6 +2553,54 @@ mod tests {
             assert_eq!(mask_indices, expect_mask);
             assert_eq!(reorder_indices, expect_reorder);
         })
+    }
+
+    /// When a struct exists in the parquet schema but none of its children match the
+    /// requested schema, the struct should be treated as missing (not nested). This
+    /// happens during schema evolution when checkpoint stats_parsed has columns from
+    /// the old schema but the predicate references only new columns.
+    #[test]
+    fn nested_struct_with_no_matching_children_treated_as_missing() {
+        // Requested: a leaf column + a nullable struct whose children don't exist in parquet
+        let requested_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable(
+                "stats",
+                StructType::new_unchecked([StructField::nullable("age", DataType::LONG)]),
+            ),
+        ]));
+        // Parquet has "stats" but with completely different children
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int64, true),
+            ArrowField::new(
+                "stats",
+                ArrowDataType::Struct(
+                    vec![
+                        ArrowField::new("id", ArrowDataType::Int64, true),
+                        ArrowField::new("name", ArrowDataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        // Only "a" should be in the mask (the struct's children don't match)
+        assert_eq!(mask_indices, vec![0]);
+        // "a" at position 0 (identity) + "stats" treated as missing (not nested)
+        let expected_stats_field = Arc::new(
+            requested_schema
+                .field("stats")
+                .unwrap()
+                .try_into_arrow()
+                .unwrap(),
+        );
+        let expect_reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::missing(1, expected_stats_field),
+        ];
+        assert_eq!(reorder_indices, expect_reorder);
     }
 
     #[test]
