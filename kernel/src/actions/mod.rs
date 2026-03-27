@@ -319,6 +319,12 @@ impl Metadata {
     }
 
     #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn format_provider(&self) -> &str {
+        &self.format.provider
+    }
+
+    #[internal_api]
     pub(crate) fn schema_string(&self) -> &String {
         &self.schema_string
     }

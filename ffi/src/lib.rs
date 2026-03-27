@@ -18,6 +18,7 @@ use {
     std::collections::HashMap,
 };
 
+use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
@@ -690,6 +691,12 @@ pub struct SharedSchema;
 #[handle_descriptor(target=Snapshot, mutable=false, sized=true)]
 pub struct SharedSnapshot;
 
+#[handle_descriptor(target=Protocol, mutable=false, sized=true)]
+pub struct SharedProtocol;
+
+#[handle_descriptor(target=Metadata, mutable=false, sized=true)]
+pub struct SharedMetadata;
+
 /// Get the latest snapshot from the specified table
 ///
 /// # Safety
@@ -898,6 +905,401 @@ pub unsafe extern "C" fn get_partition_columns(
     let partition_columns = snapshot.table_configuration().partition_columns().to_vec();
     let iter: Box<StringIter> = Box::new(partition_columns.into_iter());
     iter.into()
+}
+
+// ── Protocol handle FFI ─────────────────────────────────────────────────────
+
+/// Get the protocol for this snapshot. The returned handle must be freed with [`free_protocol`].
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_get_protocol(
+    snapshot: Handle<SharedSnapshot>,
+) -> Handle<SharedProtocol> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    Arc::new(snapshot.table_configuration().protocol().clone()).into()
+}
+
+/// Free a protocol handle obtained from [`snapshot_get_protocol`].
+///
+/// # Safety
+/// Caller is responsible for providing a valid, non-freed protocol handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_protocol(protocol: Handle<SharedProtocol>) {
+    protocol.drop_handle();
+}
+
+/// Get the minimum reader version from a protocol handle.
+///
+/// # Safety
+/// Caller is responsible for providing a valid protocol handle.
+#[no_mangle]
+pub unsafe extern "C" fn protocol_min_reader_version(protocol: Handle<SharedProtocol>) -> i32 {
+    unsafe { protocol.as_ref() }.min_reader_version()
+}
+
+/// Get the minimum writer version from a protocol handle.
+///
+/// # Safety
+/// Caller is responsible for providing a valid protocol handle.
+#[no_mangle]
+pub unsafe extern "C" fn protocol_min_writer_version(protocol: Handle<SharedProtocol>) -> i32 {
+    unsafe { protocol.as_ref() }.min_writer_version()
+}
+
+/// Visit each reader feature name in the protocol. If the protocol uses legacy versioning
+/// (minReaderVersion < 3), the visitor is never called.
+///
+/// # Safety
+/// Caller is responsible for providing a valid protocol handle, a valid `context` as an opaque
+/// pointer passed to each `visitor` invocation, and a valid `visitor` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_protocol_reader_features(
+    protocol: Handle<SharedProtocol>,
+    context: NullableCvoid,
+    visitor: extern "C" fn(NullableCvoid, KernelStringSlice),
+) {
+    let protocol = unsafe { protocol.as_ref() };
+    if let Some(features) = protocol.reader_features() {
+        for feature in features {
+            let name = feature.as_ref();
+            visitor(context, kernel_string_slice!(name));
+        }
+    }
+}
+
+/// Visit each writer feature name in the protocol. If the protocol uses legacy versioning
+/// (minWriterVersion < 7), the visitor is never called.
+///
+/// # Safety
+/// Caller is responsible for providing a valid protocol handle, a valid `context` as an opaque
+/// pointer passed to each `visitor` invocation, and a valid `visitor` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_protocol_writer_features(
+    protocol: Handle<SharedProtocol>,
+    context: NullableCvoid,
+    visitor: extern "C" fn(NullableCvoid, KernelStringSlice),
+) {
+    let protocol = unsafe { protocol.as_ref() };
+    if let Some(features) = protocol.writer_features() {
+        for feature in features {
+            let name = feature.as_ref();
+            visitor(context, kernel_string_slice!(name));
+        }
+    }
+}
+
+// ── Metadata handle FFI ─────────────────────────────────────────────────────
+
+/// Get the metadata for this snapshot. The returned handle must be freed with [`free_metadata`].
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_get_metadata(
+    snapshot: Handle<SharedSnapshot>,
+) -> Handle<SharedMetadata> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    Arc::new(snapshot.table_configuration().metadata().clone()).into()
+}
+
+/// Free a metadata handle obtained from [`snapshot_get_metadata`].
+///
+/// # Safety
+/// Caller is responsible for providing a valid, non-freed metadata handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_metadata(metadata: Handle<SharedMetadata>) {
+    metadata.drop_handle();
+}
+
+/// Allocate and return the metadata id string. The string is allocated via the provided
+/// `allocate_fn` and must be freed by the caller.
+///
+/// # Safety
+/// Caller is responsible for providing a valid metadata handle and a valid `allocate_fn`.
+#[no_mangle]
+pub unsafe extern "C" fn metadata_id(
+    metadata: Handle<SharedMetadata>,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let metadata = unsafe { metadata.as_ref() };
+    let id = metadata.id();
+    allocate_fn(kernel_string_slice!(id))
+}
+
+/// Allocate and return the metadata name string, or null if not set. The string (when present)
+/// is allocated via the provided `allocate_fn` and must be freed by the caller.
+///
+/// # Safety
+/// Caller is responsible for providing a valid metadata handle and a valid `allocate_fn`.
+#[no_mangle]
+pub unsafe extern "C" fn metadata_name(
+    metadata: Handle<SharedMetadata>,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let metadata = unsafe { metadata.as_ref() };
+    match metadata.name() {
+        Some(s) => allocate_fn(kernel_string_slice!(s)),
+        None => None,
+    }
+}
+
+/// Allocate and return the metadata description string, or null if not set. The string (when
+/// present) is allocated via the provided `allocate_fn` and must be freed by the caller.
+///
+/// # Safety
+/// Caller is responsible for providing a valid metadata handle and a valid `allocate_fn`.
+#[no_mangle]
+pub unsafe extern "C" fn metadata_description(
+    metadata: Handle<SharedMetadata>,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let metadata = unsafe { metadata.as_ref() };
+    match metadata.description() {
+        Some(s) => allocate_fn(kernel_string_slice!(s)),
+        None => None,
+    }
+}
+
+/// Allocate and return the metadata format provider string (e.g. `"parquet"`). The string is
+/// allocated via the provided `allocate_fn` and must be freed by the caller.
+///
+/// # Safety
+/// Caller is responsible for providing a valid metadata handle and a valid `allocate_fn`.
+#[no_mangle]
+pub unsafe extern "C" fn metadata_format_provider(
+    metadata: Handle<SharedMetadata>,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let metadata = unsafe { metadata.as_ref() };
+    let provider = metadata.format_provider();
+    allocate_fn(kernel_string_slice!(provider))
+}
+
+/// Returns true if this metadata has a `createdTime` value set.
+///
+/// # Safety
+/// Caller is responsible for providing a valid metadata handle.
+#[no_mangle]
+pub unsafe extern "C" fn metadata_has_created_time(metadata: Handle<SharedMetadata>) -> bool {
+    unsafe { metadata.as_ref() }.created_time().is_some()
+}
+
+/// Returns the `createdTime` value in milliseconds since Unix epoch.
+/// Only valid to call if [`metadata_has_created_time`] returned `true`.
+///
+/// # Safety
+/// Caller is responsible for providing a valid metadata handle.
+#[no_mangle]
+pub unsafe extern "C" fn metadata_created_time(metadata: Handle<SharedMetadata>) -> i64 {
+    unsafe { metadata.as_ref() }.created_time().unwrap_or(0)
+}
+
+// ── Snapshot-level computed property FFI ─────────────────────────────────────
+
+/// Get the column mapping mode for this snapshot as a u32. Values: 0=None, 1=Id, 2=Name.
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_column_mapping_mode(snapshot: Handle<SharedSnapshot>) -> u32 {
+    use delta_kernel::table_features::ColumnMappingMode;
+    let snapshot = unsafe { snapshot.as_ref() };
+    match snapshot.table_configuration().column_mapping_mode() {
+        ColumnMappingMode::None => 0,
+        ColumnMappingMode::Id => 1,
+        ColumnMappingMode::Name => 2,
+    }
+}
+
+/// Check whether the given table feature (by camelCase name) is supported by this snapshot's
+/// protocol. Returns false for unrecognised feature names.
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle and `feature_name` slice.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_is_feature_supported(
+    snapshot: Handle<SharedSnapshot>,
+    feature_name: KernelStringSlice,
+) -> bool {
+    use delta_kernel::table_features::TableFeature;
+    let snapshot = unsafe { snapshot.as_ref() };
+    let name: &str = match unsafe { TryFromStringSlice::try_from_slice(&feature_name) } {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    // TableFeature derives EnumString with a default variant (Unknown), so parse is infallible
+    #[allow(clippy::unwrap_used)]
+    let feature: TableFeature = name.parse().unwrap();
+    snapshot
+        .table_configuration()
+        .is_feature_supported(&feature)
+}
+
+/// Check whether row tracking is enabled for this snapshot (feature supported + not suspended).
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_is_row_tracking_enabled(
+    snapshot: Handle<SharedSnapshot>,
+) -> bool {
+    use delta_kernel::table_features::TableFeature;
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .table_configuration()
+        .is_feature_supported(&TableFeature::RowTracking)
+}
+
+/// Check whether deletion vectors are readable for this snapshot.
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_is_deletion_vector_readable(
+    snapshot: Handle<SharedSnapshot>,
+) -> bool {
+    use delta_kernel::table_features::TableFeature;
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .table_configuration()
+        .is_feature_enabled(&TableFeature::DeletionVectors)
+}
+
+/// Check whether IcebergCompatV2 is enabled for this snapshot.
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_is_iceberg_compat_v2_enabled(
+    snapshot: Handle<SharedSnapshot>,
+) -> bool {
+    use delta_kernel::table_features::TableFeature;
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .table_configuration()
+        .is_feature_enabled(&TableFeature::IcebergCompatV2)
+}
+
+/// Check whether IcebergCompatV3 is enabled for this snapshot.
+/// Note: IcebergCompatV3 is not yet a recognized kernel feature; this checks the protocol's
+/// writer features for an "icebergCompatV3" entry (which parses as `TableFeature::Unknown`).
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_is_iceberg_compat_v3_enabled(
+    snapshot: Handle<SharedSnapshot>,
+) -> bool {
+    use delta_kernel::table_features::TableFeature;
+    let snapshot = unsafe { snapshot.as_ref() };
+    // IcebergCompatV3 is not yet a recognized kernel variant; parsing produces Unknown("icebergCompatV3").
+    // is_feature_supported checks the protocol's writer features list for this entry.
+    #[allow(clippy::unwrap_used)]
+    let feature: TableFeature = "icebergCompatV3".parse().unwrap();
+    snapshot
+        .table_configuration()
+        .is_feature_supported(&feature)
+}
+
+/// Allocate and return the materialized row ID column name, or null if row tracking is not
+/// configured. The string (when present) is allocated via `allocate_fn`.
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle and `allocate_fn`.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_materialized_row_id_column_name(
+    snapshot: Handle<SharedSnapshot>,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let snapshot = unsafe { snapshot.as_ref() };
+    match snapshot
+        .table_configuration()
+        .table_properties()
+        .materialized_row_id_column_name
+        .as_deref()
+    {
+        Some(s) => allocate_fn(kernel_string_slice!(s)),
+        None => None,
+    }
+}
+
+/// Allocate and return the materialized row commit version column name, or null if row tracking
+/// is not configured. The string (when present) is allocated via `allocate_fn`.
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle and `allocate_fn`.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_materialized_row_commit_version_column_name(
+    snapshot: Handle<SharedSnapshot>,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let snapshot = unsafe { snapshot.as_ref() };
+    match snapshot
+        .table_configuration()
+        .table_properties()
+        .materialized_row_commit_version_column_name
+        .as_deref()
+    {
+        Some(s) => allocate_fn(kernel_string_slice!(s)),
+        None => None,
+    }
+}
+
+/// Allocate and return the metadata id for the snapshot. The string is allocated via `allocate_fn`.
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle and `allocate_fn`.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_metadata_id(
+    snapshot: Handle<SharedSnapshot>,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let id = snapshot.table_configuration().metadata().id();
+    allocate_fn(kernel_string_slice!(id))
+}
+
+/// Allocate and return the metadata format provider for the snapshot. The string is allocated
+/// via `allocate_fn`.
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle and `allocate_fn`.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_metadata_format_provider(
+    snapshot: Handle<SharedSnapshot>,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let provider = snapshot.table_configuration().metadata().format_provider();
+    allocate_fn(kernel_string_slice!(provider))
+}
+
+/// Get the minimum reader version from this snapshot's protocol.
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_min_reader_version(snapshot: Handle<SharedSnapshot>) -> i32 {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .table_configuration()
+        .protocol()
+        .min_reader_version()
+}
+
+/// Get the minimum writer version from this snapshot's protocol.
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_min_writer_version(snapshot: Handle<SharedSnapshot>) -> i32 {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .table_configuration()
+        .protocol()
+        .min_writer_version()
 }
 
 type StringIter = dyn Iterator<Item = String> + Send;
@@ -1390,6 +1792,307 @@ mod tests {
         unsafe { free_snapshot(snapshot) }
         unsafe { free_snapshot(snapshot2) }
         unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // A modern (table-features) protocol + metadata commit for feature/config tests.
+    // Protocol: minReaderVersion=3, minWriterVersion=7 with columnMapping + rowTracking.
+    // Metadata: id set, name set, createdTime set, column mapping mode = "name".
+    const METADATA_WITH_FEATURES: &str = concat!(
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
+        "\n",
+        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping","rowTracking"]}}"#,
+        "\n",
+        r#"{"metaData":{"id":"deadbeef-1234-5678-abcd-000000000000","name":"test_table","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.rowTracking.enabled":"true","delta.rowTracking.materializedRowIdColumnName":"_row_id","delta.rowTracking.materializedRowCommitVersionColumnName":"_row_commit_version"},"createdTime":1234567890000}}"#,
+    );
+
+    #[tokio::test]
+    async fn test_protocol_handle() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_protocol/";
+        // Default METADATA has minReaderVersion=1, minWriterVersion=2 (legacy, no explicit features)
+        add_commit(table_root, storage.as_ref(), 0, METADATA.to_string()).await?;
+
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
+            allocate_err,
+        );
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        let proto = unsafe { snapshot_get_protocol(snap.shallow_copy()) };
+
+        assert_eq!(
+            unsafe { protocol_min_reader_version(proto.shallow_copy()) },
+            1
+        );
+        assert_eq!(
+            unsafe { protocol_min_writer_version(proto.shallow_copy()) },
+            2
+        );
+
+        // Legacy protocol: visitor should never be called for reader or writer features.
+        static READER_CALLED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        static WRITER_CALLED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        extern "C" fn reader_visitor(_ctx: NullableCvoid, _s: KernelStringSlice) {
+            READER_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        extern "C" fn writer_visitor(_ctx: NullableCvoid, _s: KernelStringSlice) {
+            WRITER_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        unsafe { visit_protocol_reader_features(proto.shallow_copy(), None, reader_visitor) };
+        unsafe { visit_protocol_writer_features(proto.shallow_copy(), None, writer_visitor) };
+        assert!(!READER_CALLED.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!WRITER_CALLED.load(std::sync::atomic::Ordering::SeqCst));
+
+        unsafe { free_protocol(proto) };
+        unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_protocol_features_handle() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_protocol_features/";
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            METADATA_WITH_FEATURES.to_string(),
+        )
+        .await?;
+
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
+            allocate_err,
+        );
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+        let proto = unsafe { snapshot_get_protocol(snap.shallow_copy()) };
+
+        assert_eq!(
+            unsafe { protocol_min_reader_version(proto.shallow_copy()) },
+            3
+        );
+        assert_eq!(
+            unsafe { protocol_min_writer_version(proto.shallow_copy()) },
+            7
+        );
+
+        // Reader features: should yield "columnMapping"
+        let reader_features: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        extern "C" fn collect_reader(ctx: NullableCvoid, s: KernelStringSlice) {
+            let vec = unsafe { &*(ctx.unwrap().as_ptr() as *const std::sync::Mutex<Vec<String>>) };
+            vec.lock()
+                .unwrap()
+                .push(unsafe { String::try_from_slice(&s) }.unwrap());
+        }
+        let ctx = std::ptr::NonNull::new(&reader_features as *const _ as *mut std::ffi::c_void);
+        unsafe { visit_protocol_reader_features(proto.shallow_copy(), ctx, collect_reader) };
+        let rf = reader_features.into_inner().unwrap();
+        assert_eq!(rf, vec!["columnMapping"]);
+
+        // Writer features: should yield "columnMapping" and "rowTracking"
+        let writer_features: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        extern "C" fn collect_writer(ctx: NullableCvoid, s: KernelStringSlice) {
+            let vec = unsafe { &*(ctx.unwrap().as_ptr() as *const std::sync::Mutex<Vec<String>>) };
+            vec.lock()
+                .unwrap()
+                .push(unsafe { String::try_from_slice(&s) }.unwrap());
+        }
+        let ctx = std::ptr::NonNull::new(&writer_features as *const _ as *mut std::ffi::c_void);
+        unsafe { visit_protocol_writer_features(proto.shallow_copy(), ctx, collect_writer) };
+        let mut wf = writer_features.into_inner().unwrap();
+        wf.sort(); // order not guaranteed
+        assert_eq!(wf, vec!["columnMapping", "rowTracking"]);
+
+        unsafe { free_protocol(proto) };
+        unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_metadata_handle() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_metadata/";
+        // Default METADATA: id=5fba94ed-..., no name/description, provider=parquet, createdTime set
+        add_commit(table_root, storage.as_ref(), 0, METADATA.to_string()).await?;
+
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
+            allocate_err,
+        );
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+        let meta = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
+
+        // id
+        let id = recover_string(unsafe { metadata_id(meta.shallow_copy(), allocate_str) }.unwrap());
+        assert_eq!(id, "5fba94ed-9794-4965-ba6e-6ee3c0d22af9");
+
+        // name: not set in default METADATA
+        let name_ptr = unsafe { metadata_name(meta.shallow_copy(), allocate_str) };
+        assert!(
+            name_ptr.is_none(),
+            "name should be null for default metadata"
+        );
+
+        // description: not set
+        let desc_ptr = unsafe { metadata_description(meta.shallow_copy(), allocate_str) };
+        assert!(
+            desc_ptr.is_none(),
+            "description should be null for default metadata"
+        );
+
+        // format provider
+        let provider = recover_string(
+            unsafe { metadata_format_provider(meta.shallow_copy(), allocate_str) }.unwrap(),
+        );
+        assert_eq!(provider, "parquet");
+
+        // createdTime
+        assert!(unsafe { metadata_has_created_time(meta.shallow_copy()) });
+        assert_eq!(
+            unsafe { metadata_created_time(meta.shallow_copy()) },
+            1587968585495
+        );
+
+        unsafe { free_metadata(meta) };
+        unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_metadata_handle_with_name() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_metadata_name/";
+        // METADATA_WITH_FEATURES has name="test_table" and id="deadbeef-..."
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            METADATA_WITH_FEATURES.to_string(),
+        )
+        .await?;
+
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
+            allocate_err,
+        );
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+        let meta = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
+
+        let id = recover_string(unsafe { metadata_id(meta.shallow_copy(), allocate_str) }.unwrap());
+        assert_eq!(id, "deadbeef-1234-5678-abcd-000000000000");
+
+        let name =
+            recover_string(unsafe { metadata_name(meta.shallow_copy(), allocate_str) }.unwrap());
+        assert_eq!(name, "test_table");
+
+        assert!(unsafe { metadata_has_created_time(meta.shallow_copy()) });
+        assert_eq!(
+            unsafe { metadata_created_time(meta.shallow_copy()) },
+            1234567890000
+        );
+
+        unsafe { free_metadata(meta) };
+        unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_computed_properties() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_computed/";
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            METADATA_WITH_FEATURES.to_string(),
+        )
+        .await?;
+
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
+            allocate_err,
+        );
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        // column mapping mode: "name" => 2
+        assert_eq!(
+            unsafe { snapshot_column_mapping_mode(snap.shallow_copy()) },
+            2
+        );
+
+        // feature support
+        let col_mapping = "columnMapping";
+        let row_tracking = "rowTracking";
+        let unknown = "unknownFeatureXyz";
+        assert!(unsafe {
+            snapshot_is_feature_supported(snap.shallow_copy(), kernel_string_slice!(col_mapping))
+        });
+        assert!(unsafe {
+            snapshot_is_feature_supported(snap.shallow_copy(), kernel_string_slice!(row_tracking))
+        });
+        assert!(!unsafe {
+            snapshot_is_feature_supported(snap.shallow_copy(), kernel_string_slice!(unknown))
+        });
+
+        // row tracking: supported (in protocol) — should_write_row_tracking checks suspended flag;
+        // is_feature_supported for rowTracking returns true here
+        assert!(unsafe { snapshot_is_row_tracking_enabled(snap.shallow_copy()) });
+
+        // deletion vectors: not in this protocol
+        assert!(!unsafe { snapshot_is_deletion_vector_readable(snap.shallow_copy()) });
+
+        // materialized row tracking columns
+        let row_id_col = recover_string(
+            unsafe { snapshot_materialized_row_id_column_name(snap.shallow_copy(), allocate_str) }
+                .unwrap(),
+        );
+        assert_eq!(row_id_col, "_row_id");
+
+        let commit_ver_col = recover_string(
+            unsafe {
+                snapshot_materialized_row_commit_version_column_name(
+                    snap.shallow_copy(),
+                    allocate_str,
+                )
+            }
+            .unwrap(),
+        );
+        assert_eq!(commit_ver_col, "_row_commit_version");
+
+        unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
         Ok(())
     }
 }
