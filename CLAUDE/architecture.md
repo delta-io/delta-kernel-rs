@@ -143,7 +143,7 @@ writes. Kernel doesn't know about catalogs -- the catalog client provides a log 
 `SnapshotBuilder::with_log_tail()` and a custom `Committer` for staging/ratifying/publishing
 commits. Requires `catalog-managed` feature flag.
 
-The `UCCommitter` (in the `uc-catalog` crate) is the reference implementation of a catalog
+The `UCCommitter` (in the `delta-kernel-unity-catalog` crate) is the reference implementation of a catalog
 committer for Unity Catalog. It stages commits to `_staged_commits/`, calls the UC commit API to
 ratify them, and publishes by copying to `_delta_log/`.
 
