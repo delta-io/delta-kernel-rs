@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use crate::metrics::{MetricEvent, MetricId};
+use crate::metrics::{MetricEvent, MetricId, ScanType};
 
 /// Metrics collected during scan log replay. Metrics are updated and read using relaxed ordering
 /// to keep updates fast across parallel executing threads.
@@ -98,9 +98,18 @@ impl ScanMetrics {
     }
 
     /// Snapshot all counters into a `MetricEvent::ScanMetadataCompleted`.
-    pub(crate) fn to_event(&self, operation_id: MetricId, total_duration: Duration) -> MetricEvent {
+    ///
+    /// `scan_type` identifies whether this event was emitted by full scan metadata replay or
+    /// by a phase of parallel scan metadata replay.
+    pub(crate) fn to_event(
+        &self,
+        operation_id: MetricId,
+        scan_type: ScanType,
+        total_duration: Duration,
+    ) -> MetricEvent {
         MetricEvent::ScanMetadataCompleted {
             operation_id,
+            scan_type,
             total_duration,
             num_add_files_seen: self.num_add_files_seen.load(Ordering::Relaxed),
             num_active_add_files: self.num_active_add_files.load(Ordering::Relaxed),

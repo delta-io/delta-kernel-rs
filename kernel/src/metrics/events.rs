@@ -11,6 +11,28 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MetricId(Uuid);
 
+/// Identifies which scan execution path produced a scan metadata metrics event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanType {
+    /// Sequential phase of [`crate::scan::Scan::parallel_scan_metadata`].
+    SequentialPhase,
+    /// Parallel phase of [`crate::scan::Scan::parallel_scan_metadata`].
+    ParallelPhase,
+    /// Scan metadata from [`crate::scan::Scan::scan_metadata`].
+    Full,
+}
+
+impl std::fmt::Display for ScanType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let scan_type = match self {
+            ScanType::SequentialPhase => "sequential",
+            ScanType::ParallelPhase => "parallel",
+            ScanType::Full => "full",
+        };
+        write!(f, "{scan_type}")
+    }
+}
+
 impl MetricId {
     /// Generate a new unique MetricId.
     pub fn new() -> Self {
@@ -86,6 +108,11 @@ pub enum MetricEvent {
     ScanMetadataCompleted {
         /// Unique ID to correlate this scan with other events.
         operation_id: MetricId,
+        /// Indicates which scan execution path produced this event.
+        ///
+        /// This is `SequentialPhase` or `ParallelPhase` for parallel log replay, and `Full` for
+        /// [`crate::scan::Scan::scan_metadata`].
+        scan_type: ScanType,
         /// Total duration from scan start to iterator exhaustion.
         total_duration: Duration,
         /// Add files that entered the deduplication visitor. This excludes files filtered by
@@ -165,6 +192,7 @@ impl fmt::Display for MetricEvent {
             ),
             MetricEvent::ScanMetadataCompleted {
                 operation_id,
+                scan_type,
                 total_duration,
                 num_add_files_seen,
                 num_active_add_files,
@@ -176,7 +204,7 @@ impl fmt::Display for MetricEvent {
                 predicate_eval_time_ms,
             } => write!(
                 f,
-                "ScanMetadataCompleted(id={operation_id}, duration={total_duration:?}, \
+                "ScanMetadataCompleted(id={operation_id}, scan_type={scan_type}, duration={total_duration:?}, \
                  add_files_seen={num_add_files_seen}, active_add_files={num_active_add_files}, \
                  remove_files_seen={num_remove_files_seen}, non_file_actions={num_non_file_actions}, \
                  predicate_filtered={num_predicate_filtered}, peak_hash_set_size={peak_hash_set_size}, \

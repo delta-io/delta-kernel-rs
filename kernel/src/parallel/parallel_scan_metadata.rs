@@ -5,7 +5,7 @@ use delta_kernel_derive::internal_api;
 use tracing::{info, info_span, Span};
 
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
-use crate::metrics::{MetricId, MetricsReporter};
+use crate::metrics::{MetricId, MetricsReporter, ScanType};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
@@ -45,9 +45,10 @@ impl SequentialScanMetadata {
         reporter: Option<Arc<dyn MetricsReporter>>,
     ) -> Self {
         let operation_id = MetricId::new();
+        let span = info_span!("sequential_scan_metadata", %operation_id);
         Self {
             sequential,
-            span: info_span!("sequential_scan_metadata", %operation_id),
+            span,
             operation_id,
             start: Instant::now(),
             reporter,
@@ -55,25 +56,36 @@ impl SequentialScanMetadata {
     }
 
     pub fn finish(self) -> DeltaResult<AfterSequentialScanMetadata> {
-        let _guard = self.span.enter();
-        match self.sequential.finish()? {
+        let Self {
+            sequential,
+            span,
+            operation_id,
+            start,
+            reporter,
+        } = self;
+        let _guard = span.enter();
+
+        match sequential.finish()? {
             AfterSequential::Done(processor) => {
-                let event = processor
-                    .get_metrics()
-                    .to_event(self.operation_id, self.start.elapsed());
-                info!(%event, "Sequential scan metadata completed");
-                if let Some(r) = &self.reporter {
+                let event = processor.get_metrics().to_event(
+                    operation_id,
+                    ScanType::SequentialPhase,
+                    start.elapsed(),
+                );
+                info!(%event, "Sequential scan metadata completed. No Parallel Phase needed.");
+                if let Some(r) = &reporter {
                     r.report(event);
                 }
                 Ok(AfterSequentialScanMetadata::Done)
             }
             AfterSequential::Parallel { processor, files } => {
-                // Emit sequential phase metrics
-                let event = processor
-                    .get_metrics()
-                    .to_event(self.operation_id, self.start.elapsed());
-                info!(%event, "Sequential scan metadata completed");
-                if let Some(r) = &self.reporter {
+                let event = processor.get_metrics().to_event(
+                    operation_id,
+                    ScanType::SequentialPhase,
+                    start.elapsed(),
+                );
+                info!(%event, "Sequential scan metadata completed. Parallel Phase needed.");
+                if let Some(r) = &reporter {
                     r.report(event);
                 }
                 processor.get_metrics().reset_counters();
@@ -81,9 +93,9 @@ impl SequentialScanMetadata {
                 Ok(AfterSequentialScanMetadata::Parallel {
                     state: Box::new(ParallelState {
                         inner: processor,
-                        operation_id: self.operation_id,
+                        operation_id,
                         start: Instant::now(),
-                        reporter: self.reporter,
+                        reporter,
                     }),
                     files,
                 })
@@ -142,10 +154,11 @@ impl ParallelState {
     /// }
     /// ```
     pub fn report_metrics(&self) {
-        let event = self
-            .inner
-            .get_metrics()
-            .to_event(self.operation_id, self.start.elapsed());
+        let event = self.inner.get_metrics().to_event(
+            self.operation_id,
+            ScanType::ParallelPhase,
+            self.start.elapsed(),
+        );
         info!(%event, "Parallel scan metadata completed");
         if let Some(r) = &self.reporter {
             r.report(event);
@@ -238,6 +251,7 @@ impl ParallelState {
 pub struct ParallelScanMetadata {
     pub(crate) processor: ParallelPhase<Arc<ParallelState>>,
     span: Span,
+    operation_id: MetricId,
 }
 
 impl ParallelScanMetadata {
@@ -246,11 +260,13 @@ impl ParallelScanMetadata {
         state: Arc<ParallelState>,
         leaf_files: Vec<FileMeta>,
     ) -> DeltaResult<Self> {
+        let operation_id = state.operation_id;
+        let span = info_span!("parallel_scan_metadata", %operation_id);
         let read_schema = state.file_read_schema();
         Ok(Self {
             processor: ParallelPhase::try_new(engine, state, leaf_files, read_schema)?,
-            // TODO: Associate the same scan ID from sequential phase to correlate phases
-            span: info_span!("parallel_scan_metadata"),
+            span,
+            operation_id,
         })
     }
 
@@ -258,10 +274,12 @@ impl ParallelScanMetadata {
         state: Arc<ParallelState>,
         iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
     ) -> Self {
+        let operation_id = state.operation_id;
+        let span = info_span!("parallel_scan_metadata", %operation_id);
         Self {
             processor: ParallelPhase::new_from_iter(state.clone(), iter),
-            // TODO: Associate the same scan ID from sequential phase to correlate phases
-            span: info_span!("parallel_scan_metadata"),
+            span,
+            operation_id,
         }
     }
 }
@@ -270,6 +288,7 @@ impl Iterator for ParallelScanMetadata {
     type Item = DeltaResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let _operation_id = self.operation_id;
         let _guard = self.span.enter();
         self.processor.next()
     }

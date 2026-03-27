@@ -28,6 +28,7 @@ use crate::kernel_predicates::{
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
+use crate::metrics::ScanType;
 use crate::parallel::sequential_phase::SequentialPhase;
 use crate::scan::log_replay::ScanLogReplayProcessor;
 use crate::scan::log_replay::{
@@ -786,7 +787,7 @@ impl Scan {
         };
 
         let on_complete = move || {
-            let event = metrics.to_event(operation_id, start.elapsed());
+            let event = metrics.to_event(operation_id, ScanType::Full, start.elapsed());
             info!(%event);
             if let Some(r) = reporter {
                 r.report(event);
