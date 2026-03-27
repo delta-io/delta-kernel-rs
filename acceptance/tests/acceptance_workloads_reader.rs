@@ -25,15 +25,23 @@ const SKIP_LIST: &[(&str, &str)] = &[
         "cdc_err_",
         "CDF test type not yet supported (fails at parse time)",
     ),
-    // These tests panic during predicate evaluation (index out of bounds).
-    // TODO: Fix predicate parser to handle these cases properly.
+    // These tests panic in reorder_struct_array (arrow_utils.rs:1068) with "index out of bounds".
+    // Both have predicate `flag = true` on tables with 6 columns (including timestamp/decimal).
+    // Both tables were created via CLONE/RESTORE operations. Simpler boolean predicate tests pass.
+    //
+    // Root cause: When data skipping evaluates the predicate, kernel builds a stats schema.
+    // Stats have nested structure (minValues/maxValues/nullCount are nested structs), but
+    // boolean columns have no min/max stats - only nullCount. This causes a mismatch between
+    // the expected stats schema and actual stats, leading to an invalid array index access
+    // during column reordering. The bug is in kernel's data skipping stats handling, not
+    // predicate parsing. Tests without predicates on these same tables work fine.
     (
         "cloneDeepMultiType_readFiltered",
-        "Predicate evaluation panics (index out of bounds)",
+        "Kernel panic in reorder_struct_array (index out of bounds)",
     ),
     (
         "restoreCheckData_filterBoolean",
-        "Predicate evaluation panics (index out of bounds)",
+        "Kernel panic in reorder_struct_array (index out of bounds)",
     ),
 ];
 
@@ -312,14 +320,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         "variantShredding feature not supported",
         &["pv_002_upgrade_to_current/specs/pv_002_upgrade_to_current_read_latest"],
     ),
-    (
-        "Predicate parser fails to resolve nested struct columns",
-        &[
-            "dcscStructWithNull/specs/dcscStructWithNull_read_null",
-            "dcscStructWithNull/specs/dcscStructWithNull_read_non_null",
-            "ddefReadDefaultNested/specs/ddefReadDefaultNested_readNonNull",
-        ],
-    ),
     // Predicate parser: LIKE operator not supported
     (
         "Predicate parser: LIKE operator not supported",
@@ -556,6 +556,18 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "tt_version_read_timestamp_v0",
             "tt_version_read_timestamp_v1",
             "tt_version_read_timestamp_v2",
+        ],
+    ),
+    // IS NULL predicates on struct columns fail because kernel's GetReferencedFields only
+    // resolves primitive columns (which have stats). Struct columns don't have nullCount stats
+    // at the struct level - only their primitive children do. The error "Predicate references
+    // unknown column: <col>" is misleading since the column exists, it's just a struct type.
+    (
+        "IS NULL on struct columns: kernel only resolves primitive columns for data skipping",
+        &[
+            "dcscStructWithNull/specs/dcscStructWithNull_read_null",
+            "dcscStructWithNull/specs/dcscStructWithNull_read_non_null",
+            "ddefReadDefaultNested/specs/ddefReadDefaultNested_readNonNull",
         ],
     ),
 ];
