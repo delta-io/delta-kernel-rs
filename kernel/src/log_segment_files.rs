@@ -255,13 +255,13 @@ impl LogSegmentFiles {
     ///
     /// - `fs_files`: files listed from storage in ascending version order
     /// - `log_tail`: catalog-provided commits
-    /// - `log_tail_min_version`: lower bound (inclusive) for log_tail entries included in the
-    ///   result
+    /// - `start_version`: start version of the entire listing range provided; in practice,
+    ///   this is the lower bound (inclusive) for log_tail entries included in the result
     /// - `end_version`: upper bound (inclusive) on versions to include, `None` means no bound
     pub(crate) fn build_log_segment_files(
         fs_files: impl Iterator<Item = DeltaResult<ParsedLogPath>>,
         log_tail: Vec<ParsedLogPath>,
-        log_tail_min_version: Version,
+        start_version: Version,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         // check log_tail is only commits
@@ -316,7 +316,7 @@ impl LogSegmentFiles {
         // here - LogSegment::try_new is the safeguard that filters those out unconditionally
         let filtered_log_tail = log_tail
             .into_iter()
-            .filter(|entry| entry.version >= log_tail_min_version && entry.version <= end);
+            .filter(|entry| entry.version >= start_version && entry.version <= end);
         for file in filtered_log_tail {
             // Track max published version for published commits from the log_tail
             if matches!(file.file_type, LogPathFileType::Commit) {
@@ -417,7 +417,6 @@ impl LogSegmentFiles {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
         let fs_iter = list_from_storage(storage, log_root, start, end)?;
-        // We pass start as the log_tail_min_version to exclude log_tail entries before the listing start
         Self::build_log_segment_files(fs_iter, log_tail, start, end_version)
     }
 
@@ -507,9 +506,8 @@ impl LogSegmentFiles {
         }
 
         let fs_iter = windows.into_iter().rev().flatten().map(Ok);
-        // We pass the checkpoint version as the log_tail_min_version to exclude log_tail entries before the checkpoint
-        let log_tail_min_version = found_checkpoint_version.unwrap_or(0);
-        Self::build_log_segment_files(fs_iter, log_tail, log_tail_min_version, Some(end_version))
+        let start = found_checkpoint_version.unwrap_or(0);
+        Self::build_log_segment_files(fs_iter, log_tail, start, Some(end_version))
     }
 }
 
@@ -1329,7 +1327,7 @@ mod list_log_files_with_log_tail_tests {
         assert_eq!(crc.version, 6);
         assert!(matches!(crc.file_type, LogPathFileType::Crc));
 
-        // v5 passes the log_tail_min_version filter (>= 5) and is included here
+        // v5 passes the start version filter (>= 5) and is included here
         assert_eq!(result.ascending_commit_files.len(), 4);
         for (i, commit) in result.ascending_commit_files.iter().enumerate() {
             assert_eq!(commit.version, (i + 5) as u64);
