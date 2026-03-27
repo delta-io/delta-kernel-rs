@@ -38,14 +38,21 @@ pub struct CountingReporter {
     /// Number of full (non-incremental) log segment loads. Each fresh snapshot construction
     /// from a table root contributes one load; incremental snapshot updates do not.
     pub log_segment_loads: AtomicU64,
-    /// Total commit files seen across all log segment loads.
+    /// Total commit (JSON delta) files in the commit tail across all log segment loads.
+    /// These are the commits between the last checkpoint and the snapshot version — not
+    /// all historical commits in the table. Commits older than the selected checkpoint
+    /// are not included.
     pub commit_files: AtomicU64,
-    /// Total checkpoint part files selected for reading across all log segment loads.
+    /// Total checkpoint part files read across all log segment loads.
     /// For a single-part checkpoint this is 1; for a multi-part checkpoint it equals the
     /// number of parts that make up the selected checkpoint.
     pub checkpoint_files: AtomicU64,
-    /// Total log compaction files seen across all log segment loads.
+    /// Total log compaction files in the commit tail across all log segment loads.
     pub compaction_files: AtomicU64,
+    // TODO: add `crc_files` counter for version checksum (.crc) files read.
+    // Tracking CRC reads is critical for understanding snapshot load costs on tables
+    // that use CRC files heavily. Requires a new MetricEvent variant and emitting it
+    // from the CRC read path. See https://github.com/delta-io/delta-kernel-rs/issues/2257
 }
 
 impl CountingReporter {
