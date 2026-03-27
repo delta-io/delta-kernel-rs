@@ -361,7 +361,37 @@ fn column_in_literal_array_with_nulls_uses_sql_null_semantics() {
 }
 
 #[test]
-fn test_literal_complex_type_array() {
+fn column_in_literal_array_with_null_in_set_returns_null_for_non_matches() {
+    // Test SQL semantics: x IN (1, NULL) returns NULL (not FALSE) when x doesn't match 1
+    let col_array = Int32Array::from(vec![1, 2, 3]);
+    let field = Arc::new(Field::new("x", DataType::Int32, false));
+    let schema = Schema::new([field]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(col_array)]).unwrap();
+
+    // x IN (1, NULL)
+    let in_op = Pred::binary(
+        BinaryPredicateOp::In,
+        column_expr!("x"),
+        Scalar::Array(
+            ArrayData::try_new(
+                ArrayType::new(KernelDataType::INTEGER, true),
+                vec![Scalar::Integer(1), Scalar::Null(KernelDataType::INTEGER)],
+            )
+            .unwrap(),
+        ),
+    );
+
+    let result = evaluate_predicate(&in_op, &batch, false).unwrap();
+    // Row values: [1, 2, 3], IN set: {1, NULL}
+    // x=1: matches 1 -> TRUE
+    // x=2: doesn't match 1, comparing with NULL yields NULL -> NULL
+    // x=3: doesn't match 1, comparing with NULL yields NULL -> NULL
+    let expected = BooleanArray::from(vec![Some(true), None, None]);
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn nested_complex_literal_array_builds_correct_arrow_structure() {
     use crate::arrow::array::{Array as _, AsArray as _};
     use crate::arrow::datatypes::Int32Type;
 

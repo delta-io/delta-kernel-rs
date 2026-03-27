@@ -3835,5 +3835,9 @@ mod tests {
         // Empty path returns None
         let field = schema.resolve_column(&ColumnName::new(std::iter::empty::<&str>()));
         assert!(field.is_none());
+
+        // Traversing into non-struct type returns None (a.b.c is DOUBLE, not a struct)
+        let field = schema.resolve_column(&ColumnName::new(["a", "b", "c", "invalid"]));
+        assert!(field.is_none());
     }
 }
