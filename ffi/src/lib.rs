@@ -707,6 +707,10 @@ pub struct FfiSnapshotBuilder {
     log_tail: Vec<LogPath>,
 }
 
+/// An opaque handle with exclusive (Box-like) ownership of a [`FfiSnapshotBuilder`].
+#[handle_descriptor(target=FfiSnapshotBuilder, mutable=true, sized=true)]
+pub struct MutableFfiSnapshotBuilder;
+
 enum FfiSnapshotBuilderSource {
     TableRoot(Url),
     ExistingSnapshot(SnapshotRef),
@@ -724,7 +728,7 @@ enum FfiSnapshotBuilderSource {
 pub unsafe extern "C" fn get_snapshot_builder(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<*mut FfiSnapshotBuilder> {
+) -> ExternResult<Handle<MutableFfiSnapshotBuilder>> {
     let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
@@ -736,7 +740,7 @@ fn get_snapshot_builder_impl(
     make_source: impl FnOnce(Url) -> FfiSnapshotBuilderSource,
     url: DeltaResult<Url>,
     engine: Arc<dyn ExternEngine>,
-) -> DeltaResult<*mut FfiSnapshotBuilder> {
+) -> DeltaResult<Handle<MutableFfiSnapshotBuilder>> {
     let builder = Box::new(FfiSnapshotBuilder {
         engine,
         source: make_source(url?),
@@ -744,7 +748,7 @@ fn get_snapshot_builder_impl(
         #[cfg(feature = "catalog-managed")]
         log_tail: Vec::new(),
     });
-    Ok(Box::into_raw(builder))
+    Ok(builder.into())
 }
 
 /// Get a builder for incrementally updating an existing snapshot.
@@ -759,7 +763,7 @@ fn get_snapshot_builder_impl(
 pub unsafe extern "C" fn get_snapshot_builder_from(
     old_snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<*mut FfiSnapshotBuilder> {
+) -> ExternResult<Handle<MutableFfiSnapshotBuilder>> {
     let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
     let snapshot_arc = unsafe { old_snapshot.clone_as_arc() };
@@ -770,7 +774,7 @@ pub unsafe extern "C" fn get_snapshot_builder_from(
         #[cfg(feature = "catalog-managed")]
         log_tail: Vec::new(),
     });
-    Ok(Box::into_raw(builder)).into_extern_result(&engine_ref)
+    Ok(builder.into()).into_extern_result(&engine_ref)
 }
 
 /// Set the target version on a snapshot builder. When omitted, the snapshot is created at the
@@ -781,10 +785,10 @@ pub unsafe extern "C" fn get_snapshot_builder_from(
 /// Caller must pass a valid builder pointer.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_builder_set_version(
-    builder: &mut FfiSnapshotBuilder,
+    builder: &mut Handle<MutableFfiSnapshotBuilder>,
     version: Version,
 ) {
-    builder.version = Some(version);
+    unsafe { builder.as_mut() }.version = Some(version);
 }
 
 /// Set the log tail on a snapshot builder for catalog-managed tables.
@@ -796,12 +800,13 @@ pub unsafe extern "C" fn snapshot_builder_set_version(
 #[cfg(feature = "catalog-managed")]
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_builder_set_log_tail(
-    builder: &mut FfiSnapshotBuilder,
+    builder: &mut Handle<MutableFfiSnapshotBuilder>,
     log_tail: log_path::LogPathArray,
 ) -> ExternResult<bool> {
-    let engine_arc = builder.engine.clone();
+    let builder_mut = unsafe { builder.as_mut() };
+    let engine_arc = builder_mut.engine.clone();
     let engine_ref = engine_arc.as_ref();
-    snapshot_builder_set_log_tail_impl(builder, log_tail).into_extern_result(&engine_ref)
+    snapshot_builder_set_log_tail_impl(builder_mut, log_tail).into_extern_result(&engine_ref)
 }
 
 #[cfg(feature = "catalog-managed")]
@@ -821,12 +826,12 @@ fn snapshot_builder_set_log_tail_impl(
 /// Caller must pass a valid builder pointer and must not use it again after this call.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_builder_build(
-    builder: *mut FfiSnapshotBuilder,
+    mut builder: Handle<MutableFfiSnapshotBuilder>,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let builder_box = unsafe { Box::from_raw(builder) };
-    // Clone the engine Arc before consuming builder_box so we can still use it for error reporting
-    let engine_arc = builder_box.engine.clone();
+    // Clone the engine Arc before consuming the handle so we can still use it for error reporting
+    let engine_arc = unsafe { builder.as_mut() }.engine.clone();
     let engine_ref = engine_arc.as_ref();
+    let builder_box = unsafe { builder.into_inner() };
     snapshot_builder_build_impl(*builder_box).into_extern_result(&engine_ref)
 }
 
@@ -853,8 +858,8 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
 #[no_mangle]
-pub unsafe extern "C" fn free_snapshot_builder(builder: *mut FfiSnapshotBuilder) {
-    let _ = unsafe { Box::from_raw(builder) };
+pub unsafe extern "C" fn free_snapshot_builder(builder: Handle<MutableFfiSnapshotBuilder>) {
+    builder.drop_handle();
 }
 
 // ---------------------------------------------------------------------------
@@ -902,12 +907,12 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
     engine: Handle<SharedExternEngine>,
     log_paths: log_path::LogPathArray,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
+    let mut builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
         ExternResult::Ok(ptr) => ptr,
         ExternResult::Err(e) => return ExternResult::Err(e),
     };
     if let ExternResult::Err(e) =
-        unsafe { snapshot_builder_set_log_tail(&mut *builder_ptr, log_paths) }
+        unsafe { snapshot_builder_set_log_tail(&mut builder_ptr, log_paths) }
     {
         unsafe { free_snapshot_builder(builder_ptr) };
         return ExternResult::Err(e);
@@ -932,11 +937,11 @@ pub unsafe extern "C" fn snapshot_at_version(
     engine: Handle<SharedExternEngine>,
     version: Version,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
+    let mut builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
         ExternResult::Ok(ptr) => ptr,
         ExternResult::Err(e) => return ExternResult::Err(e),
     };
-    unsafe { snapshot_builder_set_version(&mut *builder_ptr, version) };
+    unsafe { snapshot_builder_set_version(&mut builder_ptr, version) };
     unsafe { snapshot_builder_build(builder_ptr) }
 }
 
@@ -960,13 +965,13 @@ pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
     version: Version,
     log_tail: log_path::LogPathArray,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
+    let mut builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
         ExternResult::Ok(ptr) => ptr,
         ExternResult::Err(e) => return ExternResult::Err(e),
     };
-    unsafe { snapshot_builder_set_version(&mut *builder_ptr, version) };
+    unsafe { snapshot_builder_set_version(&mut builder_ptr, version) };
     if let ExternResult::Err(e) =
-        unsafe { snapshot_builder_set_log_tail(&mut *builder_ptr, log_tail) }
+        unsafe { snapshot_builder_set_log_tail(&mut builder_ptr, log_tail) }
     {
         unsafe { free_snapshot_builder(builder_ptr) };
         return ExternResult::Err(e);
@@ -1716,11 +1721,11 @@ mod tests {
 
         // Create snapshot at specific version using old snapshot for optimization
         let snapshot_at_v1 = unsafe {
-            let ptr = ok_or_panic(get_snapshot_builder_from(
+            let mut ptr = ok_or_panic(get_snapshot_builder_from(
                 old_snapshot.shallow_copy(),
                 engine.shallow_copy(),
             ));
-            snapshot_builder_set_version(&mut *ptr, 1);
+            snapshot_builder_set_version(&mut ptr, 1);
             ok_or_panic(snapshot_builder_build(ptr))
         };
         let v1_version = unsafe { version(snapshot_at_v1.shallow_copy()) };
@@ -1799,12 +1804,12 @@ mod tests {
 
         // Create new snapshot using old snapshot for optimization with log tail
         let new_snapshot = unsafe {
-            let ptr = ok_or_panic(get_snapshot_builder_from(
+            let mut ptr = ok_or_panic(get_snapshot_builder_from(
                 old_snapshot.shallow_copy(),
                 engine.shallow_copy(),
             ));
             ok_or_panic(snapshot_builder_set_log_tail(
-                &mut *ptr,
+                &mut ptr,
                 log_tail_array.clone(),
             ));
             ok_or_panic(snapshot_builder_build(ptr))
@@ -1814,12 +1819,12 @@ mod tests {
 
         // Create snapshot at specific version using old snapshot with log tail
         let snapshot_at_v1 = unsafe {
-            let ptr = ok_or_panic(get_snapshot_builder_from(
+            let mut ptr = ok_or_panic(get_snapshot_builder_from(
                 old_snapshot.shallow_copy(),
                 engine.shallow_copy(),
             ));
-            snapshot_builder_set_version(&mut *ptr, 1);
-            ok_or_panic(snapshot_builder_set_log_tail(&mut *ptr, log_tail_array));
+            snapshot_builder_set_version(&mut ptr, 1);
+            ok_or_panic(snapshot_builder_set_log_tail(&mut ptr, log_tail_array));
             ok_or_panic(snapshot_builder_build(ptr))
         };
         let v1_version = unsafe { version(snapshot_at_v1.shallow_copy()) };
