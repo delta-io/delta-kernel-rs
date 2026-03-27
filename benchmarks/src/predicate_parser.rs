@@ -9,9 +9,10 @@
 //! - `IN (...)`, `NOT IN (...)`
 //! - `BETWEEN ... AND ...`
 //! - Column references and literal values (integers, floats, strings, booleans)
+//! - Typed literals: `DATE'...'`, `TIMESTAMP'...'`, `TIMESTAMP_NTZ'...'`
 //!
 //! Unsupported (returns error): `LIKE`, function calls (`HEX`, `size`, `length`),
-//! typed literals (`TIME '...'`).
+//! `TIME '...'` typed literals.
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpressionOp, ColumnName, Expression, Predicate, Scalar,
@@ -65,6 +66,13 @@ fn preprocess_timestamp_ntz(input: &str) -> String {
 /// - Column types are looked up in the schema
 /// - Literals are checked against expected types from columns
 /// - Type mismatches produce detailed error messages
+///
+/// # Note
+///
+/// `TIMESTAMP_NTZ` literals are preprocessed by stripping the prefix, since sqlparser doesn't
+/// recognize this keyword. This preprocessing uses simple string matching and may incorrectly
+/// match `TIMESTAMP_NTZ` inside string literals (e.g., `str_col = 'TIMESTAMP_NTZ is cool'`).
+/// This is acceptable for benchmark predicates which don't contain such edge cases.
 ///
 /// # Example
 /// ```ignore
@@ -130,7 +138,11 @@ fn infer_expr(schema: &Schema, expr: &Expr) -> Option<(Expression, DataType)> {
                 ast::BinaryOperator::Divide => Expression::binary(BinaryExpressionOp::Divide, l, r),
                 // Modulo: a % b = a - (b * (a / b))
                 // This relies on kernel's Divide producing integer division for integer types,
-                // which truncates toward zero. For example, 7 / 3 = 2, so 7 % 3 = 7 - (3 * 2) = 1.
+                // which truncates toward zero (like Rust/C, matching Spark behavior).
+                // Examples:
+                //   7 % 3  =  7 - (3 * (7 / 3))  =  7 - (3 * 2)  =  1
+                //  -7 % 3  = -7 - (3 * (-7 / 3)) = -7 - (3 * -2) = -1
+                //   7 % -3 =  7 - (-3 * (7 / -3)) = 7 - (-3 * -2) = 1
                 ast::BinaryOperator::Modulo => {
                     let a_div_b =
                         Expression::binary(BinaryExpressionOp::Divide, l.clone(), r.clone());
@@ -280,7 +292,7 @@ fn infer_binary_exprs(
         }
         (Some((_, ty)), None) | (None, Some((_, ty))) => ty.clone(),
         (None, None) => {
-            return Err(format!("Cannot determine types for: {} and {}", left, right).into())
+            return Err(format!("Cannot determine types for: {:?} and {:?}", left, right).into())
         }
     };
 
@@ -434,11 +446,11 @@ fn between_to_predicate(
 mod tests {
     use super::*;
     use delta_kernel::expressions::{column_name as col, Predicate as Pred, Scalar::*};
-    use delta_kernel::schema::{MapType, StructField, StructType};
+    use delta_kernel::schema::{MapType, Schema, StructField, StructType};
     use rstest::rstest;
 
-    fn test_schema() -> StructType {
-        StructType::new_unchecked(vec![
+    fn test_schema() -> Schema {
+        Schema::new_unchecked(vec![
             // Primitive types
             StructField::new("byte_col", DataType::BYTE, true),
             StructField::new("short_col", DataType::SHORT, true),
@@ -450,6 +462,7 @@ mod tests {
             StructField::new("bool_col", DataType::BOOLEAN, true),
             StructField::new("date_col", DataType::DATE, true),
             StructField::new("ts_col", DataType::TIMESTAMP, true),
+            StructField::new("ts_ntz_col", DataType::TIMESTAMP_NTZ, true),
             // Struct type
             StructField::new(
                 "struct_col",
@@ -782,5 +795,64 @@ mod tests {
             "IS NULL on expressions should not be supported: {}",
             sql
         );
+    }
+
+    // Modulo with negative operands (truncates toward zero like Rust/Spark)
+    #[test]
+    fn parse_modulo_with_negative_operands() {
+        let schema = test_schema();
+
+        // -7 % 3 = -7 - (3 * (-7 / 3)) = -7 - (3 * -2) = -7 - (-6) = -1
+        let pred = parse_predicate("long_col % 3 = -1", &schema).unwrap();
+        let a = col!("long_col");
+        let b: Expression = Long(3).into();
+        let a_div_b = Expression::binary(BinaryExpressionOp::Divide, a.clone(), b.clone());
+        let b_times_quotient = Expression::binary(BinaryExpressionOp::Multiply, b, a_div_b);
+        let modulo = Expression::binary(BinaryExpressionOp::Minus, a, b_times_quotient);
+        let expected = Pred::eq(modulo, Long(-1));
+        assert_eq!(pred, expected);
+    }
+
+    // preprocess_timestamp_ntz tests
+    #[rstest]
+    #[case("TIMESTAMP_NTZ'2024-01-01'", "'2024-01-01'")]
+    #[case("timestamp_ntz'2024-01-01'", "'2024-01-01'")] // lowercase
+    #[case("Timestamp_Ntz'2024-01-01'", "'2024-01-01'")] // mixed case
+    #[case("TIMESTAMP_NTZ '2024-01-01'", " '2024-01-01'")] // space before quote
+    #[case("col = TIMESTAMP_NTZ'2024-01-01'", "col = '2024-01-01'")] // in expression
+    #[case("TIMESTAMP'2024-01-01'", "TIMESTAMP'2024-01-01'")] // TIMESTAMP preserved
+    #[case("col = 'test'", "col = 'test'")] // no change
+    fn preprocess_timestamp_ntz_strips_prefix(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(preprocess_timestamp_ntz(input), expected);
+    }
+
+    // DATE and TIMESTAMP typed literals are supported via TypedString
+    #[test]
+    fn parse_date_typed_literal() {
+        let schema = test_schema();
+        let pred = parse_predicate("date_col = DATE'2024-01-15'", &schema).unwrap();
+        // Date is days since epoch: 2024-01-15 = 19737 days
+        let expected = Pred::eq(col!("date_col"), Date(19737));
+        assert_eq!(pred, expected);
+    }
+
+    #[test]
+    fn parse_timestamp_typed_literal() {
+        let schema = test_schema();
+        let pred = parse_predicate("ts_col = TIMESTAMP'2024-01-15 12:30:00'", &schema).unwrap();
+        // Timestamp is microseconds since epoch
+        // 2024-01-15 12:30:00 UTC = 1705321800000000 microseconds
+        let expected = Pred::eq(col!("ts_col"), Timestamp(1705321800000000));
+        assert_eq!(pred, expected);
+    }
+
+    #[test]
+    fn parse_timestamp_ntz_typed_literal() {
+        let schema = test_schema();
+        let pred =
+            parse_predicate("ts_ntz_col = TIMESTAMP_NTZ'2024-01-15 12:30:00'", &schema).unwrap();
+        // TimestampNtz is microseconds since epoch (same numeric value as Timestamp)
+        let expected = Pred::eq(col!("ts_ntz_col"), TimestampNtz(1705321800000000));
+        assert_eq!(pred, expected);
     }
 }
