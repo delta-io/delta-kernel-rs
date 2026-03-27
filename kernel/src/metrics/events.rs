@@ -78,6 +78,23 @@ pub enum MetricEvent {
 
     /// Storage copy operation completed.
     StorageCopyCompleted { duration: Duration },
+
+    /// JSON file read operation completed (one event per [`JsonHandler::read_json_files`] call).
+    ///
+    /// `bytes_read` is the sum of `FileMeta::size` for the requested files (on-disk size),
+    /// which is the best available approximation without re-reading the bytes.
+    ///
+    /// [`JsonHandler::read_json_files`]: crate::JsonHandler::read_json_files
+    JsonReadCompleted { num_files: u64, bytes_read: u64 },
+
+    /// Parquet file read operation completed (one event per
+    /// [`ParquetHandler::read_parquet_files`] call).
+    ///
+    /// `bytes_read` is the sum of `FileMeta::size` for the requested files (on-disk size),
+    /// which is the best available approximation without re-reading the bytes.
+    ///
+    /// [`ParquetHandler::read_parquet_files`]: crate::ParquetHandler::read_parquet_files
+    ParquetReadCompleted { num_files: u64, bytes_read: u64 },
 }
 
 impl fmt::Display for MetricEvent {
@@ -133,6 +150,20 @@ impl fmt::Display for MetricEvent {
             MetricEvent::StorageCopyCompleted { duration } => write!(
                 f,
                 "StorageCopyCompleted(duration={duration:?})"
+            ),
+            MetricEvent::JsonReadCompleted {
+                num_files,
+                bytes_read,
+            } => write!(
+                f,
+                "JsonReadCompleted(files={num_files}, bytes={bytes_read})"
+            ),
+            MetricEvent::ParquetReadCompleted {
+                num_files,
+                bytes_read,
+            } => write!(
+                f,
+                "ParquetReadCompleted(files={num_files}, bytes={bytes_read})"
             ),
         }
     }

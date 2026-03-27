@@ -1,5 +1,8 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
+pub mod counting_reporter;
+pub use counting_reporter::{CountingReporter, RelaxedCounter};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
