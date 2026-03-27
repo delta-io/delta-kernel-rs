@@ -255,10 +255,16 @@ const BACKWARD_SCAN_WINDOW_SIZE: u64 = 1000;
 impl LogSegmentFiles {
     /// Assembles a `LogSegmentFiles` from `fs_files` (an iterator of files
     /// listed from storage) and `log_tail` (catalog-provided commits).
+    ///
+    /// - `fs_files`: files listed from storage in ascending version order
+    /// - `log_tail`: catalog-provided commits
+    /// - `log_tail_min_version`: lower bound (inclusive) for log_tail entries included in the
+    ///   result
+    /// - `end_version`: upper bound (inclusive) on versions to include, `None` means no bound
     pub(crate) fn build_log_segment_files(
         fs_files: impl Iterator<Item = DeltaResult<ParsedLogPath>>,
         log_tail: Vec<ParsedLogPath>,
-        start_version: Version,
+        log_tail_min_version: Version,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         // check log_tail is only commits
@@ -270,7 +276,7 @@ impl LogSegmentFiles {
 
         let log_tail_start_version = log_tail.first().map(|f| f.version);
         let end = end_version.unwrap_or(Version::MAX);
-        
+
         let mut acc = ListingAccumulator {
             end_version,
             ..Default::default()
@@ -308,9 +314,12 @@ impl LogSegmentFiles {
         // Phase 1 maintains ascending version order throughout, which is required by the checkpoint
         // grouping logic. Note that Phase 1 already skipped filesystem commits at log_tail
         // versions, so there's no duplication here.
+        //
+        // log_tail entries at versions before a checkpoint may still be included
+        // here - LogSegment::try_new is the safeguard that filters those out unconditionally
         let filtered_log_tail = log_tail
             .into_iter()
-            .filter(|entry| entry.version >= start_version && entry.version <= end);
+            .filter(|entry| entry.version >= log_tail_min_version && entry.version <= end);
         for file in filtered_log_tail {
             // Track max published version for published commits from the log_tail
             if matches!(file.file_type, LogPathFileType::Commit) {
@@ -411,6 +420,7 @@ impl LogSegmentFiles {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
         let fs_iter = list_from_storage(storage, log_root, start, end)?;
+        // We pass start as the log_tail_min_version to exclude log_tail entries before the listing start
         Self::build_log_segment_files(fs_iter, log_tail, start, end_version)
     }
 
@@ -497,11 +507,9 @@ impl LogSegmentFiles {
         }
 
         let fs_iter = windows.into_iter().rev().flatten().map(Ok);
-        // Log replay starts at cp_version + 1: a checkpoint supersedes any commit at the same
-        // version, so commits at or before the checkpoint are not needed. Falls back to 0 if no
-        // checkpoint was found.
-        let start_version = found_checkpoint_version.map(|v| v + 1).unwrap_or(0);
-        Self::build_log_segment_files(fs_iter, log_tail, start_version, Some(end_version))
+        // We pass the checkpoint version as the log_tail_min_version to exclude log_tail entries before the checkpoint
+        let log_tail_min_version = found_checkpoint_version.unwrap_or(0);
+        Self::build_log_segment_files(fs_iter, log_tail, log_tail_min_version, Some(end_version))
     }
 }
 
@@ -1285,9 +1293,9 @@ mod list_log_files_with_log_tail_tests {
     #[tokio::test]
     async fn backward_scan_with_log_tail_starting_before_checkpoint() {
         // FS: commits v0..=v5 + checkpoint at v5 + CRC at v6. log_tail: catalog commits v3..=v8,
-        // starting before the checkpoint. The checkpoint at v5 sets the lower bound to v6, so
-        // log_tail v3..=v5 are excluded. The CRC at v6 is preserved even though v6 is within
-        // the log_tail range.
+        // starting before the checkpoint. The checkpoint at v5 sets the lower bound to v5, so
+        // log_tail v3..=v4 are excluded. The log_tail commit at v5 passes through (it is at the
+        // checkpoint version). The CRC at v6 is preserved even though v6 is within the log_tail range.
         let mut log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=5)
             .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
             .collect();
@@ -1321,9 +1329,10 @@ mod list_log_files_with_log_tail_tests {
         assert_eq!(crc.version, 6);
         assert!(matches!(crc.file_type, LogPathFileType::Crc));
 
-        assert_eq!(result.ascending_commit_files.len(), 3);
+        // v5 passes the log_tail_min_version filter (>= 5) and is included here
+        assert_eq!(result.ascending_commit_files.len(), 4);
         for (i, commit) in result.ascending_commit_files.iter().enumerate() {
-            assert_eq!(commit.version, (i + 6) as u64);
+            assert_eq!(commit.version, (i + 5) as u64);
             assert_source(commit, CommitSource::Catalog);
         }
         assert_eq!(result.latest_commit_file.unwrap().version, 8);
