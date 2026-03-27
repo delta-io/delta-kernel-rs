@@ -1,9 +1,11 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
-use tracing::{info_span, Span};
+use tracing::{info, info_span, Span};
 
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
+use crate::metrics::{MetricId, MetricsReporter};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
@@ -32,14 +34,23 @@ pub enum AfterSequentialScanMetadata {
 pub struct SequentialScanMetadata {
     pub(crate) sequential: SequentialPhase<ScanLogReplayProcessor>,
     span: Span,
+    operation_id: MetricId,
+    start: Instant,
+    reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl SequentialScanMetadata {
-    pub(crate) fn new(sequential: SequentialPhase<ScanLogReplayProcessor>) -> Self {
+    pub(crate) fn new(
+        sequential: SequentialPhase<ScanLogReplayProcessor>,
+        reporter: Option<Arc<dyn MetricsReporter>>,
+    ) -> Self {
+        let operation_id = MetricId::new();
         Self {
             sequential,
-            // TODO: Associate a unique scan ID with this span to correlate sequential and parallel phases
-            span: info_span!("sequential_scan_metadata"),
+            span: info_span!("sequential_scan_metadata", %operation_id),
+            operation_id,
+            start: Instant::now(),
+            reporter,
         }
     }
 
@@ -47,20 +58,33 @@ impl SequentialScanMetadata {
         let _guard = self.span.enter();
         match self.sequential.finish()? {
             AfterSequential::Done(processor) => {
-                processor
+                let event = processor
                     .get_metrics()
-                    .log("Sequential scan metadata completed");
+                    .to_event(self.operation_id, self.start.elapsed());
+                info!(%event, "Sequential scan metadata completed");
+                if let Some(r) = &self.reporter {
+                    r.report(event);
+                }
                 Ok(AfterSequentialScanMetadata::Done)
             }
             AfterSequential::Parallel { processor, files } => {
-                // Log sequential metrics and reset counters for parallel phase
-                processor
+                // Emit sequential phase metrics
+                let event = processor
                     .get_metrics()
-                    .log("Sequential scan metadata completed");
+                    .to_event(self.operation_id, self.start.elapsed());
+                info!(%event, "Sequential scan metadata completed");
+                if let Some(r) = &self.reporter {
+                    r.report(event);
+                }
                 processor.get_metrics().reset_counters();
 
                 Ok(AfterSequentialScanMetadata::Parallel {
-                    state: Box::new(ParallelState { inner: processor }),
+                    state: Box::new(ParallelState {
+                        inner: processor,
+                        operation_id: self.operation_id,
+                        start: Instant::now(),
+                        reporter: self.reporter,
+                    }),
                     files,
                 })
             }
@@ -83,6 +107,9 @@ impl Iterator for SequentialScanMetadata {
 /// in Arc and shared across threads for local parallel processing.
 pub struct ParallelState {
     inner: ScanLogReplayProcessor,
+    operation_id: MetricId,
+    start: Instant,
+    reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl ParallelLogReplayProcessor for Arc<ParallelState> {
@@ -94,10 +121,10 @@ impl ParallelLogReplayProcessor for Arc<ParallelState> {
 }
 
 impl ParallelState {
-    /// Log the accumulated metrics from parallel processing.
+    /// Report the accumulated metrics from parallel processing.
     ///
     /// Call this after all parallel workers complete. The metrics will be logged
-    /// in the current tracing span context.
+    /// and reported via the metrics reporter.
     ///
     /// # Example
     ///
@@ -110,14 +137,19 @@ impl ParallelState {
     ///     // ... spawn workers that share Arc<ParallelState> ...
     ///     // ... wait for workers to complete ...
     ///
-    ///     // Log accumulated metrics
-    ///     state.log_metrics();
+    ///     // Report accumulated metrics
+    ///     state.report_metrics();
     /// }
     /// ```
-    pub fn log_metrics(&self) {
-        self.inner
+    pub fn report_metrics(&self) {
+        let event = self
+            .inner
             .get_metrics()
-            .log("Parallel scan metadata completed");
+            .to_event(self.operation_id, self.start.elapsed());
+        info!(%event, "Parallel scan metadata completed");
+        if let Some(r) = &self.reporter {
+            r.report(event);
+        }
     }
 
     /// Get the schema to use for reading checkpoint files.
@@ -146,14 +178,23 @@ impl ParallelState {
     /// # Parameters
     /// - `engine`: Engine for creating evaluators and filters
     /// - `state`: The serialized state from a previous `into_serializable_state()` call
+    /// - `operation_id`: The operation ID to use for metrics correlation
+    /// - `reporter`: Optional metrics reporter
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn from_serializable_state(
         engine: &dyn Engine,
         state: SerializableScanState,
+        operation_id: MetricId,
+        reporter: Option<Arc<dyn MetricsReporter>>,
     ) -> DeltaResult<Self> {
         let inner = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            operation_id,
+            start: Instant::now(),
+            reporter,
+        })
     }
 
     /// Serialize the processor state directly to bytes.
@@ -179,11 +220,18 @@ impl ParallelState {
     /// # Parameters
     /// - `engine`: Engine for creating evaluators and filters
     /// - `bytes`: The serialized bytes from a previous `into_bytes()` call
+    /// - `operation_id`: The operation ID to use for metrics correlation
+    /// - `reporter`: Optional metrics reporter
     #[allow(unused)]
-    pub fn from_bytes(engine: &dyn Engine, bytes: &[u8]) -> DeltaResult<Self> {
+    pub fn from_bytes(
+        engine: &dyn Engine,
+        bytes: &[u8],
+        operation_id: MetricId,
+        reporter: Option<Arc<dyn MetricsReporter>>,
+    ) -> DeltaResult<Self> {
         let state: SerializableScanState =
             serde_json::from_slice(bytes).map_err(Error::MalformedJson)?;
-        Self::from_serializable_state(engine, state)
+        Self::from_serializable_state(engine, state, operation_id, reporter)
     }
 }
 

@@ -946,7 +946,8 @@ impl Scan {
         let sequential =
             SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
 
-        Ok(SequentialScanMetadata::new(sequential))
+        let reporter = engine.get_metrics_reporter();
+        Ok(SequentialScanMetadata::new(sequential, reporter))
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all

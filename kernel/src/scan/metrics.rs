@@ -3,8 +3,6 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tracing::info;
-
 use crate::metrics::{MetricEvent, MetricId};
 
 /// Metrics collected during scan log replay. Metrics are updated and read using relaxed ordering
@@ -97,31 +95,6 @@ impl ScanMetrics {
         self.num_predicate_filtered.store(0, Ordering::Relaxed);
         self.dedup_visitor_time_ns.store(0, Ordering::Relaxed);
         self.predicate_eval_time_ns.store(0, Ordering::Relaxed);
-    }
-
-    /// Log all metrics with a message in the current tracing span context.
-    pub(crate) fn log(&self, message: impl AsRef<str>) {
-        let add_files_seen = self.num_add_files_seen.load(Ordering::Relaxed);
-        let active_add_files = self.num_active_add_files.load(Ordering::Relaxed);
-        let remove_files_seen = self.num_remove_files_seen.load(Ordering::Relaxed);
-        let non_file_actions = self.num_non_file_actions.load(Ordering::Relaxed);
-        let predicate_filtered = self.num_predicate_filtered.load(Ordering::Relaxed);
-        let peak_hash_set_size = self.peak_hash_set_size.load(Ordering::Relaxed);
-        let dedup_visitor_time_ms = self.dedup_visitor_time_ns.load(Ordering::Relaxed) / 1_000_000;
-        let predicate_eval_time_ms =
-            self.predicate_eval_time_ns.load(Ordering::Relaxed) / 1_000_000;
-        info!(
-            add_files_seen,
-            active_add_files,
-            remove_files_seen,
-            non_file_actions,
-            predicate_filtered,
-            peak_hash_set_size,
-            dedup_visitor_time_ms,
-            predicate_eval_time_ms,
-            "{}",
-            message.as_ref()
-        );
     }
 
     /// Snapshot all counters into a `MetricEvent::ScanMetadataCompleted`.

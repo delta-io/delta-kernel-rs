@@ -12,6 +12,7 @@ use delta_kernel_derive::internal_api;
 
 use crate::log_replay::ActionsBatch;
 use crate::log_replay::ParallelLogReplayProcessor;
+use crate::metrics::MetricId;
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
 use crate::EngineData;
@@ -426,6 +427,8 @@ mod tests {
                     Arc::new(ParallelState::from_bytes(
                         engine.as_ref(),
                         &serialized_bytes,
+                        MetricId::new(),
+                        None,
                     )?)
                 } else {
                     // Non-serde: just use the state directly
@@ -474,8 +477,8 @@ mod tests {
                     all_paths.extend(paths);
                 }
 
-                // Log metrics after all parallel workers complete
-                final_state.log_metrics();
+                // Report metrics after all parallel workers complete
+                final_state.report_metrics();
             }
         }
 
