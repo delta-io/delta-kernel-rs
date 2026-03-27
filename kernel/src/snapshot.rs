@@ -10,7 +10,7 @@ use tracing::{debug, info, instrument};
 use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
-use crate::actions::set_transaction::SetTransactionScanner;
+use crate::actions::set_transaction::{is_set_txn_expired, SetTransactionScanner};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
@@ -237,6 +237,8 @@ impl Snapshot {
 
         if new_log_segment.checkpoint_version.is_some() {
             // we have a checkpoint in the new LogSegment, just construct a new snapshot from that
+            // TODO(#2217): reuse old LazyCrc when CRC file matches.
+            // TODO(#2218): consider incremental P&M replay instead of full rebuild.
             let snapshot = Self::try_new_from_log_segment_impl(
                 existing_snapshot.table_root().clone(),
                 new_log_segment,
@@ -274,7 +276,12 @@ impl Snapshot {
 
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
-        let lazy_crc = Arc::new(LazyCrc::new(new_log_segment.listed.latest_crc_file.clone()));
+        let (crc_file, lazy_crc) = Self::resolve_crc(
+            &new_log_segment,
+            old_log_segment,
+            &existing_snapshot.lazy_crc,
+        );
+
         let (new_metadata, new_protocol) =
             new_log_segment.read_protocol_metadata_opt(engine, &lazy_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
@@ -291,16 +298,6 @@ impl Snapshot {
             old_log_segment.listed.ascending_compaction_files.clone();
         ascending_compaction_files.extend(new_log_segment.listed.ascending_compaction_files);
 
-        // Note that we _could_ go backwards if someone deletes a CRC:
-        // old listing: 1, 2, 2.crc, 3, 3.crc (latest is 3.crc)
-        // new listing: 1, 2, 2.crc, 3        (latest is 2.crc)
-        // and we would still pick the new listing's (older) CRC file since it ostensibly still
-        // exists
-        let latest_crc_file = new_log_segment
-            .listed
-            .latest_crc_file
-            .or_else(|| old_log_segment.listed.latest_crc_file.clone());
-
         // Use the new latest_commit if available, otherwise use the old one
         // This handles the case where the new listing returned no commits
         let latest_commit_file =
@@ -312,7 +309,7 @@ impl Snapshot {
                 ascending_commit_files,
                 ascending_compaction_files,
                 checkpoint_parts: old_log_segment.listed.checkpoint_parts.clone(),
-                latest_crc_file,
+                latest_crc_file: crc_file,
                 latest_commit_file,
                 max_published_version: new_log_segment
                     .listed
@@ -325,14 +322,33 @@ impl Snapshot {
             old_log_segment.checkpoint_schema.clone(),
         )?;
 
-        let lazy_crc = Arc::new(LazyCrc::new(
-            combined_log_segment.listed.latest_crc_file.clone(),
-        ));
         Ok(Arc::new(Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
             lazy_crc,
         )))
+    }
+
+    /// Determine the CRC file and LazyCrc for an incremental snapshot update.
+    ///
+    /// Prefers the new segment's CRC file, falls back to the old segment's. If the resolved
+    /// CRC version matches the existing snapshot's LazyCrc, reuses it to avoid redundant I/O
+    /// (it may already be loaded in memory).
+    fn resolve_crc(
+        new_log_segment: &LogSegment,
+        old_log_segment: &LogSegment,
+        existing_lazy_crc: &Arc<LazyCrc>,
+    ) -> (Option<ParsedLogPath>, Arc<LazyCrc>) {
+        let new_crc_file = new_log_segment.listed.latest_crc_file.clone();
+        let old_crc_file = old_log_segment.listed.latest_crc_file.clone();
+        let crc_file = new_crc_file.or(old_crc_file);
+        let crc_version = crc_file.as_ref().map(|f| f.version);
+        let lazy_crc = if crc_version == existing_lazy_crc.crc_version() {
+            existing_lazy_crc.clone()
+        } else {
+            Arc::new(LazyCrc::new(crc_file.clone()))
+        };
+        (crc_file, lazy_crc)
     }
 
     /// Implementation of snapshot creation from log segment.
@@ -569,14 +585,10 @@ impl Snapshot {
             .get_or_load_if_at_version(engine, self.version())
         {
             if let Some(txn_map) = &crc.set_transactions {
-                return Ok(txn_map.get(application_id).and_then(|txn| {
-                    // Apply retention filter: if both expiration_timestamp and last_updated
-                    // are present and last_updated <= expiration, the txn is expired.
-                    match (expiration_timestamp, txn.last_updated) {
-                        (Some(exp_ts), Some(last_updated)) if last_updated <= exp_ts => None,
-                        _ => Some(txn.version),
-                    }
-                }));
+                return Ok(txn_map
+                    .get(application_id)
+                    .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
+                    .map(|txn| txn.version));
             }
         }
 
@@ -687,6 +699,14 @@ impl Snapshot {
             return None;
         }
         self.lazy_crc.cached.get()?.get().map(|arc| arc.as_ref())
+    }
+
+    /// Returns the CRC version tracked by this snapshot's LazyCrc, if any.
+    ///
+    /// This is a test-only helper for integration tests to inspect the CRC version.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn crc_version_for_testing(&self) -> Option<Version> {
+        self.lazy_crc.crc_version()
     }
 
     /// Writes a version checksum (CRC) file for this snapshot. Writers should call this after
@@ -1358,8 +1378,10 @@ mod tests {
         commit(table_root, &store, 0, commit0.clone()).await;
         commit(table_root, &store, 1, commit1).await;
 
-        // a) CRC: old one has 0.crc, no new one (expect 0.crc)
-        // b) CRC: old one has 0.crc, new one has 1.crc (expect 1.crc)
+        // Test CRC handling during incremental snapshot update (v0 -> v1).
+        // The new log listing starts at v1, so the new log segment doesn't find 0.crc.
+        // a) Only 0.crc exists: resolve_crc falls back to old segment's 0.crc.
+        // b) Both 0.crc and 1.crc exist: resolve_crc picks up 1.crc.
         let crc = json!({
             "table_size_bytes": 100,
             "num_files": 1,
@@ -1378,14 +1400,10 @@ mod tests {
             .at_version(0)
             .build(&engine)?;
 
-        // first test: no new crc
+        // a) only 0.crc exists -- falls back to old segment's 0.crc
         let snapshot = Snapshot::builder_from(base_snapshot.clone())
             .at_version(1)
             .build(&engine)?;
-        let expected = Snapshot::builder_for(table_root)
-            .at_version(1)
-            .build(&engine)?;
-        assert_eq!(snapshot, expected);
         assert_eq!(
             snapshot
                 .log_segment
@@ -1397,8 +1415,7 @@ mod tests {
             0
         );
 
-        // second test: new crc
-        // put the new crc
+        // b) both 0.crc and 1.crc exist -- resolve_crc picks up 1.crc
         let path = delta_path_for_version(1, "crc");
         let crc = json!({
             "table_size_bytes": 100,

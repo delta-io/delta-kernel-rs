@@ -1007,6 +1007,23 @@ impl StructType {
         Self::try_new(self.fields().filter(|f| predicate(f)).cloned())
     }
 
+    /// Returns an optional [`StructType`] containing only the top-level fields for which
+    /// `predicate` returns `true`.
+    ///
+    /// This is a convenience wrapper around [`StructType::with_fields_filtered`] for callers
+    /// that treat an empty top-level struct as "no schema".
+    pub fn with_fields_filtered_nonempty(
+        &self,
+        predicate: impl Fn(&StructField) -> bool,
+    ) -> DeltaResult<Option<Self>> {
+        let filtered = self.with_fields_filtered(predicate)?;
+        if filtered.num_fields() == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(filtered))
+        }
+    }
+
     /// Returns a StructType with the named field replaced.
     /// Returns an error if field doesn't exist.
     pub fn with_field_replaced(
