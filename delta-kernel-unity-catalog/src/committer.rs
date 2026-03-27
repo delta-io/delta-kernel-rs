@@ -50,11 +50,7 @@ impl<C: CommitClient> UCCommitter<C> {
         ) {
             Ok(()) => {
                 tracing::info!("wrote version 0 commit file for UC table creation");
-                let file_meta = delta_kernel::FileMeta::new(
-                    published_commit_path,
-                    commit_metadata.in_commit_timestamp(),
-                    0,
-                );
+                let file_meta = engine.storage_handler().head(&published_commit_path)?;
                 Ok(CommitResponse::Committed { file_meta })
             }
             Err(delta_kernel::Error::FileAlreadyExists(_)) => {
