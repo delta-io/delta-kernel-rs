@@ -127,10 +127,8 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
 
 /// Returns the version of the latest complete checkpoint in `files`, or `None` if no complete
 /// checkpoint exists.
-///
-/// Assumes `files` is in ascending version order, as produced by [`list_from_storage`].
-fn find_complete_checkpoint_version(files: &[ParsedLogPath]) -> Option<Version> {
-    files
+fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option<Version> {
+    ascending_files
         .iter()
         .filter(|f| f.is_checkpoint() && f.location.size > 0)
         .chunk_by(|f| f.version)
@@ -248,8 +246,7 @@ impl ListingAccumulator {
 }
 
 /// Number of versions covered by each backward-scan window in
-/// `LogSegmentFiles::list_with_backward_checkpoint_scan`. The range `[lower, upper)` is
-/// half-open, so a window size of 1000 covers exactly 1000 versions.
+/// `LogSegmentFiles::list_with_backward_checkpoint_scan`
 const BACKWARD_SCAN_WINDOW_SIZE: u64 = 1000;
 
 impl LogSegmentFiles {
@@ -463,21 +460,24 @@ impl LogSegmentFiles {
         Ok(listed_files)
     }
 
-    /// Lists log files by scanning backward from `end_version` in 1000-version windows until a
-    /// complete checkpoint is found or the log is exhausted. The resulting files are combined
-    /// with the `log_tail` (catalog-provided commits) to build a [`LogSegmentFiles`].
+    /// Returns a [`LogSegmentFiles`] ending at `end_version`, rooted at the most recent complete
+    /// checkpoint at or before `end_version`, or rooted at version 0 if no checkpoint is found.
     ///
-    /// This avoids a full forward listing when we have an upper-bound version but no checkpoint
-    /// hint: instead of listing from version 0, we walk backward from `end_version` in bounded
-    /// windows, stopping as soon as we find a complete checkpoint (or reach version 0).
+    /// To find the checkpoint without a full forward listing from version 0, this scans backward
+    /// from `end_version` in windows of size [`BACKWARD_SCAN_WINDOW_SIZE`], stopping as soon as
+    /// a complete checkpoint is found (or version 0 is reached).
+    /// Then, all files from the windows that were scanned are combined with `log_tail` to produce a log segment
+    /// rooted at the checkpoint version (or version 0 if no checkpoint) with all commits after the
+    /// checkpoint version. A log_tail commit at exactly the checkpoint version may be included at this
+    /// stage but will be filtered out by `LogSegment::try_new`.
     ///
-    /// For example, given end_version = 12500 and a checkpoint at v8900:
+    /// For example, given the desired end_version = 12500 and a checkpoint at v8900:
     /// - Window 1 [11501, 12501): no checkpoint -> continue
     /// - Window 2 [10501, 11501): no checkpoint -> continue
     /// - Window 3 [9501, 10501): no checkpoint -> continue
     /// - Window 4 [8501, 9501): checkpoint at v8900 found -> stop
-    /// All files from windows 1-4 are then passed to `build_log_segment_files`, which
-    /// returns a log segment with the checkpoint at v8900 and all commits from v8901 to v12500
+    /// All files from windows 1-4 are combined with `log_tail` to produce a log segment
+    /// rooted at the checkpoint at v8900 with all commits from v8901 to v12500.
     #[instrument(name = "log.list_with_backward_checkpoint_scan", skip_all, fields(end = end_version), err)]
     pub(crate) fn list_with_backward_checkpoint_scan(
         storage: &dyn StorageHandler,

@@ -298,11 +298,11 @@ impl LogSegment {
             .and_then(|hint| hint.checkpoint_schema.clone());
 
         // The end_version is the time_travel_version, if present
-        // TODO: When max catalog version is implemented, we would use that as end_version if time_travel_version is not present
+        // TODO: When max catalog version is implemented, we would use that as end_version if
+        // time_travel_version is not present
         let end_version = time_travel_version;
 
-        // Keep the hint only if it doesn't point past end_version
-        // If there is no end_version bound, any hint is acceptable
+        // Keep the hint only if it points at or before end_version, or if there is no end_version bound
         let usable_hint = checkpoint_hint.filter(|cp| end_version.is_none_or(|v| cp.version <= v));
 
         // Cases:
