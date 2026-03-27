@@ -137,8 +137,6 @@ pub unsafe extern "C" fn scan(
 
 /// Decode an [`EnginePredicate`] and apply it to a [`ScanBuilder`].
 ///
-/// Decode an [`EnginePredicate`] and apply it to a [`ScanBuilder`].
-///
 /// Returns an error if the engine's visitor fails to produce a valid predicate (i.e. returns
 /// an invalid expression ID). A `None` result from the visitor indicates the engine-side
 /// predicate construction failed, which would silently produce a full-table scan if ignored.
