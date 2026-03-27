@@ -132,10 +132,7 @@ impl CommitMetadata {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_unchecked(table_root: Url, version: Version) -> DeltaResult<Self> {
         let log_root = crate::path::LogRoot::new(table_root)?;
-        let protocol = Protocol::try_new_modern(
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )?;
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new())?;
         let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new())?;
         Ok(Self::new(log_root, version, 0, None, protocol, metadata))
@@ -173,14 +170,18 @@ mod tests {
         let version = 42;
         let ts = 1234;
         let max_published_version = Some(42);
-        let protocol =
-            Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
         let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
-        let metadata =
-            Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
-        let commit_metadata =
-            CommitMetadata::new(log_root, version, ts, max_published_version, protocol, metadata);
+        let commit_metadata = CommitMetadata::new(
+            log_root,
+            version,
+            ts,
+            max_published_version,
+            protocol,
+            metadata,
+        );
 
         // version
         assert_eq!(commit_metadata.version(), 42);

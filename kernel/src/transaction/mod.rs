@@ -2375,9 +2375,7 @@ mod tests {
         rt.block_on(storage.put(&commit_path, actions.into()))
             .unwrap();
 
-        let snapshot = Snapshot::builder_for(table_root)
-            .build(&engine)
-            .unwrap();
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
         // Try to commit with a catalog committer to a non-catalog-managed table
         let committer = Box::new(MockCatalogCommitter);
