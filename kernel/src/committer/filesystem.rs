@@ -87,8 +87,10 @@ impl Committer for FileSystemCommitter {
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::actions::{Metadata, Protocol};
     use crate::engine::default::DefaultEngineBuilder;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
@@ -136,7 +138,10 @@ mod tests {
 
         let committer = FileSystemCommitter::new();
         let log_root = LogRoot::new(table_root).unwrap();
-        let commit_metadata = CommitMetadata::new(log_root, 1, 12345, Some(0));
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
+        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let commit_metadata = CommitMetadata::new(log_root, 1, 12345, Some(0), protocol, metadata);
         let actions = Box::new(std::iter::empty());
 
         let result = committer.commit(&engine, actions, commit_metadata).unwrap();
@@ -161,10 +166,27 @@ mod tests {
         let engine = DefaultEngineBuilder::new(storage).build();
 
         let committer = FileSystemCommitter::new();
-        let first_metadata =
-            CommitMetadata::new(LogRoot::new(table_root.clone()).unwrap(), 1, 12345, Some(0));
-        let second_metadata =
-            CommitMetadata::new(LogRoot::new(table_root).unwrap(), 1, 12346, Some(0));
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
+        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let metadata1 =
+            Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
+        let metadata2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let first_metadata = CommitMetadata::new(
+            LogRoot::new(table_root.clone()).unwrap(),
+            1,
+            12345,
+            Some(0),
+            protocol.clone(),
+            metadata1,
+        );
+        let second_metadata = CommitMetadata::new(
+            LogRoot::new(table_root).unwrap(),
+            1,
+            12346,
+            Some(0),
+            protocol,
+            metadata2,
+        );
 
         let first = committer
             .commit(&engine, Box::new(std::iter::empty()), first_metadata)
