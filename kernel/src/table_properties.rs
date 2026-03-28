@@ -293,6 +293,26 @@ pub enum IsolationLevel {
     SnapshotIsolation,
 }
 
+/// Compression codec to use when writing Parquet files.
+///
+/// String parsing is case-insensitive.
+#[derive(Debug, EnumString, Clone, Copy, PartialEq, Eq, Default)]
+#[strum(ascii_case_insensitive)]
+pub enum ParquetCompression {
+    /// Snappy compression (default).
+    #[default]
+    Snappy,
+    /// Zstandard compression.
+    Zstd,
+}
+
+/// Configuration for writing Parquet files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParquetWriterConfig {
+    /// Compression codec to use. Defaults to [`ParquetCompression::Snappy`].
+    pub compression: ParquetCompression,
+}
+
 /// The checkpoint policy applied when writing checkpoints
 #[derive(Debug, EnumString, Default, Clone, PartialEq, Eq)]
 #[strum(serialize_all = "camelCase")]

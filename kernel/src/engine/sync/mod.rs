@@ -2,6 +2,7 @@
 
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
+use crate::table_properties::{ParquetCompression, ParquetWriterConfig};
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
     JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
@@ -31,7 +32,11 @@ impl SyncEngine {
         SyncEngine {
             storage_handler: Arc::new(storage::SyncStorageHandler {}),
             json_handler: Arc::new(json::SyncJsonHandler {}),
-            parquet_handler: Arc::new(parquet::SyncParquetHandler {}),
+            parquet_handler: Arc::new(parquet::SyncParquetHandler {
+                parquet_writer_config: ParquetWriterConfig {
+                    compression: ParquetCompression::Zstd,
+                },
+            }),
             evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
         }
     }

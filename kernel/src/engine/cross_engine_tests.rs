@@ -30,11 +30,14 @@ fn default_parquet_handler() -> Box<dyn ParquetHandler> {
     Box::new(DefaultParquetHandler::new(
         Arc::new(LocalFileSystem::new()),
         Arc::new(TokioBackgroundExecutor::new()),
+        Default::default(),
     ))
 }
 
 fn sync_parquet_handler() -> Box<dyn ParquetHandler> {
-    Box::new(SyncParquetHandler)
+    Box::new(SyncParquetHandler {
+        parquet_writer_config: Default::default(),
+    })
 }
 
 fn default_json_handler() -> Box<dyn JsonHandler> {
