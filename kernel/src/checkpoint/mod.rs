@@ -284,10 +284,10 @@ impl CheckpointWriter {
             .table_configuration()
             .is_feature_supported(&TableFeature::V2Checkpoint);
 
-        let base_schema = if is_v2_checkpoints_supported {
-            &CHECKPOINT_ACTIONS_SCHEMA_V2
+        let base_schema: SchemaRef = if is_v2_checkpoints_supported {
+            CHECKPOINT_ACTIONS_SCHEMA_V2.clone()
         } else {
-            &CHECKPOINT_ACTIONS_SCHEMA_V1
+            CHECKPOINT_ACTIONS_SCHEMA_V1.clone()
         };
 
         // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
@@ -296,56 +296,79 @@ impl CheckpointWriter {
             .table_configuration()
             .build_partition_values_parsed_schema();
 
-        // The read schema and output schema differ because the transform needs access to
-        // both stats formats as input, but may only write one format as output.
+        // The commit and checkpoint read schemas differ because commit JSON files do not carry
+        // `stats_parsed` / `partitionValues_parsed`, while checkpoint parquet files may.
         //
-        // read_schema: Always includes both `stats` and `stats_parsed` fields in the Add
-        // action, so COALESCE expressions can read from either source. For commit files,
-        // `stats_parsed` doesn't exist and is read as nulls. For partitioned tables,
-        // `partitionValues_parsed` is also included.
+        // commit_read_schema: keeps the base action schema for JSON commits.
         //
-        // output_schema: Only includes the stats fields that the table config requests
-        // (e.g., only `stats` if writeStatsAsJson=true and writeStatsAsStruct=false).
-        let read_schema =
-            build_checkpoint_read_schema(base_schema, &stats_schema, partition_schema.as_deref())?;
-
+        // checkpoint_read_schema: includes `stats_parsed` and optionally
+        // `partitionValues_parsed` so checkpoint batches can reuse pre-parsed values.
+        //
+        // The output schema still controls what is written to the final checkpoint.
+        let commit_read_schema = base_schema.clone();
+        let checkpoint_read_schema = build_checkpoint_read_schema(
+            base_schema.as_ref(),
+            &stats_schema,
+            partition_schema.as_deref(),
+        )?;
         // Read actions from log segment
-        let actions = self
+        let actions_with_info = self
             .snapshot
             .log_segment()
-            .read_actions(engine, read_schema.clone())?;
+            .read_actions_with_projected_checkpoint_actions(
+                engine,
+                commit_read_schema.clone(),
+                checkpoint_read_schema.clone(),
+                None,
+                None,
+                None,
+            )?;
 
         // Process actions through reconciliation
         let checkpoint_data = ActionReconciliationProcessor::new(
             self.deleted_file_retention_timestamp()?,
             self.get_transaction_expiration_timestamp()?,
         )
-        .process_actions_iter(actions);
+        .process_actions_iter(actions_with_info.actions);
 
         let output_schema = build_checkpoint_output_schema(
             &config,
-            base_schema,
+            base_schema.as_ref(),
             &stats_schema,
             partition_schema.as_deref(),
         )?;
 
-        // Build transform expression and create expression evaluator.
-        // The transform is applied to reconciled action batches only (not checkpoint metadata).
-        let transform_expr =
-            build_checkpoint_transform(&config, &stats_schema, partition_schema.as_ref());
-        let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            read_schema,
-            transform_expr,
+        // Build source-specific evaluators.
+        // - Commit batches: parse from JSON/map only.
+        // - Checkpoint batches: prefer pre-parsed fields via COALESCE.
+        let log_transform_expr =
+            build_checkpoint_transform(&config, &stats_schema, partition_schema.as_ref(), false);
+        let log_evaluator = engine.evaluation_handler().new_expression_evaluator(
+            commit_read_schema,
+            log_transform_expr,
+            output_schema.clone().into(),
+        )?;
+        let checkpoint_transform_expr =
+            build_checkpoint_transform(&config, &stats_schema, partition_schema.as_ref(), true);
+        let checkpoint_evaluator = engine.evaluation_handler().new_expression_evaluator(
+            checkpoint_read_schema,
+            checkpoint_transform_expr,
             output_schema.clone().into(),
         )?;
 
         // Apply stats transform to each reconciled batch
         let transformed = checkpoint_data.map(move |batch_result| {
             let batch = batch_result?;
+            let is_log_batch = batch.is_log_batch;
             let (data, sv) = batch.filtered_data.into_parts();
-            let transformed = evaluator.evaluate(data.as_ref())?;
+            let transformed = if is_log_batch {
+                log_evaluator.evaluate(data.as_ref())?
+            } else {
+                checkpoint_evaluator.evaluate(data.as_ref())?
+            };
             Ok(ActionReconciliationBatch {
                 filtered_data: FilteredEngineData::try_new(transformed, sv)?,
+                is_log_batch,
                 actions_count: batch.actions_count,
                 add_actions_count: batch.add_actions_count,
             })
@@ -472,6 +495,7 @@ impl CheckpointWriter {
 
         Ok(ActionReconciliationBatch {
             filtered_data,
+            is_log_batch: false,
             actions_count: 1,
             add_actions_count: 0,
         })

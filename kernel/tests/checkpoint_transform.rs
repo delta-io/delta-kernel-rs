@@ -12,7 +12,6 @@ use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::compute::{concat_batches, sort_to_indices, take};
-#[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
 use delta_kernel::arrow::datatypes::TimestampMicrosecondType;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
