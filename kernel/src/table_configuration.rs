@@ -762,7 +762,9 @@ mod test {
         FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
     };
-    use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
+    use crate::table_properties::{
+        TableProperties, COLUMN_MAPPING_MODE, ENABLE_IN_COMMIT_TIMESTAMPS,
+    };
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
         test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
@@ -1610,11 +1612,38 @@ mod test {
     #[cfg(feature = "catalog-managed")]
     #[test]
     fn test_catalog_managed_writes() {
-        let config = create_mock_table_config(&[], &[TableFeature::CatalogManaged]);
+        // CatalogManaged requires ICT to be supported and enabled
+        let config = create_mock_table_config(
+            &[(ENABLE_IN_COMMIT_TIMESTAMPS, "true")],
+            &[
+                TableFeature::CatalogManaged,
+                TableFeature::InCommitTimestamp,
+            ],
+        );
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
 
-        let config = create_mock_table_config(&[], &[TableFeature::CatalogOwnedPreview]);
+        let config = create_mock_table_config(
+            &[(ENABLE_IN_COMMIT_TIMESTAMPS, "true")],
+            &[
+                TableFeature::CatalogOwnedPreview,
+                TableFeature::InCommitTimestamp,
+            ],
+        );
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[test]
+    fn test_catalog_managed_rejects_missing_ict() {
+        // CatalogManaged without ICT should fail
+        let config = create_mock_table_config(&[], &[TableFeature::CatalogManaged]);
+        let err = config
+            .ensure_operation_supported(Operation::Write)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("inCommitTimestamp"),
+            "expected ICT requirement error, got: {err}"
+        );
     }
 
     /// Helper to create a schema with column mapping metadata using JSON deserialization

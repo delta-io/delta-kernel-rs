@@ -1,13 +1,18 @@
 //! Commit metadata types for the committer module.
 
+use std::collections::HashMap;
+#[cfg(any(test, feature = "test-utils"))]
+use std::sync::Arc;
+
 use url::Url;
 
+use crate::actions::{Metadata, Protocol};
 use crate::path::LogRoot;
 use crate::{DeltaResult, Version};
 
-/// `CommitMetadata` bundles the metadata about a commit operation. This currently includes the
-/// commit path and version but will expand to things like `Protocol`, `Metadata`, etc. to allow
-/// for catalogs to understand/cache/persist more information about the table at commit time.
+/// `CommitMetadata` bundles the metadata about a commit operation. This includes the commit path,
+/// version, and protocol/metadata state of the table being committed to. Catalog committers can
+/// use the protocol and metadata getters to validate or inspect the commit.
 ///
 /// Note that this struct cannot be constructed. It is handed to the [`Committer`] (in the
 /// [`commit`] method) by the kernel when a transaction is being committed.
@@ -23,7 +28,8 @@ pub struct CommitMetadata {
     pub(crate) version: Version,
     pub(crate) in_commit_timestamp: i64,
     pub(crate) max_published_version: Option<Version>,
-    // in the future this will include Protocol, Metadata, CommitInfo, Domain Metadata, etc.
+    pub(crate) protocol: Protocol,
+    pub(crate) metadata: Metadata,
 }
 
 impl CommitMetadata {
@@ -32,12 +38,16 @@ impl CommitMetadata {
         version: Version,
         in_commit_timestamp: i64,
         max_published_version: Option<Version>,
+        protocol: Protocol,
+        metadata: Metadata,
     ) -> Self {
         Self {
             log_root,
             version,
             in_commit_timestamp,
             max_published_version,
+            protocol,
+            metadata,
         }
     }
 
@@ -73,15 +83,71 @@ impl CommitMetadata {
         self.max_published_version
     }
 
+    /// The root URL of the table being committed to.
     pub fn table_root(&self) -> &Url {
         self.log_root.table_root()
     }
 
+    /// The minimum reader version required by the table's protocol.
+    pub fn min_reader_version(&self) -> i32 {
+        self.protocol.min_reader_version()
+    }
+
+    /// The minimum writer version required by the table's protocol.
+    pub fn min_writer_version(&self) -> i32 {
+        self.protocol.min_writer_version()
+    }
+
+    /// Check if the table's protocol has a specific writer feature by name.
+    ///
+    /// Feature names use the Delta protocol wire format (e.g., `"catalogManaged"`,
+    /// `"inCommitTimestamp"`). Returns `false` for legacy protocols without table features.
+    pub fn has_writer_feature(&self, feature_name: &str) -> bool {
+        self.protocol
+            .writer_features()
+            .is_some_and(|features| features.iter().any(|f| f.as_ref() == feature_name))
+    }
+
+    /// Check if the table's protocol has a specific reader feature by name.
+    ///
+    /// Feature names use the Delta protocol wire format (e.g., `"catalogManaged"`,
+    /// `"deletionVectors"`). Returns `false` for legacy protocols without table features.
+    pub fn has_reader_feature(&self, feature_name: &str) -> bool {
+        self.protocol
+            .reader_features()
+            .is_some_and(|features| features.iter().any(|f| f.as_ref() == feature_name))
+    }
+
+    /// Get the raw metadata configuration for the table being committed to.
+    ///
+    /// This returns the `Metadata.configuration` map as stored in the Delta log, containing
+    /// user-defined properties, delta table properties, and application-specific properties.
+    pub fn metadata_configuration(&self) -> &HashMap<String, String> {
+        self.metadata.configuration()
+    }
+
     /// Creates a new `CommitMetadata` for the given `table_root` and `version`. Test-only.
+    ///
+    /// Uses a default modern protocol (empty features) and empty metadata.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_unchecked(table_root: Url, version: Version) -> DeltaResult<Self> {
+        Self::new_unchecked_with(table_root, version, vec![], vec![], HashMap::new())
+    }
+
+    /// Creates a new `CommitMetadata` with specific features and configuration. Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_unchecked_with(
+        table_root: Url,
+        version: Version,
+        reader_features: Vec<&str>,
+        writer_features: Vec<&str>,
+        configuration: HashMap<String, String>,
+    ) -> DeltaResult<Self> {
         let log_root = crate::path::LogRoot::new(table_root)?;
-        Ok(Self::new(log_root, version, 0, None))
+        let protocol = Protocol::try_new_modern(reader_features, writer_features)?;
+        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, configuration)?;
+        Ok(Self::new(log_root, version, 0, None, protocol, metadata))
     }
 }
 
@@ -104,6 +170,8 @@ pub enum CommitResponse {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
     use crate::path::LogRoot;
     use url::Url;
 
@@ -114,8 +182,18 @@ mod tests {
         let version = 42;
         let ts = 1234;
         let max_published_version = Some(42);
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
+        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
-        let commit_metadata = CommitMetadata::new(log_root, version, ts, max_published_version);
+        let commit_metadata = CommitMetadata::new(
+            log_root,
+            version,
+            ts,
+            max_published_version,
+            protocol,
+            metadata,
+        );
 
         // version
         assert_eq!(commit_metadata.version(), 42);

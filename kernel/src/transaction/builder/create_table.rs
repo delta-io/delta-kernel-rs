@@ -51,6 +51,9 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::InCommitTimestamp,
     // VacuumProtocolCheck ensures consistent protocol checks during VACUUM
     TableFeature::VacuumProtocolCheck,
+    // CatalogManaged enables catalog-managed table support
+    #[cfg(feature = "catalog-managed")]
+    TableFeature::CatalogManaged,
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
     // specifying clustering columns via `with_data_layout()`.
@@ -368,6 +371,29 @@ fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProp
     }
 }
 
+/// Ensures that `inCommitTimestamp` is enabled when `catalogManaged` is present. Adds the ICT
+/// feature to the protocol and sets the enablement property if not already present.
+#[cfg(feature = "catalog-managed")]
+fn maybe_enable_ict_for_catalog_managed(validated: &mut ValidatedTableProperties) {
+    let has_catalog_managed = validated
+        .writer_features
+        .contains(&TableFeature::CatalogManaged)
+        || validated
+            .writer_features
+            .contains(&TableFeature::CatalogOwnedPreview);
+    if has_catalog_managed {
+        add_feature_to_lists(
+            TableFeature::InCommitTimestamp,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+        validated
+            .properties
+            .entry(ENABLE_IN_COMMIT_TIMESTAMPS.to_string())
+            .or_insert_with(|| "true".to_string());
+    }
+}
+
 /// Conditionally applies column mapping for table creation based on the mode in properties.
 ///
 /// If `delta.columnMapping.mode` is set to `name` or `id`, this function:
@@ -673,6 +699,10 @@ impl CreateTableTransactionBuilder {
 
         // Property-driven auto-enablement: check enablement properties
         maybe_auto_enable_property_driven_features(&mut validated);
+
+        // Auto-enable inCommitTimestamp for catalogManaged tables
+        #[cfg(feature = "catalog-managed")]
+        maybe_enable_ict_for_catalog_managed(&mut validated);
 
         // Create Protocol action with table features support
         let protocol =
@@ -1329,5 +1359,86 @@ mod tests {
         ]);
         let columns = vec![ColumnName::new(["col"])];
         assert!(validate_partition_columns(&schema, &columns).is_ok());
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[test]
+    fn test_catalog_managed_feature_signal_accepted() {
+        let properties = HashMap::from([(
+            "delta.feature.catalogManaged".to_string(),
+            "supported".to_string(),
+        )]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert!(
+            validated.properties.is_empty(),
+            "Feature signal should be removed from properties"
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::CatalogManaged),
+            "CatalogManaged should be in writer_features"
+        );
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::CatalogManaged),
+            "CatalogManaged should be in reader_features (ReaderWriter feature)"
+        );
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[test]
+    fn test_catalog_managed_auto_enables_ict() {
+        // Only set catalogManaged -- ICT should be auto-enabled
+        let properties = HashMap::from([(
+            "delta.feature.catalogManaged".to_string(),
+            "supported".to_string(),
+        )]);
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        maybe_enable_in_commit_timestamps(&mut validated);
+        maybe_enable_ict_for_catalog_managed(&mut validated);
+
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::InCommitTimestamp),
+            "ICT should be auto-added to writer_features"
+        );
+        assert_eq!(
+            validated.properties.get(ENABLE_IN_COMMIT_TIMESTAMPS),
+            Some(&"true".to_string()),
+            "delta.enableInCommitTimestamps should be set to true"
+        );
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[test]
+    fn test_catalog_managed_does_not_override_existing_ict() {
+        // Set both catalogManaged and ICT explicitly
+        let properties = HashMap::from([
+            (
+                "delta.feature.catalogManaged".to_string(),
+                "supported".to_string(),
+            ),
+            (
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        maybe_enable_in_commit_timestamps(&mut validated);
+        maybe_enable_ict_for_catalog_managed(&mut validated);
+
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::InCommitTimestamp),
+            "ICT should be in writer_features"
+        );
+        assert_eq!(
+            validated.properties.get(ENABLE_IN_COMMIT_TIMESTAMPS),
+            Some(&"true".to_string()),
+        );
     }
 }
