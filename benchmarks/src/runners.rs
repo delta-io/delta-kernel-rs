@@ -58,7 +58,7 @@ impl ReadMetadataRunner {
         let predicate = read_spec
             .predicate
             .as_deref()
-            .map(parse_predicate)
+            .map(|sql| parse_predicate(sql, &snapshot.schema()))
             .transpose()?
             .map(Arc::new);
 
