@@ -19,7 +19,10 @@ use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::scan::state::ScanFile;
-use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
+use crate::schema::{
+    ColumnMetadataKey, DataType, LogicalSchema, PrimitiveType, StructField, StructType,
+};
+use crate::table_features::ColumnMappingMode;
 use crate::{EngineData, Snapshot};
 
 use super::*;
@@ -205,9 +208,10 @@ fn test_physical_predicate() {
         ),
     ];
 
+    let table_schema =
+        LogicalSchema::new_for_test(Arc::new(logical_schema), ColumnMappingMode::Name);
     for (predicate, expected) in test_cases {
-        let result =
-            PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::Name).ok();
+        let result = PhysicalPredicate::try_new(&predicate, &table_schema).ok();
         assert_eq!(
             result, expected,
             "Failed for predicate: {predicate:#?}, expected {expected:#?}, got {result:#?}"
@@ -238,7 +242,8 @@ fn test_physical_predicate() {
         StructType::new_unchecked(vec![
             StructField::nullable("createdAt", DataType::LONG),
             StructField::nullable("Value", DataType::LONG),
-        ]).into(),
+        ])
+        .into(),
     ),
 )]
 #[case::with_column_mapping(
@@ -272,14 +277,13 @@ fn test_physical_predicate() {
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                 "phys_value",
             )]),
-        ]).into(),
+        ])
+        .into(),
     ),
 )]
 #[case::duplicate_column_different_casing(
     // predicate references same column with different casings: value > 5 AND VALUE < 10
-    StructType::new_unchecked(vec![
-        StructField::nullable("Value", DataType::LONG),
-    ]),
+    StructType::new_unchecked(vec![StructField::nullable("Value", DataType::LONG)]),
     Pred::and(
         Pred::gt(column_expr!("value"), Expr::literal(5i64)),
         Pred::lt(column_expr!("VALUE"), Expr::literal(10i64)),
@@ -290,8 +294,7 @@ fn test_physical_predicate() {
             Pred::gt(column_expr!("Value"), Expr::literal(5i64)),
             Pred::lt(column_expr!("Value"), Expr::literal(10i64)),
         )),
-        StructType::new_unchecked(vec![StructField::nullable("Value", DataType::LONG)])
-            .into(),
+        StructType::new_unchecked(vec![StructField::nullable("Value", DataType::LONG)]).into(),
     ),
 )]
 #[case::nested_fields(
@@ -306,33 +309,29 @@ fn test_physical_predicate() {
         column_pred!("Nested.FieldName").into(),
         StructType::new_unchecked(vec![StructField::nullable(
             "Nested",
-            StructType::new_unchecked(vec![
-                StructField::nullable("FieldName", DataType::LONG)
-            ]),
-        )]).into(),
+            StructType::new_unchecked(vec![StructField::nullable("FieldName", DataType::LONG)]),
+        )])
+        .into(),
     ),
 )]
 fn test_physical_predicate_case_insensitive(
     #[case] logical_schema: StructType,
-    #[case] predicate: Predicate,
+    #[case] predicate: Pred,
     #[case] column_mapping_mode: ColumnMappingMode,
     #[case] expected: PhysicalPredicate,
 ) {
-    let result =
-        PhysicalPredicate::try_new(&predicate, &logical_schema, column_mapping_mode).unwrap();
+    let ls = LogicalSchema::new_for_test(Arc::new(logical_schema), column_mapping_mode);
+    let result = PhysicalPredicate::try_new(&predicate, &ls).unwrap();
     assert_eq!(result, expected);
 }
 
 /// Unknown column still fails even with case-insensitive matching.
 #[test]
 fn test_physical_predicate_case_insensitive_unknown_column() {
-    let logical_schema =
+    let schema =
         StructType::new_unchecked(vec![StructField::nullable("createdAt", DataType::LONG)]);
-    let result = PhysicalPredicate::try_new(
-        &column_pred!("nonexistent"),
-        &logical_schema,
-        ColumnMappingMode::None,
-    );
+    let logical_schema = LogicalSchema::new_for_test(Arc::new(schema), ColumnMappingMode::None);
+    let result = PhysicalPredicate::try_new(&column_pred!("nonexistent"), &logical_schema);
     assert!(result.is_err());
 }
 

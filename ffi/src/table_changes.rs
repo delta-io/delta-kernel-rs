@@ -221,7 +221,11 @@ pub unsafe extern "C" fn table_changes_scan_logical_schema(
     table_changes_scan: Handle<SharedTableChangesScan>,
 ) -> Handle<SharedSchema> {
     let table_changes_scan = unsafe { table_changes_scan.as_ref() };
-    table_changes_scan.logical_schema().clone().into()
+    table_changes_scan
+        .logical_schema()
+        .raw_schema()
+        .clone()
+        .into()
 }
 
 /// Get the physical schema of the specified table changes scan.

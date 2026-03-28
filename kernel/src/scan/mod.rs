@@ -1,7 +1,7 @@
 //! Functionality to create and execute scans (reads) over data stored in a delta table
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
@@ -30,11 +30,11 @@ use crate::scan::log_replay::{
 };
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
+    DataType, LogicalSchema, LogicalSchemaRef, MapType, SchemaRef, StructField, StructType,
     ToSchema as _,
 };
-use crate::table_features::{ColumnMappingMode, Operation};
-use crate::transforms::{ExpressionTransform, SchemaTransform};
+use crate::table_features::Operation;
+use crate::transforms::ExpressionTransform;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 use self::log_replay::scan_action_iter;
@@ -238,12 +238,14 @@ impl ScanBuilder {
     /// perform actual data reads.
     pub fn build(self) -> DeltaResult<Scan> {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
+        let raw_logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
 
         self.snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
+        let logical_schema =
+            LogicalSchema::new(raw_logical_schema, self.snapshot.table_configuration());
         let state_info = StateInfo::try_new(
             logical_schema,
             self.snapshot.table_configuration(),
@@ -277,55 +279,27 @@ impl PhysicalPredicate {
     /// e.g. `col > 10 AND FALSE`. Such predicates can statically skip the whole query.
     pub(crate) fn try_new(
         predicate: &Predicate,
-        logical_schema: &Schema,
-        column_mapping_mode: ColumnMappingMode,
+        logical_schema: &LogicalSchema,
     ) -> DeltaResult<PhysicalPredicate> {
         if can_statically_skip_all_files(predicate) {
             return Ok(PhysicalPredicate::StaticSkipAll);
         }
-        let unresolved_references = predicate.references();
-        // Group predicate references by case-folded path so that multiple references to the
-        // same column with different casings (e.g., `col > 5 AND COL < 10`) all resolve
-        // correctly instead of one being silently dropped.
-        let mut folded_references: HashMap<Vec<String>, Vec<&ColumnName>> = HashMap::new();
-        for r in &unresolved_references {
-            let folded: Vec<String> = r.iter().map(|s| s.to_lowercase()).collect();
-            folded_references.entry(folded).or_default().push(r);
-        }
-        let mut get_referenced_fields = GetReferencedFields {
-            unresolved_references,
-            folded_references,
-            column_mappings: HashMap::new(),
-            logical_path: vec![],
-            folded_logical_path: vec![],
-            physical_path: vec![],
-            column_mapping_mode,
-        };
-        let schema_opt = get_referenced_fields.transform_struct(logical_schema);
-        let mut unresolved = get_referenced_fields.unresolved_references.into_iter();
-        if let Some(unresolved) = unresolved.next() {
-            // Schema traversal failed to resolve at least one column referenced by the predicate.
-            //
-            // NOTE: It's a pretty serious engine bug if we got this far with a query whose WHERE
-            // clause has invalid column references. Data skipping is best-effort and the predicate
-            // anyway needs to be evaluated against every row of data -- which is impossible if the
-            // columns are missing/invalid. Just blow up instead of trying to handle it gracefully.
-            return Err(Error::missing_column(format!(
-                "Predicate references unknown column: {unresolved}"
-            )));
-        }
-        let Some(schema) = schema_opt else {
+        // NOTE: It's a pretty serious engine bug if we got this far with a query whose WHERE
+        // clause has invalid column references. Data skipping is best-effort and the predicate
+        // anyway needs to be evaluated against every row of data -- which is impossible if the
+        // columns are missing/invalid. Just blow up instead of trying to handle it gracefully.
+        let Some((physical_schema, column_mappings)) =
+            logical_schema.get_referenced_physical_schema(predicate.references())?
+        else {
             // The predicate doesn't statically skip all files, and it doesn't reference any columns
             // that could dynamically change its behavior, so it's useless for data skipping.
             return Ok(PhysicalPredicate::None);
         };
-        let mut apply_mappings = ApplyColumnMappings {
-            column_mappings: get_referenced_fields.column_mappings,
-        };
+        let mut apply_mappings = ApplyColumnMappings { column_mappings };
         if let Some(predicate) = apply_mappings.transform_pred(predicate) {
             Ok(PhysicalPredicate::Some(
                 Arc::new(predicate.into_owned()),
-                Arc::new(schema.into_owned()),
+                Arc::new(physical_schema),
             ))
         } else {
             Ok(PhysicalPredicate::None)
@@ -339,63 +313,6 @@ impl PhysicalPredicate {
 fn can_statically_skip_all_files(predicate: &Predicate) -> bool {
     let evaluator = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
     evaluator.eval_sql_where(predicate) == Some(false)
-}
-
-// Build the stats read schema filtering the table schema to keep only skipping-eligible
-// leaf fields that the skipping expression actually references. Also extract physical name
-// mappings so we can access the correct physical stats column for each logical column.
-struct GetReferencedFields<'a> {
-    unresolved_references: HashSet<&'a ColumnName>,
-    /// Case-folded (lowercased) column path -> all predicate column names that fold to it,
-    /// for O(1) case-insensitive matching. Grouped as a `Vec` so that multiple references to
-    /// the same column with different casings all resolve correctly.
-    folded_references: HashMap<Vec<String>, Vec<&'a ColumnName>>,
-    column_mappings: HashMap<ColumnName, ColumnName>,
-    logical_path: Vec<String>,
-    /// Case-folded version of `logical_path`, maintained incrementally via push/pop to avoid
-    /// re-folding the entire path at every leaf field.
-    folded_logical_path: Vec<String>,
-    physical_path: Vec<String>,
-    column_mapping_mode: ColumnMappingMode,
-}
-impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
-    // Capture the path mapping for this leaf field
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        // Record the physical name mappings for all referenced leaf columns. Delta column names
-        // are case-insensitive, so we probe the case-folded lookup map for O(1) matching.
-        let pred_cols = self
-            .folded_references
-            .remove(self.folded_logical_path.as_slice())?;
-        let physical = ColumnName::new(&self.physical_path);
-        for pred_col in pred_cols {
-            self.unresolved_references.remove(pred_col);
-            // Use the predicate's column name as key so ApplyColumnMappings can look it up
-            // by the exact name used in the predicate expression.
-            self.column_mappings
-                .insert(pred_col.clone(), physical.clone());
-        }
-        Some(Cow::Borrowed(ptype))
-    }
-
-    // array and map fields are not eligible for data skipping, so filter them out.
-    fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        None
-    }
-    fn transform_map(&mut self, _: &'a MapType) -> Option<Cow<'a, MapType>> {
-        None
-    }
-
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        let physical_name = field.physical_name(self.column_mapping_mode);
-        self.logical_path.push(field.name.clone());
-        self.folded_logical_path.push(field.name.to_lowercase());
-        self.physical_path.push(physical_name.to_string());
-        let field = self.recurse_into_struct_field(field);
-        self.logical_path.pop();
-        self.folded_logical_path.pop();
-        self.physical_path.pop();
-        Some(Cow::Owned(field?.with_name(physical_name)))
-    }
 }
 
 /// Prefixes all column references in a predicate with a fixed path.
@@ -513,7 +430,7 @@ pub struct Scan {
 impl std::fmt::Debug for Scan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Scan")
-            .field("schema", &self.state_info.logical_schema)
+            .field("logical_schema", &self.state_info.logical_schema)
             .field("predicate", &self.state_info.physical_predicate)
             .field("stats_output_mode", &self.stats_output_mode)
             .finish()
@@ -543,12 +460,13 @@ impl Scan {
         &self.snapshot
     }
 
-    /// Get a shared reference to the logical [`Schema`] of the scan (i.e. the output schema of the
-    /// scan). Note that the logical schema can differ from the physical schema due to e.g.
-    /// partition columns which are present in the logical schema but not in the physical schema.
+    /// Returns the [`LogicalSchema`] for this scan, which bundles the logical schema together with
+    /// column mapping mode and partition columns. Note that the logical schema can differ from the
+    /// physical schema due to e.g. partition columns which are present in the logical schema but
+    /// not in the physical schema.
     ///
     /// [`Schema`]: crate::schema::Schema
-    pub fn logical_schema(&self) -> &SchemaRef {
+    pub fn logical_schema(&self) -> &LogicalSchemaRef {
         &self.state_info.logical_schema
     }
 
@@ -793,9 +711,9 @@ impl Scan {
                     .as_ref()
                     .map(|s| s.as_ref()),
                 self.state_info
-                    .physical_partition_schema
-                    .as_ref()
-                    .map(|s| s.as_ref()),
+                    .logical_schema
+                    .physical_partition_schema()
+                    .as_deref(),
             )
     }
 
@@ -952,7 +870,7 @@ impl Scan {
             .flatten_ok();
 
         let physical_schema = self.physical_schema().clone();
-        let logical_schema = self.logical_schema().clone();
+        let logical_schema = self.state_info.logical_schema.clone();
         let result = scan_files_iter
             .map(move |scan_file| -> DeltaResult<_> {
                 let scan_file = scan_file?;
@@ -982,7 +900,7 @@ impl Scan {
 
                 let engine = engine.clone(); // Arc clone
                 let physical_schema_inner = physical_schema.clone();
-                let logical_schema_inner = logical_schema.clone();
+                let logical_schema_inner = logical_schema.clone(); // Arc clone
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form

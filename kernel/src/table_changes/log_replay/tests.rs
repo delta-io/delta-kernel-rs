@@ -8,7 +8,7 @@ use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, LogicalSchema, SchemaRef, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
@@ -834,25 +834,30 @@ async fn data_skipping_filter() {
         column_expr!("id"),
         Scalar::from(4),
     );
-    let logical_schema = get_schema();
-    let predicate =
-        match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
-            Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
-            other => panic!("Unexpected result: {other:?}"),
-        };
+    let logical_schema = LogicalSchema::new_for_test(get_schema(), ColumnMappingMode::None);
+    let predicate = match PhysicalPredicate::try_new(&predicate, &logical_schema) {
+        Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
+        other => panic!("Unexpected result: {other:?}"),
+    };
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
         .unwrap()
         .into_iter();
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let sv = table_changes_action_iter(engine, &table_config, commits, logical_schema, predicate)
-        .unwrap()
-        .flat_map(|scan_metadata| {
-            let scan_metadata = scan_metadata.unwrap();
-            scan_metadata.selection_vector
-        })
-        .collect_vec();
+    let sv = table_changes_action_iter(
+        engine,
+        &table_config,
+        commits,
+        logical_schema.raw_schema().clone(),
+        predicate,
+    )
+    .unwrap()
+    .flat_map(|scan_metadata| {
+        let scan_metadata = scan_metadata.unwrap();
+        scan_metadata.selection_vector
+    })
+    .collect_vec();
 
     // Note: since the first pair is a dv operation, remove action will always be filtered
     assert_eq!(sv, &[false, true, false, false, true]);

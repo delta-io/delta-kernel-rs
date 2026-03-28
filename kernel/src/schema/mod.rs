@@ -30,6 +30,11 @@ pub(crate) mod diff;
 pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
+pub(crate) mod logical_schema;
+pub use logical_schema::LogicalSchema;
+/// A reference-counted [`LogicalSchema`]. Prefer this over a bare `LogicalSchema` in any struct
+/// that derives `Clone`, to avoid heap-allocating the partition-column list on each clone.
+pub type LogicalSchemaRef = Arc<LogicalSchema>;
 pub(crate) mod variant_utils;
 
 pub type Schema = StructType;
@@ -722,6 +727,12 @@ impl StructType {
     /// Checks if the [`StructType`] contains a field with the specified name.
     pub fn contains(&self, name: impl AsRef<str>) -> bool {
         self.fields.contains_key(name.as_ref())
+    }
+
+    /// Converts this [`StructType`] into a [`DataType::Struct`] for use as an expression output type.
+    // TODO: expensive deep clone of the schema
+    pub(crate) fn as_output_data_type(&self) -> DataType {
+        DataType::Struct(Box::new(self.clone()))
     }
 
     /// Checks if the [`StructType`] contains a metadata column with the given spec.

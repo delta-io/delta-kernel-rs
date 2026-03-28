@@ -2944,9 +2944,11 @@ fn test_schema_has_compatible_stats_parsed_basic() {
 }
 
 #[test]
-fn test_schema_has_compatible_stats_parsed_missing_column_ok() {
-    // Checkpoint has "id" column, stats schema needs "other" column
-    // Missing column is acceptable - it will return null when accessed
+fn test_schema_has_compatible_stats_parsed_no_overlap_returns_false() {
+    // Checkpoint has "id" column, stats schema needs "other" column only.
+    // When no requested stats columns exist in the checkpoint, reading stats_parsed would cause
+    // Arrow to omit all leaf columns and reorder_struct_array would panic on out-of-bounds access.
+    // Return false so the caller falls back to JSON parsing instead.
     let checkpoint_schema =
         create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
             "id",
@@ -2955,9 +2957,7 @@ fn test_schema_has_compatible_stats_parsed_missing_column_ok() {
 
     let stats_schema = create_stats_schema(vec![StructField::nullable("other", DataType::INTEGER)]);
 
-    // Missing column in checkpoint is OK - it will return null when accessed,
-    // which is acceptable for data skipping (just means we can't skip based on that column)
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
         &checkpoint_schema,
         &stats_schema
     ));

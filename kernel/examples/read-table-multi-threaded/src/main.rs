@@ -10,7 +10,7 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, ScanFile};
-use delta_kernel::schema::SchemaRef;
+use delta_kernel::schema::{LogicalSchemaRef, SchemaRef};
 use delta_kernel::{DeltaResult, Engine, ExpressionRef, FileMeta, Snapshot};
 
 use clap::Parser;
@@ -72,7 +72,7 @@ fn send_scan_file(scan_tx: &mut spmc::Sender<FileToScan>, scan_file: ScanFile) {
 struct ScanState {
     table_root: Url,
     physical_schema: SchemaRef,
-    logical_schema: SchemaRef,
+    logical_schema: LogicalSchemaRef,
 }
 
 fn try_main() -> DeltaResult<()> {

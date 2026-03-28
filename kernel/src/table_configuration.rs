@@ -35,13 +35,19 @@ use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
 use tracing::warn;
 
-/// Expected schema for file statistics, using physical column names.
+/// Expected schemas for file statistics.
 ///
-/// Wrapped in a struct so it can be extended with a logical-name variant if needed.
+/// Contains both logical and physical versions of the stats schema:
+/// - **Logical schema**: Uses original column names (matching table schema)
+/// - **Physical schema**: Uses physical column names (for storage)
+///
+/// When column mapping is disabled (`ColumnMappingMode::None`), both schemas are identical.
 #[allow(unused)]
 #[derive(Debug, Clone)]
 #[internal_api]
 pub(crate) struct ExpectedStatsSchemas {
+    /// Stats schema using logical (user-facing) column names.
+    pub logical: SchemaRef,
     /// Stats schema using physical column names (for storage).
     pub physical: SchemaRef,
 }
@@ -237,7 +243,23 @@ impl TableConfiguration {
         )?);
         let physical_stats_schema = strip_metadata(physical_stats_schema);
 
+        // Compute logical stats schema from logical data schema (uses logical column names).
+        // When column mapping is disabled, logical == physical.
+        let logical_stats_schema = if self.column_mapping_mode() == ColumnMappingMode::None {
+            physical_stats_schema.clone()
+        } else {
+            let logical_data_schema = self.logical_data_schema();
+            let logical_stats_schema = Arc::new(expected_stats_schema(
+                &logical_data_schema,
+                &config,
+                required_columns_physical,
+                requested_columns_physical,
+            )?);
+            strip_metadata(logical_stats_schema)
+        };
+
         Ok(ExpectedStatsSchemas {
+            logical: logical_stats_schema,
             physical: physical_stats_schema,
         })
     }
