@@ -11,10 +11,8 @@ use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArr
 use crate::arrow::datatypes::{DataType, Field, Schema};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStore};
-use crate::parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-};
-use crate::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
+use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use crate::parquet::arrow::async_writer::AsyncArrowWriter;
 use crate::parquet::arrow::async_writer::ParquetObjectWriter;
@@ -40,21 +38,7 @@ use crate::{
     ParquetHandler, PredicateRef,
 };
 
-/// Returns the standard [`ArrowReaderOptions`] for all kernel parquet reads.
-///
-/// Skipping the embedded Arrow IPC schema avoids dependence on Arrow-specific metadata and
-/// ensures that type resolution is driven by the kernel schema rather than the file's schema.
-pub(in crate::engine) fn reader_options() -> ArrowReaderOptions {
-    ArrowReaderOptions::new().with_skip_arrow_metadata(true)
-}
-
-/// Returns the standard [`ArrowWriterOptions`] for all kernel parquet writes.
-///
-/// Omitting the Arrow IPC schema from the file metadata keeps Delta files interoperable with
-/// non-Arrow readers and avoids encoding Arrow-specific type information.
-pub(in crate::engine) fn writer_options() -> ArrowWriterOptions {
-    ArrowWriterOptions::new().with_skip_arrow_metadata(true)
-}
+use crate::engine::{reader_options, writer_options};
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
