@@ -980,17 +980,27 @@ impl Scan {
                     None,
                 )?;
 
+                let mut read_result_iter = read_result_iter.peekable();
+
                 // Only flag an empty iterator as a connector bug when stats are present
                 // and report a positive row count. When stats are absent we cannot
                 // distinguish a legitimate 0-row file from a buggy connector, so we
                 // conservatively allow it.
                 let expect_data = scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
-                let file_path_for_err = scan_file.path.clone();
+                if expect_data && read_result_iter.peek().is_none() {
+                    return Err(Error::internal_error(format!(
+                        "ParquetHandler returned no data for file '{}'. \
+                         This is likely a connector bug -- the handler's \
+                         read_parquet_files must return at least one batch \
+                         for each requested file that contains rows.",
+                        scan_file.path
+                    )));
+                }
 
                 let engine = engine.clone(); // Arc clone
                 let physical_schema_inner = physical_schema.clone();
                 let logical_schema_inner = logical_schema.clone();
-                let inner = read_result_iter.map(move |read_result| -> DeltaResult<_> {
+                Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(
@@ -1013,77 +1023,13 @@ impl Scan {
                     };
                     selection_vector = rest;
                     result
-                });
-
-                // Wrap the inner iterator so that after it is fully consumed, if it
-                // produced zero batches for a file that should contain data, a trailing
-                // error item is emitted.
-                Ok(NonEmptyFileIter::new(inner, expect_data, file_path_for_err))
+                }))
             })
             // Iterator<DeltaResult<Iterator<DeltaResult<Box<dyn EngineData>>>>> to Iterator<DeltaResult<DeltaResult<Box<dyn EngineData>>>>
             .flatten_ok()
             // Iterator<DeltaResult<DeltaResult<Box<dyn EngineData>>>> to Iterator<DeltaResult<Box<dyn EngineData>>>
             .map(|x| x?);
         Ok(result)
-    }
-}
-
-/// Iterator adapter that detects when a `ParquetHandler` returns an empty iterator for a file
-/// that should contain data (i.e. its stats do not indicate zero records). After the inner
-/// iterator is fully consumed, if it yielded zero items and `expect_data` is true, this iterator
-/// emits a single trailing `Err` item to surface the connector bug.
-struct NonEmptyFileIter<I> {
-    inner: I,
-    batch_count: u64,
-    expect_data: bool,
-    file_path: String,
-    /// Set to `true` once the inner iterator returned `None` and we have already either emitted
-    /// the sentinel error or confirmed the iterator was non-empty.
-    done: bool,
-}
-
-impl<I> NonEmptyFileIter<I> {
-    fn new(inner: I, expect_data: bool, file_path: String) -> Self {
-        Self {
-            inner,
-            batch_count: 0,
-            expect_data,
-            file_path,
-            done: false,
-        }
-    }
-}
-
-impl<I> Iterator for NonEmptyFileIter<I>
-where
-    I: Iterator<Item = DeltaResult<Box<dyn EngineData>>>,
-{
-    type Item = DeltaResult<Box<dyn EngineData>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        match self.inner.next() {
-            Some(item) => {
-                self.batch_count += 1;
-                Some(item)
-            }
-            None => {
-                self.done = true;
-                if self.expect_data && self.batch_count == 0 {
-                    Some(Err(Error::internal_error(format!(
-                        "ParquetHandler returned no data for file '{}'. \
-                         This is likely a connector bug -- the handler's \
-                         read_parquet_files must return at least one batch \
-                         for each requested file that contains rows.",
-                        self.file_path
-                    ))))
-                } else {
-                    None
-                }
-            }
-        }
     }
 }
 
