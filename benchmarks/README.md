@@ -85,12 +85,26 @@ BENCH_TAGS=base,my-feature cargo bench -p delta_kernel_benchmarks
 
 ### Running benchmarking on a PR
 
-To trigger benchmarks on a pull request, post a comment on the PR with one of the following:
+To trigger benchmarks on a pull request, post a comment using the following syntax:
 
-- `/bench` — runs benchmarks with `BENCH_TAGS=base`
-- `/bench <tags>` — runs benchmarks with `BENCH_TAGS=<tags>` (e.g. `bench base,tag1`)
+```
+/bench [--tags <comma separated list of tags>] [--filter <regex>]
+```
 
-See [By tag (`BENCH_TAGS`)](#by-tag-bench_tags) for details on how tags work. Results are posted automatically as a PR comment, comparing the PR branch against the base branch.
+- `--tags` sets `BENCH_TAGS` (comma-separated), controlling which tables run. Defaults to `base` if omitted.
+- `--filter` is a single-token Criterion regex matched against benchmark names. Optional.
+- Both flags are independent and can be given in any order.
+
+Examples:
+```
+/bench                                                  # BENCH_TAGS=base, all benchmark names
+/bench --tags base,my-tag                               # BENCH_TAGS=base,my-tag, all benchmark names
+/bench --filter snapshotConstruction                    # BENCH_TAGS=base, only snapshotConstruction benchmarks
+/bench --tags base --filter 101kAdds.*snapshotConstruction  # combined: AND pattern
+/bench --filter 101kAdds|10kAdds                        # OR two table names
+```
+
+See [By tag (`BENCH_TAGS`)](#by-tag-bench_tags) for how tags work and [By benchmark name](#by-benchmark-name) for regex pattern examples. Results are posted automatically as a PR comment, comparing the PR branch against the base branch.
 
 ## Workload data layout
 
