@@ -1308,6 +1308,7 @@ dependencies = [
  "serde_json",
  "sqlparser",
  "tar",
+ "test_utils",
  "ureq",
  "url",
 ]
