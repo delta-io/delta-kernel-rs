@@ -3655,7 +3655,7 @@ async fn test_checkpoint_non_kernel_written_table() {
     let batches_before = test_utils::read_scan(&scan_before, engine.clone()).unwrap();
 
     // Create checkpoint via snapshot.checkpoint()
-    Arc::clone(&snapshot).checkpoint(engine.as_ref()).unwrap();
+    snapshot.checkpoint(engine.as_ref()).unwrap();
 
     // Read data after checkpoint
     let snapshot_after = Snapshot::builder_for(url.clone())

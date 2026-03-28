@@ -9,7 +9,7 @@ use delta_kernel::crc::{Crc, FileStatsValidity};
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::snapshot::{ChecksumWriteResult, FileStats, Snapshot};
+use delta_kernel::snapshot::{ChecksumWriteResult, FileStats, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Engine};
@@ -256,7 +256,7 @@ async fn test_post_commit_crc_chains_only_if_read_snapshot_has_crc(
 /// Writes the in-memory CRC to disk, reloads a fresh snapshot, and asserts that the
 /// round-tripped CRC matches the in-memory one. Returns the loaded CRC for further assertions.
 fn write_and_verify_crc(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     table_path: &str,
     engine: &dyn delta_kernel::Engine,
 ) -> Crc {
@@ -419,7 +419,7 @@ async fn test_write_checksum_success_simple() -> DeltaResult<()> {
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
     let snapshot = committed.post_commit_snapshot().unwrap();
 
-    let result = snapshot.write_checksum(engine.as_ref())?;
+    let (result, _updated) = snapshot.write_checksum(engine.as_ref())?;
     assert_eq!(result, ChecksumWriteResult::Written);
 
     // Verify the CRC file is readable by loading a fresh snapshot from disk
@@ -442,14 +442,16 @@ async fn test_write_checksum_double_write_returns_already_exists(
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
     let snapshot = committed.post_commit_snapshot().unwrap();
 
-    let first = snapshot.write_checksum(engine.as_ref())?;
+    let (first, updated) = snapshot.write_checksum(engine.as_ref())?;
     assert_eq!(first, ChecksumWriteResult::Written);
 
     let second = if reload_snapshot {
         let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-        fresh.write_checksum(engine.as_ref())?
+        let (result, _) = fresh.write_checksum(engine.as_ref())?;
+        result
     } else {
-        snapshot.write_checksum(engine.as_ref())?
+        let (result, _) = updated.write_checksum(engine.as_ref())?;
+        result
     };
     assert_eq!(second, ChecksumWriteResult::AlreadyExists);
 
@@ -733,7 +735,7 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
 
     // Case 3: Write CRC to disk, then reload fresh snapshot => DM loaded from CRC (fast path)
     //         Use NoJsonReadsEngine to prove no log replay occurs.
-    post_commit_snapshot.write_checksum(engine.as_ref())?;
+    let _ = post_commit_snapshot.write_checksum(engine.as_ref())?;
 
     let fresh_snapshot_with_crc = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(fresh_snapshot_with_crc
