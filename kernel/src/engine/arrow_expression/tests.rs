@@ -12,7 +12,7 @@ use crate::arrow::array::{
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
-use crate::engine::arrow_data::EngineDataArrowExt as _;
+use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::to_json;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
@@ -25,8 +25,9 @@ use crate::kernel_predicates::{
 };
 use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
 use crate::utils::test_utils::assert_result_error_with_message;
-use crate::EvaluationHandlerExtension as _;
+use crate::{EvaluationHandler, EvaluationHandlerExtension as _};
 
+use super::apply_schema::apply_schema;
 use super::*;
 
 use Expression as Expr;
@@ -1074,9 +1075,6 @@ fn test_null_scalar_map() -> DeltaResult<()> {
 
 #[test]
 fn test_apply_schema_column_count_mismatch() {
-    use super::apply_schema::apply_schema;
-    use crate::schema::StructType;
-
     // Create a struct array with 3 columns
     let struct_array = StructArray::from(vec![
         (
@@ -1262,4 +1260,77 @@ fn test_to_json_with_nested_struct() {
         json_array.value(1),
         r#"{"outer_int":200,"nested_struct":{"inner_string":"value"}}"#
     );
+}
+
+fn make_mixed_string_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("s_utf8", DataType::Utf8, true),
+            Field::new("s_large", DataType::LargeUtf8, true),
+            Field::new("s_view", DataType::Utf8View, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+            Arc::new(GenericStringArray::<i64>::from(vec!["b"])) as ArrayRef,
+            Arc::new(StringViewArray::from(vec!["c"])) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn mixed_string_kernel_fields() -> [StructField; 3] {
+    [
+        StructField::nullable("s_utf8", KernelDataType::STRING),
+        StructField::nullable("s_large", KernelDataType::STRING),
+        StructField::nullable("s_view", KernelDataType::STRING),
+    ]
+}
+
+/// Evaluator must succeed when a struct contains Utf8, LargeUtf8, and Utf8View columns in the
+/// identity transform branch. The output schema is derived from actual column types, so
+/// `LargeUtf8` and `Utf8View` columns remain valid even though the kernel type is `STRING`.
+#[test]
+fn test_evaluator_mixed_string_types_identity_transform() {
+    let engine_data = ArrowEngineData::new(make_mixed_string_batch());
+    let fields = mixed_string_kernel_fields();
+    let input_schema = Arc::new(StructType::new_unchecked(fields.clone()));
+    let output_type = KernelDataType::Struct(Box::new(StructType::new_unchecked(fields)));
+
+    let handler = ArrowEvaluationHandler;
+    let expression: ExpressionRef = Arc::new(Expression::Transform(Transform::new_top_level()));
+    handler
+        .new_expression_evaluator(input_schema, expression, output_type)
+        .unwrap()
+        .evaluate(&engine_data)
+        .unwrap();
+}
+
+/// Evaluator must succeed when a struct contains Utf8, LargeUtf8, and Utf8View columns in the
+/// struct expression branch.
+#[test]
+fn test_evaluator_mixed_string_types_struct_expression() {
+    let inner_batch = make_mixed_string_batch();
+    let inner_struct: ArrayRef = Arc::new(StructArray::from(inner_batch));
+    let inner_arrow_type = inner_struct.data_type().clone();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("st", inner_arrow_type, false)])),
+        vec![inner_struct],
+    )
+    .unwrap();
+    let engine_data = ArrowEngineData::new(batch);
+
+    let fields = mixed_string_kernel_fields();
+    let input_schema = Arc::new(StructType::new_unchecked([StructField::not_null(
+        "st",
+        KernelDataType::struct_type_unchecked(fields.clone()),
+    )]));
+    let output_type = KernelDataType::Struct(Box::new(StructType::new_unchecked(fields)));
+
+    let handler = ArrowEvaluationHandler;
+    let expression: ExpressionRef = Arc::new(column_expr!("st"));
+    handler
+        .new_expression_evaluator(input_schema, expression, output_type)
+        .unwrap()
+        .evaluate(&engine_data)
+        .unwrap();
 }
