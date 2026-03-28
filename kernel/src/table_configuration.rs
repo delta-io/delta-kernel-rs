@@ -64,7 +64,7 @@ pub(crate) enum InCommitTimestampEnablement {
 /// stats from a checkpoint written before logical metadata was added.
 fn strip_metadata(schema: SchemaRef) -> SchemaRef {
     match StripFieldMetadataTransform.transform_struct(&schema) {
-        Some(Cow::Owned(s)) => Arc::new(s),
+        Cow::Owned(s) => Arc::new(s),
         _ => schema,
     }
 }

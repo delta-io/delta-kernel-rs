@@ -3,11 +3,9 @@
 use super::TableFeature;
 use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
-use crate::transforms::SchemaTransform;
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
-
-use std::borrow::Cow;
 
 /// Validates that if a table schema contains TIMESTAMP_NTZ columns, the table must have the
 /// TimestampWithoutTimezone feature in both reader and writer features.
@@ -27,19 +25,19 @@ pub(crate) fn validate_timestamp_ntz_feature_support(tc: &TableConfiguration) ->
 /// Checks if any column in the schema (including nested structs, arrays, maps) uses
 /// the TIMESTAMP_NTZ primitive type.
 pub(crate) fn schema_contains_timestamp_ntz(schema: &Schema) -> bool {
-    let mut uses_timestamp_ntz = UsesTimestampNtz(false);
-    let _ = uses_timestamp_ntz.transform_struct(schema);
-    uses_timestamp_ntz.0
+    UsesTimestampNtz.transform_struct(schema).is_err()
 }
 
-struct UsesTimestampNtz(bool);
+struct UsesTimestampNtz;
 
 impl<'a> SchemaTransform<'a> for UsesTimestampNtz {
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        if *ptype == PrimitiveType::TimestampNtz {
-            self.0 = true;
+    transform_output_type!(|'a, T| Result<(), ()>);
+
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Result<(), ()> {
+        match ptype {
+            PrimitiveType::TimestampNtz => Err(()),
+            _ => Ok(()),
         }
-        None
     }
 }
 
