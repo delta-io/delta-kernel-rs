@@ -980,6 +980,23 @@ impl Scan {
                     None,
                 )?;
 
+                let mut read_result_iter = read_result_iter.peekable();
+
+                // Only flag an empty iterator as a connector bug when stats are present
+                // and report a positive row count. When stats are absent we cannot
+                // distinguish a legitimate 0-row file from a buggy connector, so we
+                // conservatively allow it.
+                let expect_data = scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
+                if expect_data && read_result_iter.peek().is_none() {
+                    return Err(Error::internal_error(format!(
+                        "ParquetHandler returned no data for file '{}'. \
+                         This is likely a connector bug -- the handler's \
+                         read_parquet_files must return at least one batch \
+                         for each requested file that contains rows.",
+                        scan_file.path
+                    )));
+                }
+
                 let engine = engine.clone(); // Arc clone
                 let physical_schema_inner = physical_schema.clone();
                 let logical_schema_inner = logical_schema.clone();
