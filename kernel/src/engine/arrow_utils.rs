@@ -625,9 +625,8 @@ fn _count_cols(dt: &ArrowDataType) -> usize {
 }
 
 /// Validate that a given field in a parquet file which is presumed to represent data of the
-/// `VARIANT` type is represented as `STRUCT<metadata: BINARY, value: BINARY>`. This is to make
-/// sure that the default engine does not try to read shredded Variants, which it currently does
-/// not support.
+/// `VARIANT` type is represented as an unshredded two-field struct. We accept both field orders
+/// here so legacy kernel-written files remain readable while still rejecting shredded variants.
 fn validate_parquet_variant(field: &ArrowField) -> DeltaResult<()> {
     fn variant_parquet_error(field_name: &String) -> Error {
         Error::Generic(format!(

@@ -1777,11 +1777,11 @@ impl DataType {
     }
 
     /// Create a new unshredded [`DataType::Variant`]. This data type is a struct of two not-null
-    /// binary fields: `metadata` and `value`.
+    /// binary fields: `value` and `metadata`.
     pub fn unshredded_variant() -> Self {
         DataType::Variant(Box::new(StructType::new_unchecked([
-            StructField::not_null("metadata", DataType::BINARY),
             StructField::not_null("value", DataType::BINARY),
+            StructField::not_null("metadata", DataType::BINARY),
         ])))
     }
 
@@ -2147,11 +2147,11 @@ mod tests {
                 let fields: Vec<_> = struct_type.fields().collect();
                 assert_eq!(fields.len(), 2);
 
-                assert_eq!(fields[0].name, "metadata");
+                assert_eq!(fields[0].name, "value");
                 assert_eq!(fields[0].data_type, DataType::BINARY);
                 assert!(!fields[0].nullable);
 
-                assert_eq!(fields[1].name, "value");
+                assert_eq!(fields[1].name, "metadata");
                 assert_eq!(fields[1].data_type, DataType::BINARY);
                 assert!(!fields[1].nullable);
             }

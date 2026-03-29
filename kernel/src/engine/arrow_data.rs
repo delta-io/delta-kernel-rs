@@ -68,12 +68,12 @@ pub(crate) fn extract_record_batch(engine_data: &dyn EngineData) -> DeltaResult<
     Ok(arrow_data.record_batch())
 }
 
-/// unshredded variant arrow type: struct of two non-nullable binary fields 'metadata' and 'value'
+/// unshredded variant arrow type: struct of two non-nullable binary fields 'value' and 'metadata'
 #[allow(dead_code)]
 pub(crate) fn unshredded_variant_arrow_type() -> ArrowDataType {
-    let metadata_field = ArrowField::new("metadata", ArrowDataType::Binary, false);
     let value_field = ArrowField::new("value", ArrowDataType::Binary, false);
-    let fields = vec![metadata_field, value_field];
+    let metadata_field = ArrowField::new("metadata", ArrowDataType::Binary, false);
+    let fields = vec![value_field, metadata_field];
     ArrowDataType::Struct(fields.into())
 }
 

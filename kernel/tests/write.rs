@@ -1162,15 +1162,15 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
     fn unshredded_variant_schema_flipped() -> DataType {
         DataType::variant_type([
-            StructField::not_null("value", DataType::BINARY),
             StructField::not_null("metadata", DataType::BINARY),
+            StructField::not_null("value", DataType::BINARY),
         ])
         .unwrap()
     }
     fn variant_arrow_type_flipped() -> ArrowDataType {
-        let metadata_field = Field::new("metadata", ArrowDataType::Binary, false);
         let value_field = Field::new("value", ArrowDataType::Binary, false);
-        let fields = vec![value_field, metadata_field];
+        let metadata_field = Field::new("metadata", ArrowDataType::Binary, false);
+        let fields = vec![metadata_field, value_field];
         ArrowDataType::Struct(fields.into())
     }
 
@@ -1269,15 +1269,15 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 
     let variant_v_array = StructArray::try_new(
         fields.clone(),
-        vec![metadata_v_array, value_v_array],
+        vec![value_v_array, metadata_v_array],
         Some(null_bitmap.clone()),
     )?;
 
     let variant_nested_v_array = Arc::new(StructArray::try_new(
         fields_flipped.clone(),
         vec![
-            value_nested_v_array.clone(),
             metadata_nested_v_array.clone(),
+            value_nested_v_array.clone(),
         ],
         Some(null_bitmap.clone()),
     )?);
@@ -1353,10 +1353,10 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ])?);
 
-    // During the read, the flipped fields should be reordered into metadata, value.
+    // During the read, the flipped fields should be reordered into value, metadata.
     let variant_nested_v_array_expected = Arc::new(StructArray::try_new(
         fields,
-        vec![metadata_nested_v_array, value_nested_v_array],
+        vec![value_nested_v_array, metadata_nested_v_array],
         Some(null_bitmap),
     )?);
     let variant_arrow_type: ArrowDataType =
@@ -1395,7 +1395,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     )])?);
 
     // The table will be attempted to be written in this form but be read into
-    // STRUCT<metadata: BINARY, value: BINARY>. The read should fail because the default engine
+    // STRUCT<value: BINARY, metadata: BINARY>. The read should fail because the default engine
     // currently does not support shredded reads.
     let shredded_write_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "v",
