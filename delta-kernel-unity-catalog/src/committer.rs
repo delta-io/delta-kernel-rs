@@ -6,8 +6,8 @@ use tracing::{debug, info};
 use unity_catalog_delta_client_api::{Commit, CommitClient, CommitRequest};
 
 use crate::constants::{
-    CATALOG_MANAGED_FEATURE, ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_FEATURE,
-    UC_TABLE_ID_KEY, VACUUM_PROTOCOL_CHECK_FEATURE,
+    CATALOG_MANAGED_FEATURE, CLUSTERING_DOMAIN_NAME, ENABLE_IN_COMMIT_TIMESTAMPS,
+    IN_COMMIT_TIMESTAMP_FEATURE, UC_TABLE_ID_KEY, VACUUM_PROTOCOL_CHECK_FEATURE,
 };
 
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
@@ -95,12 +95,9 @@ impl<C: CommitClient> UCCommitter<C> {
         Ok(())
     }
 
-    /// Validates that this commit does not change the table's protocol or metadata.
-    /// ALTER TABLE operations (schema changes, property changes, feature additions) are not
-    /// supported through the UCCommitter for catalog-managed tables.
-    fn validate_no_protocol_or_metadata_change(
-        commit_metadata: &CommitMetadata,
-    ) -> DeltaResult<()> {
+    /// Validates that this commit does not include ALTER TABLE changes. Protocol changes, metadata
+    /// changes, and clustering column changes are not supported through the UCCommitter.
+    fn validate_no_alter_table_changes(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
         if commit_metadata.has_protocol_change() {
             return Err(DeltaError::generic(
                 "UCCommitter does not support commits that change the table protocol. \
@@ -111,6 +108,12 @@ impl<C: CommitClient> UCCommitter<C> {
             return Err(DeltaError::generic(
                 "UCCommitter does not support commits that change the table metadata. \
                  ALTER TABLE operations are not supported for catalog-managed tables.",
+            ));
+        }
+        if commit_metadata.has_domain_metadata_change(CLUSTERING_DOMAIN_NAME) {
+            return Err(DeltaError::generic(
+                "UCCommitter does not support commits that change clustering columns. \
+                 ALTER TABLE CLUSTER BY is not supported for catalog-managed tables.",
             ));
         }
         Ok(())
@@ -164,7 +167,7 @@ impl<C: CommitClient> UCCommitter<C> {
             "commit_version_non_zero called with version 0"
         );
         Self::validate_no_catalog_managed_change(&commit_metadata)?;
-        Self::validate_no_protocol_or_metadata_change(&commit_metadata)?;
+        Self::validate_no_alter_table_changes(&commit_metadata)?;
         let staged_commit_path = commit_metadata.staged_commit_path()?;
         engine
             .json_handler()
@@ -485,6 +488,24 @@ mod tests {
         assert!(
             err.to_string().contains("table metadata"),
             "expected metadata change error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn commit_version_non_zero_rejects_clustering_change() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        let commit_metadata =
+            catalog_managed_commit_metadata(table_root, 1).with_domain_change("delta.clustering");
+        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+
+        let err = committer
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("clustering columns"),
+            "expected clustering change error, got: {err}"
         );
     }
 

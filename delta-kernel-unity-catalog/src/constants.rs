@@ -18,3 +18,5 @@ pub(crate) const CATALOG_MANAGED_FEATURE: &str = "catalogManaged";
 pub(crate) const VACUUM_PROTOCOL_CHECK_FEATURE: &str = "vacuumProtocolCheck";
 /// Feature name for in-commit timestamps (wire format).
 pub(crate) const IN_COMMIT_TIMESTAMP_FEATURE: &str = "inCommitTimestamp";
+/// Domain name for clustering metadata.
+pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";

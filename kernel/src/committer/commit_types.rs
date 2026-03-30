@@ -262,6 +262,17 @@ impl CommitMetadata {
         self.new_metadata = Some(self.metadata.clone());
         self
     }
+
+    /// Adds a domain metadata change for the given domain name. Test-only.
+    ///
+    /// Creates a synthetic domain metadata entry to simulate a domain metadata change
+    /// (e.g. clustering column change via ALTER TABLE CLUSTER BY).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_domain_change(mut self, domain: &str) -> Self {
+        self.domain_metadata_changes
+            .push(DomainMetadata::new(domain.to_string(), String::new()));
+        self
+    }
 }
 
 /// `CommitResponse` is the result of committing a transaction via a catalog. The committer uses
