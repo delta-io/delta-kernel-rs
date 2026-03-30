@@ -951,8 +951,6 @@ impl Snapshot {
     ///
     /// When In-Commit Timestamps (ICT) are enabled, returns the In-Commit Timestamp value.
     /// Otherwise, falls back to the filesystem last-modified time of the latest commit file.
-    /// Note that without ICT, the returned timestamp is best-effort and may not be monotonically
-    /// increasing (e.g., after table copies or across writers with clock skew).
     ///
     /// Returns an error if the commit file is missing, the ICT configuration is invalid, or the
     /// ICT value cannot be read.
@@ -961,8 +959,8 @@ impl Snapshot {
     ///
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
     #[allow(unused)]
-    #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
     #[internal_api]
+    #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
     pub(crate) fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         match self
             .table_configuration()
@@ -2125,7 +2123,9 @@ mod tests {
     #[case::ict_enabled(true)]
     #[case::ict_disabled(false)]
     #[tokio::test]
-    async fn test_get_timestamp_errors_when_commit_file_missing(#[case] ict_enabled: bool) -> DeltaResult<()> {
+    async fn test_get_timestamp_errors_when_commit_file_missing(
+        #[case] ict_enabled: bool,
+    ) -> DeltaResult<()> {
         let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
@@ -2144,7 +2144,6 @@ mod tests {
         ];
         commit(url.as_str(), store.as_ref(), 0, commit_data).await;
 
-        // Build snapshot to get table configuration
         let snapshot = Snapshot::builder_for(url.as_str())
             .at_version(0)
             .build(&engine)?;
@@ -2152,7 +2151,6 @@ mod tests {
         let snapshot_no_commit =
             create_snapshot_no_commit(&url, snapshot.table_configuration().clone())?;
 
-        // Should return an error when commit file is missing
         let result = snapshot_no_commit.get_timestamp(&engine);
         assert_result_error_with_message(result, NO_COMMIT_FILE_ERROR);
 
