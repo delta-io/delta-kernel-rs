@@ -14,6 +14,9 @@ pub(crate) const METASTORE_LAST_UPDATE_VERSION: &str = "delta.lastUpdateVersion"
 pub(crate) const METASTORE_LAST_COMMIT_TIMESTAMP: &str = "delta.lastCommitTimestamp";
 /// Feature name for catalog-managed tables (wire format).
 pub(crate) const CATALOG_MANAGED_FEATURE: &str = "catalogManaged";
+/// Feature name for catalog-owned preview tables (wire format). This is the preview feature
+/// used by delta-spark OSS. Tables with this feature are treated as catalog-managed.
+pub(crate) const CATALOG_OWNED_PREVIEW_FEATURE: &str = "catalogOwned-preview";
 /// Feature name for vacuum protocol check (wire format).
 pub(crate) const VACUUM_PROTOCOL_CHECK_FEATURE: &str = "vacuumProtocolCheck";
 /// Feature name for in-commit timestamps (wire format).
