@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
@@ -260,7 +260,6 @@ impl DataSkippingFilter {
         let batch_len = batch.len();
 
         let file_stats = self.stats_evaluator.evaluate(batch)?;
-        debug_assert_eq!(file_stats.len(), batch_len);
         require!(
             file_stats.len() == batch_len,
             Error::internal_error(format!(
@@ -271,7 +270,6 @@ impl DataSkippingFilter {
         );
 
         let skipping_predicate = self.skipping_evaluator.evaluate(&*file_stats)?;
-        debug_assert_eq!(skipping_predicate.len(), batch_len);
         require!(
             skipping_predicate.len() == batch_len,
             Error::internal_error(format!(
@@ -297,13 +295,11 @@ impl DataSkippingFilter {
         let mut visitor = SelectionVectorVisitor::default();
         visitor.visit_rows_of(selection_vector.as_ref())?;
 
-        let skipped = visitor
-            .selection_vector
-            .iter()
-            .filter(|&&kept| !kept)
-            .count();
-        if skipped > 0 {
-            info!("data skipping filtered {skipped}/{batch_len} rows from batch",);
+        if visitor.num_filtered > 0 {
+            debug!(
+                "data skipping filtered {}/{batch_len} rows from batch",
+                visitor.num_filtered
+            );
         }
 
         if let Some(metrics) = self.metrics.as_ref() {

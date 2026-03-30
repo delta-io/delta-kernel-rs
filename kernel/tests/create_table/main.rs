@@ -19,6 +19,7 @@ use delta_kernel::table_features::{
 use delta_kernel::table_properties::TableProperties;
 use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
 use delta_kernel::DeltaResult;
+use rstest::rstest;
 use serde_json::Value;
 use test_utils::{assert_result_error_with_message, test_table_setup};
 
@@ -340,12 +341,22 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn test_create_table_with_vacuum_protocol_check() -> DeltaResult<()> {
+#[rstest]
+#[case("vacuumProtocolCheck", TableFeature::VacuumProtocolCheck, true)]
+#[case("v2Checkpoint", TableFeature::V2Checkpoint, true)]
+// DV uses EnabledIf: the feature signal alone makes it supported but not enabled
+// (requires delta.enableDeletionVectors=true property to be enabled)
+#[case("deletionVectors", TableFeature::DeletionVectors, false)]
+fn test_create_table_with_feature_signal(
+    #[case] feature_name: &str,
+    #[case] feature: TableFeature,
+    #[case] enabled_when_supported: bool,
+) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
+    let property_key = format!("delta.feature.{feature_name}");
     let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
-        .with_table_properties([("delta.feature.vacuumProtocolCheck", "supported")])
+        .with_table_properties([(property_key.as_str(), "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
@@ -353,25 +364,105 @@ fn test_create_table_with_vacuum_protocol_check() -> DeltaResult<()> {
     let table_config = snapshot.table_configuration();
 
     assert!(
-        table_config.is_feature_supported(&TableFeature::VacuumProtocolCheck),
-        "vacuumProtocolCheck should be supported"
+        table_config.is_feature_supported(&feature),
+        "{feature_name} should be supported"
     );
-    assert!(
-        table_config.is_feature_enabled(&TableFeature::VacuumProtocolCheck),
-        "vacuumProtocolCheck should be enabled (AlwaysIfSupported)"
+    assert_eq!(
+        table_config.is_feature_enabled(&feature),
+        enabled_when_supported,
+        "{feature_name}: is_feature_enabled should be {enabled_when_supported}"
     );
     let protocol = table_config.protocol();
     assert!(
         protocol
             .writer_features()
-            .is_some_and(|f| f.contains(&TableFeature::VacuumProtocolCheck)),
-        "vacuumProtocolCheck should be in writer features"
+            .is_some_and(|f| f.contains(&feature)),
+        "{feature_name} should be in writer features"
     );
     assert!(
         protocol
             .reader_features()
-            .is_some_and(|f| f.contains(&TableFeature::VacuumProtocolCheck)),
-        "vacuumProtocolCheck should be in reader features"
+            .is_some_and(|f| f.contains(&feature)),
+        "{feature_name} should be in reader features"
+    );
+
+    Ok(())
+}
+
+#[rstest]
+fn test_create_table_with_checkpoint_stats_properties(
+    #[values(true, false)] write_stats_as_json: bool,
+    #[values(true, false)] write_stats_as_struct: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let json_val = write_stats_as_json.to_string();
+    let struct_val = write_stats_as_struct.to_string();
+
+    let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
+        .with_table_properties([
+            ("delta.checkpoint.writeStatsAsJson", json_val.as_str()),
+            ("delta.checkpoint.writeStatsAsStruct", struct_val.as_str()),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let tp = snapshot.table_properties();
+    assert_eq!(tp.checkpoint_write_stats_as_json, Some(write_stats_as_json));
+    assert_eq!(
+        tp.checkpoint_write_stats_as_struct,
+        Some(write_stats_as_struct)
+    );
+
+    Ok(())
+}
+
+#[rstest]
+#[case("true", true)]
+#[case("false", false)]
+fn test_create_table_with_deletion_vectors_property(
+    #[case] value: &str,
+    #[case] expect_enabled: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
+        .with_table_properties([("delta.enableDeletionVectors", value)])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let table_config = snapshot.table_configuration();
+
+    assert_eq!(
+        snapshot.table_properties().enable_deletion_vectors,
+        Some(value.parse::<bool>().unwrap())
+    );
+    assert_eq!(
+        table_config.is_feature_supported(&TableFeature::DeletionVectors),
+        expect_enabled,
+        "DeletionVectors supported should be {expect_enabled}"
+    );
+    assert_eq!(
+        table_config.is_feature_enabled(&TableFeature::DeletionVectors),
+        expect_enabled,
+        "DeletionVectors enabled should be {expect_enabled}"
+    );
+    let protocol = table_config.protocol();
+    assert_eq!(
+        protocol
+            .writer_features()
+            .is_some_and(|f| f.contains(&TableFeature::DeletionVectors)),
+        expect_enabled,
+        "DeletionVectors in writer features should be {expect_enabled}"
+    );
+    assert_eq!(
+        protocol
+            .reader_features()
+            .is_some_and(|f| f.contains(&TableFeature::DeletionVectors)),
+        expect_enabled,
+        "DeletionVectors in reader features should be {expect_enabled}"
     );
 
     Ok(())
