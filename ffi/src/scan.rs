@@ -720,8 +720,9 @@ mod scan_builder_tests {
         visit_field_integer, visit_field_struct, KernelSchemaVisitorState,
     };
     use crate::{
-        engine_to_handle, free_engine, free_schema, free_snapshot, kernel_string_slice,
-        snapshot as get_snapshot, ExternResult, SharedExternEngine, SharedSnapshot,
+        engine_to_handle, free_engine, free_schema, free_snapshot, get_snapshot_builder,
+        kernel_string_slice, snapshot_builder_build, ExternResult, SharedExternEngine,
+        SharedSnapshot,
     };
 
     use super::{
@@ -750,10 +751,11 @@ mod scan_builder_tests {
         let engine = DefaultEngineBuilder::new(storage).build();
         let engine_handle = engine_to_handle(Arc::new(engine), allocate_err);
         let snapshot_handle = unsafe {
-            ok_or_panic(get_snapshot(
+            let builder = ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine_handle.shallow_copy(),
-            ))
+            ));
+            ok_or_panic(snapshot_builder_build(builder))
         };
         (engine_handle, snapshot_handle)
     }
