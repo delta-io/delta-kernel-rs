@@ -434,6 +434,41 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         "Predicate: _metadata columns not supported",
         &["rt_filter_read/specs/rt_filter_read_read_filtered"],
     ),
+    // Kernel evaluator doesn't support `Column IN (literal_array)` pattern yet.
+    // The predicate parser correctly generates this, but evaluate_expression only handles
+    // `Literal IN Column` (scalar in array column) and `Literal IN Literal(Array)`.
+    (
+        "Kernel: Column IN (literal_array) evaluation not supported",
+        &[
+            "DV-004/specs/DV-004_filter_300_787_239",
+            "cks_dv_in_crc/specs/cks_dv_in_crc_read_remaining",
+            "dpReadPartitionAfterAppend/specs/dpReadPartitionAfterAppend_filterPartInCD",
+            "dpReadPartitionIn/specs/dpReadPartitionIn_filterPartInAC",
+            "dpReadPartitionIn/specs/dpReadPartitionIn_filterPartInBDE",
+            "ds_in_list/specs/ds_in_list_in_list_single_file",
+            "ds_in_list/specs/ds_in_list_in_list",
+            "ds_in_nested/specs/ds_in_nested_hit_code_in_1_2",
+            "ds_in_nested/specs/ds_in_nested_miss_code_in_99",
+            "ds_in_set/specs/ds_in_set_hit_in_1",
+            "ds_in_set/specs/ds_in_set_hit_in_12",
+            "ds_in_set/specs/ds_in_set_hit_in_123",
+            "ds_in_set/specs/ds_in_set_miss_in_456",
+            "ds_in_with_nulls_mixed/specs/ds_in_with_nulls_mixed_hit_in_1_null",
+            "ds_in_with_nulls_mixed/specs/ds_in_with_nulls_mixed_miss_in_99_null",
+            "ds_in_with_nulls_only/specs/ds_in_with_nulls_only_hit_in_1_2",
+            "ds_in_with_nulls_only/specs/ds_in_with_nulls_only_hit_in_5",
+            "ds_in_with_thresholds/specs/ds_in_with_thresholds_hit_in_cross_files",
+            "ds_in_with_thresholds/specs/ds_in_with_thresholds_hit_in_small",
+            "ds_in_with_thresholds/specs/ds_in_with_thresholds_miss_in_no_match",
+            "ds_not_in/specs/ds_not_in_not_in_1_2",
+            "ds_not_in/specs/ds_not_in_not_in_3",
+            "ds_not_in/specs/ds_not_in_not_in_all",
+            "ds_not_in/specs/ds_not_in_not_in_outside",
+            "dsReadInPredicate/specs/dsReadInPredicate_readInSet",
+            "dv_partition_pruning/specs/dv_partition_pruning_prune_north_or_east",
+            "tt_partition_filter/specs/tt_partition_filter_v0_part_0_or_1",
+        ],
+    ),
     // Tests with simple predicates that fail due to timestamp schema mismatch
     // These have predicates like "c1 = 1" that work, but the result comparison fails
     // because kernel uses Timestamp(Microsecond, UTC) while Spark uses Timestamp(Nanosecond, None)
