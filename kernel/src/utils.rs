@@ -910,6 +910,15 @@ mod tests {
     }
 
     #[test]
+    fn once_lock_first_init_wins() {
+        let lock = OnceLock::new();
+        let val1 = once_lock_get_or_try_init(&lock, || Ok(1)).unwrap();
+        let val2 = once_lock_get_or_try_init(&lock, || Ok(2)).unwrap();
+        assert_eq!(val1, 1);
+        assert_eq!(val2, 1);
+    }
+
+    #[test]
     fn try_from_uri_without_trailing_slash() {
         let location = "s3://foo/__unitystorage/catalogs/cid/tables/tid";
         let url = try_parse_uri(location).unwrap();
