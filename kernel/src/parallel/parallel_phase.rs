@@ -474,8 +474,8 @@ mod tests {
                     all_paths.extend(paths);
                 }
 
-                // Log metrics after all parallel workers complete
-                final_state.log_metrics();
+                // Report metrics after all parallel workers complete
+                final_state.report_metrics();
             }
         }
 

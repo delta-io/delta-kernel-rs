@@ -20,6 +20,7 @@ use crate::log_replay::{
     ParallelLogReplayProcessor,
 };
 use crate::log_segment::CheckpointReadInfo;
+use crate::metrics::MetricId;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
@@ -44,6 +45,7 @@ struct InternalScanState {
     skip_stats: bool,
     /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
     physical_partition_schema: Option<SchemaRef>,
+    operation_id: String,
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -122,6 +124,8 @@ pub struct ScanLogReplayProcessor {
     checkpoint_info: CheckpointReadInfo,
     /// Metrics related to the scan
     metrics: Arc<ScanMetrics>,
+    /// Operation identifier used to correlate scan metric events across phases.
+    operation_id: MetricId,
 }
 
 impl ScanLogReplayProcessor {
@@ -254,6 +258,7 @@ impl ScanLogReplayProcessor {
             skip_stats,
             checkpoint_info,
             metrics,
+            operation_id: MetricId::new(),
         })
     }
 
@@ -264,6 +269,22 @@ impl ScanLogReplayProcessor {
 
     pub(crate) fn get_metrics(&self) -> &ScanMetrics {
         self.metrics.as_ref()
+    }
+
+    /// Returns the operation identifier used for scan metrics correlation.
+    pub(crate) fn operation_id(&self) -> MetricId {
+        self.operation_id
+    }
+
+    /// Overrides the operation identifier used for scan metrics correlation.
+    pub(crate) fn set_operation_id(&mut self, operation_id: MetricId) {
+        self.operation_id = operation_id;
+    }
+
+    /// Transition to phase-2 parallel reporting with fresh counters.
+    pub(crate) fn start_parallel_phase(&mut self, operation_id: MetricId) {
+        self.operation_id = operation_id;
+        self.metrics.reset_counters();
     }
 
     /// Serialize the processor state for distributed processing.
@@ -298,7 +319,8 @@ impl ScanLogReplayProcessor {
             _ => (None, None),
         };
 
-        // Serialize internal state to JSON blob (schemas, transform spec, and column mapping mode)
+        // Serialize internal state to JSON blob (schemas, transforms, mapping mode, and metrics
+        // correlation context).
         let internal_state = InternalScanState {
             logical_schema,
             physical_schema,
@@ -308,6 +330,7 @@ impl ScanLogReplayProcessor {
             physical_stats_schema,
             skip_stats: self.skip_stats,
             physical_partition_schema,
+            operation_id: self.operation_id.to_string(),
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {e}")))?;
@@ -356,23 +379,41 @@ impl ScanLogReplayProcessor {
             None => PhysicalPredicate::None,
         };
 
+        let InternalScanState {
+            logical_schema,
+            physical_schema,
+            predicate_schema: _,
+            transform_spec,
+            column_mapping_mode,
+            physical_stats_schema,
+            skip_stats,
+            physical_partition_schema,
+            operation_id,
+        } = internal_state;
+
         let state_info = Arc::new(StateInfo {
-            logical_schema: internal_state.logical_schema,
-            physical_schema: internal_state.physical_schema,
+            logical_schema,
+            physical_schema,
             physical_predicate,
-            transform_spec: internal_state.transform_spec,
-            column_mapping_mode: internal_state.column_mapping_mode,
-            physical_stats_schema: internal_state.physical_stats_schema,
-            physical_partition_schema: internal_state.physical_partition_schema,
+            transform_spec,
+            column_mapping_mode,
+            physical_stats_schema,
+            physical_partition_schema,
         });
 
-        Self::new_with_seen_files(
+        let operation_id = operation_id
+            .parse::<MetricId>()
+            .map_err(|e| Error::generic(format!("Invalid operation id in internal state: {e}")))?;
+
+        let mut processor = Self::new_with_seen_files(
             engine,
             state_info,
             state.checkpoint_info,
             state.seen_file_keys,
-            internal_state.skip_stats,
-        )
+            skip_stats,
+        )?;
+        processor.set_operation_id(operation_id);
+        Ok(processor)
     }
 }
 
@@ -1423,6 +1464,7 @@ mod tests {
             physical_stats_schema: None,
             skip_stats: false,
             physical_partition_schema: None,
+            operation_id: "test-operation-id".to_string(),
         };
         let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -1455,6 +1497,7 @@ mod tests {
             physical_stats_schema: None,
             skip_stats: false,
             physical_partition_schema: None,
+            operation_id: "test-operation-id".to_string(),
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
