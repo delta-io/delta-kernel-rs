@@ -390,9 +390,7 @@ impl<S> Transaction<S> {
         // Step 7: Commit via the committer
         // Enforce that committer type matches table type for catalog-managed tables.
         // A non-catalog committer cannot commit to a catalog-managed table, and a catalog
-        // committer cannot commit to a non-catalog-managed table. This is a kernel-level
-        // policy to prevent accidental misuse -- the Delta protocol spec requires catalog
-        // committers for catalog-managed tables but is silent on the reverse direction.
+        // committer cannot commit to a non-catalog-managed table.
         #[cfg(feature = "catalog-managed")]
         {
             let is_catalog_committer = self.committer.is_catalog_committer();
