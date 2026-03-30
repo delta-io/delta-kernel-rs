@@ -87,8 +87,7 @@ pub enum MetricEvent {
     /// [`JsonHandler::read_json_files`]: crate::JsonHandler::read_json_files
     JsonReadCompleted { num_files: u64, bytes_read: u64 },
 
-    /// Parquet file read operation completed (one event per
-    /// [`ParquetHandler::read_parquet_files`] call).
+    /// Parquet file read completed (one event per [`ParquetHandler::read_parquet_files`] call).
     ///
     /// `bytes_read` is the sum of `FileMeta::size` for the requested files (on-disk size),
     /// which is the best available approximation without re-reading the bytes.

@@ -87,9 +87,9 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
 
-/// Wraps a [`FileDataReadResultIterator`] to emit a [`MetricEvent`] exactly once when the
-/// iterator is either exhausted or dropped. Used by JSON and Parquet handlers to report
-/// the number of files and bytes requested per `read_*_files` call.
+/// Wraps a [`FileDataReadResultIterator`] to emit a [`MetricEvent`] exactly once when the iterator
+/// is either exhausted or dropped. Used by JSON and Parquet handlers to report the number of files
+/// and bytes requested per `read_*_files` call.
 pub(super) struct ReadMetricsIterator {
     inner: crate::FileDataReadResultIterator,
     reporter: Arc<dyn crate::metrics::MetricsReporter>,
