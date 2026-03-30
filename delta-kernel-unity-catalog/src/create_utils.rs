@@ -75,8 +75,6 @@ pub fn get_required_properties_for_disk(uc_table_id: &str) -> HashMap<String, St
 /// - `delta.lastCommitTimestamp` -- the snapshot's in-commit timestamp (requires ICT enabled)
 /// - `clusteringColumns` -- JSON-serialized clustering columns (if clustering is enabled)
 ///
-/// Note: This performs log replay to read in-commit timestamp and clustering domain metadata.
-///
 /// # Clustering columns
 ///
 /// Clustering columns are returned as logical column names.
@@ -160,8 +158,7 @@ mod tests {
     use delta_kernel::transaction::data_layout::DataLayout;
     use delta_kernel::{DeltaResult, Engine, FileMeta, FilteredEngineData};
 
-    /// A mock catalog committer that writes directly to the published path (like
-    /// FileSystemCommitter) but reports `is_catalog_committer() = true`.
+    /// A mock catalog committer that writes directly to the published path.
     struct MockCatalogCommitter;
     impl Committer for MockCatalogCommitter {
         fn commit(
