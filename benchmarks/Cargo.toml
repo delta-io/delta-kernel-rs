@@ -21,6 +21,7 @@ ureq = "3.1"
 
 [dependencies]
 delta_kernel = { path = "../kernel", features = ["default-engine-rustls", "internal-api"] }
+itertools = "0.14"
 test_utils = { path = "../test-utils" }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }

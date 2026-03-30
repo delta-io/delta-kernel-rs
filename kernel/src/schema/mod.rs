@@ -742,6 +742,7 @@ impl StructType {
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate
     /// field is not a struct type.
+    #[internal_api]
     pub(crate) fn walk_column_fields<'a>(
         &'a self,
         col: &ColumnName,
