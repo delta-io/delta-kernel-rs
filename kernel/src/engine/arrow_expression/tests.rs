@@ -33,7 +33,7 @@ use Expression as Expr;
 use Predicate as Pred;
 
 #[test]
-fn literal_in_list_column_evaluates_membership_per_row() {
+fn test_array_column() {
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
     let field = Arc::new(Field::new("item", DataType::Int32, true));
@@ -73,7 +73,7 @@ fn literal_in_list_column_evaluates_membership_per_row() {
 }
 
 #[test]
-fn in_predicate_errors_when_right_side_is_not_array_type() {
+fn test_bad_right_type_array() {
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let field = Arc::new(Field::new("item", DataType::Int32, true));
     let schema = Schema::new([field.clone()]);
@@ -246,7 +246,7 @@ fn test_binary_predicate_with_view_types(
 }
 
 #[test]
-fn literal_in_literal_array_returns_single_boolean() {
+fn test_literal_type_array() {
     let field = Arc::new(Field::new("item", DataType::Int32, true));
     let schema = Schema::new([field.clone()]);
     let batch = RecordBatch::new_empty(Arc::new(schema));
@@ -274,7 +274,7 @@ fn literal_in_literal_array_returns_single_boolean() {
 }
 
 #[test]
-fn nested_complex_literal_array_builds_correct_arrow_structure() {
+fn test_literal_complex_type_array() {
     use crate::arrow::array::{Array as _, AsArray as _};
     use crate::arrow::datatypes::Int32Type;
 
@@ -400,7 +400,7 @@ fn nested_complex_literal_array_builds_correct_arrow_structure() {
 }
 
 #[test]
-fn in_predicate_errors_when_both_sides_are_columns() {
+fn test_invalid_array_sides() {
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
     let field = Arc::new(Field::new("item", DataType::Int32, true));
@@ -423,7 +423,7 @@ fn in_predicate_errors_when_both_sides_are_columns() {
 }
 
 #[test]
-fn string_literal_in_string_list_column_evaluates_correctly() {
+fn test_str_arrays() {
     let values = GenericStringArray::<i32>::from(vec![
         "hi", "bye", "hi", "hi", "bye", "bye", "hi", "bye", "hi",
     ]);
