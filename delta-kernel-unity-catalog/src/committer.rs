@@ -95,6 +95,27 @@ impl<C: CommitClient> UCCommitter<C> {
         Ok(())
     }
 
+    /// Validates that this commit does not change the table's protocol or metadata.
+    /// ALTER TABLE operations (schema changes, property changes, feature additions) are not
+    /// supported through the UCCommitter for catalog-managed tables.
+    fn validate_no_protocol_or_metadata_change(
+        commit_metadata: &CommitMetadata,
+    ) -> DeltaResult<()> {
+        if commit_metadata.has_protocol_change() {
+            return Err(DeltaError::generic(
+                "UCCommitter does not support commits that change the table protocol. \
+                 ALTER TABLE operations are not supported for catalog-managed tables.",
+            ));
+        }
+        if commit_metadata.has_metadata_change() {
+            return Err(DeltaError::generic(
+                "UCCommitter does not support commits that change the table metadata. \
+                 ALTER TABLE operations are not supported for catalog-managed tables.",
+            ));
+        }
+        Ok(())
+    }
+
     /// Commit version 0 (table creation). Validates that all required UC properties are present,
     /// then writes the version 0 commit file directly to the published commit path.
     fn commit_version_0(
@@ -143,6 +164,7 @@ impl<C: CommitClient> UCCommitter<C> {
             "commit_version_non_zero called with version 0"
         );
         Self::validate_no_catalog_managed_change(&commit_metadata)?;
+        Self::validate_no_protocol_or_metadata_change(&commit_metadata)?;
         let staged_commit_path = commit_metadata.staged_commit_path()?;
         engine
             .json_handler()
@@ -429,6 +451,40 @@ mod tests {
         assert!(
             err.to_string().contains("catalogManaged"),
             "expected catalogManaged error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn commit_version_non_zero_rejects_protocol_change() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        let commit_metadata = catalog_managed_commit_metadata(table_root, 1).with_protocol_change();
+        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+
+        let err = committer
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("table protocol"),
+            "expected protocol change error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn commit_version_non_zero_rejects_metadata_change() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        let commit_metadata = catalog_managed_commit_metadata(table_root, 1).with_metadata_change();
+        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+
+        let err = committer
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("table metadata"),
+            "expected metadata change error, got: {err}"
         );
     }
 

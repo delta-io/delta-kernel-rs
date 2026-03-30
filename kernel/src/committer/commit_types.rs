@@ -242,6 +242,26 @@ impl CommitMetadata {
             CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None)?,
         ))
     }
+
+    /// Marks this `CommitMetadata` as having a protocol change. Test-only.
+    ///
+    /// Copies the existing protocol into the `new_protocol` field to simulate an ALTER TABLE
+    /// that changes the protocol.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_protocol_change(mut self) -> Self {
+        self.new_protocol = Some(self.protocol.clone());
+        self
+    }
+
+    /// Marks this `CommitMetadata` as having a metadata change. Test-only.
+    ///
+    /// Copies the existing metadata into the `new_metadata` field to simulate an ALTER TABLE
+    /// that changes the metadata.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_metadata_change(mut self) -> Self {
+        self.new_metadata = Some(self.metadata.clone());
+        self
+    }
 }
 
 /// `CommitResponse` is the result of committing a transaction via a catalog. The committer uses
