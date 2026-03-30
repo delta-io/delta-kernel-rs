@@ -1037,6 +1037,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "compliance_suite"
+version = "0.20.0"
+dependencies = [
+ "delta_kernel",
+ "paste",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "const-random"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

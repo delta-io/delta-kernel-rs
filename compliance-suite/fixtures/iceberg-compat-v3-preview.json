@@ -1,0 +1,232 @@
+{
+  "$schemas": {
+    "simple_int_mapped": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        }
+      ]
+    },
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "iceberg_v3_preview_no_cm_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["domainMetadata", "rowTracking", "icebergCompatV3-preview"]
+    },
+    "iceberg_v3_preview_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": [
+        "columnMapping",
+        "domainMetadata",
+        "rowTracking",
+        "icebergCompatV3-preview"
+      ]
+    },
+    "iceberg_v3_preview_and_v1_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": [
+        "columnMapping",
+        "domainMetadata",
+        "rowTracking",
+        "icebergCompatV1",
+        "icebergCompatV3-preview"
+      ]
+    },
+    "iceberg_v3_preview_with_dv_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": [
+        "columnMapping",
+        "domainMetadata",
+        "rowTracking",
+        "icebergCompatV3-preview",
+        "deletionVectors"
+      ]
+    },
+    "iceberg_v3_preview_and_v2_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": [
+        "columnMapping",
+        "domainMetadata",
+        "rowTracking",
+        "icebergCompatV2",
+        "icebergCompatV3-preview"
+      ]
+    }
+  },
+  "$notes": {
+    "mutual_exclusion": "icebergCompatV1 and icebergCompatV2 are mutually exclusive. V2 explicitly requires that V1 is not active (feature absent or property not true). icebergCompatV3-preview additionally requires that both V1 and V2 are not active.",
+    "v3_preview_rfc": "icebergCompatV3 is an RFC-stage feature (protocol_rfcs/iceberg-compat-v3.md) not yet ratified in PROTOCOL.md. Cases use the feature name icebergCompatV3-preview per the pre-ratification naming convention. RFC requirements: CM name or id mode, Row Tracking enabled on the table, ICv1 and ICv2 not active. Unlike ICv1 and ICv2, DV is explicitly permitted to be both supported and active under ICv3."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "iceberg_v3_preview_create_table_2_7_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV3-preview",
+      "description": "Creating a (2,7)+[columnMapping,domainMetadata,rowTracking,icebergCompatV3-preview] table with columnMapping mode=name, delta.enableIcebergCompatV3=true, and row tracking enabled succeeds.",
+      "note": "$notes.v3_preview_rfc",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v3_preview_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV3": "true",
+            "delta.enableRowTracking": "true",
+            "delta.rowTracking.materializedRowIdColumnName": "_row_id",
+            "delta.rowTracking.materializedRowCommitVersionColumnName": "_commit_version"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "iceberg_v3_preview_supported_not_active_create_table_succeeds",
+      "feature": "icebergCompatV3-preview",
+      "flavor": "supported_not_active",
+      "description": "Creating a (2,7)+[columnMapping,domainMetadata,rowTracking,icebergCompatV3-preview] table without delta.enableIcebergCompatV3=true succeeds; icebergCompatV3-preview writer requirements only apply when the feature is active.",
+      "note": "$notes.v3_preview_rfc",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v3_preview_2_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "iceberg_v3_preview_create_table_2_7_with_deletion_vectors_active_succeeds",
+      "feature": "icebergCompatV3-preview",
+      "description": "Creating a (2,7)+[columnMapping,domainMetadata,rowTracking,icebergCompatV3-preview,deletionVectors] table with delta.enableIcebergCompatV3=true and delta.enableDeletionVectors=true succeeds; unlike ICv1 and ICv2, ICv3 explicitly permits deletion vectors to be both supported and active.",
+      "note": "$notes.v3_preview_rfc",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v3_preview_with_dv_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV3": "true",
+            "delta.enableRowTracking": "true",
+            "delta.rowTracking.materializedRowIdColumnName": "_row_id",
+            "delta.rowTracking.materializedRowCommitVersionColumnName": "_commit_version",
+            "delta.enableDeletionVectors": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 4,
+      "name": "iceberg_v3_preview_create_table_2_7_missing_column_mapping_fails",
+      "feature": "icebergCompatV3-preview",
+      "flavor": "missing_dependency",
+      "description": "Creating a (2,7)+[domainMetadata,rowTracking,icebergCompatV3-preview] table without columnMapping in writerFeatures and delta.enableIcebergCompatV3=true fails; the RFC requires columnMapping to be co-listed.",
+      "note": "$notes.v3_preview_rfc",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v3_preview_no_cm_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableIcebergCompatV3": "true"}
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 5,
+      "name": "iceberg_v3_preview_create_table_2_7_column_mapping_not_active_fails",
+      "feature": "icebergCompatV3-preview",
+      "description": "Creating a (2,7)+[columnMapping,domainMetadata,rowTracking,icebergCompatV3-preview] table with delta.enableIcebergCompatV3=true but no columnMapping mode set fails; the RFC requires columnMapping to be active in name or id mode when ICv3 is active.",
+      "note": "$notes.v3_preview_rfc",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v3_preview_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableIcebergCompatV3": "true"}
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 6,
+      "name": "iceberg_v3_preview_create_table_2_7_row_tracking_not_enabled_fails",
+      "feature": "icebergCompatV3-preview",
+      "description": "Creating a (2,7)+[columnMapping,domainMetadata,rowTracking,icebergCompatV3-preview] table with delta.enableIcebergCompatV3=true but without delta.enableRowTracking=true fails; the RFC requires Row Tracking to be enabled when ICv3 is active.",
+      "note": "$notes.v3_preview_rfc",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v3_preview_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV3": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 7,
+      "name": "iceberg_v3_preview_and_v2_create_table_both_active_fails",
+      "feature": "icebergCompatV3-preview",
+      "description": "Creating a table with both delta.enableIcebergCompatV2=true and delta.enableIcebergCompatV3=true fails; the RFC requires ICv2 to not be active when ICv3 is active.",
+      "note": "$notes.mutual_exclusion",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v3_preview_and_v2_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true",
+            "delta.enableIcebergCompatV3": "true",
+            "delta.enableRowTracking": "true",
+            "delta.rowTracking.materializedRowIdColumnName": "_row_id",
+            "delta.rowTracking.materializedRowCommitVersionColumnName": "_commit_version"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 8,
+      "name": "iceberg_v3_preview_and_v1_create_table_both_active_fails",
+      "feature": "icebergCompatV3-preview",
+      "description": "Creating a table with both delta.enableIcebergCompatV1=true and delta.enableIcebergCompatV3=true fails; the RFC requires ICv1 to not be active when ICv3 is active.",
+      "note": "$notes.mutual_exclusion",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v3_preview_and_v1_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV1": "true",
+            "delta.enableIcebergCompatV3": "true",
+            "delta.enableRowTracking": "true",
+            "delta.rowTracking.materializedRowIdColumnName": "_row_id",
+            "delta.rowTracking.materializedRowCommitVersionColumnName": "_commit_version"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    }
+  ]
+}

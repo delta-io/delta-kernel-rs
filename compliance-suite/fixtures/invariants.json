@@ -1,0 +1,276 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    },
+    "cm_invariants_id_gt_0": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {
+            "delta.columnMapping.id": 1,
+            "delta.columnMapping.physicalName": "col-1",
+            "delta.invariants": "{\"expression\":{\"expression\":\"id > 0\"}}"
+          }
+        }
+      ]
+    },
+    "invariants_id_gt_0": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.invariants": "{\"expression\":{\"expression\":\"id > 0\"}}"}
+        }
+      ]
+    }
+  },
+  "$protocols": {
+    "legacy_1_2": {"minReaderVersion": 1, "minWriterVersion": 2},
+    "modern_3_7_cm_invariants": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["columnMapping"],
+      "writerFeatures": ["columnMapping", "invariants"]
+    },
+    "legacy_1_1": {"minReaderVersion": 1, "minWriterVersion": 1},
+    "modern_3_7_invariants": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["invariants"]
+    },
+    "modern_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    }
+  },
+  "$notes": {
+    "orphan_writer_feature": "At (3,7), the spec requires activation properties to be paired with the corresponding feature in writerFeatures. Writing an activation property for a feature absent from writerFeatures is invalid committed state."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "invariants_create_table_3_7_no_feature_listed_with_schema_fails",
+      "flavor": "orphan",
+      "feature": "invariants",
+      "description": "Creating a (3,7) table with a delta.invariants column but invariants absent from writerFeatures fails.",
+      "note": "$notes.orphan_writer_feature",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7",
+        "metadata": {"schemaString": "$schemas.invariants_id_gt_0"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 2,
+      "name": "invariants_empty_commit_3_7_no_feature_listed_with_schema_fails",
+      "flavor": "orphan",
+      "feature": "invariants",
+      "description": "Appending to a (3,7) table with a delta.invariants column but invariants absent from writerFeatures fails.",
+      "note": "$notes.orphan_writer_feature",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {"metaData": {"schemaString": "$schemas.invariants_id_gt_0"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 3,
+      "name": "invariants_create_table_1_2_with_invariant_schema",
+      "flavor": "legacy",
+      "feature": "invariants",
+      "description": "Creating a (1,2) table with a delta.invariants column metadata succeeds: invariants are always supported at writer version 2.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_2",
+        "metadata": {"schemaString": "$schemas.invariants_id_gt_0"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 4,
+      "name": "invariants_empty_commit_1_2_with_invariant_schema",
+      "flavor": "legacy",
+      "feature": "invariants",
+      "description": "Appending to a (1,2) table with a delta.invariants column succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_2"},
+          {"metaData": {"schemaString": "$schemas.invariants_id_gt_0"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "invariants_read_snapshot_3_7_no_feature_listed_with_schema",
+      "flavor": "orphan",
+      "feature": "invariants",
+      "description": "Reading a (3,7) table with a delta.invariants column but invariants absent from writerFeatures succeeds; invariants is writer-only.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {"metaData": {"schemaString": "$schemas.invariants_id_gt_0"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "invariants_supported_not_active_empty_commit_succeeds",
+      "flavor": "supported_not_active",
+      "feature": "invariants",
+      "description": "Appending to a (3,7)+[invariants] table without any delta.invariants column metadata succeeds: the feature is supported but not active.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_invariants"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "invariants_supported_active_empty_commit_succeeds",
+      "feature": "invariants",
+      "description": "Appending to a (3,7)+[invariants] table with a delta.invariants column succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_invariants"},
+          {"metaData": {"schemaString": "$schemas.invariants_id_gt_0"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 8,
+      "name": "invariants_create_table_1_1_succeeds",
+      "flavor": "orphan",
+      "feature": "invariants",
+      "description": "Creating a (1,1) table with a delta.invariants column succeeds; writer version 1 predates the invariants feature and the spec does not prohibit committing the metadata.",
+      "note": "$errata.orphan_feature_metadata",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_1",
+        "metadata": {"schemaString": "$schemas.invariants_id_gt_0"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 9,
+      "name": "invariants_create_table_3_7_feature_listed_succeeds",
+      "feature": "invariants",
+      "description": "Creating a (3,7)+[invariants] table with a delta.invariants column succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_invariants",
+        "metadata": {"schemaString": "$schemas.invariants_id_gt_0"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 10,
+      "name": "invariants_read_snapshot_1_2_with_schema_succeeds",
+      "flavor": "legacy",
+      "feature": "invariants",
+      "description": "Reading a (1,2) table with a delta.invariants column succeeds: invariants is writer-only and does not affect the reader.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_2"},
+          {"metaData": {"schemaString": "$schemas.invariants_id_gt_0"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 11,
+      "name": "invariants_read_snapshot_3_7_feature_listed_succeeds",
+      "feature": "invariants",
+      "description": "Reading a (3,7)+[invariants] table with a delta.invariants column succeeds: invariants is writer-only.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_invariants"},
+          {"metaData": {"schemaString": "$schemas.invariants_id_gt_0"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "invariants_supported_not_active_read_snapshot_succeeds",
+      "flavor": "supported_not_active",
+      "feature": "invariants",
+      "description": "Reading a (3,7)+[invariants] table without any delta.invariants column succeeds: the feature is supported but not active.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_invariants"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 13,
+      "name": "invariants_cm_create_table_3_7_both_features_listed_succeeds",
+      "feature": "invariants",
+      "description": "Creating a (3,7)+[columnMapping,invariants] table with a CM-annotated column with a delta.invariants expression succeeds.",
+      "note": "$errata.sql_expression_cm_name_resolution",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_cm_invariants",
+        "metadata": {
+          "schemaString": "$schemas.cm_invariants_id_gt_0",
+          "configuration": {
+            "delta.columnMapping.mode": "id",
+            "delta.columnMapping.maxColumnId": "1"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 14,
+      "name": "invariants_cm_empty_commit_3_7_both_features_listed_succeeds",
+      "feature": "invariants",
+      "description": "Appending to a (3,7)+[columnMapping,invariants] table with a CM-annotated column with a delta.invariants expression succeeds.",
+      "note": "$errata.sql_expression_cm_name_resolution",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_cm_invariants"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.cm_invariants_id_gt_0",
+              "configuration": {
+                "delta.columnMapping.mode": "id",
+                "delta.columnMapping.maxColumnId": "1"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    }
+  ]
+}

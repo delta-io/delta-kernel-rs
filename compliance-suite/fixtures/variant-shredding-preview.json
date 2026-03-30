@@ -1,0 +1,87 @@
+{
+  "$schemas": {
+    "variant_col": {
+      "type": "struct",
+      "fields": [{"name": "v", "type": "variant", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "variant_shredding_with_preview_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["variantType-preview", "variantShredding-preview"],
+      "writerFeatures": ["variantType-preview", "variantShredding-preview"]
+    },
+    "variant_shredding_with_variant_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["variantType", "variantShredding-preview"],
+      "writerFeatures": ["variantType", "variantShredding-preview"]
+    }
+  },
+  "$notes": {
+    "variantShredding_unreleased": "variantShredding is referenced in PROTOCOL.md only as a forward reference ('will be introduced later as a separate variantShredding table feature'). It is not yet ratified. variantShredding-preview is the only currently available name; cases for it record observed behavior."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "variant_shredding_preview_create_table_3_7_without_variant_type_fails",
+      "feature": "variantShredding-preview",
+      "flavor": "missing_dependency",
+      "description": "Creating a (3,7)+[variantShredding-preview] table without variantType in the feature lists fails; the RFC requires variantType in both readerFeatures and writerFeatures as a prerequisite for variantShredding.",
+      "note": "$notes.variantShredding_unreleased",
+      "operation": {
+        "type": "create_table",
+        "protocol": {
+          "minReaderVersion": 3,
+          "minWriterVersion": 7,
+          "readerFeatures": ["variantShredding-preview"],
+          "writerFeatures": ["variantShredding-preview"]
+        },
+        "metadata": {"schemaString": "$schemas.variant_col"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 2,
+      "name": "variant_shredding_preview_create_table_3_7_with_variant_type_succeeds",
+      "feature": "variantShredding-preview",
+      "description": "Creating a (3,7)+[variantType, variantShredding-preview] table with a variant column succeeds.",
+      "note": "$notes.variantShredding_unreleased",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.variant_shredding_with_variant_3_7",
+        "metadata": {"schemaString": "$schemas.variant_col"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "variant_shredding_preview_read_snapshot_3_7_with_variant_type_succeeds",
+      "feature": "variantShredding-preview",
+      "description": "Reading a (3,7)+[variantType, variantShredding-preview] table with a variant column succeeds.",
+      "note": "$notes.variantShredding_unreleased",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.variant_shredding_with_variant_3_7"},
+          {"metaData": {"schemaString": "$schemas.variant_col"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 4,
+      "name": "variant_shredding_preview_create_table_3_7_with_variant_type_preview_succeeds",
+      "feature": "variantShredding-preview",
+      "description": "Creating a (3,7)+[variantType-preview, variantShredding-preview] table with a variant column succeeds.",
+      "note": "$notes.variantShredding_unreleased",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.variant_shredding_with_preview_3_7",
+        "metadata": {"schemaString": "$schemas.variant_col"}
+      },
+      "expected_outcome": "success"
+    }
+  ]
+}

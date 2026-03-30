@@ -1,0 +1,319 @@
+{
+  "$schemas": {
+    "simple_int_mapped": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}
+        }
+      ]
+    },
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "column_mapping_only_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["columnMapping"]
+    },
+    "iceberg_v1_and_v2_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["columnMapping", "icebergCompatV1", "icebergCompatV2"]
+    },
+    "iceberg_v2_with_dv_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["columnMapping", "icebergCompatV2", "deletionVectors"]
+    },
+    "iceberg_v2_no_cm_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["icebergCompatV2"]
+    },
+    "iceberg_v2_2_7": {
+      "minReaderVersion": 2,
+      "minWriterVersion": 7,
+      "writerFeatures": ["columnMapping", "icebergCompatV2"]
+    },
+    "iceberg_v2_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["columnMapping"],
+      "writerFeatures": ["columnMapping", "icebergCompatV2"]
+    }
+  },
+  "$notes": {
+    "v2_activation": "icebergCompatV2 is activated by two conditions: (1) the feature listed in writerFeatures, and (2) the table property delta.enableIcebergCompatV2=true. When active, columnMapping must be in name or id mode, and deletion vectors must not be active (DV may be supported but inactive \u2014 contrast with ICv1, which forbids DV support entirely). ICv2 also requires nested field identifiers for arrays and maps, int64 timestamps, and columns from an allowed-types list.",
+    "mutual_exclusion": "icebergCompatV1 and icebergCompatV2 are mutually exclusive. V2 explicitly requires that V1 is not active (feature absent or property not true). icebergCompatV3-preview additionally requires that both V1 and V2 are not active."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "iceberg_v2_create_table_2_7_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV2",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV2] table with columnMapping mode=name and delta.enableIcebergCompatV2=true succeeds.",
+      "note": "$notes.v2_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "iceberg_v2_create_table_2_7_no_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV2",
+      "flavor": "orphan",
+      "description": "Creating a (2,7)+[columnMapping] table with delta.enableIcebergCompatV2=true but icebergCompatV2 absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.column_mapping_only_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "iceberg_v2_read_snapshot_2_7_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV2",
+      "description": "Reading a (2,7)+[columnMapping,icebergCompatV2] table with delta.enableIcebergCompatV2=true succeeds; icebergCompatV2 is writer-only.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.iceberg_v2_2_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int_mapped",
+              "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.enableIcebergCompatV2": "true"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 4,
+      "name": "iceberg_v2_empty_commit_2_7_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV2",
+      "description": "Appending to a (2,7)+[columnMapping,icebergCompatV2] table with delta.enableIcebergCompatV2=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.iceberg_v2_2_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int_mapped",
+              "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.enableIcebergCompatV2": "true"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "iceberg_v2_supported_not_active_create_table_succeeds",
+      "feature": "icebergCompatV2",
+      "flavor": "supported_not_active",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV2] table without delta.enableIcebergCompatV2=true succeeds; icebergCompatV2 writer requirements only apply when the feature is active.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_2_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "iceberg_v2_create_table_3_7_feature_listed_property_true_succeeds",
+      "feature": "icebergCompatV2",
+      "description": "Creating a (3,7)+[columnMapping in readerFeatures and writerFeatures, icebergCompatV2] table with columnMapping mode=name and delta.enableIcebergCompatV2=true succeeds; (3,7) with columnMapping in readerFeatures is a valid alternate protocol path.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "iceberg_v2_create_table_2_7_missing_column_mapping_fails",
+      "feature": "icebergCompatV2",
+      "flavor": "missing_dependency",
+      "description": "Creating a (2,7)+[icebergCompatV2] table without columnMapping in writerFeatures and delta.enableIcebergCompatV2=true fails; the spec requires columnMapping to be co-listed.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_no_cm_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableIcebergCompatV2": "true"}
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 8,
+      "name": "iceberg_v2_create_table_2_7_column_mapping_not_active_fails",
+      "feature": "icebergCompatV2",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV2] table with delta.enableIcebergCompatV2=true but no columnMapping mode set fails; the spec requires columnMapping to be active in name or id mode when ICv2 is active.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableIcebergCompatV2": "true"}
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 9,
+      "name": "iceberg_v2_create_table_2_7_with_deletion_vectors_active_fails",
+      "feature": "icebergCompatV2",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV2,deletionVectors] table with delta.enableIcebergCompatV2=true and delta.enableDeletionVectors=true fails; ICv2 requires deletion vectors not be active.",
+      "note": "$errata.iceberg_compat_dv_restriction",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_with_dv_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true",
+            "delta.enableDeletionVectors": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 10,
+      "name": "iceberg_v2_create_table_2_7_with_deletion_vectors_supported_not_active_succeeds",
+      "feature": "icebergCompatV2",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV2,deletionVectors] table with delta.enableIcebergCompatV2=true but without delta.enableDeletionVectors=true succeeds; ICv2 only prohibits deletion vectors being active, not merely supported. This is the key behavioral difference from ICv1, which prohibits deletion vectors being present in the protocol at all.",
+      "note": "$errata.iceberg_compat_dv_restriction",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v2_with_dv_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 11,
+      "name": "iceberg_v1_and_v2_feature_listed_only_v2_property_true_succeeds",
+      "feature": "icebergCompatV2",
+      "description": "Creating a (2,7)+[columnMapping,icebergCompatV1,icebergCompatV2] table with only delta.enableIcebergCompatV2=true (ICv1 not active) succeeds; the mutual exclusion check fires on ICv1 being active, not merely supported.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_and_v2_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "iceberg_v1_and_v2_create_table_both_active_fails",
+      "feature": "icebergCompatV2",
+      "description": "Creating a table with both delta.enableIcebergCompatV1=true and delta.enableIcebergCompatV2=true fails; V2 requires that V1 is not active.",
+      "note": "$notes.mutual_exclusion",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.iceberg_v1_and_v2_2_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int_mapped",
+          "configuration": {
+            "delta.columnMapping.mode": "name",
+            "delta.enableIcebergCompatV1": "true",
+            "delta.enableIcebergCompatV2": "true"
+          }
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 13,
+      "name": "iceberg_v2_read_snapshot_2_7_no_feature_listed_with_property_succeeds",
+      "feature": "icebergCompatV2",
+      "flavor": "orphan",
+      "description": "Reading a (2,7)+[columnMapping] table with delta.enableIcebergCompatV2=true but icebergCompatV2 absent from writerFeatures succeeds; icebergCompatV2 is writer-only and the orphan property has no effect on reads.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.column_mapping_only_2_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int_mapped",
+              "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.enableIcebergCompatV2": "true"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 14,
+      "name": "iceberg_v2_empty_commit_2_7_without_column_mapping_protocol_fails",
+      "feature": "icebergCompatV2",
+      "flavor": "missing_dependency",
+      "description": "Appending to a (2,7)+[icebergCompatV2] table without columnMapping in writerFeatures fails; the spec requires columnMapping to be co-listed whenever icebergCompatV2 is listed.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.iceberg_v2_no_cm_2_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    }
+  ]
+}
