@@ -85,7 +85,7 @@ echo "Parsed filter: ${FILTER:-<none>}"
 #    "changes" baseline files are preserved across the branch switch.
 # ---------------------------------------------------------------------------
 git fetch origin -- "$BASE_REF"
-git checkout -- "$BASE_REF"
+git checkout FETCH_HEAD
 (cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline base "$FILTER")
 
 # ---------------------------------------------------------------------------
