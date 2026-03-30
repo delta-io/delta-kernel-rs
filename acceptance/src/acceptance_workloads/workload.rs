@@ -39,26 +39,6 @@ pub struct SnapshotResult {
     pub metadata: Metadata,
 }
 
-/// Applies row-level filtering to batches using a predicate.
-///
-/// Kernel's scan only does data skipping (file-level filtering based on stats).
-/// This function applies the predicate to filter individual rows within each batch.
-fn filter_batches_with_predicate(
-    batches: Vec<RecordBatch>,
-    predicate: Option<&Predicate>,
-) -> DeltaResult<Vec<RecordBatch>> {
-    match predicate {
-        Some(pred) => batches
-            .into_iter()
-            .map(|batch| {
-                let mask = evaluate_predicate(pred, &batch, false)?;
-                filter_record_batch(&batch, &mask).map_err(Error::from)
-            })
-            .try_collect(),
-        None => Ok(batches),
-    }
-}
-
 /// Build a snapshot with optional time travel.
 fn build_snapshot(
     engine: &dyn Engine,
@@ -122,6 +102,27 @@ pub fn execute_read_workload(
         schema: schema.clone(),
         row_count,
     })
+}
+
+/// Filter record batches using a predicate expression.
+fn filter_batches_with_predicate(
+    batches: Vec<RecordBatch>,
+    predicate: Option<&Predicate>,
+) -> DeltaResult<Vec<RecordBatch>> {
+    let Some(predicate) = predicate else {
+        return Ok(batches);
+    };
+
+    batches
+        .into_iter()
+        .map(|batch| {
+            // Evaluate predicate to get boolean selection array
+            let selection = evaluate_predicate(predicate, &batch, false)?;
+            // Filter the batch using the selection
+            let filtered = filter_record_batch(&batch, &selection)?;
+            Ok(filtered)
+        })
+        .collect()
 }
 
 /// Execute a snapshot workload (for metadata validation).
