@@ -6,13 +6,12 @@
 //!
 //! Engine and snapshot construction is handled internally based on `TableInfo`:
 //! - Catalog-managed tables (`catalog_managed_info` set): credentials from `UC_WORKSPACE`/`UC_TOKEN`
-//!   env vars, snapshot via `UCCatalog::load_snapshot`
+//!   env vars, snapshot via `UCKernelClient::load_snapshot`
 //! - S3 tables (`table_path` with s3:// scheme): credentials from `AWS_*` env vars
 //! - Local tables: local filesystem engine
 
 use crate::models::{
     ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
-    TimeTravel,
 };
 use crate::predicate_parser::parse_predicate;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
@@ -22,9 +21,11 @@ use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::Engine;
 use delta_kernel::Snapshot;
 use object_store::local::LocalFileSystem;
-use uc_catalog::UCCatalog;
-use uc_client::prelude::*;
-use uc_client::ClientConfig;
+use delta_kernel_unity_catalog::UCKernelClient;
+use unity_catalog_delta_client_api::{Error as UcApiError, Operation};
+use unity_catalog_delta_rest_client::{
+    ClientConfig, Error as UcRestError, UCClient, UCCommitsRestClient,
+};
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -51,7 +52,7 @@ fn build_engine(
     )
 }
 
-/// Pre-resolved catalog state for building snapshots via UCCatalog.
+/// Pre-resolved catalog state for building snapshots via UCKernelClient.
 struct ResolvedUcInfo {
     table_id: String,
     table_uri: String,
@@ -64,7 +65,7 @@ impl ResolvedUcInfo {
         engine: &dyn Engine,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
-        let catalog = UCCatalog::new(&self.commits_client);
+        let catalog = UCKernelClient::new(&self.commits_client);
         runtime
             .block_on(catalog.load_snapshot(&self.table_id, &self.table_uri, engine))
             .map_err(|e| format!("Catalog snapshot failed: {e}").into())
@@ -88,18 +89,19 @@ fn resolve_uc_info(
     let client = UCClient::new(config.clone())?;
     let commits_client = UCCommitsRestClient::new(config)?;
 
-    let (table_id, table_uri, aws) = runtime.block_on(async {
+    let result: Result<_, UcRestError> = runtime.block_on(async {
         let table = client.get_table(&cm.table_name).await?;
         let creds = client
             .get_credentials(&table.table_id, Operation::Read)
             .await?;
         let aws = creds
             .aws_temp_credentials
-            .ok_or(uc_client::Error::UnsupportedOperation(
+            .ok_or(UcApiError::UnsupportedOperation(
                 "Credential vending returned no AWS credentials".into(),
             ))?;
-        Ok::<_, uc_client::Error>((table.table_id, table.storage_location, aws))
-    })?;
+        Ok((table.table_id, table.storage_location, aws))
+    });
+    let (table_id, table_uri, aws) = result?;
 
     let table_url = Url::parse(&table_uri)?;
     let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string());
@@ -369,7 +371,7 @@ impl SnapshotConstructionRunner {
             engine,
             runtime,
             url: table_info.resolved_table_root(),
-            version: snapshot_spec.version,
+            version,
             uc,
             name,
         })
