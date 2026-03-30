@@ -949,18 +949,19 @@ impl Snapshot {
 
     /// Get the timestamp for this snapshot's version, in milliseconds since the Unix epoch.
     ///
-    /// When In-Commit Timestamps (ICT) are enabled, returns the ICT value from the commit's
-    /// `CommitInfo` action. Otherwise, falls back to the filesystem last-modified time of the
-    /// latest commit file.
+    /// When In-Commit Timestamps (ICT) are enabled, returns the In-Commit Timestamp value.
+    /// Otherwise, falls back to the filesystem last-modified time of the latest commit file.
+    /// Note that without ICT, the returned timestamp is best-effort and may not be monotonically
+    /// increasing (e.g., after table copies or across writers with clock skew).
     ///
-    /// # Returns
-    /// - `Ok(timestamp)` - the timestamp in milliseconds since the Unix epoch
-    /// - `Err(...)` - commit file is missing, ICT state is invalid, or the ICT value cannot be read
+    /// Returns an error if the commit file is missing, the ICT configuration is invalid, or the
+    /// ICT value cannot be read.
     ///
     /// See also [`get_in_commit_timestamp`] for ICT-only semantics.
     ///
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
     #[allow(unused)]
+    #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
     #[internal_api]
     pub(crate) fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         match self
@@ -2124,14 +2125,14 @@ mod tests {
     #[case::ict_enabled(true)]
     #[case::ict_disabled(false)]
     #[tokio::test]
-    async fn test_get_timestamp_no_commit(#[case] ict_enabled: bool) -> DeltaResult<()> {
+    async fn test_get_timestamp_errors_when_commit_file_missing(#[case] ict_enabled: bool) -> DeltaResult<()> {
         let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         let ict_config = ict_enabled.then(|| ("0".to_string(), "1612345678".to_string()));
         let reader_version = ict_enabled.then_some(TABLE_FEATURES_MIN_READER_VERSION as u32);
-        let commit_data = [
+        let commit_data = vec![
             create_protocol(ict_enabled, reader_version),
             create_metadata(
                 Some("test_id"),
@@ -2141,7 +2142,7 @@ mod tests {
                 false,
             ),
         ];
-        commit(url.as_str(), store.as_ref(), 0, commit_data.to_vec()).await;
+        commit(url.as_str(), store.as_ref(), 0, commit_data).await;
 
         // Build snapshot to get table configuration
         let snapshot = Snapshot::builder_for(url.as_str())
