@@ -28,9 +28,10 @@ use crate::table_features::{
     SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    TableProperties, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
+    TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
-    ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS, SET_TRANSACTION_RETENTION_DURATION,
+    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS,
+    ENABLE_TYPE_WIDENING, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -56,6 +57,12 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // specifying clustering columns via `with_data_layout()`.
     TableFeature::DeletionVectors,
     TableFeature::V2Checkpoint,
+    // Simple protocol-only features: enabling these only updates the protocol action.
+    // They can also be auto-enabled via their enablement properties (e.g. delta.appendOnly=true)
+    // through `maybe_auto_enable_property_driven_features`.
+    TableFeature::AppendOnly,
+    TableFeature::ChangeDataFeed,
+    TableFeature::TypeWidening,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
@@ -71,8 +78,11 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // Checkpoint stats format properties
     CHECKPOINT_WRITE_STATS_AS_JSON,
     CHECKPOINT_WRITE_STATS_AS_STRUCT,
-    // DeletionVectors enablement property: auto-enables the DeletionVectors feature
+    // Property-driven feature enablement properties
     ENABLE_DELETION_VECTORS,
+    ENABLE_CHANGE_DATA_FEED,
+    ENABLE_TYPE_WIDENING,
+    APPEND_ONLY,
     // Set transaction retention duration: controls expiration of txn identifiers
     SET_TRANSACTION_RETENTION_DURATION,
 ];
@@ -719,6 +729,7 @@ mod tests {
     use super::*;
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, StructField, StructType};
+    use crate::table_properties::ENABLE_ICEBERG_COMPAT_V1;
     use crate::utils::test_utils::assert_result_error_with_message;
 
     fn test_schema() -> SchemaRef {
@@ -830,14 +841,12 @@ mod tests {
 
     #[test]
     fn test_validate_unsupported_properties() {
-        use crate::table_properties::{APPEND_ONLY, ENABLE_CHANGE_DATA_FEED};
-
         // Delta properties not on allow list are rejected
         let mut properties = HashMap::new();
-        properties.insert(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string());
+        properties.insert(ENABLE_ICEBERG_COMPAT_V1.to_string(), "true".to_string());
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
-            "Setting delta property 'delta.enableChangeDataFeed' is not supported",
+            "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
         );
 
         // Feature signals for features not in ALLOWED_DELTA_FEATURES are rejected
@@ -863,10 +872,10 @@ mod tests {
         // Mixed properties with unsupported delta property are rejected
         let mut properties = HashMap::new();
         properties.insert("myapp.version".to_string(), "1.0".to_string());
-        properties.insert(APPEND_ONLY.to_string(), "true".to_string());
+        properties.insert(ENABLE_ICEBERG_COMPAT_V1.to_string(), "true".to_string());
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
-            "Setting delta property 'delta.appendOnly' is not supported",
+            "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
         );
     }
 
