@@ -29,9 +29,9 @@ use delta_kernel::{DeltaResult, Snapshot};
 use test_utils::insert_data;
 use url::Url;
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Scenario 11: incremental update replays only new tail commits
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /// `Snapshot::builder_from(existing)` starts from an existing snapshot and replays only the
 /// commits that arrived after it. The JSON reads reflect only the new tail commit, not the full
