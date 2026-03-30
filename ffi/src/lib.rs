@@ -1005,6 +1005,27 @@ pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
     snapshot.version()
 }
 
+/// Get the timestamp of the specified snapshot in milliseconds since the Unix epoch.
+///
+/// When In-Commit Timestamps (ICT) are enabled, returns the ICT value from the commit's
+/// `CommitInfo` action. Otherwise, falls back to the filesystem last-modified time of
+/// the latest commit file.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles.
+#[no_mangle]
+pub unsafe extern "C" fn get_timestamp_snapshot(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<i64> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .get_timestamp(engine_ref.engine().as_ref())
+        .into_extern_result(&engine_ref)
+}
+
 /// Get the logical schema of the specified snapshot
 ///
 /// # Safety
@@ -1313,6 +1334,95 @@ mod tests {
 
         unsafe { free_snapshot(snapshot1) }
         unsafe { free_snapshot(snapshot2) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_timestamp_snapshot_no_ict() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        let ts = unsafe {
+            ok_or_panic(get_timestamp_snapshot(
+                snap.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        };
+        // ICT is not enabled -- falls back to commit file mtime (written "now").
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let two_days_ms = 2 * 24 * 60 * 60 * 1000_i64;
+        assert!(
+            (now_ms - two_days_ms..=now_ms + two_days_ms).contains(&ts),
+            "timestamp {ts} not within 2 days of now {now_ms}"
+        );
+
+        unsafe { free_snapshot(snap) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_timestamp_snapshot_ict_enabled() -> Result<(), Box<dyn std::error::Error>> {
+        use delta_kernel::schema::StructType;
+        use test_utils::create_table;
+        use url::Url;
+
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
+
+        // create_table with "inCommitTimestamp" in writer_features sets up:
+        //   - protocol v3.7 with writerFeatures=["inCommitTimestamp"]
+        //   - metadata config: enableInCommitTimestamps=true, enablement version/timestamp
+        //   - commitInfo with inCommitTimestamp=1612345678 (fixed test value)
+        create_table(
+            storage.clone(),
+            Url::parse(table_root)?,
+            Arc::new(StructType::try_new([]).unwrap()),
+            &[],
+            true,
+            vec![],
+            vec!["inCommitTimestamp"],
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        let ts = unsafe {
+            ok_or_panic(get_timestamp_snapshot(
+                snap.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        };
+        assert_eq!(ts, 1612345678_i64);
+
+        unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
         Ok(())
     }
