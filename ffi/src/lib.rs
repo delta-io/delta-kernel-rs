@@ -1234,9 +1234,8 @@ mod tests {
     use test_utils::add_staged_commit;
     use test_utils::{
         actions_to_string, actions_to_string_partitioned, actions_to_string_with_metadata,
-        add_commit, TestAction, METADATA, METADATA_WITH_TABLE_PROPERTIES,
+        add_commit, create_table, TestAction, METADATA, METADATA_WITH_TABLE_PROPERTIES,
     };
-    use test_utils::create_table;
     use url::Url;
 
     #[no_mangle]
