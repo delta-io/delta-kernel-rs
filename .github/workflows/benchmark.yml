@@ -80,4 +80,5 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ needs.run-benchmark.outputs.pr_number }}
-        run: gh pr comment "$PR_NUMBER" --body-file /tmp/bench-comment.md
+          REPO: ${{ github.repository }}
+        run: gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/bench-comment.md
