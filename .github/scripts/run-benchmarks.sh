@@ -10,11 +10,6 @@
 #   COMMENT    - the /bench PR comment body
 #   BASE_REF   - base branch ref (e.g. "main")
 #   HEAD_SHA   - full SHA of the PR head commit
-#
-# Usage for local testing:
-#   COMMENT="/bench --tags base --filter snapshotConstruction" \
-#   BASE_REF=main HEAD_SHA=abc1234 \
-#   bash .github/scripts/run-benchmarks.sh
 
 set -euo pipefail
 shopt -s extglob
@@ -23,7 +18,7 @@ shopt -s extglob
 # 1. Parse the /bench comment
 #    Syntax: /bench [--tags <csv>] [--filter <regex>]
 #      --tags    sets BENCH_TAGS (comma-separated tag list); defaults to "base"
-#                when the comment is bare /bench with no recognized args
+#                when the comment is just /bench
 #      --filter  Criterion name regex passed as a positional arg to cargo bench
 # ---------------------------------------------------------------------------
 
@@ -60,8 +55,7 @@ fi
 TAGS=$(printf '%s' "$TAGS" | tr -cd 'a-zA-Z0-9,_-')
 
 # Sanitize filter: strip control characters only, preserving regex metacharacters.
-# The filter is always passed double-quoted to cargo bench so no shell injection
-# is possible from the preserved printable characters.
+# The filter is always passed double-quoted to cargo bench.
 FILTER=$(printf '%s' "$FILTER" | tr -d '\000-\037\177')
 
 # If nothing was parsed (unrecognized tokens, typos, missing values), default to "base"
@@ -174,10 +168,15 @@ COMPARISON=$((cd benchmarks && critcmp base changes) | python3 /tmp/parse_critcm
 #    and posts it as a PR comment using a step that holds GH_TOKEN.
 # ---------------------------------------------------------------------------
 SHORT_SHA="${HEAD_SHA:0:7}"
+
+SUMMARY=""
+[[ -n "$TAGS" ]]   && SUMMARY="tags: \`${TAGS}\`"
+[[ -n "$FILTER" ]] && SUMMARY+="${SUMMARY:+ | }filter: \`${FILTER}\`"
+
 {
   echo "## Benchmark for ${SHORT_SHA}"
   echo "<details>"
-  echo "<summary>Click to view benchmark</summary>"
+  echo "<summary>${SUMMARY}</summary>"
   echo ""
   echo "$COMPARISON"
   echo ""

@@ -50,8 +50,6 @@ jobs:
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Run benchmarks
-        # GH_TOKEN is intentionally absent from this step's env. Untrusted PR code
-        # (build.rs, bench files) must not have access to the write-capable token.
         # The comment is posted in the post-comment job after this job completes.
         env:
           COMMENT:  ${{ github.event.comment.body }}
