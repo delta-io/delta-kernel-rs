@@ -1169,6 +1169,22 @@ fn test_create_many_wrong_field_count_returns_error() {
 }
 
 #[test]
+fn test_create_many_wrong_field_type_returns_error() {
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("a", KernelDataType::INTEGER),
+        StructField::nullable("b", KernelDataType::STRING),
+    ]));
+    // Row 1 passes a Long where an Integer is expected for field "a"
+    let good_row: &[Scalar] = &[1.into(), "x".into()];
+    let bad_row: &[Scalar] = &[1i64.into(), "y".into()];
+    let handler = ArrowEvaluationHandler;
+    assert_result_error_with_message(
+        handler.create_many(schema, &[good_row, bad_row]),
+        "Row 1, field 'a' (expected type integer, got long): Invalid expression evaluation: Invalid builder for long",
+    );
+}
+
+#[test]
 fn test_create_many_single_row_matches_create_one() {
     // create_many with one row should produce the same result as create_one
     let values: &[Scalar] = &[

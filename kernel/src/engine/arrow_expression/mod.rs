@@ -303,9 +303,18 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             .map(|field| array::make_builder(field.data_type(), num_rows))
             .collect();
 
+        let fields: Vec<_> = schema.fields().collect();
         for (col_idx, builder) in builders.iter_mut().enumerate() {
-            for row in rows.iter() {
-                row[col_idx].append_to(builder.as_mut(), 1)?;
+            let field_name = fields[col_idx].name();
+            for (row_idx, row) in rows.iter().enumerate() {
+                row[col_idx].append_to(builder.as_mut(), 1).map_err(|e| {
+                    Error::generic(format!(
+                        "Row {row_idx}, field '{field_name}' \
+                            (expected type {}, got {}): {e}",
+                        fields[col_idx].data_type(),
+                        row[col_idx].data_type()
+                    ))
+                })?;
             }
         }
 
