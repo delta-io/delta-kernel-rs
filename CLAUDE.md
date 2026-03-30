@@ -173,9 +173,8 @@ Keep this list updated when new protocol features are added to kernel.
 ## Code Style / Documentation
 
 - Line width is 100 characters. Wrap comments and string literals at 100, not 80.
-- In prose comments and doc comments, use `--` as an em-dash separator (e.g. `// foo -- bar`,
-  not `// foo == bar`). `==` is reserved for visual section dividers (e.g. `// === Helpers ===`
-  or `// ============`).
+- Use `==` only as a visual section divider in comments (e.g. `// === Helpers ===` or
+  `// ============`), not as a prose separator.
 - MUST include doc comments for all public functions, structs, enums, and methods.
 - MUST document function parameters, return values, and errors.
 - Keep comments up-to-date with code changes.
