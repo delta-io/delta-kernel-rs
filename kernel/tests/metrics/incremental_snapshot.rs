@@ -14,8 +14,8 @@
 //!   counts reflect the new checkpoint and its tail, not the prior snapshot's history.
 //!
 //! The tests below cover the incremental (no new checkpoint) path. The full-rebuild path
-//! (new checkpoint found) is exercised by the same code paths as scenario 2/3 in
-//! `snapshot_load.rs` and does not require separate coverage here.
+//! (new checkpoint found) is exercised by the same code paths as scenario 2/3 in `snapshot_load.rs`
+//! and does not require separate coverage here.
 
 use super::{measuring_engine, simple_schema};
 use std::sync::Arc;
@@ -33,13 +33,12 @@ use url::Url;
 // Scenario 11: incremental update replays only new tail commits
 // ---------------------------------------------------------------------------
 
-/// `Snapshot::builder_from(existing)` starts from an existing snapshot and replays
-/// only the commits that arrived after it. The JSON reads reflect only the new tail
-/// commit, not the full history -- demonstrating that incremental updates are cheaper
-/// than a full `builder_for` rebuild.
+/// `Snapshot::builder_from(existing)` starts from an existing snapshot and replays only the
+/// commits that arrived after it. The JSON reads reflect only the new tail commit, not the full
+/// history -- demonstrating that incremental updates are cheaper than a full `builder_for` rebuild.
 ///
-/// `LogSegmentLoaded` is emitted with the net-new commit count (commits after the
-/// existing snapshot's version), not the full listing total.
+/// `LogSegmentLoaded` is emitted with the net-new commit count (commits after the existing
+/// snapshot's version), not the full listing total.
 ///
 /// Table setup: v0 (create) + v1 (insert) = existing snapshot at v1; v2 (insert) added
 /// after. The incremental build from v1 sees only v2.
