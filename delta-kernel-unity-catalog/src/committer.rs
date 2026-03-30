@@ -34,8 +34,7 @@ impl<C: CommitClient> UCCommitter<C> {
     }
 
     /// Commit version 0 (table creation). Writes the version 0 commit file directly to the
-    /// published commit path. The connector is responsible for calling the UC create table API
-    /// afterward.
+    /// published commit path.
     fn commit_version_0(
         &self,
         engine: &dyn Engine,
