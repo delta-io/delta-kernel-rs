@@ -82,19 +82,11 @@ impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
             }
         }
 
-        // we always get back the latest version from commits response, and pass that in to
-        // kernel's Snapshot builder. basically, load_table for the latest version always looks
-        // like a time travel query since we know the latest version ahead of time.
-        //
-        // note there is a weird edge case: if the table was just created it will return
-        // latest_table_version = -1, but the 0.json will exist in the _delta_log.
-        let version: Version = match version {
-            Some(v) => v,
-            None => match commits.latest_table_version {
-                -1 => 0,
-                i => i.try_into()?,
-            },
-        };
+        // The catalog always returns the latest ratified version. Use it as the
+        // max_catalog_version for snapshot building, and as the effective version when no
+        // explicit time-travel version is requested.
+        let catalog_version: Version = commits.latest_table_version.try_into()?;
+        let version: Version = version.unwrap_or(catalog_version);
 
         // consume the UC Commit and hand back a delta_kernel LogPath
         let mut table_url = Url::parse(&table_uri)?;
@@ -127,7 +119,7 @@ impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
 
         Snapshot::builder_for(table_url)
             .at_version(version)
-            .with_max_catalog_version(version)
+            .with_max_catalog_version(catalog_version)
             .with_log_tail(commits)
             .build(engine)
             .map_err(|e| e.into())

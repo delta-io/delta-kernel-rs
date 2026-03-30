@@ -9,6 +9,8 @@ use crate::log_segment::LogSegment;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::snapshot::SnapshotRef;
 use crate::utils::try_parse_uri;
+#[cfg(feature = "catalog-managed")]
+use crate::{path::LogPathFileType, utils::require};
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
 /// Builder for creating [`Snapshot`] instances.
@@ -81,11 +83,19 @@ impl SnapshotBuilder {
     }
 
     /// Set the maximum catalog-ratified version. When set, the snapshot will not load versions
-    /// beyond this limit, even if later commits exist on the filesystem. This ensures the
-    /// catalog remains the source of truth for catalog-managed tables.
+    /// beyond this limit, even if later commits exist on the filesystem. This ensures the catalog
+    /// remains the source of truth for catalog-managed tables.
     ///
-    /// When no explicit time-travel version is set via [`at_version`], the `max_catalog_version`
-    /// is used as the effective target version.
+    /// When no explicit time-travel version is set via [`at_version`], `max_catalog_version` is
+    /// used as the effective target version. When time-travelling to an explicit version,
+    /// `max_catalog_version` must still be set for catalog-managed tables -- the requested version
+    /// must not exceed it.
+    ///
+    /// # Log tail requirements
+    ///
+    /// When `max_catalog_version` is set and no time-travel version is specified, the last entry in
+    /// the log tail must match `max_catalog_version` exactly. When time-travelling, the last log
+    /// tail entry must be >= the requested version.
     ///
     /// [`at_version`]: Self::at_version
     #[cfg(feature = "catalog-managed")]
@@ -134,9 +144,11 @@ impl SnapshotBuilder {
 
         // Pre-build validations for catalog-managed tables
         #[cfg(feature = "catalog-managed")]
-        Self::validate_catalog_version_static(version, max_catalog_version, &log_tail)?;
+        Self::validate_catalog_managed_build_inputs(version, max_catalog_version, &log_tail)?;
 
-        // Compute effective version: use time-travel version, or fall back to max_catalog_version
+        // Use time-travel version if set, otherwise fall back to max_catalog_version. Passing this
+        // as the version to LogSegment::for_snapshot does NOT skip the _last_checkpoint hint --
+        // the hint is still used when its version <= effective_version.
         let effective_version = version.or(max_catalog_version);
 
         let result = if let Some(table_root) = table_root {
@@ -178,7 +190,7 @@ impl SnapshotBuilder {
         // Post-build validations for catalog-managed tables
         #[cfg(feature = "catalog-managed")]
         let result = result.and_then(|snapshot| {
-            Self::validate_catalog_managed_consistency(&snapshot, max_catalog_version)?;
+            Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
             Ok(snapshot)
         });
 
@@ -221,17 +233,13 @@ impl SnapshotBuilder {
 
     /// Pre-build validations for catalog-managed table invariants.
     #[cfg(feature = "catalog-managed")]
-    fn validate_catalog_version_static(
+    fn validate_catalog_managed_build_inputs(
         version: Option<Version>,
         max_catalog_version: Option<Version>,
         log_tail: &[crate::path::ParsedLogPath],
     ) -> DeltaResult<()> {
-        use crate::path::LogPathFileType;
-        use crate::utils::require;
-
-        // TODO: If inline commits (or any other catalog commits) are
-        // ever supported, change this method to check if there are any
-        // catalog commits
+        // TODO: If inline commits (or any other catalog commits) are ever supported, change this
+        // method to check if there are any catalog commits.
         let has_catalog_commits = log_tail
             .iter()
             .any(|p| p.file_type == LogPathFileType::StagedCommit);
@@ -286,12 +294,10 @@ impl SnapshotBuilder {
     /// Post-build validation: catalog-managed tables must have max_catalog_version, and
     /// non-catalog-managed tables must not.
     #[cfg(feature = "catalog-managed")]
-    fn validate_catalog_managed_consistency(
+    fn validate_catalog_managed_build_result(
         snapshot: &SnapshotRef,
         max_catalog_version: Option<Version>,
     ) -> DeltaResult<()> {
-        use crate::utils::require;
-
         let is_catalog_managed = snapshot.table_configuration().is_catalog_managed();
 
         require!(
@@ -323,17 +329,17 @@ impl SnapshotBuilder {
     }
 
     fn target_version_str(&self) -> String {
-        let version_str = self
-            .version
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "LATEST".into());
-
         #[cfg(feature = "catalog-managed")]
         if let Some(mcv) = self.max_catalog_version {
-            return format!("{version_str} (max_catalog_version={mcv})");
+            return match self.version {
+                Some(v) => format!("{v} (max_catalog_version={mcv})"),
+                None => format!("{mcv} (max_catalog_version)"),
+            };
         }
 
-        version_str
+        self.version
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "LATEST".into())
     }
 }
 
@@ -351,6 +357,7 @@ mod tests {
     use crate::utils::test_utils::CapturingReporter;
     use itertools::Itertools;
     use serde_json::json;
+    use test_utils::{actions_to_string, add_commit, TestAction};
 
     use super::*;
 
@@ -365,70 +372,24 @@ mod tests {
         (engine, store, table_root)
     }
 
-    // TODO (#1990): update this function to properly store the table at table_root
-    async fn create_table(store: &Arc<DynObjectStore>, _table_root: String) -> DeltaResult<()> {
-        let protocol = json!({
-            "minReaderVersion": 3,
-            "minWriterVersion": 7,
-            "readerFeatures": ["catalogManaged"],
-            "writerFeatures": ["catalogManaged"],
-        });
-
-        let metadata = json!({
-            "id": "test-table-id",
-            "format": {
-                "provider": "parquet",
-                "options": {}
-            },
-            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
-            "partitionColumns": [],
-            "configuration": {},
-            "createdTime": 1587968585495i64
-        });
-
-        // Create commit 0 with protocol and metadata
-        let commit0 = [
-            json!({
-                "protocol": protocol
-            }),
-            json!({
-                "metaData": metadata
-            }),
-        ];
-
-        // Write commit 0
-        let commit0_data = commit0
-            .iter()
-            .map(ToString::to_string)
-            .collect_vec()
-            .join("\n");
-
-        let path = Path::from(format!("_delta_log/{:020}.json", 0).as_str());
-        store.put(&path, commit0_data.into()).await?;
-
-        // Create commit 1 with a single addFile action
-        let commit1 = [json!({
-            "add": {
-                "path": "part-00000-test.parquet",
-                "partitionValues": {},
-                "size": 1024,
-                "modificationTime": 1587968586000i64,
-                "dataChange": true,
-                "stats": null,
-                "tags": null
-            }
-        })];
-
-        // Write commit 1
-        let commit1_data = commit1
-            .iter()
-            .map(ToString::to_string)
-            .collect_vec()
-            .join("\n");
-
-        let path = Path::from(format!("_delta_log/{:020}.json", 1).as_str());
-        store.put(&path, commit1_data.into()).await?;
-
+    async fn create_table(
+        store: &Arc<DynObjectStore>,
+        table_root: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        add_commit(
+            table_root,
+            store.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+        add_commit(
+            table_root,
+            store.as_ref(),
+            1,
+            actions_to_string(vec![TestAction::Add("part-00000-test.parquet".into())]),
+        )
+        .await?;
         Ok(())
     }
 
@@ -436,16 +397,13 @@ mod tests {
     async fn test_snapshot_builder() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         let engine = engine.as_ref();
-        create_table(&store, table_root.clone()).await?;
+        create_table(&store, &table_root).await?;
 
-        let snapshot = SnapshotBuilder::new_for(table_root.clone())
-            .with_max_catalog_version(1)
-            .build(engine)?;
+        let snapshot = SnapshotBuilder::new_for(table_root.clone()).build(engine)?;
         assert_eq!(snapshot.version(), 1);
 
         let snapshot = SnapshotBuilder::new_for(table_root.clone())
             .at_version(0)
-            .with_max_catalog_version(1)
             .build(engine)?;
         assert_eq!(snapshot.version(), 0);
 
@@ -584,12 +542,11 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_update_from_existing_emits_metric() {
         let (engine, store, table_root, reporter) = setup_test_with_reporter();
-        create_table(&store, table_root.clone()).await.unwrap();
+        create_table(&store, &table_root).await.unwrap();
 
         // Build an initial snapshot at version 0
         let base = SnapshotBuilder::new_for(table_root)
             .at_version(0)
-            .with_max_catalog_version(1)
             .build(engine.as_ref())
             .unwrap();
 
@@ -598,7 +555,6 @@ mod tests {
 
         // Incrementally update to the latest version via the else branch
         let updated = SnapshotBuilder::new_from(base)
-            .with_max_catalog_version(1)
             .build(engine.as_ref())
             .unwrap();
         assert_eq!(updated.version(), 1);
@@ -624,11 +580,10 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_update_to_earlier_version_emits_failed_metric() {
         let (engine, store, table_root, reporter) = setup_test_with_reporter();
-        create_table(&store, table_root.clone()).await.unwrap();
+        create_table(&store, &table_root).await.unwrap();
 
         // Build a snapshot at version 1
         let base = SnapshotBuilder::new_for(table_root)
-            .with_max_catalog_version(1)
             .build(engine.as_ref())
             .unwrap();
         assert_eq!(base.version(), 1);
@@ -657,10 +612,9 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_completed_duration_includes_log_segment_loading() {
         let (engine, store, table_root, reporter) = setup_test_with_reporter();
-        create_table(&store, table_root.clone()).await.unwrap();
+        create_table(&store, &table_root).await.unwrap();
 
         let _snapshot = SnapshotBuilder::new_for(table_root)
-            .with_max_catalog_version(1)
             .build(engine.as_ref())
             .unwrap();
 
@@ -724,11 +678,14 @@ mod tests {
             LogPath::try_new(file_meta).expect("Failed to create LogPath")
         }
 
-        #[test_log::test(tokio::test)]
-        async fn test_staged_commits_without_max_catalog_version_errors(
-        ) -> Result<(), Box<dyn std::error::Error>> {
+        /// Creates an in-memory engine, store, and table root with an initial catalog-managed
+        /// commit at version 0 (protocol + metadata).
+        async fn setup_catalog_managed_test() -> (
+            Arc<DefaultEngine<TokioBackgroundExecutor>>,
+            Arc<DynObjectStore>,
+            String,
+        ) {
             let (engine, store, table_root) = setup_test();
-
             let actions = vec![TestAction::Metadata];
             add_commit(
                 &table_root,
@@ -736,7 +693,15 @@ mod tests {
                 0,
                 actions_to_string_catalog_managed(actions),
             )
-            .await?;
+            .await
+            .expect("Failed to write initial catalog-managed commit");
+            (engine, store, table_root)
+        }
+
+        #[test_log::test(tokio::test)]
+        async fn test_staged_commits_without_max_catalog_version_errors(
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let (engine, store, table_root) = setup_catalog_managed_test().await;
             let path1 =
                 add_staged_commit(&table_root, store.as_ref(), 1, String::from("{}")).await?;
 
@@ -757,16 +722,7 @@ mod tests {
         #[test_log::test(tokio::test)]
         async fn test_version_exceeds_max_catalog_version_errors(
         ) -> Result<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_test();
-
-            let actions = vec![TestAction::Metadata];
-            add_commit(
-                &table_root,
-                store.as_ref(),
-                0,
-                actions_to_string_catalog_managed(actions),
-            )
-            .await?;
+            let (engine, _store, table_root) = setup_catalog_managed_test().await;
 
             let result = SnapshotBuilder::new_for(table_root)
                 .at_version(5)
@@ -784,16 +740,7 @@ mod tests {
         #[test_log::test(tokio::test)]
         async fn test_log_tail_last_version_mismatch_errors(
         ) -> Result<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_test();
-
-            let actions = vec![TestAction::Metadata];
-            add_commit(
-                &table_root,
-                store.as_ref(),
-                0,
-                actions_to_string_catalog_managed(actions),
-            )
-            .await?;
+            let (engine, store, table_root) = setup_catalog_managed_test().await;
             let actions = vec![TestAction::Add("file_1.parquet".to_string())];
             add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
             let actions = vec![TestAction::Add("file_2.parquet".to_string())];
@@ -821,16 +768,7 @@ mod tests {
         #[test_log::test(tokio::test)]
         async fn test_catalog_managed_table_without_max_catalog_version_errors(
         ) -> Result<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_test();
-
-            let actions = vec![TestAction::Metadata];
-            add_commit(
-                &table_root,
-                store.as_ref(),
-                0,
-                actions_to_string_catalog_managed(actions),
-            )
-            .await?;
+            let (engine, _store, table_root) = setup_catalog_managed_test().await;
 
             let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
 
@@ -865,17 +803,7 @@ mod tests {
         #[test_log::test(tokio::test)]
         async fn test_max_catalog_version_as_effective_version(
         ) -> Result<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_test();
-
-            // Create catalog-managed table with commits 0, 1, 2
-            let actions = vec![TestAction::Metadata];
-            add_commit(
-                &table_root,
-                store.as_ref(),
-                0,
-                actions_to_string_catalog_managed(actions),
-            )
-            .await?;
+            let (engine, store, table_root) = setup_catalog_managed_test().await;
             let actions = vec![TestAction::Add("file_1.parquet".to_string())];
             add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
             let actions = vec![TestAction::Add("file_2.parquet".to_string())];
@@ -893,17 +821,7 @@ mod tests {
         #[test_log::test(tokio::test)]
         async fn test_time_travel_with_max_catalog_version(
         ) -> Result<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_test();
-
-            // Create catalog-managed table with commits 0, 1
-            let actions = vec![TestAction::Metadata];
-            add_commit(
-                &table_root,
-                store.as_ref(),
-                0,
-                actions_to_string_catalog_managed(actions),
-            )
-            .await?;
+            let (engine, store, table_root) = setup_catalog_managed_test().await;
             let actions = vec![TestAction::Add("file_1.parquet".to_string())];
             add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
 

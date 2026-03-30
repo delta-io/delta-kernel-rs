@@ -50,7 +50,13 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     // _delta_log/_staged_commits/1.uuid.json // add an unused staged commit at version 1
     // _delta_log/_staged_commits/2.uuid.json
     let actions = vec![TestAction::Metadata];
-    add_commit(table_root, storage.as_ref(), 0, actions_to_string_catalog_managed(actions)).await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_catalog_managed(actions),
+    )
+    .await?;
     let path1 = add_staged_commit(table_root, storage.as_ref(), 1, String::from("{}")).await?;
     let _ = add_staged_commit(table_root, storage.as_ref(), 1, String::from("{}")).await?;
     let path2 = add_staged_commit(table_root, storage.as_ref(), 2, String::from("{}")).await?;
@@ -245,7 +251,13 @@ async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::
 
     // commits 0, 1, 2 in storage (catalog-managed)
     let actions = vec![TestAction::Metadata];
-    add_commit(table_root, storage.as_ref(), 0, actions_to_string_catalog_managed(actions)).await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_catalog_managed(actions),
+    )
+    .await?;
     let actions = vec![TestAction::Add("file_1.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 1, actions_to_string(actions)).await?;
     let actions = vec![TestAction::Add("file_2.parquet".to_string())];
