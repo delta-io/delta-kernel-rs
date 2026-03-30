@@ -855,25 +855,6 @@ async fn backward_scan_log_tail_defines_latest_version() {
 
 // ===== find_complete_checkpoint_version direct unit tests (other cases already covered by tests above) =====
 
-fn zero_size_checkpoint_files() -> Vec<ParsedLogPath> {
-    // Commits v0..=5 plus a zero-size checkpoint at v3. make_parsed_log_path_with_source
-    // always sets a non-zero size; override here to simulate a corrupt/empty checkpoint
-    // file and exercise the size > 0 guard.
-    let mut files: Vec<ParsedLogPath> = (0..=5)
-        .map(|v| {
-            make_parsed_log_path_with_source(v, LogPathFileType::Commit, CommitSource::Filesystem)
-        })
-        .collect();
-    let mut cp = make_parsed_log_path_with_source(
-        3,
-        LogPathFileType::SinglePartCheckpoint,
-        CommitSource::Filesystem,
-    );
-    cp.location.size = 0;
-    files.push(cp);
-    files
-}
-
 fn incomplete_then_complete_files() -> Vec<ParsedLogPath> {
     // Commits v0..=10, an incomplete checkpoint at v5 (1 of 3 parts), and a complete
     // checkpoint at v10. find_complete_checkpoint_version must continue past the failed group
@@ -926,8 +907,6 @@ fn two_complete_checkpoints_files() -> Vec<ParsedLogPath> {
         (0u64..=5).map(|v| make_parsed_log_path_with_source(v, LogPathFileType::Commit, CommitSource::Filesystem)).collect(),
         None
     )]
-// Commits v0..=5 plus a zero-size (corrupt) checkpoint at v3
-#[case::zero_size_checkpoint(zero_size_checkpoint_files(), None)]
 // Commits v0..=10, incomplete checkpoint at v5, complete checkpoint at v10
 #[case::incomplete_then_complete(incomplete_then_complete_files(), Some(10))]
 // Commits v0..=10, complete checkpoint at v5 and v10: must return v10 (latest)

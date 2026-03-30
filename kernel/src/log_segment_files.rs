@@ -133,7 +133,7 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
 fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option<Version> {
     ascending_files
         .iter()
-        .filter(|f| f.is_checkpoint() && f.location.size > 0)
+        .filter(|f| f.is_checkpoint())
         .chunk_by(|f| f.version)
         .into_iter()
         .filter_map(|(version, parts)| {
