@@ -728,10 +728,6 @@ impl CreateTableTransactionBuilder {
         #[cfg(feature = "catalog-managed")]
         maybe_enable_ict_for_catalog_managed(&mut validated)?;
 
-        // Create Protocol action with table features support
-        let protocol =
-            Protocol::try_new_modern(validated.reader_features, validated.writer_features)?;
-
         // Create Metadata action with filtered properties (feature signals removed)
         // Use effective_schema which includes column mapping annotations if enabled
         // Partition columns are validated to be top-level, so each ColumnName has
@@ -1403,6 +1399,7 @@ mod tests {
         assert!(validate_partition_columns(&schema, &columns).is_ok());
     }
 
+    #[cfg(feature = "catalog-managed")]
     #[test]
     fn test_catalog_managed_auto_enables_ict() {
         let properties = HashMap::from([(
@@ -1426,6 +1423,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "catalog-managed")]
     #[test]
     fn test_catalog_managed_with_ict_true_succeeds() {
         let properties = HashMap::from([
