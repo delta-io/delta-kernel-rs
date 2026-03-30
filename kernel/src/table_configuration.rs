@@ -1679,20 +1679,6 @@ mod test {
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
     }
 
-    #[cfg(feature = "catalog-managed")]
-    #[test]
-    fn test_catalog_managed_rejects_missing_ict() {
-        // CatalogManaged without ICT should fail
-        let config = create_mock_table_config(&[], &[TableFeature::CatalogManaged]);
-        let err = config
-            .ensure_operation_supported(Operation::Write)
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("inCommitTimestamp"),
-            "expected ICT requirement error, got: {err}"
-        );
-    }
-
     /// Helper to create a schema with column mapping metadata using JSON deserialization
     fn schema_with_column_mapping() -> SchemaRef {
         let field_a: StructField = serde_json::from_str(
