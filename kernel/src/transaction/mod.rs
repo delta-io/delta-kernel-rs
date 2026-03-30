@@ -340,21 +340,27 @@ impl<S> Transaction<S> {
         let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
 
         // Step 3: Generate Protocol and Metadata actions for create-table
-        let (protocol_action, metadata_action) = if self.is_create_table() {
-            let table_config = self.read_snapshot.table_configuration();
-            let protocol = table_config.protocol().clone();
-            let metadata = table_config.metadata().clone();
+        let (protocol_action, metadata_action, new_protocol, new_metadata) =
+            if self.is_create_table() {
+                let table_config = self.read_snapshot.table_configuration();
+                let protocol = table_config.protocol().clone();
+                let metadata = table_config.metadata().clone();
 
-            let protocol_schema = get_commit_schema().project(&[PROTOCOL_NAME])?;
-            let metadata_schema = get_commit_schema().project(&[METADATA_NAME])?;
+                let protocol_schema = get_commit_schema().project(&[PROTOCOL_NAME])?;
+                let metadata_schema = get_commit_schema().project(&[METADATA_NAME])?;
 
-            let protocol_data = protocol.into_engine_data(protocol_schema, engine)?;
-            let metadata_data = metadata.into_engine_data(metadata_schema, engine)?;
+                let protocol_data = protocol.clone().into_engine_data(protocol_schema, engine)?;
+                let metadata_data = metadata.clone().into_engine_data(metadata_schema, engine)?;
 
-            (Some(protocol_data), Some(metadata_data))
-        } else {
-            (None, None)
-        };
+                (
+                    Some(protocol_data),
+                    Some(metadata_data),
+                    Some(protocol),
+                    Some(metadata),
+                )
+            } else {
+                (None, None, None, None)
+            };
 
         // Step 4: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
         let commit_version = self.get_commit_version();
@@ -418,12 +424,11 @@ impl<S> Transaction<S> {
                 .log_segment()
                 .listed
                 .max_published_version,
-            // Note: these reflect the read snapshot's protocol/metadata. For create-table,
-            // these match the committed state. When protocol/metadata evolution is added,
-            // this must be updated to carry the post-commit state instead.
             table_config.protocol().clone(),
             table_config.metadata().clone(),
-        );
+        )
+        .with_new_protocol_and_metadata(new_protocol, new_metadata)
+        .with_domain_metadata_changes(dm_changes.clone());
         match self
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)

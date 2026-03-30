@@ -4,9 +4,10 @@ use std::collections::HashMap;
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
-use crate::actions::{Metadata, Protocol};
+use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::path::LogRoot;
 use crate::{DeltaResult, Version};
 
@@ -28,8 +29,18 @@ pub struct CommitMetadata {
     pub(crate) version: Version,
     pub(crate) in_commit_timestamp: i64,
     pub(crate) max_published_version: Option<Version>,
+    /// The read snapshot's protocol (table state when the transaction started).
     pub(crate) protocol: Protocol,
+    /// The read snapshot's metadata (table state when the transaction started).
     pub(crate) metadata: Metadata,
+    /// New protocol being committed, if the transaction changes it (e.g. create-table or future
+    /// ALTER TABLE). `None` for normal commits that don't modify the protocol.
+    pub(crate) new_protocol: Option<Protocol>,
+    /// New metadata being committed, if the transaction changes it (e.g. create-table or future
+    /// ALTER TABLE). `None` for normal commits that don't modify metadata.
+    pub(crate) new_metadata: Option<Metadata>,
+    /// Domain metadata actions in this commit (additions and removals).
+    pub(crate) domain_metadata_changes: Vec<DomainMetadata>,
 }
 
 impl CommitMetadata {
@@ -48,7 +59,31 @@ impl CommitMetadata {
             max_published_version,
             protocol,
             metadata,
+            new_protocol: None,
+            new_metadata: None,
+            domain_metadata_changes: vec![],
         }
+    }
+
+    /// Set the new protocol and metadata being committed (for create-table or ALTER TABLE).
+    #[internal_api]
+    pub(crate) fn with_new_protocol_and_metadata(
+        mut self,
+        new_protocol: Option<Protocol>,
+        new_metadata: Option<Metadata>,
+    ) -> Self {
+        self.new_protocol = new_protocol;
+        self.new_metadata = new_metadata;
+        self
+    }
+
+    /// Set the domain metadata changes for this commit.
+    pub(crate) fn with_domain_metadata_changes(
+        mut self,
+        domain_metadata_changes: Vec<DomainMetadata>,
+    ) -> Self {
+        self.domain_metadata_changes = domain_metadata_changes;
+        self
     }
 
     /// The commit path is the absolute path (e.g. s3://bucket/table/_delta_log/{version}.json) to
@@ -126,6 +161,25 @@ impl CommitMetadata {
         self.metadata.configuration()
     }
 
+    /// Returns `true` if this commit changes the table's protocol (e.g. create-table or future
+    /// ALTER TABLE). Returns `false` for normal commits that don't modify the protocol.
+    pub fn has_protocol_change(&self) -> bool {
+        self.new_protocol.is_some()
+    }
+
+    /// Returns `true` if this commit changes the table's metadata (e.g. create-table or future
+    /// ALTER TABLE). Returns `false` for normal commits that don't modify metadata.
+    pub fn has_metadata_change(&self) -> bool {
+        self.new_metadata.is_some()
+    }
+
+    /// Returns `true` if this commit includes a domain metadata change for the given domain name.
+    pub fn has_domain_metadata_change(&self, domain: &str) -> bool {
+        self.domain_metadata_changes
+            .iter()
+            .any(|dm| dm.domain() == domain)
+    }
+
     /// Creates a new `CommitMetadata` for the given `table_root` and `version`. Test-only.
     ///
     /// Uses a default modern protocol (empty features) and empty metadata.
@@ -137,6 +191,7 @@ impl CommitMetadata {
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new())?;
         Ok(Self::new(log_root, version, 0, None, protocol, metadata))
     }
+
 }
 
 /// `CommitResponse` is the result of committing a transaction via a catalog. The committer uses
