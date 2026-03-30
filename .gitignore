@@ -20,6 +20,7 @@ integration-tests/Cargo.lock
 
 # Project
 acceptance/tests/dat/
+acceptance/workloads/
 ffi/examples/read-table/build
 ffi/examples/visit-expression/build
 /build

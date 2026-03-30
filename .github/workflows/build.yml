@@ -244,7 +244,7 @@ jobs:
           cargo build --locked
           popd
           pushd ffi
-          cargo build --locked --features default-engine-rustls,test-ffi,tracing,uc-catalog
+          cargo build --locked --features default-engine-rustls,test-ffi,tracing,delta-kernel-unity-catalog
           popd
       - name: build and run read-table test
         run: |
@@ -262,9 +262,9 @@ jobs:
           cmake ..
           make
           make test
-      - name: build and run uc-catalog-ffi test
+      - name: build and run delta-kernel-unity-catalog-ffi test
         run: |
-          pushd ffi/examples/uc-catalog-example
+          pushd ffi/examples/delta-kernel-unity-catalog-example
           mkdir build
           pushd build
           cmake ..
@@ -290,7 +290,7 @@ jobs:
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --locked --features default-engine-rustls,uc-catalog --partition slice:${{ matrix.partition }}/3
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog --partition slice:${{ matrix.partition }}/3
 
   coverage:
     runs-on: ubuntu-latest

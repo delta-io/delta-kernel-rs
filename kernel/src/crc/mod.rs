@@ -10,6 +10,7 @@
 #![allow(unreachable_pub)]
 
 mod delta;
+mod file_size_histogram;
 mod file_stats;
 mod lazy;
 mod reader;
@@ -17,6 +18,8 @@ mod writer;
 
 #[allow(unused)]
 pub(crate) use delta::CrcDelta;
+#[allow(unused)]
+pub(crate) use file_size_histogram::FileSizeHistogram;
 pub(crate) use file_stats::FileStats;
 #[allow(unused)]
 pub(crate) use file_stats::FileStatsDelta;
@@ -212,22 +215,6 @@ where
         None => serializer.serialize_none(),
         Some(m) => m.values().collect::<Vec<_>>().serialize(serializer),
     }
-}
-
-/// The [FileSizeHistogram] object represents a histogram tracking file counts and total bytes
-/// across different size ranges.
-///
-/// [FileSizeHistogram]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#file-size-histogram-schema
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileSizeHistogram {
-    /// A sorted array of bin boundaries where each element represents the start of a bin
-    /// (inclusive) and the next element represents the end of the bin (exclusive). The first
-    /// element must be 0.
-    pub(crate) sorted_bin_boundaries: Vec<i64>,
-    /// Count of files in each bin. Length must match `sorted_bin_boundaries`.
-    pub(crate) file_counts: Vec<i64>,
-    /// Total bytes of files in each bin. Length must match `sorted_bin_boundaries`.
-    pub(crate) total_bytes: Vec<i64>,
 }
 
 /// The [DeletedRecordCountsHistogram] object represents a histogram tracking the distribution of
