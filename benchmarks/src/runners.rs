@@ -20,8 +20,8 @@ use delta_kernel::expressions::PredicateRef;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::Engine;
 use delta_kernel::Snapshot;
-use object_store::local::LocalFileSystem;
 use delta_kernel_unity_catalog::UCKernelClient;
+use object_store::local::LocalFileSystem;
 use unity_catalog_delta_client_api::{Error as UcApiError, Operation};
 use unity_catalog_delta_rest_client::{
     ClientConfig, Error as UcRestError, UCClient, UCCommitsRestClient,
@@ -35,10 +35,6 @@ pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
     fn name(&self) -> &str;
 }
-
-// ---------------------------------------------------------------------------
-// Engine + snapshot setup (resolved from TableInfo + env vars)
-// ---------------------------------------------------------------------------
 
 fn build_engine(
     store: Arc<dyn object_store::ObjectStore>,
@@ -104,7 +100,7 @@ fn resolve_uc_info(
     let (table_id, table_uri, aws) = result?;
 
     let table_url = Url::parse(&table_uri)?;
-    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string());
+    let region = std::env::var("AWS_REGION").map_err(|_| "AWS_REGION required")?;
     let options = [
         ("region", region.as_str()),
         ("access_key_id", aws.access_key_id.as_str()),
@@ -131,10 +127,8 @@ fn resolve_engine(
     match url.scheme() {
         "s3" | "s3a" => {
             let env = |k: &str| std::env::var(k).ok();
-            let mut opts: Vec<(&str, String)> = vec![(
-                "region",
-                env("AWS_REGION").unwrap_or_else(|| "us-west-2".into()),
-            )];
+            let region = env("AWS_REGION").ok_or("AWS_REGION required for S3 tables")?;
+            let mut opts: Vec<(&str, String)> = vec![("region", region)];
             if let Some(v) = env("AWS_ACCESS_KEY_ID") {
                 opts.push(("access_key_id", v));
             }
@@ -154,10 +148,6 @@ fn resolve_engine(
         .into()),
     }
 }
-
-// ---------------------------------------------------------------------------
-// ReadMetadataRunner
-// ---------------------------------------------------------------------------
 
 pub struct ReadMetadataRunner {
     snapshot: Arc<Snapshot>,
@@ -327,10 +317,6 @@ pub fn create_read_runner(
         ReadOperation::ReadData => Err("ReadDataRunner not yet implemented".into()),
     }
 }
-
-// ---------------------------------------------------------------------------
-// SnapshotConstructionRunner
-// ---------------------------------------------------------------------------
 
 pub struct SnapshotConstructionRunner {
     engine: Arc<dyn Engine>,
