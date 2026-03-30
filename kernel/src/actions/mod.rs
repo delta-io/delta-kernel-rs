@@ -1001,6 +1001,9 @@ impl DomainMetadata {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
+    use super::set_transaction::is_set_txn_expired;
     use super::*;
     use crate::{
         arrow::{
@@ -1016,7 +1019,6 @@ mod tests {
         utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
-    use rstest::rstest;
     use serde_json::json;
 
     // duplicated
@@ -1063,6 +1065,24 @@ mod tests {
             ArrowDataType::Utf8,
             nullable_values,
         ))
+    }
+
+    #[rstest]
+    #[case::no_expiration_configured(None, Some(1000), false)]
+    #[case::null_last_updated_never_expires(Some(5000), None, false)]
+    #[case::both_none(None, None, false)]
+    #[case::last_updated_before_expiration(Some(2000), Some(1000), true)]
+    #[case::last_updated_at_expiration(Some(1000), Some(1000), true)]
+    #[case::last_updated_after_expiration(Some(2000), Some(3000), false)]
+    fn test_is_set_txn_expired(
+        #[case] expiration_timestamp: Option<i64>,
+        #[case] last_updated: Option<i64>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            is_set_txn_expired(expiration_timestamp, last_updated),
+            expected
+        );
     }
 
     #[test]

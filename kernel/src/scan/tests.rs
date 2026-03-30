@@ -20,6 +20,10 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
+use crate::{
+    Engine, EvaluationHandler, FileDataReadResultIterator, FileMeta, JsonHandler, ParquetFooter,
+    ParquetHandler, PredicateRef, StorageHandler,
+};
 use crate::{EngineData, Snapshot};
 
 use super::*;
@@ -1419,4 +1423,94 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
             "Should still have numRecords"
         );
     }
+}
+
+/// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.
+/// Used to simulate a buggy connector that drops all data for a file.
+struct EmptyParquetHandler;
+
+impl ParquetHandler for EmptyParquetHandler {
+    fn read_parquet_files(
+        &self,
+        _files: &[FileMeta],
+        _schema: crate::schema::SchemaRef,
+        _predicate: Option<PredicateRef>,
+    ) -> crate::DeltaResult<FileDataReadResultIterator> {
+        Ok(Box::new(std::iter::empty()))
+    }
+
+    fn read_parquet_footer(&self, _file: &FileMeta) -> crate::DeltaResult<ParquetFooter> {
+        unimplemented!()
+    }
+
+    fn write_parquet_file(
+        &self,
+        _location: url::Url,
+        _data: Box<dyn Iterator<Item = crate::DeltaResult<Box<dyn EngineData>>> + Send>,
+    ) -> crate::DeltaResult<()> {
+        unimplemented!()
+    }
+}
+
+/// An [`Engine`] that delegates everything to a [`SyncEngine`] except `parquet_handler`, which
+/// returns [`EmptyParquetHandler`].
+struct EmptyParquetEngine(Arc<SyncEngine>);
+
+impl Engine for EmptyParquetEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        self.0.evaluation_handler()
+    }
+
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.0.json_handler()
+    }
+
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        Arc::new(EmptyParquetHandler)
+    }
+
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.0.storage_handler()
+    }
+}
+
+/// When a file's Add action stats report `numRecords > 0` and the parquet handler returns an empty
+/// iterator, `execute` must surface an error rather than silently producing no rows.
+#[test]
+fn execute_errors_when_parquet_returns_empty_for_file_with_positive_stats() {
+    let path =
+        std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(EmptyParquetEngine(Arc::new(SyncEngine::new())));
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let scan = snapshot.scan_builder().build().unwrap();
+
+    let results: Vec<_> = scan.execute(engine).unwrap().collect();
+    assert_eq!(results.len(), 1, "should emit exactly one error item");
+    assert!(results[0].is_err(), "the result should be an error, got Ok");
+    let err = results[0].as_ref().err().unwrap().to_string();
+    assert!(
+        err.contains("ParquetHandler returned no data"),
+        "unexpected error message: {err}"
+    );
+}
+
+/// When a file's Add action has no stats, an empty iterator from the parquet handler is allowed
+/// -- we conservatively treat the file as possibly legitimately empty.
+#[test]
+fn execute_does_not_error_when_parquet_returns_empty_and_stats_absent() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-cdf/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(EmptyParquetEngine(Arc::new(SyncEngine::new())));
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let scan = snapshot.scan_builder().build().unwrap();
+
+    // All Add files in this table have no stats -- empty iterators should be silently ignored.
+    let results: Vec<_> = scan.execute(engine).unwrap().collect();
+    assert!(
+        results.iter().all(|r| r.is_ok()),
+        "expected no errors for stats-absent files"
+    );
 }
