@@ -36,6 +36,7 @@ use crate::{DeltaResult, Engine, Error, Version};
 mod builder;
 pub use builder::SnapshotBuilder;
 
+/// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
 
 /// File-level statistics for a table version.
@@ -105,21 +106,25 @@ impl Snapshot {
     /// version.
     ///
     /// We implement a simple heuristic:
-    /// 1. if the new version == existing version, just return the existing snapshot
+    /// 1. if the caller explicitly requests the existing version, just return the existing
+    ///    snapshot
     /// 2. if the new version < existing version, error: there is no optimization to do here
-    /// 3. list from (existing checkpoint version + 1) onward (or just existing snapshot version if
-    ///    no checkpoint)
-    /// 4. a. if new checkpoint is found: just create a new snapshot from that checkpoint (and
-    ///    commits after it)
-    ///    b. if no new checkpoint is found: do lightweight P+M replay on the latest commits (after
-    ///    ensuring we only retain commits > any checkpoints)
+    /// 3. list from (existing checkpoint version + 1) onward (or from version 1 if there is no
+    ///    checkpoint yet)
+    /// 4. if a newer or newly discovered checkpoint is found while refreshing to the latest
+    ///    version, create a new snapshot from that checkpoint (and commits after it), even if the
+    ///    table version itself did not advance
+    /// 5. if no new checkpoint is found and the table version did not advance, return the
+    ///    existing snapshot
+    /// 6. if no new checkpoint is found, do lightweight P+M replay on the latest commits after
+    ///    ensuring we only retain commits > any checkpoints
     ///
     /// # Parameters
     ///
     /// - `existing_snapshot`: reference to an existing [`Snapshot`]
     /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
-    ///   version of the table.
+    /// - `target_version`: target version of the [`Snapshot`]. None will create a snapshot at the
+    ///   latest version of the table.
     pub fn builder_from(existing_snapshot: SnapshotRef) -> SnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
     }
@@ -160,21 +165,21 @@ impl Snapshot {
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
         engine: &dyn Engine,
-        version: impl Into<Option<Version>>,
+        target_version: impl Into<Option<Version>>,
         operation_id: MetricId,
     ) -> DeltaResult<Arc<Self>> {
         let old_log_segment = &existing_snapshot.log_segment;
         let old_version = existing_snapshot.version();
-        let new_version = version.into();
-        if let Some(new_version) = new_version {
-            if new_version == old_version {
+        let requested_version = target_version.into();
+        if let Some(requested_version) = requested_version {
+            if requested_version == old_version {
                 // Re-requesting the same version
                 return Ok(existing_snapshot.clone());
             }
-            if new_version < old_version {
+            if requested_version < old_version {
                 // Hint is too new: error since this is effectively an incorrect optimization
                 return Err(Error::Generic(format!(
-                    "Requested snapshot version {new_version} is older than snapshot hint version {old_version}"
+                    "Requested snapshot version {requested_version} is older than snapshot hint version {old_version}"
                 )));
             }
         }
@@ -182,7 +187,7 @@ impl Snapshot {
         let log_root = old_log_segment.log_root.clone();
         let storage = engine.storage_handler();
 
-        // Start listing just after the previous segment's checkpoint, if any
+        // Start listing just after the previous segment's checkpoint, if any.
         let listing_start = old_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
         // Check for new commits (and CRC)
@@ -191,7 +196,7 @@ impl Snapshot {
             &log_root,
             log_tail,
             Some(listing_start),
-            new_version,
+            requested_version,
         )?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below
@@ -200,11 +205,11 @@ impl Snapshot {
         if new_listed_files.ascending_commit_files().is_empty()
             && new_listed_files.checkpoint_parts().is_empty()
         {
-            match new_version {
-                Some(new_version) if new_version != old_version => {
+            match requested_version {
+                Some(requested_version) if requested_version != old_version => {
                     // No new commits, but we are looking for a new version
                     return Err(Error::Generic(format!(
-                        "Requested snapshot version {new_version} is newer than the latest version {old_version}"
+                        "Requested snapshot version {requested_version} is newer than the latest version {old_version}"
                     )));
                 }
                 _ => {
@@ -221,7 +226,7 @@ impl Snapshot {
         // Note: new_log_segment won't have checkpoint_schema since we're listing without a hint.
         // If it has a checkpoint, we use it as-is. Otherwise, we preserve the old checkpoint_schema.
         let mut new_log_segment =
-            LogSegment::try_new(new_listed_files, log_root.clone(), new_version, None)?;
+            LogSegment::try_new(new_listed_files, log_root.clone(), requested_version, None)?;
 
         let new_end_version = new_log_segment.end_version;
         if new_end_version < old_version {
@@ -230,13 +235,8 @@ impl Snapshot {
             return Err(Error::Generic(format!(
                 "Unexpected state: The newest version in the log {new_end_version} is older than the old version {old_version}")));
         }
-        if new_end_version == old_version {
-            // No new commits, just return the same snapshot
-            return Ok(existing_snapshot.clone());
-        }
-
         if new_log_segment.checkpoint_version.is_some() {
-            // we have a checkpoint in the new LogSegment, just construct a new snapshot from that
+            // We found a checkpoint in the new log segment, so build a fresh snapshot from it.
             // TODO(#2217): reuse old LazyCrc when CRC file matches.
             // TODO(#2218): consider incremental P&M replay instead of full rebuild.
             let snapshot = Self::try_new_from_log_segment_impl(
@@ -246,6 +246,11 @@ impl Snapshot {
                 operation_id,
             );
             return Ok(Arc::new(snapshot?));
+        }
+
+        if new_end_version == old_version {
+            // No new commits and no newly discovered checkpoint, just return the same snapshot.
+            return Ok(existing_snapshot.clone());
         }
 
         // after this point, we incrementally update the snapshot with the new log segment.
@@ -317,7 +322,7 @@ impl Snapshot {
                     .max(old_log_segment.listed.max_published_version),
             },
             log_root,
-            new_version,
+            requested_version,
             // Preserve checkpoint schema from old segment
             old_log_segment.checkpoint_schema.clone(),
         )?;
@@ -472,16 +477,19 @@ impl Snapshot {
 
     /// Performs a complete checkpoint of this snapshot using the provided engine.
     ///
-    /// Writes a checkpoint parquet file and the `_last_checkpoint` file.
+    /// Writes a checkpoint parquet file and the `_last_checkpoint` file. Returns an updated
+    /// [`SnapshotRef`] whose log segment reflects the new checkpoint. Commits and compaction
+    /// files subsumed by the checkpoint are dropped from the returned snapshot.
     ///
     /// Note: This function uses [`crate::ParquetHandler::write_parquet_file`] and
     /// [`crate::StorageHandler::head`], which may not be implemented by all engines
     /// (e.g., `SyncEngine`).
     ///
-    /// If you are using the default engine, make sure to build it with the multi-threaded executor if you want to use this method.
+    /// If you are using the default engine, make sure to build it with the multi-threaded
+    /// executor if you want to use this method.
     #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
-    pub fn checkpoint(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<()> {
-        let writer = self.create_checkpoint_writer()?;
+    pub fn checkpoint(self: &SnapshotRef, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+        let writer = Arc::clone(self).create_checkpoint_writer()?;
         let checkpoint_path = writer.checkpoint_path()?;
         let data_iter = writer.checkpoint_data(engine)?;
         let state = data_iter.state();
@@ -493,7 +501,19 @@ impl Snapshot {
         let file_meta = engine.storage_handler().head(&checkpoint_path)?;
 
         // Finalize the checkpoint (writes `_last_checkpoint` file).
-        writer.finalize(engine, &file_meta, &state)
+        writer.finalize(engine, &file_meta, &state)?;
+
+        let checkpoint_log_path = ParsedLogPath::try_from(file_meta)?.ok_or_else(|| {
+            Error::internal_error("Checkpoint path could not be parsed as a log path")
+        })?;
+        let new_log_segment = self
+            .log_segment
+            .try_new_with_checkpoint(checkpoint_log_path)?;
+        Ok(Arc::new(Snapshot::new_with_crc(
+            new_log_segment,
+            self.table_configuration().clone(),
+            self.lazy_crc.clone(),
+        )))
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
@@ -716,9 +736,10 @@ impl Snapshot {
     /// information in memory (i.e. the snapshot returned by
     /// [`CommittedTransaction::post_commit_snapshot`]).
     ///
-    /// Returns [`ChecksumWriteResult::AlreadyExists`] if a checksum already exists at this
-    /// version (safe for concurrent writers). Returns [`ChecksumWriteResult::Written`] on
-    /// success.
+    /// Returns a tuple of [`ChecksumWriteResult`] and a [`SnapshotRef`]. On
+    /// [`ChecksumWriteResult::Written`], the returned snapshot has the CRC file recorded in
+    /// its log segment. On [`ChecksumWriteResult::AlreadyExists`], the original snapshot is
+    /// returned unchanged.
     ///
     /// # Errors
     ///
@@ -732,7 +753,10 @@ impl Snapshot {
     ///
     /// [`CommittedTransaction::post_commit_snapshot`]: crate::transaction::CommittedTransaction::post_commit_snapshot
     #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
-    pub fn write_checksum(&self, engine: &dyn Engine) -> DeltaResult<ChecksumWriteResult> {
+    pub fn write_checksum(
+        self: &SnapshotRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<(ChecksumWriteResult, SnapshotRef)> {
         let has_crc_on_disk = self
             .log_segment
             .listed
@@ -745,7 +769,7 @@ impl Snapshot {
                 "CRC file already exists on disk at version {}",
                 self.version()
             );
-            return Ok(ChecksumWriteResult::AlreadyExists);
+            return Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)));
         }
 
         let crc = self
@@ -759,22 +783,24 @@ impl Snapshot {
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
-        // TODO: Would be nice to update LogSegment.listed.latest_crc_file here, but that probably
-        //       requires changing it to a OnceLock, which is a bit of an invasive change. Perhaps,
-        //       return an updated Snapshot instead.
-
         // Note: try_write_crc_file validates file stats validity before writing.
         match try_write_crc_file(engine, &crc_path.location, crc) {
             Ok(()) => {
                 info!("Wrote CRC file at {}", crc_path.location);
-                Ok(ChecksumWriteResult::Written)
+                let new_log_segment = self.log_segment.try_new_with_crc_file(crc_path)?;
+                let new_snapshot = Arc::new(Snapshot::new_with_crc(
+                    new_log_segment,
+                    self.table_configuration().clone(),
+                    self.lazy_crc.clone(),
+                ));
+                Ok((ChecksumWriteResult::Written, new_snapshot))
             }
             Err(Error::FileAlreadyExists(_)) => {
                 info!(
                     "Another writer beat us to writing CRC file at {}",
                     crc_path.location
                 );
-                Ok(ChecksumWriteResult::AlreadyExists)
+                Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)))
             }
             Err(e) => Err(e),
         }
@@ -956,9 +982,11 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::executor::tokio::{
+        TokioBackgroundExecutor, TokioMultiThreadExecutor,
+    };
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-    use crate::engine::default::DefaultEngineBuilder;
+    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::log_segment::LogSegment;
@@ -2278,6 +2306,112 @@ mod tests {
         Ok(())
     }
 
+    struct IncrementalSnapshotTestContext {
+        store: Arc<InMemory>,
+        url: Url,
+        engine: Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+    }
+
+    fn setup_incremental_snapshot_test() -> DeltaResult<IncrementalSnapshotTestContext> {
+        let store = Arc::new(InMemory::new());
+        let url = Url::parse("memory:///")?;
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(store.clone())
+                .with_task_executor(executor)
+                .build(),
+        );
+
+        Ok(IncrementalSnapshotTestContext { store, url, engine })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version(
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
+
+        let snapshot_v1 = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(1)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
+
+        snapshot_v1.clone().checkpoint(ctx.engine.as_ref())?;
+
+        let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        assert_eq!(fresh.version(), 1);
+        assert_eq!(fresh.log_segment.checkpoint_version, Some(1));
+
+        let updated = Snapshot::builder_from(snapshot_v1).build(ctx.engine.as_ref())?;
+        assert_eq!(updated.version(), 1);
+        assert_eq!(updated.log_segment.checkpoint_version, Some(1));
+        assert_eq!(updated, fresh);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_snapshot_picks_up_newer_checkpoint_below_current_version(
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
+
+        Snapshot::builder_for(ctx.url.as_str())
+            .at_version(1)
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref())?;
+
+        let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(3)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(snapshot_v3.log_segment.checkpoint_version, Some(1));
+
+        Snapshot::builder_for(ctx.url.as_str())
+            .at_version(2)
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref())?;
+
+        let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        assert_eq!(fresh.version(), 3);
+        assert_eq!(fresh.log_segment.checkpoint_version, Some(2));
+
+        let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
+        assert_eq!(updated.version(), 3);
+        assert_eq!(updated.log_segment.checkpoint_version, Some(2));
+        assert_eq!(updated, fresh);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_explicit_same_version_request_keeps_existing_snapshot_after_checkpoint_write(
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 2).await?;
+
+        let snapshot_v1 = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(1)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
+
+        snapshot_v1.clone().checkpoint(ctx.engine.as_ref())?;
+
+        let refreshed = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        assert_eq!(refreshed.log_segment.checkpoint_version, Some(1));
+
+        let pinned = Snapshot::builder_from(snapshot_v1.clone())
+            .at_version(1)
+            .build(ctx.engine.as_ref())?;
+        assert!(Arc::ptr_eq(&pinned, &snapshot_v1));
+        assert_eq!(pinned.log_segment.checkpoint_version, None);
+
+        Ok(())
+    }
     /// The incremental snapshot path (try_new_from_impl) re-lists files from the checkpoint
     /// version onwards. We must ensure that it deduplicates compaction files, since producing
     /// duplicates violated the sort invariant in LogSegmentFilesBuilder::build().
