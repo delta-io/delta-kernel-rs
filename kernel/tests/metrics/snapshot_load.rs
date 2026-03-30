@@ -21,9 +21,9 @@ use delta_kernel::{DeltaResult, Snapshot};
 use test_utils::{insert_data, test_table_setup_mt};
 use url::Url;
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Scenario 1: delta-only (2 commits, no checkpoint, no compaction)
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /// A snapshot built from two JSON commits -- no checkpoint, no CRC, no compaction --
 /// reports exactly the commit file count and triggers one JSON read call covering all
@@ -66,9 +66,9 @@ async fn delta_only_snapshot_emits_expected_metrics() -> DeltaResult<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Scenario 2: v1 parquet checkpoint + one tail commit
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /// After a v1 parquet checkpoint is written at version 1 and a further commit is added,
 /// a fresh snapshot sees one checkpoint file, one tail commit, and performs a single
@@ -106,9 +106,9 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Scenario 3: v1 parquet checkpoint at latest version (no tail commits)
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /// When the latest version has a checkpoint and no subsequent commits exist, the snapshot
 /// has zero commit files and the JSON handler is called with an empty file list.
@@ -135,9 +135,9 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> DeltaResult<()> 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Scenario 4: log compaction covering early commits + one tail commit
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /// When early commits are covered by a compacted log file, the snapshot reports both
 /// the individual commit count and the compaction count. The JSON handler reads the
@@ -204,9 +204,9 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Scenario 5: CRC fast-path bypasses JSON replay
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /// When a CRC file exists at the target snapshot version, Protocol+Metadata are loaded
 /// directly from it, skipping all JSON log replay. The JSON handler is never called.
@@ -239,9 +239,9 @@ async fn snapshot_with_crc_at_target_version_skips_json_replay() -> DeltaResult<
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Scenario 6: CRC at a prior version (CRC exists but is older than latest)
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /// When a CRC file exists at an older version than the snapshot, the kernel takes the
 /// partial-replay path: it replays only the tail commits (those after the CRC version)
@@ -299,9 +299,9 @@ async fn crc_at_prior_version_triggers_tail_replay_then_falls_back_to_crc() -> D
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Scenario 7: checkpoint behind latest version (with multiple tail commits)
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /// A checkpoint that is multiple versions behind the latest forces a longer tail replay.
 /// Checkpoint at v1 plus 3 additional commits (v2, v3, v4) verifies that all tail commits
@@ -340,9 +340,9 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Delta
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Scenario 8: on-demand domain metadata query incurs additional log replay
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /// `snapshot.get_domain_metadata()` always performs a full log replay when no CRC is
 /// present at the target version. Calling it after a snapshot is already built generates
@@ -388,9 +388,9 @@ async fn get_domain_metadata_incurs_additional_log_replay() -> DeltaResult<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Scenario 9: snapshot.transaction() on a clustered table
-// ---------------------------------------------------------------------------
+// ============================================================================
 // NOTE: This scenario is verified via clustering_e2e.rs tests because the
 // `clustered-table` Rust feature is not exposed to the integration test binary.
 // The mechanism: `transaction()` unconditionally calls `get_clustering_columns_physical()`,

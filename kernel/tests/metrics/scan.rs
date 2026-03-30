@@ -16,9 +16,9 @@ use delta_kernel::{DeltaResult, Engine, Snapshot};
 use test_utils::insert_data;
 use url::Url;
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Scenario 10: scan.execute() contributes parquet data-file reads
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /// `scan.execute()` reads the actual parquet data files written during inserts.
 /// These go through `DefaultParquetHandler::read_parquet_files` and appear in
