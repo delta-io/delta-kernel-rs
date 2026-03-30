@@ -191,7 +191,6 @@ impl CommitMetadata {
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new())?;
         Ok(Self::new(log_root, version, 0, None, protocol, metadata))
     }
-
 }
 
 /// `CommitResponse` is the result of committing a transaction via a catalog. The committer uses
