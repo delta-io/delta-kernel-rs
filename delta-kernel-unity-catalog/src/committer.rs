@@ -241,7 +241,7 @@ impl<C: CommitClient + 'static> Committer for UCCommitter<C> {
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         if commit_metadata.version() == 0 {
-            return self.commit_version_0(engine, actions, &commit_metadata);
+            return Self::commit_version_0(engine, actions, &commit_metadata);
         }
         self.commit_version_non_zero(engine, actions, commit_metadata)
     }
