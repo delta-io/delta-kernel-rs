@@ -1015,7 +1015,7 @@ pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
 ///
 /// Caller is responsible for passing valid handles.
 #[no_mangle]
-pub unsafe extern "C" fn get_timestamp_snapshot(
+pub unsafe extern "C" fn snapshot_timestamp(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<i64> {
@@ -1226,6 +1226,7 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStore;
+    use delta_kernel::schema::StructType;
     use rstest::rstest;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -1235,6 +1236,8 @@ mod tests {
         actions_to_string, actions_to_string_partitioned, actions_to_string_with_metadata,
         add_commit, TestAction, METADATA, METADATA_WITH_TABLE_PROPERTIES,
     };
+    use test_utils::create_table;
+    use url::Url;
 
     #[no_mangle]
     extern "C" fn allocate_null_err(_: KernelError, _: KernelStringSlice) -> *mut EngineError {
@@ -1339,7 +1342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_timestamp_snapshot_no_ict() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_snapshot_timestamp_no_ict() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
         add_commit(
@@ -1360,7 +1363,7 @@ mod tests {
         };
 
         let ts = unsafe {
-            ok_or_panic(get_timestamp_snapshot(
+            ok_or_panic(snapshot_timestamp(
                 snap.shallow_copy(),
                 engine.shallow_copy(),
             ))
@@ -1372,7 +1375,7 @@ mod tests {
             .as_millis() as i64;
         let two_days_ms = 2 * 24 * 60 * 60 * 1000_i64;
         assert!(
-            (now_ms - two_days_ms..=now_ms + two_days_ms).contains(&ts),
+            (now_ms - two_days_ms..=now_ms).contains(&ts),
             "timestamp {ts} not within 2 days of now {now_ms}"
         );
 
@@ -1382,11 +1385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_timestamp_snapshot_ict_enabled() -> Result<(), Box<dyn std::error::Error>> {
-        use delta_kernel::schema::StructType;
-        use test_utils::create_table;
-        use url::Url;
-
+    async fn test_snapshot_timestamp_ict_enabled() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
 
@@ -1415,7 +1414,7 @@ mod tests {
         };
 
         let ts = unsafe {
-            ok_or_panic(get_timestamp_snapshot(
+            ok_or_panic(snapshot_timestamp(
                 snap.shallow_copy(),
                 engine.shallow_copy(),
             ))
