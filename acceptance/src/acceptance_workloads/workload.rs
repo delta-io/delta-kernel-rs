@@ -8,6 +8,7 @@ use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
+use delta_kernel::expressions::Predicate;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, Error, Version};
@@ -36,6 +37,26 @@ pub struct SnapshotResult {
     pub protocol: Protocol,
     /// The table metadata at this version.
     pub metadata: Metadata,
+}
+
+/// Applies row-level filtering to batches using a predicate.
+///
+/// Kernel's scan only does data skipping (file-level filtering based on stats).
+/// This function applies the predicate to filter individual rows within each batch.
+fn filter_batches_with_predicate(
+    batches: Vec<RecordBatch>,
+    predicate: Option<&Predicate>,
+) -> DeltaResult<Vec<RecordBatch>> {
+    match predicate {
+        Some(pred) => batches
+            .into_iter()
+            .map(|batch| {
+                let mask = evaluate_predicate(pred, &batch, false)?;
+                filter_record_batch(&batch, &mask).map_err(Error::from)
+            })
+            .try_collect(),
+        None => Ok(batches),
+    }
 }
 
 /// Build a snapshot with optional time travel.
@@ -86,25 +107,12 @@ pub fn execute_read_workload(
 
     let schema = scan.logical_schema();
 
-    // Execute scan
+    // Execute scan and apply row-level filtering
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|data| data?.try_into_record_batch())
         .try_collect()?;
-
-    // Apply row-level filtering if predicate is present
-    // (kernel only does data skipping, not row filtering)
-    let batches = if let Some(ref pred) = predicate {
-        batches
-            .into_iter()
-            .map(|batch| {
-                let mask = evaluate_predicate(pred, &batch, false)?;
-                filter_record_batch(&batch, &mask).map_err(Error::from)
-            })
-            .try_collect()?
-    } else {
-        batches
-    };
+    let batches = filter_batches_with_predicate(batches, predicate.as_ref())?;
 
     // Compute row count from filtered batches
     let row_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
