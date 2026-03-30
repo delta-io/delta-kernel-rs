@@ -198,6 +198,21 @@ pub struct CheckpointWriter {
     checkpoint_output_schema: OnceLock<SchemaRef>,
 }
 
+impl Clone for CheckpointWriter {
+    fn clone(&self) -> Self {
+        let checkpoint_output_schema = OnceLock::new();
+        if let Some(schema) = self.checkpoint_output_schema.get() {
+            // SAFETY: checkpoint_output_schema just initialized
+            let _ = checkpoint_output_schema.set(schema.clone());
+        }
+        Self {
+            snapshot: self.snapshot.clone(),
+            version: self.version,
+            checkpoint_output_schema,
+        }
+    }
+}
+
 impl RetentionCalculator for CheckpointWriter {
     fn table_properties(&self) -> &TableProperties {
         self.snapshot.table_properties()
