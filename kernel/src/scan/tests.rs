@@ -1452,8 +1452,8 @@ impl ParquetHandler for EmptyParquetHandler {
     }
 }
 
-/// An [`Engine`] that delegates everything to a [`SyncEngine`] except `parquet_handler`,
-/// which returns [`EmptyParquetHandler`].
+/// An [`Engine`] that delegates everything to a [`SyncEngine`] except `parquet_handler`, which
+/// returns [`EmptyParquetHandler`].
 struct EmptyParquetEngine(Arc<SyncEngine>);
 
 impl Engine for EmptyParquetEngine {
@@ -1474,8 +1474,8 @@ impl Engine for EmptyParquetEngine {
     }
 }
 
-/// When a file's Add action stats report `numRecords > 0` and the parquet handler returns an
-/// empty iterator, `execute` must surface an error rather than silently producing no rows.
+/// When a file's Add action stats report `numRecords > 0` and the parquet handler returns an empty
+/// iterator, `execute` must surface an error rather than silently producing no rows.
 #[test]
 fn execute_errors_when_parquet_returns_empty_for_file_with_positive_stats() {
     let path =
@@ -1496,8 +1496,8 @@ fn execute_errors_when_parquet_returns_empty_for_file_with_positive_stats() {
     );
 }
 
-/// When a file's Add action has no stats, an empty iterator from the parquet handler is
-/// allowed -- we conservatively treat the file as possibly legitimately empty.
+/// When a file's Add action has no stats, an empty iterator from the parquet handler is allowed
+/// -- we conservatively treat the file as possibly legitimately empty.
 #[test]
 fn execute_does_not_error_when_parquet_returns_empty_and_stats_absent() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-cdf/")).unwrap();
