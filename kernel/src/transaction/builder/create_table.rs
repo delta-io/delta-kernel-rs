@@ -1403,7 +1403,6 @@ mod tests {
         assert!(validate_partition_columns(&schema, &columns).is_ok());
     }
 
-    #[cfg(feature = "catalog-managed")]
     #[test]
     fn test_catalog_managed_auto_enables_ict() {
         let properties = HashMap::from([(
@@ -1427,7 +1426,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "catalog-managed")]
     #[test]
     fn test_catalog_managed_with_ict_true_succeeds() {
         let properties = HashMap::from([
