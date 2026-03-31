@@ -41,6 +41,11 @@ impl<C: CommitClient> UCCommitter<C> {
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: &CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
+        debug_assert!(
+            commit_metadata.version() == 0,
+            "commit_version_0 called with version {}",
+            commit_metadata.version()
+        );
         let published_commit_path = commit_metadata.published_commit_path()?;
         match engine.json_handler().write_json_file(
             &published_commit_path,
@@ -70,6 +75,10 @@ impl<C: CommitClient> UCCommitter<C> {
     where
         C: 'static,
     {
+        debug_assert!(
+            commit_metadata.version() != 0,
+            "commit_version_non_zero called with version 0"
+        );
         let staged_commit_path = commit_metadata.staged_commit_path()?;
         engine
             .json_handler()
@@ -134,8 +143,8 @@ impl<C: CommitClient + 'static> Committer for UCCommitter<C> {
     /// The connector is responsible for finalizing the table in UC via the create table API.
     ///
     /// For version >= 1, writes a staged commit then calls the UC commit API to ratify it.
-    /// Staged commits accumulate and clients are expected to periodically publish them to the
-    /// delta log. UC expects to be informed of the last known published version during commit.
+    /// Connectors should publish staged commits to the delta log immediately after writing.
+    /// UC expects to be informed of the last known published version during commit.
     fn commit(
         &self,
         engine: &dyn Engine,
