@@ -95,6 +95,12 @@ impl ParquetHandler for SyncParquetHandler {
             .to_file_path()
             .map_err(|_| crate::Error::generic(format!("Invalid file URL: {location}")))?;
 
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
         let mut file = File::create(&path)?;
 
         // Get first batch to initialize writer with schema
@@ -143,9 +149,27 @@ mod tests {
     use super::*;
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
+    use crate::{DeltaResult, EngineData};
     use std::sync::Arc;
     use tempfile::tempdir;
     use url::Url;
+
+    fn test_data_iter() -> Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![
+                (
+                    "id",
+                    Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+                ),
+                (
+                    "name",
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])) as Arc<dyn Array>,
+                ),
+            ])
+            .unwrap(),
+        ));
+        Box::new(std::iter::once(Ok(engine_data)))
+    }
 
     #[test]
     fn test_sync_write_parquet_file() {
@@ -390,5 +414,37 @@ mod tests {
         assert_eq!(value_col.values(), &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
         assert!(result.next().is_none());
+    }
+
+    #[test]
+    fn write_parquet_creates_parent_directories() {
+        let handler = SyncParquetHandler;
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("a/b/c/test.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        assert!(!temp_dir.path().join("a").exists());
+        handler.write_parquet_file(url, test_data_iter()).unwrap();
+        assert!(file_path.exists());
+    }
+
+    #[test]
+    fn write_parquet_does_not_modify_existing_parent_directory() {
+        let handler = SyncParquetHandler;
+        let temp_dir = tempdir().unwrap();
+        let parent = temp_dir.path().join("existing_dir");
+        std::fs::create_dir(&parent).unwrap();
+
+        let marker = parent.join("marker.txt");
+        std::fs::write(&marker, "keep me").unwrap();
+
+        let file_path = parent.join("test.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        handler.write_parquet_file(url, test_data_iter()).unwrap();
+
+        assert!(file_path.exists());
+        assert!(marker.exists());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "keep me");
     }
 }
