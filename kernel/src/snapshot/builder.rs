@@ -9,7 +9,6 @@ use crate::log_segment::LogSegment;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::snapshot::SnapshotRef;
 use crate::utils::try_parse_uri;
-#[cfg(feature = "catalog-managed")]
 use crate::{path::LogPathFileType, utils::require};
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
@@ -76,7 +75,12 @@ impl SnapshotBuilder {
     /// systems to provide an up-to-date log tail when used to build a snapshot.
     ///
     /// Note that the log tail must be a contiguous sequence of commits from M..=N where N is the
-    /// latest version of the table and 0 <= M <= N.
+    /// target version of the snapshot and 0 <= M <= N.
+    ///
+    /// See [`with_max_catalog_version`] for additional constraints when loading catalog-managed
+    /// tables.
+    ///
+    /// [`with_max_catalog_version`]: Self::with_max_catalog_version
     pub fn with_log_tail(mut self, log_tail: Vec<LogPath>) -> Self {
         self.log_tail = log_tail;
         self
@@ -98,7 +102,6 @@ impl SnapshotBuilder {
     /// tail entry must be >= the requested version.
     ///
     /// [`at_version`]: Self::at_version
-    #[cfg(feature = "catalog-managed")]
     pub fn with_max_catalog_version(mut self, max_catalog_version: Version) -> Self {
         self.max_catalog_version = Some(max_catalog_version);
         self
@@ -143,7 +146,6 @@ impl SnapshotBuilder {
         let start = Instant::now();
 
         // Pre-build validations for catalog-managed tables
-        #[cfg(feature = "catalog-managed")]
         Self::validate_catalog_managed_build_inputs(version, max_catalog_version, &log_tail)?;
 
         // Use time-travel version if set, otherwise fall back to max_catalog_version. Passing this
@@ -181,14 +183,13 @@ impl SnapshotBuilder {
                         existing_snapshot,
                         log_tail,
                         engine,
-                        self.version,
+                        effective_version,
                         operation_id,
                     )
                 })
         };
 
         // Post-build validations for catalog-managed tables
-        #[cfg(feature = "catalog-managed")]
         let result = result.and_then(|snapshot| {
             Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
             Ok(snapshot)
@@ -232,7 +233,6 @@ impl SnapshotBuilder {
     // ===== Catalog-managed Validations =====
 
     /// Pre-build validations for catalog-managed table invariants.
-    #[cfg(feature = "catalog-managed")]
     fn validate_catalog_managed_build_inputs(
         version: Option<Version>,
         max_catalog_version: Option<Version>,
@@ -293,7 +293,6 @@ impl SnapshotBuilder {
 
     /// Post-build validation: catalog-managed tables must have max_catalog_version, and
     /// non-catalog-managed tables must not.
-    #[cfg(feature = "catalog-managed")]
     fn validate_catalog_managed_build_result(
         snapshot: &SnapshotRef,
         max_catalog_version: Option<Version>,
@@ -329,7 +328,6 @@ impl SnapshotBuilder {
     }
 
     fn target_version_str(&self) -> String {
-        #[cfg(feature = "catalog-managed")]
         if let Some(mcv) = self.max_catalog_version {
             return match self.version {
                 Some(v) => format!("{v} (max_catalog_version={mcv})"),
@@ -654,7 +652,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "catalog-managed")]
     mod catalog_managed_tests {
         use super::*;
 
@@ -796,6 +793,33 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("max_catalog_version must not be set for non-catalog-managed tables"));
+
+            Ok(())
+        }
+
+        #[test_log::test(tokio::test)]
+        async fn test_log_tail_last_version_less_than_time_travel_version_errors(
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+            add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
+
+            let log_tail = vec![create_log_path(
+                &table_root,
+                test_utils::delta_path_for_version(1, "json"),
+            )];
+
+            // Time travel to v2, but log tail only goes up to v1
+            let result = SnapshotBuilder::new_for(table_root)
+                .at_version(2)
+                .with_log_tail(log_tail)
+                .with_max_catalog_version(3)
+                .build(engine.as_ref());
+
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("Log tail last version 1 is less than requested version 2"));
 
             Ok(())
         }

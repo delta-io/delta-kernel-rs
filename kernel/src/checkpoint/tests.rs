@@ -185,9 +185,13 @@ fn create_basic_protocol_action() -> Action {
     )
 }
 
-/// Create a Protocol action with catalogManaged feature support
+/// Create a Protocol action with catalogManaged feature support. Per the Delta protocol,
+/// catalogManaged depends on inCommitTimestamp.
 fn create_catalog_managed_protocol_action() -> Action {
-    Action::Protocol(Protocol::try_new_modern(["catalogManaged"], ["catalogManaged"]).unwrap())
+    Action::Protocol(
+        Protocol::try_new_modern(["catalogManaged"], ["catalogManaged", "inCommitTimestamp"])
+            .unwrap(),
+    )
 }
 
 /// Create a Protocol action with v2Checkpoint feature support
@@ -195,8 +199,8 @@ fn create_v2_checkpoint_protocol_action() -> Action {
     Action::Protocol(Protocol::try_new_modern(vec!["v2Checkpoint"], vec!["v2Checkpoint"]).unwrap())
 }
 
-/// Create a Metadata action
-fn create_metadata_action() -> Action {
+/// Create a Metadata action with the given table configuration.
+fn create_metadata_action_with_config(configuration: HashMap<String, String>) -> Action {
     Action::Metadata(
         Metadata::try_new(
             Some("test-table".into()),
@@ -207,10 +211,15 @@ fn create_metadata_action() -> Action {
             )])),
             vec![],
             0,
-            HashMap::new(),
+            configuration,
         )
         .unwrap(),
     )
+}
+
+/// Create a Metadata action with no configuration.
+fn create_metadata_action() -> Action {
+    create_metadata_action_with_config(HashMap::new())
 }
 
 /// Create a simple Add action with the specified path (no stats)
@@ -535,7 +544,10 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
     write_commit_to_store(
         &store,
         vec![
-            create_metadata_action(),
+            create_metadata_action_with_config(HashMap::from([(
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            )])),
             create_catalog_managed_protocol_action(),
         ],
         0,

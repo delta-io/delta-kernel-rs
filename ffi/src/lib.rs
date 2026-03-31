@@ -162,6 +162,15 @@ impl<T> From<Option<T>> for OptionalValue<T> {
     }
 }
 
+impl<T> From<OptionalValue<T>> for Option<T> {
+    fn from(item: OptionalValue<T>) -> Self {
+        match item {
+            OptionalValue::Some(value) => Some(value),
+            OptionalValue::None => None,
+        }
+    }
+}
+
 /// Creates a new [`KernelStringSlice`] from a string reference (which must be an identifier, to
 /// ensure it is not immediately dropped). This is the safest way to create a kernel string slice.
 ///

@@ -297,6 +297,55 @@ async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+/// Verify that `builder_from` with `max_catalog_version` stops at the catalog-ratified version
+/// even when later commits exist on the filesystem.
+#[tokio::test]
+async fn incremental_snapshot_caps_at_max_catalog_version() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    // commits 0, 1, 2 in storage (catalog-managed)
+    let actions = vec![TestAction::Metadata];
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_catalog_managed(actions),
+    )
+    .await?;
+    let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+    add_commit(table_root, storage.as_ref(), 1, actions_to_string(actions)).await?;
+    let actions = vec![TestAction::Add("file_2.parquet".to_string())];
+    add_commit(table_root, storage.as_ref(), 2, actions_to_string(actions)).await?;
+
+    // Build initial snapshot at version 1, catalog knows about version 2
+    let initial_snapshot = Snapshot::builder_for(table_root)
+        .at_version(1)
+        .with_max_catalog_version(2)
+        .build(engine.as_ref())?;
+    assert_eq!(initial_snapshot.version(), 1);
+
+    // Commit 3 appears on filesystem, but catalog only ratifies up to v2
+    let actions = vec![TestAction::Add("file_3.parquet".to_string())];
+    add_commit(table_root, storage.as_ref(), 3, actions_to_string(actions)).await?;
+
+    // Incremental update: catalog still at v2, log_tail includes v2
+    let log_tail = vec![create_log_path(
+        &table_url,
+        delta_path_for_version(2, "json"),
+    )];
+    let new_snapshot = Snapshot::builder_from(initial_snapshot)
+        .with_log_tail(log_tail)
+        .with_max_catalog_version(2)
+        .build(engine.as_ref())?;
+
+    // Should stop at v2 despite v3 existing on filesystem
+    assert_eq!(new_snapshot.version(), 2);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn log_tail_exceeds_requested_version() -> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
