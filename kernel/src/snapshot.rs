@@ -562,32 +562,42 @@ impl Snapshot {
         self.table_configuration().table_properties()
     }
 
-    /// The minimum reader version required to read this table.
-    pub fn min_reader_version(&self) -> i32 {
-        self.table_configuration().protocol().min_reader_version()
-    }
-
-    /// The minimum writer version required to write to this table.
-    pub fn min_writer_version(&self) -> i32 {
-        self.table_configuration().protocol().min_writer_version()
-    }
-
-    /// Get the reader feature names for this table's protocol, if using table features
-    /// (reader version 3). Returns `None` for legacy protocols.
-    pub fn reader_features(&self) -> Option<Vec<&str>> {
-        self.table_configuration()
-            .protocol()
-            .reader_features()
-            .map(|features| features.iter().map(|f| f.as_ref()).collect())
-    }
-
-    /// Get the writer feature names for this table's protocol, if using table features
-    /// (writer version 7). Returns `None` for legacy protocols.
-    pub fn writer_features(&self) -> Option<Vec<&str>> {
-        self.table_configuration()
-            .protocol()
-            .writer_features()
-            .map(|features| features.iter().map(|f| f.as_ref()).collect())
+    /// Returns the protocol-derived table properties as a map of key-value pairs.
+    ///
+    /// This includes:
+    /// - `delta.minReaderVersion` and `delta.minWriterVersion`
+    /// - `delta.feature.<name> = "supported"` for each reader and writer feature (when using
+    ///   table features protocol, i.e. reader version 3 / writer version 7)
+    #[allow(dead_code)] // Called by delta-kernel-unity-catalog via internal-api
+    #[internal_api]
+    pub(crate) fn get_protocol_derived_properties(&self) -> HashMap<String, String> {
+        let protocol = self.table_configuration().protocol();
+        let mut properties = HashMap::new();
+        properties.insert(
+            "delta.minReaderVersion".to_string(),
+            protocol.min_reader_version().to_string(),
+        );
+        properties.insert(
+            "delta.minWriterVersion".to_string(),
+            protocol.min_writer_version().to_string(),
+        );
+        let feature_prefix = "delta.feature.";
+        let feature_value = "supported";
+        if let Some(features) = protocol.reader_features() {
+            for feature in features {
+                properties
+                    .entry(format!("{feature_prefix}{}", feature.as_ref()))
+                    .or_insert_with(|| feature_value.to_string());
+            }
+        }
+        if let Some(features) = protocol.writer_features() {
+            for feature in features {
+                properties
+                    .entry(format!("{feature_prefix}{}", feature.as_ref()))
+                    .or_insert_with(|| feature_value.to_string());
+            }
+        }
+        properties
     }
 
     /// Get the raw metadata configuration for this table.
@@ -595,7 +605,9 @@ impl Snapshot {
     /// This returns the `Metadata.configuration` map as stored in the Delta log, containing
     /// user-defined properties, delta table properties (e.g., `delta.enableInCommitTimestamps`),
     /// and application-specific properties (e.g., `io.unitycatalog.tableId`).
-    pub fn metadata_configuration(&self) -> &HashMap<String, String> {
+    #[allow(dead_code)] // Called by delta-kernel-unity-catalog via internal-api
+    #[internal_api]
+    pub(crate) fn metadata_configuration(&self) -> &HashMap<String, String> {
         self.table_configuration().metadata().configuration()
     }
 
@@ -695,7 +707,9 @@ impl Snapshot {
     /// column name cannot be resolved to a logical name in the schema.
     ///
     /// [`ColumnName`]: crate::expressions::ColumnName
-    pub fn get_clustering_columns(
+    #[allow(dead_code)] // Called by delta-kernel-unity-catalog via internal-api
+    #[internal_api]
+    pub(crate) fn get_logical_clustering_columns(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
@@ -704,16 +718,16 @@ impl Snapshot {
             None => return Ok(None),
         };
         let column_mapping_mode = self.table_configuration.column_mapping_mode();
-        if matches!(column_mapping_mode, ColumnMappingMode::None) {
+        if column_mapping_mode == ColumnMappingMode::None {
             // No column mapping: physical = logical
             return Ok(Some(physical_columns));
         }
         // Convert physical column names to logical names by walking the schema
-        let schema = self.table_configuration.logical_schema();
+        let logical_schema = self.table_configuration.logical_schema();
         let logical_columns = physical_columns
             .iter()
             .map(|physical_col| {
-                physical_to_logical_column_name(&schema, physical_col, column_mapping_mode)
+                physical_to_logical_column_name(&logical_schema, physical_col, column_mapping_mode)
             })
             .collect::<DeltaResult<Vec<_>>>()?;
         Ok(Some(logical_columns))
@@ -2608,7 +2622,7 @@ mod tests {
     }
 
     #[test]
-    fn test_public_protocol_getters() {
+    fn test_get_protocol_derived_properties() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -2616,20 +2630,19 @@ mod tests {
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
+        let props = snapshot.get_protocol_derived_properties();
         assert_eq!(
-            snapshot.min_reader_version(),
-            TABLE_FEATURES_MIN_READER_VERSION
+            props.get("delta.minReaderVersion").unwrap(),
+            &TABLE_FEATURES_MIN_READER_VERSION.to_string()
         );
         assert_eq!(
-            snapshot.min_writer_version(),
-            TABLE_FEATURES_MIN_WRITER_VERSION
+            props.get("delta.minWriterVersion").unwrap(),
+            &TABLE_FEATURES_MIN_WRITER_VERSION.to_string()
         );
-
-        let reader_features = snapshot.reader_features().unwrap();
-        assert!(reader_features.contains(&"deletionVectors"));
-
-        let writer_features = snapshot.writer_features().unwrap();
-        assert!(writer_features.contains(&"deletionVectors"));
+        assert_eq!(
+            props.get("delta.feature.deletionVectors").unwrap(),
+            "supported"
+        );
     }
 
     #[tokio::test]

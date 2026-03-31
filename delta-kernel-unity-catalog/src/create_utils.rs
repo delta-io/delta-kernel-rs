@@ -27,9 +27,9 @@ use std::collections::HashMap;
 use delta_kernel::{Engine, Snapshot};
 
 use crate::constants::{
-    CATALOG_MANAGED_FEATURE_KEY, ENABLE_IN_COMMIT_TIMESTAMPS, FEATURE_PREFIX, FEATURE_SUPPORTED,
-    METASTORE_LAST_COMMIT_TIMESTAMP, METASTORE_LAST_UPDATE_VERSION, MIN_READER_VERSION_KEY,
-    MIN_WRITER_VERSION_KEY, UC_TABLE_ID_KEY, VACUUM_PROTOCOL_CHECK_FEATURE_KEY,
+    CATALOG_MANAGED_FEATURE_KEY, ENABLE_IN_COMMIT_TIMESTAMPS, FEATURE_SUPPORTED,
+    METASTORE_LAST_COMMIT_TIMESTAMP, METASTORE_LAST_UPDATE_VERSION, UC_TABLE_ID_KEY,
+    VACUUM_PROTOCOL_CHECK_FEATURE_KEY,
 };
 
 /// Returns the table properties that must be written to disk (in `000.json`) for a UC catalog-managed table.
@@ -84,34 +84,19 @@ pub fn get_final_required_properties_for_uc(
     snapshot: &Snapshot,
     engine: &dyn Engine,
 ) -> delta_kernel::DeltaResult<HashMap<String, String>> {
+    if snapshot.version() != 0 {
+        return Err(delta_kernel::Error::generic(format!(
+            "get_final_required_properties_for_uc is only valid for version 0 (table creation) \
+             snapshots, but snapshot is at version {}",
+            snapshot.version()
+        )));
+    }
+
     // Start with metadata configuration (user + delta properties)
     let mut properties = snapshot.metadata_configuration().clone();
 
-    // Protocol-derived properties (versions + features)
-    properties.insert(
-        MIN_READER_VERSION_KEY.to_string(),
-        snapshot.min_reader_version().to_string(),
-    );
-    properties.insert(
-        MIN_WRITER_VERSION_KEY.to_string(),
-        snapshot.min_writer_version().to_string(),
-    );
-
-    // Feature signals: delta.feature.<name> = "supported" for all reader + writer features
-    if let Some(features) = snapshot.reader_features() {
-        for feature_name in features {
-            properties
-                .entry(format!("{FEATURE_PREFIX}{feature_name}"))
-                .or_insert_with(|| FEATURE_SUPPORTED.to_string());
-        }
-    }
-    if let Some(features) = snapshot.writer_features() {
-        for feature_name in features {
-            properties
-                .entry(format!("{FEATURE_PREFIX}{feature_name}"))
-                .or_insert_with(|| FEATURE_SUPPORTED.to_string());
-        }
-    }
+    // Protocol-derived properties (versions + feature signals)
+    properties.extend(snapshot.get_protocol_derived_properties());
 
     // UC-specific properties
     properties.insert(
@@ -129,7 +114,7 @@ pub fn get_final_required_properties_for_uc(
     );
 
     // Clustering columns as logical names (if present)
-    if let Some(columns) = snapshot.get_clustering_columns(engine)? {
+    if let Some(columns) = snapshot.get_logical_clustering_columns(engine)? {
         let column_arrays: Vec<Vec<&str>> = columns
             .iter()
             .map(|c| c.path().iter().map(|s| s.as_str()).collect())
@@ -278,6 +263,43 @@ mod tests {
         assert!(
             timestamp > 0,
             "ICT timestamp should be non-zero, got {timestamp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_final_required_properties_for_uc_rejects_non_zero_version() {
+        let storage = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(storage).build();
+        let table_path = "memory:///test_version_check/";
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap(),
+        );
+
+        // Create a table (version 0) and append (version 1)
+        let disk_props = get_required_properties_for_disk("test-table-id");
+        let _ = create_table(table_path, schema, "Test/1.0")
+            .with_table_properties(disk_props)
+            .build(&engine, Box::new(MockCatalogCommitter))
+            .unwrap()
+            .commit(&engine)
+            .unwrap();
+        let v0_snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
+        let result = v0_snapshot
+            .transaction(Box::new(MockCatalogCommitter), &engine)
+            .unwrap()
+            .commit(&engine)
+            .unwrap();
+        assert!(result.is_committed());
+
+        // Load snapshot at version 1
+        let snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
+        assert_eq!(snapshot.version(), 1);
+
+        // Should fail because version != 0
+        let err = get_final_required_properties_for_uc(&snapshot, &engine).unwrap_err();
+        assert!(
+            err.to_string().contains("version 0"),
+            "expected version 0 error, got: {err}"
         );
     }
 
