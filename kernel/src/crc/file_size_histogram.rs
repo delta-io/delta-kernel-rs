@@ -1,6 +1,3 @@
-// Placeholder for stacked pr
-#![allow(dead_code)]
-// Methods are consumed in follow-up steps (FileStatsVisitor, CrcDelta, Crc::apply).
 //! [`FileSizeHistogram`] tracks the distribution of file sizes across predefined bins.
 //!
 //! Used in CRC (version checksum) files to record the size distribution of active files in a
@@ -88,7 +85,6 @@ impl FileSizeHistogram {
     /// - All arrays have the same length (>= 2)
     /// - The first boundary is 0
     /// - Boundaries are sorted in ascending order
-    #[allow(dead_code)]
     pub(crate) fn try_new(
         sorted_bin_boundaries: Vec<i64>,
         file_counts: Vec<i64>,
@@ -129,6 +125,17 @@ impl FileSizeHistogram {
             file_counts,
             total_bytes,
         })
+    }
+
+    /// Creates an empty histogram with the given bin boundaries and zero counts/bytes.
+    ///
+    /// Used when a previous CRC has non-default boundaries and we need to build delta
+    /// histograms that match, so that `try_add`/`try_sub` succeed during merge.
+    pub(crate) fn create_empty_with_boundaries(
+        sorted_bin_boundaries: Vec<i64>,
+    ) -> DeltaResult<Self> {
+        let len = sorted_bin_boundaries.len();
+        Self::try_new(sorted_bin_boundaries, vec![0; len], vec![0; len])
     }
 
     /// Creates a default histogram with the standard 95 bin boundaries and zero counts.
@@ -270,6 +277,14 @@ mod tests {
         assert_eq!(hist.sorted_bin_boundaries[0], 0);
         assert!(hist.file_counts.iter().all(|&c| c == 0));
         assert!(hist.total_bytes.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn create_empty_with_boundaries_produces_zeroed_histogram() {
+        let hist = FileSizeHistogram::create_empty_with_boundaries(vec![0, 100, 1000]).unwrap();
+        assert_eq!(hist.sorted_bin_boundaries, vec![0, 100, 1000]);
+        assert_eq!(hist.file_counts, vec![0, 0, 0]);
+        assert_eq!(hist.total_bytes, vec![0, 0, 0]);
     }
 
     #[test]

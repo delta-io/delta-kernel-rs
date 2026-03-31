@@ -9,7 +9,7 @@ use delta_kernel::crc::{Crc, FileStatsValidity};
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::snapshot::{ChecksumWriteResult, FileStats, Snapshot, SnapshotRef};
+use delta_kernel::snapshot::{ChecksumWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Engine};
@@ -31,12 +31,10 @@ async fn test_get_file_stats_from_crc() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 0);
 
-    let file_stats = snapshot.get_file_stats(&engine);
-    let expected = FileStats {
-        table_size_bytes: 5259,
-        num_files: 10,
-    };
-    assert_eq!(file_stats, Some(expected));
+    let file_stats = snapshot.get_file_stats(&engine).unwrap();
+    assert_eq!(file_stats.num_files, 10);
+    assert_eq!(file_stats.table_size_bytes, 5259);
+    assert!(file_stats.file_size_histogram.is_some());
 
     Ok(())
 }

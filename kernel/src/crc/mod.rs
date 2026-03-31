@@ -18,7 +18,6 @@ mod writer;
 
 #[allow(unused)]
 pub(crate) use delta::CrcDelta;
-#[allow(unused)]
 pub(crate) use file_size_histogram::FileSizeHistogram;
 pub(crate) use file_stats::FileStats;
 #[allow(unused)]
@@ -135,7 +134,7 @@ pub struct Crc {
     )]
     pub domain_metadata: Option<HashMap<String, DomainMetadata>>,
     /// Size distribution information of files remaining after action reconciliation.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_size_histogram: Option<FileSizeHistogram>,
     /// All live [`Add`] file actions at this version.
     #[serde(skip)]
@@ -162,6 +161,7 @@ impl Crc {
             FileStatsValidity::Valid => Some(FileStats {
                 num_files: self.num_files,
                 table_size_bytes: self.table_size_bytes,
+                file_size_histogram: self.file_size_histogram.clone(),
             }),
             _ => None,
         }
