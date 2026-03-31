@@ -843,6 +843,18 @@ impl Snapshot {
         crc.file_stats()
     }
 
+    /// Returns the file size histogram bin boundaries from the loaded CRC, if available.
+    ///
+    /// Purely opportunistic: no I/O. Returns `None` if the CRC is not loaded, not at this
+    /// version, or has no histogram.
+    pub(crate) fn histogram_bin_boundaries(&self) -> Option<&[i64]> {
+        self.lazy_crc
+            .get_if_loaded_at_version(self.version())?
+            .file_size_histogram
+            .as_ref()
+            .map(|h| h.sorted_bin_boundaries.as_slice())
+    }
+
     /// Returns the CRC if one has been loaded at this snapshot's version (no I/O).
     ///
     /// This is a test-only helper for integration tests to inspect the CRC state.

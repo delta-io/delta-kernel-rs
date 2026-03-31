@@ -1002,9 +1002,11 @@ impl<S> Transaction<S> {
         in_commit_timestamp: Option<i64>,
         dm_changes: Vec<DomainMetadata>,
     ) -> DeltaResult<CrcDelta> {
+        let bin_boundaries = self.read_snapshot.histogram_bin_boundaries();
         let file_stats = FileStatsDelta::try_compute_for_txn(
             &self.add_files_metadata,
             &self.remove_files_metadata,
+            bin_boundaries,
         )?;
         let is_create = self.is_create_table();
         Ok(CrcDelta {

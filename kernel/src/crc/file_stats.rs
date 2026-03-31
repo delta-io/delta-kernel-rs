@@ -1,9 +1,8 @@
-// FileStatsDelta is not yet consumed outside this module.
-#![allow(dead_code)]
 //! File statistics and deltas for CRC tracking.
 //!
-//! [`FileStats`] represents absolute file-level statistics (count and size) for a table version.
-//! [`FileStatsDelta`] captures the net changes from a single commit.
+//! [`FileStats`] represents absolute file-level statistics (count, size, histogram) for a table
+//! version. [`FileStatsDelta`] captures the net changes from a single commit, including per-side
+//! [`FileSizeHistogram`]s for incremental histogram updates.
 //!
 //! [`FileStatsDelta`] captures how many files were added/removed and their total sizes. It can be
 //! produced from either:
@@ -12,12 +11,13 @@
 
 use std::sync::LazyLock;
 
+use super::FileSizeHistogram;
 use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, EngineData, Error, RowVisitor};
 
-/// File-level statistics for a table version: total file count and size.
+/// File-level statistics for a table version: total file count, size, and histogram.
 ///
 /// Obtained via [`Crc::file_stats()`](super::Crc::file_stats), which returns `None` when
 /// the stats are not known to be valid.
@@ -28,15 +28,23 @@ pub struct FileStats {
     /// Total size of the table in bytes (sum of all active
     /// [`Add`](crate::actions::Add) file sizes).
     pub table_size_bytes: i64,
+    /// Size distribution of active files, if available.
+    pub file_size_histogram: Option<FileSizeHistogram>,
 }
 
-/// Net file count and size changes from a single commit.
+/// Net file count and size changes from a single commit, with optional per-side histograms.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FileStatsDelta {
     /// Net change in file count (files added minus files removed).
     pub(crate) net_files: i64,
     /// Net change in total bytes (bytes added minus bytes removed).
     pub(crate) net_bytes: i64,
+    /// Histogram of file sizes added in this delta. `None` when the delta source does not
+    /// provide histogram data (e.g. forward log replay without histogram support).
+    pub(crate) added_histogram: Option<FileSizeHistogram>,
+    /// Histogram of file sizes removed in this delta. `None` when the delta source does not
+    /// provide histogram data.
+    pub(crate) removed_histogram: Option<FileSizeHistogram>,
 }
 
 impl FileStatsDelta {
@@ -63,40 +71,52 @@ impl FileStatsDelta {
         Self::INCREMENTAL_SAFE_OPS.contains(&operation)
     }
 
-    /// Compute file stats from a transaction's staged add and remove file metadata.
+    /// Compute file stats and histograms from a transaction's staged add and remove metadata.
     ///
     /// A commit writes three kinds of file actions:
     ///   (1) Add actions (from `add_files_metadata`)
     ///   (2) Remove actions (from `remove_files_metadata`)
-    ///   (3) DV update actions (which contain both a Remove and an Add for the same file at the same size).
+    ///   (3) DV update actions (which contain both a Remove and an Add for the same file at
+    ///       the same size).
     ///
-    /// Only the first two need visiting -- DV updates have a net-zero effect on file counts and sizes.
+    /// Only the first two need visiting -- DV updates have a net-zero effect on file counts,
+    /// sizes, and histograms.
+    ///
+    /// `bin_boundaries` specifies the histogram bin boundaries to use. When `Some`, the
+    /// delta histograms are built with those boundaries (matching the previous CRC's histogram).
+    /// When `None`, the standard default boundaries are used. Callers should pass the previous
+    /// CRC's boundaries when available so that `try_add`/`try_sub` in [`Crc::apply`] succeed.
     pub(crate) fn try_compute_for_txn(
         add_files_metadata: &[Box<dyn EngineData>],
         remove_files_metadata: &[FilteredEngineData],
+        bin_boundaries: Option<&[i64]>,
     ) -> DeltaResult<Self> {
         // Visit add files. Every row is a file being added (no selection vector).
-        let mut add_visitor = FileStatsVisitor::new(None);
+        let mut add_visitor = FileStatsVisitor::new(None, bin_boundaries)?;
         for batch in add_files_metadata {
             add_visitor.visit_rows_of(batch.as_ref())?;
         }
 
         // Visit remove files. Each FilteredEngineData has its own selection vector, so we
-        // create a visitor per batch and accumulate counts.
+        // create a visitor per batch and accumulate counts and histograms.
         let mut remove_count = 0i64;
         let mut remove_size = 0i64;
+        let mut remove_histogram = create_histogram(bin_boundaries)?;
         for filtered_batch in remove_files_metadata {
             let sv = filtered_batch.selection_vector();
             let sv_opt = if sv.is_empty() { None } else { Some(sv) };
-            let mut visitor = FileStatsVisitor::new(sv_opt);
+            let mut visitor = FileStatsVisitor::new(sv_opt, bin_boundaries)?;
             visitor.visit_rows_of(filtered_batch.data())?;
             remove_count += visitor.count;
             remove_size += visitor.total_size;
+            remove_histogram = remove_histogram.try_add(&visitor.histogram)?;
         }
 
         Ok(FileStatsDelta {
             net_files: add_visitor.count - remove_count,
             net_bytes: add_visitor.total_size - remove_size,
+            added_histogram: Some(add_visitor.histogram),
+            removed_histogram: Some(remove_histogram),
         })
     }
 }
@@ -117,16 +137,30 @@ struct FileStatsVisitor<'sv> {
     offset: usize,
     count: i64,
     total_size: i64,
+    /// Histogram tracking file size distribution for the visited files.
+    histogram: FileSizeHistogram,
 }
 
 impl<'sv> FileStatsVisitor<'sv> {
-    fn new(selection_vector: Option<&'sv [bool]>) -> Self {
-        Self {
+    fn new(
+        selection_vector: Option<&'sv [bool]>,
+        bin_boundaries: Option<&[i64]>,
+    ) -> DeltaResult<Self> {
+        Ok(Self {
             selection_vector,
             offset: 0,
             count: 0,
             total_size: 0,
-        }
+            histogram: create_histogram(bin_boundaries)?,
+        })
+    }
+}
+
+/// Creates an empty histogram using the given boundaries, or the default boundaries if `None`.
+fn create_histogram(bin_boundaries: Option<&[i64]>) -> DeltaResult<FileSizeHistogram> {
+    match bin_boundaries {
+        Some(b) => FileSizeHistogram::create_empty_with_boundaries(b.to_vec()),
+        None => Ok(FileSizeHistogram::create_default()),
     }
 }
 
@@ -154,6 +188,7 @@ impl RowVisitor for FileStatsVisitor<'_> {
                 let size: i64 = getters[0].get(i, "size")?;
                 self.count += 1;
                 self.total_size += size;
+                self.histogram.insert(size)?;
             }
         }
         self.offset += row_count;
@@ -177,34 +212,40 @@ mod tests {
     struct TryComputeCase {
         add_batches: Vec<Vec<i64>>,
         remove_batches: Vec<Vec<i64>>,
-        expected: FileStatsDelta,
+        expected_net_files: i64,
+        expected_net_bytes: i64,
     }
 
     #[rstest]
     #[case::empty(TryComputeCase {
         add_batches: vec![],
         remove_batches: vec![],
-        expected: FileStatsDelta { net_files: 0, net_bytes: 0 },
+        expected_net_files: 0,
+        expected_net_bytes: 0,
     })]
     #[case::adds_only(TryComputeCase {
         add_batches: vec![vec![100, 200, 300]],
         remove_batches: vec![],
-        expected: FileStatsDelta { net_files: 3, net_bytes: 600 }, // 600 = 100 + 200 + 300
+        expected_net_files: 3,
+        expected_net_bytes: 600, // 600 = 100 + 200 + 300
     })]
     #[case::multiple_add_batches(TryComputeCase {
         add_batches: vec![vec![100, 200], vec![300, 400, 500]],
         remove_batches: vec![],
-        expected: FileStatsDelta { net_files: 5, net_bytes: 1500 }, // 1500 = 100 + 200 + 300 + 400 + 500
+        expected_net_files: 5,
+        expected_net_bytes: 1500, // 1500 = 100 + 200 + 300 + 400 + 500
     })]
     #[case::removes_only(TryComputeCase {
         add_batches: vec![],
         remove_batches: vec![vec![500, 700]],
-        expected: FileStatsDelta { net_files: -2, net_bytes: -1200 }, // -1200 = -(500 + 700)
+        expected_net_files: -2,
+        expected_net_bytes: -1200, // -1200 = -(500 + 700)
     })]
     #[case::adds_and_removes(TryComputeCase {
         add_batches: vec![vec![100, 200], vec![300, 400]],
         remove_batches: vec![vec![500], vec![600, 700]],
-        expected: FileStatsDelta { net_files: 1, net_bytes: -800 }, // -800 = (100 + 200 + 300 + 400) -(500 + 600 + 700)
+        expected_net_files: 1,
+        expected_net_bytes: -800, // -800 = (100 + 200 + 300 + 400) -(500 + 600 + 700)
     })]
     fn test_try_compute(#[case] case: TryComputeCase) {
         let adds: Vec<_> = case.add_batches.into_iter().map(size_batch).collect();
@@ -213,8 +254,9 @@ mod tests {
             .into_iter()
             .map(|sizes| FilteredEngineData::with_all_rows_selected(size_batch(sizes)))
             .collect();
-        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes).unwrap();
-        assert_eq!(stats, case.expected);
+        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
+        assert_eq!(stats.net_files, case.expected_net_files);
+        assert_eq!(stats.net_bytes, case.expected_net_bytes);
     }
 
     #[test]
@@ -228,10 +270,103 @@ mod tests {
             FilteredEngineData::try_new(size_batch(vec![600, 700, 800]), vec![false, true, true])
                 .unwrap(),
         ];
-        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes).unwrap();
+        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
         // adds: 3 files, 600 bytes (100 + 200 + 300)
         // removes: 4 files, 2400 bytes (400 + 500 + 700 + 800)
         assert_eq!(stats.net_files, -1); // 3 - 4
         assert_eq!(stats.net_bytes, -1800); // 600 - 2400
+    }
+
+    #[test]
+    fn try_compute_builds_histograms_from_add_and_remove_sizes() {
+        let adds = vec![size_batch(vec![100, 200, 300])];
+        let removes = vec![FilteredEngineData::with_all_rows_selected(size_batch(
+            vec![500, 700],
+        ))];
+        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
+
+        // All sizes < 8KB so they all land in bin 0
+        let added = stats.added_histogram.unwrap();
+        assert_eq!(added.file_counts[0], 3);
+        assert_eq!(added.total_bytes[0], 600);
+        let removed = stats.removed_histogram.unwrap();
+        assert_eq!(removed.file_counts[0], 2);
+        assert_eq!(removed.total_bytes[0], 1200);
+    }
+
+    #[test]
+    fn try_compute_empty_batches_produce_zero_histograms() {
+        let stats = FileStatsDelta::try_compute_for_txn(&[], &[], None).unwrap();
+        let added = stats.added_histogram.unwrap();
+        assert!(added.file_counts.iter().all(|&c| c == 0));
+        let removed = stats.removed_histogram.unwrap();
+        assert!(removed.file_counts.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn try_compute_histograms_with_selection_vectors() {
+        let adds = vec![size_batch(vec![100, 200])];
+        let removes = vec![FilteredEngineData::try_new(
+            size_batch(vec![300, 400, 500]),
+            vec![true, false, true], // 300 selected, 400 skipped, 500 selected
+        )
+        .unwrap()];
+        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
+
+        let added = stats.added_histogram.unwrap();
+        assert_eq!(added.file_counts[0], 2);
+        assert_eq!(added.total_bytes[0], 300);
+        // Only 300 and 500 are selected (400 skipped)
+        let removed = stats.removed_histogram.unwrap();
+        assert_eq!(removed.file_counts[0], 2);
+        assert_eq!(removed.total_bytes[0], 800);
+    }
+
+    #[test]
+    fn try_compute_with_custom_boundaries_uses_them() {
+        // Custom 3-bin histogram: [0, 200) [200, 1000) [1000, inf)
+        let boundaries: &[i64] = &[0, 200, 1000];
+        let adds = vec![size_batch(vec![50, 300, 1500])];
+        let removes = vec![FilteredEngineData::with_all_rows_selected(size_batch(
+            vec![100, 500],
+        ))];
+        let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, Some(boundaries)).unwrap();
+
+        let added = stats.added_histogram.unwrap();
+        assert_eq!(added.sorted_bin_boundaries, vec![0, 200, 1000]);
+        assert_eq!(added.file_counts, vec![1, 1, 1]); // 50 in bin 0, 300 in bin 1, 1500 in bin 2
+        assert_eq!(added.total_bytes, vec![50, 300, 1500]);
+
+        let removed = stats.removed_histogram.unwrap();
+        assert_eq!(removed.sorted_bin_boundaries, vec![0, 200, 1000]);
+        assert_eq!(removed.file_counts, vec![1, 1, 0]); // 100 in bin 0, 500 in bin 1
+        assert_eq!(removed.total_bytes, vec![100, 500, 0]);
+    }
+
+    #[test]
+    fn try_compute_with_custom_boundaries_produces_mergeable_histograms() {
+        // Build a base histogram with custom boundaries, then verify delta histograms merge.
+        let boundaries = vec![0, 200, 1000];
+        let mut base = FileSizeHistogram::create_empty_with_boundaries(boundaries.clone()).unwrap();
+        base.insert(150).unwrap(); // bin 0
+        base.insert(500).unwrap(); // bin 1
+
+        let adds = vec![size_batch(vec![100, 300])];
+        let removes = vec![FilteredEngineData::with_all_rows_selected(size_batch(
+            vec![150],
+        ))];
+        let stats =
+            FileStatsDelta::try_compute_for_txn(&adds, &removes, Some(&boundaries)).unwrap();
+
+        let added = stats.added_histogram.unwrap();
+        let removed = stats.removed_histogram.unwrap();
+
+        // Merge: base + added - removed should succeed (boundaries match)
+        let merged = base
+            .try_add(&added)
+            .and_then(|h| h.try_sub(&removed))
+            .unwrap();
+        assert_eq!(merged.file_counts, vec![1, 2, 0]); // (1+1-1), (1+1-0), (0+0-0)
+        assert_eq!(merged.total_bytes, vec![100, 800, 0]); // (150+100-150), (500+300-0)
     }
 }
