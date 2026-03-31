@@ -119,47 +119,58 @@ impl EnsureDataTypes {
                 Ok(DataTypeCompat::Nested)
             }
             (DataType::Struct(kernel_fields), ArrowDataType::Struct(arrow_fields)) => {
-                if matches!(self.mode, ValidationMode::TypesOnly) {
-                    // Ordinal matching: check field count and types by position, ignore names.
-                    // This is used when column mapping can cause name mismatches between
-                    // physical (arrow) and logical (kernel) field names.
-                    require!(kernel_fields.num_fields() == arrow_fields.len(), {
-                        make_arrow_error(format!(
-                            "Struct field count mismatch: expected {}, got {}",
-                            kernel_fields.num_fields(),
-                            arrow_fields.len()
-                        ))
-                    });
-                    for (kernel_field, arrow_field) in
-                        kernel_fields.fields().zip(arrow_fields.iter())
-                    {
-                        self.ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
+                match self.mode {
+                    ValidationMode::TypesOnly => {
+                        // Ordinal matching: check field count and types by position,
+                        // ignore names. Column mapping can cause name mismatches between
+                        // physical (arrow) and logical (kernel) field names.
+                        require!(kernel_fields.num_fields() == arrow_fields.len(), {
+                            make_arrow_error(format!(
+                                "Struct field count mismatch: expected {}, got {}",
+                                kernel_fields.num_fields(),
+                                arrow_fields.len()
+                            ))
+                        });
+                        for (kernel_field, arrow_field) in
+                            kernel_fields.fields().zip(arrow_fields.iter())
+                        {
+                            self.ensure_data_types(
+                                &kernel_field.data_type,
+                                arrow_field.data_type(),
+                            )?;
+                        }
                     }
-                } else {
-                    // Name-based matching: look up kernel fields by arrow field name.
-                    let mapped_fields = arrow_fields
-                        .iter()
-                        .filter_map(|f| kernel_fields.field(f.name()));
+                    ValidationMode::TypesAndNames | ValidationMode::Full => {
+                        // Name-based matching: look up kernel fields by arrow field name.
+                        // Full mode additionally checks nullability and metadata.
+                        let mapped_fields = arrow_fields
+                            .iter()
+                            .filter_map(|f| kernel_fields.field(f.name()));
 
-                    let mut found_fields = 0;
-                    for (kernel_field, arrow_field) in mapped_fields.zip(arrow_fields) {
-                        self.ensure_nullability_and_metadata(kernel_field, arrow_field)?;
-                        self.ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
-                        found_fields += 1;
+                        let mut found_fields = 0;
+                        for (kernel_field, arrow_field) in mapped_fields.zip(arrow_fields) {
+                            self.ensure_nullability_and_metadata(kernel_field, arrow_field)?;
+                            self.ensure_data_types(
+                                &kernel_field.data_type,
+                                arrow_field.data_type(),
+                            )?;
+                            found_fields += 1;
+                        }
+
+                        require!(kernel_fields.num_fields() == found_fields, {
+                            let arrow_field_map: HashSet<&String> =
+                                HashSet::from_iter(arrow_fields.iter().map(|f| f.name()));
+                            let missing_field_names = kernel_fields
+                                .field_names()
+                                .filter(|kernel_field| !arrow_field_map.contains(kernel_field))
+                                .take(5)
+                                .join(", ");
+                            make_arrow_error(format!(
+                                "Missing Struct fields {missing_field_names} \
+                                 (Up to five missing fields shown)"
+                            ))
+                        });
                     }
-
-                    require!(kernel_fields.num_fields() == found_fields, {
-                        let arrow_field_map: HashSet<&String> =
-                            HashSet::from_iter(arrow_fields.iter().map(|f| f.name()));
-                        let missing_field_names = kernel_fields
-                            .field_names()
-                            .filter(|kernel_field| !arrow_field_map.contains(kernel_field))
-                            .take(5)
-                            .join(", ");
-                        make_arrow_error(format!(
-                            "Missing Struct fields {missing_field_names} (Up to five missing fields shown)"
-                        ))
-                    });
                 }
                 Ok(DataTypeCompat::Nested)
             }
