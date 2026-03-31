@@ -149,6 +149,7 @@ mod tests {
             12345,
             Some(0),
             CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None).unwrap(),
+            vec![],
         );
         let actions = Box::new(std::iter::empty());
 
@@ -187,6 +188,7 @@ mod tests {
             Some(0),
             CommitProtocolMetadata::try_new(Some(protocol.clone()), Some(metadata1), None, None)
                 .unwrap(),
+            vec![],
         );
         let second_metadata = CommitMetadata::new(
             LogRoot::new(table_root).unwrap(),
@@ -195,6 +197,7 @@ mod tests {
             12346,
             Some(0),
             CommitProtocolMetadata::try_new(Some(protocol), Some(metadata2), None, None).unwrap(),
+            vec![],
         );
 
         let first = committer

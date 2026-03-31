@@ -6,9 +6,8 @@ use tracing::{debug, info};
 use unity_catalog_delta_client_api::{Commit, CommitClient, CommitRequest};
 
 use crate::constants::{
-    CATALOG_MANAGED_FEATURE, CATALOG_OWNED_PREVIEW_FEATURE, CLUSTERING_DOMAIN_NAME,
-    ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_FEATURE, UC_TABLE_ID_KEY,
-    VACUUM_PROTOCOL_CHECK_FEATURE,
+    CATALOG_MANAGED_FEATURE, CLUSTERING_DOMAIN_NAME, ENABLE_IN_COMMIT_TIMESTAMPS,
+    IN_COMMIT_TIMESTAMP_FEATURE, UC_TABLE_ID_KEY, VACUUM_PROTOCOL_CHECK_FEATURE,
 };
 
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
@@ -40,14 +39,11 @@ impl<C: CommitClient> UCCommitter<C> {
         }
     }
 
-    /// Returns true if the commit metadata has either the `catalogManaged` or
-    /// `catalogOwned-preview` feature in both reader and writer features.
+    /// Returns true if the commit metadata has the `catalogManaged` feature in both reader and
+    /// writer features.
     fn has_catalog_managed_feature(commit_metadata: &CommitMetadata) -> bool {
-        let has_cm = commit_metadata.has_writer_feature(CATALOG_MANAGED_FEATURE)
-            && commit_metadata.has_reader_feature(CATALOG_MANAGED_FEATURE);
-        let has_preview = commit_metadata.has_writer_feature(CATALOG_OWNED_PREVIEW_FEATURE)
-            && commit_metadata.has_reader_feature(CATALOG_OWNED_PREVIEW_FEATURE);
-        has_cm || has_preview
+        commit_metadata.has_writer_feature(CATALOG_MANAGED_FEATURE)
+            && commit_metadata.has_reader_feature(CATALOG_MANAGED_FEATURE)
     }
 
     /// Validates that the commit metadata contains all required properties for a UC
@@ -55,8 +51,8 @@ impl<C: CommitClient> UCCommitter<C> {
     fn validate_version_0_properties(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
         if !Self::has_catalog_managed_feature(commit_metadata) {
             return Err(DeltaError::generic(
-                "UC catalog-managed table creation requires the 'catalogManaged' or \
-                 'catalogOwned-preview' table feature in both readerFeatures and writerFeatures",
+                "UC catalog-managed table creation requires the 'catalogManaged' table feature \
+                 in both readerFeatures and writerFeatures",
             ));
         }
         if !commit_metadata.has_writer_feature(VACUUM_PROTOCOL_CHECK_FEATURE)
@@ -97,9 +93,8 @@ impl<C: CommitClient> UCCommitter<C> {
         // changes, ensures catalog-managed status cannot be removed.
         if !Self::has_catalog_managed_feature(commit_metadata) {
             return Err(DeltaError::generic(
-                "UCCommitter requires the 'catalogManaged' or 'catalogOwned-preview' table feature \
-                 in both readerFeatures and writerFeatures. Catalog-managed status cannot be \
-                 changed after table creation.",
+                "UCCommitter requires the 'catalogManaged' table feature in both readerFeatures \
+                 and writerFeatures. Catalog-managed status cannot be changed after table creation.",
             ));
         }
         Ok(())
