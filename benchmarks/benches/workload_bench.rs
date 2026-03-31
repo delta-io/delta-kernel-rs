@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -10,12 +9,10 @@ use delta_kernel_benchmarks::runners::{
     create_read_runner, SnapshotConstructionRunner, WorkloadRunner,
 };
 use delta_kernel_benchmarks::utils::load_all_workloads;
-use test_utils::CountingReporter;
 
 // Loads all workloads, then registers each as a top-level benchmark.
 // For each workload, builds a runner that encapsulates the state (table info, engine, config, etc.)
-// and execution logic. After each Criterion timing pass, runs one IO-profiling iteration and
-// prints per-call storage and log-replay counts.
+// and execution logic.
 fn workload_benchmarks(c: &mut Criterion) {
     let workloads = match load_all_workloads() {
         Ok(workloads) if !workloads.is_empty() => workloads,
@@ -23,8 +20,8 @@ fn workload_benchmarks(c: &mut Criterion) {
         Err(e) => panic!("Failed to load workloads: {e}"),
     };
 
-    let reporter = Arc::new(CountingReporter::new());
-    let runtime = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"));
+    let runtime =
+        Arc::new(tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"));
 
     for workload in &workloads {
         match &workload.spec {
@@ -40,7 +37,7 @@ fn workload_benchmarks(c: &mut Criterion) {
                             runtime.clone(),
                         )
                         .expect("Failed to create read runner");
-                        run_benchmark(c, runner.as_ref(), &reporter);
+                        run_benchmark(c, runner.as_ref());
                     }
                 }
             }
@@ -52,27 +49,18 @@ fn workload_benchmarks(c: &mut Criterion) {
                     runtime.clone(),
                 )
                 .expect("Failed to create snapshot construction runner");
-                run_benchmark(c, &runner, &reporter);
+                run_benchmark(c, &runner);
             }
         }
     }
 }
 
 // Registers a workload with Criterion and benchmarks its `execute()` function.
-// After timing completes, runs one IO-profiling iteration and prints per-call storage and
-// log-replay counts. The IO profile is skipped entirely when Criterion filters out the benchmark,
-// since Criterion never calls the closure for filtered benchmarks.
-fn run_benchmark(c: &mut Criterion, runner: &dyn WorkloadRunner, reporter: &CountingReporter) {
-    let bench_ran = AtomicBool::new(false);
+// TODO: Wire CountingReporter into engines for IO profiling (removed during engine refactor).
+fn run_benchmark(c: &mut Criterion, runner: &dyn WorkloadRunner) {
     c.bench_function(runner.name(), |b| {
-        bench_ran.store(true, Ordering::Relaxed);
         b.iter(|| runner.execute().expect("Benchmark execution failed"))
     });
-    if bench_ran.load(Ordering::Relaxed) {
-        reporter.reset();
-        runner.execute().expect("IO profiling iteration failed");
-        reporter.print_summary(runner.name());
-    }
 }
 
 fn build_read_configs(table_name: &str) -> Vec<ReadConfig> {

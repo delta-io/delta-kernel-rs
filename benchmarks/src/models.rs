@@ -30,11 +30,13 @@ pub enum ParallelScan {
     Enabled { num_threads: usize },
 }
 
-/// Info needed to access a catalog-managed table via credential vending
+/// Info needed to access a UC-managed table via credential vending.
+/// This covers both catalog-managed (CCv2) and non-catalog-managed UC tables.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CatalogManagedInfo {
-    pub table_name: String, // fully-qualified name: "catalog.schema.table"
+pub struct UcTableInfo {
+    /// Fully-qualified table name: "catalog.schema.table"
+    pub table_name: String,
 }
 
 /// Table info JSON files are located at the root of each table directory
@@ -50,11 +52,15 @@ pub struct TableInfo {
     pub description: String,
     /// URL to the table. Used for remote tables (e.g. `s3://my-bucket/my-table`) or (rarely)
     /// absolute local paths. If `None`, the table is assumed to be in the `delta/` subdirectory
-    /// next to `tableInfo.json`.
+    /// next to `tableInfo.json`. Mutually exclusive with `uc_table_info`.
     pub table_path: Option<Url>,
-    /// Info needed to access a catalog-managed table via credential vending.
-    /// When present, the engine is set up with catalog credentials instead of local/S3 access.
-    pub catalog_managed_info: Option<CatalogManagedInfo>,
+    /// Info needed to access a UC-managed table via credential vending.
+    /// When present, the engine is set up with UC-vended credentials instead of local/S3 access.
+    /// Whether to use `UCKernelClient` (catalog-managed) or standard snapshot builder is
+    /// determined by the `delta.feature.catalogManaged` property.
+    /// Mutually exclusive with `table_path`.
+    #[serde(alias = "catalogManagedInfo")]
+    pub uc_table_info: Option<UcTableInfo>,
     /// Schema at the latest version of the table, in Delta protocol JSON format
     /// e.g. `{"type": "struct", "fields": [...]}`
     pub schema: Schema,
@@ -97,6 +103,12 @@ impl TableInfo {
     pub fn from_json_path<P: AsRef<Path>>(path: P) -> Result<Self, serde_json::Error> {
         let content = std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
         let mut table_info: TableInfo = serde_json::from_str(&content)?;
+        if table_info.uc_table_info.is_some() && table_info.table_path.is_some() {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "uc_table_info and table_path are mutually exclusive",
+            )));
+        }
         // Stores the parent directory of the `tableInfo.json` file
         if let Some(parent) = path.as_ref().parent() {
             table_info.table_info_dir = parent.to_path_buf();
@@ -429,20 +441,34 @@ mod tests {
         false,
         ""
     )]
-    fn test_deserialize_catalog_managed_info(
+    fn test_deserialize_uc_table_info_field(
         #[case] json: &str,
         #[case] expect_present: bool,
         #[case] expected_table_name: &str,
     ) {
         let table_info: TableInfo =
             serde_json::from_str(json).expect("Failed to deserialize table info");
-        assert_eq!(table_info.catalog_managed_info.is_some(), expect_present);
+        assert_eq!(table_info.uc_table_info.is_some(), expect_present);
         if expect_present {
             assert_eq!(
-                table_info.catalog_managed_info.unwrap().table_name,
+                table_info.uc_table_info.unwrap().table_name,
                 expected_table_name
             );
         }
+    }
+
+    #[test]
+    fn test_time_travel_as_version_returns_version() {
+        let tt = TimeTravel::Version { version: 42 };
+        assert_eq!(tt.as_version(), Ok(42));
+    }
+
+    #[test]
+    fn test_time_travel_as_version_rejects_timestamp() {
+        let tt = TimeTravel::Timestamp {
+            timestamp: "2024-01-01".to_string(),
+        };
+        assert!(tt.as_version().is_err());
     }
 
     #[rstest]

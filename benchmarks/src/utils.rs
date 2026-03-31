@@ -22,6 +22,8 @@ const DELTA_DIR_NAME: &str = "delta";
 /// only workloads whose `table_info.json` has at least one matching tag are returned.
 /// If `BENCH_TAGS` is unset or empty, all workloads are returned.
 pub fn load_all_workloads() -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
+    // When KERNEL_BENCH_WORKLOAD_DIR is set, tag filtering is skipped -- remote workload
+    // directories are assumed to be curated, so all tables in the directory are benchmarked.
     let (base_dir, required_tags) = if let Ok(dir) = std::env::var("KERNEL_BENCH_WORKLOAD_DIR") {
         (PathBuf::from(dir), None)
     } else {
@@ -34,7 +36,7 @@ pub fn load_all_workloads() -> Result<Vec<Workload>, Box<dyn std::error::Error>>
     let mut all_workloads = Vec::new();
 
     for table_dir in table_directories {
-        all_workloads.extend(load_specs_from_table(&table_dir, required_tags.as_ref())?);
+        all_workloads.extend(load_specs_from_table(&table_dir, required_tags.as_deref())?);
     }
 
     Ok(all_workloads)
@@ -78,7 +80,7 @@ fn find_table_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::
 /// Otherwise, a specific table is included (not skipped by this function) if any of its tags appear in `required_tags` (uses union semantics)
 fn load_specs_from_table(
     table_dir: &Path,
-    required_tags: Option<&Vec<String>>,
+    required_tags: Option<&[String]>,
 ) -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
     let specs_dir = table_dir.join(SPECS_DIR_NAME);
 
@@ -102,9 +104,9 @@ fn load_specs_from_table(
         }
     }
 
-    // Remote tables (table_path or catalog_managed_info set) don't need local data.
+    // Remote tables (table_path or uc_table_info present) don't need local data.
     // Local tables must have a delta/ subdirectory next to tableInfo.json.
-    let is_remote = table_info.table_path.is_some() || table_info.catalog_managed_info.is_some();
+    let is_remote = table_info.table_path.is_some() || table_info.uc_table_info.is_some();
     if !is_remote {
         let delta_dir = table_dir.join(DELTA_DIR_NAME);
         if !delta_dir.is_dir() {
