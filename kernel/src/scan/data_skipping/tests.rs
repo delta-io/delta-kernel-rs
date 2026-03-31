@@ -350,14 +350,15 @@ fn test_sql_where() {
     do_test(ALL_NULL, pred, PRESENT, None, Some(false));
     do_test(ALL_NULL, pred, MISSING, None, None);
 
-    // Comparison inside OR works
+    // Comparison inside OR: null-safety wrapping is NOT pushed into OR children, so
+    // all-null columns produce NULL (= can't skip) instead of FALSE.
     let pred = &Pred::or(FALSE, Pred::lt(col.clone(), VAL));
-    do_test(ALL_NULL, pred, PRESENT, None, Some(false));
+    do_test(ALL_NULL, pred, PRESENT, None, None);
     do_test(ALL_NULL, pred, MISSING, None, None);
 
-    // Comparison inside AND inside OR works
+    // Comparison inside AND inside OR: the OR prevents null-wrapping from reaching the AND
     let pred = &Pred::or(FALSE, Pred::and(TRUE, Pred::lt(col.clone(), VAL)));
-    do_test(ALL_NULL, pred, PRESENT, None, Some(false));
+    do_test(ALL_NULL, pred, PRESENT, None, None);
     do_test(ALL_NULL, pred, MISSING, None, None);
 }
 
