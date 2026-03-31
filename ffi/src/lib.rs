@@ -163,7 +163,7 @@ impl<T> From<Option<T>> for OptionalValue<T> {
 
 /// FFI-safe representation of the column mapping mode for a Delta table.
 #[repr(C)]
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum KernelColumnMappingMode {
     /// No column mapping is applied
     None = 0,
@@ -175,11 +175,10 @@ pub enum KernelColumnMappingMode {
 
 impl From<delta_kernel::table_features::ColumnMappingMode> for KernelColumnMappingMode {
     fn from(mode: delta_kernel::table_features::ColumnMappingMode) -> Self {
-        use delta_kernel::table_features::ColumnMappingMode;
         match mode {
-            ColumnMappingMode::None => KernelColumnMappingMode::None,
-            ColumnMappingMode::Id => KernelColumnMappingMode::Id,
-            ColumnMappingMode::Name => KernelColumnMappingMode::Name,
+            delta_kernel::table_features::ColumnMappingMode::None => KernelColumnMappingMode::None,
+            delta_kernel::table_features::ColumnMappingMode::Id => KernelColumnMappingMode::Id,
+            delta_kernel::table_features::ColumnMappingMode::Name => KernelColumnMappingMode::Name,
         }
     }
 }
@@ -925,7 +924,8 @@ pub unsafe extern "C" fn get_partition_columns(
     iter.into()
 }
 
-/// Get the minimum reader version from the protocol of the specified snapshot.
+/// Get the minimum reader version from the protocol of the specified snapshot. Returns the
+/// `minReaderVersion` field from the Protocol action (an integer >= 1).
 ///
 /// # Safety
 ///
@@ -939,7 +939,8 @@ pub unsafe extern "C" fn snapshot_min_reader_version(snapshot: Handle<SharedSnap
         .min_reader_version()
 }
 
-/// Get the minimum writer version from the protocol of the specified snapshot.
+/// Get the minimum writer version from the protocol of the specified snapshot. Returns the
+/// `minWriterVersion` field from the Protocol action (an integer >= 1).
 ///
 /// # Safety
 ///
@@ -953,7 +954,7 @@ pub unsafe extern "C" fn snapshot_min_writer_version(snapshot: Handle<SharedSnap
         .min_writer_version()
 }
 
-/// The column mapping mode for the table at the specified snapshot.
+/// Get the column mapping mode for the table at the specified snapshot.
 ///
 /// # Safety
 ///
@@ -982,7 +983,7 @@ pub unsafe extern "C" fn snapshot_metadata_id(
 }
 
 /// Look up a single table property by key from the specified snapshot's metadata configuration.
-/// Returns null if the key is not found.
+/// Returns null if the key is not found or if `key` is not valid UTF-8.
 ///
 /// # Safety
 ///
@@ -999,6 +1000,7 @@ pub unsafe extern "C" fn snapshot_table_property(
         Ok(k) => k,
         Err(_) => return None,
     };
+    // TableProperties is a typed struct; arbitrary key lookup requires the raw configuration map.
     match snapshot
         .table_configuration()
         .metadata()
@@ -1690,6 +1692,68 @@ mod tests {
         let writer_v = unsafe { snapshot_min_writer_version(snap.shallow_copy()) };
         assert_eq!(reader_v, 2);
         assert_eq!(writer_v, 5);
+
+        unsafe { free_snapshot(snap) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_column_mapping_mode_id() -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        let metadata_with_id_mapping = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
+{"protocol":{"minReaderVersion":2,"minWriterVersion":5}}
+{"metaData":{"id":"test-col-mapping-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-id-1\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"id"},"createdTime":1587968585495}}"#;
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            metadata_with_id_mapping.to_string(),
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        let mode = unsafe { snapshot_column_mapping_mode(snap.shallow_copy()) };
+        assert_eq!(mode, KernelColumnMappingMode::Id);
+
+        unsafe { free_snapshot(snap) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_protocol_versions_table_features(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        // Protocol v3/v7 with explicit reader/writer features
+        let metadata_v3_v7 = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}
+{"metaData":{"id":"test-v3-v7","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+        add_commit(table_root, storage.as_ref(), 0, metadata_v3_v7.to_string()).await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        let reader_v = unsafe { snapshot_min_reader_version(snap.shallow_copy()) };
+        let writer_v = unsafe { snapshot_min_writer_version(snap.shallow_copy()) };
+        assert_eq!(reader_v, 3);
+        assert_eq!(writer_v, 7);
 
         unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
