@@ -161,6 +161,29 @@ impl<T> From<Option<T>> for OptionalValue<T> {
     }
 }
 
+/// FFI-safe representation of the column mapping mode for a Delta table.
+#[repr(C)]
+#[derive(Debug, PartialEq)]
+pub enum KernelColumnMappingMode {
+    /// No column mapping is applied
+    None = 0,
+    /// Columns are mapped by their field_id in parquet
+    Id = 1,
+    /// Columns are mapped to a physical name
+    Name = 2,
+}
+
+impl From<delta_kernel::table_features::ColumnMappingMode> for KernelColumnMappingMode {
+    fn from(mode: delta_kernel::table_features::ColumnMappingMode) -> Self {
+        use delta_kernel::table_features::ColumnMappingMode;
+        match mode {
+            ColumnMappingMode::None => KernelColumnMappingMode::None,
+            ColumnMappingMode::Id => KernelColumnMappingMode::Id,
+            ColumnMappingMode::Name => KernelColumnMappingMode::Name,
+        }
+    }
+}
+
 /// Creates a new [`KernelStringSlice`] from a string reference (which must be an identifier, to
 /// ensure it is not immediately dropped). This is the safest way to create a kernel string slice.
 ///
@@ -902,6 +925,91 @@ pub unsafe extern "C" fn get_partition_columns(
     iter.into()
 }
 
+/// Get the minimum reader version from the protocol of the specified snapshot.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_min_reader_version(snapshot: Handle<SharedSnapshot>) -> i32 {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .table_configuration()
+        .protocol()
+        .min_reader_version()
+}
+
+/// Get the minimum writer version from the protocol of the specified snapshot.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_min_writer_version(snapshot: Handle<SharedSnapshot>) -> i32 {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .table_configuration()
+        .protocol()
+        .min_writer_version()
+}
+
+/// The column mapping mode for the table at the specified snapshot.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_column_mapping_mode(
+    snapshot: Handle<SharedSnapshot>,
+) -> KernelColumnMappingMode {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot.table_configuration().column_mapping_mode().into()
+}
+
+/// Get the metadata ID (table UUID) of the specified snapshot.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle and a valid `allocate_fn`.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_metadata_id(
+    snapshot: Handle<SharedSnapshot>,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let id = snapshot.table_configuration().metadata().id();
+    allocate_fn(kernel_string_slice!(id))
+}
+
+/// Look up a single table property by key from the specified snapshot's metadata configuration.
+/// Returns null if the key is not found.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle, a valid `key`, and a valid
+/// `allocate_fn`.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_table_property(
+    snapshot: Handle<SharedSnapshot>,
+    key: KernelStringSlice,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let key: &str = match unsafe { TryFromStringSlice::try_from_slice(&key) } {
+        Ok(k) => k,
+        Err(_) => return None,
+    };
+    match snapshot
+        .table_configuration()
+        .metadata()
+        .configuration()
+        .get(key)
+    {
+        Some(value) => allocate_fn(kernel_string_slice!(value)),
+        None => None,
+    }
+}
+
 /// Visit each metadata configuration (key/value pair) for the specified snapshot by invoking the provided
 /// `visitor` callback once per entry.
 ///
@@ -1483,6 +1591,223 @@ mod tests {
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_snapshot(snapshot2) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_protocol_versions() -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        // METADATA uses minReaderVersion=1, minWriterVersion=2
+        let reader_v = unsafe { snapshot_min_reader_version(snap.shallow_copy()) };
+        let writer_v = unsafe { snapshot_min_writer_version(snap.shallow_copy()) };
+        assert_eq!(reader_v, 1);
+        assert_eq!(writer_v, 2);
+
+        unsafe { free_snapshot(snap) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_column_mapping_mode_none() -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        let mode = unsafe { snapshot_column_mapping_mode(snap.shallow_copy()) };
+        assert_eq!(mode, KernelColumnMappingMode::None);
+
+        unsafe { free_snapshot(snap) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_column_mapping_mode_name() -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        // Use protocol v2/v5 with column mapping = name. Schema fields must include
+        // delta.columnMapping.id and delta.columnMapping.physicalName annotations.
+        let metadata_with_column_mapping = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
+{"protocol":{"minReaderVersion":2,"minWriterVersion":5}}
+{"metaData":{"id":"test-col-mapping","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-abc-123\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name"},"createdTime":1587968585495}}"#;
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            metadata_with_column_mapping.to_string(),
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        let mode = unsafe { snapshot_column_mapping_mode(snap.shallow_copy()) };
+        assert_eq!(mode, KernelColumnMappingMode::Name);
+
+        // Also verify protocol versions for this metadata
+        let reader_v = unsafe { snapshot_min_reader_version(snap.shallow_copy()) };
+        let writer_v = unsafe { snapshot_min_writer_version(snap.shallow_copy()) };
+        assert_eq!(reader_v, 2);
+        assert_eq!(writer_v, 5);
+
+        unsafe { free_snapshot(snap) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_metadata_id() -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        let id_ptr = unsafe { snapshot_metadata_id(snap.shallow_copy(), allocate_str) };
+        assert!(id_ptr.is_some());
+        let id = recover_string(id_ptr.unwrap());
+        // METADATA has id "5fba94ed-9794-4965-ba6e-6ee3c0d22af9"
+        assert_eq!(id, "5fba94ed-9794-4965-ba6e-6ee3c0d22af9");
+
+        unsafe { free_snapshot(snap) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_table_property_found() -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string_with_metadata(
+                vec![TestAction::Metadata],
+                METADATA_WITH_TABLE_PROPERTIES,
+            ),
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        // Look up an existing property
+        let key = "delta.appendOnly";
+        let val_ptr = unsafe {
+            snapshot_table_property(snap.shallow_copy(), kernel_string_slice!(key), allocate_str)
+        };
+        assert!(val_ptr.is_some());
+        let val = recover_string(val_ptr.unwrap());
+        assert_eq!(val, "true");
+
+        // Look up another existing property
+        let key2 = "custom.key";
+        let val_ptr2 = unsafe {
+            snapshot_table_property(
+                snap.shallow_copy(),
+                kernel_string_slice!(key2),
+                allocate_str,
+            )
+        };
+        assert!(val_ptr2.is_some());
+        let val2 = recover_string(val_ptr2.unwrap());
+        assert_eq!(val2, "custom_value");
+
+        unsafe { free_snapshot(snap) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_table_property_not_found() -> Result<(), Box<dyn std::error::Error>> {
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        // Look up a non-existent property -- should return None
+        let key = "nonexistent.property";
+        let val_ptr = unsafe {
+            snapshot_table_property(snap.shallow_copy(), kernel_string_slice!(key), allocate_str)
+        };
+        assert!(val_ptr.is_none());
+
+        unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
         Ok(())
     }
