@@ -86,7 +86,6 @@ impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
         // max_catalog_version for snapshot building, and as the effective version when no
         // explicit time-travel version is requested.
         let catalog_version: Version = commits.latest_table_version.try_into()?;
-        let version: Version = version.unwrap_or(catalog_version);
 
         // consume the UC Commit and hand back a delta_kernel LogPath
         let mut table_url = Url::parse(&table_uri)?;
@@ -117,12 +116,15 @@ impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
 
         debug!("commits for kernel: {:?}\n", commits);
 
-        Snapshot::builder_for(table_url)
-            .at_version(version)
+        let mut builder = Snapshot::builder_for(table_url)
             .with_max_catalog_version(catalog_version)
-            .with_log_tail(commits)
-            .build(engine)
-            .map_err(|e| e.into())
+            .with_log_tail(commits);
+
+        if let Some(v) = version {
+            builder = builder.at_version(v);
+        }
+
+        builder.build(engine).map_err(Into::into)
     }
 }
 

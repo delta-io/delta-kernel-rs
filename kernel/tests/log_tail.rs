@@ -319,28 +319,32 @@ async fn incremental_snapshot_caps_at_max_catalog_version() -> Result<(), Box<dy
     let actions = vec![TestAction::Add("file_2.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 2, actions_to_string(actions)).await?;
 
+    // Simulate a request to the catalog which reports max_catalog_version = 2
+    let mcv = 2;
+
     // Build initial snapshot at version 1, catalog knows about version 2
     let initial_snapshot = Snapshot::builder_for(table_root)
         .at_version(1)
-        .with_max_catalog_version(2)
+        .with_max_catalog_version(mcv)
         .build(engine.as_ref())?;
     assert_eq!(initial_snapshot.version(), 1);
 
-    // Commit 3 appears on filesystem, but catalog only ratifies up to v2
+    // Catalog reported v2 as the max ratified version. A moment later, v3 was
+    // ratified and published to the log -- but the client is unaware of v3.
     let actions = vec![TestAction::Add("file_3.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 3, actions_to_string(actions)).await?;
 
-    // Incremental update: catalog still at v2, log_tail includes v2
+    // Incremental update: catalog reported v2 as max, log_tail includes v2
     let log_tail = vec![create_log_path(
         &table_url,
-        delta_path_for_version(2, "json"),
+        delta_path_for_version(mcv, "json"),
     )];
     let new_snapshot = Snapshot::builder_from(initial_snapshot)
         .with_log_tail(log_tail)
-        .with_max_catalog_version(2)
+        .with_max_catalog_version(mcv)
         .build(engine.as_ref())?;
 
-    // Should stop at v2 despite v3 existing on filesystem
+    // Snapshot respects the catalog's reported max version (v2)
     assert_eq!(new_snapshot.version(), 2);
 
     Ok(())

@@ -1802,6 +1802,26 @@ mod tests {
         let snapshot_version = unsafe { version(snapshot.shallow_copy()) };
         assert_eq!(snapshot_version, 1);
 
+        // Test for failure when not passing in max_catalog_version
+        let invalid_snapshot = unsafe {
+            snapshot_at_version_with_log_tail(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+                1,
+                log_tail.clone(),
+                OptionalValue::None, // max_catalog_version
+            )
+        };
+        assert_extern_result_error_with_message(
+            invalid_snapshot,
+            KernelError::GenericError,
+            concat!(
+                "Generic delta kernel error: Staged commits in log_tail require ",
+                "max_catalog_version to be set. Use with_max_catalog_version() ",
+                "when providing staged commits."
+            ),
+        );
+
         // Test getting snapshot at version
         let snapshot2 = unsafe {
             let mut ptr = ok_or_panic(get_snapshot_builder(
