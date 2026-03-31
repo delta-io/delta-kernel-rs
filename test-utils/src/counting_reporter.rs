@@ -189,7 +189,9 @@ impl MetricsReporter for CountingReporter {
                     .fetch_add(num_compaction_files, Ordering::Relaxed);
             }
             // Intentionally not tracked -- add counters if needed.
-            MetricEvent::ProtocolMetadataLoaded { .. } | MetricEvent::SnapshotFailed { .. } => {}
+            MetricEvent::ProtocolMetadataLoaded { .. }
+            | MetricEvent::SnapshotFailed { .. }
+            | MetricEvent::ScanMetadataCompleted { .. } => {}
         }
     }
 }
