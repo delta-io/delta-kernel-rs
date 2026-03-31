@@ -11,8 +11,11 @@ use crate::{DeltaResult, ExternEngine, Snapshot, Url};
 use crate::{ExclusiveEngineData, SharedExternEngine};
 use crate::{KernelStringSlice, SharedSnapshot};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
+use delta_kernel::transaction::create_table::CreateTableTransactionBuilder;
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
+
+use crate::SharedSchema;
 
 /// A handle representing an exclusive transaction on a Delta table. (Similar to a Box<_>)
 ///
@@ -175,6 +178,134 @@ pub unsafe extern "C" fn commit(
         Err(e) => Err(e),
     }
     .into_extern_result(&extern_engine)
+}
+
+// ============================================================================
+// Create Table DDL
+// ============================================================================
+
+/// A handle representing an exclusive [`CreateTableTransactionBuilder`].
+///
+/// The caller must eventually either call [`create_table_commit`] (which consumes the handle and
+/// creates the table) or [`free_create_table_builder`] (which drops it without creating anything).
+#[handle_descriptor(target=CreateTableTransactionBuilder, mutable=true, sized=true)]
+pub struct ExclusiveCreateTableBuilder;
+
+/// Create a new [`CreateTableTransactionBuilder`] for creating a Delta table at the given path.
+///
+/// The returned builder can be configured with [`create_table_set_property`] before committing
+/// with [`create_table_commit`].
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid `path`, `schema`, and `engine_info`.
+#[no_mangle]
+pub unsafe extern "C" fn create_table(
+    path: KernelStringSlice,
+    schema: Handle<SharedSchema>,
+    engine_info: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    create_table_impl(path, schema, engine_info).into_extern_result(&engine)
+}
+
+fn create_table_impl(
+    path: KernelStringSlice,
+    schema: Handle<SharedSchema>,
+    engine_info: KernelStringSlice,
+) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
+    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&path) }?;
+    let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
+    let schema = unsafe { schema.clone_as_arc() };
+    let builder =
+        delta_kernel::transaction::create_table::create_table(path, schema, info.to_string());
+    Ok(Box::new(builder).into())
+}
+
+/// Set a single table property on a [`CreateTableTransactionBuilder`].
+///
+/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
+/// pointer with the returned handle.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid builder handle, `key`, and `value`.
+/// CONSUMES the builder handle.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_set_property(
+    builder: Handle<ExclusiveCreateTableBuilder>,
+    key: KernelStringSlice,
+    value: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    create_table_set_property_impl(builder, key, value).into_extern_result(&engine)
+}
+
+fn create_table_set_property_impl(
+    builder: Handle<ExclusiveCreateTableBuilder>,
+    key: KernelStringSlice,
+    value: KernelStringSlice,
+) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
+    let builder = unsafe { builder.into_inner() };
+    let key: String = unsafe { TryFromStringSlice::try_from_slice(&key) }?;
+    let value: String = unsafe { TryFromStringSlice::try_from_slice(&value) }?;
+    let builder = builder.with_table_properties([(key, value)]);
+    Ok(Box::new(builder).into())
+}
+
+/// Build and commit a create-table transaction. Returns the committed version (always 0 for new
+/// tables). This consumes the builder handle.
+///
+/// Uses [`FileSystemCommitter`] by default.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid builder and engine handle.
+/// CONSUMES the builder handle -- caller must not use it after this call.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_commit(
+    builder: Handle<ExclusiveCreateTableBuilder>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<u64> {
+    let builder = unsafe { builder.into_inner() };
+    let extern_engine = unsafe { engine.as_ref() };
+    create_table_commit_impl(*builder, extern_engine).into_extern_result(&extern_engine)
+}
+
+fn create_table_commit_impl(
+    builder: CreateTableTransactionBuilder,
+    extern_engine: &dyn ExternEngine,
+) -> DeltaResult<u64> {
+    let engine = extern_engine.engine();
+    let committer = Box::new(FileSystemCommitter::new());
+    let transaction = builder.build(engine.as_ref(), committer)?;
+    match transaction.commit(engine.as_ref()) {
+        Ok(CommitResult::CommittedTransaction(committed)) => Ok(committed.commit_version()),
+        Ok(CommitResult::RetryableTransaction(_)) => Err(delta_kernel::Error::unsupported(
+            "commit failed: retryable transaction not supported in FFI (yet)",
+        )),
+        Ok(CommitResult::ConflictedTransaction(conflicted)) => {
+            Err(delta_kernel::Error::Generic(format!(
+                "commit conflict at version {}",
+                conflicted.conflict_version()
+            )))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Free a [`CreateTableTransactionBuilder`] without committing.
+///
+/// Use this on failure paths when the builder will not be committed.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_create_table_builder(builder: Handle<ExclusiveCreateTableBuilder>) {
+    builder.drop_handle();
 }
 
 #[cfg(test)]
@@ -660,5 +791,204 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_create_table_basic() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let table_path_str = tmp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(StructType::try_new(vec![
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("name", DataType::STRING),
+        ])?);
+
+        let engine = get_default_engine(table_path_str);
+        let schema_handle: Handle<crate::SharedSchema> = schema.into();
+
+        let engine_info = "test-engine/1.0";
+        let builder = ok_or_panic(unsafe {
+            create_table(
+                kernel_string_slice!(table_path_str),
+                schema_handle,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+
+        // Commit -- should return version 0
+        let version = ok_or_panic(unsafe { create_table_commit(builder, engine.shallow_copy()) });
+        assert_eq!(version, 0);
+
+        // Verify by opening a snapshot of the created table
+        let snap = ok_or_panic(unsafe {
+            crate::snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        let snap_version = unsafe { crate::version(snap.shallow_copy()) };
+        assert_eq!(snap_version, 0);
+
+        // Verify schema
+        let snap_schema = unsafe { crate::logical_schema(snap.shallow_copy()) };
+        let snap_schema_ref = unsafe { snap_schema.as_ref() };
+        assert_eq!(snap_schema_ref.num_fields(), 2);
+        assert_eq!(snap_schema_ref.field_at_index(0).unwrap().name, "id");
+        assert_eq!(snap_schema_ref.field_at_index(1).unwrap().name, "name");
+
+        unsafe { free_schema(snap_schema) };
+        unsafe { crate::free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_create_table_with_properties() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let table_path_str = tmp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )])?);
+
+        let engine = get_default_engine(table_path_str);
+        let schema_handle: Handle<crate::SharedSchema> = schema.into();
+
+        let engine_info = "test-engine/1.0";
+        let builder = ok_or_panic(unsafe {
+            create_table(
+                kernel_string_slice!(table_path_str),
+                schema_handle,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+
+        // Set properties
+        let prop_key1 = "delta.appendOnly";
+        let prop_val1 = "true";
+        let builder = ok_or_panic(unsafe {
+            create_table_set_property(
+                builder,
+                kernel_string_slice!(prop_key1),
+                kernel_string_slice!(prop_val1),
+                engine.shallow_copy(),
+            )
+        });
+        let prop_key2 = "custom.key";
+        let prop_val2 = "custom_value";
+        let builder = ok_or_panic(unsafe {
+            create_table_set_property(
+                builder,
+                kernel_string_slice!(prop_key2),
+                kernel_string_slice!(prop_val2),
+                engine.shallow_copy(),
+            )
+        });
+
+        let version = ok_or_panic(unsafe { create_table_commit(builder, engine.shallow_copy()) });
+        assert_eq!(version, 0);
+
+        // Verify properties via snapshot
+        let snap = ok_or_panic(unsafe {
+            crate::snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+
+        let key = "delta.appendOnly";
+        let val_ptr = unsafe {
+            crate::snapshot_table_property(
+                snap.shallow_copy(),
+                kernel_string_slice!(key),
+                allocate_str,
+            )
+        };
+        assert!(val_ptr.is_some());
+        let val = recover_string(val_ptr.unwrap());
+        assert_eq!(val, "true");
+
+        let key2 = "custom.key";
+        let val_ptr2 = unsafe {
+            crate::snapshot_table_property(
+                snap.shallow_copy(),
+                kernel_string_slice!(key2),
+                allocate_str,
+            )
+        };
+        assert!(val_ptr2.is_some());
+        let val2 = recover_string(val_ptr2.unwrap());
+        assert_eq!(val2, "custom_value");
+
+        unsafe { crate::free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_create_table_already_exists() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let table_path_str = tmp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )])?);
+
+        let engine = get_default_engine(table_path_str);
+
+        // Create the table first time -- should succeed
+        let schema_handle: Handle<crate::SharedSchema> = schema.clone().into();
+        let engine_info = "test-engine/1.0";
+        let builder = ok_or_panic(unsafe {
+            create_table(
+                kernel_string_slice!(table_path_str),
+                schema_handle,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+        let version = ok_or_panic(unsafe { create_table_commit(builder, engine.shallow_copy()) });
+        assert_eq!(version, 0);
+
+        // Try to create the same table again -- should error
+        let schema_handle2: Handle<crate::SharedSchema> = schema.into();
+        let builder2 = ok_or_panic(unsafe {
+            create_table(
+                kernel_string_slice!(table_path_str),
+                schema_handle2,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+        let result = unsafe { create_table_commit(builder2, engine.shallow_copy()) };
+        // The commit should fail because the table already exists
+        match result {
+            ExternResult::Err(e) => {
+                // Clean up the error to prevent leaks
+                let error = unsafe { crate::ffi_test_utils::recover_error(e) };
+                assert!(
+                    error.message.contains("already exists"),
+                    "Expected 'already exists' error, got: {}",
+                    error.message
+                );
+            }
+            ExternResult::Ok(_) => panic!("Expected error for table that already exists"),
+        }
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[test]
+    fn test_free_create_table_builder() {
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)]).unwrap(),
+        );
+        let builder =
+            delta_kernel::transaction::create_table::create_table("memory:///test", schema, "test");
+        let handle: Handle<ExclusiveCreateTableBuilder> = Box::new(builder).into();
+        // Should not panic or leak
+        unsafe { free_create_table_builder(handle) };
     }
 }
