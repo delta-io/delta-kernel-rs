@@ -31,7 +31,7 @@ pub enum ParallelScan {
 }
 
 /// Info needed to access a UC-managed table via credential vending.
-/// This covers both catalog-managed (CCv2) and non-catalog-managed UC tables.
+/// This covers both catalog-managed and non-catalog-managed UC tables.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UcTableInfo {
@@ -59,7 +59,7 @@ pub struct TableInfo {
     /// Whether to use `UCKernelClient` (catalog-managed) or standard snapshot builder is
     /// determined by the `delta.feature.catalogManaged` property.
     /// Mutually exclusive with `table_path`.
-    #[serde(alias = "catalogManagedInfo")]
+    #[serde(alias = "catalogManagedInfo", alias = "catalogInfo")]
     pub uc_table_info: Option<UcTableInfo>,
     /// Schema at the latest version of the table, in Delta protocol JSON format
     /// e.g. `{"type": "struct", "fields": [...]}`
@@ -421,7 +421,7 @@ mod tests {
     #[case(
         r#"{
             "name": "catalog_table", "description": "A catalog-managed table",
-            "catalogManagedInfo": {"tableName": "main.schema.table"},
+            "catalogInfo": {"tableName": "main.schema.table"},
             "schema": {"type": "struct", "fields": []},
             "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
             "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},

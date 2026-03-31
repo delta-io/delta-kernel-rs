@@ -5,12 +5,9 @@
 //! Results are discarded for benchmarking purposes.
 //!
 //! Engine and snapshot construction is handled internally based on `TableInfo`:
-//! - UC catalog-managed (CCv2) tables (`uc_table_info` set and
-//!   `delta.feature.catalogManaged = supported` in properties): UC-vended credentials,
-//!   snapshot via `UCKernelClient::load_snapshot`
-//! - UC non-catalog-managed tables (`uc_table_info` set, no catalog-managed feature):
-//!   UC-vended credentials, standard snapshot builder
-//! - S3 tables (`table_path` with s3:// scheme): credentials from `AWS_*` env vars
+//! - UC tables (`uc_table_info`): UC-vended credentials; catalog-managed tables use
+//!   `UCKernelClient::load_snapshot`, others use the standard snapshot builder
+//! - S3 tables (`table_path` with s3://): credentials from `AWS_*` env vars
 //! - Local tables: local filesystem engine
 
 use crate::models::{
@@ -35,7 +32,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use url::Url;
 
-/// Delta table property indicating catalog-managed (CCv2) support.
+/// Delta table property indicating catalog-managed support.
 const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
 
 /// A benchmark workload that can be executed by Criterion.
@@ -63,11 +60,10 @@ fn build_engine(
 enum SnapshotStrategy {
     /// Standard snapshot builder (local, S3, or UC-managed non-catalog-managed tables).
     Standard { url: Url },
-    /// Catalog-managed (CCv2) table: snapshot loaded via `UCKernelClient::load_snapshot`.
+    /// Catalog-managed table: snapshot loaded via `UCKernelClient::load_snapshot`.
     CatalogManaged {
         table_id: String,
         table_uri: String,
-        /// Boxed to satisfy clippy::large_enum_variant (Standard variant is much smaller).
         commits_client: Box<UCCommitsRestClient>,
     },
 }
@@ -94,14 +90,14 @@ impl SnapshotStrategy {
                 commits_client,
             } => {
                 let catalog = UCKernelClient::new(commits_client.as_ref());
-                let result = if let Some(tt) = time_travel {
-                    let version = tt.as_version()?;
-                    runtime.block_on(
-                        catalog.load_snapshot_at(table_id, table_uri, version, engine),
-                    )
-                } else {
-                    runtime
-                        .block_on(catalog.load_snapshot(table_id, table_uri, engine))
+                let result = match time_travel {
+                    Some(tt) => {
+                        let version = tt.as_version()?;
+                        runtime.block_on(
+                            catalog.load_snapshot_at(table_id, table_uri, version, engine),
+                        )
+                    }
+                    None => runtime.block_on(catalog.load_snapshot(table_id, table_uri, engine)),
                 };
                 result.map_err(|e| format!("Catalog snapshot failed: {e}").into())
             }
@@ -143,7 +139,12 @@ fn resolve_snapshot_strategy(
             .ok_or(UcApiError::UnsupportedOperation(
                 "Credential vending returned no AWS credentials".into(),
             ))?;
-        Ok((table.table_id, table.storage_location, table.properties, aws))
+        Ok((
+            table.table_id,
+            table.storage_location,
+            table.properties,
+            aws,
+        ))
     });
     let (table_id, table_uri, uc_properties, aws) = result?;
 
@@ -158,7 +159,6 @@ fn resolve_snapshot_strategy(
     let (store, _) = object_store::parse_url_opts(&table_url, options)?;
     let engine = build_engine(store.into(), runtime);
 
-    // Check the UC-returned properties (live source of truth), not the static tableInfo.json.
     let is_catalog_managed = uc_properties
         .get(CATALOG_MANAGED_PROPERTY)
         .is_some_and(|v| v == "supported");
@@ -207,8 +207,6 @@ fn resolve_engine(
     }
 }
 
-/// Benchmarks the read-metadata path: builds a scan from a pre-loaded snapshot and iterates
-/// over scan metadata (serial or parallel).
 pub struct ReadMetadataRunner {
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn Engine>,
@@ -219,7 +217,6 @@ pub struct ReadMetadataRunner {
 }
 
 impl ReadMetadataRunner {
-    /// Creates a runner by resolving the engine, loading a snapshot, and parsing the predicate.
     pub fn setup(
         table_info: &TableInfo,
         case_name: &str,
@@ -369,19 +366,15 @@ pub fn create_read_runner(
     }
 }
 
-/// Benchmarks snapshot construction: resolves the engine at setup, then builds a snapshot
-/// from scratch on each `execute()` call so Criterion measures the snapshot loading time.
 pub struct SnapshotConstructionRunner {
     engine: Arc<dyn Engine>,
     runtime: Arc<tokio::runtime::Runtime>,
-    strategy: SnapshotStrategy,
+    snapshot_strategy: SnapshotStrategy,
     time_travel: Option<TimeTravel>,
     name: String,
 }
 
 impl SnapshotConstructionRunner {
-    /// Creates a runner by resolving the engine and snapshot strategy. The snapshot itself is
-    /// built during `execute()`, not here.
     pub fn setup(
         table_info: &TableInfo,
         case_name: &str,
@@ -395,12 +388,12 @@ impl SnapshotConstructionRunner {
             snapshot_spec.as_str()
         );
 
-        let (engine, strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
+        let (engine, snapshot_strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
 
         Ok(Self {
             engine,
             runtime,
-            strategy,
+            snapshot_strategy,
             time_travel: snapshot_spec.time_travel.clone(),
             name,
         })
@@ -409,7 +402,7 @@ impl SnapshotConstructionRunner {
 
 impl WorkloadRunner for SnapshotConstructionRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let snapshot = self.strategy.load_snapshot(
+        let snapshot = self.snapshot_strategy.load_snapshot(
             self.engine.as_ref(),
             &self.runtime,
             self.time_travel.as_ref(),
