@@ -2209,10 +2209,13 @@ async fn timestamp_max_stat_truncation_does_not_over_prune(
     //   file1 pruned; file2 max=4s > 3_999_002 -> kept (4 rows)
     assert_eq!(row_count(4_000_001)?, 4, "1us above ms: file2+file3 kept");
 
+    // 998us above ms boundary (4.000998s): adjusted to 3_999_999
+    //   file2 max=4s > 3_999_999 -> kept (just not prunable)
+    assert_eq!(row_count(4_000_998)?, 4, "just not prunable: file2+file3 kept");
+
     // 999us above ms boundary (4.000999s): adjusted to 4_000_000
-    //   file2 max=4s == 4_000_000 -> NOT strictly greater -> pruned (2 rows)
-    //   This is correct: actual max 4.000500s < 4.000999s, so no matching rows in file2.
-    assert_eq!(row_count(4_000_999)?, 2, "999us above ms: only file3 kept");
+    //   file2 max=4s == 4_000_000 -> NOT strictly greater -> pruned (just prunable)
+    assert_eq!(row_count(4_000_999)?, 2, "just prunable: only file3 kept");
 
     // Next ms boundary (4.001000s): adjusted to 4_000_001
     //   file2 max=4s < 4_000_001 -> pruned (2 rows)
