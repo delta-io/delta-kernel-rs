@@ -371,11 +371,17 @@ fn collect_junction_preds(
     Pred::junction(op, preds)
 }
 
-/// Adjusts a comparison value before comparing against a max stat, to account for existing
-/// Delta writers truncating timestamp JSON stats to millisecond precision. Truncation floors
-/// to the millisecond, so the stored max can be up to 999us less than the actual maximum
-/// (`actual_max <= stored_max + 999`). We subtract 999us from the comparison value to avoid
-/// incorrectly pruning files.
+/// Adjusts a comparison value before comparing against a max stat, to account for the Delta
+/// protocol allowing timestamp stats to be truncated to millisecond precision (see Per-file
+/// Statistics: "Timestamp columns are truncated down to milliseconds"). Truncation floors to
+/// the nearest millisecond, so: `stored_max <= actual_max <= stored_max + 999us`. We subtract
+/// 999us from the comparison value to avoid incorrectly pruning files whose actual max may be
+/// higher than the stored (truncated) max.
+///
+/// For example, if a file's actual max is `4_000_500us` (4.000500s), Spark truncates the
+/// stored max stat to `4_000_000us` (4.000s). A predicate `ts > 4_000_400` would incorrectly
+/// prune this file by comparing against the truncated max. By adjusting the comparison value
+/// to `4_000_400 - 999 = 3_999_401`, we ensure the file is kept.
 ///
 /// Non-timestamp values pass through unchanged.
 fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Cow<'_, Scalar> {

@@ -2179,49 +2179,64 @@ async fn timestamp_max_stat_truncation_does_not_over_prune(
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
-    // ts_col > 4_000_400: adjusted predicate = 3_999_401
-    //   file1 max=2M < 3_999_401 -> pruned (proves skipping works)
-    //   file2 truncated max=4M > 3_999_401 -> kept (proves truncation is safe)
-    //   file3 max=8M > 3_999_401 -> kept
-    let predicate = Arc::new(Pred::gt(
-        column_expr!("ts_col"),
-        Expr::literal(Scalar::Timestamp(4_000_400)),
-    ));
-    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    let row_count = |predicate_us: i64| -> Result<usize, Box<dyn std::error::Error>> {
+        let predicate = Arc::new(Pred::gt(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(predicate_us)),
+        ));
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(predicate)
+            .build()?;
+        let batches = read_scan(&scan, engine.clone())?;
+        Ok(batches.iter().map(|b| b.num_rows()).sum())
+    };
 
-    let batches = read_scan(&scan, engine.clone())?;
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    // Mid-ms value (4.000400s): adjusted to 3_999_401
+    //   file1 max=2s < 3_999_401 -> pruned; file2+3 kept (4 rows)
+    assert_eq!(row_count(4_000_400)?, 4, "mid-ms: file2+file3 kept");
+
+    // Exact ms boundary (4.000000s = truncated max of file2): adjusted to 3_999_001
+    //   file1 max=2s < 3_999_001 -> pruned; file2 max=4s > 3_999_001 -> kept (4 rows)
     assert_eq!(
-        total_rows, 4,
-        "Expected file1 pruned (2 rows), file2+file3 kept (4 rows)"
+        row_count(4_000_000)?,
+        4,
+        "exact ms boundary: file2+file3 kept"
+    );
+
+    // 1us above ms boundary (4.000001s): adjusted to 3_999_002
+    //   file1 pruned; file2 max=4s > 3_999_002 -> kept (4 rows)
+    assert_eq!(row_count(4_000_001)?, 4, "1us above ms: file2+file3 kept");
+
+    // 999us above ms boundary (4.000999s): adjusted to 4_000_000
+    //   file2 max=4s == 4_000_000 -> NOT strictly greater -> pruned (2 rows)
+    //   This is correct: actual max 4.000500s < 4.000999s, so no matching rows in file2.
+    assert_eq!(row_count(4_000_999)?, 2, "999us above ms: only file3 kept");
+
+    // Next ms boundary (4.001000s): adjusted to 4_000_001
+    //   file2 max=4s < 4_000_001 -> pruned (2 rows)
+    assert_eq!(
+        row_count(4_001_000)?,
+        2,
+        "next ms boundary: only file3 kept"
     );
 
     Ok(())
 }
 
-// End-to-end test using a Spark-written Delta table with real truncated JSON stats.
+// End-to-end tests using a Spark-written Delta table with real truncated JSON stats.
 // Table has three files:
-//   file 1: ts_col [1s, 2s]           -- max at ms boundary
-//   file 2: ts_col [3s, 4.000500s]    -- max truncated to 4.000s in JSON stats
-//   file 3: ts_col [7s, 8s]           -- max at ms boundary
+//   file 1: id=[1,2], ts_col=[1s, 2s]           -- max at ms boundary
+//   file 2: id=[3,4], ts_col=[3s, 4.000500s]    -- max truncated to 4.000s in JSON stats
+//   file 3: id=[5,6], ts_col=[7s, 8s]           -- max at ms boundary
 //
-// Predicate `ts_col > 4.000400s` (4_000_400 us):
-//   file 1: max=2s << predicate -> pruned (proves max stat skipping works)
-//   file 2: truncated max=4s < 4.000400s, but adjusted predicate=3.999401s < 4s
-//           -> kept (proves truncation adjustment prevents incorrect pruning)
-//   file 3: max=8s >> predicate -> kept
+// Predicate value 4.000400s sits between the truncated max (4.000s) and actual max
+// (4.000500s) of file 2, exercising the truncation adjustment.
+
+// GT: file1 pruned (max=2s < adjusted 3.999401s), file2+3 kept
 #[test]
-fn timestamp_max_stat_pruning_with_real_table() -> Result<(), Box<dyn std::error::Error>> {
-    let expected = vec![
-        "+----+-----------------------------+",
-        "| id | ts_col                      |",
-        "+----+-----------------------------+",
-        "| 3  | 1970-01-01T00:00:03Z        |",
-        "| 4  | 1970-01-01T00:00:04.000500Z |",
-        "| 5  | 1970-01-01T00:00:07Z        |",
-        "| 6  | 1970-01-01T00:00:08Z        |",
-        "+----+-----------------------------+",
-    ];
+fn timestamp_truncation_real_table_gt() -> Result<(), Box<dyn std::error::Error>> {
     read_table_data_str(
         "./tests/data/timestamp-truncation-stats",
         None,
@@ -2229,6 +2244,106 @@ fn timestamp_max_stat_pruning_with_real_table() -> Result<(), Box<dyn std::error
             column_expr!("ts_col"),
             Expr::literal(Scalar::Timestamp(4_000_400)),
         )),
-        expected,
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "| 5  | 1970-01-01T00:00:07Z        |",
+            "| 6  | 1970-01-01T00:00:08Z        |",
+            "+----+-----------------------------+",
+        ],
+    )
+}
+
+// GE: file1 pruned (max=2s < adjusted 3.999401s), file2+3 kept
+#[test]
+fn timestamp_truncation_real_table_ge() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::ge(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "| 5  | 1970-01-01T00:00:07Z        |",
+            "| 6  | 1970-01-01T00:00:08Z        |",
+            "+----+-----------------------------+",
+        ],
+    )
+}
+
+// LT: file3 pruned (min=7s > 4.000400s), file1+2 kept
+#[test]
+fn timestamp_truncation_real_table_lt() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::lt(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 1  | 1970-01-01T00:00:01Z        |",
+            "| 2  | 1970-01-01T00:00:02Z        |",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "+----+-----------------------------+",
+        ],
+    )
+}
+
+// LE: file3 pruned (min=7s > 4.000400s), file1+2 kept
+#[test]
+fn timestamp_truncation_real_table_le() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::le(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 1  | 1970-01-01T00:00:01Z        |",
+            "| 2  | 1970-01-01T00:00:02Z        |",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "+----+-----------------------------+",
+        ],
+    )
+}
+
+// EQ: file1 pruned (max=2s < adjusted 3.999401s), file3 pruned (min=7s > 4.000400s).
+// Only file2 kept (ids 3,4).
+#[test]
+fn timestamp_truncation_real_table_eq() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::eq(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "+----+-----------------------------+",
+        ],
     )
 }

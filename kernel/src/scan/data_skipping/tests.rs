@@ -532,89 +532,81 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
 
 // Verifies the null-guarded checkpoint skipping path also applies the 999us timestamp
 // truncation adjustment to max stat comparisons.
-#[test]
-fn test_checkpoint_skipping_timestamp_adjustment() {
+#[rstest]
+fn test_checkpoint_skipping_timestamp_adjustment(
+    #[values(Scalar::Timestamp(1_000_000), Scalar::TimestampNtz(1_000_000))] timestamp: Scalar,
+) {
     let col = &column_expr!("ts_col");
-    for timestamp in [
-        &Scalar::Timestamp(1_000_000),
-        &Scalar::TimestampNtz(1_000_000),
-    ] {
-        // GT: should produce OR(maxValues.ts_col IS NULL, maxValues.ts_col > 999001)
-        let pred = Pred::gt(col.clone(), timestamp.clone());
-        let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
-        let s = skipping_pred.to_string();
-        assert!(
-            s.contains("999001"),
-            "Expected adjusted literal 999001 in checkpoint GT: {s}"
-        );
 
-        // EQ: max stat leg should use adjusted literal
-        let pred = Pred::eq(col.clone(), timestamp.clone());
-        let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
-        let s = skipping_pred.to_string();
-        assert!(
-            s.contains("999001"),
-            "Expected adjusted literal 999001 in checkpoint EQ: {s}"
-        );
-    }
+    // GT: should produce OR(maxValues.ts_col IS NULL, maxValues.ts_col > 999001)
+    let pred = Pred::gt(col.clone(), timestamp.clone());
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
+    assert_eq!(
+        skipping_pred.to_string(),
+        "OR(Column(maxValues.ts_col) IS NULL, Column(maxValues.ts_col) > 999001)"
+    );
+
+    // EQ: max stat leg should use adjusted literal
+    let pred = Pred::eq(col.clone(), timestamp.clone());
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
+    assert_eq!(
+        skipping_pred.to_string(),
+        "AND(OR(Column(minValues.ts_col) IS NULL, NOT(Column(minValues.ts_col) > 1000000)), \
+         OR(Column(maxValues.ts_col) IS NULL, NOT(Column(maxValues.ts_col) < 999001)))"
+    );
 }
 
 // Timestamp predicates use max stats with a 999us adjustment to account for millisecond
 // truncation in Delta JSON stats.
-#[test]
-fn test_timestamp_predicates_use_adjusted_max_stats() {
+#[rstest]
+fn test_timestamp_predicates_use_adjusted_max_stats(
+    #[values(Scalar::Timestamp(1_000_000), Scalar::TimestampNtz(1_000_000))] timestamp: Scalar,
+) {
     let col = &column_expr!("ts_col");
-    for timestamp in [&Scalar::Timestamp(1000000), &Scalar::TimestampNtz(1000000)] {
-        // LT uses minValues (no adjustment needed for min stats)
-        let pred = Pred::lt(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert_eq!(
-            skipping_pred.unwrap().to_string(),
-            "Column(stats_parsed.minValues.ts_col) < 1000000"
-        );
 
-        // GT uses maxValues with adjusted literal (1000000 - 999 = 999001)
-        let pred = Pred::gt(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert_eq!(
-            skipping_pred.unwrap().to_string(),
-            "Column(stats_parsed.maxValues.ts_col) > 999001"
-        );
+    // LT uses minValues (no adjustment needed for min stats)
+    let pred = Pred::lt(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "Column(stats_parsed.minValues.ts_col) < 1000000"
+    );
 
-        // EQ uses both min (unadjusted) and max (adjusted)
-        let pred = Pred::eq(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert_eq!(
-            skipping_pred.unwrap().to_string(),
-            "AND(NOT(Column(stats_parsed.minValues.ts_col) > 1000000), \
-             NOT(Column(stats_parsed.maxValues.ts_col) < 999001))"
-        );
+    // GT uses maxValues with adjusted literal (1000000 - 999 = 999001)
+    let pred = Pred::gt(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "Column(stats_parsed.maxValues.ts_col) > 999001"
+    );
 
-        // NE uses both min (unadjusted) and max (adjusted)
-        let pred = Pred::ne(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert_eq!(
-            skipping_pred.unwrap().to_string(),
-            "OR(NOT(Column(stats_parsed.minValues.ts_col) = 1000000), \
-             NOT(Column(stats_parsed.maxValues.ts_col) = 999001))"
-        );
+    // EQ uses both min (unadjusted) and max (adjusted)
+    let pred = Pred::eq(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "AND(NOT(Column(stats_parsed.minValues.ts_col) > 1000000), \
+         NOT(Column(stats_parsed.maxValues.ts_col) < 999001))"
+    );
 
-        // GE (col >= val) uses maxValues with adjusted literal
-        let pred = Pred::ge(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert_eq!(
-            skipping_pred.unwrap().to_string(),
-            "NOT(Column(stats_parsed.maxValues.ts_col) < 999001)"
-        );
+    // NE uses both min (unadjusted) and max (adjusted)
+    let pred = Pred::ne(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "OR(NOT(Column(stats_parsed.minValues.ts_col) = 1000000), \
+         NOT(Column(stats_parsed.maxValues.ts_col) = 999001))"
+    );
 
-        // LE (col <= val) uses minValues only (no adjustment needed)
-        let pred = Pred::le(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert_eq!(
-            skipping_pred.unwrap().to_string(),
-            "NOT(Column(stats_parsed.minValues.ts_col) > 1000000)"
-        );
-    }
+    // GE (col >= val) uses maxValues with adjusted literal
+    let pred = Pred::ge(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "NOT(Column(stats_parsed.maxValues.ts_col) < 999001)"
+    );
+
+    // LE (col <= val) uses minValues only (no adjustment needed)
+    let pred = Pred::le(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "NOT(Column(stats_parsed.minValues.ts_col) > 1000000)"
+    );
 }
 
 // Partition timestamp columns use exact values (not truncated), so no adjustment is applied.
