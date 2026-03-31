@@ -3,11 +3,16 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::debug;
+use tracing::{debug, info};
 use url::Url;
+
+use crate::metrics::MetricId;
+use crate::scan::metrics::ScanMetrics;
+use crate::utils::IteratorExt;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::get_scan_metadata_transform_expr;
@@ -23,6 +28,7 @@ use crate::kernel_predicates::{
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
+use crate::metrics::ScanType;
 use crate::parallel::sequential_phase::SequentialPhase;
 use crate::scan::log_replay::ScanLogReplayProcessor;
 use crate::scan::log_replay::{
@@ -571,6 +577,12 @@ impl Scan {
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
+    ///
+    /// Reports metrics: [`MetricEvent::ScanMetadataCompleted`] when the returned iterator is
+    /// fully exhausted.
+    ///
+    /// [`MetricEvent::ScanMetadataCompleted`]: crate::metrics::MetricEvent::ScanMetadataCompleted
+    ///
     /// Each item in the returned iterator is a struct of:
     /// - `Box<dyn EngineData>`: Data in engine format, where each row represents a file to be
     ///   scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
@@ -753,17 +765,35 @@ impl Scan {
             impl Iterator<Item = DeltaResult<ActionsBatch>>,
         >,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
-            return Ok(None.into_iter().flatten());
-        }
-        let it = scan_action_iter(
-            engine,
-            actions_with_checkpoint_info.actions,
-            self.state_info.clone(),
-            actions_with_checkpoint_info.checkpoint_info,
-            self.skip_stats(),
-        )?;
-        Ok(Some(it).into_iter().flatten())
+        let start = Instant::now();
+        let reporter = engine.get_metrics_reporter();
+        let operation_id = MetricId::new();
+
+        let (iter, metrics) = match self.state_info.physical_predicate {
+            PhysicalPredicate::StaticSkipAll => {
+                info!("Predicate statically evaluated to false; skipping all files");
+                (None, Arc::new(ScanMetrics::default()))
+            }
+            _ => {
+                let (it, m) = scan_action_iter(
+                    engine,
+                    actions_with_checkpoint_info.actions,
+                    self.state_info.clone(),
+                    actions_with_checkpoint_info.checkpoint_info,
+                    self.skip_stats(),
+                )?;
+                (Some(it), m)
+            }
+        };
+
+        let on_complete = move || {
+            let event = metrics.to_event(operation_id, ScanType::Full, start.elapsed());
+            info!(%event);
+            if let Some(r) = reporter {
+                r.report(event);
+            }
+        };
+        Ok(iter.into_iter().flatten().on_complete(on_complete))
     }
 
     // Factored out to facilitate testing
@@ -979,6 +1009,21 @@ impl Scan {
                     physical_schema.clone(),
                     None,
                 )?;
+
+                let mut read_result_iter = read_result_iter.peekable();
+
+                // Only flag an empty iterator as a connector bug when stats are present and report
+                // a positive row count. When stats are absent we cannot distinguish a legitimate
+                // 0-row file from a buggy connector, so we conservatively allow it.
+                let expect_data = scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
+                if expect_data && read_result_iter.peek().is_none() {
+                    return Err(Error::internal_error(format!(
+                        "ParquetHandler returned no data for file '{}'. This is likely a connector \
+                         bug -- the handler's read_parquet_files must return at least one batch for \
+                         each requested file that contains rows.",
+                        scan_file.path
+                    )));
+                }
 
                 let engine = engine.clone(); // Arc clone
                 let physical_schema_inner = physical_schema.clone();

@@ -454,11 +454,11 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "uc-catalog")]
+    #[cfg(feature = "delta-kernel-unity-catalog")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg_attr(miri, ignore)]
     async fn test_transaction_with_uc_committer() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::uc_catalog::{
+        use crate::delta_kernel_unity_catalog::{
             free_uc_commit_client, get_uc_commit_client, get_uc_committer,
             tests::{cast_test_context, get_test_context, recover_test_context},
             CommitRequest,

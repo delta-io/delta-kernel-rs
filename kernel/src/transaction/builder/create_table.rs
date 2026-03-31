@@ -24,13 +24,14 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     assign_column_mapping_metadata, get_any_level_column_physical_name,
     get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
-    FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    EnablementCheck, FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
     SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
-    COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX, ENABLE_IN_COMMIT_TIMESTAMPS,
-    SET_TRANSACTION_RETENTION_DURATION,
+    TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
+    COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
+    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS,
+    ENABLE_TYPE_WIDENING, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -54,9 +55,14 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
     // specifying clustering columns via `with_data_layout()`.
-    // As features are supported, add them here:
-    // TableFeature::DeletionVectors,
+    TableFeature::DeletionVectors,
     TableFeature::V2Checkpoint,
+    // Simple protocol-only features: enabling these only updates the protocol action.
+    // They can also be auto-enabled via their enablement properties (e.g. delta.appendOnly=true)
+    // through `maybe_auto_enable_property_driven_features`.
+    TableFeature::AppendOnly,
+    TableFeature::ChangeDataFeed,
+    TableFeature::TypeWidening,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
@@ -72,10 +78,13 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // Checkpoint stats format properties
     CHECKPOINT_WRITE_STATS_AS_JSON,
     CHECKPOINT_WRITE_STATS_AS_STRUCT,
+    // Property-driven feature enablement properties
+    ENABLE_DELETION_VECTORS,
+    ENABLE_CHANGE_DATA_FEED,
+    ENABLE_TYPE_WIDENING,
+    APPEND_ONLY,
     // Set transaction retention duration: controls expiration of txn identifiers
     SET_TRANSACTION_RETENTION_DURATION,
-    // As features are supported, add them here:
-    // "delta.enableDeletionVectors",
 ];
 
 /// Ensures that no Delta table exists at the given path.
@@ -351,19 +360,21 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     }
 }
 
-/// Conditionally adds the `inCommitTimestamp` feature to the protocol when
-/// `delta.enableInCommitTimestamps=true` is set in the table properties.
-fn maybe_enable_in_commit_timestamps(validated: &mut ValidatedTableProperties) {
-    let enabled = validated
-        .properties
-        .get(ENABLE_IN_COMMIT_TIMESTAMPS)
-        .is_some_and(|v| v == "true");
-    if enabled {
-        add_feature_to_lists(
-            TableFeature::InCommitTimestamp,
-            &mut validated.reader_features,
-            &mut validated.writer_features,
-        );
+/// Auto-enables allowed features whose [`EnablementCheck::EnabledIf`] check is satisfied by the
+/// table properties. Features with [`EnablementCheck::AlwaysIfSupported`] are skipped since they
+/// don't require property-driven enablement.
+fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProperties) {
+    let table_properties = TableProperties::from(validated.properties.iter());
+    for feature in ALLOWED_DELTA_FEATURES {
+        if let EnablementCheck::EnabledIf(check) = feature.info().enablement_check {
+            if check(&table_properties) {
+                add_feature_to_lists(
+                    feature.clone(),
+                    &mut validated.reader_features,
+                    &mut validated.writer_features,
+                );
+            }
+        }
     }
 }
 
@@ -426,6 +437,12 @@ fn maybe_apply_column_mapping_for_table_create(
 /// 4. Extracts reader/writer features from validated feature signals
 ///
 /// Non-delta properties (user/application properties) are always allowed.
+///
+/// Note: This function does not auto-set enablement properties. A feature signal like
+/// `delta.feature.deletionVectors=supported` adds the feature to the protocol but does
+/// not insert `delta.enableDeletionVectors=true` into the properties. Property-driven
+/// auto-enablement is handled separately by [`maybe_auto_enable_property_driven_features`]
+/// called after validation.
 fn validate_extract_table_features_and_properties(
     properties: HashMap<String, String>,
 ) -> DeltaResult<ValidatedTableProperties> {
@@ -660,14 +677,12 @@ impl CreateTableTransactionBuilder {
             &mut validated,
         )?;
 
-        // Auto-enable variantType feature if schema contains Variant columns
+        // Schema-driven auto-enablement: detect types that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
-
-        // Auto-enable timestampNtz feature if schema contains TimestampNTZ columns
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
 
-        // Auto-enable inCommitTimestamp feature if property is set
-        maybe_enable_in_commit_timestamps(&mut validated);
+        // Property-driven auto-enablement: check enablement properties
+        maybe_auto_enable_property_driven_features(&mut validated);
 
         // Create Protocol action with table features support
         let protocol =
@@ -714,6 +729,7 @@ mod tests {
     use super::*;
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, StructField, StructType};
+    use crate::table_properties::ENABLE_ICEBERG_COMPAT_V1;
     use crate::utils::test_utils::assert_result_error_with_message;
 
     fn test_schema() -> SchemaRef {
@@ -825,24 +841,22 @@ mod tests {
 
     #[test]
     fn test_validate_unsupported_properties() {
-        use crate::table_properties::{APPEND_ONLY, ENABLE_CHANGE_DATA_FEED};
-
         // Delta properties not on allow list are rejected
         let mut properties = HashMap::new();
-        properties.insert(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string());
+        properties.insert(ENABLE_ICEBERG_COMPAT_V1.to_string(), "true".to_string());
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
-            "Setting delta property 'delta.enableChangeDataFeed' is not supported",
+            "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
         );
 
         // Feature signals for features not in ALLOWED_DELTA_FEATURES are rejected
         let properties = HashMap::from([(
-            "delta.feature.deletionVectors".to_string(),
+            "delta.feature.identityColumns".to_string(),
             "supported".to_string(),
         )]);
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
-            "Enabling feature 'deletionVectors' via 'delta.feature.deletionVectors' is not supported",
+            "Enabling feature 'identityColumns' via 'delta.feature.identityColumns' is not supported",
         );
 
         // Clustering feature signal is rejected - users must use with_clustering_columns() instead
@@ -858,10 +872,10 @@ mod tests {
         // Mixed properties with unsupported delta property are rejected
         let mut properties = HashMap::new();
         properties.insert("myapp.version".to_string(), "1.0".to_string());
-        properties.insert(APPEND_ONLY.to_string(), "true".to_string());
+        properties.insert(ENABLE_ICEBERG_COMPAT_V1.to_string(), "true".to_string());
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
-            "Setting delta property 'delta.appendOnly' is not supported",
+            "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
         );
     }
 
@@ -1104,7 +1118,7 @@ mod tests {
             .collect();
         let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
 
-        maybe_enable_in_commit_timestamps(&mut validated);
+        maybe_auto_enable_property_driven_features(&mut validated);
 
         assert_eq!(
             validated

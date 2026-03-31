@@ -342,11 +342,20 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
 }
 
 #[rstest]
-#[case("vacuumProtocolCheck", TableFeature::VacuumProtocolCheck)]
-#[case("v2Checkpoint", TableFeature::V2Checkpoint)]
+// ReaderWriter features (AlwaysIfSupported)
+#[case("vacuumProtocolCheck", TableFeature::VacuumProtocolCheck, true, true)]
+#[case("v2Checkpoint", TableFeature::V2Checkpoint, true, true)]
+// ReaderWriter features (EnabledIf -- feature signal alone does not enable)
+#[case("deletionVectors", TableFeature::DeletionVectors, true, false)]
+#[case("typeWidening", TableFeature::TypeWidening, true, false)]
+// WriterOnly features (EnabledIf -- feature signal alone does not enable)
+#[case("appendOnly", TableFeature::AppendOnly, false, false)]
+#[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false)]
 fn test_create_table_with_feature_signal(
     #[case] feature_name: &str,
     #[case] feature: TableFeature,
+    #[case] is_reader_writer: bool,
+    #[case] enabled_when_supported: bool,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
@@ -363,9 +372,10 @@ fn test_create_table_with_feature_signal(
         table_config.is_feature_supported(&feature),
         "{feature_name} should be supported"
     );
-    assert!(
+    assert_eq!(
         table_config.is_feature_enabled(&feature),
-        "{feature_name} should be enabled"
+        enabled_when_supported,
+        "{feature_name}: is_feature_enabled should be {enabled_when_supported}"
     );
     let protocol = table_config.protocol();
     assert!(
@@ -374,12 +384,14 @@ fn test_create_table_with_feature_signal(
             .is_some_and(|f| f.contains(&feature)),
         "{feature_name} should be in writer features"
     );
-    assert!(
-        protocol
-            .reader_features()
-            .is_some_and(|f| f.contains(&feature)),
-        "{feature_name} should be in reader features"
-    );
+    if is_reader_writer {
+        assert!(
+            protocol
+                .reader_features()
+                .is_some_and(|f| f.contains(&feature)),
+            "{feature_name} should be in reader features"
+        );
+    }
 
     Ok(())
 }
@@ -409,6 +421,61 @@ fn test_create_table_with_checkpoint_stats_properties(
         tp.checkpoint_write_stats_as_struct,
         Some(write_stats_as_struct)
     );
+
+    Ok(())
+}
+
+#[rstest]
+// ReaderWriter features
+#[case("delta.enableDeletionVectors", TableFeature::DeletionVectors, true)]
+#[case("delta.enableTypeWidening", TableFeature::TypeWidening, true)]
+// WriterOnly features
+#[case("delta.enableChangeDataFeed", TableFeature::ChangeDataFeed, false)]
+#[case("delta.appendOnly", TableFeature::AppendOnly, false)]
+fn test_create_table_with_enablement_property(
+    #[case] property: &str,
+    #[case] feature: TableFeature,
+    #[case] is_reader_writer: bool,
+    #[values(true, false)] expect_enabled: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let value = expect_enabled.to_string();
+
+    let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
+        .with_table_properties([(property, value.as_str())])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let table_config = snapshot.table_configuration();
+
+    assert_eq!(
+        table_config.is_feature_supported(&feature),
+        expect_enabled,
+        "{property}={value}: feature supported should be {expect_enabled}"
+    );
+    assert_eq!(
+        table_config.is_feature_enabled(&feature),
+        expect_enabled,
+        "{property}={value}: feature enabled should be {expect_enabled}"
+    );
+    let protocol = table_config.protocol();
+    assert_eq!(
+        protocol
+            .writer_features()
+            .is_some_and(|f| f.contains(&feature)),
+        expect_enabled,
+        "{property}={value}: in writer features should be {expect_enabled}"
+    );
+    if is_reader_writer {
+        assert_eq!(
+            protocol
+                .reader_features()
+                .is_some_and(|f| f.contains(&feature)),
+            expect_enabled,
+            "{property}={value}: in reader features should be {expect_enabled}"
+        );
+    }
 
     Ok(())
 }

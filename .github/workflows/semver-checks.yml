@@ -70,3 +70,19 @@ jobs:
         run: |
           cargo semver-checks -p delta_kernel -p delta_kernel_ffi --all-features \
             --baseline-rev "$BASELINE_REV"
+      # Upload the step outcome as an artifact so semver-label.yml can read it via workflow_run.
+      # steps.check.outcome is the raw result *before* continue-on-error converts it to "success",
+      # so it correctly reflects whether a breaking change was detected.
+      # Only upload for pull_request events; merge_group runs have no PR to label.
+      - name: Save semver outcome
+        if: github.event_name == 'pull_request'
+        env:
+          SEMVER_OUTCOME: ${{ steps.check.outcome }}
+        run: echo "$SEMVER_OUTCOME" > semver-outcome.txt
+      - name: Upload semver outcome
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: semver-outcome
+          path: semver-outcome.txt
+          retention-days: 1
