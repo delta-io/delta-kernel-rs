@@ -129,6 +129,33 @@ impl<C: CommitClient> UCCommitter<C> {
         Ok(())
     }
 
+    /// Validates that the table's metadata configuration has the required UC properties. If the
+    /// UC table ID is present, it must match the one this committer was initialized with. ICT
+    /// must always be enabled. This catches cases where another writer may have tampered with
+    /// the table.
+    fn validate_required_table_properties(
+        &self,
+        commit_metadata: &CommitMetadata,
+    ) -> DeltaResult<()> {
+        let config = commit_metadata.metadata_configuration();
+        if let Some(table_id) = config.get(UC_TABLE_ID_KEY) {
+            if table_id != &self.table_id {
+                return Err(DeltaError::generic(format!(
+                    "UC table ID mismatch: expected '{}' but found '{table_id}'. \
+                     The table may have been modified by another writer.",
+                    self.table_id
+                )));
+            }
+        }
+        if config.get(ENABLE_IN_COMMIT_TIMESTAMPS).map(String::as_str) != Some("true") {
+            return Err(DeltaError::generic(format!(
+                "UC catalog-managed table requires '{ENABLE_IN_COMMIT_TIMESTAMPS}=true' but it is \
+                 missing or disabled. The table may have been modified by another writer.",
+            )));
+        }
+        Ok(())
+    }
+
     /// Commit version 0 (table creation). Validates that all required UC properties are present,
     /// then writes the version 0 commit file directly to the published commit path.
     fn commit_version_0(
@@ -177,6 +204,7 @@ impl<C: CommitClient> UCCommitter<C> {
             "commit_version_non_zero called with version 0"
         );
         Self::validate_no_catalog_managed_change(&commit_metadata)?;
+        self.validate_required_table_properties(&commit_metadata)?;
         Self::validate_no_alter_table_changes(&commit_metadata)?;
         let staged_commit_path = commit_metadata.staged_commit_path()?;
         engine
@@ -516,6 +544,24 @@ mod tests {
         assert!(
             err.to_string().contains("clustering columns"),
             "expected clustering change error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn commit_version_non_zero_rejects_mismatched_table_id() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        let commit_metadata = catalog_managed_commit_metadata(table_root, 1);
+        // Committer initialized with a different table ID than what's in the metadata
+        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "different-table-id");
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+
+        let err = committer
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("table ID mismatch"),
+            "expected table ID mismatch error, got: {err}"
         );
     }
 
