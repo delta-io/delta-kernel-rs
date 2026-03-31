@@ -12,7 +12,9 @@ use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
     DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
-use crate::committer::{CommitMetadata, CommitResponse, Committer};
+use crate::committer::{
+    CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
+};
 use crate::crc::{CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
@@ -394,41 +396,38 @@ impl<S> Transaction<S> {
             .chain(dv_update_actions);
 
         // Step 7: Commit via the committer
-        // Enforce that committer type matches table type for catalog-managed tables.
-        // A non-catalog committer cannot commit to a catalog-managed table, and a catalog
-        // committer cannot commit to a non-catalog-managed table.
-        #[cfg(feature = "catalog-managed")]
-        {
-            let is_catalog_committer = self.committer.is_catalog_committer();
-            let is_catalog_managed = self
-                .read_snapshot
-                .table_configuration()
-                .is_catalog_managed();
-            if is_catalog_committer != is_catalog_managed {
-                let msg = if is_catalog_managed {
-                    "A catalog committer must be used to commit to catalog-managed tables. \
-                     Please provide a catalog committer via Snapshot::transaction()."
-                } else {
-                    "A catalog committer cannot be used to commit to non-catalog-managed tables."
-                };
-                return Err(Error::generic(msg));
-            }
-        }
         let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
         let table_config = self.read_snapshot.table_configuration();
+        let is_create = self.is_create_table();
+        let commit_type = Self::determine_commit_type(is_create, table_config);
+        Self::validate_commit_type(self.committer.is_catalog_committer(), &commit_type)?;
+        // For create-table: read P&M is None (no previous table), new P&M is set.
+        // For existing table: read P&M is from the snapshot, new P&M is None.
+        let protocol_metadata = CommitProtocolMetadata {
+            read_protocol: if is_create {
+                None
+            } else {
+                Some(table_config.protocol().clone())
+            },
+            read_metadata: if is_create {
+                None
+            } else {
+                Some(table_config.metadata().clone())
+            },
+            new_protocol,
+            new_metadata,
+        };
         let commit_metadata = CommitMetadata::new(
             log_root,
             commit_version,
+            commit_type,
             self.commit_timestamp,
             self.read_snapshot
                 .log_segment()
                 .listed
                 .max_published_version,
-            table_config.protocol().clone(),
-            table_config.metadata().clone(),
-        )
-        .with_new_protocol_and_metadata(new_protocol, new_metadata)
-        .with_domain_metadata_changes(dm_changes.clone());
+            protocol_metadata,
+        );
         match self
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)
@@ -520,6 +519,46 @@ impl<S> Transaction<S> {
         self.user_domain_metadata_additions
             .push(DomainMetadata::new(domain, configuration));
         self
+    }
+
+    /// Validates that the committer type matches the commit type. A catalog committer must be
+    /// used for catalog-managed operations, and a non-catalog committer for path-based operations.
+    /// Determines the commit type based on whether this is a create-table operation and whether
+    /// the table is catalog-managed.
+    fn determine_commit_type(
+        is_create: bool,
+        table_config: &crate::table_configuration::TableConfiguration,
+    ) -> CommitType {
+        #[cfg(feature = "catalog-managed")]
+        let is_catalog_managed = table_config.is_catalog_managed();
+        #[cfg(not(feature = "catalog-managed"))]
+        let is_catalog_managed = {
+            let _ = table_config;
+            false
+        };
+
+        match (is_create, is_catalog_managed) {
+            (true, true) => CommitType::CatalogManagedCreate,
+            (true, false) => CommitType::PathBasedCreate,
+            (false, true) => CommitType::CatalogManagedWrite,
+            (false, false) => CommitType::PathBasedWrite,
+        }
+    }
+
+    fn validate_commit_type(
+        is_catalog_committer: bool,
+        commit_type: &CommitType,
+    ) -> DeltaResult<()> {
+        if is_catalog_committer != commit_type.is_catalog_managed() {
+            let msg = if commit_type.is_catalog_managed() {
+                "A catalog committer must be used to commit to catalog-managed tables. \
+                 Please provide a catalog committer via Snapshot::transaction()."
+            } else {
+                "A catalog committer cannot be used to commit to non-catalog-managed tables."
+            };
+            return Err(Error::generic(msg));
+        }
+        Ok(())
     }
 
     /// Validate that the transaction is eligible to be marked as a blind append.
