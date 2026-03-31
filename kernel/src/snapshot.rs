@@ -572,31 +572,30 @@ impl Snapshot {
     #[internal_api]
     pub(crate) fn get_protocol_derived_properties(&self) -> HashMap<String, String> {
         let protocol = self.table_configuration().protocol();
-        let mut properties = HashMap::new();
-        properties.insert(
-            "delta.minReaderVersion".to_string(),
-            protocol.min_reader_version().to_string(),
-        );
-        properties.insert(
-            "delta.minWriterVersion".to_string(),
-            protocol.min_writer_version().to_string(),
-        );
-        let feature_prefix = "delta.feature.";
-        let feature_value = "supported";
-        if let Some(features) = protocol.reader_features() {
-            for feature in features {
-                properties
-                    .entry(format!("{feature_prefix}{}", feature.as_ref()))
-                    .or_insert_with(|| feature_value.to_string());
-            }
+
+        let mut properties = HashMap::from([
+            (
+                "delta.minReaderVersion".into(),
+                protocol.min_reader_version().to_string(),
+            ),
+            (
+                "delta.minWriterVersion".into(),
+                protocol.min_writer_version().to_string(),
+            ),
+        ]);
+
+        let features = protocol
+            .reader_features()
+            .into_iter()
+            .flatten()
+            .chain(protocol.writer_features().into_iter().flatten());
+
+        for feature in features {
+            properties
+                .entry(format!("delta.feature.{}", feature.as_ref()))
+                .or_insert_with(|| "supported".to_string());
         }
-        if let Some(features) = protocol.writer_features() {
-            for feature in features {
-                properties
-                    .entry(format!("{feature_prefix}{}", feature.as_ref()))
-                    .or_insert_with(|| feature_value.to_string());
-            }
-        }
+
         properties
     }
 
@@ -1008,7 +1007,8 @@ impl Snapshot {
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
     #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
-    pub fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
+    #[internal_api]
+    pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
         let enablement = self
             .table_configuration()

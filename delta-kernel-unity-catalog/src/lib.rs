@@ -2,9 +2,9 @@
 
 mod committer;
 mod constants;
-mod create_utils;
+mod utils;
 pub use committer::UCCommitter;
-pub use create_utils::{get_final_required_properties_for_uc, get_required_properties_for_disk};
+pub use utils::{get_final_required_properties_for_uc, get_required_properties_for_disk};
 
 use std::sync::Arc;
 

@@ -32,33 +32,21 @@ use crate::constants::{
     VACUUM_PROTOCOL_CHECK_FEATURE_KEY,
 };
 
-/// Returns the table properties that must be written to disk (in `000.json`) for a UC catalog-managed table.
+/// Returns the table properties that must be written to disk (in `000.json`) for a UC
+/// catalog-managed table.
 ///
-/// These properties must be persisted in the Delta log so that the table is
-/// recognized as catalog-managed. Pass the returned map to
-/// `CreateTableTransactionBuilder::with_table_properties()`. The builder will separate feature
-/// signals from configuration properties internally.
-///
-/// # Properties returned
-///
-/// - `delta.feature.catalogManaged = "supported"` -- enables the catalog-managed table feature
-/// - `delta.feature.vacuumProtocolCheck = "supported"` -- required by UC
-/// - `io.unitycatalog.tableId = <uc_table_id>` -- persisted in metadata configuration
-/// - `delta.enableInCommitTimestamps = "true"` -- enables in-commit timestamps (required by
-///   catalog-managed tables)
+/// These properties must be persisted in the Delta log so that the table is recognized as
+/// catalog-managed.
 pub fn get_required_properties_for_disk(uc_table_id: &str) -> HashMap<String, String> {
-    HashMap::from([
-        (
-            CATALOG_MANAGED_FEATURE_KEY.to_string(),
-            FEATURE_SUPPORTED.to_string(),
-        ),
-        (
-            VACUUM_PROTOCOL_CHECK_FEATURE_KEY.to_string(),
-            FEATURE_SUPPORTED.to_string(),
-        ),
-        (UC_TABLE_ID_KEY.to_string(), uc_table_id.to_string()),
-        (ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string()),
-    ])
+    [
+        (CATALOG_MANAGED_FEATURE_KEY, FEATURE_SUPPORTED),
+        (VACUUM_PROTOCOL_CHECK_FEATURE_KEY, FEATURE_SUPPORTED),
+        (UC_TABLE_ID_KEY, uc_table_id),
+        (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
 }
 
 /// Extracts the properties that must be sent to the UC server when finalizing a table creation.
@@ -171,26 +159,11 @@ mod tests {
     #[test]
     fn test_get_required_properties_for_disk() {
         let props = get_required_properties_for_disk("my-uc-table-123");
-
-        // Feature signals
-        assert_eq!(
-            props.get("delta.feature.catalogManaged"),
-            Some(&"supported".to_string())
-        );
-        assert_eq!(
-            props.get("delta.feature.vacuumProtocolCheck"),
-            Some(&"supported".to_string())
-        );
-        // Configuration
-        assert_eq!(
-            props.get("io.unitycatalog.tableId"),
-            Some(&"my-uc-table-123".to_string())
-        );
-        assert_eq!(
-            props.get("delta.enableInCommitTimestamps"),
-            Some(&"true".to_string())
-        );
         assert_eq!(props.len(), 4);
+        assert_eq!(props["delta.feature.catalogManaged"], "supported");
+        assert_eq!(props["delta.feature.vacuumProtocolCheck"], "supported");
+        assert_eq!(props["io.unitycatalog.tableId"], "my-uc-table-123");
+        assert_eq!(props["delta.enableInCommitTimestamps"], "true");
     }
 
     #[tokio::test]
@@ -199,71 +172,52 @@ mod tests {
         let engine = DefaultEngineBuilder::new(storage).build();
         let table_path = "memory:///test_table/";
         let schema = Arc::new(
-            StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap(),
+            StructType::try_new(vec![
+                StructField::new("id", DataType::INTEGER, false),
+                StructField::new("region", DataType::STRING, true),
+            ])
+            .unwrap(),
         );
 
-        // Create a UC catalog-managed table with the required properties.
+        // Create a UC catalog-managed table with clustering
         let disk_props = get_required_properties_for_disk("test-table-id-456");
         let _ = create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
+            .with_data_layout(DataLayout::clustered(["region"]))
             .build(&engine, Box::new(MockCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap();
 
-        // Load the post-commit snapshot
         let snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
         assert_eq!(snapshot.version(), 0);
-
-        // Extract UC properties
         let uc_props = get_final_required_properties_for_uc(&snapshot, &engine).unwrap();
 
-        // Verify protocol-derived properties
-        assert_eq!(
-            uc_props.get("delta.minReaderVersion"),
-            Some(&"3".to_string())
-        );
-        assert_eq!(
-            uc_props.get("delta.minWriterVersion"),
-            Some(&"7".to_string())
-        );
+        // Protocol-derived properties
+        assert_eq!(uc_props["delta.minReaderVersion"], "3");
+        assert_eq!(uc_props["delta.minWriterVersion"], "7");
+        assert_eq!(uc_props["delta.feature.catalogManaged"], "supported");
+        assert_eq!(uc_props["delta.feature.vacuumProtocolCheck"], "supported");
+        assert_eq!(uc_props["delta.feature.inCommitTimestamp"], "supported");
+        assert_eq!(uc_props["delta.feature.clustering"], "supported");
 
-        // Verify feature signals are present for all protocol features
-        assert_eq!(
-            uc_props.get("delta.feature.catalogManaged"),
-            Some(&"supported".to_string())
-        );
-        assert_eq!(
-            uc_props.get("delta.feature.vacuumProtocolCheck"),
-            Some(&"supported".to_string())
-        );
-        // ICT is enabled via delta.enableInCommitTimestamps=true in disk properties
-        assert_eq!(
-            uc_props.get("delta.feature.inCommitTimestamp"),
-            Some(&"supported".to_string())
-        );
+        // Metadata configuration
+        assert_eq!(uc_props["io.unitycatalog.tableId"], "test-table-id-456");
 
-        // Verify metadata configuration properties
-        assert_eq!(
-            uc_props.get("io.unitycatalog.tableId"),
-            Some(&"test-table-id-456".to_string())
-        );
-
-        // Verify UC-specific properties
-        assert_eq!(
-            uc_props.get("delta.lastUpdateVersion"),
-            Some(&"0".to_string())
-        );
-        // ICT is enabled, so the timestamp should be a non-zero value
-        let timestamp: i64 = uc_props
-            .get("delta.lastCommitTimestamp")
-            .expect("delta.lastCommitTimestamp should be present")
+        // UC-specific properties
+        assert_eq!(uc_props["delta.lastUpdateVersion"], "0");
+        let timestamp: i64 = uc_props["delta.lastCommitTimestamp"]
             .parse()
             .expect("timestamp should be a valid i64");
         assert!(
             timestamp > 0,
             "ICT timestamp should be non-zero, got {timestamp}"
         );
+
+        // Clustering columns
+        let parsed: Vec<Vec<String>> =
+            serde_json::from_str(&uc_props["clusteringColumns"]).unwrap();
+        assert_eq!(parsed, vec![vec!["region"]]);
     }
 
     #[tokio::test]
@@ -300,45 +254,6 @@ mod tests {
         assert!(
             err.to_string().contains("version 0"),
             "expected version 0 error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_final_required_properties_for_uc_with_clustering() {
-        let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage).build();
-        let table_path = "memory:///test_clustered_table/";
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::new("id", DataType::INTEGER, false),
-                StructField::new("region", DataType::STRING, true),
-            ])
-            .unwrap(),
-        );
-
-        let disk_props = get_required_properties_for_disk("clustered-table-id");
-        let _ = create_table(table_path, schema, "Test/1.0")
-            .with_table_properties(disk_props)
-            .with_data_layout(DataLayout::clustered(["region"]))
-            .build(&engine, Box::new(MockCatalogCommitter))
-            .unwrap()
-            .commit(&engine)
-            .unwrap();
-
-        let snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
-        let uc_props = get_final_required_properties_for_uc(&snapshot, &engine).unwrap();
-
-        // Verify clustering columns are present in UC properties
-        let clustering_json = uc_props
-            .get("clusteringColumns")
-            .expect("clusteringColumns should be present");
-        let parsed: Vec<Vec<String>> = serde_json::from_str(clustering_json).unwrap();
-        assert_eq!(parsed, vec![vec!["region"]]);
-
-        // Verify the clustering feature is in the protocol
-        assert_eq!(
-            uc_props.get("delta.feature.clustering"),
-            Some(&"supported".to_string())
         );
     }
 }
