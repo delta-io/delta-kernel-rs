@@ -359,7 +359,7 @@ mod tests {
     use crate::schema::{
         ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
     };
-    use crate::transforms::SchemaTransform;
+    use crate::transforms::{transform_output_type, SchemaTransform};
     use crate::DeltaResult;
     use std::collections::HashMap;
 
@@ -404,10 +404,9 @@ mod tests {
     }
 
     impl<'a> SchemaTransform<'a> for FieldIdCollector {
-        fn transform_struct_field(
-            &mut self,
-            field: &'a StructField,
-        ) -> Option<std::borrow::Cow<'a, StructField>> {
+        transform_output_type!(|'a, T| ());
+
+        fn transform_struct_field(&mut self, field: &'a StructField) {
             // Collect field ID if present
             if let Some(field_id) = field
                 .metadata()

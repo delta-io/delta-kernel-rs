@@ -11,10 +11,9 @@ use crate::schema::{
 };
 
 use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
-use crate::transforms::SchemaTransform;
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Error};
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -60,13 +59,8 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
         mode,
         path: vec![],
         seen: HashMap::new(),
-        err: None,
     };
-    let _ = validator.transform_struct(schema);
-    match validator.err {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
+    validator.transform_struct(schema)
 }
 
 /// Validates a field's column mapping annotations and extracts the physical name and column
@@ -173,47 +167,44 @@ struct ValidateColumnMappings<'a> {
     mode: ColumnMappingMode,
     path: Vec<&'a str>,
     seen: HashMap<i64, &'a str>, // column mapping id -> first field name that claimed it
-    err: Option<Error>,
 }
 
 impl<'a> ValidateColumnMappings<'a> {
-    fn transform_inner<R>(&mut self, field_name: &'a str, validate: impl FnOnce(&mut Self) -> R) {
-        if self.err.is_none() {
-            self.path.push(field_name);
-            let _ = validate(self);
-            self.path.pop();
-        }
+    fn transform_inner<V>(&mut self, field_name: &'a str, validate: V) -> DeltaResult<()>
+    where
+        V: FnOnce(&mut Self) -> DeltaResult<()>,
+    {
+        self.path.push(field_name);
+        let result = validate(self);
+        self.path.pop();
+        result
     }
 }
 
 impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
+    transform_output_type!(|'a, T| DeltaResult<()>);
+
     // Override array element and map key/value for better error messages
-    fn transform_array_element(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner("<array element>", |this| this.transform(etype));
-        Some(Cow::Borrowed(etype))
+    fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<()> {
+        self.transform_inner("<array element>", |this| this.transform(etype))
     }
-    fn transform_map_key(&mut self, ktype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner("<map key>", |this| this.transform(ktype));
-        Some(Cow::Borrowed(ktype))
+    fn transform_map_key(&mut self, ktype: &'a DataType) -> DeltaResult<()> {
+        self.transform_inner("<map key>", |this| this.transform(ktype))
     }
-    fn transform_map_value(&mut self, vtype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        self.transform_inner("<map value>", |this| this.transform(vtype));
-        Some(Cow::Borrowed(vtype))
+    fn transform_map_value(&mut self, vtype: &'a DataType) -> DeltaResult<()> {
+        self.transform_inner("<map value>", |this| this.transform(vtype))
     }
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
         self.transform_inner(field.name(), |this| {
-            get_field_column_mapping_info(field, this.mode, &this.path, Some(&mut this.seen))
-                .map_err(|e| this.err = Some(e))
-                .ok()?;
+            get_field_column_mapping_info(field, this.mode, &this.path, Some(&mut this.seen))?;
             this.recurse_into_struct_field(field)
-        });
-        None
+        })
     }
-    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
+    fn transform_variant(&mut self, _stype: &'a StructType) -> DeltaResult<()> {
         // don't recurse into variant's fields, as they are not expected to have column mapping
         // annotations
         // TODO: this changes with icebergcompat right? see issue#1125 for icebergcompat.
-        None
+        Ok(())
     }
 }
 

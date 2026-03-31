@@ -40,7 +40,7 @@ use crate::schema::{
     ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
-use crate::transforms::{ExpressionTransform, SchemaTransform};
+use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 use self::log_replay::scan_action_iter;
@@ -365,6 +365,8 @@ struct GetReferencedFields<'a> {
     column_mapping_mode: ColumnMappingMode,
 }
 impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     // Capture the path mapping for this leaf field
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
         // Record the physical name mappings for all referenced leaf columns. Delta column names
@@ -412,8 +414,10 @@ struct PrefixColumns {
 }
 
 impl<'a> ExpressionTransform<'a> for PrefixColumns {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        Some(Cow::Owned(self.prefix.join(name)))
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Cow<'a, ColumnName> {
+        Cow::Owned(self.prefix.join(name))
     }
 }
 
@@ -421,6 +425,8 @@ struct ApplyColumnMappings {
     column_mappings: HashMap<ColumnName, ColumnName>,
 }
 impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     // NOTE: We already verified all column references. But if the map probe ever did fail, the
     // transform would just delete any expression(s) that reference the invalid column.
     fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
@@ -861,7 +867,7 @@ impl Scan {
         let mut prefixer = PrefixColumns {
             prefix: ColumnName::new(["add", "stats_parsed"]),
         };
-        let prefixed = prefixer.transform_pred(&skipping_pred)?;
+        let prefixed = prefixer.transform_pred(&skipping_pred);
         Some(Arc::new(prefixed.into_owned()))
     }
 

@@ -714,6 +714,7 @@ impl<S> Transaction<S> {
             .read_snapshot
             .table_configuration()
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
+        // TODO: We should filter TableConfiguration::physical_schema() instead of making a new one here.
         let physical_fields = snapshot_schema
             .fields()
             .filter(|f| {
@@ -1022,7 +1023,7 @@ impl<S> Transaction<S> {
         }
 
         let input_schema = scan_row_schema();
-        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema())?;
+        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema());
         let evaluation_handler = engine.evaluation_handler();
 
         // Create the transform expression once, since it only contains literals and column references

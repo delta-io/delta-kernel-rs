@@ -3,27 +3,24 @@
 use crate::schema::{Schema, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
-use crate::transforms::SchemaTransform;
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
-use std::borrow::Cow;
 
 /// Schema visitor that checks if any column in the schema uses VARIANT type
-#[derive(Debug, Default)]
-pub(crate) struct UsesVariant(bool);
+pub(crate) struct UsesVariant;
 
 impl<'a> SchemaTransform<'a> for UsesVariant {
-    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
-        self.0 = true;
-        None
+    transform_output_type!(|'a, T| Result<(), ()>);
+
+    fn transform_variant(&mut self, _: &'a StructType) -> Result<(), ()> {
+        Err(())
     }
 }
 
 /// Checks if any column in the schema (including nested columns) has VARIANT type.
 pub(crate) fn schema_contains_variant_type(schema: &Schema) -> bool {
-    let mut visitor = UsesVariant(false);
-    let _ = visitor.transform_struct(schema);
-    visitor.0
+    UsesVariant.transform_struct(schema).is_err()
 }
 
 pub(crate) fn validate_variant_type_feature_support(tc: &TableConfiguration) -> DeltaResult<()> {
