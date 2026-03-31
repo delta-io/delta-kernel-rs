@@ -63,6 +63,9 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::AppendOnly,
     TableFeature::ChangeDataFeed,
     TableFeature::TypeWidening,
+    // CatalogManaged enables catalog-managed table support (requires catalog-managed feature)
+    #[cfg(feature = "catalog-managed")]
+    TableFeature::CatalogManaged,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
@@ -1160,6 +1163,32 @@ mod tests {
                 .reader_features
                 .contains(&TableFeature::VacuumProtocolCheck),
             "VacuumProtocolCheck should be in reader_features (ReaderWriter feature)"
+        );
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[test]
+    fn test_catalog_managed_feature_signal_accepted() {
+        let properties = HashMap::from([(
+            "delta.feature.catalogManaged".to_string(),
+            "supported".to_string(),
+        )]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert!(
+            validated.properties.is_empty(),
+            "Feature signal should be removed from properties"
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::CatalogManaged),
+            "CatalogManaged should be in writer_features"
+        );
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::CatalogManaged),
+            "CatalogManaged should be in reader_features (ReaderWriter feature)"
         );
     }
 
