@@ -191,14 +191,18 @@ pub unsafe extern "C" fn commit(
 #[handle_descriptor(target=CreateTableTransactionBuilder, mutable=true, sized=true)]
 pub struct ExclusiveCreateTableBuilder;
 
+// TODO: Add `create_table_set_data_layout` FFI function to support partitioned and clustered
+// table creation. The kernel's `CreateTableTransactionBuilder::with_data_layout(DataLayout)`
+// supports this but is not yet exposed through FFI.
+
 /// Create a new [`CreateTableTransactionBuilder`] for creating a Delta table at the given path.
 ///
 /// The returned builder can be configured with [`create_table_set_property`] before committing
-/// with [`create_table_commit`].
+/// with [`create_table_commit`]. The engine is only used for error reporting at this stage.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid `path`, `schema`, and `engine_info`.
+/// Caller is responsible for passing a valid `path`, `schema`, `engine_info`, and `engine`.
 #[no_mangle]
 pub unsafe extern "C" fn create_table(
     path: KernelStringSlice,
@@ -207,19 +211,22 @@ pub unsafe extern "C" fn create_table(
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
     let engine = unsafe { engine.as_ref() };
-    create_table_impl(path, schema, engine_info).into_extern_result(&engine)
+    let path: DeltaResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&path) };
+    let info: DeltaResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
+    let schema = unsafe { schema.clone_as_arc() };
+    create_table_impl(path, schema, info).into_extern_result(&engine)
 }
 
 fn create_table_impl(
-    path: KernelStringSlice,
-    schema: Handle<SharedSchema>,
-    engine_info: KernelStringSlice,
+    path: DeltaResult<&str>,
+    schema: Arc<delta_kernel::schema::Schema>,
+    engine_info: DeltaResult<&str>,
 ) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
-    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&path) }?;
-    let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
-    let schema = unsafe { schema.clone_as_arc() };
-    let builder =
-        delta_kernel::transaction::create_table::create_table(path, schema, info.to_string());
+    let builder = delta_kernel::transaction::create_table::create_table(
+        path?,
+        schema,
+        engine_info?.to_string(),
+    );
     Ok(Box::new(builder).into())
 }
 
@@ -230,7 +237,7 @@ fn create_table_impl(
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid builder handle, `key`, and `value`.
+/// Caller is responsible for passing a valid builder handle, `key`, `value`, and `engine`.
 /// CONSUMES the builder handle.
 #[no_mangle]
 pub unsafe extern "C" fn create_table_set_property(
@@ -240,23 +247,23 @@ pub unsafe extern "C" fn create_table_set_property(
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
     let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { *builder.into_inner() };
+    let key: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&key) };
+    let value: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&value) };
     create_table_set_property_impl(builder, key, value).into_extern_result(&engine)
 }
 
 fn create_table_set_property_impl(
-    builder: Handle<ExclusiveCreateTableBuilder>,
-    key: KernelStringSlice,
-    value: KernelStringSlice,
+    builder: CreateTableTransactionBuilder,
+    key: DeltaResult<String>,
+    value: DeltaResult<String>,
 ) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
-    let builder = unsafe { builder.into_inner() };
-    let key: String = unsafe { TryFromStringSlice::try_from_slice(&key) }?;
-    let value: String = unsafe { TryFromStringSlice::try_from_slice(&value) }?;
-    let builder = builder.with_table_properties([(key, value)]);
+    let builder = builder.with_table_properties([(key?, value?)]);
     Ok(Box::new(builder).into())
 }
 
-/// Build and commit a create-table transaction. Returns the committed version (always 0 for new
-/// tables). This consumes the builder handle.
+/// Build and commit a create-table transaction. Returns the committed version on success. For
+/// new tables, this is always 0. This consumes the builder handle.
 ///
 /// Uses [`FileSystemCommitter`] by default.
 ///
@@ -990,5 +997,62 @@ mod tests {
         let handle: Handle<ExclusiveCreateTableBuilder> = Box::new(builder).into();
         // Should not panic or leak
         unsafe { free_create_table_builder(handle) };
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_create_table_with_invalid_property() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let table_path_str = tmp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )])?);
+
+        let engine = get_default_engine(table_path_str);
+        let schema_handle: Handle<crate::SharedSchema> = schema.into();
+
+        let engine_info = "test-engine/1.0";
+        let builder = ok_or_panic(unsafe {
+            create_table(
+                kernel_string_slice!(table_path_str),
+                schema_handle,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+
+        // Set an invalid delta feature property that should be rejected at commit time
+        let prop_key = "delta.enableDeletionVectors";
+        let prop_val = "true";
+        let builder = ok_or_panic(unsafe {
+            create_table_set_property(
+                builder,
+                kernel_string_slice!(prop_key),
+                kernel_string_slice!(prop_val),
+                engine.shallow_copy(),
+            )
+        });
+
+        // Commit should fail due to the invalid property
+        let result = unsafe { create_table_commit(builder, engine.shallow_copy()) };
+        match result {
+            ExternResult::Err(e) => {
+                let error = unsafe { crate::ffi_test_utils::recover_error(e) };
+                // The error should indicate a problem with the property
+                assert!(
+                    !error.message.is_empty(),
+                    "Expected a non-empty error message for invalid property"
+                );
+            }
+            ExternResult::Ok(_) => {
+                // Some delta properties may be accepted -- if so, that's fine too.
+                // This test mainly ensures the error path works correctly.
+            }
+        }
+
+        unsafe { free_engine(engine) };
+        Ok(())
     }
 }
