@@ -94,8 +94,6 @@ impl std::fmt::Debug for Snapshot {
     }
 }
 
-const NO_COMMIT_FILE_ERROR: &str = "Last commit file not found in log segment";
-
 impl Snapshot {
     /// Create a new [`SnapshotBuilder`] to build a new [`Snapshot`] for a given table root. If you
     /// instead have an existing [`Snapshot`] you would like to do minimal work to update, consider
@@ -965,7 +963,7 @@ impl Snapshot {
                 let ict = commit_file_meta.read_in_commit_timestamp(engine)?;
                 Ok(Some(ict))
             }
-            None => Err(Error::generic(NO_COMMIT_FILE_ERROR)),
+            None => Err(Error::generic("Last commit file not found in log segment")),
         }
     }
 
@@ -989,21 +987,31 @@ impl Snapshot {
             .in_commit_timestamp_enablement()?
         {
             InCommitTimestampEnablement::NotEnabled => {
-                let commit = self
-                    .log_segment()
-                    .listed
-                    .latest_commit_file()
-                    .as_ref()
-                    .ok_or_else(|| Error::generic(NO_COMMIT_FILE_ERROR))?;
-                Ok(commit.location.last_modified)
+                match &self.log_segment.listed.latest_commit_file {
+                    Some(commit_file_meta) => {
+                        let ts = commit_file_meta.location.last_modified;
+                        Ok(ts)
+                    }
+                    None => Err(Error::generic(format!(
+                        "Last commit file not found in log segment for version {} \
+                         (ICT disabled): cannot read filesystem modification timestamp",
+                        self.version()
+                    ))),
+                }
             }
-            InCommitTimestampEnablement::Enabled { .. } => {
-                self.get_in_commit_timestamp(engine)?.ok_or_else(|| {
+            InCommitTimestampEnablement::Enabled { .. } => self
+                .get_in_commit_timestamp(engine)
+                .map_err(|e| {
+                    Error::generic(format!(
+                        "Reading in-commit timestamp for version {}: {e}",
+                        self.version()
+                    ))
+                })?
+                .ok_or_else(|| {
                     Error::internal_error(
-                        "ICT is enabled but get_in_commit_timestamp returned None",
+                        format!("Invalid state: version {}, ICT is enabled but get_in_commit_timestamp returned None", self.version()),
                     )
-                })
-            }
+                }),
         }
     }
 }
@@ -1127,7 +1135,7 @@ mod tests {
         format!("{protocol}\n{metadata}")
     }
 
-    fn create_snapshot_no_commit(
+    fn create_snapshot_with_commit_file_absent_from_log_segment(
         url: &Url,
         table_cfg: TableConfiguration,
     ) -> DeltaResult<Snapshot> {
@@ -2010,12 +2018,14 @@ mod tests {
             .at_version(0)
             .build(&engine)?;
 
-        let snapshot_no_commit =
-            create_snapshot_no_commit(&url, snapshot.table_configuration().clone())?;
+        let snapshot_no_commit = create_snapshot_with_commit_file_absent_from_log_segment(
+            &url,
+            snapshot.table_configuration().clone(),
+        )?;
 
         // Should return an error when commit file is missing
         let result = snapshot_no_commit.get_in_commit_timestamp(&engine);
-        assert_result_error_with_message(result, NO_COMMIT_FILE_ERROR);
+        assert_result_error_with_message(result, "Last commit file not found in log segment");
 
         Ok(())
     }
@@ -2093,7 +2103,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_timestamp_not_enabled_returns_fs_mtime() -> DeltaResult<()> {
+    async fn test_get_timestamp_with_ict_disabled_returns_file_system_modification_time(
+    ) -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
         let engine = DefaultEngineBuilder::new(store.clone()).build();
@@ -2109,7 +2120,7 @@ mod tests {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let two_days_ms = 2 * 24 * 60 * 60 * 1000_i64;
         assert!(
-            ts >= now_ms - two_days_ms && ts <= now_ms,
+            (now_ms - two_days_ms..=now_ms).contains(&ts),
             "timestamp {ts} not within 2 days of now ({now_ms})"
         );
         Ok(())
@@ -2154,9 +2165,19 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
 
+        // TODO: refactor `ict_config` from a raw tuple to a dedicated ICTConfig struct so the
+        // enablement version and enablement timestamp fields are named and self-documenting.
+        // The ict_config tuple is (inCommitTimestampEnablementVersion, inCommitTimestampEnablementTimestamp):
+        // if ICT is enabled, the enablement version is 0 with an arbitrary enablement timestamp.
         let ict_config = ict_enabled.then(|| ("0".to_string(), "1612345678".to_string()));
         let reader_version = ict_enabled.then_some(TABLE_FEATURES_MIN_READER_VERSION as u32);
-        let commit_data = vec![
+
+        let mut commit_data = vec![];
+        // When ICT is enabled, commitInfo must be the first action (protocol requirement)
+        if ict_enabled {
+            commit_data.push(create_commit_info(1677811175819, Some(1677811175999)));
+        }
+        commit_data.extend([
             create_protocol(ict_enabled, reader_version),
             create_metadata(
                 Some("test_id"),
@@ -2165,18 +2186,48 @@ mod tests {
                 ict_config,
                 false,
             ),
-        ];
+        ]);
         commit(url.as_str(), store.as_ref(), 0, commit_data).await;
 
         let snapshot = Snapshot::builder_for(url.as_str())
             .at_version(0)
             .build(&engine)?;
 
-        let snapshot_no_commit =
-            create_snapshot_no_commit(&url, snapshot.table_configuration().clone())?;
+        let snapshot_no_commit = create_snapshot_with_commit_file_absent_from_log_segment(
+            &url,
+            snapshot.table_configuration().clone(),
+        )?;
 
         let result = snapshot_no_commit.get_timestamp(&engine);
-        assert_result_error_with_message(result, NO_COMMIT_FILE_ERROR);
+        assert_result_error_with_message(result, "Last commit file not found in log segment");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_timestamp_errors_when_ict_missing_from_commit_info() -> DeltaResult<()> {
+        // ICT is enabled and commit file IS present in the log segment, but the commitInfo
+        // action does not carry an inCommitTimestamp value (corrupt/incomplete commit).
+        let store = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+        let commit0_data = vec![
+            create_commit_info(1677811175819, None), // commitInfo without inCommitTimestamp
+            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
+            create_metadata(
+                Some("test_id"),
+                Some("{\"type\":\"struct\",\"fields\":[]}"),
+                Some(1677811175819),
+                Some(("0".to_string(), "1612345678".to_string())), // ict enabled at version 0, and an arbitrary timestamp
+                false,
+            ),
+        ];
+        commit(table_root, store.as_ref(), 0, commit0_data).await;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        let result = snapshot.get_timestamp(&engine);
+        assert_result_error_with_message(result, "In-Commit Timestamp not found in commit file");
 
         Ok(())
     }
