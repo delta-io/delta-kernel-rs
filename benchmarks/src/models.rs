@@ -60,7 +60,6 @@ pub struct TableInfo {
     /// determined by the `delta.feature.catalogManaged` property.
     /// Mutually exclusive with `table_path`.
     /// TODO(#2303): Create an enum type that ensures table_path and catalog_info are mutually exclusive
-    #[serde(alias = "catalogManagedInfo")]
     pub catalog_info: Option<CatalogInfo>,
     /// Schema at the latest version of the table, in Delta protocol JSON format
     /// e.g. `{"type": "struct", "fields": [...]}`
