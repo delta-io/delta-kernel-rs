@@ -1,4 +1,5 @@
 use std::clone::Clone;
+use std::collections::hash_map::RandomState;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
@@ -115,7 +116,7 @@ pub struct ScanLogReplayProcessor {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
-    seen_file_keys: HashSet<FileActionKey>,
+    seen_file_keys: hashbrown::HashSet<FileActionKey, RandomState>,
     /// Skip reading file statistics.
     skip_stats: bool,
     /// Information about checkpoint reading for stats optimization
@@ -146,7 +147,7 @@ impl ScanLogReplayProcessor {
             engine,
             state_info,
             checkpoint_info,
-            HashSet::with_capacity(dedup_capacity),
+            hashbrown::HashSet::with_capacity_and_hasher(dedup_capacity, RandomState::new()),
             skip_stats,
         )
     }
@@ -166,7 +167,7 @@ impl ScanLogReplayProcessor {
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
         checkpoint_info: CheckpointReadInfo,
-        seen_file_keys: HashSet<FileActionKey>,
+        seen_file_keys: hashbrown::HashSet<FileActionKey, RandomState>,
         skip_stats: bool,
     ) -> DeltaResult<Self> {
         let CheckpointReadInfo {
@@ -315,7 +316,7 @@ impl ScanLogReplayProcessor {
         Ok(SerializableScanState {
             predicate,
             internal_state_blob,
-            seen_file_keys: self.seen_file_keys,
+            seen_file_keys: self.seen_file_keys.into_iter().collect(),
             checkpoint_info: self.checkpoint_info,
         })
     }
@@ -370,7 +371,7 @@ impl ScanLogReplayProcessor {
             engine,
             state_info,
             state.checkpoint_info,
-            state.seen_file_keys,
+            state.seen_file_keys.into_iter().collect(),
             internal_state.skip_stats,
         )
     }

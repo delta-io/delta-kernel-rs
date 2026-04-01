@@ -41,6 +41,7 @@ use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
+use std::collections::hash_map::RandomState;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -50,7 +51,7 @@ use std::sync::{Arc, LazyLock};
 pub(crate) struct ActionReconciliationProcessor {
     /// Tracks file actions that have been seen during log replay to avoid duplicates.
     /// Contains (data file path, dv_unique_id) pairs as `FileActionKey` instances.
-    seen_file_keys: HashSet<FileActionKey>,
+    seen_file_keys: hashbrown::HashSet<FileActionKey, RandomState>,
     /// Indicates whether a protocol action has been seen in the log.
     seen_protocol: bool,
     /// Indicates whether a metadata action has been seen in the log.
@@ -345,7 +346,7 @@ impl ActionReconciliationVisitor<'_> {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<'seen>(
-        seen_file_keys: &'seen mut HashSet<FileActionKey>,
+        seen_file_keys: &'seen mut hashbrown::HashSet<FileActionKey, RandomState>,
         is_log_batch: bool,
         selection_vector: Vec<bool>,
         minimum_file_retention_timestamp: i64,
@@ -664,7 +665,7 @@ mod tests {
     #[test]
     fn test_action_reconciliation_visitor() -> DeltaResult<()> {
         let data = action_batch();
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::with_hasher(RandomState::new());
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = ActionReconciliationVisitor::new(
@@ -722,7 +723,7 @@ mod tests {
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::with_hasher(RandomState::new());
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = ActionReconciliationVisitor::new(
@@ -755,7 +756,7 @@ mod tests {
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::with_hasher(RandomState::new());
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = ActionReconciliationVisitor::new(
@@ -796,7 +797,7 @@ mod tests {
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::with_hasher(RandomState::new());
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = ActionReconciliationVisitor::new(
@@ -831,7 +832,7 @@ mod tests {
         let batch = parse_json_batch(json_strings);
 
         // Pre-populate with txn app1
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::with_hasher(RandomState::new());
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         seen_txns.insert("app1".to_string());
@@ -873,7 +874,7 @@ mod tests {
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::with_hasher(RandomState::new());
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = ActionReconciliationVisitor::new(
@@ -1033,7 +1034,7 @@ mod tests {
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::with_hasher(RandomState::new());
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = ActionReconciliationVisitor::new(
@@ -1191,7 +1192,7 @@ mod tests {
 
     /// Helper function to create a standard action reconciliation visitor for error testing
     fn create_test_visitor<'a>(
-        seen_file_keys: &'a mut HashSet<FileActionKey>,
+        seen_file_keys: &'a mut hashbrown::HashSet<FileActionKey, RandomState>,
         seen_txns: &'a mut HashSet<String>,
         seen_domains: &'a mut HashSet<String>,
         txn_expiration_timestamp: Option<i64>,
@@ -1229,7 +1230,7 @@ mod tests {
     #[test]
     fn test_action_reconciliation_visitor_validation_and_type_errors() {
         // Test 1: Wrong getter count validation
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::with_hasher(RandomState::new());
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor =
@@ -1257,7 +1258,7 @@ mod tests {
         ];
 
         for (getter_index, field_name, error_type, expected_error_text) in test_cases {
-            let mut seen_file_keys = HashSet::new();
+            let mut seen_file_keys = hashbrown::HashSet::with_hasher(RandomState::new());
             let mut seen_txns = HashSet::new();
             let mut seen_domains = HashSet::new();
             let mut visitor =
@@ -1277,7 +1278,7 @@ mod tests {
     #[test]
     fn test_action_reconciliation_visitor_complex_field_errors() {
         // Test txn.lastUpdated with retention enabled
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::with_hasher(RandomState::new());
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor = create_test_visitor(
@@ -1308,7 +1309,7 @@ mod tests {
             .contains("lastUpdated is not of type i64"));
 
         // Test remove.deletionTimestamp
-        let mut seen_file_keys = HashSet::new();
+        let mut seen_file_keys = hashbrown::HashSet::with_hasher(RandomState::new());
         let mut seen_txns = HashSet::new();
         let mut seen_domains = HashSet::new();
         let mut visitor =

@@ -20,7 +20,7 @@ use crate::{DeltaResult, EngineData};
 
 use delta_kernel_derive::internal_api;
 
-use std::collections::HashSet;
+use std::collections::hash_map::RandomState;
 use std::sync::Arc;
 
 use tracing::debug;
@@ -56,7 +56,7 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log for deduplication. This is a mutable reference to the set
     /// of seen file keys that persists across multiple log batches.
-    seen_file_keys: &'seen mut HashSet<FileActionKey>,
+    seen_file_keys: &'seen mut hashbrown::HashSet<FileActionKey, RandomState>,
     // TODO: Consider renaming to `is_commit_batch`, `deduplicate_batch`, or `save_batch`
     // to better reflect its role in deduplication logic.
     /// Whether we're processing a commit log JSON file (`true`) or a checkpoint file (`false`).
@@ -74,7 +74,7 @@ pub(crate) struct FileActionDeduplicator<'seen> {
 
 impl<'seen> FileActionDeduplicator<'seen> {
     pub(crate) fn new(
-        seen_file_keys: &'seen mut HashSet<FileActionKey>,
+        seen_file_keys: &'seen mut hashbrown::HashSet<FileActionKey, RandomState>,
         is_log_batch: bool,
         add_path_index: usize,
         remove_path_index: usize,
@@ -361,7 +361,7 @@ mod tests {
     use super::*;
     use crate::engine_data::GetData;
     use crate::DeltaResult;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     /// Mock GetData implementation for testing
     struct MockGetData {
@@ -413,7 +413,7 @@ mod tests {
 
     /// Helper to create a FileActionDeduplicator with standard indices
     fn create_deduplicator(
-        seen: &mut HashSet<FileActionKey>,
+        seen: &mut hashbrown::HashSet<FileActionKey, RandomState>,
         is_log_batch: bool,
     ) -> FileActionDeduplicator<'_> {
         FileActionDeduplicator::new(
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_extract_file_action_add() -> DeltaResult<()> {
-        let mut seen = HashSet::new();
+        let mut seen = hashbrown::HashSet::with_hasher(RandomState::new());
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let mut mock_add = MockGetData::new();
@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn test_extract_file_action_remove() -> DeltaResult<()> {
-        let mut seen = HashSet::new();
+        let mut seen = hashbrown::HashSet::with_hasher(RandomState::new());
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let mut mock_remove = MockGetData::new();
@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn test_extract_file_action_with_deletion_vector() -> DeltaResult<()> {
-        let mut seen = HashSet::new();
+        let mut seen = hashbrown::HashSet::with_hasher(RandomState::new());
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let mut mock_dv = MockGetData::new();
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_extract_file_action_skip_removes() -> DeltaResult<()> {
-        let mut seen = HashSet::new();
+        let mut seen = hashbrown::HashSet::with_hasher(RandomState::new());
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let mut mock_remove = MockGetData::new();
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_extract_file_action_no_action_found() -> DeltaResult<()> {
-        let mut seen = HashSet::new();
+        let mut seen = hashbrown::HashSet::with_hasher(RandomState::new());
         let deduplicator = create_deduplicator(&mut seen, true);
 
         let getters = create_getters_with_mocks(None, None);
@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn test_check_and_record_seen() {
-        let mut seen = HashSet::new();
+        let mut seen = hashbrown::HashSet::with_hasher(RandomState::new());
 
         // Pre-populate with an existing key
         let pre_existing_key = FileActionKey::new("existing.parquet", None);
@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_is_log_batch() {
-        let mut seen = HashSet::new();
+        let mut seen = hashbrown::HashSet::with_hasher(RandomState::new());
 
         // Test with is_log_batch = true
         let deduplicator_log = create_deduplicator(&mut seen, true);
@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_extract_file_action_add() -> DeltaResult<()> {
-        let seen = HashSet::new();
+        let seen = hashbrown::HashSet::with_hasher(RandomState::new());
         let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2)?;
 
         let mut mock_add = MockGetData::new();
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_extract_file_action_with_deletion_vector() -> DeltaResult<()> {
-        let seen = HashSet::new();
+        let seen = hashbrown::HashSet::with_hasher(RandomState::new());
         let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2)?;
 
         let mut mock_dv = MockGetData::new();
@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_deduplicator_filters_commit_duplicates() -> DeltaResult<()> {
-        let mut seen = HashSet::new();
+        let mut seen = hashbrown::HashSet::with_hasher(RandomState::new());
 
         // Files "seen" during commit processing
         seen.insert(FileActionKey::new("modified_in_commit.parquet", None));

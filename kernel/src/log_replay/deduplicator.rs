@@ -10,10 +10,10 @@
 //!
 //! [`FileActionDeduplicator`]: crate::log_replay::FileActionDeduplicator
 
-use std::collections::HashSet;
-
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
+use std::collections::hash_map::RandomState;
+
 use crate::log_replay::FileActionKey;
 use crate::DeltaResult;
 
@@ -75,7 +75,7 @@ pub(crate) trait Deduplicator {
 /// [`FileActionDeduplicator`]: crate::log_replay::FileActionDeduplicator
 #[allow(unused)]
 pub(crate) struct CheckpointDeduplicator<'a> {
-    seen_file_keys: &'a HashSet<FileActionKey>,
+    seen_file_keys: &'a hashbrown::HashSet<FileActionKey, RandomState>,
     add_path_index: usize,
     add_dv_start_index: usize,
 }
@@ -83,7 +83,7 @@ pub(crate) struct CheckpointDeduplicator<'a> {
 impl<'a> CheckpointDeduplicator<'a> {
     #[allow(unused)]
     pub(crate) fn try_new(
-        seen_file_keys: &'a HashSet<FileActionKey>,
+        seen_file_keys: &'a hashbrown::HashSet<FileActionKey, RandomState>,
         add_path_index: usize,
         add_dv_start_index: usize,
     ) -> DeltaResult<Self> {
