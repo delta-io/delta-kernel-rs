@@ -712,7 +712,7 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
-        let physical_columns = match self.get_clustering_columns_physical(engine)? {
+        let physical_columns = match self.get_physical_clustering_columns(engine)? {
             Some(cols) => cols,
             None => return Ok(None),
         };
