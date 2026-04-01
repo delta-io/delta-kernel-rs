@@ -1007,13 +1007,16 @@ pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
 
 /// Get the timestamp of the specified snapshot in milliseconds since the Unix epoch.
 ///
-/// When In-Commit Timestamps (ICT) are enabled, returns the ICT value from the commit's
+/// When In-Commit Timestamp (ICT) is enabled, returns the ICT value from the commit's
 /// `CommitInfo` action. Otherwise, falls back to the filesystem last-modified time of
 /// the latest commit file.
 ///
+/// Returns an error if the commit file is missing, the ICT configuration is invalid, or the
+/// ICT value cannot be read.
+///
 /// # Safety
 ///
-/// Caller is responsible for passing valid handles.
+/// Caller is responsible for passing valid snapshot handle and engine handle.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_timestamp(
     snapshot: Handle<SharedSnapshot>,
