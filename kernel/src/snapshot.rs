@@ -649,7 +649,7 @@ impl Snapshot {
     /// The columns are returned as physical column names, respecting the column mapping mode.
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     #[internal_api]
-    pub(crate) fn get_clustering_columns_physical(
+    pub(crate) fn get_physical_clustering_columns(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
