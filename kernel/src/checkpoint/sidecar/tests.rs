@@ -48,8 +48,7 @@ fn generate_checkpoint_parts(
     let iter_state = data_iter.state();
     let output_schema = writer
         .checkpoint_output_schema
-        .try_get()
-        .expect("mutex should not be poisoned")
+        .get()
         .expect("checkpoint_output_schema should be set by checkpoint_data");
 
     let splitter = SidecarSplitter::new(
@@ -578,8 +577,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
     // Validate the checkpoint data schema
     let schema = writer
         .checkpoint_output_schema
-        .try_get()
-        .expect("mutex should not be poisoned")
+        .get()
         .expect("should be cached after checkpoint_data");
     let add_field = schema.field(ADD_NAME).expect("schema should have 'add'");
     if let DataType::Struct(ref add_struct) = add_field.data_type {
@@ -671,8 +669,7 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
     let data_iter = writer.checkpoint_data(&engine)?;
     let output_schema = writer
         .checkpoint_output_schema
-        .try_get()
-        .expect("mutex should not be poisoned")
+        .get()
         .expect("checkpoint_output_schema should be set by checkpoint_data");
 
     let splitter = SidecarSplitter::new(
