@@ -40,7 +40,12 @@ impl CommitType {
 
     /// Returns `true` if this is a catalog-managed commit.
     pub fn is_catalog_managed(&self) -> bool {
-        matches!(self, Self::CatalogManagedCreate | Self::CatalogManagedWrite)
+        matches!(
+            self,
+            Self::CatalogManagedCreate
+                | Self::CatalogManagedWrite
+                | Self::UpgradeToCatalogManaged
+        )
     }
 }
 
