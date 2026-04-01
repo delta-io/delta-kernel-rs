@@ -23,10 +23,6 @@ pub enum CommitType {
     PathBasedWrite,
     /// Writing to an existing catalog-managed table.
     CatalogManagedWrite,
-    /// Upgrading an existing path-based table to catalog-managed. Not currently supported.
-    UpgradeToCatalogManaged,
-    /// Downgrading an existing catalog-managed table to path-based. Not currently supported.
-    DowngradeToPathBased,
 }
 
 impl CommitType {
@@ -37,10 +33,7 @@ impl CommitType {
 
     /// Returns `true` if this is a catalog-managed commit.
     pub fn is_catalog_managed(&self) -> bool {
-        matches!(
-            self,
-            Self::CatalogManagedCreate | Self::CatalogManagedWrite | Self::UpgradeToCatalogManaged
-        )
+        matches!(self, Self::CatalogManagedCreate | Self::CatalogManagedWrite)
     }
 }
 
@@ -48,7 +41,7 @@ impl CommitType {
 /// and the new state being committed (if any).
 #[derive(Debug)]
 #[allow(dead_code)] // Fields read by delta-kernel-unity-catalog via effective_protocol/metadata
-pub struct CommitProtocolMetadata {
+pub(crate) struct CommitProtocolMetadata {
     /// Existing table protocol from read snapshot. `None` for create-table.
     pub(crate) read_protocol: Option<Protocol>,
     /// Existing table metadata from read snapshot. `None` for create-table.

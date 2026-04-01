@@ -545,6 +545,8 @@ impl<S> Transaction<S> {
         }
     }
 
+    /// Validates that the committer type matches the commit type. A catalog committer must be
+    /// used for catalog-managed operations, and a non-catalog committer for path-based operations.
     fn validate_commit_type(
         is_catalog_committer: bool,
         commit_type: &CommitType,
