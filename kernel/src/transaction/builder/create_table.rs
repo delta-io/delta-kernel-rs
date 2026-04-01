@@ -381,6 +381,26 @@ fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProp
     }
 }
 
+/// Ensures that `inCommitTimestamp` is enabled when `catalogManaged` is present. Adds the ICT
+/// feature to the protocol and sets the enablement property if not already present.
+#[cfg(feature = "catalog-managed")]
+fn maybe_enable_ict_for_catalog_managed(validated: &mut ValidatedTableProperties) {
+    let has_catalog_managed = validated
+        .writer_features
+        .contains(&TableFeature::CatalogManaged);
+    if has_catalog_managed {
+        add_feature_to_lists(
+            TableFeature::InCommitTimestamp,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+        validated
+            .properties
+            .entry(ENABLE_IN_COMMIT_TIMESTAMPS.to_string())
+            .or_insert_with(|| "true".to_string());
+    }
+}
+
 /// Conditionally applies column mapping for table creation based on the mode in properties.
 ///
 /// If `delta.columnMapping.mode` is set to `name` or `id`, this function:
@@ -687,6 +707,10 @@ impl CreateTableTransactionBuilder {
         // Property-driven auto-enablement: check enablement properties
         maybe_auto_enable_property_driven_features(&mut validated);
 
+        // Auto-enable inCommitTimestamp for catalogManaged tables
+        #[cfg(feature = "catalog-managed")]
+        maybe_enable_ict_for_catalog_managed(&mut validated);
+
         // Create Protocol action with table features support
         let protocol =
             Protocol::try_new_modern(validated.reader_features, validated.writer_features)?;
@@ -732,6 +756,7 @@ mod tests {
     use super::*;
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, StructField, StructType};
+    use crate::table_features::FeatureType;
     use crate::table_properties::ENABLE_ICEBERG_COMPAT_V1;
     use crate::utils::test_utils::assert_result_error_with_message;
 
@@ -824,22 +849,6 @@ mod tests {
             validated.properties.get("custom.setting"),
             Some(&"value".to_string())
         );
-
-        // Feature signal for domainMetadata IS allowed (it's in ALLOWED_DELTA_FEATURES)
-        let properties = HashMap::from([(
-            "delta.feature.domainMetadata".to_string(),
-            "supported".to_string(),
-        )]);
-        let result = validate_extract_table_features_and_properties(properties);
-        assert!(result.is_ok());
-        let validated = result.unwrap();
-        // Feature signals are removed from properties (not stored in metadata)
-        assert!(validated.properties.is_empty());
-        // DomainMetadata is a writer-only feature
-        assert!(validated.reader_features.is_empty());
-        assert!(validated
-            .writer_features
-            .contains(&TableFeature::DomainMetadata));
     }
 
     #[test]
@@ -1141,54 +1150,65 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_vacuum_protocol_check_feature_signal() {
-        let properties = HashMap::from([(
-            "delta.feature.vacuumProtocolCheck".to_string(),
-            "supported".to_string(),
-        )]);
+    #[rstest::rstest]
+    #[case::vacuum_protocol_check(TableFeature::VacuumProtocolCheck, "vacuumProtocolCheck")]
+    #[case::domain_metadata(TableFeature::DomainMetadata, "domainMetadata")]
+    #[case::column_mapping(TableFeature::ColumnMapping, "columnMapping")]
+    #[case::in_commit_timestamp(TableFeature::InCommitTimestamp, "inCommitTimestamp")]
+    #[case::deletion_vectors(TableFeature::DeletionVectors, "deletionVectors")]
+    #[case::v2_checkpoint(TableFeature::V2Checkpoint, "v2Checkpoint")]
+    #[case::append_only(TableFeature::AppendOnly, "appendOnly")]
+    #[case::change_data_feed(TableFeature::ChangeDataFeed, "changeDataFeed")]
+    #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
+    fn test_feature_signal_accepted(
+        #[case] feature: TableFeature,
+        #[case] feature_name: &str,
+    ) {
+        let key = format!("delta.feature.{feature_name}");
+        let properties = HashMap::from([(key, "supported".to_string())]);
         let validated = validate_extract_table_features_and_properties(properties).unwrap();
+
         assert!(
             validated.properties.is_empty(),
             "Feature signal should be removed from properties"
         );
         assert!(
-            validated
-                .writer_features
-                .contains(&TableFeature::VacuumProtocolCheck),
-            "VacuumProtocolCheck should be in writer_features"
+            validated.writer_features.contains(&feature),
+            "{feature:?} should be in writer_features"
         );
-        assert!(
-            validated
-                .reader_features
-                .contains(&TableFeature::VacuumProtocolCheck),
-            "VacuumProtocolCheck should be in reader_features (ReaderWriter feature)"
-        );
+        match feature.feature_type() {
+            FeatureType::ReaderWriter => assert!(
+                validated.reader_features.contains(&feature),
+                "{feature:?} is ReaderWriter but missing from reader_features"
+            ),
+            _ => assert!(
+                validated.reader_features.is_empty(),
+                "{feature:?} is WriterOnly but reader_features is not empty"
+            ),
+        }
     }
 
+    // TODO: Merge into `test_feature_signal_accepted` once the `catalog-managed` feature flag
+    // is removed.
     #[cfg(feature = "catalog-managed")]
     #[test]
-    fn test_catalog_managed_feature_signal_accepted() {
-        let properties = HashMap::from([(
-            "delta.feature.catalogManaged".to_string(),
-            "supported".to_string(),
-        )]);
+    fn test_feature_signal_accepted_catalog_managed() {
+        let key = "delta.feature.catalogManaged".to_string();
+        let properties = HashMap::from([(key, "supported".to_string())]);
         let validated = validate_extract_table_features_and_properties(properties).unwrap();
+
         assert!(
             validated.properties.is_empty(),
             "Feature signal should be removed from properties"
         );
+        let feature = TableFeature::CatalogManaged;
         assert!(
-            validated
-                .writer_features
-                .contains(&TableFeature::CatalogManaged),
-            "CatalogManaged should be in writer_features"
+            validated.writer_features.contains(&feature),
+            "{feature:?} should be in writer_features"
         );
         assert!(
-            validated
-                .reader_features
-                .contains(&TableFeature::CatalogManaged),
-            "CatalogManaged should be in reader_features (ReaderWriter feature)"
+            validated.reader_features.contains(&feature),
+            "{feature:?} is ReaderWriter but missing from reader_features"
         );
     }
 
@@ -1367,5 +1387,60 @@ mod tests {
         ]);
         let columns = vec![ColumnName::new(["col"])];
         assert!(validate_partition_columns(&schema, &columns).is_ok());
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[test]
+    fn test_catalog_managed_auto_enables_ict() {
+        // Only set catalogManaged -- ICT should be auto-enabled
+        let properties = HashMap::from([(
+            "delta.feature.catalogManaged".to_string(),
+            "supported".to_string(),
+        )]);
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        maybe_auto_enable_property_driven_features(&mut validated);
+        maybe_enable_ict_for_catalog_managed(&mut validated);
+
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::InCommitTimestamp),
+            "ICT should be auto-added to writer_features"
+        );
+        assert_eq!(
+            validated.properties.get(ENABLE_IN_COMMIT_TIMESTAMPS),
+            Some(&"true".to_string()),
+            "delta.enableInCommitTimestamps should be set to true"
+        );
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[test]
+    fn test_catalog_managed_does_not_override_existing_ict() {
+        // Set both catalogManaged and ICT explicitly
+        let properties = HashMap::from([
+            (
+                "delta.feature.catalogManaged".to_string(),
+                "supported".to_string(),
+            ),
+            (
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        maybe_auto_enable_property_driven_features(&mut validated);
+        maybe_enable_ict_for_catalog_managed(&mut validated);
+
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::InCommitTimestamp),
+            "ICT should be in writer_features"
+        );
+        assert_eq!(
+            validated.properties.get(ENABLE_IN_COMMIT_TIMESTAMPS),
+            Some(&"true".to_string()),
+        );
     }
 }
