@@ -792,24 +792,25 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_create_table_basic() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
-        let table_path_str = tmp_dir.path().to_str().unwrap();
-
-        let schema = Arc::new(StructType::try_new(vec![
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-        ])?);
-
-        let engine = get_default_engine(table_path_str);
+    /// Create a [`CreateTableTransactionBuilder`] handle via the FFI, using the given schema
+    /// fields. Returns `(table_path, engine_handle, builder_handle)`. The caller is responsible
+    /// for freeing/consuming the engine and builder handles.
+    fn create_table_builder(
+        tmp_dir: &tempfile::TempDir,
+        fields: Vec<StructField>,
+    ) -> (
+        String,
+        Handle<crate::SharedExternEngine>,
+        Handle<ExclusiveCreateTableBuilder>,
+    ) {
+        let table_path = tmp_dir.path().to_str().unwrap().to_string();
+        let schema = Arc::new(StructType::try_new(fields).unwrap());
+        let engine = get_default_engine(&table_path);
         let schema_handle: Handle<crate::SharedSchema> = schema.into();
-
         let engine_info = "test-engine/1.0";
         let builder = ok_or_panic(unsafe {
             create_table(
-                kernel_string_slice!(table_path_str),
+                kernel_string_slice!(table_path),
                 schema_handle.shallow_copy(),
                 kernel_string_slice!(engine_info),
                 engine.shallow_copy(),
@@ -817,6 +818,21 @@ mod tests {
         });
         // create_table does NOT consume the schema handle -- free it
         unsafe { free_schema(schema_handle) };
+        (table_path, engine, builder)
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_create_table_basic() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let (table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("name", DataType::STRING),
+            ],
+        );
+        let table_path_str = table_path.as_str();
 
         // Commit -- should return version 0
         let version = ok_or_panic(unsafe { create_table_commit(builder, engine.shallow_copy()) });
@@ -846,27 +862,11 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     async fn test_create_table_with_properties() -> Result<(), Box<dyn std::error::Error>> {
         let tmp_dir = tempdir()?;
-        let table_path_str = tmp_dir.path().to_str().unwrap();
-
-        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-            "id",
-            DataType::INTEGER,
-        )])?);
-
-        let engine = get_default_engine(table_path_str);
-        let schema_handle: Handle<crate::SharedSchema> = schema.into();
-
-        let engine_info = "test-engine/1.0";
-        let builder = ok_or_panic(unsafe {
-            create_table(
-                kernel_string_slice!(table_path_str),
-                schema_handle.shallow_copy(),
-                kernel_string_slice!(engine_info),
-                engine.shallow_copy(),
-            )
-        });
-        // create_table does NOT consume the schema handle -- free it
-        unsafe { free_schema(schema_handle) };
+        let (table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let table_path_str = table_path.as_str();
 
         // Set properties
         let prop_key1 = "delta.appendOnly";
@@ -931,39 +931,20 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     async fn test_create_table_already_exists() -> Result<(), Box<dyn std::error::Error>> {
         let tmp_dir = tempdir()?;
-        let table_path_str = tmp_dir.path().to_str().unwrap();
-
-        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-            "id",
-            DataType::INTEGER,
-        )])?);
-
-        let engine = get_default_engine(table_path_str);
 
         // Create the table first time -- should succeed
-        let schema_handle: Handle<crate::SharedSchema> = schema.clone().into();
-        let engine_info = "test-engine/1.0";
-        let builder = ok_or_panic(unsafe {
-            create_table(
-                kernel_string_slice!(table_path_str),
-                schema_handle.shallow_copy(),
-                kernel_string_slice!(engine_info),
-                engine.shallow_copy(),
-            )
-        });
+        let (_table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
         let version = ok_or_panic(unsafe { create_table_commit(builder, engine.shallow_copy()) });
         assert_eq!(version, 0);
 
         // Try to create the same table again -- should error
-        let builder2 = ok_or_panic(unsafe {
-            create_table(
-                kernel_string_slice!(table_path_str),
-                schema_handle.shallow_copy(),
-                kernel_string_slice!(engine_info),
-                engine.shallow_copy(),
-            )
-        });
-        unsafe { free_schema(schema_handle) };
+        let (_, _, builder2) = create_table_builder(
+            &tmp_dir,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
         let result = unsafe { create_table_commit(builder2, engine.shallow_copy()) };
         // The commit should fail because the table already exists
         match result {
@@ -1000,23 +981,8 @@ mod tests {
     async fn test_create_table_commit_with_empty_schema_returns_error(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_dir = tempdir()?;
-        let table_path_str = tmp_dir.path().to_str().unwrap();
-
         // An empty schema is always invalid for table creation
-        let schema = Arc::new(StructType::try_new(vec![])?);
-        let engine = get_default_engine(table_path_str);
-        let schema_handle: Handle<crate::SharedSchema> = schema.into();
-
-        let engine_info = "test-engine/1.0";
-        let builder = ok_or_panic(unsafe {
-            create_table(
-                kernel_string_slice!(table_path_str),
-                schema_handle.shallow_copy(),
-                kernel_string_slice!(engine_info),
-                engine.shallow_copy(),
-            )
-        });
-        unsafe { free_schema(schema_handle) };
+        let (_table_path, engine, builder) = create_table_builder(&tmp_dir, vec![]);
 
         let result = unsafe { create_table_commit(builder, engine.shallow_copy()) };
         match result {
