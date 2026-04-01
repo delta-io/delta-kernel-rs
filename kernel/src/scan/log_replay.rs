@@ -1,5 +1,4 @@
 use std::clone::Clone;
-use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
@@ -74,7 +73,7 @@ pub struct SerializableScanState {
     /// Opaque internal state blob
     pub internal_state_blob: Vec<u8>,
     /// Set of file action keys that have already been processed.
-    pub seen_file_keys: HashSet<FileActionKey>,
+    pub seen_file_keys: hashbrown::HashSet<FileActionKey>,
     /// Information about checkpoint reading for stats optimization
     pub(crate) checkpoint_info: CheckpointReadInfo,
 }
@@ -115,7 +114,7 @@ pub struct ScanLogReplayProcessor {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
-    seen_file_keys: HashSet<FileActionKey>,
+    seen_file_keys: hashbrown::HashSet<FileActionKey>,
     /// Skip reading file statistics.
     skip_stats: bool,
     /// Information about checkpoint reading for stats optimization
@@ -146,7 +145,7 @@ impl ScanLogReplayProcessor {
             engine,
             state_info,
             checkpoint_info,
-            HashSet::with_capacity(dedup_capacity),
+            hashbrown::HashSet::with_capacity(dedup_capacity),
             skip_stats,
         )
     }
@@ -166,7 +165,7 @@ impl ScanLogReplayProcessor {
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
         checkpoint_info: CheckpointReadInfo,
-        seen_file_keys: HashSet<FileActionKey>,
+        seen_file_keys: hashbrown::HashSet<FileActionKey>,
         skip_stats: bool,
     ) -> DeltaResult<Self> {
         let CheckpointReadInfo {
@@ -884,7 +883,7 @@ pub(crate) fn scan_action_iter(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use rstest::rstest;
@@ -1398,7 +1397,7 @@ mod tests {
         let invalid_state = SerializableScanState {
             predicate: None,
             internal_state_blob: vec![0, 1, 2, 3, 255], // Invalid JSON
-            seen_file_keys: HashSet::new(),
+            seen_file_keys: hashbrown::HashSet::new(),
             checkpoint_info,
         };
         assert!(ScanLogReplayProcessor::from_serializable_state(&engine, invalid_state).is_err());
@@ -1429,7 +1428,7 @@ mod tests {
         let invalid_state = SerializableScanState {
             predicate: Some(predicate), // Predicate exists but schema is None
             internal_state_blob: invalid_blob,
-            seen_file_keys: HashSet::new(),
+            seen_file_keys: hashbrown::HashSet::new(),
             checkpoint_info,
         };
         let result = ScanLogReplayProcessor::from_serializable_state(&engine, invalid_state);
@@ -1470,7 +1469,7 @@ mod tests {
         let state = SerializableScanState {
             predicate: None,
             internal_state_blob: vec![],
-            seen_file_keys: HashSet::new(),
+            seen_file_keys: hashbrown::HashSet::new(),
             checkpoint_info: test_checkpoint_info(),
         };
         let blob = serde_json::to_string(&state).unwrap();
@@ -1494,7 +1493,7 @@ mod tests {
         let state = SerializableScanState {
             predicate: Some(opaque_predicate),
             internal_state_blob: vec![],
-            seen_file_keys: HashSet::new(),
+            seen_file_keys: hashbrown::HashSet::new(),
             checkpoint_info: test_checkpoint_info(),
         };
 
