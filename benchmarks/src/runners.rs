@@ -5,7 +5,7 @@
 //! Results are discarded for benchmarking purposes.
 //!
 //! Engine and snapshot construction is handled based on `TableInfo`:
-//! - UC tables (`uc_table_info`): UC-vended credentials; catalog-managed tables use
+//! - UC tables (`catalog_info`): UC-vended credentials; catalog-managed tables use
 //!   `UCKernelClient::load_snapshot`, others use the standard snapshot builder
 //! - S3 tables (`table_path` with s3://): credentials from `AWS_*` env vars
 //! - Local tables: local filesystem engine
@@ -104,7 +104,7 @@ impl SnapshotStrategy {
 
 /// Resolves engine credentials and snapshot strategy from a [`TableInfo`].
 ///
-/// For UC-managed tables (`uc_table_info` is present), credentials are vended via
+/// For UC-managed tables (`catalog_info` is present), credentials are vended via
 /// `UCClient`. The `delta.feature.catalogManaged` property then determines whether to use
 /// `UCKernelClient` (catalog-managed) or the standard snapshot builder.
 ///
@@ -114,7 +114,7 @@ fn resolve_snapshot_strategy(
     table_info: &TableInfo,
     runtime: Arc<tokio::runtime::Runtime>,
 ) -> Result<(Arc<dyn Engine>, SnapshotStrategy), Box<dyn std::error::Error>> {
-    let Some(cm) = &table_info.uc_table_info else {
+    let Some(cm) = &table_info.catalog_info else {
         let url = table_info.resolved_table_root();
         let engine = resolve_engine_for_url(&url, runtime)?;
         return Ok((engine, SnapshotStrategy::Standard { url }));

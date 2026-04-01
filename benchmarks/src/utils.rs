@@ -104,9 +104,9 @@ fn load_specs_from_table(
         }
     }
 
-    // Remote tables (table_path or uc_table_info present) don't need local data.
+    // Remote tables (table_path or catalog_info present) don't need local data.
     // Local tables must have a delta/ subdirectory next to tableInfo.json.
-    let is_remote = table_info.table_path.is_some() || table_info.uc_table_info.is_some();
+    let is_remote = table_info.table_path.is_some() || table_info.catalog_info.is_some();
     if !is_remote {
         let delta_dir = table_dir.join(DELTA_DIR_NAME);
         if !delta_dir.is_dir() {
