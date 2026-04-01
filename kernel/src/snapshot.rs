@@ -834,25 +834,12 @@ impl Snapshot {
     /// snapshot's version.
     ///
     /// NOTE: This is an unstable API expected to change in future releases.
-    #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_file_stats(&self, engine: &dyn Engine) -> Option<FileStats> {
         let crc = self
             .lazy_crc
             .get_or_load_if_at_version(engine, self.version())?;
         crc.file_stats()
-    }
-
-    /// Returns the file size histogram bin boundaries from the loaded CRC, if available.
-    ///
-    /// Purely opportunistic: no I/O. Returns `None` if the CRC is not loaded, not at this
-    /// version, or has no histogram.
-    pub(crate) fn histogram_bin_boundaries(&self) -> Option<&[i64]> {
-        self.lazy_crc
-            .get_if_loaded_at_version(self.version())?
-            .file_size_histogram
-            .as_ref()
-            .map(|h| h.sorted_bin_boundaries.as_slice())
     }
 
     /// Returns the CRC if one has been loaded at this snapshot's version (no I/O).
