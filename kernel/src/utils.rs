@@ -25,7 +25,7 @@ pub(crate) use require;
 /// (tracking issue: <https://github.com/rust-lang/rust/issues/109737>),
 /// so we provide our own implementation.
 ///
-/// Returns a clone of the cached value, initializing it with `f` on first call.
+/// Returns a clone of the cached value, or try to initialize it with `f` if the value is uninitialized.
 pub(crate) fn once_lock_get_or_try_init<T: Clone>(
     lock: &OnceLock<T>,
     f: impl FnOnce() -> DeltaResult<T>,
@@ -34,10 +34,7 @@ pub(crate) fn once_lock_get_or_try_init<T: Clone>(
         return Ok(cached.clone());
     }
     let val = f()?;
-    // set() only fails if another thread initialized the lock between our get() and here,
-    // in which case the lock already holds a valid value. So we can safely ignore the result.
-    let _ = lock.set(val.clone());
-    Ok(val)
+    Ok(lock.get_or_init(|| val).clone())
 }
 
 /// Try to parse string uri into a URL for a table path. This will do it's best to handle things
