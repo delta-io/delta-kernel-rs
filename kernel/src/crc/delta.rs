@@ -168,11 +168,11 @@ impl Crc {
             return;
         }
 
-        let is_safe = delta
+        let is_incremental_safe = delta
             .operation
             .as_deref()
             .is_some_and(FileStatsDelta::is_incremental_safe);
-        if !is_safe {
+        if !is_incremental_safe {
             self.file_stats_validity = FileStatsValidity::Indeterminate;
             self.file_size_histogram = None;
             return;
@@ -666,12 +666,18 @@ mod tests {
 
     // ===== Histogram tests =====
 
-    /// Helper: creates a CRC with a histogram containing the given file sizes.
-    fn base_crc_with_histogram(file_sizes: &[i64]) -> Crc {
+    /// Helper: creates a default-boundary histogram populated with the given file sizes.
+    fn histogram_from_sizes(sizes: &[i64]) -> FileSizeHistogram {
         let mut hist = FileSizeHistogram::create_default();
-        for &size in file_sizes {
+        for &size in sizes {
             hist.insert(size).unwrap();
         }
+        hist
+    }
+
+    /// Helper: creates a CRC with a histogram containing the given file sizes.
+    fn base_crc_with_histogram(file_sizes: &[i64]) -> Crc {
+        let hist = histogram_from_sizes(file_sizes);
         Crc {
             table_size_bytes: file_sizes.iter().sum(),
             num_files: file_sizes.len() as i64,
@@ -682,16 +688,10 @@ mod tests {
         }
     }
 
-    /// Helper: creates a write delta with histogram data for adds and removes.
+    /// Helper: creates a CrcDelta with histogram data for adds and removes.
     fn write_delta_with_histograms(add_sizes: &[i64], remove_sizes: &[i64]) -> CrcDelta {
-        let mut added = FileSizeHistogram::create_default();
-        for &size in add_sizes {
-            added.insert(size).unwrap();
-        }
-        let mut removed = FileSizeHistogram::create_default();
-        for &size in remove_sizes {
-            removed.insert(size).unwrap();
-        }
+        let added = histogram_from_sizes(add_sizes);
+        let removed = histogram_from_sizes(remove_sizes);
         let net_files = add_sizes.len() as i64 - remove_sizes.len() as i64;
         let net_bytes: i64 = add_sizes.iter().sum::<i64>() - remove_sizes.iter().sum::<i64>();
         CrcDelta {
@@ -706,18 +706,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn apply_merges_histogram_when_both_present() {
-        // Base: 3 files [100, 200, 300] all in bin 0
-        let mut crc = base_crc_with_histogram(&[100, 200, 300]);
-        // Delta: add [500], remove [200]
-        let delta = write_delta_with_histograms(&[500], &[200]);
+    /// Histogram bins used in tests (default boundaries):
+    ///   Bin 0: [0, 8KB)     -- e.g. 100, 200, 300, 500
+    ///   Bin 1: [8KB, 16KB)  -- e.g. 10_000
+    ///   Bin 2: [16KB, 32KB) -- e.g. 20_000
+    ///   Bin 10: [4MB, 8MB)  -- e.g. 5_000_000
+    #[rstest]
+    #[case::single_bin(&[100, 200, 300], &[500], &[200], &[(0, 3, 900)])]
+    #[case::adds_only(&[100], &[200, 300], &[], &[(0, 3, 600)])]
+    #[case::removes_only(&[100, 200, 300], &[], &[100, 200], &[(0, 1, 300)])]
+    #[case::empty_delta(&[100, 10_000], &[], &[], &[(0, 1, 100), (1, 1, 10_000)])]
+    #[case::multi_bin(
+        &[100, 10_000, 20_000],
+        &[200, 10_500],
+        &[100, 20_000],
+        &[(0, 1, 200), (1, 2, 20_500), (2, 0, 0)]
+    )]
+    #[case::large_files(
+        &[100, 5_000_000],
+        &[10_000, 5_500_000],
+        &[100],
+        &[(0, 0, 0), (1, 1, 10_000), (10, 2, 10_500_000)]
+    )]
+    fn apply_merges_histogram(
+        #[case] base: &[i64],
+        #[case] add: &[i64],
+        #[case] remove: &[i64],
+        #[case] expected_bins: &[(usize, i64, i64)],
+    ) {
+        let mut crc = base_crc_with_histogram(base);
+        let delta = write_delta_with_histograms(add, remove);
         crc.apply(delta);
 
         let hist = crc.file_size_histogram.as_ref().unwrap();
-        // Bin 0: was 3 files/600 bytes, +1 file/+500 bytes, -1 file/-200 bytes = 3 files/900 bytes
-        assert_eq!(hist.file_counts[0], 3);
-        assert_eq!(hist.total_bytes[0], 900);
+        for &(bin, count, bytes) in expected_bins {
+            assert_eq!(hist.file_counts[bin], count, "file_counts[{bin}]");
+            assert_eq!(hist.total_bytes[bin], bytes, "total_bytes[{bin}]");
+        }
     }
 
     #[rstest]
@@ -734,20 +759,8 @@ mod tests {
             Some(sizes) => base_crc_with_histogram(sizes),
             None => base_crc(),
         };
-        let added_histogram = added_sizes.map(|sizes| {
-            let mut h = FileSizeHistogram::create_default();
-            for s in &sizes {
-                h.insert(*s).unwrap();
-            }
-            h
-        });
-        let removed_histogram = removed_sizes.map(|sizes| {
-            let mut h = FileSizeHistogram::create_default();
-            for s in &sizes {
-                h.insert(*s).unwrap();
-            }
-            h
-        });
+        let added_histogram = added_sizes.map(|sizes| histogram_from_sizes(&sizes));
+        let removed_histogram = removed_sizes.map(|sizes| histogram_from_sizes(&sizes));
         let delta = CrcDelta {
             file_stats: FileStatsDelta {
                 net_files: 1,
@@ -780,6 +793,7 @@ mod tests {
     #[test]
     fn apply_drops_histogram_on_untrackable() {
         let mut crc = base_crc_with_histogram(&[100, 200]);
+        // A missing file size makes byte-level stats impossible, so the histogram is dropped.
         let delta = CrcDelta {
             has_missing_file_size: true,
             ..write_delta(1, 100)
@@ -791,9 +805,7 @@ mod tests {
 
     #[test]
     fn into_crc_for_version_zero_includes_histogram() {
-        let mut added = FileSizeHistogram::create_default();
-        added.insert(500).unwrap();
-        added.insert(1000).unwrap();
+        let added = histogram_from_sizes(&[500, 1000]);
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
             metadata: Some(Metadata::default()),
@@ -814,6 +826,8 @@ mod tests {
 
     #[test]
     fn into_crc_for_version_zero_without_histogram() {
+        // write_delta() produces a CrcDelta with no added/removed histograms, so
+        // into_crc_for_version_zero cannot construct a file size histogram.
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
             metadata: Some(Metadata::default()),
