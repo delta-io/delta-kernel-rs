@@ -460,6 +460,7 @@ pub unsafe extern "C" fn remove_files(
     let engine = unsafe { engine.as_ref() };
     let data = unsafe { data.into_inner() };
     let txn = unsafe { txn.as_mut() };
+    // empty sv = all rows selected (per FilteredEngineData contract)
     let sv = if selection_vector.is_null() || selection_vector_len == 0 {
         vec![]
     } else {
@@ -510,6 +511,8 @@ fn remove_scan_metadata_impl(
             "scan_metadata handle has other outstanding references and cannot be consumed".into(),
         )
     })?;
+    // row_transforms are only needed for read-path data transformations, not for identifying
+    // which files to remove.
     txn.remove_files(metadata.scan_files);
     Ok(())
 }
@@ -1461,6 +1464,87 @@ mod tests {
         ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
         assert_no_active_files(&kernel_engine, table_path_str)?;
 
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_files_null_sv_creates_empty_filtered_data() {
+        // Verify that the null-pointer / zero-length selection vector path in remove_files
+        // correctly creates a FilteredEngineData with an empty selection vector (all rows
+        // selected). We test FilteredEngineData construction directly since the null-pointer
+        // handling occurs in the extern "C" wrapper before calling remove_files_impl.
+        use delta_kernel::arrow::array::Int32Array;
+        use delta_kernel::engine::arrow_data::ArrowEngineData;
+
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+        )])
+        .unwrap();
+        let data: Box<dyn delta_kernel::EngineData> = Box::new(ArrowEngineData::from(batch));
+
+        // Empty selection vector means "all rows selected"
+        let filtered = FilteredEngineData::try_new(data, vec![]).unwrap();
+        assert_eq!(filtered.selection_vector().len(), 0);
+        assert_eq!(filtered.data().len(), 3);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_remove_scan_metadata_fails_with_multiple_arc_refs(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let (table_path, engine) = create_table_with_one_file(&tmp_dir)?;
+        let table_path_str = table_path.as_str();
+
+        let kernel_engine = unsafe { engine.as_ref() }.engine();
+        let snapshot = delta_kernel::snapshot::Snapshot::builder_for(delta_kernel::try_parse_uri(
+            table_path_str,
+        )?)
+        .build(kernel_engine.as_ref())?;
+
+        let scan = snapshot.scan_builder().build()?;
+        let scan_meta_items: Vec<_> = scan
+            .scan_metadata(kernel_engine.as_ref())?
+            .collect::<Result<_, _>>()?;
+
+        let scan_meta_arc = Arc::new(scan_meta_items.into_iter().next().unwrap());
+        // Hold a second Arc reference so Arc::try_unwrap will fail
+        let _extra_ref = Arc::clone(&scan_meta_arc);
+        let scan_meta_handle: Handle<crate::scan::SharedScanMetadata> = scan_meta_arc.into();
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        let engine_info = "test-engine/1.0";
+        let txn = ok_or_panic(unsafe {
+            with_engine_info(
+                txn,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+
+        let result = unsafe {
+            remove_scan_metadata(txn.shallow_copy(), scan_meta_handle, engine.shallow_copy())
+        };
+        match result {
+            ExternResult::Err(e) => {
+                let error = unsafe { crate::ffi_test_utils::recover_error(e) };
+                assert!(
+                    error.message.contains("outstanding references"),
+                    "Expected error about outstanding references, got: {}",
+                    error.message
+                );
+            }
+            ExternResult::Ok(_) => {
+                panic!("Expected error when Arc has multiple references")
+            }
+        }
+
+        // Clean up: free the txn (not committed) and engine
+        unsafe { crate::transaction::free_transaction(txn) };
         unsafe { free_engine(engine) };
         Ok(())
     }
