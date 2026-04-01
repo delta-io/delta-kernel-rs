@@ -1147,7 +1147,7 @@ mod tests {
     use crate::error::{EngineError, KernelError};
     use crate::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
-        recover_string,
+        recover_string, setup_snapshot,
     };
     use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -1635,18 +1635,7 @@ mod tests {
         #[case] expected_reader: i32,
         #[case] expected_writer: i32,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let table_root = "memory:///";
-        let storage = Arc::new(InMemory::new());
-        add_commit(table_root, storage.as_ref(), 0, commit_data).await?;
-
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let snap = unsafe {
-            ok_or_panic(snapshot(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
+        let (engine, snap) = setup_snapshot(commit_data).await?;
 
         let reader_v = unsafe { snapshot_min_reader_version(snap.shallow_copy()) };
         let writer_v = unsafe { snapshot_min_writer_version(snap.shallow_copy()) };
@@ -1680,18 +1669,7 @@ mod tests {
         #[case] commit_data: String,
         #[case] expected: KernelColumnMappingMode,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let table_root = "memory:///";
-        let storage = Arc::new(InMemory::new());
-        add_commit(table_root, storage.as_ref(), 0, commit_data).await?;
-
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let snap = unsafe {
-            ok_or_panic(snapshot(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
+        let (engine, snap) = setup_snapshot(commit_data).await?;
 
         let mode = unsafe { snapshot_column_mapping_mode(snap.shallow_copy()) };
         assert_eq!(mode, expected);
@@ -1703,24 +1681,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_metadata_id() -> Result<(), Box<dyn std::error::Error>> {
-        let table_root = "memory:///";
-        let storage = Arc::new(InMemory::new());
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            0,
-            actions_to_string(vec![TestAction::Metadata]),
-        )
-        .await?;
-
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let snap = unsafe {
-            ok_or_panic(snapshot(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
+        let (engine, snap) = setup_snapshot(actions_to_string(vec![TestAction::Metadata])).await?;
 
         let id_ptr = unsafe { snapshot_metadata_id(snap.shallow_copy(), allocate_str) };
         assert!(id_ptr.is_some());
@@ -1735,27 +1696,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_table_property_found() -> Result<(), Box<dyn std::error::Error>> {
-        let table_root = "memory:///";
-        let storage = Arc::new(InMemory::new());
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            0,
-            actions_to_string_with_metadata(
-                vec![TestAction::Metadata],
-                METADATA_WITH_TABLE_PROPERTIES,
-            ),
-        )
+        let (engine, snap) = setup_snapshot(actions_to_string_with_metadata(
+            vec![TestAction::Metadata],
+            METADATA_WITH_TABLE_PROPERTIES,
+        ))
         .await?;
-
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let snap = unsafe {
-            ok_or_panic(snapshot(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
 
         // Look up an existing property
         let key = "delta.appendOnly";
@@ -1786,24 +1731,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_table_property_not_found() -> Result<(), Box<dyn std::error::Error>> {
-        let table_root = "memory:///";
-        let storage = Arc::new(InMemory::new());
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            0,
-            actions_to_string(vec![TestAction::Metadata]),
-        )
-        .await?;
-
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let snap = unsafe {
-            ok_or_panic(snapshot(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
+        let (engine, snap) = setup_snapshot(actions_to_string(vec![TestAction::Metadata])).await?;
 
         // Look up a non-existent property -- should return None
         let key = "nonexistent.property";
@@ -1820,24 +1748,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_table_property_invalid_utf8_returns_none(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let table_root = "memory:///";
-        let storage = Arc::new(InMemory::new());
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            0,
-            actions_to_string(vec![TestAction::Metadata]),
-        )
-        .await?;
-
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let snap = unsafe {
-            ok_or_panic(snapshot(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
+        let (engine, snap) = setup_snapshot(actions_to_string(vec![TestAction::Metadata])).await?;
 
         // Construct a KernelStringSlice with invalid UTF-8 bytes
         let bad_bytes: &[u8] = &[0xFF, 0xFE];
