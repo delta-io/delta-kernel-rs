@@ -984,7 +984,10 @@ pub unsafe extern "C" fn snapshot_metadata_id(
 }
 
 /// Look up a single table property by key from the specified snapshot's metadata configuration.
-/// Returns null if the key is not found or if `key` is not valid UTF-8.
+///
+/// Returns `OptionalValue::None` if the key is not found or if `key` is not valid UTF-8.
+/// Returns `OptionalValue::Some(allocated_string)` if the key exists, where the inner value
+/// is the result of `allocate_fn` (which may itself be null if the allocator fails).
 ///
 /// See also [`visit_metadata_configuration`] for iterating over all configuration key-value pairs.
 ///
@@ -997,11 +1000,11 @@ pub unsafe extern "C" fn snapshot_table_property(
     snapshot: Handle<SharedSnapshot>,
     key: KernelStringSlice,
     allocate_fn: AllocateStringFn,
-) -> NullableCvoid {
+) -> OptionalValue<NullableCvoid> {
     let snapshot = unsafe { snapshot.as_ref() };
     let key: &str = match unsafe { TryFromStringSlice::try_from_slice(&key) } {
         Ok(k) => k,
-        Err(_) => return None,
+        Err(_) => return OptionalValue::None,
     };
     // TableProperties is a typed struct; arbitrary key lookup requires the raw configuration map.
     match snapshot
@@ -1010,8 +1013,8 @@ pub unsafe extern "C" fn snapshot_table_property(
         .configuration()
         .get(key)
     {
-        Some(value) => allocate_fn(kernel_string_slice!(value)),
-        None => None,
+        Some(value) => OptionalValue::Some(allocate_fn(kernel_string_slice!(value))),
+        None => OptionalValue::None,
     }
 }
 
@@ -1704,23 +1707,27 @@ mod tests {
 
         // Look up an existing property
         let key = "delta.appendOnly";
-        let val_ptr = unsafe {
+        let result = unsafe {
             snapshot_table_property(snap.shallow_copy(), kernel_string_slice!(key), allocate_str)
         };
-        assert!(val_ptr.is_some());
+        let OptionalValue::Some(val_ptr) = result else {
+            panic!("Expected Some for existing property 'delta.appendOnly'");
+        };
         let val = recover_string(val_ptr.unwrap());
         assert_eq!(val, "true");
 
         // Look up another existing property
         let key2 = "custom.key";
-        let val_ptr2 = unsafe {
+        let result2 = unsafe {
             snapshot_table_property(
                 snap.shallow_copy(),
                 kernel_string_slice!(key2),
                 allocate_str,
             )
         };
-        assert!(val_ptr2.is_some());
+        let OptionalValue::Some(val_ptr2) = result2 else {
+            panic!("Expected Some for existing property 'custom.key'");
+        };
         let val2 = recover_string(val_ptr2.unwrap());
         assert_eq!(val2, "custom_value");
 
@@ -1733,12 +1740,12 @@ mod tests {
     async fn test_snapshot_table_property_not_found() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, snap) = setup_snapshot(actions_to_string(vec![TestAction::Metadata])).await?;
 
-        // Look up a non-existent property -- should return None
+        // Look up a non-existent property -- should return OptionalValue::None
         let key = "nonexistent.property";
-        let val_ptr = unsafe {
+        let result = unsafe {
             snapshot_table_property(snap.shallow_copy(), kernel_string_slice!(key), allocate_str)
         };
-        assert!(val_ptr.is_none());
+        assert_eq!(result, OptionalValue::None);
 
         unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
@@ -1756,9 +1763,9 @@ mod tests {
             ptr: bad_bytes.as_ptr() as *const c_char,
             len: bad_bytes.len(),
         };
-        let val_ptr =
+        let result =
             unsafe { snapshot_table_property(snap.shallow_copy(), bad_slice, allocate_str) };
-        assert!(val_ptr.is_none());
+        assert_eq!(result, OptionalValue::None);
 
         unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
