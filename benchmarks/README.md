@@ -71,10 +71,26 @@ Set the `BENCH_TAGS` environment variable to a comma-separated list of tags to r
 BENCH_TAGS=base cargo bench -p delta_kernel_benchmarks
 ```
 
-Built-in tags:
+Built-in tags (with current table assignments - for the most up-to-date table assignments, run benchmarks locally and inspect `benchmarks/workloads/benchmarks/<any-existing-table-name>/tableInfo.json` to learn about the existing tables):
 - **`base`** — a base set of tables run in CI
+  - Tables: `101kAdds1kCommitsSinceChkpt1Chkpt`
+- **`commit-size-scaling`** — tables for comparing how log replay time scales with the number of actions in the log; all are single-commit tables with varying action counts (100, 1k, 10k, 100k, 1M)
+  - Tables: `100Adds0Chkpts`, `1kAdds0Chkpts`, `10kAdds0Chkpts`, `100kAdds0Chkpts`, `1MAddsNoData0Chkpts`
+- **`checkpoint-reads-by-type`** — tables for comparing checkpoint reading performance for different kinds of checkpointing
+  - Tables: `10kAdds0CommitsSinceChkpt1Chkpt`, `10kAdds0CommitsSinceChkpt1V2Chkpt`
+- **`v2-checkpoint`** — tables with v2 checkpoints
+  - Tables: `10kAdds0CommitsSinceChkpt1V2Chkpt`
+- **`crc-optimization`** — tables for comparing how CRC files affect log replay timing; designed to isolate the effect of CRC files at different versions relative to the checkpoint and latest version
+  - Tables: `101kAdds1kCommitsSinceChkpt1Chkpt`, `20kAdds100CommitsSinceChkpt1Chkpt0CommitsSinceCrc`, `20kAdds100CommitsSinceChkpt1Chkpt50CommitsSinceCrc`, `20kAdds100CommitsSinceChkpt1ChkptNoCrc`
+- **`time-travel-optimization`** — tables with multiple specs or specs not at the latest version, useful for benchmarking snapshot construction at historical versions
+  - Tables: `101kAdds1kCommitsSinceChkpt1Chkpt`, `200kAdds0CommitsSinceChkpt2Chkpts0CommitsSinceCrc`
+- **`listing-optimization`** — table for benchmarking log listing efficiency (e.g. `list_from()` call patterns); useful for features that optimize how the delta log directory is scanned
+  - Tables: `200kAdds0CommitsSinceChkpt2Chkpts0CommitsSinceCrc`
+- **`metadata-only`** — tables with no actual data files, useful for isolating log metadata processing overhead
+  - Tables: `1MAddsNoData0Chkpts`
 
-You can also add custom tags to any `tableInfo.json` to group tables relevant to your work, then pass that tag via `BENCH_TAGS` without modifying any code:
+
+You can also add custom tags to the `tags` field of any local `tableInfo.json` to group tables relevant to your work, then pass that tag via `BENCH_TAGS` without modifying any code:
 
 ```bash
 BENCH_TAGS=my-feature cargo bench -p delta_kernel_benchmarks
@@ -129,7 +145,11 @@ Workloads are downloaded from the DAT GitHub release and extracted to `benchmark
 
 Workloads are discovered automatically by path. `load_all_workloads()` scans every subdirectory of `benchmarks/workloads/benchmarks/`, loading `tableInfo.json` and every spec file under `specs/`. The spec filename (without extension) becomes the `case_name`.
 
-## Adding a new table
+## Current benchmarking workloads
+
+There is no single exhaustive list of all benchmark tables and their contents maintained in this README, as this can change over time. The [built-in tags](#by-tag-bench_tags) section includes a list of table names grouped by tag, but this is non-exhaustive and subject to change. To explore which tables exist and what each one contains, run benchmarks locally and inspect the `tableInfo.json` file in each table's directory under `benchmarks/workloads/benchmarks/`.
+
+## Adding a new table locally
 
 To benchmark against a custom Delta table:
 
