@@ -728,6 +728,10 @@ impl CreateTableTransactionBuilder {
         #[cfg(feature = "catalog-managed")]
         maybe_enable_ict_for_catalog_managed(&mut validated)?;
 
+        // Create Protocol action with table features support
+        let protocol =
+            Protocol::try_new_modern(validated.reader_features, validated.writer_features)?;
+
         // Create Metadata action with filtered properties (feature signals removed)
         // Use effective_schema which includes column mapping annotations if enabled
         // Partition columns are validated to be top-level, so each ColumnName has

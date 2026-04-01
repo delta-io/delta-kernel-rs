@@ -211,20 +211,6 @@ impl CommitMetadata {
             })
     }
 
-    /// The minimum reader version required by the effective protocol.
-    pub fn min_reader_version(&self) -> i32 {
-        self.effective_protocol()
-            .map(|p| p.min_reader_version())
-            .unwrap_or(0)
-    }
-
-    /// The minimum writer version required by the effective protocol.
-    pub fn min_writer_version(&self) -> i32 {
-        self.effective_protocol()
-            .map(|p| p.min_writer_version())
-            .unwrap_or(0)
-    }
-
     /// Check if the effective protocol has a specific writer feature by name.
     pub fn has_writer_feature(&self, feature_name: &str) -> bool {
         self.effective_protocol()

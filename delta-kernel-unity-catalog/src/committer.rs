@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
+use delta_kernel::committer::{
+    CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
+};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
 use tracing::{debug, info};
 use unity_catalog_delta_client_api::{Commit, CommitClient, CommitRequest};
@@ -57,11 +59,7 @@ impl<C: CommitClient> UCCommitter<C> {
 
     /// Validates that protocol features and metadata properties are correct for a UC
     /// catalog-managed table.
-    fn validate_catalog_managed_state(
-        &self,
-        commit_metadata: &CommitMetadata,
-    ) -> DeltaResult<()> {
-        use delta_kernel::committer::CommitType;
+    fn validate_catalog_managed_state(&self, commit_metadata: &CommitMetadata) -> DeltaResult<()> {
         require!(
             commit_metadata.commit_type() != CommitType::UpgradeToCatalogManaged,
             crate::errors::upgrade_downgrade_unsupported("upgrade")
@@ -82,16 +80,13 @@ impl<C: CommitClient> UCCommitter<C> {
         let config = commit_metadata
             .metadata_configuration()
             .ok_or_else(crate::errors::missing_metadata_configuration)?;
+        let table_id = config
+            .get(UC_TABLE_ID_KEY)
+            .ok_or_else(|| crate::errors::missing_property(UC_TABLE_ID_KEY))?;
         require!(
-            config.contains_key(UC_TABLE_ID_KEY),
-            crate::errors::missing_property(UC_TABLE_ID_KEY)
+            table_id == &self.table_id,
+            crate::errors::table_id_mismatch(&self.table_id, table_id)
         );
-        if let Some(table_id) = config.get(UC_TABLE_ID_KEY) {
-            require!(
-                table_id == &self.table_id,
-                crate::errors::table_id_mismatch(&self.table_id, table_id)
-            );
-        }
         require!(
             config.get(ENABLE_IN_COMMIT_TIMESTAMPS).map(String::as_str) == Some("true"),
             crate::errors::ict_not_enabled()

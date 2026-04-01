@@ -26,9 +26,7 @@ pub(crate) fn table_id_mismatch(expected: &str, actual: &str) -> DeltaError {
 }
 
 pub(crate) fn ict_not_enabled() -> DeltaError {
-    DeltaError::generic(
-        "UC catalog-managed table requires 'delta.enableInCommitTimestamps=true'",
-    )
+    DeltaError::generic("UC catalog-managed table requires 'delta.enableInCommitTimestamps=true'")
 }
 
 pub(crate) fn upgrade_downgrade_unsupported(direction: &str) -> DeltaError {
