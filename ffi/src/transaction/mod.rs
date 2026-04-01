@@ -9,13 +9,11 @@ use crate::handle::Handle;
 use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
 use crate::{DeltaResult, ExternEngine, Snapshot, Url};
 use crate::{ExclusiveEngineData, SharedExternEngine};
-use crate::{KernelStringSlice, SharedSnapshot};
+use crate::{KernelStringSlice, SharedSchema, SharedSnapshot};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::transaction::create_table::CreateTableTransactionBuilder;
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
-
-use crate::SharedSchema;
 
 /// A handle representing an exclusive transaction on a Delta table. (Similar to a Box<_>)
 ///
@@ -147,6 +145,25 @@ pub unsafe extern "C" fn set_data_change(mut txn: Handle<ExclusiveTransaction>, 
     underlying_txn.set_data_change(data_change);
 }
 
+/// Convert a [`CommitResult`] into a committed version number, or an error if the commit was not
+/// successful. Used by both [`commit`] and [`create_table_commit`].
+///
+/// TODO: expose the full `CommitResult` enum through FFI for conflict resolution.
+fn commit_result_to_version<S>(result: DeltaResult<CommitResult<S>>) -> DeltaResult<u64> {
+    match result? {
+        CommitResult::CommittedTransaction(committed) => Ok(committed.commit_version()),
+        CommitResult::RetryableTransaction(_) => Err(delta_kernel::Error::unsupported(
+            "commit failed: retryable transaction not supported in FFI (yet)",
+        )),
+        CommitResult::ConflictedTransaction(conflicted) => {
+            Err(delta_kernel::Error::Generic(format!(
+                "commit conflict at version {}",
+                conflicted.conflict_version()
+            )))
+        }
+    }
+}
+
 /// Attempt to commit a transaction to the table. Returns version number if successful.
 /// Returns error if the commit fails.
 ///
@@ -162,22 +179,7 @@ pub unsafe extern "C" fn commit(
     let txn = unsafe { txn.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
     let engine = extern_engine.engine();
-    // TODO: for now this removes the enum, which prevents doing any conflict resolution. We should fix
-    //       this by making the commit function return the enum somehow.
-    match txn.commit(engine.as_ref()) {
-        Ok(CommitResult::CommittedTransaction(committed)) => Ok(committed.commit_version()),
-        Ok(CommitResult::RetryableTransaction(_)) => Err(delta_kernel::Error::unsupported(
-            "commit failed: retryable transaction not supported in FFI (yet)",
-        )),
-        Ok(CommitResult::ConflictedTransaction(conflicted)) => {
-            Err(delta_kernel::Error::Generic(format!(
-                "commit conflict at version {}",
-                conflicted.conflict_version()
-            )))
-        }
-        Err(e) => Err(e),
-    }
-    .into_extern_result(&extern_engine)
+    commit_result_to_version(txn.commit(engine.as_ref())).into_extern_result(&extern_engine)
 }
 
 // ============================================================================
@@ -288,19 +290,7 @@ fn create_table_commit_impl(
     let engine = extern_engine.engine();
     let committer = Box::new(FileSystemCommitter::new());
     let transaction = builder.build(engine.as_ref(), committer)?;
-    match transaction.commit(engine.as_ref()) {
-        Ok(CommitResult::CommittedTransaction(committed)) => Ok(committed.commit_version()),
-        Ok(CommitResult::RetryableTransaction(_)) => Err(delta_kernel::Error::unsupported(
-            "commit failed: retryable transaction not supported in FFI (yet)",
-        )),
-        Ok(CommitResult::ConflictedTransaction(conflicted)) => {
-            Err(delta_kernel::Error::Generic(format!(
-                "commit conflict at version {}",
-                conflicted.conflict_version()
-            )))
-        }
-        Err(e) => Err(e),
-    }
+    commit_result_to_version(transaction.commit(engine.as_ref()))
 }
 
 /// Free a [`CreateTableTransactionBuilder`] without committing.
@@ -1001,15 +991,13 @@ mod tests {
 
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
-    async fn test_create_table_with_invalid_property() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_create_table_commit_with_empty_schema_returns_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_dir = tempdir()?;
         let table_path_str = tmp_dir.path().to_str().unwrap();
 
-        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-            "id",
-            DataType::INTEGER,
-        )])?);
-
+        // An empty schema is always invalid for table creation
+        let schema = Arc::new(StructType::try_new(vec![])?);
         let engine = get_default_engine(table_path_str);
         let schema_handle: Handle<crate::SharedSchema> = schema.into();
 
@@ -1023,33 +1011,13 @@ mod tests {
             )
         });
 
-        // Set an invalid delta feature property that should be rejected at commit time
-        let prop_key = "delta.enableDeletionVectors";
-        let prop_val = "true";
-        let builder = ok_or_panic(unsafe {
-            create_table_set_property(
-                builder,
-                kernel_string_slice!(prop_key),
-                kernel_string_slice!(prop_val),
-                engine.shallow_copy(),
-            )
-        });
-
-        // Commit should fail due to the invalid property
         let result = unsafe { create_table_commit(builder, engine.shallow_copy()) };
         match result {
             ExternResult::Err(e) => {
                 let error = unsafe { crate::ffi_test_utils::recover_error(e) };
-                // The error should indicate a problem with the property
-                assert!(
-                    !error.message.is_empty(),
-                    "Expected a non-empty error message for invalid property"
-                );
+                assert!(!error.message.is_empty());
             }
-            ExternResult::Ok(_) => {
-                // Some delta properties may be accepted -- if so, that's fine too.
-                // This test mainly ensures the error path works correctly.
-            }
+            ExternResult::Ok(_) => panic!("Expected error for empty schema"),
         }
 
         unsafe { free_engine(engine) };
