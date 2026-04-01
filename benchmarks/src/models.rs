@@ -59,6 +59,7 @@ pub struct TableInfo {
     /// Whether to use `UCKernelClient` (catalog-managed) or standard snapshot builder is
     /// determined by the `delta.feature.catalogManaged` property.
     /// Mutually exclusive with `table_path`.
+    /// TODO: Create an enum type that ensures table_path and uc_table_info are mutually exclusive
     #[serde(alias = "catalogManagedInfo", alias = "catalogInfo")]
     pub uc_table_info: Option<UcTableInfo>,
     /// Schema at the latest version of the table, in Delta protocol JSON format
