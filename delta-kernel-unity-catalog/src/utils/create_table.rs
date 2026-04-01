@@ -10,7 +10,7 @@
 //! let staging_info = my_uc_client.get_staging_table(..);
 //!
 //! // Step 2: Build and commit the create-table transaction
-//! let disk_props = get_create_table_disk_properties(staging_info.table_id);
+//! let disk_props = get_required_properties_for_disk(staging_info.table_id);
 //! let create_table_txn = kernel::create_table(path, schema, "MyApp/1.0")
 //!     .with_table_properties(disk_props)
 //!     .build(engine, committer);
@@ -18,7 +18,7 @@
 //!
 //! // Step 3: Finalize table in UC
 //! let snapshot = /* load post-commit snapshot at version 0 */;
-//! let uc_props = get_create_table_uc_properties(&snapshot, engine)?;
+//! let uc_props = get_final_required_properties_for_uc(&snapshot, engine)?;
 //! my_uc_client.create_table(.., uc_props);
 //! ```
 
@@ -37,7 +37,7 @@ use crate::constants::{
 /// These properties must be persisted in the Delta log so that the table is recognized as
 /// catalog-managed. Note: ICT enablement is handled automatically by kernel's CREATE TABLE
 /// when the `catalogManaged` feature is present.
-pub fn get_create_table_disk_properties(uc_table_id: &str) -> HashMap<String, String> {
+pub fn get_required_properties_for_disk(uc_table_id: &str) -> HashMap<String, String> {
     [
         (CATALOG_MANAGED_FEATURE_KEY, FEATURE_SUPPORTED),
         (VACUUM_PROTOCOL_CHECK_FEATURE_KEY, FEATURE_SUPPORTED),
@@ -67,13 +67,13 @@ pub fn get_create_table_disk_properties(uc_table_id: &str) -> HashMap<String, St
 /// Clustering columns are returned as logical column names. When column mapping is enabled,
 /// the physical names stored in domain metadata are converted to logical names using the
 /// table schema.
-pub fn get_create_table_uc_properties(
+pub fn get_final_required_properties_for_uc(
     snapshot: &Snapshot,
     engine: &dyn Engine,
 ) -> delta_kernel::DeltaResult<HashMap<String, String>> {
     if snapshot.version() != 0 {
         return Err(delta_kernel::Error::generic(format!(
-            "get_create_table_uc_properties is only valid for version 0 (table creation) \
+            "get_final_required_properties_for_uc is only valid for version 0 (table creation) \
              snapshots, but snapshot is at version {}",
             snapshot.version()
         )));
@@ -156,8 +156,8 @@ mod tests {
     }
 
     #[test]
-    fn test_get_create_table_disk_properties() {
-        let props = get_create_table_disk_properties("my-uc-table-123");
+    fn test_get_required_properties_for_disk() {
+        let props = get_required_properties_for_disk("my-uc-table-123");
         assert_eq!(props.len(), 3);
         assert_eq!(props["delta.feature.catalogManaged"], "supported");
         assert_eq!(props["delta.feature.vacuumProtocolCheck"], "supported");
@@ -165,7 +165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_create_table_uc_properties() {
+    async fn test_get_final_required_properties_for_uc() {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage).build();
         let table_path = "memory:///test_table/";
@@ -178,7 +178,7 @@ mod tests {
         );
 
         // Create a UC catalog-managed table with clustering
-        let disk_props = get_create_table_disk_properties("test-table-id-456");
+        let disk_props = get_required_properties_for_disk("test-table-id-456");
         let _ = create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
             .with_data_layout(DataLayout::clustered(["region"]))
@@ -189,7 +189,7 @@ mod tests {
 
         let snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
         assert_eq!(snapshot.version(), 0);
-        let uc_props = get_create_table_uc_properties(&snapshot, &engine).unwrap();
+        let uc_props = get_final_required_properties_for_uc(&snapshot, &engine).unwrap();
 
         // Protocol-derived properties
         assert_eq!(uc_props["delta.minReaderVersion"], "3");
@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_create_table_uc_properties_rejects_non_zero_version() {
+    async fn test_get_final_required_properties_for_uc_rejects_non_zero_version() {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage).build();
         let table_path = "memory:///test_version_check/";
@@ -228,7 +228,7 @@ mod tests {
         );
 
         // Create a table (version 0) and append (version 1)
-        let disk_props = get_create_table_disk_properties("test-table-id");
+        let disk_props = get_required_properties_for_disk("test-table-id");
         let _ = create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
             .build(&engine, Box::new(MockCatalogCommitter))
@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(snapshot.version(), 1);
 
         // Should fail because version != 0
-        let err = get_create_table_uc_properties(&snapshot, &engine).unwrap_err();
+        let err = get_final_required_properties_for_uc(&snapshot, &engine).unwrap_err();
         assert!(
             err.to_string().contains("version 0"),
             "expected version 0 error, got: {err}"

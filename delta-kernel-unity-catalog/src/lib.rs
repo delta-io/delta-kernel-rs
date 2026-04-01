@@ -4,7 +4,7 @@ mod committer;
 mod constants;
 mod utils;
 pub use committer::UCCommitter;
-pub use utils::{get_create_table_disk_properties, get_create_table_uc_properties};
+pub use utils::{get_final_required_properties_for_uc, get_required_properties_for_disk};
 
 use std::sync::Arc;
 
