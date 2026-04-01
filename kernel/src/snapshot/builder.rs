@@ -238,6 +238,17 @@ impl SnapshotBuilder {
         max_catalog_version: Option<Version>,
         log_tail: &[crate::path::ParsedLogPath],
     ) -> DeltaResult<()> {
+        // Log tail must be sorted ascending and contiguous (no gaps or duplicates)
+        for pair in log_tail.windows(2) {
+            require!(
+                pair[0].version + 1 == pair[1].version,
+                Error::generic(format!(
+                    "log_tail must be sorted and contiguous, but found versions {} and {}",
+                    pair[0].version, pair[1].version
+                ))
+            );
+        }
+
         // TODO: If inline commits (or any other catalog commits) are ever supported, change this
         // method to check if there are any catalog commits.
         let has_catalog_commits = log_tail
@@ -855,6 +866,86 @@ mod tests {
                 .with_max_catalog_version(1)
                 .build(engine.as_ref())?;
             assert_eq!(snapshot.version(), 0);
+
+            Ok(())
+        }
+
+        #[test_log::test(tokio::test)]
+        async fn test_log_tail_with_gap_errors() -> Result<(), Box<dyn std::error::Error>> {
+            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+            add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
+            let actions = vec![TestAction::Add("file_2.parquet".to_string())];
+            add_commit(&table_root, store.as_ref(), 3, actions_to_string(actions)).await?;
+
+            // log_tail has versions 1 and 3 (gap at 2)
+            let log_tail = vec![
+                create_log_path(&table_root, test_utils::delta_path_for_version(1, "json")),
+                create_log_path(&table_root, test_utils::delta_path_for_version(3, "json")),
+            ];
+
+            let result = SnapshotBuilder::new_for(table_root)
+                .with_log_tail(log_tail)
+                .with_max_catalog_version(3)
+                .build(engine.as_ref());
+
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("log_tail must be sorted and contiguous"));
+
+            Ok(())
+        }
+
+        #[test_log::test(tokio::test)]
+        async fn test_log_tail_with_duplicate_versions_errors(
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+            add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
+
+            // log_tail has version 1 twice
+            let log_tail = vec![
+                create_log_path(&table_root, test_utils::delta_path_for_version(1, "json")),
+                create_log_path(&table_root, test_utils::delta_path_for_version(1, "json")),
+            ];
+
+            let result = SnapshotBuilder::new_for(table_root)
+                .with_log_tail(log_tail)
+                .with_max_catalog_version(1)
+                .build(engine.as_ref());
+
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("log_tail must be sorted and contiguous"));
+
+            Ok(())
+        }
+
+        #[test_log::test(tokio::test)]
+        async fn test_log_tail_unsorted_errors() -> Result<(), Box<dyn std::error::Error>> {
+            let (engine, store, table_root) = setup_catalog_managed_test().await;
+            let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+            add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
+            let actions = vec![TestAction::Add("file_2.parquet".to_string())];
+            add_commit(&table_root, store.as_ref(), 2, actions_to_string(actions)).await?;
+
+            // log_tail is in descending order
+            let log_tail = vec![
+                create_log_path(&table_root, test_utils::delta_path_for_version(2, "json")),
+                create_log_path(&table_root, test_utils::delta_path_for_version(1, "json")),
+            ];
+
+            let result = SnapshotBuilder::new_for(table_root)
+                .with_log_tail(log_tail)
+                .with_max_catalog_version(2)
+                .build(engine.as_ref());
+
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("log_tail must be sorted and contiguous"));
 
             Ok(())
         }

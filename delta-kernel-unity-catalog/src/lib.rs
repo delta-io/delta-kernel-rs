@@ -75,13 +75,6 @@ impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
             commits.sort_by_key(|c| c.version)
         }
 
-        // if commits are present, we ensure they are sorted+contiguous
-        if let Some(commits) = &commits.commits {
-            if !commits.windows(2).all(|w| w[1].version == w[0].version + 1) {
-                return Err("Received non-contiguous commit versions".into());
-            }
-        }
-
         // The catalog always returns the latest ratified version. Use it as the
         // max_catalog_version for snapshot building, and as the effective version when no
         // explicit time-travel version is requested.
@@ -295,8 +288,20 @@ mod tests {
             TableData {
                 max_ratified_version: 3,
                 catalog_commits: vec![
-                    Commit::new(1, 0, "1.json", 100, 0),
-                    Commit::new(3, 0, "3.json", 100, 0), // gap: version 2 missing
+                    Commit::new(
+                        1,
+                        0,
+                        "00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+                        100,
+                        0,
+                    ),
+                    Commit::new(
+                        3,
+                        0,
+                        "00000000000000000003.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+                        100,
+                        0,
+                    ), // gap: version 2 missing
                 ],
             },
         );
@@ -307,7 +312,9 @@ mod tests {
         let result = catalog
             .load_snapshot("test_table", "memory:///", &engine)
             .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("non-contiguous"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("log_tail must be sorted and contiguous"));
     }
 }
