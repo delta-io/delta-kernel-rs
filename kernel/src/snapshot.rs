@@ -979,7 +979,6 @@ impl Snapshot {
     ///
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
     #[allow(unused)]
-    #[internal_api]
     #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
     pub(crate) fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         match self
@@ -1003,14 +1002,16 @@ impl Snapshot {
                 .get_in_commit_timestamp(engine)
                 .map_err(|e| {
                     Error::generic(format!(
-                        "Reading in-commit timestamp for version {}: {e}",
+                        "Unable to read in-commit timestamp for version {}: {e}",
                         self.version()
                     ))
                 })?
                 .ok_or_else(|| {
-                    Error::internal_error(
-                        format!("Invalid state: version {}, ICT is enabled but get_in_commit_timestamp returned None", self.version()),
-                    )
+                    Error::internal_error(format!(
+                        "Invalid state: version {}, ICT is enabled \
+                        but get_in_commit_timestamp returned None",
+                        self.version()
+                    ))
                 }),
         }
     }
@@ -1030,6 +1031,7 @@ mod tests {
     use crate::actions::{DomainMetadata, Protocol};
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
+    use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
@@ -1046,9 +1048,12 @@ mod tests {
     use crate::object_store::ObjectStore;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::{LogPathFileType, ParsedLogPath};
+    use crate::schema::{DataType, StructField, StructType};
     use crate::table_features::{
         TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
+    use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
+    use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
 
     /// Helper function to create a commitInfo action with optional ICT
@@ -2102,20 +2107,34 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_get_timestamp_with_ict_disabled_returns_file_system_modification_time(
-    ) -> DeltaResult<()> {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory:///test_table/";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+    #[rstest]
+    #[case::ict_disabled(false)]
+    #[case::ict_enabled(true)]
+    fn test_get_timestamp_returns_valid_timestamp(#[case] ict_enabled: bool) -> DeltaResult<()> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = Url::from_directory_path(temp_dir.path())
+            .unwrap()
+            .to_string();
+        let store = Arc::new(LocalFileSystem::new());
+        let engine = DefaultEngineBuilder::new(store).build();
 
-        let commit0_data = vec![
-            create_protocol(false, None),
-            create_metadata(None, None, None, None, false),
-        ];
-        commit(table_root, store.as_ref(), 0, commit0_data).await;
-        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        let schema = Arc::new(StructType::try_new(vec![StructField::new(
+            "id",
+            DataType::INTEGER,
+            true,
+        )])?);
 
+        let mut create_table_builder = create_table(&table_path, schema, "Test/1.0");
+        if ict_enabled {
+            create_table_builder = create_table_builder
+                .with_table_properties(vec![(ENABLE_IN_COMMIT_TIMESTAMPS, "true")]);
+        }
+
+        let _ = create_table_builder
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?;
+
+        let snapshot = Snapshot::builder_for(&table_path).build(&engine)?;
         let ts = snapshot.get_timestamp(&engine)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let two_days_ms = 2 * 24 * 60 * 60 * 1000_i64;
@@ -2123,34 +2142,11 @@ mod tests {
             (now_ms - two_days_ms..=now_ms).contains(&ts),
             "timestamp {ts} not within 2 days of now ({now_ms})"
         );
-        Ok(())
-    }
 
-    #[tokio::test]
-    async fn test_get_timestamp_ict_enabled() -> DeltaResult<()> {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory:///test_table/";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
-
-        let expected_ict = 1587968586999i64;
-        // commitInfo must be first when ICT is enabled (protocol requirement)
-        let commit0_data = vec![
-            create_commit_info(1587968586000, Some(expected_ict)),
-            create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
-            create_metadata(
-                None,
-                None,
-                None,
-                Some(("0".to_string(), "1612345678".to_string())),
-                false,
-            ),
-        ];
-        commit(table_root, store.as_ref(), 0, commit0_data).await;
-
-        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-
-        let result = snapshot.get_timestamp(&engine)?;
-        assert_eq!(result, expected_ict);
+        if ict_enabled {
+            let ict_ts = snapshot.get_in_commit_timestamp(&engine)?.unwrap();
+            assert_eq!(ts, ict_ts);
+        }
         Ok(())
     }
 
