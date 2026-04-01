@@ -115,7 +115,9 @@ Workloads are discovered automatically by path. `load_all_workloads()` scans eve
 
 ## Adding a new table
 
-To benchmark against a custom Delta table:
+### Local tables
+
+To benchmark against a local Delta table:
 
 1. Extract the workload archive if you haven't already — the simplest way is to run any benchmark once, which auto-extracts it:
    ```bash
@@ -133,6 +135,43 @@ To benchmark against a custom Delta table:
    ```bash
    cargo bench -p delta_kernel_benchmarks --bench workload_bench "<table_name>"
    ```
+
+### Remote tables (S3 / UC)
+
+Remote tables are benchmarked via `KERNEL_BENCH_WORKLOAD_DIR`, which points to a directory of
+table configs outside of the workload archive. Each subdirectory has the same layout as local
+tables (`tableInfo.json` + `specs/`), but no `delta/` directory is needed.
+
+There are two types of remote tables, determined by the `tableInfo.json` fields:
+
+- **S3 tables** — set `tablePath` to the S3 URL (e.g. `s3://bucket/path`). Requires `AWS_*`
+  env vars for credentials.
+- **UC tables** — set `catalogInfo` with a `tableName` field (e.g. `catalog.schema.table`).
+  Credentials are vended via UC at runtime (`UC_WORKSPACE` / `UC_TOKEN` env vars). The
+  benchmark harness automatically detects catalog-managed tables (via UC properties) and
+  uses the appropriate snapshot loading path.
+
+Example `tableInfo.json` for a UC table:
+```json
+{
+  "name": "my_uc_table",
+  "description": "A UC-managed table",
+  "catalogInfo": {"tableName": "catalog.schema.table"},
+  "schema": {"type": "struct", "fields": [...]},
+  "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+  "logInfo": {"numAddFiles": 100, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 100},
+  "properties": {},
+  "dataLayout": {},
+  "tags": []
+}
+```
+
+Example:
+```bash
+KERNEL_BENCH_WORKLOAD_DIR=/path/to/my/tables \
+  UC_WORKSPACE=https://my-workspace.cloud.databricks.com UC_TOKEN=... AWS_REGION=us-west-2 \
+  cargo bench --bench workload_bench
+```
 
 ## Entities
 

@@ -37,9 +37,7 @@ const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
 
 /// A benchmark workload that can be executed by Criterion.
 pub trait WorkloadRunner {
-    /// Runs the workload once. Results are discarded (consumed by `black_box`).
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
-    /// Returns the fully-qualified benchmark name (e.g. `table/case/operation/config`).
     fn name(&self) -> &str;
 }
 
@@ -119,7 +117,7 @@ fn resolve_snapshot_strategy(
 ) -> Result<(Arc<dyn Engine>, SnapshotStrategy), Box<dyn std::error::Error>> {
     let Some(cm) = &table_info.uc_table_info else {
         let url = table_info.resolved_table_root();
-        let engine = resolve_engine(&url, runtime)?;
+        let engine = resolve_engine_for_url(&url, runtime)?;
         return Ok((engine, SnapshotStrategy::Standard { url }));
     };
 
@@ -178,7 +176,7 @@ fn resolve_snapshot_strategy(
 }
 
 /// Builds an engine from the table URL scheme and env vars (S3 or local).
-fn resolve_engine(
+fn resolve_engine_for_url(
     url: &Url,
     runtime: Arc<tokio::runtime::Runtime>,
 ) -> Result<Arc<dyn Engine>, Box<dyn std::error::Error>> {
@@ -625,7 +623,7 @@ mod tests {
     #[test]
     fn test_resolve_engine_unsupported_scheme() {
         let url = Url::parse("gs://bucket/table").unwrap();
-        let result = resolve_engine(&url, test_runtime());
+        let result = resolve_engine_for_url(&url, test_runtime());
         assert!(result.is_err());
     }
 

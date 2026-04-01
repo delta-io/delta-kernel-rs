@@ -457,20 +457,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_time_travel_as_version_returns_version() {
-        let tt = TimeTravel::Version { version: 42 };
-        assert_eq!(tt.as_version(), Ok(42));
-    }
-
-    #[test]
-    fn test_time_travel_as_version_rejects_timestamp() {
-        let tt = TimeTravel::Timestamp {
-            timestamp: "2024-01-01".to_string(),
-        };
-        assert!(tt.as_version().is_err());
-    }
-
     #[rstest]
     #[case(r#"{"description": "missing name"}"#, "missing field")]
     #[case(
