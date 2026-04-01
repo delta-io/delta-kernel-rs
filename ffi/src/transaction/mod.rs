@@ -205,6 +205,7 @@ pub struct ExclusiveCreateTableBuilder;
 /// # Safety
 ///
 /// Caller is responsible for passing a valid `path`, `schema`, `engine_info`, and `engine`.
+/// Does NOT consume the `schema` handle -- the caller is still responsible for freeing it.
 #[no_mangle]
 pub unsafe extern "C" fn create_table(
     path: KernelStringSlice,
