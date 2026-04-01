@@ -48,9 +48,9 @@ fn generate_checkpoint_parts(
     let iter_state = data_iter.state();
     let output_schema = writer
         .checkpoint_output_schema
-        .get()
-        .expect("checkpoint_output_schema should be set by checkpoint_data")
-        .clone();
+        .try_get()
+        .expect("mutex should not be poisoned")
+        .expect("checkpoint_output_schema should be set by checkpoint_data");
 
     let splitter = SidecarSplitter::new(
         data_iter,
@@ -181,7 +181,7 @@ fn struct_field_value<T: ArrowPrimitiveType>(
 }
 
 /// Extract a string value from a named field of a [`StructArray`] at the given row.
-fn struct_field_string(s: &StructArray, field: &str, row: usize) -> &str {
+fn struct_field_string<'a>(s: &'a StructArray, field: &str, row: usize) -> &'a str {
     s.column_by_name(field)
         .unwrap_or_else(|| panic!("missing field '{field}'"))
         .as_string::<i32>()
@@ -578,7 +578,8 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
     // Validate the checkpoint data schema
     let schema = writer
         .checkpoint_output_schema
-        .get()
+        .try_get()
+        .expect("mutex should not be poisoned")
         .expect("should be cached after checkpoint_data");
     let add_field = schema.field(ADD_NAME).expect("schema should have 'add'");
     if let DataType::Struct(ref add_struct) = add_field.data_type {
@@ -670,9 +671,9 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
     let data_iter = writer.checkpoint_data(&engine)?;
     let output_schema = writer
         .checkpoint_output_schema
-        .get()
-        .expect("checkpoint_output_schema should be set by checkpoint_data")
-        .clone();
+        .try_get()
+        .expect("mutex should not be poisoned")
+        .expect("checkpoint_output_schema should be set by checkpoint_data");
 
     let splitter = SidecarSplitter::new(
         data_iter,
