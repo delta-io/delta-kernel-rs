@@ -1474,9 +1474,6 @@ mod tests {
         // correctly creates a FilteredEngineData with an empty selection vector (all rows
         // selected). We test FilteredEngineData construction directly since the null-pointer
         // handling occurs in the extern "C" wrapper before calling remove_files_impl.
-        use delta_kernel::arrow::array::Int32Array;
-        use delta_kernel::engine::arrow_data::ArrowEngineData;
-
         let batch = RecordBatch::try_from_iter(vec![(
             "id",
             Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
