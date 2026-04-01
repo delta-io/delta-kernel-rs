@@ -3,7 +3,6 @@ use super::*;
 use crate::expressions::column_name;
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, UnimplementedColumnResolver};
 use rstest::rstest;
-use std::borrow::Cow;
 use std::collections::HashMap;
 
 const TRUE: Option<bool> = Some(true);
@@ -396,28 +395,27 @@ fn test_timestamp_stats_enabled() {
 fn test_adjust_scalar_for_max_stat_truncation() {
     // Timestamp: subtracts 999us
     assert_eq!(
-        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(1_000_000)).into_owned(),
+        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(1_000_000)),
         Scalar::Timestamp(999_001)
     );
     // TimestampNtz: subtracts 999us
     assert_eq!(
-        adjust_scalar_for_max_stat_truncation(&Scalar::TimestampNtz(1_000_000)).into_owned(),
+        adjust_scalar_for_max_stat_truncation(&Scalar::TimestampNtz(1_000_000)),
         Scalar::TimestampNtz(999_001)
     );
     // Non-timestamp: unchanged
-    let int_val = Scalar::from(42i64);
-    assert!(matches!(
-        adjust_scalar_for_max_stat_truncation(&int_val),
-        Cow::Borrowed(_)
-    ));
+    assert_eq!(
+        adjust_scalar_for_max_stat_truncation(&Scalar::from(42i64)),
+        Scalar::from(42i64)
+    );
     // Saturating at i64::MIN
     assert_eq!(
-        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(i64::MIN)).into_owned(),
+        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(i64::MIN)),
         Scalar::Timestamp(i64::MIN)
     );
     // Near-zero: goes negative
     assert_eq!(
-        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(500)).into_owned(),
+        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(500)),
         Scalar::Timestamp(-499)
     );
 }
@@ -616,14 +614,9 @@ fn test_partition_timestamp_column_no_adjustment() {
     let pred = Pred::gt(column_expr!("ts_part"), Scalar::Timestamp(1_000_000));
     let skipping_pred =
         as_data_skipping_predicate_with_partitions(&pred, &partition_columns).unwrap();
-    let s = skipping_pred.to_string();
-    assert!(
-        s.contains("1000000"),
-        "Partition timestamp should use exact value, not adjusted: {s}"
-    );
-    assert!(
-        !s.contains("999001"),
-        "Partition timestamp should not have truncation adjustment: {s}"
+    assert_eq!(
+        skipping_pred.to_string(),
+        "OR(NOT(Column(is_add)), Column(partitionValues_parsed.ts_part) > 1000000)"
     );
 }
 

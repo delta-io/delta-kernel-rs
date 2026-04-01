@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
@@ -384,13 +383,11 @@ fn collect_junction_preds(
 /// to `4_000_400 - 999 = 3_999_401`, we ensure the file is kept.
 ///
 /// Non-timestamp values pass through unchanged.
-fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Cow<'_, Scalar> {
+fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Scalar {
     match val {
-        Scalar::Timestamp(micros) => Cow::Owned(Scalar::Timestamp(micros.saturating_sub(999))),
-        Scalar::TimestampNtz(micros) => {
-            Cow::Owned(Scalar::TimestampNtz(micros.saturating_sub(999)))
-        }
-        _ => Cow::Borrowed(val),
+        Scalar::Timestamp(micros) => Scalar::Timestamp(micros.saturating_sub(999)),
+        Scalar::TimestampNtz(micros) => Scalar::TimestampNtz(micros.saturating_sub(999)),
+        other => other.clone(),
     }
 }
 
@@ -461,11 +458,10 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         inverted: bool,
     ) -> Option<Pred> {
         let max = self.get_max_stat(col, &val.data_type())?;
-        let adjusted = if self.is_partition_column(col) {
-            Cow::Borrowed(val)
-        } else {
-            adjust_scalar_for_max_stat_truncation(val)
-        };
+        if self.is_partition_column(col) {
+            return self.eval_partial_cmp(ord, max, val, inverted);
+        }
+        let adjusted = adjust_scalar_for_max_stat_truncation(val);
         self.eval_partial_cmp(ord, max, &adjusted, inverted)
     }
 

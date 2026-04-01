@@ -2070,6 +2070,7 @@ fn partition_values_parsed_skipping() -> Result<(), Box<dyn std::error::Error>> 
     )?;
     Ok(())
 }
+
 // In-memory test with crafted truncated JSON stats. Three files:
 //   file 1: ts_col [1s, 2s]           -- max at ms boundary
 //   file 2: ts_col [3s, 4.000500s]    -- JSON max truncated to 4.000s
@@ -2211,7 +2212,11 @@ async fn timestamp_max_stat_truncation_does_not_over_prune(
 
     // 998us above ms boundary (4.000998s): adjusted to 3_999_999
     //   file2 max=4s > 3_999_999 -> kept (just not prunable)
-    assert_eq!(row_count(4_000_998)?, 4, "just not prunable: file2+file3 kept");
+    assert_eq!(
+        row_count(4_000_998)?,
+        4,
+        "just not prunable: file2+file3 kept"
+    );
 
     // 999us above ms boundary (4.000999s): adjusted to 4_000_000
     //   file2 max=4s == 4_000_000 -> NOT strictly greater -> pruned (just prunable)
