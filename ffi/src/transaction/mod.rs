@@ -454,8 +454,9 @@ pub unsafe extern "C" fn free_create_table_builder(builder: Handle<ExclusiveCrea
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles. The `selection_vector` pointer must be valid
-/// for `selection_vector_len` bool elements (1 byte each), or null. Consumes the `data` handle.
-/// Does NOT consume the `txn` handle.
+/// for `selection_vector_len` bool elements (1 byte each), or null. Each byte must be exactly
+/// `0x00` (false) or `0x01` (true) -- any other byte value is undefined behavior. Consumes the
+/// `data` handle. Does NOT consume the `txn` handle.
 #[no_mangle]
 pub unsafe extern "C" fn remove_files(
     mut txn: Handle<ExclusiveTransaction>,
@@ -521,9 +522,13 @@ fn remove_scan_metadata_impl(
             "scan_metadata handle has other outstanding references and cannot be consumed".into(),
         )
     })?;
-    // row_transforms are only needed for read-path data transformations, not for identifying
-    // which files to remove.
-    txn.remove_files(metadata.scan_files);
+    // scan_file_transforms are only needed for read-path data transformations, not for
+    // identifying which files to remove. Destructure to make the discard explicit.
+    let delta_kernel::scan::ScanMetadata {
+        scan_files,
+        scan_file_transforms: _,
+    } = metadata;
+    txn.remove_files(scan_files);
     Ok(())
 }
 
