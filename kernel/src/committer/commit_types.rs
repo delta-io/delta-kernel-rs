@@ -186,6 +186,7 @@ impl CommitMetadata {
     /// Returns the effective protocol for this commit. Prefers new_protocol (create-table / ALTER
     /// TABLE), falling back to the read snapshot's protocol.
     pub(crate) fn effective_protocol(&self) -> DeltaResult<&Protocol> {
+        let pm = &self.protocol_metadata;
         pm.new_protocol
             .as_ref()
             .or(pm.read_protocol.as_ref())
@@ -199,6 +200,7 @@ impl CommitMetadata {
     /// Returns the effective metadata for this commit. Prefers new_metadata (create-table / ALTER
     /// TABLE), falling back to the read snapshot's metadata.
     pub(crate) fn effective_metadata(&self) -> DeltaResult<&Metadata> {
+        let pm = &self.protocol_metadata;
         pm.new_metadata
             .as_ref()
             .or(pm.read_metadata.as_ref())
@@ -226,6 +228,7 @@ impl CommitMetadata {
     /// Check if the effective protocol has a specific writer feature by name.
     pub fn has_writer_feature(&self, feature_name: &str) -> bool {
         self.effective_protocol()
+            .ok()
             .and_then(|p| p.writer_features())
             .is_some_and(|features| features.iter().any(|f| f.as_ref() == feature_name))
     }
@@ -233,6 +236,7 @@ impl CommitMetadata {
     /// Check if the effective protocol has a specific reader feature by name.
     pub fn has_reader_feature(&self, feature_name: &str) -> bool {
         self.effective_protocol()
+            .ok()
             .and_then(|p| p.reader_features())
             .is_some_and(|features| features.iter().any(|f| f.as_ref() == feature_name))
     }
@@ -240,7 +244,7 @@ impl CommitMetadata {
     /// Get the raw metadata configuration for the effective metadata. Returns `None` if no
     /// metadata is set.
     pub fn metadata_configuration(&self) -> Option<&HashMap<String, String>> {
-        self.effective_metadata().map(|m| m.configuration())
+        self.effective_metadata().ok().map(|m| m.configuration())
     }
 
     /// Returns `true` if this commit changes the table's protocol.

@@ -10,6 +10,15 @@ use crate::constants::{
     IN_COMMIT_TIMESTAMP_FEATURE, UC_TABLE_ID_KEY, VACUUM_PROTOCOL_CHECK_FEATURE,
 };
 
+/// Convenience macro: returns an error if a condition is not met.
+macro_rules! require {
+    ($cond:expr, $err:expr) => {
+        if !($cond) {
+            return Err($err);
+        }
+    };
+}
+
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
 ///
@@ -46,121 +55,83 @@ impl<C: CommitClient> UCCommitter<C> {
             && commit_metadata.has_reader_feature(CATALOG_MANAGED_FEATURE)
     }
 
-    /// Validates that the commit metadata contains all required properties for a UC
-    /// catalog-managed table creation. Returns an error if any required property is missing.
-    fn validate_version_0_properties(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
-        if !Self::has_catalog_managed_feature(commit_metadata) {
-            return Err(DeltaError::generic(
-                "UC catalog-managed table creation requires the 'catalogManaged' table feature \
-                 in both readerFeatures and writerFeatures",
-            ));
-        }
-        if !commit_metadata.has_writer_feature(VACUUM_PROTOCOL_CHECK_FEATURE)
-            || !commit_metadata.has_reader_feature(VACUUM_PROTOCOL_CHECK_FEATURE)
-        {
-            return Err(DeltaError::generic(
-                "UC catalog-managed table creation requires the 'vacuumProtocolCheck' table feature \
-                 in both readerFeatures and writerFeatures",
-            ));
-        }
-        if !commit_metadata.has_writer_feature(IN_COMMIT_TIMESTAMP_FEATURE) {
-            return Err(DeltaError::generic(
-                "UC catalog-managed table creation requires the 'inCommitTimestamp' table feature",
-            ));
-        }
-        let config = commit_metadata.metadata_configuration().ok_or_else(|| {
-            DeltaError::generic("UC catalog-managed table creation requires metadata configuration")
-        })?;
-        if !config.contains_key(UC_TABLE_ID_KEY) {
-            return Err(DeltaError::generic(format!(
-                "UC catalog-managed table creation requires '{UC_TABLE_ID_KEY}' in metadata configuration",
-            )));
-        }
-        if config.get(ENABLE_IN_COMMIT_TIMESTAMPS).map(String::as_str) != Some("true") {
-            return Err(DeltaError::generic(format!(
-                "UC catalog-managed table creation requires '{ENABLE_IN_COMMIT_TIMESTAMPS}=true' \
-                 in metadata configuration",
-            )));
-        }
-        Ok(())
-    }
-
-    /// Validates that catalog-managed status has not changed between the existing table state
-    /// and this commit. Prevents adding or removing catalog-managed status after table creation.
-    fn validate_no_catalog_managed_change(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
-        // For version >= 1, the table already exists. The commit_metadata carries the read
-        // snapshot's protocol. If the table is NOT catalog-managed, the UCCommitter should
-        // not be used. If the table IS catalog-managed, we verify the feature is still present.
-        // This check, combined with `validate_no_alter_table_changes` which blocks protocol
-        // changes, ensures catalog-managed status cannot be removed.
-        if !Self::has_catalog_managed_feature(commit_metadata) {
-            return Err(DeltaError::generic(
-                "UCCommitter requires the 'catalogManaged' table feature in both readerFeatures \
-                 and writerFeatures. Catalog-managed status cannot be changed after table creation.",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Validates that this commit does not include ALTER TABLE changes. Protocol changes, metadata
-    /// changes, and clustering column changes are not supported through the UCCommitter.
-    fn validate_no_alter_table_changes(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
-        if commit_metadata.has_protocol_change() {
-            return Err(DeltaError::generic(
-                "UCCommitter does not support commits that change the table protocol. \
-                 ALTER TABLE operations are not supported for catalog-managed tables.",
-            ));
-        }
-        if commit_metadata.has_metadata_change() {
-            return Err(DeltaError::generic(
-                "UCCommitter does not support commits that change the table metadata. \
-                 ALTER TABLE operations are not supported for catalog-managed tables.",
-            ));
-        }
-        if commit_metadata.has_domain_metadata_change(CLUSTERING_DOMAIN_NAME) {
-            return Err(DeltaError::generic(
-                "UCCommitter does not support commits that change clustering columns. \
-                 ALTER TABLE CLUSTER BY is not supported for catalog-managed tables.",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Validates that the table's metadata configuration has the required UC properties. If the
-    /// UC table ID is present, it must match the one this committer was initialized with. ICT
-    /// must always be enabled. This catches cases where another writer may have tampered with
-    /// the table.
-    fn validate_required_table_properties(
+    /// Validates that protocol features and metadata properties are correct for a UC
+    /// catalog-managed table.
+    fn validate_catalog_managed_state(
         &self,
         commit_metadata: &CommitMetadata,
     ) -> DeltaResult<()> {
-        let config = commit_metadata.metadata_configuration().ok_or_else(|| {
-            DeltaError::generic(
-                "UC catalog-managed table requires metadata configuration. \
-                 The table may have been modified by another writer.",
-            )
-        })?;
+        use delta_kernel::committer::CommitType;
+        require!(
+            commit_metadata.commit_type() != CommitType::UpgradeToCatalogManaged,
+            crate::errors::upgrade_downgrade_unsupported("upgrade")
+        );
+        require!(
+            commit_metadata.commit_type() != CommitType::DowngradeToPathBased,
+            crate::errors::upgrade_downgrade_unsupported("downgrade")
+        );
+        require!(
+            Self::has_catalog_managed_feature(commit_metadata),
+            crate::errors::missing_feature(CATALOG_MANAGED_FEATURE)
+        );
+        require!(
+            commit_metadata.has_writer_feature(IN_COMMIT_TIMESTAMP_FEATURE),
+            crate::errors::missing_feature(IN_COMMIT_TIMESTAMP_FEATURE)
+        );
+
+        let config = commit_metadata
+            .metadata_configuration()
+            .ok_or_else(crate::errors::missing_metadata_configuration)?;
+        require!(
+            config.contains_key(UC_TABLE_ID_KEY),
+            crate::errors::missing_property(UC_TABLE_ID_KEY)
+        );
         if let Some(table_id) = config.get(UC_TABLE_ID_KEY) {
-            if table_id != &self.table_id {
-                return Err(DeltaError::generic(format!(
-                    "UC table ID mismatch: expected '{}' but found '{table_id}'. \
-                     The table may have been modified by another writer.",
-                    self.table_id
-                )));
-            }
+            require!(
+                table_id == &self.table_id,
+                crate::errors::table_id_mismatch(&self.table_id, table_id)
+            );
         }
-        if config.get(ENABLE_IN_COMMIT_TIMESTAMPS).map(String::as_str) != Some("true") {
-            return Err(DeltaError::generic(format!(
-                "UC catalog-managed table requires '{ENABLE_IN_COMMIT_TIMESTAMPS}=true' but it is \
-                 missing or disabled. The table may have been modified by another writer.",
-            )));
-        }
+        require!(
+            config.get(ENABLE_IN_COMMIT_TIMESTAMPS).map(String::as_str) == Some("true"),
+            crate::errors::ict_not_enabled()
+        );
+        Ok(())
+    }
+
+    /// Additional validation for version 0 (table creation). Checks that `vacuumProtocolCheck`
+    /// is present, which is required when creating new catalog-managed tables.
+    fn validate_version_0_features(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
+        require!(
+            commit_metadata.has_writer_feature(VACUUM_PROTOCOL_CHECK_FEATURE)
+                && commit_metadata.has_reader_feature(VACUUM_PROTOCOL_CHECK_FEATURE),
+            crate::errors::missing_feature(VACUUM_PROTOCOL_CHECK_FEATURE)
+        );
+        Ok(())
+    }
+
+    /// Validates that this commit does not include ALTER TABLE changes (protocol, metadata,
+    /// or clustering column changes).
+    fn validate_no_alter_table_changes(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
+        require!(
+            !commit_metadata.has_protocol_change(),
+            crate::errors::alter_table_unsupported("protocol")
+        );
+        require!(
+            !commit_metadata.has_metadata_change(),
+            crate::errors::alter_table_unsupported("metadata")
+        );
+        require!(
+            !commit_metadata.has_domain_metadata_change(CLUSTERING_DOMAIN_NAME),
+            crate::errors::alter_table_unsupported("clustering columns")
+        );
         Ok(())
     }
 
     /// Commit version 0 (table creation). Validates that all required UC properties are present,
     /// then writes the version 0 commit file directly to the published commit path.
     fn commit_version_0(
+        &self,
         engine: &dyn Engine,
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: &CommitMetadata,
@@ -170,7 +141,8 @@ impl<C: CommitClient> UCCommitter<C> {
             "commit_version_0 called with version {}",
             commit_metadata.version()
         );
-        Self::validate_version_0_properties(commit_metadata)?;
+        self.validate_catalog_managed_state(commit_metadata)?;
+        Self::validate_version_0_features(commit_metadata)?;
         let published_commit_path = commit_metadata.published_commit_path()?;
         match engine.json_handler().write_json_file(
             &published_commit_path,
@@ -205,8 +177,7 @@ impl<C: CommitClient> UCCommitter<C> {
             commit_metadata.version() != 0,
             "commit_version_non_zero called with version 0"
         );
-        Self::validate_no_catalog_managed_change(&commit_metadata)?;
-        self.validate_required_table_properties(&commit_metadata)?;
+        self.validate_catalog_managed_state(&commit_metadata)?;
         Self::validate_no_alter_table_changes(&commit_metadata)?;
         let staged_commit_path = commit_metadata.staged_commit_path()?;
         engine
@@ -281,7 +252,7 @@ impl<C: CommitClient + 'static> Committer for UCCommitter<C> {
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         if commit_metadata.version() == 0 {
-            return Self::commit_version_0(engine, actions, &commit_metadata);
+            return self.commit_version_0(engine, actions, &commit_metadata);
         }
         self.commit_version_non_zero(engine, actions, commit_metadata)
     }
@@ -463,7 +434,10 @@ mod tests {
             0,
             vec!["catalogManaged", "vacuumProtocolCheck"],
             vec!["catalogManaged", "inCommitTimestamp", "vacuumProtocolCheck"],
-            HashMap::from([("io.unitycatalog.tableId".to_string(), "test-id".to_string())]),
+            HashMap::from([(
+                "io.unitycatalog.tableId".to_string(),
+                "test-table-id".to_string(),
+            )]),
         )
         .unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");

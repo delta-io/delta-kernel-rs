@@ -395,16 +395,8 @@ impl<S> Transaction<S> {
             .chain(dv_update_actions);
 
         // Step 7: Commit via the committer
-<<<<<<< HEAD
-        let commit_metadata = self.create_commit_metadata(commit_version, protocol, metadata)?;
-=======
-        let commit_metadata = self.create_commit_metadata(
-            commit_version,
-            protocol,
-            metadata,
-            dm_changes.clone(),
-        )?;
->>>>>>> b118906a (refactor: address pt3/pt4 review feedback and add back CommitMetadata API)
+        let commit_metadata =
+            self.create_commit_metadata(commit_version, protocol, metadata, dm_changes.clone())?;
         match self
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)
