@@ -1302,6 +1302,7 @@ dependencies = [
  "criterion",
  "delta_kernel",
  "flate2",
+ "itertools 0.14.0",
  "rayon",
  "rstest",
  "serde",
