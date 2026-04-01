@@ -899,26 +899,30 @@ mod tests {
         });
 
         let key = "delta.appendOnly";
-        let val_ptr = unsafe {
+        let result = unsafe {
             crate::snapshot_table_property(
                 snap.shallow_copy(),
                 kernel_string_slice!(key),
                 allocate_str,
             )
         };
-        assert!(val_ptr.is_some());
+        let crate::OptionalValue::Some(val_ptr) = result else {
+            panic!("Expected Some for existing property 'delta.appendOnly'");
+        };
         let val = recover_string(val_ptr.unwrap());
         assert_eq!(val, "true");
 
         let key2 = "custom.key";
-        let val_ptr2 = unsafe {
+        let result2 = unsafe {
             crate::snapshot_table_property(
                 snap.shallow_copy(),
                 kernel_string_slice!(key2),
                 allocate_str,
             )
         };
-        assert!(val_ptr2.is_some());
+        let crate::OptionalValue::Some(val_ptr2) = result2 else {
+            panic!("Expected Some for existing property 'custom.key'");
+        };
         let val2 = recover_string(val_ptr2.unwrap());
         assert_eq!(val2, "custom_value");
 
