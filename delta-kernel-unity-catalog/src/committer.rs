@@ -68,7 +68,9 @@ impl<C: CommitClient> UCCommitter<C> {
                 "UC catalog-managed table creation requires the 'inCommitTimestamp' table feature",
             ));
         }
-        let config = commit_metadata.metadata_configuration();
+        let config = commit_metadata.metadata_configuration().ok_or_else(|| {
+            DeltaError::generic("UC catalog-managed table creation requires metadata configuration")
+        })?;
         if !config.contains_key(UC_TABLE_ID_KEY) {
             return Err(DeltaError::generic(format!(
                 "UC catalog-managed table creation requires '{UC_TABLE_ID_KEY}' in metadata configuration",
@@ -132,7 +134,12 @@ impl<C: CommitClient> UCCommitter<C> {
         &self,
         commit_metadata: &CommitMetadata,
     ) -> DeltaResult<()> {
-        let config = commit_metadata.metadata_configuration();
+        let config = commit_metadata.metadata_configuration().ok_or_else(|| {
+            DeltaError::generic(
+                "UC catalog-managed table requires metadata configuration. \
+                 The table may have been modified by another writer.",
+            )
+        })?;
         if let Some(table_id) = config.get(UC_TABLE_ID_KEY) {
             if table_id != &self.table_id {
                 return Err(DeltaError::generic(format!(

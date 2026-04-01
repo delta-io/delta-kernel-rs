@@ -53,7 +53,6 @@ impl CommitType {
 /// The protocol and metadata state for this commit. Groups the read snapshot state (if any)
 /// and the new state being committed (if any).
 #[derive(Debug)]
-#[allow(dead_code)] // Fields read by delta-kernel-unity-catalog via effective_protocol/metadata
 pub(crate) struct CommitProtocolMetadata {
     /// Existing table protocol from read snapshot. `None` for create-table.
     read_protocol: Option<Protocol>,
@@ -238,11 +237,10 @@ impl CommitMetadata {
             .is_some_and(|features| features.iter().any(|f| f.as_ref() == feature_name))
     }
 
-    /// Get the raw metadata configuration for the effective metadata.
-    pub fn metadata_configuration(&self) -> HashMap<String, String> {
-        self.effective_metadata()
-            .map(|m| m.configuration().clone())
-            .unwrap_or_default()
+    /// Get the raw metadata configuration for the effective metadata. Returns `None` if no
+    /// metadata is set.
+    pub fn metadata_configuration(&self) -> Option<&HashMap<String, String>> {
+        self.effective_metadata().map(|m| m.configuration())
     }
 
     /// Returns `true` if this commit changes the table's protocol.
