@@ -80,7 +80,7 @@ Built-in tags (with current table assignments - for the most up-to-date table as
   - Tables: `10kAdds0CommitsSinceChkpt1Chkpt`, `10kAdds0CommitsSinceChkpt1V2Chkpt`
 - **`v2-checkpoint`** — tables with v2 checkpoints
   - Tables: `10kAdds0CommitsSinceChkpt1V2Chkpt`
-- **`crc-optimization`** — tables for comparing how CRC files affect log replay timing; designed to isolate the effect of a single CRC at different versions relative to the checkpoint and latest version
+- **`crc-optimization`** — tables for comparing how CRC files affect log replay timing; designed to isolate the effect of CRC files at different versions relative to the checkpoint and latest version
   - Tables: `101kAdds1kCommitsSinceChkpt1Chkpt`, `20kAdds100CommitsSinceChkpt1Chkpt0CommitsSinceCrc`, `20kAdds100CommitsSinceChkpt1Chkpt50CommitsSinceCrc`, `20kAdds100CommitsSinceChkpt1ChkptNoCrc`
 - **`time-travel-optimization`** — tables with multiple specs or specs not at the latest version, useful for benchmarking snapshot construction at historical versions
   - Tables: `101kAdds1kCommitsSinceChkpt1Chkpt`, `200kAdds0CommitsSinceChkpt2Chkpts0CommitsSinceCrc`
