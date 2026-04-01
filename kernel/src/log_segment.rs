@@ -149,20 +149,37 @@ fn schema_to_is_not_null_predicate(schema: &StructType) -> Option<PredicateRef> 
 }
 
 impl LogSegment {
-    /// Creates a synthetic LogSegment for pre-commit transactions (e.g., create-table).
-    /// The sentinel version PRE_COMMIT_VERSION indicates no version exists yet on disk.
-    /// This is used to construct a pre-commit snapshot that provides table configuration
-    /// (protocol, metadata, schema) for operations like CTAS.
-    #[allow(dead_code)] // Used by create_table module
-    pub(crate) fn for_pre_commit(log_root: Url) -> Self {
-        use crate::PRE_COMMIT_VERSION;
-        Self {
-            end_version: PRE_COMMIT_VERSION,
+    /// Creates a LogSegment for version zero containing a single v0 commit file.
+    /// Used to construct a post-commit snapshot after a CREATE TABLE transaction.
+    pub(crate) fn new_for_version_zero(
+        log_root: Url,
+        v0_commit: ParsedLogPath,
+    ) -> DeltaResult<Self> {
+        require!(
+            v0_commit.version == 0 && v0_commit.is_commit(),
+            Error::internal_error(format!(
+                "new_for_version_zero requires a v0 commit file. Got version={}, type={:?}",
+                v0_commit.version, v0_commit.file_type
+            ))
+        );
+        let max_published_version = match v0_commit.file_type {
+            LogPathFileType::Commit => Some(0),
+            _ => None,
+        };
+        Ok(Self {
+            end_version: 0,
             checkpoint_version: None,
             log_root,
             checkpoint_schema: None,
-            listed: LogSegmentFiles::default(),
-        }
+            listed: LogSegmentFiles {
+                ascending_commit_files: vec![v0_commit.clone()],
+                ascending_compaction_files: vec![],
+                checkpoint_parts: vec![],
+                latest_crc_file: None,
+                latest_commit_file: Some(v0_commit),
+                max_published_version,
+            },
+        })
     }
 
     #[internal_api]

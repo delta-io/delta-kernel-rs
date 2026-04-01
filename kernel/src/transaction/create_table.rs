@@ -37,7 +37,7 @@ use crate::actions::DomainMetadata;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::SchemaRef;
-use crate::snapshot::SnapshotRef;
+use crate::table_configuration::TableConfiguration;
 use crate::transaction::{CreateTable, Transaction};
 use crate::utils::current_time_ms;
 use crate::DeltaResult;
@@ -133,31 +133,29 @@ impl CreateTableTransaction {
     /// Create a new transaction for creating a new table. This is used when the table doesn't
     /// exist yet and we need to create it with Protocol and Metadata actions.
     ///
-    /// The `pre_commit_snapshot` is a synthetic snapshot created from the protocol and metadata
-    /// that will be committed. It uses `PRE_COMMIT_VERSION` as a sentinel to indicate no
-    /// version exists yet on disk.
+    /// The `effective_table_config` contains the protocol and metadata for the new table.
+    /// No read snapshot is needed since there is no prior table state.
     ///
     /// This is typically called via `CreateTableTransactionBuilder::build()` rather than directly.
     pub(crate) fn try_new_create_table(
-        pre_commit_snapshot: SnapshotRef,
+        effective_table_config: TableConfiguration,
         engine_info: String,
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
     ) -> DeltaResult<Self> {
-        // TODO(sanuj) Today transactions expect a read snapshot to be passed in and we pass
-        // in the pre_commit_snapshot for CREATE. To support other operations such as ALTERs
-        // there might be cleaner alternatives which can clearly disambiguate b/w a snapshot
-        // the was read vs the effective snapshot we will use for the commit.
         let span = tracing::info_span!(
             "txn",
-            path = %pre_commit_snapshot.table_root(),
+            path = %effective_table_config.table_root(),
             operation = "CREATE",
         );
 
         Ok(Transaction {
             span,
-            read_snapshot: pre_commit_snapshot,
+            read_snapshot: None,
+            effective_table_config,
+            should_emit_protocol: true,
+            should_emit_metadata: true,
             committer,
             operation: Some("CREATE TABLE".to_string()),
             engine_info: Some(engine_info),

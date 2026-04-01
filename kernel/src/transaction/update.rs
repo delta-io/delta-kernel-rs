@@ -66,6 +66,8 @@ impl Transaction {
 
         let commit_timestamp = current_time_ms()?;
 
+        let effective_table_config = read_snapshot.table_configuration().clone();
+
         let span = tracing::info_span!(
             "txn",
             path = %read_snapshot.table_root(),
@@ -74,7 +76,10 @@ impl Transaction {
 
         Ok(Transaction {
             span,
-            read_snapshot,
+            read_snapshot: Some(read_snapshot),
+            effective_table_config,
+            should_emit_protocol: false,
+            should_emit_metadata: false,
             committer,
             operation: None,
             engine_info: None,
@@ -258,8 +263,7 @@ impl Transaction {
             ));
         }
         if !self
-            .read_snapshot
-            .table_configuration()
+            .effective_table_config
             .is_feature_supported(&TableFeature::DeletionVectors)
         {
             return Err(Error::unsupported(

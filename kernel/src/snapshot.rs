@@ -28,6 +28,7 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
+use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
 use crate::utils::require;
 use crate::LogCompactionWriter;
@@ -466,9 +467,6 @@ impl Snapshot {
     /// metadata, set transactions, ICT) and avoids re-reading them from storage. CREATE TABLE
     /// always produces a CRC at v0. If no CRC was available on the pre-commit snapshot, the
     /// existing lazy CRC is carried forward unchanged.
-    ///
-    /// TODO: Handle Protocol changes in CrcDelta (when Kernel-RS supports protocol changes)
-    /// TODO: Handle Metadata changes in CrcDelta (when Kernel-RS supports metadata changes)
     pub(crate) fn new_post_commit(
         &self,
         commit: ParsedLogPath,
@@ -508,20 +506,21 @@ impl Snapshot {
 
     /// Compute the lazy CRC for a post-commit snapshot by applying a [`CrcDelta`].
     ///
-    /// For CREATE TABLE, builds a fresh CRC from the `crc_delta`. For existing tables, applies
-    /// the `crc_delta` to the current CRC if loaded, otherwise carries forward the existing lazy CRC.
-    fn compute_post_commit_crc(&self, new_version: Version, crc_delta: CrcDelta) -> Arc<LazyCrc> {
-        let crc = if self.version() == crate::PRE_COMMIT_VERSION {
-            crc_delta.into_crc_for_version_zero()
-        } else {
-            self.lazy_crc
-                .get_if_loaded_at_version(self.version())
-                .map(|base| {
-                    let mut crc = base.as_ref().clone();
-                    crc.apply(crc_delta);
-                    crc
-                })
-        };
+    /// Applies the `crc_delta` to the current CRC if loaded, otherwise carries forward the
+    /// existing lazy CRC unchanged.
+    pub(crate) fn compute_post_commit_crc(
+        &self,
+        new_version: Version,
+        crc_delta: CrcDelta,
+    ) -> Arc<LazyCrc> {
+        let crc = self
+            .lazy_crc
+            .get_if_loaded_at_version(self.version())
+            .map(|base| {
+                let mut crc = base.as_ref().clone();
+                crc.apply(crc_delta);
+                crc
+            });
 
         match crc {
             Some(c) => Arc::new(LazyCrc::new_precomputed(c, new_version)),
@@ -618,6 +617,24 @@ impl Snapshot {
     /// Create a [`ScanBuilder`] for an `SnapshotRef`.
     pub fn scan_builder(self: Arc<Self>) -> ScanBuilder {
         ScanBuilder::new(self)
+    }
+
+    /// Create an [`AlterTableTransactionBuilder`] for evolving the schema of this table.
+    ///
+    /// Returns a builder that accepts schema operations (add column, drop column, rename column,
+    /// set nullable) and produces a metadata-only commit when built and committed.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let result = snapshot
+    ///     .alter_table()
+    ///     .add_column(StructField::nullable("email", DataType::STRING))
+    ///     .build(engine, committer)?
+    ///     .commit(engine)?;
+    /// ```
+    pub fn alter_table(self: Arc<Self>) -> AlterTableTransactionBuilder {
+        AlterTableTransactionBuilder::new(self)
     }
 
     /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
