@@ -441,9 +441,12 @@ pub unsafe extern "C" fn free_create_table_builder(builder: Handle<ExclusiveCrea
 ///
 /// The `data` handle is consumed. The selection vector indicates which rows in `data` represent
 /// files to remove: `true` means the row is selected for removal, `false` means it is skipped.
-/// If `selection_vector` is null or `selection_vector_len` is 0, all rows are selected.
+/// If `selection_vector` is null or `selection_vector_len` is 0, all rows are selected. When
+/// `selection_vector_len` is 0, the `selection_vector` pointer is not accessed and may be null
+/// or any arbitrary value.
 ///
-/// The `data` schema must match the scan row schema returned by scan metadata.
+/// The `data` schema must match the scan row schema returned by
+/// [`scan_metadata_next`](crate::scan::scan_metadata_next).
 ///
 /// Note: Unlike [`add_files`], this function takes an `engine` handle and returns
 /// [`ExternResult`] because the selection vector validation can fail.
@@ -452,6 +455,7 @@ pub unsafe extern "C" fn free_create_table_builder(builder: Handle<ExclusiveCrea
 ///
 /// Caller is responsible for passing valid handles. The `selection_vector` pointer must be valid
 /// for `selection_vector_len` bool elements (1 byte each), or null. Consumes the `data` handle.
+/// Does NOT consume the `txn` handle.
 #[no_mangle]
 pub unsafe extern "C" fn remove_files(
     mut txn: Handle<ExclusiveTransaction>,
@@ -486,13 +490,16 @@ fn remove_files_impl(
 /// [`scan_metadata_next`](crate::scan::scan_metadata_next).
 ///
 /// This is a convenience function that extracts the scan files from `ScanMetadata` and passes
-/// them to [`Transaction::remove_files`]. The `scan_metadata` handle is consumed -- the caller
-/// must not hold other references to it. If the handle has other outstanding references (e.g.
-/// from `shallow_copy()`), this function returns an error.
+/// them to [`Transaction::remove_files`]. The `scan_metadata` handle is always consumed
+/// regardless of whether the function succeeds or fails -- do not use or free the handle after
+/// calling this function. If the underlying `Arc` has other outstanding references (e.g. from
+/// `shallow_copy()`), this function returns an error.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing valid handles. Consumes the `scan_metadata` handle.
+/// Caller is responsible for passing valid handles. The `scan_metadata` handle is consumed
+/// unconditionally -- do not call `free_scan_metadata` after this function, even on error.
+/// Does NOT consume the `txn` handle.
 #[no_mangle]
 pub unsafe extern "C" fn remove_scan_metadata(
     mut txn: Handle<ExclusiveTransaction>,
@@ -1488,6 +1495,70 @@ mod tests {
         let filtered = FilteredEngineData::try_new(data, vec![]).unwrap();
         assert_eq!(filtered.selection_vector().len(), 0);
         assert_eq!(filtered.data().len(), 3);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_remove_files_with_non_empty_selection_vector(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Exercises the from_raw_parts code path in the remove_files FFI wrapper by passing
+        // a non-null selection vector pointer with non-zero length. The existing
+        // test_remove_files_with_selection_vector always passes a null SV because
+        // scan_metadata for a single-file table returns an empty selection vector.
+        let tmp_dir = tempdir()?;
+        let (table_path, engine) = create_table_with_one_file(&tmp_dir)?;
+        let table_path_str = table_path.as_str();
+
+        let kernel_engine = unsafe { engine.as_ref() }.engine();
+        let snapshot = delta_kernel::snapshot::Snapshot::builder_for(delta_kernel::try_parse_uri(
+            table_path_str,
+        )?)
+        .build(kernel_engine.as_ref())?;
+
+        let scan = snapshot.scan_builder().build()?;
+        let scan_meta_items: Vec<_> = scan
+            .scan_metadata(kernel_engine.as_ref())?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(scan_meta_items.len(), 1);
+
+        let scan_meta = scan_meta_items.into_iter().next().unwrap();
+        let (data, _original_sv) = scan_meta.scan_files.into_parts();
+        let num_rows = data.len();
+        assert!(num_rows > 0);
+        let data_handle: Handle<ExclusiveEngineData> = data.into();
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        let engine_info = "test-engine/1.0";
+        let txn = ok_or_panic(unsafe {
+            with_engine_info(
+                txn,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+
+        // Construct a non-empty all-true SV selecting every row. This exercises the
+        // from_raw_parts code path (non-null pointer with non-zero length) rather than the
+        // null-pointer shortcut taken when the SV is empty.
+        let sv: Vec<bool> = vec![true; num_rows];
+        ok_or_panic(unsafe {
+            remove_files(
+                txn.shallow_copy(),
+                data_handle,
+                sv.as_ptr(),
+                sv.len(),
+                engine.shallow_copy(),
+            )
+        });
+
+        // Don't commit -- the from_raw_parts path has been exercised. Committing with
+        // a non-empty SV triggers a different code path in generate_remove_actions that
+        // requires additional scan row fields not present in this test setup.
+        unsafe { crate::transaction::free_transaction(txn) };
+        unsafe { free_engine(engine) };
+        Ok(())
     }
 
     #[tokio::test]
