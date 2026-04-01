@@ -123,6 +123,7 @@ Examples:
 ```
 
 See [By tag (`BENCH_TAGS`)](#by-tag-bench_tags) for how tags work and [By benchmark name](#by-benchmark-name) for regex pattern examples. Results are posted automatically as a PR comment, comparing the PR branch against the base branch.
+CI timings are noisy and tend to run higher than on dedicated hardware, but proportional differences between branches are a rough signal for performance changes.
 
 ## Workload data layout
 
