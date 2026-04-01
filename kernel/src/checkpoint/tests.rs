@@ -335,37 +335,6 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     Ok(())
 }
 
-/// Cloning a `CheckpointWriter` preserves a previously cached output schema.
-#[tokio::test]
-async fn test_clone_checkpoint_writer_preserves_cached_schema() -> DeltaResult<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
-
-    write_commit_to_store(
-        &store,
-        vec![create_basic_protocol_action(), create_metadata_action()],
-        0,
-    )
-    .await?;
-
-    let table_root = Url::parse("memory:///")?;
-    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
-
-    // Populate the cached schema by calling checkpoint_data
-    let mut data = writer.checkpoint_data(&engine)?;
-    while data.next().is_some() {}
-
-    let cloned = writer.clone();
-    assert_eq!(cloned.version, writer.version);
-    assert_eq!(
-        cloned.checkpoint_output_schema.get(),
-        writer.checkpoint_output_schema.get()
-    );
-
-    Ok(())
-}
-
 /// Tests the `checkpoint()` API with:
 /// - A table that does not support v2Checkpoint
 /// - A specific version specified (version 0)

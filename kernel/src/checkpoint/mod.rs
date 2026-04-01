@@ -184,7 +184,7 @@ static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| {
 ///
 /// # See Also
 /// See the [module-level documentation](self) for the complete checkpoint workflow
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CheckpointWriter {
     /// Reference to the snapshot (i.e. version) of the table being checkpointed
     pub(crate) snapshot: SnapshotRef,
@@ -196,21 +196,6 @@ pub struct CheckpointWriter {
 
     /// Cached checkpoint output schema.
     checkpoint_output_schema: OnceLock<SchemaRef>,
-}
-
-impl Clone for CheckpointWriter {
-    fn clone(&self) -> Self {
-        let checkpoint_output_schema = OnceLock::new();
-        if let Some(schema) = self.checkpoint_output_schema.get() {
-            // SAFETY: checkpoint_output_schema just initialized
-            let _ = checkpoint_output_schema.set(schema.clone());
-        }
-        Self {
-            snapshot: self.snapshot.clone(),
-            version: self.version,
-            checkpoint_output_schema,
-        }
-    }
 }
 
 impl RetentionCalculator for CheckpointWriter {
