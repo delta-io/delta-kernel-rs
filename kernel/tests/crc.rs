@@ -31,7 +31,7 @@ async fn test_get_file_stats_from_crc() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 0);
 
-    let file_stats = snapshot.get_file_stats(&engine).unwrap();
+    let file_stats = snapshot.get_or_load_file_stats(&engine).unwrap();
     assert_eq!(file_stats.num_files, 10);
     assert_eq!(file_stats.table_size_bytes, 5259);
     assert!(file_stats.file_size_histogram.is_some());
@@ -56,7 +56,7 @@ async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
 
-    let file_stats = snapshot.get_file_stats(engine.as_ref());
+    let file_stats = snapshot.get_or_load_file_stats(engine.as_ref());
     assert_eq!(file_stats, None);
 
     Ok(())
@@ -76,7 +76,7 @@ async fn test_get_file_stats_crc_not_at_snapshot_version() -> DeltaResult<()> {
     // Verify the table starts at version 0 with valid CRC stats
     let snapshot = Snapshot::builder_for(table_path.clone()).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
-    assert!(snapshot.get_file_stats(engine.as_ref()).is_some());
+    assert!(snapshot.get_or_load_file_stats(engine.as_ref()).is_some());
 
     // ===== WHEN =====
     // Empty commit to advance to version 1 (no new CRC file written)
@@ -89,7 +89,7 @@ async fn test_get_file_stats_crc_not_at_snapshot_version() -> DeltaResult<()> {
     assert_eq!(snapshot.version(), 1);
 
     // No CRC at version 1, so file stats should be None
-    let file_stats = snapshot.get_file_stats(engine.as_ref());
+    let file_stats = snapshot.get_or_load_file_stats(engine.as_ref());
     assert_eq!(file_stats, None);
 
     Ok(())

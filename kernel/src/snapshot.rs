@@ -701,11 +701,22 @@ impl Snapshot {
     /// snapshot's version.
     ///
     /// NOTE: This is an unstable API expected to change in future releases.
+    #[allow(unused)]
     #[internal_api]
-    pub(crate) fn get_file_stats(&self, engine: &dyn Engine) -> Option<FileStats> {
+    pub(crate) fn get_or_load_file_stats(&self, engine: &dyn Engine) -> Option<FileStats> {
         let crc = self
             .lazy_crc
             .get_or_load_if_at_version(engine, self.version())?;
+        crc.file_stats()
+    }
+
+    /// Returns file-level statistics, or `None` if CRC is not loaded, not at this
+    /// version, or has no valid file stats.
+    ///
+    /// NOTE: This API is purely opportunistic, no I/O.
+    #[internal_api]
+    pub(crate) fn get_file_stats_if_loaded(&self) -> Option<FileStats> {
+        let crc = self.lazy_crc.get_if_loaded_at_version(self.version())?;
         crc.file_stats()
     }
 

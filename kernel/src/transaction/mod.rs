@@ -418,7 +418,7 @@ impl<S> Transaction<S> {
             Ok(CommitResponse::Committed { file_meta }) => {
                 let bin_boundaries = self
                     .read_snapshot
-                    .get_file_stats(engine)
+                    .get_file_stats_if_loaded()
                     .and_then(|s| s.file_size_histogram)
                     .map(|h| h.sorted_bin_boundaries);
                 let crc_delta = self.build_crc_delta(
