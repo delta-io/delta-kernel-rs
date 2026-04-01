@@ -49,6 +49,14 @@ impl<T: Clone> FallibleLazy<T> {
         }
     }
 
+    /// Returns a clone of the cached value, or `None` if uninitialized.
+    #[allow(unused)]
+    // This will be used in next PR to create sidecar infrastructures.
+    pub(crate) fn get(&self) -> Option<T> {
+        // SAFETY: Production code should never panic, so the mutex should never be poisoned.
+        self.inner.lock().unwrap_or_else(|_| unreachable!()).clone()
+    }
+
     /// Returns a clone of the cached value, or initializes it with `f` if uninitialized.
     pub(crate) fn get_or_try_init(&self, f: impl FnOnce() -> DeltaResult<T>) -> DeltaResult<T> {
         let mut guard = self
@@ -937,9 +945,11 @@ mod tests {
     #[test]
     fn fallible_lazy_first_init_wins() {
         let lazy = FallibleLazy::new();
+        assert_eq!(lazy.get(), None);
         let val1 = lazy.get_or_try_init(|| Ok(1)).unwrap();
-        let val2 = lazy.get_or_try_init(|| Ok(2)).unwrap();
         assert_eq!(val1, 1);
+        assert_eq!(lazy.get(), Some(1));
+        let val2 = lazy.get_or_try_init(|| Ok(2)).unwrap();
         assert_eq!(val2, 1);
     }
 
