@@ -91,6 +91,7 @@ To trigger benchmarks on a pull request, post a comment on the PR with one of th
 - `/bench <tags>` — runs benchmarks with `BENCH_TAGS=<tags>` (e.g. `bench base,tag1`)
 
 See [By tag (`BENCH_TAGS`)](#by-tag-bench_tags) for details on how tags work. Results are posted automatically as a PR comment, comparing the PR branch against the base branch.
+In CI, the timing is sometimes less accurate than if you ran it on different machines yourself, but it still gives you a clear idea of any performance changes.
 
 ## Workload data layout
 
