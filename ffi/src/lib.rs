@@ -986,6 +986,8 @@ pub unsafe extern "C" fn snapshot_metadata_id(
 /// Look up a single table property by key from the specified snapshot's metadata configuration.
 /// Returns null if the key is not found or if `key` is not valid UTF-8.
 ///
+/// See also [`visit_metadata_configuration`] for iterating over all configuration key-value pairs.
+///
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle, a valid `key`, and a valid
