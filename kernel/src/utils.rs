@@ -55,10 +55,10 @@ impl<T: Clone> FallibleLazy<T> {
             .inner
             .lock()
             .map_err(|_| Error::internal_error("FallibleLazy mutex poisoned"))?;
-        guard
-            .as_ref()
-            .map(T::clone)
-            .map_or_else(|| f().map(|val| guard.insert(val).clone()), Ok)
+        match guard.as_ref() {
+            Some(cached) => Ok(cached.clone()),
+            None => f().map(|val| guard.insert(val).clone()),
+        }
     }
 }
 
