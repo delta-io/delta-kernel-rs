@@ -85,7 +85,6 @@ fn visit_domain_metadata_impl(
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::error::KernelError;

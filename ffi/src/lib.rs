@@ -716,7 +716,6 @@ enum FfiSnapshotBuilderSource {
     ExistingSnapshot(SnapshotRef),
 }
 
-// Common base for snapshot_builder
 fn make_snapshot_builder(
     source: FfiSnapshotBuilderSource,
     engine: Arc<dyn ExternEngine>,
@@ -814,7 +813,7 @@ pub unsafe extern "C" fn snapshot_builder_set_log_tail(
 }
 
 #[cfg(feature = "catalog-managed")]
-fn snapshot_builder_set_log_tail_impl(
+unsafe fn snapshot_builder_set_log_tail_impl(
     builder: &mut FfiSnapshotBuilder,
     log_tail: log_path::LogPathArray,
 ) -> DeltaResult<bool> {
