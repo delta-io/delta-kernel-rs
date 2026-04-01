@@ -1276,25 +1276,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            0,
-            actions_to_string(vec![TestAction::Metadata]),
-        )
-        .await?;
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let (_, engine, snapshot1) = make_engine_and_v0_snapshot(table_root).await?;
 
         // Test getting latest snapshot
-        let snapshot1 = unsafe {
-            ok_or_panic(snapshot(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
         let version1 = unsafe { version(snapshot1.shallow_copy()) };
         assert_eq!(version1, 0);
 
@@ -1617,16 +1602,9 @@ mod tests {
     #[cfg(feature = "catalog-managed")]
     #[tokio::test]
     async fn test_snapshot_log_tail() -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
-
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            0,
-            actions_to_string(vec![TestAction::Metadata]),
-        )
-        .await?;
+        let (storage, engine, snap) = make_engine_and_v0_snapshot(table_root).await?;
+        unsafe { free_snapshot(snap) };
         let commit1 = add_staged_commit(
             table_root,
             storage.as_ref(),
@@ -1634,8 +1612,6 @@ mod tests {
             actions_to_string(vec![TestAction::Add("path1".into())]),
         )
         .await?;
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let commit1_path = format!(
             "{}_delta_log/_staged_commits/{}",
@@ -1850,19 +1826,9 @@ mod tests {
     #[tokio::test]
     async fn test_free_snapshot_builder_without_building() -> Result<(), Box<dyn std::error::Error>>
     {
-        let storage = Arc::new(InMemory::new());
         let path = "memory:///";
-        add_commit(
-            path,
-            storage.as_ref(),
-            0,
-            actions_to_string(vec![TestAction::Metadata]),
-        )
-        .await?;
-        let engine = engine_to_handle(
-            Arc::new(DefaultEngineBuilder::new(storage).build()),
-            allocate_err,
-        );
+        let (_, engine, snap) = make_engine_and_v0_snapshot(path).await?;
+        unsafe { free_snapshot(snap) };
 
         let ptr = unsafe {
             ok_or_panic(get_snapshot_builder(
@@ -1898,19 +1864,9 @@ mod tests {
     #[tokio::test]
     async fn test_builder_at_nonexistent_version_returns_error(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
         let path = "memory:///";
-        add_commit(
-            path,
-            storage.as_ref(),
-            0,
-            actions_to_string(vec![TestAction::Metadata]),
-        )
-        .await?;
-        let engine = engine_to_handle(
-            Arc::new(DefaultEngineBuilder::new(storage).build()),
-            allocate_err,
-        );
+        let (_, engine, snap) = make_engine_and_v0_snapshot(path).await?;
+        unsafe { free_snapshot(snap) };
 
         let result = unsafe {
             let mut ptr = ok_or_panic(get_snapshot_builder(
