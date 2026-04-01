@@ -220,11 +220,11 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn build_expected_stats_schemas(
         &self,
-        required_columns_physical: Option<&[ColumnName]>,
-        requested_columns_physical: Option<&[ColumnName]>,
+        required_physical_columns: Option<&[ColumnName]>,
+        requested_physical_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<ExpectedStatsSchemas> {
         let physical_data_schema = self.physical_data_schema_without_partition_columns();
-        let required_physical_stats_columns = self.required_stats_columns_physical();
+        let required_physical_stats_columns = self.required_physical_stats_columns();
         let config = StatsConfig {
             data_skipping_stats_columns: required_physical_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: self.table_properties().data_skipping_num_indexed_cols,
@@ -232,8 +232,8 @@ impl TableConfiguration {
         let physical_stats_schema = Arc::new(expected_stats_schema(
             &physical_data_schema,
             &config,
-            required_columns_physical,
-            requested_columns_physical,
+            required_physical_columns,
+            requested_physical_columns,
         )?);
         let physical_stats_schema = strip_metadata(physical_stats_schema);
 
@@ -243,11 +243,11 @@ impl TableConfiguration {
     }
 
     /// Returns the list of physical column names that should have statistics collected.
-    pub(crate) fn stats_column_names_physical(
+    pub(crate) fn physical_stats_column_names(
         &self,
         required_columns: Option<&[ColumnName]>,
     ) -> Vec<ColumnName> {
-        let physical_stats_columns = self.required_stats_columns_physical();
+        let physical_stats_columns = self.required_physical_stats_columns();
         let config = StatsConfig {
             data_skipping_stats_columns: physical_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: self.table_properties().data_skipping_num_indexed_cols,
@@ -326,7 +326,7 @@ impl TableConfiguration {
     ///
     /// Returns `None` if the table property is not set. Entries that cannot be resolved
     /// (e.g. non-existent columns) are silently skipped with a warning.
-    fn required_stats_columns_physical(&self) -> Option<Vec<ColumnName>> {
+    fn required_physical_stats_columns(&self) -> Option<Vec<ColumnName>> {
         self.table_properties()
             .data_skipping_stats_columns
             .as_ref()
@@ -1857,12 +1857,12 @@ mod test {
     }
 
     #[test]
-    fn test_stats_column_names_physical_returns_physical_names() {
-        // stats_column_names_physical should return physical column names
+    fn test_physical_stats_column_names_returns_physical_names() {
+        // physical_stats_column_names should return physical column names
         let schema = schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
-        let column_names = config.stats_column_names_physical(None /* required_columns */);
+        let column_names = config.physical_stats_column_names(None /* required_columns */);
 
         // Should return physical names, not logical names
         assert_eq!(
@@ -1876,13 +1876,13 @@ mod test {
     }
 
     #[test]
-    fn test_stats_column_names_physical_with_data_skipping_stats_columns() {
+    fn test_physical_stats_column_names_with_data_skipping_stats_columns() {
         let config = create_table_config_with_column_mapping_and_props(
             test_schema_nested_with_column_mapping(),
             "name",
             [("delta.dataSkippingStatsColumns", "id,info.name")],
         );
-        let column_names = config.stats_column_names_physical(None);
+        let column_names = config.physical_stats_column_names(None);
         assert_eq!(
             column_names,
             vec![
@@ -1893,13 +1893,13 @@ mod test {
     }
 
     #[test]
-    fn test_stats_column_names_physical_skips_nonexistent_data_skipping_stats_column() {
+    fn test_physical_stats_column_names_skips_nonexistent_data_skipping_stats_column() {
         let config = create_table_config_with_column_mapping_and_props(
             test_schema_nested_with_column_mapping(),
             "name",
             [("delta.dataSkippingStatsColumns", "id,nonexistent")],
         );
-        let column_names = config.stats_column_names_physical(None);
+        let column_names = config.physical_stats_column_names(None);
         assert_eq!(column_names, vec![ColumnName::new(["phys_id"])],);
     }
 
@@ -1980,13 +1980,13 @@ mod test {
         "id",
         vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
     )]
-    fn test_stats_column_names_physical_all_schemas(
+    fn test_physical_stats_column_names_all_schemas(
         #[case] schema: SchemaRef,
         #[case] mode: &str,
         #[case] expected_physical: Vec<ColumnName>,
     ) {
         let config = create_table_config_with_column_mapping(schema, mode);
-        let physical_names = config.stats_column_names_physical(None);
+        let physical_names = config.physical_stats_column_names(None);
         assert_eq!(
             physical_names, expected_physical,
             "Incorrect physical column names for mode '{mode}'"
