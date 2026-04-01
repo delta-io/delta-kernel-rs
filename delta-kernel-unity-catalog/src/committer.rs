@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
+use tracing::{debug, info};
 use unity_catalog_delta_client_api::{Commit, CommitClient, CommitRequest};
 
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
@@ -35,6 +36,8 @@ impl<C: CommitClient> UCCommitter<C> {
 
     /// Commit version 0 (table creation). Writes the version 0 commit file directly to the
     /// published commit path.
+    // TODO: Validate commit metadata before writing. Ensure ICT is enabled and the UC table
+    // ID has not been tampered with.
     fn commit_version_0(
         &self,
         engine: &dyn Engine,
@@ -53,12 +56,12 @@ impl<C: CommitClient> UCCommitter<C> {
             false,
         ) {
             Ok(()) => {
-                tracing::info!("wrote version 0 commit file for UC table creation");
+                info!("wrote version 0 commit file for UC table creation");
                 let file_meta = engine.storage_handler().head(&published_commit_path)?;
                 Ok(CommitResponse::Committed { file_meta })
             }
             Err(delta_kernel::Error::FileAlreadyExists(_)) => {
-                tracing::info!("version 0 commit conflict: commit file already exists");
+                info!("version 0 commit conflict: commit file already exists");
                 Ok(CommitResponse::Conflict { version: 0 })
             }
             Err(e) => Err(e),
@@ -85,7 +88,7 @@ impl<C: CommitClient> UCCommitter<C> {
             .write_json_file(&staged_commit_path, Box::new(actions), false)?;
 
         let committed = engine.storage_handler().head(&staged_commit_path)?;
-        tracing::debug!("wrote staged commit file: {:?}", committed);
+        debug!("wrote staged commit file: {:?}", committed);
 
         let commit_req = CommitRequest::new(
             self.table_id.clone(),
