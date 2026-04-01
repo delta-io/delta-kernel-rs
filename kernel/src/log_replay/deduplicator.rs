@@ -13,8 +13,6 @@
 
 use std::hash::Hash;
 
-use hashbrown::HashSet;
-
 use crate::engine_data::{GetData, TypedGetData};
 use crate::log_replay::{DvUniqueId, FileActionKey};
 use crate::DeltaResult;
@@ -122,17 +120,15 @@ pub(crate) trait Deduplicator {
         let path = getters[dv_start_index + 1].get(i, "deletionVector.pathOrInlineDv")?;
         let dv = match storage_type {
             "i" => DvUniqueIdRef::Inline(path),
-            "u" => {
+            typ @ ("u" | "p") => {
                 let offset = getters[dv_start_index + 2]
                     .get_opt(i, "deletionVector.offset")?
                     .unwrap_or(0);
-                DvUniqueIdRef::Uuid(path, offset)
-            }
-            "p" => {
-                let offset = getters[dv_start_index + 2]
-                    .get_opt(i, "deletionVector.offset")?
-                    .unwrap_or(0);
-                DvUniqueIdRef::Path(path, offset)
+                if typ == "u" {
+                    DvUniqueIdRef::Uuid(path, offset)
+                } else {
+                    DvUniqueIdRef::Path(path, offset)
+                }
             }
             other => {
                 return Err(crate::Error::generic(format!(

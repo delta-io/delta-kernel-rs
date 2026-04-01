@@ -402,7 +402,6 @@ mod tests {
     use super::*;
     use crate::engine_data::GetData;
     use crate::DeltaResult;
-    use hashbrown::HashSet;
     use std::collections::HashMap;
 
     /// Mock GetData implementation for testing
