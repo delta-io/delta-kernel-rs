@@ -228,7 +228,7 @@ pub struct Transaction<S = ExistingTable> {
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
-    clustering_columns_physical: Option<Vec<ColumnName>>,
+    physical_clustering_columns: Option<Vec<ColumnName>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -640,7 +640,7 @@ impl<S> Transaction<S> {
     pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
         let tc = self.read_snapshot.table_configuration();
         let stats_schemas =
-            tc.build_expected_stats_schemas(self.clustering_columns_physical.as_deref(), None)?;
+            tc.build_expected_stats_schemas(self.physical_clustering_columns.as_deref(), None)?;
         Ok(stats_schemas.physical)
     }
 
@@ -659,7 +659,7 @@ impl<S> Transaction<S> {
     pub fn stats_columns(&self) -> Vec<ColumnName> {
         self.read_snapshot
             .table_configuration()
-            .stats_column_names_physical(self.clustering_columns_physical.as_deref())
+            .physical_stats_column_names(self.physical_clustering_columns.as_deref())
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
@@ -761,7 +761,7 @@ impl<S> Transaction<S> {
         if add_files.is_empty() {
             return Ok(());
         }
-        if let Some(ref clustering_cols) = self.clustering_columns_physical {
+        if let Some(ref clustering_cols) = self.physical_clustering_columns {
             if !clustering_cols.is_empty() {
                 let physical_schema = self.read_snapshot.table_configuration().physical_schema();
                 let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
@@ -1326,7 +1326,7 @@ mod tests {
         /// Set clustering columns for testing purposes without needing a table
         /// with the ClusteredTable feature enabled.
         fn with_clustering_columns_for_test(mut self, columns: Vec<ColumnName>) -> Self {
-            self.clustering_columns_physical = Some(columns);
+            self.physical_clustering_columns = Some(columns);
             self
         }
     }
