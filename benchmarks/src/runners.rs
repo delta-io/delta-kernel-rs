@@ -4,7 +4,7 @@
 //! pre-built snapshots and a config) so that `execute` measures only the operation itself.
 //! Results are discarded for benchmarking purposes.
 //!
-//! Engine and snapshot construction is handled internally based on `TableInfo`:
+//! Engine and snapshot construction is handled based on `TableInfo`:
 //! - UC tables (`uc_table_info`): UC-vended credentials; catalog-managed tables use
 //!   `UCKernelClient::load_snapshot`, others use the standard snapshot builder
 //! - S3 tables (`table_path` with s3://): credentials from `AWS_*` env vars
@@ -35,7 +35,6 @@ use url::Url;
 /// Delta table property indicating catalog-managed support.
 const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
 
-/// A benchmark workload that can be executed by Criterion.
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
     fn name(&self) -> &str;
@@ -135,6 +134,7 @@ fn resolve_snapshot_strategy(
         let aws = creds
             .aws_temp_credentials
             .ok_or(UcApiError::UnsupportedOperation(
+                // TODO(#2305): support non-AWS credential types
                 "Credential vending returned no AWS credentials".into(),
             ))?;
         Ok((
