@@ -10,7 +10,7 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
-    DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    DomainMetadata, Metadata, Protocol, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
@@ -342,27 +342,26 @@ impl<S> Transaction<S> {
         let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
 
         // Step 3: Generate Protocol and Metadata actions for create-table
-        let (protocol_action, metadata_action, new_protocol, new_metadata) =
-            if self.is_create_table() {
-                let table_config = self.read_snapshot.table_configuration();
-                let protocol = table_config.protocol().clone();
-                let metadata = table_config.metadata().clone();
+        let (protocol_action, metadata_action, protocol, metadata) = if self.is_create_table() {
+            let table_config = self.read_snapshot.table_configuration();
+            let protocol = table_config.protocol().clone();
+            let metadata = table_config.metadata().clone();
 
-                let protocol_schema = get_commit_schema().project(&[PROTOCOL_NAME])?;
-                let metadata_schema = get_commit_schema().project(&[METADATA_NAME])?;
+            let protocol_schema = get_commit_schema().project(&[PROTOCOL_NAME])?;
+            let metadata_schema = get_commit_schema().project(&[METADATA_NAME])?;
 
-                let protocol_data = protocol.clone().into_engine_data(protocol_schema, engine)?;
-                let metadata_data = metadata.clone().into_engine_data(metadata_schema, engine)?;
+            let protocol_data = protocol.clone().into_engine_data(protocol_schema, engine)?;
+            let metadata_data = metadata.clone().into_engine_data(metadata_schema, engine)?;
 
-                (
-                    Some(protocol_data),
-                    Some(metadata_data),
-                    Some(protocol),
-                    Some(metadata),
-                )
-            } else {
-                (None, None, None, None)
-            };
+            (
+                Some(protocol_data),
+                Some(metadata_data),
+                Some(protocol),
+                Some(metadata),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
         // Step 4: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
         let commit_version = self.get_commit_version();
@@ -396,38 +395,11 @@ impl<S> Transaction<S> {
             .chain(dv_update_actions);
 
         // Step 7: Commit via the committer
-        let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
-        let table_config = self.read_snapshot.table_configuration();
-        let is_create = self.is_create_table();
-        let commit_type = Self::determine_commit_type(is_create, table_config);
-        Self::validate_commit_type(self.committer.is_catalog_committer(), &commit_type)?;
-        // For create-table: read P&M is None (no previous table), new P&M is set.
-        // For existing table: read P&M is from the snapshot, new P&M is None.
-        let protocol_metadata = CommitProtocolMetadata {
-            read_protocol: if is_create {
-                None
-            } else {
-                Some(table_config.protocol().clone())
-            },
-            read_metadata: if is_create {
-                None
-            } else {
-                Some(table_config.metadata().clone())
-            },
-            new_protocol,
-            new_metadata,
-        };
-        let commit_metadata = CommitMetadata::new(
-            log_root,
+        let commit_metadata = self.create_commit_metadata(
             commit_version,
-            commit_type,
-            self.commit_timestamp,
-            self.read_snapshot
-                .log_segment()
-                .listed
-                .max_published_version,
-            protocol_metadata,
-        );
+            protocol,
+            metadata,
+        )?;
         match self
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)
@@ -521,8 +493,6 @@ impl<S> Transaction<S> {
         self
     }
 
-    /// Validates that the committer type matches the commit type. A catalog committer must be
-    /// used for catalog-managed operations, and a non-catalog committer for path-based operations.
     /// Determines the commit type based on whether this is a create-table operation and whether
     /// the table is catalog-managed.
     fn determine_commit_type(
@@ -556,11 +526,53 @@ impl<S> Transaction<S> {
                 "A catalog committer must be used to commit to catalog-managed tables. \
                  Please provide a catalog committer via Snapshot::transaction()."
             } else {
-                "A catalog committer cannot be used to commit to non-catalog-managed tables."
+                "A catalog committer cannot be used to commit to path-based tables."
             };
             return Err(Error::generic(msg));
         }
         Ok(())
+    }
+
+    /// Builds the [`CommitMetadata`] for this transaction. Determines the commit type,
+    /// validates the committer, and assembles the protocol/metadata state.
+    fn create_commit_metadata(
+        &self,
+        commit_version: Version,
+        new_protocol: Option<Protocol>,
+        new_metadata: Option<Metadata>,
+    ) -> DeltaResult<CommitMetadata> {
+        let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
+        let table_config = self.read_snapshot.table_configuration();
+        let is_create = self.is_create_table();
+        let commit_type = Self::determine_commit_type(is_create, table_config);
+        Self::validate_commit_type(self.committer.is_catalog_committer(), &commit_type)?;
+        // For create-table: read P&M is None (no previous table), new P&M is set.
+        // For existing table: read P&M is from the snapshot, new P&M is None.
+        let (read_protocol, read_metadata) = if is_create {
+            (None, None)
+        } else {
+            (
+                Some(table_config.protocol().clone()),
+                Some(table_config.metadata().clone()),
+            )
+        };
+        let protocol_metadata = CommitProtocolMetadata::try_new(
+            read_protocol,
+            read_metadata,
+            new_protocol,
+            new_metadata,
+        )?;
+        Ok(CommitMetadata::new(
+            log_root,
+            commit_version,
+            commit_type,
+            self.commit_timestamp,
+            self.read_snapshot
+                .log_segment()
+                .listed
+                .max_published_version,
+            protocol_metadata,
+        ))
     }
 
     /// Validate that the transaction is eligible to be marked as a blind append.
@@ -2290,7 +2302,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("A catalog committer cannot be used to commit to non-catalog-managed tables")
+            crate::Error::Generic(e) if e.contains("A catalog committer cannot be used to commit to path-based tables")
         ));
     }
 
@@ -2312,7 +2324,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("A catalog committer cannot be used to commit to non-catalog-managed tables")
+            crate::Error::Generic(e) if e.contains("A catalog committer cannot be used to commit to path-based tables")
         ));
     }
 }

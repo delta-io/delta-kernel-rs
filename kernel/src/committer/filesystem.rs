@@ -148,12 +148,7 @@ mod tests {
             CommitType::PathBasedWrite,
             12345,
             Some(0),
-            CommitProtocolMetadata {
-                read_protocol: Some(protocol),
-                read_metadata: Some(metadata),
-                new_protocol: None,
-                new_metadata: None,
-            },
+            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None).unwrap(),
         );
         let actions = Box::new(std::iter::empty());
 
@@ -190,12 +185,8 @@ mod tests {
             CommitType::PathBasedWrite,
             12345,
             Some(0),
-            CommitProtocolMetadata {
-                read_protocol: Some(protocol.clone()),
-                read_metadata: Some(metadata1),
-                new_protocol: None,
-                new_metadata: None,
-            },
+            CommitProtocolMetadata::try_new(Some(protocol.clone()), Some(metadata1), None, None)
+                .unwrap(),
         );
         let second_metadata = CommitMetadata::new(
             LogRoot::new(table_root).unwrap(),
@@ -203,12 +194,7 @@ mod tests {
             CommitType::PathBasedWrite,
             12346,
             Some(0),
-            CommitProtocolMetadata {
-                read_protocol: Some(protocol),
-                read_metadata: Some(metadata2),
-                new_protocol: None,
-                new_metadata: None,
-            },
+            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata2), None, None).unwrap(),
         );
 
         let first = committer

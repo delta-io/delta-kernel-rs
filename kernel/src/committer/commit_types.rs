@@ -23,6 +23,13 @@ pub enum CommitType {
     PathBasedWrite,
     /// Writing to an existing catalog-managed table.
     CatalogManagedWrite,
+    // TODO: Wire these up when ALTER TABLE SET TBLPROPERTIES is supported.
+    /// Upgrading an existing path-based table to catalog-managed. Not currently supported.
+    #[allow(dead_code)]
+    UpgradeToCatalogManaged,
+    /// Downgrading an existing catalog-managed table to path-based. Not currently supported.
+    #[allow(dead_code)]
+    DowngradeToPathBased,
 }
 
 impl CommitType {
@@ -43,13 +50,38 @@ impl CommitType {
 #[allow(dead_code)] // Fields read by delta-kernel-unity-catalog via effective_protocol/metadata
 pub(crate) struct CommitProtocolMetadata {
     /// Existing table protocol from read snapshot. `None` for create-table.
-    pub(crate) read_protocol: Option<Protocol>,
+    read_protocol: Option<Protocol>,
     /// Existing table metadata from read snapshot. `None` for create-table.
-    pub(crate) read_metadata: Option<Metadata>,
+    read_metadata: Option<Metadata>,
     /// New protocol being committed. `Some` for create-table and future ALTER TABLE.
-    pub(crate) new_protocol: Option<Protocol>,
+    new_protocol: Option<Protocol>,
     /// New metadata being committed. `Some` for create-table and future ALTER TABLE.
-    pub(crate) new_metadata: Option<Metadata>,
+    new_metadata: Option<Metadata>,
+}
+
+impl CommitProtocolMetadata {
+    /// Creates a new `CommitProtocolMetadata`, validating that at least one complete pair
+    /// (protocol + metadata) is present.
+    pub(crate) fn try_new(
+        read_protocol: Option<Protocol>,
+        read_metadata: Option<Metadata>,
+        new_protocol: Option<Protocol>,
+        new_metadata: Option<Metadata>,
+    ) -> DeltaResult<Self> {
+        let has_read_pair = read_protocol.is_some() && read_metadata.is_some();
+        let has_new_pair = new_protocol.is_some() && new_metadata.is_some();
+        if !has_read_pair && !has_new_pair {
+            return Err(crate::Error::generic(
+                "CommitProtocolMetadata requires at least one complete protocol/metadata pair",
+            ));
+        }
+        Ok(Self {
+            read_protocol,
+            read_metadata,
+            new_protocol,
+            new_metadata,
+        })
+    }
 }
 
 /// `CommitMetadata` bundles the metadata about a commit operation. This includes the commit path,
@@ -140,17 +172,31 @@ impl CommitMetadata {
     /// Returns the effective protocol for this commit. Prefers new_protocol (create-table / ALTER
     /// TABLE), falling back to the read snapshot's protocol.
     #[allow(dead_code)] // Used by delta-kernel-unity-catalog for commit validation
-    pub(crate) fn effective_protocol(&self) -> Option<&Protocol> {
+    pub(crate) fn effective_protocol(&self) -> DeltaResult<&Protocol> {
         let pm = &self.protocol_metadata;
-        pm.new_protocol.as_ref().or(pm.read_protocol.as_ref())
+        pm.new_protocol
+            .as_ref()
+            .or(pm.read_protocol.as_ref())
+            .ok_or_else(|| {
+                crate::Error::internal_error(
+                    "CommitProtocolMetadata should have at least one protocol",
+                )
+            })
     }
 
     /// Returns the effective metadata for this commit. Prefers new_metadata (create-table / ALTER
     /// TABLE), falling back to the read snapshot's metadata.
     #[allow(dead_code)] // Used by delta-kernel-unity-catalog for commit validation
-    pub(crate) fn effective_metadata(&self) -> Option<&Metadata> {
+    pub(crate) fn effective_metadata(&self) -> DeltaResult<&Metadata> {
         let pm = &self.protocol_metadata;
-        pm.new_metadata.as_ref().or(pm.read_metadata.as_ref())
+        pm.new_metadata
+            .as_ref()
+            .or(pm.read_metadata.as_ref())
+            .ok_or_else(|| {
+                crate::Error::internal_error(
+                    "CommitProtocolMetadata should have at least one metadata",
+                )
+            })
     }
 
     /// Creates a new `CommitMetadata` for the given `table_root` and `version`. Test-only.
@@ -168,12 +214,12 @@ impl CommitMetadata {
             CommitType::PathBasedWrite,
             0,
             None,
-            CommitProtocolMetadata {
-                read_protocol: Some(protocol),
-                read_metadata: Some(metadata),
-                new_protocol: None,
-                new_metadata: None,
-            },
+            CommitProtocolMetadata::try_new(
+                Some(protocol),
+                Some(metadata),
+                None,
+                None,
+            )?,
         ))
     }
 }
@@ -219,12 +265,13 @@ mod tests {
             CommitType::PathBasedWrite,
             ts,
             max_published_version,
-            CommitProtocolMetadata {
-                read_protocol: Some(protocol),
-                read_metadata: Some(metadata),
-                new_protocol: None,
-                new_metadata: None,
-            },
+            CommitProtocolMetadata::try_new(
+                Some(protocol),
+                Some(metadata),
+                None,
+                None,
+            )
+            .unwrap(),
         );
 
         // version
