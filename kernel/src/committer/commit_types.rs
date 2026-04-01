@@ -42,9 +42,7 @@ impl CommitType {
     pub fn is_catalog_managed(&self) -> bool {
         matches!(
             self,
-            Self::CatalogManagedCreate
-                | Self::CatalogManagedWrite
-                | Self::UpgradeToCatalogManaged
+            Self::CatalogManagedCreate | Self::CatalogManagedWrite | Self::UpgradeToCatalogManaged
         )
     }
 }
@@ -219,12 +217,7 @@ impl CommitMetadata {
             CommitType::PathBasedWrite,
             0,
             None,
-            CommitProtocolMetadata::try_new(
-                Some(protocol),
-                Some(metadata),
-                None,
-                None,
-            )?,
+            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None)?,
         ))
     }
 }
@@ -270,13 +263,7 @@ mod tests {
             CommitType::PathBasedWrite,
             ts,
             max_published_version,
-            CommitProtocolMetadata::try_new(
-                Some(protocol),
-                Some(metadata),
-                None,
-                None,
-            )
-            .unwrap(),
+            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None).unwrap(),
         );
 
         // version
