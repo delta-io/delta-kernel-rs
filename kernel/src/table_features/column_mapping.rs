@@ -396,35 +396,11 @@ pub(crate) fn physical_to_logical_column_name(
     physical_col: &ColumnName,
     column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<ColumnName> {
-    let mut logical_path = Vec::with_capacity(physical_col.path().len());
-    let mut current_struct = schema;
-
-    for (i, physical_component) in physical_col.path().iter().enumerate() {
-        let field = current_struct
-            .fields()
-            .find(|f| f.physical_name(column_mapping_mode) == physical_component.as_str())
-            .ok_or_else(|| {
-                Error::generic(format!(
-                    "Physical column name component '{physical_component}' not found in schema"
-                ))
-            })?;
-        logical_path.push(field.name.clone());
-
-        // If not the last component, descend into the struct
-        if i < physical_col.path().len() - 1 {
-            match field.data_type() {
-                DataType::Struct(inner) => current_struct = inner,
-                dt => {
-                    return Err(Error::generic(format!(
-                        "Expected struct type for nested column path, found '{dt}' at '{}'",
-                        field.name
-                    )));
-                }
-            }
-        }
-    }
-
-    Ok(ColumnName::new(logical_path))
+    let fields = schema.walk_column_fields_by(physical_col, |s, phys_name| {
+        s.fields()
+            .find(|f| f.physical_name(column_mapping_mode) == phys_name)
+    })?;
+    Ok(ColumnName::new(fields.iter().map(|f| f.name.clone())))
 }
 
 #[cfg(test)]
@@ -1329,6 +1305,6 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Expected struct type"));
+            .contains("is not a struct type"));
     }
 }

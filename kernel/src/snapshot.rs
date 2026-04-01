@@ -568,7 +568,7 @@ impl Snapshot {
     /// - `delta.minReaderVersion` and `delta.minWriterVersion`
     /// - `delta.feature.<name> = "supported"` for each reader and writer feature (when using
     ///   table features protocol, i.e. reader version 3 / writer version 7)
-    #[allow(dead_code)] // Called by delta-kernel-unity-catalog via internal-api
+    #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_protocol_derived_properties(&self) -> HashMap<String, String> {
         let protocol = self.table_configuration().protocol();
@@ -604,7 +604,7 @@ impl Snapshot {
     /// This returns the `Metadata.configuration` map as stored in the Delta log, containing
     /// user-defined properties, delta table properties (e.g., `delta.enableInCommitTimestamps`),
     /// and application-specific properties (e.g., `io.unitycatalog.tableId`).
-    #[allow(dead_code)] // Called by delta-kernel-unity-catalog via internal-api
+    #[allow(unused)]
     #[internal_api]
     pub(crate) fn metadata_configuration(&self) -> &HashMap<String, String> {
         self.table_configuration().metadata().configuration()
@@ -706,7 +706,7 @@ impl Snapshot {
     /// column name cannot be resolved to a logical name in the schema.
     ///
     /// [`ColumnName`]: crate::expressions::ColumnName
-    #[allow(dead_code)] // Called by delta-kernel-unity-catalog via internal-api
+    #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_logical_clustering_columns(
         &self,
@@ -2681,5 +2681,54 @@ mod tests {
             Some(&"abc-123".to_string())
         );
         assert_eq!(config.get("myapp.setting"), Some(&"value".to_string()));
+    }
+
+    #[rstest::rstest]
+    #[case::no_clustering(None, None, None)]
+    #[case::clustered_no_column_mapping(
+        Some(vec!["region"]),
+        None,
+        Some(vec![ColumnName::new(["region"])])
+    )]
+    #[case::clustered_with_column_mapping(
+        Some(vec!["region"]),
+        Some("name"),
+        Some(vec![ColumnName::new(["region"])])
+    )]
+    fn get_logical_clustering_columns_cases(
+        #[case] clustering_cols: Option<Vec<&str>>,
+        #[case] column_mapping_mode: Option<&str>,
+        #[case] expected: Option<Vec<ColumnName>>,
+    ) {
+        use crate::transaction::create_table::create_table;
+        use crate::transaction::data_layout::DataLayout;
+
+        let storage = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(storage).build();
+        let schema = Arc::new(
+            crate::schema::StructType::try_new(vec![
+                crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, false),
+                crate::schema::StructField::new("region", crate::schema::DataType::STRING, true),
+            ])
+            .unwrap(),
+        );
+        let mut builder = create_table("memory:///", schema, "test");
+        if let Some(cols) = &clustering_cols {
+            builder = builder.with_data_layout(DataLayout::clustered(cols.clone()));
+        }
+        if let Some(mode) = column_mapping_mode {
+            builder = builder.with_table_properties([("delta.columnMapping.mode", mode)]);
+        }
+        let _ = builder
+            .build(
+                &engine,
+                Box::new(crate::committer::FileSystemCommitter::new()),
+            )
+            .unwrap()
+            .commit(&engine)
+            .unwrap();
+        let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
+        let result = snapshot.get_logical_clustering_columns(&engine).unwrap();
+        assert_eq!(result, expected);
     }
 }
