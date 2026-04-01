@@ -969,7 +969,7 @@ impl Snapshot {
 
     /// Get the timestamp for this snapshot's version, in milliseconds since the Unix epoch.
     ///
-    /// When In-Commit Timestamps (ICT) are enabled, returns the In-Commit Timestamp value.
+    /// When In-Commit Timestamp (ICT) are enabled, returns the In-Commit Timestamp value.
     /// Otherwise, falls back to the filesystem last-modified time of the latest commit file.
     ///
     /// Returns an error if the commit file is missing, the ICT configuration is invalid, or the
