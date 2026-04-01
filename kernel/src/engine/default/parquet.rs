@@ -34,6 +34,7 @@ use crate::engine::arrow_utils::{
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::expressions::ColumnName;
+use crate::metrics::{MetricEvent, MetricsReporter};
 use crate::schema::{SchemaRef, StructType};
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
@@ -61,6 +62,8 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
     readahead: usize,
+    /// Optional reporter for emitting [`MetricEvent::ParquetReadCompleted`] events.
+    reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 /// Metadata of a data file (typically a parquet file).
@@ -161,6 +164,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             store,
             task_executor,
             readahead: 10,
+            reporter: None,
         }
     }
 
@@ -169,6 +173,12 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// Defaults to 10.
     pub fn with_readahead(mut self, readahead: usize) -> Self {
         self.readahead = readahead;
+        self
+    }
+
+    /// Set a metrics reporter to receive [`MetricEvent::ParquetReadCompleted`] events.
+    pub fn with_reporter(mut self, reporter: Option<Arc<dyn MetricsReporter>>) -> Self {
+        self.reporter = reporter;
         self
     }
 
@@ -324,7 +334,23 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             physical_schema,
             predicate,
         );
-        super::stream_future_to_iter(self.task_executor.clone(), future)
+        let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        if let Some(reporter) = &self.reporter {
+            let num_files = files.len() as u64;
+            let bytes_read = files.iter().map(|f| f.size).sum();
+            Ok(Box::new(super::ReadMetricsIterator::new(
+                inner,
+                reporter.clone(),
+                num_files,
+                bytes_read,
+                |num_files, bytes_read| MetricEvent::ParquetReadCompleted {
+                    num_files,
+                    bytes_read,
+                },
+            )))
+        } else {
+            Ok(inner)
+        }
     }
 
     /// Writes engine data to a Parquet file at the specified location.

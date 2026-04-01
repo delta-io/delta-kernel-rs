@@ -340,7 +340,6 @@ impl ParsedLogPath<Url> {
     }
 
     /// Create a new ParsedCheckpointPath<Url> for a classic parquet checkpoint file
-    #[allow(dead_code)] // TODO: Remove this once we have a use case for it
     pub(crate) fn new_classic_parquet_checkpoint(
         table_root: &Url,
         version: Version,
