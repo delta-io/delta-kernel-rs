@@ -1174,10 +1174,7 @@ mod tests {
     #[case::append_only(TableFeature::AppendOnly, "appendOnly")]
     #[case::change_data_feed(TableFeature::ChangeDataFeed, "changeDataFeed")]
     #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
-    fn test_feature_signal_accepted(
-        #[case] feature: TableFeature,
-        #[case] feature_name: &str,
-    ) {
+    fn test_feature_signal_accepted(#[case] feature: TableFeature, #[case] feature_name: &str) {
         let key = format!("delta.feature.{feature_name}");
         let properties = HashMap::from([(key, "supported".to_string())]);
         let validated = validate_extract_table_features_and_properties(properties).unwrap();
