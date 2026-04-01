@@ -81,15 +81,19 @@ def main():
         chg_display  = chg_dur_str  or 'N/A'
         difference   = 'N/A'
 
+        # Only compute a percentage change when both runs have a measurement for this benchmark.
         if base_dur_str and chg_dur_str:
+            # Parse each duration string into (mean, error, units), e.g. "1.2±0.01µs" -> (1.2, 0.01, "µs").
             base_p = parse_duration(base_dur_str)
             chg_p  = parse_duration(chg_dur_str)
             if base_p and chg_p:
+                # Normalise both measurements to milliseconds so they can be compared directly.
                 base_ms     = to_ms(base_p[0], base_p[2])
                 base_err_ms = to_ms(base_p[1], base_p[2])
                 chg_ms      = to_ms(chg_p[0],  chg_p[2])
                 chg_err_ms  = to_ms(chg_p[1],  chg_p[2])
 
+                # Compute relative change: negative means faster, positive means slower.
                 pct    = -(1 - chg_ms / base_ms) * 100
                 prefix = '' if chg_ms <= base_ms else '+'
                 difference = f'{prefix}{pct:.2f}%'
