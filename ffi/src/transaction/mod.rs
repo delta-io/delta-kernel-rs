@@ -236,12 +236,13 @@ fn create_table_impl(
 /// Set a single table property on a [`CreateTableTransactionBuilder`].
 ///
 /// This consumes the builder handle and returns a new one. The caller MUST replace their handle
-/// pointer with the returned handle.
+/// pointer with the returned handle. On error, the old builder handle is consumed and gone --
+/// do not free or reuse it. There is no new handle to free either.
 ///
 /// # Safety
 ///
 /// Caller is responsible for passing a valid builder handle, `key`, `value`, and `engine`.
-/// CONSUMES the builder handle.
+/// CONSUMES the builder handle unconditionally (even on error).
 #[no_mangle]
 pub unsafe extern "C" fn create_table_set_property(
     builder: Handle<ExclusiveCreateTableBuilder>,
@@ -809,11 +810,13 @@ mod tests {
         let builder = ok_or_panic(unsafe {
             create_table(
                 kernel_string_slice!(table_path_str),
-                schema_handle,
+                schema_handle.shallow_copy(),
                 kernel_string_slice!(engine_info),
                 engine.shallow_copy(),
             )
         });
+        // create_table does NOT consume the schema handle -- free it
+        unsafe { free_schema(schema_handle) };
 
         // Commit -- should return version 0
         let version = ok_or_panic(unsafe { create_table_commit(builder, engine.shallow_copy()) });
@@ -857,11 +860,13 @@ mod tests {
         let builder = ok_or_panic(unsafe {
             create_table(
                 kernel_string_slice!(table_path_str),
-                schema_handle,
+                schema_handle.shallow_copy(),
                 kernel_string_slice!(engine_info),
                 engine.shallow_copy(),
             )
         });
+        // create_table does NOT consume the schema handle -- free it
+        unsafe { free_schema(schema_handle) };
 
         // Set properties
         let prop_key1 = "delta.appendOnly";
@@ -941,7 +946,7 @@ mod tests {
         let builder = ok_or_panic(unsafe {
             create_table(
                 kernel_string_slice!(table_path_str),
-                schema_handle,
+                schema_handle.shallow_copy(),
                 kernel_string_slice!(engine_info),
                 engine.shallow_copy(),
             )
@@ -950,15 +955,15 @@ mod tests {
         assert_eq!(version, 0);
 
         // Try to create the same table again -- should error
-        let schema_handle2: Handle<crate::SharedSchema> = schema.into();
         let builder2 = ok_or_panic(unsafe {
             create_table(
                 kernel_string_slice!(table_path_str),
-                schema_handle2,
+                schema_handle.shallow_copy(),
                 kernel_string_slice!(engine_info),
                 engine.shallow_copy(),
             )
         });
+        unsafe { free_schema(schema_handle) };
         let result = unsafe { create_table_commit(builder2, engine.shallow_copy()) };
         // The commit should fail because the table already exists
         match result {
@@ -1006,17 +1011,24 @@ mod tests {
         let builder = ok_or_panic(unsafe {
             create_table(
                 kernel_string_slice!(table_path_str),
-                schema_handle,
+                schema_handle.shallow_copy(),
                 kernel_string_slice!(engine_info),
                 engine.shallow_copy(),
             )
         });
+        unsafe { free_schema(schema_handle) };
 
         let result = unsafe { create_table_commit(builder, engine.shallow_copy()) };
         match result {
             ExternResult::Err(e) => {
                 let error = unsafe { crate::ffi_test_utils::recover_error(e) };
-                assert!(!error.message.is_empty());
+                assert!(
+                    error.message.contains("schema")
+                        || error.message.contains("field")
+                        || error.message.contains("empty"),
+                    "Expected schema-related error, got: {}",
+                    error.message
+                );
             }
             ExternResult::Ok(_) => panic!("Expected error for empty schema"),
         }
