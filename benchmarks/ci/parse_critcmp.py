@@ -76,6 +76,7 @@ def main():
         if not name and not base_dur_str and not chg_dur_str:
             continue
 
+        # N/A when a benchmark only exists in one of the two runs (added or removed).
         base_display = base_dur_str or 'N/A'
         chg_display  = chg_dur_str  or 'N/A'
         difference   = 'N/A'
@@ -93,6 +94,8 @@ def main():
                 prefix = '' if chg_ms <= base_ms else '+'
                 difference = f'{prefix}{pct:.2f}%'
 
+                # Bold the slower of the two durations to draw attention to what changed,
+                # and always bold the difference column when the change is significant.
                 if is_significant(chg_ms, chg_err_ms, base_ms, base_err_ms):
                     if chg_ms < base_ms:
                         chg_display = f'**{chg_dur_str}**'
