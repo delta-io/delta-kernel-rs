@@ -87,7 +87,7 @@
 // Future extensions:
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
@@ -109,7 +109,7 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _}
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
-use crate::utils::once_lock_get_or_try_init;
+use crate::utils::FallibleLazy;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 
 use url::Url;
@@ -195,7 +195,7 @@ pub struct CheckpointWriter {
     version: i64,
 
     /// Cached checkpoint output schema.
-    checkpoint_output_schema: OnceLock<SchemaRef>,
+    checkpoint_output_schema: FallibleLazy<SchemaRef>,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -222,7 +222,7 @@ impl CheckpointWriter {
         Ok(Self {
             snapshot,
             version,
-            checkpoint_output_schema: OnceLock::new(),
+            checkpoint_output_schema: FallibleLazy::new(),
         })
     }
     /// Returns the URL where the checkpoint file should be written.
@@ -330,7 +330,7 @@ impl CheckpointWriter {
         )
         .process_actions_iter(actions);
 
-        let output_schema = once_lock_get_or_try_init(&self.checkpoint_output_schema, || {
+        let output_schema = self.checkpoint_output_schema.get_or_try_init(|| {
             build_checkpoint_output_schema(
                 &config,
                 base_schema,

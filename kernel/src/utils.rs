@@ -2,7 +2,7 @@
 use std::borrow::Cow;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use url::Url;
@@ -21,20 +21,45 @@ macro_rules! require {
 
 pub(crate) use require;
 
+/// Thread-safe fallible lazy value.
+///
 /// `OnceLock::get_or_try_init` is unstable
 /// (tracking issue: <https://github.com/rust-lang/rust/issues/109737>),
 /// so we provide our own implementation.
-///
-/// Returns a clone of the cached value, or try to initialize it with `f` if the value is uninitialized.
-pub(crate) fn once_lock_get_or_try_init<T: Clone>(
-    lock: &OnceLock<T>,
-    f: impl FnOnce() -> DeltaResult<T>,
-) -> DeltaResult<T> {
-    if let Some(cached) = lock.get() {
-        return Ok(cached.clone());
+#[derive(Debug)]
+pub(crate) struct FallibleLazy<T> {
+    inner: Mutex<Option<T>>,
+}
+
+impl<T: Clone> Clone for FallibleLazy<T> {
+    fn clone(&self) -> Self {
+        // SAFETY: Production code should never panic, so the mutex should never be poisoned.
+        let val = self.inner.lock().unwrap_or_else(|_| unreachable!()).clone();
+        Self {
+            inner: Mutex::new(val),
+        }
     }
-    let val = f()?;
-    Ok(lock.get_or_init(|| val).clone())
+}
+
+impl<T: Clone> FallibleLazy<T> {
+    /// Creates a new uninitialized `FallibleLazy`.
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    /// Returns a clone of the cached value, or initializes it with `f` if uninitialized.
+    pub(crate) fn get_or_try_init(&self, f: impl FnOnce() -> DeltaResult<T>) -> DeltaResult<T> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| Error::internal_error("FallibleLazy mutex poisoned"))?;
+        guard
+            .as_ref()
+            .map(T::clone)
+            .map_or_else(|| f().map(|val| guard.insert(val).clone()), Ok)
+    }
 }
 
 /// Try to parse string uri into a URL for a table path. This will do it's best to handle things
@@ -863,6 +888,9 @@ pub(crate) mod test_utils {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
     use super::*;
 
     #[test]
@@ -907,12 +935,47 @@ mod tests {
     }
 
     #[test]
-    fn once_lock_first_init_wins() {
-        let lock = OnceLock::new();
-        let val1 = once_lock_get_or_try_init(&lock, || Ok(1)).unwrap();
-        let val2 = once_lock_get_or_try_init(&lock, || Ok(2)).unwrap();
+    fn fallible_lazy_first_init_wins() {
+        let lazy = FallibleLazy::new();
+        let val1 = lazy.get_or_try_init(|| Ok(1)).unwrap();
+        let val2 = lazy.get_or_try_init(|| Ok(2)).unwrap();
         assert_eq!(val1, 1);
         assert_eq!(val2, 1);
+    }
+
+    #[test]
+    fn fallible_lazy_concurrent_callers_get_same_result() {
+        let lazy = Arc::new(FallibleLazy::new());
+        let barrier = Arc::new(Barrier::new(10));
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let lazy = Arc::clone(&lazy);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    lazy.get_or_try_init(|| Ok(i)).unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<i32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = results[0];
+        assert!(results.iter().all(|&v| v == first));
+    }
+
+    #[test]
+    fn fallible_lazy_clone() {
+        // Clone uninitialized: cloned copy can be initialized independently
+        let lazy: FallibleLazy<i32> = FallibleLazy::new();
+        let cloned = lazy.clone();
+        let val = cloned.get_or_try_init(|| Ok(7)).unwrap();
+        assert_eq!(val, 7);
+
+        // Clone after initialization: cloned copy preserves cached value
+        let lazy = FallibleLazy::new();
+        lazy.get_or_try_init(|| Ok(42)).unwrap();
+        let cloned = lazy.clone();
+        let val = cloned.get_or_try_init(|| Ok(999)).unwrap();
+        assert_eq!(val, 42);
     }
 
     #[test]
