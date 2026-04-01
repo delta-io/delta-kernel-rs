@@ -445,6 +445,9 @@ pub unsafe extern "C" fn free_create_table_builder(builder: Handle<ExclusiveCrea
 ///
 /// The `data` schema must match the scan row schema returned by scan metadata.
 ///
+/// Note: Unlike [`add_files`], this function takes an `engine` handle and returns
+/// [`ExternResult`] because the selection vector validation can fail.
+///
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles. The `selection_vector` pointer must be valid
