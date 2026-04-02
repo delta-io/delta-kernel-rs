@@ -979,6 +979,15 @@ mod tests {
     }
 
     #[test]
+    fn fallible_lazy_retries_after_error() {
+        let lazy = FallibleLazy::new();
+        let res = lazy.get_or_try_init(|| Err(Error::generic("init failed")));
+        assert!(res.is_err());
+        let val = lazy.get_or_try_init(|| Ok(42)).unwrap();
+        assert_eq!(val, 42);
+    }
+
+    #[test]
     fn try_from_uri_without_trailing_slash() {
         let location = "s3://foo/__unitystorage/catalogs/cid/tables/tid";
         let url = try_parse_uri(location).unwrap();
