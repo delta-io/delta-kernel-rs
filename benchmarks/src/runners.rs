@@ -1,28 +1,208 @@
 //! Benchmark runners for executing Delta table operations.
 //!
-//! Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
-//! so that `execute` measures only the operation itself
-//! Results are discarded for benchmarking purposes
+//! Each runner holds all the state required for its workload (e.g. read metadata needs
+//! pre-built snapshots and a config) so that `execute` measures only the operation itself.
+//! Results are discarded for benchmarking purposes.
+//!
+//! Engine and snapshot construction is handled based on `TableInfo`:
+//! - UC tables (`catalog_info`): UC-vended credentials; catalog-managed tables use
+//!   `UCKernelClient::load_snapshot`, others use the standard snapshot builder
+//! - S3 tables (`table_path` with s3://): credentials from `AWS_*` env vars
+//! - Local tables: local filesystem engine
 
 use crate::models::{
     ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
     TimeTravel,
 };
 use crate::predicate_parser::parse_predicate;
+use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::PredicateRef;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::Engine;
 use delta_kernel::Snapshot;
+use delta_kernel_unity_catalog::UCKernelClient;
+use object_store::local::LocalFileSystem;
+use unity_catalog_delta_client_api::{Error as UcApiError, Operation};
+use unity_catalog_delta_rest_client::{
+    ClientConfig, Error as UcRestError, UCClient, UCCommitsRestClient,
+};
 
 use std::hint::black_box;
 use std::sync::Arc;
 use url::Url;
 
-/// Each runner holds all the state required for its workload (e.g. read metadata needs pre-built snapshots and a config)
-/// so that `execute` measures only the operation itself
+/// Delta table property indicating catalog-managed support.
+const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
+
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
     fn name(&self) -> &str;
+}
+
+fn build_engine(
+    store: Arc<dyn object_store::ObjectStore>,
+    runtime: Arc<tokio::runtime::Runtime>,
+) -> Arc<dyn Engine> {
+    let executor = TokioMultiThreadExecutor::new(runtime.handle().clone());
+    Arc::new(
+        DefaultEngine::builder(store)
+            .with_task_executor(Arc::new(executor))
+            .build(),
+    )
+}
+
+/// Determines how a snapshot is loaded. Built once at setup via [`resolve_snapshot_strategy`],
+/// then used by runners to construct snapshots.
+enum SnapshotStrategy {
+    /// Standard snapshot builder (local, S3, or UC-managed non-catalog-managed tables).
+    Standard { url: Url },
+    /// Catalog-managed table: snapshot loaded via `UCKernelClient::load_snapshot`.
+    CatalogManaged {
+        table_id: String,
+        table_uri: String,
+        commits_client: Box<UCCommitsRestClient>,
+    },
+}
+
+impl SnapshotStrategy {
+    /// Builds a snapshot using this strategy.
+    fn load_snapshot(
+        &self,
+        engine: &dyn Engine,
+        runtime: &tokio::runtime::Runtime,
+        time_travel: Option<&TimeTravel>,
+    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+        match self {
+            SnapshotStrategy::Standard { url } => {
+                let mut builder = Snapshot::builder_for(url.clone());
+                if let Some(tt) = time_travel {
+                    builder = builder.at_version(tt.as_version()?);
+                }
+                Ok(builder.build(engine)?)
+            }
+            SnapshotStrategy::CatalogManaged {
+                table_id,
+                table_uri,
+                commits_client,
+            } => {
+                let catalog = UCKernelClient::new(commits_client.as_ref());
+                let result = match time_travel {
+                    Some(tt) => {
+                        let version = tt.as_version()?;
+                        runtime.block_on(
+                            catalog.load_snapshot_at(table_id, table_uri, version, engine),
+                        )
+                    }
+                    None => runtime.block_on(catalog.load_snapshot(table_id, table_uri, engine)),
+                };
+                result.map_err(|e| format!("Catalog snapshot failed: {e}").into())
+            }
+        }
+    }
+}
+
+/// Resolves engine credentials and snapshot strategy from a [`TableInfo`].
+///
+/// For UC-managed tables (`catalog_info` is present), credentials are vended via
+/// `UCClient`. The `delta.feature.catalogManaged` property then determines whether to use
+/// `UCKernelClient` (catalog-managed) or the standard snapshot builder.
+///
+/// For non-UC tables, the engine is built from env vars (`AWS_*` for S3, local filesystem
+/// otherwise).
+fn resolve_snapshot_strategy(
+    table_info: &TableInfo,
+    runtime: Arc<tokio::runtime::Runtime>,
+) -> Result<(Arc<dyn Engine>, SnapshotStrategy), Box<dyn std::error::Error>> {
+    let Some(cm) = &table_info.catalog_info else {
+        let url = table_info.resolved_table_root();
+        let engine = resolve_engine_for_url(&url, runtime)?;
+        return Ok((engine, SnapshotStrategy::Standard { url }));
+    };
+
+    let endpoint = std::env::var("UC_WORKSPACE").map_err(|_| "UC_WORKSPACE required")?;
+    let token = std::env::var("UC_TOKEN").map_err(|_| "UC_TOKEN required")?;
+
+    let config = ClientConfig::build(&endpoint, &token).build()?;
+    let client = UCClient::new(config.clone())?;
+
+    let result: Result<_, UcRestError> = runtime.block_on(async {
+        let table = client.get_table(&cm.table_name).await?;
+        let creds = client
+            .get_credentials(&table.table_id, Operation::Read)
+            .await?;
+        let aws = creds
+            .aws_temp_credentials
+            .ok_or(UcApiError::UnsupportedOperation(
+                // TODO(#2305): support non-AWS credential types
+                "Credential vending returned no AWS credentials".into(),
+            ))?;
+        Ok((
+            table.table_id,
+            table.storage_location,
+            table.properties,
+            aws,
+        ))
+    });
+    let (table_id, table_uri, uc_properties, aws) = result?;
+
+    let table_url = Url::parse(&table_uri)?;
+    let region = std::env::var("AWS_REGION").map_err(|_| "AWS_REGION required")?;
+    let options = [
+        ("region", region.as_str()),
+        ("access_key_id", aws.access_key_id.as_str()),
+        ("secret_access_key", aws.secret_access_key.as_str()),
+        ("session_token", aws.session_token.as_str()),
+    ];
+    let (store, _) = object_store::parse_url_opts(&table_url, options)?;
+    let engine = build_engine(store.into(), runtime);
+
+    let is_catalog_managed = uc_properties
+        .get(CATALOG_MANAGED_PROPERTY)
+        .is_some_and(|v| v == "supported");
+
+    let strategy = if is_catalog_managed {
+        let commits_client = Box::new(UCCommitsRestClient::new(config)?);
+        SnapshotStrategy::CatalogManaged {
+            table_id,
+            table_uri,
+            commits_client,
+        }
+    } else {
+        SnapshotStrategy::Standard { url: table_url }
+    };
+
+    Ok((engine, strategy))
+}
+
+/// Builds an engine from the table URL scheme and env vars (S3 or local).
+fn resolve_engine_for_url(
+    url: &Url,
+    runtime: Arc<tokio::runtime::Runtime>,
+) -> Result<Arc<dyn Engine>, Box<dyn std::error::Error>> {
+    match url.scheme() {
+        "s3" | "s3a" => {
+            let region =
+                std::env::var("AWS_REGION").map_err(|_| "AWS_REGION required for S3 tables")?;
+            let mut opts: Vec<(&str, String)> = vec![("region", region)];
+            for (env_key, opt_key) in [
+                ("AWS_ACCESS_KEY_ID", "access_key_id"),
+                ("AWS_SECRET_ACCESS_KEY", "secret_access_key"),
+                ("AWS_SESSION_TOKEN", "session_token"),
+            ] {
+                if let Ok(v) = std::env::var(env_key) {
+                    opts.push((opt_key, v));
+                }
+            }
+            let (store, _) = object_store::parse_url_opts(url, opts)?;
+            Ok(build_engine(store.into(), runtime))
+        }
+        "file" => Ok(build_engine(Arc::new(LocalFileSystem::new()), runtime)),
+        scheme => Err(format!(
+            "Unsupported scheme '{scheme}': only s3://, s3a://, and file:// are supported"
+        )
+        .into()),
+    }
 }
 
 pub struct ReadMetadataRunner {
@@ -40,20 +220,11 @@ impl ReadMetadataRunner {
         case_name: &str,
         read_spec: &ReadSpec,
         config: ReadConfig,
-        engine: Arc<dyn Engine>,
+        runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let url = table_info.resolved_table_root();
-
-        let mut builder = Snapshot::builder_for(url);
-        match &read_spec.time_travel {
-            Some(TimeTravel::Version { version }) => builder = builder.at_version(*version),
-            Some(TimeTravel::Timestamp { .. }) => {
-                return Err("Timestamp-based time travel not supported in benchmarks".into())
-            }
-            None => {}
-        }
-
-        let snapshot = builder.build(engine.as_ref())?;
+        let (engine, strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
+        let snapshot =
+            strategy.load_snapshot(engine.as_ref(), &runtime, read_spec.time_travel.as_ref())?;
 
         let predicate = read_spec
             .predicate
@@ -166,15 +337,9 @@ impl ReadMetadataRunner {
 impl WorkloadRunner for ReadMetadataRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
         match &self.config.parallel_scan {
-            ParallelScan::Disabled => {
-                self.execute_serial()?;
-            }
-            ParallelScan::Enabled { .. } => {
-                self.execute_parallel()?;
-            }
+            ParallelScan::Disabled => self.execute_serial(),
+            ParallelScan::Enabled { .. } => self.execute_parallel(),
         }
-
-        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -189,20 +354,21 @@ pub fn create_read_runner(
     read_spec: &ReadSpec,
     operation: ReadOperation,
     config: ReadConfig,
-    engine: Arc<dyn Engine>,
+    runtime: Arc<tokio::runtime::Runtime>,
 ) -> Result<Box<dyn WorkloadRunner>, Box<dyn std::error::Error>> {
     match operation {
         ReadOperation::ReadMetadata => Ok(Box::new(ReadMetadataRunner::setup(
-            table_info, case_name, read_spec, config, engine,
+            table_info, case_name, read_spec, config, runtime,
         )?)),
         ReadOperation::ReadData => Err("ReadDataRunner not yet implemented".into()),
     }
 }
 
 pub struct SnapshotConstructionRunner {
-    url: Url,
-    version: Option<u64>,
     engine: Arc<dyn Engine>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    snapshot_strategy: SnapshotStrategy,
+    time_travel: Option<TimeTravel>,
     name: String,
 }
 
@@ -211,10 +377,8 @@ impl SnapshotConstructionRunner {
         table_info: &TableInfo,
         case_name: &str,
         snapshot_spec: &SnapshotConstructionSpec,
-        engine: Arc<dyn Engine>,
+        runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let url = table_info.resolved_table_root();
-
         let name = format!(
             "{}/{}/{}",
             table_info.name,
@@ -222,18 +386,13 @@ impl SnapshotConstructionRunner {
             snapshot_spec.as_str()
         );
 
-        let version = match &snapshot_spec.time_travel {
-            Some(TimeTravel::Version { version }) => Some(*version),
-            Some(TimeTravel::Timestamp { .. }) => {
-                return Err("Timestamp-based time travel not supported in benchmarks".into())
-            }
-            None => None,
-        };
+        let (engine, snapshot_strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
 
         Ok(Self {
-            url,
-            version,
             engine,
+            runtime,
+            snapshot_strategy,
+            time_travel: snapshot_spec.time_travel.clone(),
             name,
         })
     }
@@ -241,12 +400,12 @@ impl SnapshotConstructionRunner {
 
 impl WorkloadRunner for SnapshotConstructionRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut builder = Snapshot::builder_for(self.url.clone());
-        if let Some(version) = self.version {
-            builder = builder.at_version(version);
-        }
-        black_box(builder.build(self.engine.as_ref())?);
-
+        let snapshot = self.snapshot_strategy.load_snapshot(
+            self.engine.as_ref(),
+            &self.runtime,
+            self.time_travel.as_ref(),
+        )?;
+        black_box(snapshot);
         Ok(())
     }
 
@@ -258,9 +417,15 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo};
-    use delta_kernel::engine::default::DefaultEngine;
-    use delta_kernel::object_store::local::LocalFileSystem;
+    use crate::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo, TimeTravel};
+    use std::sync::LazyLock;
+
+    fn test_runtime() -> Arc<tokio::runtime::Runtime> {
+        static RT: LazyLock<Arc<tokio::runtime::Runtime>> = LazyLock::new(|| {
+            Arc::new(tokio::runtime::Runtime::new().expect("failed to create runtime"))
+        });
+        RT.clone()
+    }
 
     fn test_table_info() -> TableInfo {
         let path = format!(
@@ -320,11 +485,6 @@ mod tests {
         }
     }
 
-    fn test_engine() -> Arc<dyn Engine> {
-        let store = Arc::new(LocalFileSystem::new());
-        Arc::new(DefaultEngine::builder(store).build())
-    }
-
     #[test]
     fn test_read_metadata_runner_serial() {
         let runner = ReadMetadataRunner::setup(
@@ -332,7 +492,7 @@ mod tests {
             "testCase",
             &test_read_spec(),
             serial_config(),
-            test_engine(),
+            test_runtime(),
         )
         .expect("setup should succeed");
         assert_eq!(
@@ -349,7 +509,7 @@ mod tests {
             "testCase",
             &test_read_spec(),
             parallel_config(),
-            test_engine(),
+            test_runtime(),
         )
         .expect("setup should succeed");
         assert_eq!(
@@ -372,7 +532,7 @@ mod tests {
             &test_table_info(),
             "testCase",
             &test_snapshot_spec(),
-            test_engine(),
+            test_runtime(),
         );
         assert!(runner.is_ok());
     }
@@ -383,7 +543,7 @@ mod tests {
             &test_table_info(),
             "testCase",
             &test_snapshot_spec(),
-            test_engine(),
+            test_runtime(),
         )
         .expect("setup should succeed");
         assert_eq!(
@@ -398,7 +558,7 @@ mod tests {
             &test_table_info(),
             "testCase",
             &test_snapshot_spec(),
-            test_engine(),
+            test_runtime(),
         )
         .expect("setup should succeed");
         assert!(runner.execute().is_ok());
@@ -412,7 +572,7 @@ mod tests {
             &test_read_spec(),
             ReadOperation::ReadMetadata,
             serial_config(),
-            test_engine(),
+            test_runtime(),
         )
         .expect("create_read_runner should succeed");
         assert!(runner.execute().is_ok());
@@ -427,7 +587,7 @@ mod tests {
             "test_case",
             &spec,
             serial_config(),
-            test_engine(),
+            test_runtime(),
         )
         .expect("setup should succeed");
         assert!(runner.execute().is_ok());
@@ -442,7 +602,7 @@ mod tests {
             "test_case",
             &spec,
             serial_config(),
-            test_engine(),
+            test_runtime(),
         );
         assert!(result.is_err());
     }
@@ -455,8 +615,31 @@ mod tests {
             &test_read_spec(),
             ReadOperation::ReadData,
             serial_config(),
-            test_engine(),
+            test_runtime(),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_engine_unsupported_scheme() {
+        let url = Url::parse("gs://bucket/table").unwrap();
+        let result = resolve_engine_for_url(&url, test_runtime());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_snapshot_construction_with_time_travel() {
+        let spec = SnapshotConstructionSpec {
+            time_travel: Some(TimeTravel::Version { version: 0 }),
+            expected: None,
+        };
+        let runner = SnapshotConstructionRunner::setup(
+            &test_table_info(),
+            "testCase",
+            &spec,
+            test_runtime(),
+        )
+        .expect("setup should succeed");
+        assert!(runner.execute().is_ok());
     }
 }

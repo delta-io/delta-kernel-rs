@@ -2,10 +2,17 @@ use std::sync::Arc;
 
 use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
+use tracing::{debug, info};
 use unity_catalog_delta_client_api::{Commit, CommitClient, CommitRequest};
 
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
+///
+/// For version 0 (table creation), the committer writes `000.json` directly to the published
+/// commit path. The caller (connector) is responsible for finalizing the table in UC via the
+/// create table API.
+///
+/// For version >= 1, the committer writes a staged commit and calls the UC commit API to ratify it.
 ///
 /// NOTE: this [`Committer`] requires a multi-threaded tokio runtime. That is, whatever
 /// implementation consumes the Committer to commit to the table, must call `commit` from within a
@@ -26,32 +33,62 @@ impl<C: CommitClient> UCCommitter<C> {
             table_id: table_id.into(),
         }
     }
-}
 
-impl<C: CommitClient + 'static> Committer for UCCommitter<C> {
-    /// Commit the given `actions` to the delta table in UC. UC's committer elects to write out a
-    /// staged commit for the actions then call the UC commit API to 'finalize' (ratify) the staged
-    /// commit. Note that this will accumulate staged commits, and separately clients are expected
-    /// to periodically publish the staged commits to the delta log. In it's current form, UC
-    /// expects to be informed of the last known published version during this commit.
-    fn commit(
+    /// Commit version 0 (table creation). Writes the version 0 commit file directly to the
+    /// published commit path.
+    // TODO: Validate commit metadata before writing. Ensure ICT is enabled and the UC table
+    // ID has not been tampered with.
+    fn commit_version_0(
+        &self,
+        engine: &dyn Engine,
+        actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        commit_metadata: &CommitMetadata,
+    ) -> DeltaResult<CommitResponse> {
+        debug_assert!(
+            commit_metadata.version() == 0,
+            "commit_version_0 called with version {}",
+            commit_metadata.version()
+        );
+        let published_commit_path = commit_metadata.published_commit_path()?;
+        match engine.json_handler().write_json_file(
+            &published_commit_path,
+            Box::new(actions),
+            false,
+        ) {
+            Ok(()) => {
+                info!("wrote version 0 commit file for UC table creation");
+                let file_meta = engine.storage_handler().head(&published_commit_path)?;
+                Ok(CommitResponse::Committed { file_meta })
+            }
+            Err(delta_kernel::Error::FileAlreadyExists(_)) => {
+                info!("version 0 commit conflict: commit file already exists");
+                Ok(CommitResponse::Conflict { version: 0 })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Commit version >= 1. Writes a staged commit file and calls the UC commit API to ratify it.
+    fn commit_version_non_zero(
         &self,
         engine: &dyn Engine,
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: CommitMetadata,
-    ) -> DeltaResult<CommitResponse> {
-        if commit_metadata.version() == 0 {
-            return Err(DeltaError::unsupported(
-                "UCCommitter does not support version 0 (table creation) commits",
-            ));
-        }
+    ) -> DeltaResult<CommitResponse>
+    where
+        C: 'static,
+    {
+        debug_assert!(
+            commit_metadata.version() != 0,
+            "commit_version_non_zero called with version 0"
+        );
         let staged_commit_path = commit_metadata.staged_commit_path()?;
         engine
             .json_handler()
             .write_json_file(&staged_commit_path, Box::new(actions), false)?;
 
         let committed = engine.storage_handler().head(&staged_commit_path)?;
-        tracing::debug!("wrote staged commit file: {:?}", committed);
+        debug!("wrote staged commit file: {:?}", committed);
 
         let commit_req = CommitRequest::new(
             self.table_id.clone(),
@@ -100,6 +137,28 @@ impl<C: CommitClient + 'static> Committer for UCCommitter<C> {
             file_meta: committed,
         })
     }
+}
+
+impl<C: CommitClient + 'static> Committer for UCCommitter<C> {
+    /// Commit the given `actions` to the delta table in UC.
+    ///
+    /// For version 0 (table creation), writes `000.json` directly to the published commit path.
+    /// The connector is responsible for finalizing the table in UC via the create table API.
+    ///
+    /// For version >= 1, writes a staged commit then calls the UC commit API to ratify it.
+    /// Connectors should publish staged commits to the delta log immediately after writing.
+    /// UC expects to be informed of the last known published version during commit.
+    fn commit(
+        &self,
+        engine: &dyn Engine,
+        actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        commit_metadata: CommitMetadata,
+    ) -> DeltaResult<CommitResponse> {
+        if commit_metadata.version() == 0 {
+            return self.commit_version_0(engine, actions, &commit_metadata);
+        }
+        self.commit_version_non_zero(engine, actions, commit_metadata)
+    }
 
     fn is_catalog_committer(&self) -> bool {
         true
@@ -143,16 +202,58 @@ mod tests {
     }
 
     #[test]
-    fn commit_rejects_version_0() {
+    fn commit_version_0_writes_published_commit() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
-        let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
+        let commit_metadata = CommitMetadata::new_unchecked(table_root.clone(), 0).unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
-        let result = committer.commit(&engine, Box::new(std::iter::empty()), commit_metadata);
+
+        // Create the _delta_log directory
+        fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
+
+        let result = committer
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap();
+        match result {
+            CommitResponse::Committed { file_meta } => {
+                assert!(
+                    file_meta
+                        .location
+                        .as_str()
+                        .ends_with("00000000000000000000.json"),
+                    "expected published path for version 0, got: {}",
+                    file_meta.location
+                );
+                // Verify the file was written to disk
+                let commit_path = tmp_dir.path().join("_delta_log/00000000000000000000.json");
+                assert!(commit_path.exists(), "000.json should exist on disk");
+            }
+            CommitResponse::Conflict { .. } => {
+                panic!("expected Committed for version 0, got Conflict")
+            }
+        }
+    }
+
+    #[test]
+    fn commit_version_0_conflict_when_file_exists() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+
+        // Pre-create the commit file to trigger a conflict
+        let delta_log = tmp_dir.path().join("_delta_log");
+        fs::create_dir_all(&delta_log).unwrap();
+        fs::write(delta_log.join("00000000000000000000.json"), "existing").unwrap();
+
+        let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
+        let result = committer
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap();
         assert!(
-            matches!(result, Err(DeltaError::Unsupported(_))),
-            "expected Unsupported error for version 0, got: {result:?}"
+            matches!(result, CommitResponse::Conflict { version: 0 }),
+            "expected Conflict for version 0 when file exists, got: {result:?}"
         );
     }
 

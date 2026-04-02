@@ -805,14 +805,13 @@ fn get_indices(
                     }
                 }
                 _ => {
-                    // we don't care about matching on nullability or metadata here so pass `false`
-                    // as the final argument. These can differ between the delta schema and the
-                    // parquet schema without causing issues in reading the data. We fix them up in
-                    // expression evaluation later.
+                    // We don't care about matching on nullability or metadata here. These can
+                    // differ between the delta schema and the parquet schema without causing
+                    // issues in reading the data. We fix them up in expression evaluation later.
                     match super::ensure_data_types::ensure_data_types(
                         &requested_field.data_type,
                         field.data_type(),
-                        false,
+                        super::ensure_data_types::ValidationMode::TypesAndNames,
                     )? {
                         DataTypeCompat::Identical => {
                             reorder_indices.push(ReorderIndex::identity(index))
