@@ -1205,9 +1205,11 @@ mod tests {
     use rstest::rstest;
     use serde_json::Value;
     use std::collections::HashMap;
+    #[cfg(feature = "catalog-managed")]
+    use test_utils::add_staged_commit;
     use test_utils::{
         actions_to_string, actions_to_string_partitioned, actions_to_string_with_metadata,
-        add_commit, add_staged_commit, TestAction, METADATA, METADATA_WITH_TABLE_PROPERTIES,
+        add_commit, TestAction, METADATA, METADATA_WITH_TABLE_PROPERTIES,
     };
 
     #[no_mangle]
@@ -1298,7 +1300,7 @@ mod tests {
         let snapshot_at_non_existent_version = unsafe {
             snapshot_at_version(kernel_string_slice!(table_root), engine.shallow_copy(), 1)
         };
-        assert_extern_result_error_with_message(snapshot_at_non_existent_version, KernelError::GenericError, "Generic delta kernel error: LogSegment end version 0 not the same as the specified end version 1");
+        assert_extern_result_error_with_message(snapshot_at_non_existent_version, KernelError::GenericError, Some("Generic delta kernel error: LogSegment end version 0 not the same as the specified end version 1"));
 
         let snapshot_table_root_str =
             unsafe { snapshot_table_root(snapshot1.shallow_copy(), allocate_str) };
@@ -1855,7 +1857,7 @@ mod tests {
             let invalid_path = "not a valid url!";
             get_snapshot_builder(kernel_string_slice!(invalid_path), engine.shallow_copy())
         };
-        assert!(result.is_err());
+        assert_extern_result_error_with_message(result, KernelError::InvalidUrlError, None);
 
         unsafe { free_engine(engine) }
         Ok(())
@@ -1876,7 +1878,7 @@ mod tests {
             snapshot_builder_set_version(&mut ptr, 99);
             snapshot_builder_build(ptr)
         };
-        assert!(result.is_err());
+        assert_extern_result_error_with_message(result, KernelError::GenericError, None);
 
         unsafe { free_engine(engine) }
         Ok(())
