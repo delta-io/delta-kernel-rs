@@ -732,6 +732,10 @@ impl<S> Transaction<S> {
     /// to add multiple batches.
     ///
     /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
+    // TODO(#2312): At commit time, validate that each add.path is a valid URI (RFC 2396)
+    // and that partitionValues are correctly serialized. Currently this accepts whatever the
+    // engine provides with no validation, which means custom engines that bypass
+    // DefaultEngine can silently commit malformed paths or wrong partition value formats.
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
     }

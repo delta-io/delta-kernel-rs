@@ -21,7 +21,7 @@ use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::Snapshot;
-// use tempfile::tempdir;
+use tempfile::tempdir;
 use url::Url;
 
 // === Helpers ===
@@ -335,15 +335,8 @@ async fn test_write_partitioned_with_all_supported_types() -> Result<(), Box<dyn
 {
     let _ = tracing_subscriber::fmt::try_init();
 
-    // let tmp_dir = tempdir()?;
-    // let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
-    let table_path =
-        std::path::Path::new(&std::env::var("HOME").unwrap()).join("tmp_delta_tables/kernel_001");
-    if table_path.exists() {
-        std::fs::remove_dir_all(&table_path).unwrap();
-    }
-    std::fs::create_dir_all(&table_path).unwrap();
-    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let tmp_dir = tempdir()?;
+    let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
     let table_schema = partitioned_table_schema();
 
     let engine = DefaultEngineBuilder::new(store_from_url(&table_url)?).build();
