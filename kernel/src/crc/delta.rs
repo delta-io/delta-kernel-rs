@@ -9,17 +9,17 @@
 //! - **Metadata fields** (protocol, metadata, domain metadata, set transactions, in-commit
 //!   timestamp): always kept up-to-date -- every `apply` unconditionally merges these from
 //!   the delta.
-//! - **File stats** (`num_files`, `table_size_bytes`): only updated when the current
-//!   [`FileStatsValidity`] is not terminal and the commit's operation is incremental-safe.
-//!   Once validity degrades (e.g. a non-incremental operation like ANALYZE STATS, or a
-//!   missing file size), file stats stop updating for the lifetime of that CRC.
+//! - **File stats**: only updated when the current [`FileStatsState`] is not terminal and the
+//!   commit's operation is incremental-safe. Once the state degrades (e.g. a non-incremental
+//!   operation like ANALYZE STATS, or a missing file size), file stats stop updating for the
+//!   lifetime of that CRC.
 
 use std::collections::HashMap;
 
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 
 use super::file_stats::FileStatsDelta;
-use super::{Crc, DomainMetadataState, FileStatsValidity, SetTransactionState};
+use super::{Crc, DomainMetadataState, FileSizeHistogram, FileStatsState, SetTransactionState};
 
 /// CRC-relevant changes to apply to a base [`Crc`]. Produced either from a single commit
 /// (transaction path) or from accumulated reverse log replay (snapshot loading path).
@@ -52,7 +52,7 @@ pub(crate) struct CrcUpdate {
     /// In-commit timestamp, if present. In replay mode, from the newest commit.
     pub(crate) in_commit_timestamp: Option<i64>,
     /// Whether all operations in this update are incremental-safe. `false` or unknown
-    /// operations transition file stats validity to `Indeterminate`.
+    /// operations transition file stats to `Indeterminate`.
     pub(crate) operation_safe: bool,
     /// A file action had a missing `size` field, making byte-level file stats impossible
     /// to compute.
@@ -67,7 +67,7 @@ impl CrcUpdate {
     ///
     /// The resulting CRC has:
     /// - DM/txns: Complete (the full state was captured)
-    /// - File stats validity: derived from `has_missing_file_size` and `operation_safe`
+    /// - File stats: derived from `has_missing_file_size` and `operation_safe`
     /// - Histogram: computed from added/removed histograms when available
     ///
     /// # Errors
@@ -86,43 +86,40 @@ impl CrcUpdate {
         );
         let set_transactions = SetTransactionState::Complete(self.set_transactions);
 
-        // Determine file stats validity from the update flags.
-        let file_stats_validity = if self.has_missing_file_size {
-            FileStatsValidity::Untrackable
+        // Determine file stats state from the update flags.
+        let file_stats = if self.has_missing_file_size {
+            FileStatsState::Untrackable
         } else if !self.operation_safe {
-            FileStatsValidity::Indeterminate
+            FileStatsState::Indeterminate
         } else {
-            FileStatsValidity::Valid
-        };
-
-        // Compute the initial histogram from the file stats. If both added and removed
-        // histograms are present, subtract removals from additions. If only the added
-        // histogram is present, use it directly. Otherwise, we cannot produce a histogram.
-        //
-        // If try_sub fails for any reason (e.g. histogram goes negative) then the histogram
-        // is silently dropped.
-        let initial_histogram = match (
-            self.file_stats.added_histogram,
-            self.file_stats.removed_histogram,
-        ) {
-            (Some(added), Some(removed)) => added.try_sub(&removed).ok(),
-            (Some(added), None) => Some(added),
-            _ => None,
+            // Compute the initial histogram from the file stats. If both added and removed
+            // histograms are present, subtract removals from additions. If only the added
+            // histogram is present, use it directly. Otherwise, we cannot produce a histogram.
+            //
+            // If try_sub fails for any reason (e.g. histogram goes negative) then the histogram
+            // is silently dropped.
+            let histogram = match (
+                self.file_stats.added_histogram,
+                self.file_stats.removed_histogram,
+            ) {
+                (Some(added), Some(removed)) => added.try_sub(&removed).ok(),
+                (Some(added), None) => Some(added),
+                _ => None,
+            };
+            FileStatsState::Valid {
+                num_files: self.file_stats.net_files,
+                table_size_bytes: self.file_stats.net_bytes,
+                histogram,
+            }
         };
 
         Ok(Crc {
-            table_size_bytes: self.file_stats.net_bytes,
-            num_files: self.file_stats.net_files,
-            num_metadata: 1,
-            num_protocol: 1,
             protocol,
             metadata,
+            file_stats,
             domain_metadata,
             set_transactions,
             in_commit_timestamp_opt: self.in_commit_timestamp,
-            file_size_histogram: initial_histogram,
-            file_stats_validity,
-            ..Default::default()
         })
     }
 
@@ -134,13 +131,41 @@ impl CrcUpdate {
     }
 }
 
+/// Merge a base histogram with added/removed delta histograms. Returns the merged histogram
+/// if successful, `None` if the merge fails (e.g. boundary mismatch, negative counts) or if
+/// the delta does not provide both add/remove histograms. When the base has a histogram but
+/// the delta cannot provide both sides, the histogram is dropped (stale data is worse than
+/// no data).
+fn merge_histogram(
+    base: &Option<FileSizeHistogram>,
+    delta: &FileStatsDelta,
+) -> Option<FileSizeHistogram> {
+    if let (Some(base_hist), Some(added), Some(removed)) = (
+        base.as_ref(),
+        &delta.added_histogram,
+        &delta.removed_histogram,
+    ) {
+        base_hist
+            .try_add(added)
+            .and_then(|h| h.try_sub(removed))
+            .ok()
+    } else if base.is_some() {
+        // The base had a histogram but the update could not provide add/remove histograms.
+        // Drop it rather than leaving a stale value.
+        None
+    } else {
+        // Base had no histogram and delta did not provide one. Stay at None.
+        None
+    }
+}
+
 /// Commit delta application for [`Crc`]. See the [module-level docs](self) for details.
 impl Crc {
-    /// Apply a commit delta, updating all CRC fields and adjusting file stats validity.
+    /// Apply a commit delta, updating all CRC fields and adjusting file stats state.
     ///
     /// Metadata fields are always updated. File stats are only updated when:
-    /// - Validity is not already terminal ([`Untrackable`](FileStatsValidity::Untrackable) or
-    ///   [`Indeterminate`](FileStatsValidity::Indeterminate))
+    /// - The current state is not already terminal ([`Untrackable`](FileStatsState::Untrackable)
+    ///   or [`Indeterminate`](FileStatsState::Indeterminate))
     /// - The delta has no missing file sizes
     /// - The operation is incremental-safe
     pub(crate) fn apply(&mut self, update: CrcUpdate) {
@@ -182,50 +207,46 @@ impl Crc {
         // clears the previous value.
         self.in_commit_timestamp_opt = update.in_commit_timestamp;
 
-        // Bail if already Untrackable -- nothing can recover missing file stats or histograms.
-        if self.file_stats_validity == FileStatsValidity::Untrackable {
-            return;
-        }
-
-        // Missing file size poisons stats permanently. Checked after the Untrackable bail-out
-        // so that Untrackable can never transition to Indeterminate below.
-        if update.has_missing_file_size {
-            self.file_stats_validity = FileStatsValidity::Untrackable;
-            self.file_size_histogram = None;
-            return;
-        }
-
-        // Bail if already Indeterminate (theoretically recoverable via full replay).
-        if self.file_stats_validity == FileStatsValidity::Indeterminate {
-            return;
-        }
-
-        if !update.operation_safe {
-            self.file_stats_validity = FileStatsValidity::Indeterminate;
-            self.file_size_histogram = None;
-            return;
-        }
-        self.num_files += update.file_stats.net_files;
-        self.table_size_bytes += update.file_stats.net_bytes;
-
-        // Histogram: merge base + added - removed.
-        // Only update if the base CRC has a histogram AND the update provides both histograms.
-        // If the merge fails (e.g. negative counts from corrupted data) or the update is missing
-        // either histogram, drop it rather than leaving stale data.
-        if let (Some(base_hist), Some(added), Some(removed)) = (
-            self.file_size_histogram.as_ref(),
-            &update.file_stats.added_histogram,
-            &update.file_stats.removed_histogram,
-        ) {
-            match base_hist.try_add(added).and_then(|h| h.try_sub(removed)) {
-                Ok(merged) => self.file_size_histogram = Some(merged),
-                Err(_) => self.file_size_histogram = None,
+        // File stats: transition based on current state.
+        self.file_stats = match &self.file_stats {
+            FileStatsState::Untrackable => {
+                // Terminal: nothing can recover missing file stats.
+                return;
             }
-        } else if self.file_size_histogram.is_some() {
-            // The base had a histogram but the update couldn't provide add/remove histograms.
-            // Drop it rather than leaving a stale value.
-            self.file_size_histogram = None;
-        }
+            _ if update.has_missing_file_size => {
+                // Missing file size poisons stats permanently.
+                FileStatsState::Untrackable
+            }
+            FileStatsState::Indeterminate => {
+                // Terminal for file stats (theoretically recoverable via full replay).
+                return;
+            }
+            _ if !update.operation_safe => {
+                // Non-incremental operation makes file stats indeterminate.
+                FileStatsState::Indeterminate
+            }
+            FileStatsState::Valid {
+                num_files,
+                table_size_bytes,
+                histogram,
+            } => {
+                let new_histogram = merge_histogram(histogram, &update.file_stats);
+                FileStatsState::Valid {
+                    num_files: num_files + update.file_stats.net_files,
+                    table_size_bytes: table_size_bytes + update.file_stats.net_bytes,
+                    histogram: new_histogram,
+                }
+            }
+            FileStatsState::RequiresCheckpointRead {
+                commit_delta_files,
+                commit_delta_bytes,
+                commit_delta_histogram,
+            } => FileStatsState::RequiresCheckpointRead {
+                commit_delta_files: commit_delta_files + update.file_stats.net_files,
+                commit_delta_bytes: commit_delta_bytes + update.file_stats.net_bytes,
+                commit_delta_histogram: merge_histogram(commit_delta_histogram, &update.file_stats),
+            },
+        };
     }
 }
 
@@ -237,14 +258,17 @@ mod tests {
 
     use super::*;
     use crate::actions::{DomainMetadata, Metadata, Protocol};
-    use crate::crc::{DomainMetadataState, FileSizeHistogram, SetTransactionState};
+    use crate::crc::{
+        DomainMetadataState, FileSizeHistogram, FileStatsValidity, SetTransactionState,
+    };
 
     fn base_crc() -> Crc {
         Crc {
-            table_size_bytes: 1000,
-            num_files: 10,
-            num_metadata: 1,
-            num_protocol: 1,
+            file_stats: FileStatsState::Valid {
+                num_files: 10,
+                table_size_bytes: 1000,
+                histogram: None,
+            },
             ..Default::default()
         }
     }
@@ -295,9 +319,10 @@ mod tests {
     #[test]
     fn test_deserialized_crc_has_valid_stats() {
         let crc = base_crc();
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
-        assert_eq!(crc.num_files, 10);
-        assert_eq!(crc.table_size_bytes, 1000);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Valid);
+        let stats = crc.file_stats().unwrap();
+        assert_eq!(stats.num_files, 10);
+        assert_eq!(stats.table_size_bytes, 1000);
     }
 
     // ===== Crc::apply tests =====
@@ -306,9 +331,10 @@ mod tests {
     fn test_apply_updates_file_stats() {
         let mut crc = base_crc();
         crc.apply(write_update(3, 600));
-        assert_eq!(crc.num_files, 13); // 10 + 3
-        assert_eq!(crc.table_size_bytes, 1600); // 1000 + 600
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
+        let stats = crc.file_stats().unwrap();
+        assert_eq!(stats.num_files, 13); // 10 + 3
+        assert_eq!(stats.table_size_bytes, 1600); // 1000 + 600
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Valid);
     }
 
     /// Simulates forward log replay: apply multiple commit deltas sequentially.
@@ -317,9 +343,10 @@ mod tests {
         let mut crc = base_crc();
         crc.apply(write_update(3, 600));
         crc.apply(write_update(-2, -400));
-        assert_eq!(crc.num_files, 11); // 10 + 3 - 2
-        assert_eq!(crc.table_size_bytes, 1200); // 1000 + 600 - 400
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
+        let stats = crc.file_stats().unwrap();
+        assert_eq!(stats.num_files, 11); // 10 + 3 - 2
+        assert_eq!(stats.table_size_bytes, 1200); // 1000 + 600 - 400
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Valid);
     }
 
     #[test]
@@ -330,7 +357,7 @@ mod tests {
             ..write_update(1, 100)
         };
         crc.apply(unsafe_change);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Indeterminate);
     }
 
     #[test]
@@ -341,7 +368,7 @@ mod tests {
             ..write_update(1, 100)
         };
         crc.apply(unknown_delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Indeterminate);
     }
 
     #[test]
@@ -352,11 +379,11 @@ mod tests {
             ..write_update(1, 100)
         };
         crc.apply(unsafe_change);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Indeterminate);
 
         // Subsequent safe op doesn't recover validity.
         crc.apply(write_update(5, 500));
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Indeterminate);
     }
 
     // ===== apply: Untrackable (missing file size) tests =====
@@ -369,7 +396,7 @@ mod tests {
             ..write_update(1, 100)
         };
         crc.apply(delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Untrackable);
     }
 
     #[test]
@@ -380,18 +407,18 @@ mod tests {
             ..write_update(1, 100)
         };
         crc.apply(delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Untrackable);
 
         // Applying a safe delta does not recover from Untrackable.
         crc.apply(write_update(5, 500));
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Untrackable);
 
         // Applying an unsafe delta also stays Untrackable (does not downgrade to Indeterminate).
         crc.apply(CrcUpdate {
             operation_safe: false,
             ..write_update(1, 100)
         });
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Untrackable);
     }
 
     #[test]
@@ -402,7 +429,7 @@ mod tests {
             ..write_update(1, 100)
         };
         crc.apply(unsafe_change);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Indeterminate);
 
         // Missing size escalates Indeterminate to Untrackable.
         let delta = CrcUpdate {
@@ -410,7 +437,7 @@ mod tests {
             ..write_update(1, 100)
         };
         crc.apply(delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Untrackable);
     }
 
     // ===== apply: non-file-stats field updates =====
@@ -559,11 +586,10 @@ mod tests {
         let crc = delta.into_crc_for_version_zero().unwrap();
         assert_eq!(crc.protocol, protocol);
         assert_eq!(crc.metadata, metadata);
-        assert_eq!(crc.num_files, 5);
-        assert_eq!(crc.table_size_bytes, 1000);
-        assert_eq!(crc.num_metadata, 1);
-        assert_eq!(crc.num_protocol, 1);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
+        let stats = crc.file_stats().unwrap();
+        assert_eq!(stats.num_files, 5);
+        assert_eq!(stats.table_size_bytes, 1000);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Valid);
         assert_eq!(
             crc.domain_metadata,
             DomainMetadataState::Complete(HashMap::new())
@@ -725,11 +751,11 @@ mod tests {
     fn base_crc_with_histogram(file_sizes: &[i64]) -> Crc {
         let hist = histogram_from_sizes(file_sizes);
         Crc {
-            table_size_bytes: file_sizes.iter().sum(),
-            num_files: file_sizes.len() as i64,
-            num_metadata: 1,
-            num_protocol: 1,
-            file_size_histogram: Some(hist),
+            file_stats: FileStatsState::Valid {
+                num_files: file_sizes.len() as i64,
+                table_size_bytes: file_sizes.iter().sum(),
+                histogram: Some(hist),
+            },
             ..Default::default()
         }
     }
@@ -784,7 +810,11 @@ mod tests {
         let delta = write_delta_with_histograms(add, remove);
         crc.apply(delta);
 
-        let hist = crc.file_size_histogram.as_ref().unwrap();
+        let hist = crc
+            .file_stats()
+            .expect("file stats should be Valid")
+            .file_size_histogram
+            .expect("histogram should be present");
         for &(bin, count, bytes) in expected_bins {
             assert_eq!(hist.file_counts[bin], count, "file_counts[{bin}]");
             assert_eq!(hist.total_bytes[bin], bytes, "total_bytes[{bin}]");
@@ -818,8 +848,9 @@ mod tests {
             ..Default::default()
         };
         crc.apply(delta);
+        let stats = crc.file_stats().expect("file stats should be Valid");
         assert!(
-            crc.file_size_histogram.is_none(),
+            stats.file_size_histogram.is_none(),
             "histogram should be None when delta can't provide both add/remove histograms"
         );
     }
@@ -832,8 +863,8 @@ mod tests {
             ..write_update(1, 100)
         };
         crc.apply(unsafe_delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
-        assert!(crc.file_size_histogram.is_none());
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Indeterminate);
+        assert!(crc.file_stats().is_none());
     }
 
     #[test]
@@ -845,8 +876,8 @@ mod tests {
             ..write_update(1, 100)
         };
         crc.apply(delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
-        assert!(crc.file_size_histogram.is_none());
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Untrackable);
+        assert!(crc.file_stats().is_none());
     }
 
     #[test]
@@ -865,7 +896,11 @@ mod tests {
             ..Default::default()
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
-        let hist = crc.file_size_histogram.as_ref().unwrap();
+        let hist = crc
+            .file_stats()
+            .unwrap()
+            .file_size_histogram
+            .expect("histogram should be present");
         assert_eq!(hist.file_counts[0], 2);
         assert_eq!(hist.total_bytes[0], 1500);
     }
@@ -880,7 +915,7 @@ mod tests {
             ..write_update(0, 0)
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
-        assert!(crc.file_size_histogram.is_none());
+        assert!(crc.file_stats().unwrap().file_size_histogram.is_none());
     }
 
     #[test]
@@ -894,11 +929,11 @@ mod tests {
         )
         .unwrap();
         let mut crc = Crc {
-            table_size_bytes: 800,
-            num_files: 3,
-            num_metadata: 1,
-            num_protocol: 1,
-            file_size_histogram: Some(base_hist),
+            file_stats: FileStatsState::Valid {
+                num_files: 3,
+                table_size_bytes: 800,
+                histogram: Some(base_hist),
+            },
             ..Default::default()
         };
 
@@ -924,11 +959,38 @@ mod tests {
         crc.apply(delta);
 
         // Histogram should be preserved (boundaries match)
-        let hist = crc.file_size_histogram.as_ref().unwrap();
+        let stats = crc.file_stats().unwrap();
+        let hist = stats.file_size_histogram.as_ref().unwrap();
         assert_eq!(hist.sorted_bin_boundaries, vec![0, 200, 1000]);
         assert_eq!(hist.file_counts, vec![2, 1, 1]); // (2+1-1), (1+0-0), (0+1-0)
         assert_eq!(hist.total_bytes, vec![250, 500, 1500]); // (300+100-150), (500+0-0), (0+1500-0)
-        assert_eq!(crc.num_files, 4);
-        assert_eq!(crc.table_size_bytes, 2250);
+        assert_eq!(stats.num_files, 4);
+        assert_eq!(stats.table_size_bytes, 2250);
+    }
+
+    // ===== into_fresh_crc: file stats state tests =====
+
+    #[test]
+    fn into_fresh_crc_with_unsafe_operation_produces_indeterminate() {
+        let update = CrcUpdate {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            operation_safe: false,
+            ..write_update(5, 1000)
+        };
+        let crc = update.into_fresh_crc().unwrap();
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Indeterminate);
+    }
+
+    #[test]
+    fn into_fresh_crc_with_missing_file_size_produces_untrackable() {
+        let update = CrcUpdate {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            has_missing_file_size: true,
+            ..write_update(5, 1000)
+        };
+        let crc = update.into_fresh_crc().unwrap();
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Untrackable);
     }
 }

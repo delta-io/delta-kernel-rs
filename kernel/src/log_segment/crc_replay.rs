@@ -397,6 +397,6 @@ mod tests {
         let stats = base.file_stats().expect("file stats should be Valid");
         assert_eq!(stats.num_files, 3);
         assert_eq!(stats.table_size_bytes, 700);
-        assert_eq!(base.file_stats_validity, FileStatsValidity::Valid);
+        assert_eq!(base.file_stats_validity(), FileStatsValidity::Valid);
     }
 }

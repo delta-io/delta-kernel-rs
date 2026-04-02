@@ -48,10 +48,9 @@ mod tests {
         let crc = try_read_crc_file(&engine, &crc_path).unwrap();
 
         // Verify basic fields
-        assert_eq!(crc.table_size_bytes, 5259);
-        assert_eq!(crc.num_files, 10);
-        assert_eq!(crc.num_metadata, 1);
-        assert_eq!(crc.num_protocol, 1);
+        let stats = crc.file_stats().unwrap();
+        assert_eq!(stats.table_size_bytes, 5259);
+        assert_eq!(stats.num_files, 10);
         assert_eq!(crc.in_commit_timestamp_opt, Some(1694758257000));
 
         // Verify protocol
@@ -124,20 +123,13 @@ mod tests {
         assert_eq!(txns["streaming-job-abc"].last_updated, Some(1694758255000));
 
         // Verify file size histogram was deserialized (all 10 files in bin 0, < 8KB)
-        let hist = crc.file_size_histogram.as_ref().unwrap();
+        let hist = stats.file_size_histogram.as_ref().unwrap();
         assert_eq!(hist.sorted_bin_boundaries.len(), 95);
         assert_eq!(hist.file_counts[0], 10);
         assert_eq!(hist.total_bytes[0], 5259);
         // All other bins should be zero
         assert!(hist.file_counts[1..].iter().all(|&c| c == 0));
         assert!(hist.total_bytes[1..].iter().all(|&b| b == 0));
-
-        // Remaining skipped fields are still None (pending serde support on their types)
-        assert!(crc.txn_id.is_none());
-        assert!(crc.all_files.is_none());
-        assert!(crc.num_deleted_records_opt.is_none());
-        assert!(crc.num_deletion_vectors_opt.is_none());
-        assert!(crc.deleted_record_counts_histogram_opt.is_none());
     }
 
     #[test]

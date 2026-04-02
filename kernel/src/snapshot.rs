@@ -16,8 +16,8 @@ use crate::checkpoint::CheckpointWriter;
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 use crate::crc::{
-    try_read_crc_file, try_write_crc_file, Crc, CrcUpdate, DomainMetadataState,
-    LazyCrc, SetTransactionState,
+    try_read_crc_file, try_write_crc_file, Crc, CrcUpdate, DomainMetadataState, LazyCrc,
+    SetTransactionState,
 };
 use crate::expressions::ColumnName;
 use crate::log_segment::{DomainMetadataMap, LogSegment};

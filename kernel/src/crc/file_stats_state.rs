@@ -25,7 +25,6 @@ use super::FileSizeHistogram;
 /// Each variant carries exactly the data that makes sense for that state. You cannot
 /// accidentally use a commit delta as an absolute file count because they live in
 /// different variants with different field names.
-#[allow(dead_code)] // Variants used in follow-up steps (CrcProcessor, Snapshot integration).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileStatsState {
     /// File stats are known-correct absolute totals. Histogram is optional: `Some` when the
@@ -62,7 +61,6 @@ pub enum FileStatsState {
     Untrackable,
 }
 
-#[allow(dead_code)] // Methods used in follow-up steps (Snapshot, CRC write).
 impl FileStatsState {
     /// Returns absolute file stats if available.
     ///
@@ -141,7 +139,6 @@ pub enum FileStatsValidity {
 /// - `Partial` and `Untracked` both serialize as `null` (partial data is not persisted)
 /// - Deserialization from `[...]` produces `Complete(map)`, from `null`/absent produces
 ///   `Untracked` (CRC files on disk always have complete data or no data)
-#[allow(dead_code)] // Variants used in follow-up steps (Snapshot DM fast path).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DomainMetadataState {
     /// All domain metadata is known. The map is the complete set of active (non-removed)
@@ -160,7 +157,6 @@ pub enum DomainMetadataState {
     Untracked,
 }
 
-#[allow(dead_code)]
 impl DomainMetadataState {
     /// Returns the map if available (Complete or Partial), `None` if Untracked.
     pub fn map(&self) -> Option<&HashMap<String, DomainMetadata>> {
@@ -183,7 +179,6 @@ impl DomainMetadataState {
 /// The completeness state of set transactions in a CRC. Owns the underlying HashMap.
 ///
 /// Same serde and completeness semantics as [`DomainMetadataState`].
-#[allow(dead_code)] // Variants used in follow-up steps (Snapshot txn fast path).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SetTransactionState {
     /// All set transactions are known. If an app_id is not in the map, no transaction
@@ -200,7 +195,6 @@ pub enum SetTransactionState {
     Untracked,
 }
 
-#[allow(dead_code)]
 impl SetTransactionState {
     /// Returns the map if available (Complete or Partial), `None` if Untracked.
     pub fn map(&self) -> Option<&HashMap<String, SetTransaction>> {

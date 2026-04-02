@@ -121,9 +121,6 @@ async fn test_get_current_crc_if_loaded_returns_loaded_crc() -> DeltaResult<()> 
     let file_stats = crc.file_stats().unwrap();
     assert_eq!(file_stats.table_size_bytes, 5259);
     assert_eq!(file_stats.num_files, 10);
-    assert_eq!(crc.num_metadata, 1);
-    assert_eq!(crc.num_protocol, 1);
-
     // Protocol and metadata should match the snapshot's table configuration
     assert_eq!(crc.protocol, *snapshot.table_configuration().protocol());
     assert_eq!(crc.metadata, *snapshot.table_configuration().metadata());
@@ -159,7 +156,7 @@ async fn test_crc_without_crc_file_built_from_scratch_with_valid_stats() -> Delt
     let crc = snapshot.get_current_crc_if_loaded_for_testing().unwrap();
 
     // Full replay produces Valid file stats (CREATE TABLE has 0 files)
-    assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
+    assert_eq!(crc.file_stats_validity(), FileStatsValidity::Valid);
     let stats = crc.file_stats().unwrap();
     assert_eq!(stats.num_files, 0);
     assert_eq!(stats.table_size_bytes, 0);
@@ -211,8 +208,6 @@ async fn test_create_table_produces_post_commit_crc() -> DeltaResult<()> {
     let file_stats = crc.file_stats().unwrap();
     assert_eq!(file_stats.num_files, 0);
     assert_eq!(file_stats.table_size_bytes, 0);
-    assert_eq!(crc.num_metadata, 1);
-    assert_eq!(crc.num_protocol, 1);
     assert_eq!(crc.protocol, *snapshot.table_configuration().protocol());
     assert_eq!(crc.metadata, *snapshot.table_configuration().metadata());
     let dms = crc.domain_metadata.map().unwrap();
@@ -245,7 +240,7 @@ async fn test_post_commit_crc_state_depends_on_read_snapshot_crc_quality(
         .unwrap();
     // Both paths now produce Valid file stats and Complete DM: the post-commit path via
     // CrcUpdate::into_crc_for_version_zero, the fresh-from-disk path via build_crc_from_scratch.
-    assert_eq!(base_crc.file_stats_validity, FileStatsValidity::Valid);
+    assert_eq!(base_crc.file_stats_validity(), FileStatsValidity::Valid);
     assert!(base_crc.domain_metadata.is_complete());
 
     let committed = read_snapshot
@@ -267,7 +262,7 @@ async fn test_post_commit_crc_state_depends_on_read_snapshot_crc_quality(
     // - Post-commit snapshot: CrcUpdate applied to a Valid base
     // - Fresh-from-disk: build_crc_from_scratch reads the full log -> Valid and Complete
     //   Then CrcUpdate applied to that Valid base -> stays Valid and Complete
-    assert_eq!(post_crc.file_stats_validity, FileStatsValidity::Valid);
+    assert_eq!(post_crc.file_stats_validity(), FileStatsValidity::Valid);
     assert!(post_crc.domain_metadata.is_complete());
 
     Ok(())
@@ -428,7 +423,10 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
     assert_eq!(committed.commit_version(), 2);
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
     let crc_v2 = snapshot_v2.get_current_crc_if_loaded_for_testing().unwrap();
-    assert_eq!(crc_v2.file_stats_validity, FileStatsValidity::Indeterminate);
+    assert_eq!(
+        crc_v2.file_stats_validity(),
+        FileStatsValidity::Indeterminate
+    );
 
     Ok(())
 }
@@ -631,8 +629,6 @@ async fn test_incremental_snapshot_old_crc_no_new_crc_produces_crc_at_v1() -> De
         .unwrap();
 
     // The CRC should have the correct P&M from the table
-    assert_eq!(crc_v1.num_metadata, 1);
-    assert_eq!(crc_v1.num_protocol, 1);
     assert_eq!(
         crc_v1.protocol,
         *incremental_v1.table_configuration().protocol()
@@ -1059,7 +1055,7 @@ async fn test_build_crc_from_scratch_produces_complete_crc_with_valid_stats() ->
         .expect("CRC should be built from scratch when no CRC file exists");
 
     // File stats should be Valid with correct counts
-    assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
+    assert_eq!(crc.file_stats_validity(), FileStatsValidity::Valid);
     let stats = crc.file_stats().expect("Valid CRC should have file stats");
     assert_eq!(stats.num_files, 2); // one file per insert
     assert!(stats.table_size_bytes > 0);

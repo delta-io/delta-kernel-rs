@@ -148,6 +148,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::crc::FileStatsState;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
     use crate::object_store::memory::InMemory;
@@ -165,15 +166,19 @@ mod tests {
     #[test]
     fn test_crc_load_result_loaded() {
         let crc = Crc {
-            table_size_bytes: 100,
-            num_files: 10,
-            num_metadata: 1,
-            num_protocol: 1,
+            file_stats: FileStatsState::Valid {
+                num_files: 10,
+                table_size_bytes: 100,
+                histogram: None,
+            },
             ..Default::default()
         };
         let loaded = CrcLoadResult::Loaded(Arc::new(crc));
         assert!(loaded.get().is_some());
-        assert_eq!(loaded.get().unwrap().table_size_bytes, 100);
+        assert_eq!(
+            loaded.get().unwrap().file_stats().unwrap().table_size_bytes,
+            100
+        );
     }
 
     #[rstest]
@@ -231,7 +236,7 @@ mod tests {
         assert!(lazy.is_loaded());
 
         let crc = result.get().unwrap();
-        assert_eq!(crc.table_size_bytes, 5259);
+        assert_eq!(crc.file_stats().unwrap().table_size_bytes, 5259);
     }
 
     #[test]
@@ -253,10 +258,11 @@ mod tests {
 
     fn test_crc(table_size_bytes: i64) -> Crc {
         Crc {
-            table_size_bytes,
-            num_files: 1,
-            num_metadata: 1,
-            num_protocol: 1,
+            file_stats: FileStatsState::Valid {
+                num_files: 1,
+                table_size_bytes,
+                histogram: None,
+            },
             ..Default::default()
         }
     }
@@ -272,7 +278,7 @@ mod tests {
         // get_if_loaded_at_version should return the CRC at the correct version
         let loaded = lazy.get_if_loaded_at_version(5);
         assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().table_size_bytes, 42);
+        assert_eq!(loaded.unwrap().file_stats().unwrap().table_size_bytes, 42);
 
         // Wrong version should return None
         assert!(lazy.get_if_loaded_at_version(4).is_none());
