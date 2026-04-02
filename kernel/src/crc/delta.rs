@@ -13,6 +13,8 @@
 //!   Once validity degrades (e.g. a non-incremental operation like ANALYZE STATS, or a
 //!   missing file size), file stats stop updating for the lifetime of that CRC.
 
+use tracing::warn;
+
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 
 use super::file_stats::FileStatsDelta;
@@ -72,11 +74,15 @@ impl CrcDelta {
         );
         // For version zero the delta IS the full table histogram. Validate that all bins
         // are non-negative (a real table can't have negative file counts). If validation
-        // fails, silently drop the histogram.
-        let initial_histogram = self
-            .file_stats
-            .net_histogram
-            .and_then(|delta| delta.check_non_negative().ok());
+        // fails, drop the histogram.
+        let initial_histogram = self.file_stats.net_histogram.and_then(|delta| {
+            delta
+                .check_non_negative()
+                .inspect_err(|e| {
+                    warn!("Non-negative file count check failed, dropping file size histogram for version zero: {e}");
+                })
+                .ok()
+        });
         Some(Crc {
             table_size_bytes: self.file_stats.net_bytes,
             num_files: self.file_stats.net_files,
@@ -183,7 +189,12 @@ impl Crc {
         ) {
             match base_hist.try_apply_delta(delta_hist) {
                 Ok(merged) => self.file_size_histogram = Some(merged),
-                Err(_) => self.file_size_histogram = None,
+                Err(e) => {
+                    warn!(
+                        "Non-negative file count check failed, dropping file size histogram: {e}"
+                    );
+                    self.file_size_histogram = None;
+                }
             }
         } else if self.file_size_histogram.is_some() {
             // The base had a histogram but the delta couldn't provide one

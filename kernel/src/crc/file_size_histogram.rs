@@ -217,7 +217,7 @@ impl FileSizeHistogram {
             require!(
                 count >= 0 && bytes >= 0,
                 Error::internal_error(format!(
-                    "Addition would result in negative counts or bytes at bin {}",
+                    "Merge would result in negative counts or bytes at bin {}",
                     i
                 ))
             );
