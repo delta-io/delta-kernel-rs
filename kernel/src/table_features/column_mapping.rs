@@ -392,11 +392,11 @@ pub(crate) fn get_any_level_column_physical_name(
 /// For each path component in the physical column, finds the field in the schema whose
 /// `physical_name(mode)` matches, and returns the field's logical name instead.
 pub(crate) fn physical_to_logical_column_name(
-    schema: &StructType,
+    logical_schema: &StructType,
     physical_col: &ColumnName,
     column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<ColumnName> {
-    let fields = schema.walk_column_fields_by(physical_col, |s, phys_name| {
+    let fields = logical_schema.walk_column_fields_by(physical_col, |s, phys_name| {
         s.fields()
             .find(|f| f.physical_name(column_mapping_mode) == phys_name)
     })?;
