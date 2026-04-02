@@ -319,6 +319,7 @@ mod tests {
 
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStore;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
@@ -862,11 +863,10 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     async fn test_create_table_with_properties() -> Result<(), Box<dyn std::error::Error>> {
         let tmp_dir = tempdir()?;
-        let (table_path, engine, builder) = create_table_builder(
+        let (_table_path, engine, builder) = create_table_builder(
             &tmp_dir,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
-        let table_path_str = table_path.as_str();
 
         // Set properties
         let prop_key1 = "delta.appendOnly";
@@ -893,40 +893,27 @@ mod tests {
         let version = ok_or_panic(unsafe { create_table_commit(builder, engine.shallow_copy()) });
         assert_eq!(version, 0);
 
-        // Verify properties via snapshot
-        let snap = ok_or_panic(unsafe {
-            crate::snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
+        // Verify properties by reading the commit log directly
+        let commit_path = Path::from("_delta_log/00000000000000000000.json");
+        let storage = LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap();
+        let commit_bytes = storage
+            .get(&commit_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let commit_str = std::str::from_utf8(&commit_bytes).unwrap();
+        // Parse each line as a JSON action and find the metaData action
+        let metadata_action: serde_json::Value = commit_str
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|v| v.get("metaData").is_some())
+            .expect("commit should contain a metaData action");
+        let config = &metadata_action["metaData"]["configuration"];
+        assert_eq!(config["delta.appendOnly"], "true");
+        assert_eq!(config["custom.key"], "custom_value");
 
-        let key = "delta.appendOnly";
-        let result = unsafe {
-            crate::snapshot_table_property(
-                snap.shallow_copy(),
-                kernel_string_slice!(key),
-                allocate_str,
-            )
-        };
-        let crate::OptionalValue::Some(val_ptr) = result else {
-            panic!("Expected Some for existing property 'delta.appendOnly'");
-        };
-        let val = recover_string(val_ptr.unwrap());
-        assert_eq!(val, "true");
-
-        let key2 = "custom.key";
-        let result2 = unsafe {
-            crate::snapshot_table_property(
-                snap.shallow_copy(),
-                kernel_string_slice!(key2),
-                allocate_str,
-            )
-        };
-        let crate::OptionalValue::Some(val_ptr2) = result2 else {
-            panic!("Expected Some for existing property 'custom.key'");
-        };
-        let val2 = recover_string(val_ptr2.unwrap());
-        assert_eq!(val2, "custom_value");
-
-        unsafe { crate::free_snapshot(snap) };
         unsafe { free_engine(engine) };
         Ok(())
     }
