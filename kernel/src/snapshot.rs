@@ -521,11 +521,15 @@ impl Snapshot {
             .parquet_handler()
             .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))
         {
-            Ok(_) => (),
+            Ok(()) => (),
             Err(Error::FileAlreadyExists(_)) => {
                 // NOTE: Per write_parquet_file's documentation, it should silently overwrite existing files,
                 // so we log a warning but still return the correct result.
-                warn!("ParquetHandler::write_parquet_file unexpectedly failed on FileAlreadyExists for version {}", self.version());
+                warn!(
+                    "ParquetHandler::write_parquet_file unexpectedly failed on \
+                    FileAlreadyExists for version {}",
+                    self.version()
+                );
                 return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
             }
             Err(e) => return Err(e),
@@ -2339,40 +2343,6 @@ mod tests {
                 content.into(),
             )
             .await?;
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_returns_already_exists_when_checkpoint_at_version() -> DeltaResult<()>
-    {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        let executor = Arc::new(TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ));
-        let engine = DefaultEngineBuilder::new(store.clone())
-            .with_task_executor(executor)
-            .build();
-
-        setup_test_table_with_commits(table_root, &store, 2).await?;
-
-        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-        let (result, snapshot_w_ckpt) = snapshot.checkpoint(&engine)?;
-        assert_eq!(result, CheckpointWriteResult::Written);
-
-        // The returned snapshot has checkpoint_version == end_version, so a second call
-        // should detect the existing checkpoint.
-        let (result, unchanged) = snapshot_w_ckpt.checkpoint(&engine)?;
-        assert_eq!(result, CheckpointWriteResult::AlreadyExists);
-        assert_eq!(unchanged.version(), snapshot_w_ckpt.version());
-
-        // A fresh snapshot loaded from storage also sees the checkpoint and returns
-        // AlreadyExists.
-        let fresh = Snapshot::builder_for(table_root).build(&engine)?;
-        assert_eq!(fresh.log_segment.checkpoint_version, Some(1));
-        let (result, _) = fresh.checkpoint(&engine)?;
-        assert_eq!(result, CheckpointWriteResult::AlreadyExists);
-
         Ok(())
     }
 

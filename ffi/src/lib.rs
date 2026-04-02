@@ -827,7 +827,8 @@ fn snapshot_checkpoint_impl(
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<bool> {
     let (_result, _updated) = snapshot.checkpoint(extern_engine.engine().as_ref())?;
-    // Even if checkpoint already existed, we return true to indicate success (this preserves legacy behavior)
+    // We ignore the CheckpointWriteResult because both Written and AlreadyExists are non-error
+    // outcomes at the FFI layer.
     Ok(true)
 }
 
