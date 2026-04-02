@@ -705,15 +705,22 @@ fn get_indices(
                         )?;
                         // advance the number of parquet fields, but subtract 1 because the
                         // struct will be counted by the `enumerate` call but doesn't count as
-                        // an actual index.
-                        parquet_offset += parquet_advance - 1;
+                        // an actual index. Use saturating_sub to handle empty structs (0 fields).
+                        parquet_offset += parquet_advance.saturating_sub(1);
                         // If no leaf columns were selected (mask unchanged), the parquet
                         // reader will omit this struct entirely. Let the post-loop missing
                         // field logic handle it instead of creating a Nested entry that
                         // would index into a column that doesn't exist. The recursive call
                         // is still needed for the correct `parquet_advance` value;
                         // `children` is intentionally discarded in this case.
-                        if mask_indices.len() > mask_before {
+                        //
+                        // However, if the recursive call fully resolved all requested children
+                        // (e.g. all children are nullable and missing from parquet, or the
+                        // struct is empty), we still emit the struct so it isn't treated as a
+                        // missing top-level field by the post-loop logic.
+                        let all_children_resolved =
+                            children.len() == requested_schema.num_fields();
+                        if mask_indices.len() > mask_before || all_children_resolved {
                             found_fields.insert(requested_field.name());
                             reorder_indices.push(ReorderIndex::nested(index, children));
                         }
@@ -2588,17 +2595,17 @@ mod tests {
             get_requested_indices(&requested_schema, &parquet_schema).unwrap();
         // Only "a" should be in the mask (the struct's children don't match)
         assert_eq!(mask_indices, vec![0]);
-        // "a" at position 0 (identity) + "stats" treated as missing (not nested)
-        let expected_stats_field = Arc::new(
-            requested_schema
-                .field("stats")
-                .unwrap()
-                .try_into_arrow()
-                .unwrap(),
+        // "a" at position 0 (identity) + "stats" as a nested struct with missing child "age"
+        let stats_struct = match &requested_schema.field("stats").unwrap().data_type {
+            DataType::Struct(s) => s,
+            other => panic!("expected struct, got: {other:?}"),
+        };
+        let expected_age_field = Arc::new(
+            stats_struct.field("age").unwrap().try_into_arrow().unwrap(),
         );
         let expect_reorder = vec![
             ReorderIndex::identity(0),
-            ReorderIndex::missing(1, expected_stats_field),
+            ReorderIndex::nested(1, vec![ReorderIndex::missing(0, expected_age_field)]),
         ];
         assert_eq!(reorder_indices, expect_reorder);
     }
@@ -4260,6 +4267,65 @@ mod tests {
         assert_eq!(
             json,
             "{\"str_col\":\"foo\",\"map_col\":{\"bar\":null}}\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn struct_with_all_nullable_children_unmatched_is_not_an_error() {
+        // Requested schema has a non-nullable struct `info` with a nullable child `z`.
+        // Parquet has `info` with different children `x` and `y` (no `z`).
+        // Since `z` is nullable, the struct should be returned with `z` as null rather
+        // than erroring because the non-nullable struct is "missing".
+        let requested_schema = Arc::new(StructType::new_unchecked([
+            StructField::not_null("a", DataType::LONG),
+            StructField::not_null(
+                "info",
+                StructType::new_unchecked([StructField::nullable("z", DataType::LONG)]),
+            ),
+        ]));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int64, true),
+            ArrowField::new(
+                "info",
+                ArrowDataType::Struct(
+                    vec![
+                        ArrowField::new("x", ArrowDataType::Int64, true),
+                        ArrowField::new("y", ArrowDataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            ),
+        ]));
+        let result = get_requested_indices(&requested_schema, &parquet_schema);
+        assert!(
+            result.is_ok(),
+            "Expected Ok when struct children are all nullable and unmatched, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn empty_struct_is_matched() {
+        // Delta protocol allows empty structs. An empty struct has no children, so no
+        // leaf columns are selected — but the struct itself should still be matched.
+        let requested_schema = Arc::new(StructType::new_unchecked([
+            StructField::not_null("a", DataType::LONG),
+            StructField::not_null("empty", StructType::new_unchecked([])),
+        ]));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int64, true),
+            ArrowField::new(
+                "empty",
+                ArrowDataType::Struct(ArrowFields::empty()),
+                false,
+            ),
+        ]));
+        let result = get_requested_indices(&requested_schema, &parquet_schema);
+        assert!(
+            result.is_ok(),
+            "Expected Ok for empty struct, got: {:?}",
+            result.unwrap_err()
         );
     }
 }
