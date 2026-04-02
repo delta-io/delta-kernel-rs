@@ -767,12 +767,12 @@ pub unsafe extern "C" fn get_snapshot_builder(
 /// Caller is responsible for passing valid handles.
 #[no_mangle]
 pub unsafe extern "C" fn get_snapshot_builder_from(
-    old_snapshot: Handle<SharedSnapshot>,
+    prev_snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<MutableFfiSnapshotBuilder>> {
     let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
-    let snapshot_arc = unsafe { old_snapshot.clone_as_arc() };
+    let snapshot_arc = unsafe { prev_snapshot.clone_as_arc() };
     make_snapshot_builder(
         FfiSnapshotBuilderSource::ExistingSnapshot(snapshot_arc),
         engine_arc,
@@ -908,7 +908,8 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
     unsafe { snapshot_builder_build(builder_ptr) }
 }
 
-/// Get the snapshot from the specified table at a specific version.
+/// Get the snapshot from the specified table at a specific version. Note this is only safe for
+/// non-catalog-managed tables.
 ///
 /// # Safety
 ///
@@ -1659,8 +1660,8 @@ mod tests {
     async fn test_builder_from_existing_snapshot_advances_to_latest_and_pinned_version(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let path = "memory:///";
-        let (storage, engine, old_snapshot) = make_engine_and_v0_snapshot(path).await?;
-        assert_eq!(unsafe { version(old_snapshot.shallow_copy()) }, 0);
+        let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
+        assert_eq!(unsafe { version(snapshot_at_v0.shallow_copy()) }, 0);
 
         add_commit(
             path,
@@ -1677,20 +1678,18 @@ mod tests {
         )
         .await?;
 
-        // advance to latest version using existing snapshot
-        let new_snapshot = unsafe {
+        let snapshot_at_v2 = unsafe {
             let ptr = ok_or_panic(get_snapshot_builder_from(
-                old_snapshot.shallow_copy(),
+                snapshot_at_v0.shallow_copy(),
                 engine.shallow_copy(),
             ));
             ok_or_panic(snapshot_builder_build(ptr))
         };
-        assert_eq!(unsafe { version(new_snapshot.shallow_copy()) }, 2);
+        assert_eq!(unsafe { version(snapshot_at_v2.shallow_copy()) }, 2);
 
-        // pin to version 1 using existing snapshot
         let snapshot_at_v1 = unsafe {
             let mut ptr = ok_or_panic(get_snapshot_builder_from(
-                old_snapshot.shallow_copy(),
+                snapshot_at_v0.shallow_copy(),
                 engine.shallow_copy(),
             ));
             snapshot_builder_set_version(&mut ptr, 1);
@@ -1698,20 +1697,72 @@ mod tests {
         };
         assert_eq!(unsafe { version(snapshot_at_v1.shallow_copy()) }, 1);
 
-        unsafe { free_snapshot(old_snapshot) }
-        unsafe { free_snapshot(new_snapshot) }
+        unsafe { free_snapshot(snapshot_at_v2) }
         unsafe { free_snapshot(snapshot_at_v1) }
+        unsafe { free_snapshot(snapshot_at_v0) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_builder_from_existing_snapshot_rejects_earlier_version(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = "memory:///";
+        let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
+
+        add_commit(
+            path,
+            storage.as_ref(),
+            1,
+            actions_to_string(vec![TestAction::Add("file1.parquet".into())]),
+        )
+        .await?;
+        add_commit(
+            path,
+            storage.as_ref(),
+            2,
+            actions_to_string(vec![TestAction::Add("file2.parquet".into())]),
+        )
+        .await?;
+
+        // build a v2 snapshot to use as the base
+        let snapshot_at_v2 = unsafe {
+            let ptr = ok_or_panic(get_snapshot_builder_from(
+                snapshot_at_v0.shallow_copy(),
+                engine.shallow_copy(),
+            ));
+            ok_or_panic(snapshot_builder_build(ptr))
+        };
+        assert_eq!(unsafe { version(snapshot_at_v2.shallow_copy()) }, 2);
+
+        // pinning to a version older than the hint snapshot is rejected
+        let result = unsafe {
+            let mut ptr = ok_or_panic(get_snapshot_builder_from(
+                snapshot_at_v2.shallow_copy(),
+                engine.shallow_copy(),
+            ));
+            snapshot_builder_set_version(&mut ptr, 1);
+            snapshot_builder_build(ptr)
+        };
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::GenericError,
+            Some("Generic delta kernel error: Requested snapshot version 1 is older than snapshot hint version 2"),
+        );
+
+        unsafe { free_snapshot(snapshot_at_v2) }
+        unsafe { free_snapshot(snapshot_at_v0) }
         unsafe { free_engine(engine) }
         Ok(())
     }
 
     #[cfg(feature = "catalog-managed")]
     #[tokio::test]
-    async fn test_snapshot_with_log_tail_and_old_snapshot() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn test_snapshot_with_prev_snapshot_and_log_tail(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let path = "memory:///";
-        let (storage, engine, old_snapshot) = make_engine_and_v0_snapshot(path).await?;
-        assert_eq!(unsafe { version(old_snapshot.shallow_copy()) }, 0);
+        let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
+        assert_eq!(unsafe { version(snapshot_at_v0.shallow_copy()) }, 0);
 
         // Add staged commit (version 1)
         let commit1 = add_staged_commit(
@@ -1752,10 +1803,9 @@ mod tests {
             len: log_tail.len(),
         };
 
-        // Create new snapshot using old snapshot for optimization with log tail
-        let new_snapshot = unsafe {
+        let snapshot_at_v2 = unsafe {
             let mut ptr = ok_or_panic(get_snapshot_builder_from(
-                old_snapshot.shallow_copy(),
+                snapshot_at_v0.shallow_copy(),
                 engine.shallow_copy(),
             ));
             ok_or_panic(snapshot_builder_set_log_tail(
@@ -1764,25 +1814,22 @@ mod tests {
             ));
             ok_or_panic(snapshot_builder_build(ptr))
         };
-        let new_version = unsafe { version(new_snapshot.shallow_copy()) };
-        assert_eq!(new_version, 2);
+        assert_eq!(unsafe { version(snapshot_at_v2.shallow_copy()) }, 2);
 
-        // Create snapshot at specific version using old snapshot with log tail
         let snapshot_at_v1 = unsafe {
             let mut ptr = ok_or_panic(get_snapshot_builder_from(
-                old_snapshot.shallow_copy(),
+                snapshot_at_v0.shallow_copy(),
                 engine.shallow_copy(),
             ));
             snapshot_builder_set_version(&mut ptr, 1);
             ok_or_panic(snapshot_builder_set_log_tail(&mut ptr, log_tail_array));
             ok_or_panic(snapshot_builder_build(ptr))
         };
-        let v1_version = unsafe { version(snapshot_at_v1.shallow_copy()) };
-        assert_eq!(v1_version, 1);
+        assert_eq!(unsafe { version(snapshot_at_v1.shallow_copy()) }, 1);
 
-        unsafe { free_snapshot(old_snapshot) }
-        unsafe { free_snapshot(new_snapshot) }
+        unsafe { free_snapshot(snapshot_at_v2) }
         unsafe { free_snapshot(snapshot_at_v1) }
+        unsafe { free_snapshot(snapshot_at_v0) }
         unsafe { free_engine(engine) }
         Ok(())
     }
@@ -1811,16 +1858,16 @@ mod tests {
             allocate_err,
         );
 
-        let snap = unsafe {
+        let snapshot_at_v1 = unsafe {
             let ptr = ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
             ));
             ok_or_panic(snapshot_builder_build(ptr))
         };
-        assert_eq!(unsafe { version(snap.shallow_copy()) }, 1);
+        assert_eq!(unsafe { version(snapshot_at_v1.shallow_copy()) }, 1);
 
-        unsafe { free_snapshot(snap) }
+        unsafe { free_snapshot(snapshot_at_v1) }
         unsafe { free_engine(engine) }
         Ok(())
     }
@@ -1838,14 +1885,14 @@ mod tests {
                 engine.shallow_copy(),
             ))
         };
-        unsafe { free_snapshot_builder(ptr) };
 
+        unsafe { free_snapshot_builder(ptr) };
         unsafe { free_engine(engine) }
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_builder_with_invalid_path_returns_error() -> Result<(), Box<dyn std::error::Error>>
+    async fn test_builder_with_nonexistent_path_returns_error() -> Result<(), Box<dyn std::error::Error>>
     {
         let storage = Arc::new(InMemory::new());
         let engine = engine_to_handle(
@@ -1857,7 +1904,7 @@ mod tests {
             let invalid_path = "not a valid url!";
             get_snapshot_builder(kernel_string_slice!(invalid_path), engine.shallow_copy())
         };
-        assert_extern_result_error_with_message(result, KernelError::InvalidUrlError, None);
+        assert_extern_result_error_with_message(result, KernelError::InvalidTableLocationError, None);
 
         unsafe { free_engine(engine) }
         Ok(())
