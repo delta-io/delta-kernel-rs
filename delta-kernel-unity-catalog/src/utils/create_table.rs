@@ -212,10 +212,58 @@ mod tests {
             "ICT timestamp should be non-zero, got {timestamp}"
         );
 
-        // Clustering columns
+        // Clustering columns: serialized as [[col1], [col2]] (array of path arrays)
         let parsed: Vec<Vec<String>> =
             serde_json::from_str(&uc_props["clusteringColumns"]).unwrap();
         assert_eq!(parsed, vec![vec!["region"]]);
+    }
+
+    #[tokio::test]
+    async fn test_clustering_columns_serialization_multiple_and_nested() {
+        let storage = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(storage).build();
+        let table_path = "memory:///test_clustering_ser/";
+        let address_struct = StructType::new_unchecked(vec![
+            StructField::new("city", DataType::STRING, true),
+            StructField::new("zip", DataType::STRING, true),
+        ]);
+        let schema = Arc::new(
+            StructType::try_new(vec![
+                StructField::new("id", DataType::INTEGER, false),
+                StructField::new("region", DataType::STRING, true),
+                StructField::new("address", DataType::Struct(Box::new(address_struct)), true),
+            ])
+            .unwrap(),
+        );
+
+        use delta_kernel::expressions::ColumnName;
+
+        let disk_props = get_required_properties_for_disk("test-table-id");
+        let _ = create_table(table_path, schema, "Test/1.0")
+            .with_table_properties(disk_props)
+            .with_data_layout(DataLayout::Clustered {
+                columns: vec![
+                    ColumnName::new(["region"]),
+                    ColumnName::new(["address", "city"]),
+                ],
+            })
+            .build(&engine, Box::new(MockCatalogCommitter))
+            .unwrap()
+            .commit(&engine)
+            .unwrap();
+
+        let snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
+        let uc_props = get_final_required_properties_for_uc(&snapshot, &engine).unwrap();
+
+        // Clustering columns serialized as array of path arrays:
+        // [["region"], ["address", "city"]]
+        let raw_json = &uc_props["clusteringColumns"];
+        let parsed: Vec<Vec<String>> = serde_json::from_str(raw_json).unwrap();
+        assert_eq!(
+            parsed,
+            vec![vec!["region"], vec!["address", "city"]],
+            "Raw JSON: {raw_json}"
+        );
     }
 
     #[tokio::test]
