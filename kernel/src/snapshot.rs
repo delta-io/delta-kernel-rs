@@ -2695,7 +2695,7 @@ mod tests {
         Some("name"),
         Some(vec![ColumnName::new(["region"])])
     )]
-    fn get_logical_clustering_columns_cases(
+    fn test_get_logical_clustering_columns(
         #[case] clustering_cols: Option<Vec<&str>>,
         #[case] column_mapping_mode: Option<&str>,
         #[case] expected: Option<Vec<ColumnName>>,
