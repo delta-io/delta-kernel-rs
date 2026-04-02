@@ -519,16 +519,19 @@ impl<S> Transaction<S> {
         is_catalog_committer: bool,
         commit_type: &CommitType,
     ) -> DeltaResult<()> {
-        if is_catalog_committer != commit_type.requires_catalog_committer() {
-            let msg = if commit_type.requires_catalog_committer() {
+        match (
+            is_catalog_committer,
+            commit_type.requires_catalog_committer(),
+        ) {
+            (true, true) | (false, false) => Ok(()),
+            (false, true) => Err(Error::generic(
                 "A catalog committer must be used to commit to catalog-managed tables. \
-                 Please provide a catalog committer via Snapshot::transaction()."
-            } else {
-                "A catalog committer cannot be used to commit to path-based tables."
-            };
-            return Err(Error::generic(msg));
+                 Please provide a catalog committer via Snapshot::transaction().",
+            )),
+            (true, false) => Err(Error::generic(
+                "A catalog committer cannot be used to commit to path-based tables.",
+            )),
         }
-        Ok(())
     }
 
     /// Builds the [`CommitMetadata`] for this transaction. Determines the commit type,
