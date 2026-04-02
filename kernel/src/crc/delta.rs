@@ -177,8 +177,9 @@ impl Crc {
             self.metadata = m;
         }
 
-        // Domain metadata: insert or remove by domain name. Only update if the base CRC
-        // tracks domain metadata (Complete or Partial). Untracked stays Untracked.
+        // Domain metadata: insert or remove by domain name. Complete and Partial get
+        // entries upserted. Untracked transitions to Partial when the update has entries
+        // (we found DM in the replay range even though the base CRC lacked a DM field).
         if !update.domain_metadata.is_empty() {
             match &mut self.domain_metadata {
                 DomainMetadataState::Complete(map) | DomainMetadataState::Partial(map) => {
@@ -190,16 +191,30 @@ impl Crc {
                         }
                     }
                 }
-                DomainMetadataState::Untracked => {}
+                DomainMetadataState::Untracked => {
+                    self.domain_metadata = DomainMetadataState::Partial(
+                        update
+                            .domain_metadata
+                            .into_iter()
+                            .filter(|(_, dm)| !dm.is_removed())
+                            .collect(),
+                    );
+                }
             }
         }
 
-        // Set transactions: upsert by app_id. Only update if the base CRC tracks them.
-        match &mut self.set_transactions {
-            SetTransactionState::Complete(map) | SetTransactionState::Partial(map) => {
-                map.extend(update.set_transactions);
+        // Set transactions: upsert by app_id. Untracked transitions to Partial when the
+        // update has entries.
+        if !update.set_transactions.is_empty() {
+            match &mut self.set_transactions {
+                SetTransactionState::Complete(map) | SetTransactionState::Partial(map) => {
+                    map.extend(update.set_transactions);
+                }
+                SetTransactionState::Untracked => {
+                    self.set_transactions =
+                        SetTransactionState::Partial(update.set_transactions);
+                }
             }
-            SetTransactionState::Untracked => {}
         }
 
         // In-commit timestamp: unconditional replace (not guarded by `if let Some`).
@@ -478,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_with_untracked_domain_metadata_skips_changes() {
+    fn test_apply_with_untracked_domain_metadata_transitions_to_partial() {
         let mut crc = base_crc();
         assert!(matches!(
             crc.domain_metadata,
@@ -491,11 +506,11 @@ mod tests {
         };
         crc.apply(update);
 
-        // domain_metadata stays Untracked. apply() must not create a partial map.
-        assert!(matches!(
-            crc.domain_metadata,
-            DomainMetadataState::Untracked
-        ));
+        // Untracked transitions to Partial: we found DM entries in the update.
+        let map = crc.domain_metadata.map().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["my.domain"].configuration(), "config1");
+        assert!(!crc.domain_metadata.is_complete());
     }
 
     #[test]
@@ -662,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_with_untracked_set_transactions_skips_changes() {
+    fn test_apply_with_untracked_set_transactions_transitions_to_partial() {
         let mut crc = base_crc();
         assert!(matches!(
             crc.set_transactions,
@@ -675,11 +690,11 @@ mod tests {
         };
         crc.apply(update);
 
-        // set_transactions stays Untracked. apply() must not create a partial map.
-        assert!(matches!(
-            crc.set_transactions,
-            SetTransactionState::Untracked
-        ));
+        // Untracked transitions to Partial: we found txn entries in the update.
+        let map = crc.set_transactions.map().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["my-app"].version, 1);
+        assert!(!crc.set_transactions.is_complete());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -640,13 +640,25 @@ impl Snapshot {
         let expiration_timestamp =
             calculate_transaction_expiration_timestamp(self.table_properties())?;
 
-        // Fast path: serve from CRC only when set transactions are Complete.
-        // Partial state has entries from newer commits but may be missing older entries.
-        if let SetTransactionState::Complete(txn_map) = self.crc.set_transaction_state() {
-            return Ok(txn_map
-                .get(application_id)
-                .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
-                .map(|txn| txn.version));
+        match self.crc.set_transaction_state() {
+            SetTransactionState::Complete(txn_map) => {
+                // Complete: map is authoritative.
+                return Ok(txn_map
+                    .get(application_id)
+                    .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
+                    .map(|txn| txn.version));
+            }
+            SetTransactionState::Partial(txn_map) => {
+                // Partial: check cache first. If found, use it. If not, replay.
+                if let Some(txn) = txn_map.get(application_id) {
+                    if !is_set_txn_expired(expiration_timestamp, txn.last_updated) {
+                        return Ok(Some(txn.version));
+                    }
+                    return Ok(None);
+                }
+                // Not in partial cache, fall through to log replay.
+            }
+            SetTransactionState::Untracked => {}
         }
 
         // Fallback: full log replay.
@@ -714,17 +726,44 @@ impl Snapshot {
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
     ) -> DeltaResult<DomainMetadataMap> {
-        // Fast path: serve from CRC only when domain metadata is Complete.
-        // Partial state has entries from newer commits but may be missing older entries.
-        if let DomainMetadataState::Complete(dm_map) = self.crc.domain_metadata_state() {
-            return Ok(match domains {
-                None => dm_map.clone(),
-                Some(filter) => dm_map
-                    .iter()
-                    .filter(|(k, _): &(&String, &DomainMetadata)| filter.contains(k.as_str()))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            });
+        match self.crc.domain_metadata_state() {
+            DomainMetadataState::Complete(dm_map) => {
+                // Complete: map is authoritative. Filter and return directly.
+                return Ok(match domains {
+                    None => dm_map.clone(),
+                    Some(filter) => dm_map
+                        .iter()
+                        .filter(|(k, _)| filter.contains(k.as_str()))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                });
+            }
+            DomainMetadataState::Partial(dm_map) => {
+                // Partial: cache has entries from recent commits. For specific domain
+                // queries, check cache first and only replay for misses.
+                if let Some(filter) = domains {
+                    let mut result = HashMap::new();
+                    let mut missing = HashSet::new();
+                    for domain in filter {
+                        if let Some(dm) = dm_map.get(*domain) {
+                            result.insert(domain.to_string(), dm.clone());
+                        } else {
+                            missing.insert(*domain);
+                        }
+                    }
+                    if missing.is_empty() {
+                        return Ok(result);
+                    }
+                    // Replay only for missing domains
+                    let replayed = self
+                        .log_segment()
+                        .scan_domain_metadatas(Some(&missing), engine)?;
+                    result.extend(replayed);
+                    return Ok(result);
+                }
+                // Partial + requesting ALL domains: must replay the full log
+            }
+            DomainMetadataState::Untracked => {}
         }
         // Fallback: full log replay.
         self.log_segment().scan_domain_metadatas(domains, engine)
