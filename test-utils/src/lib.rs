@@ -433,12 +433,13 @@ pub async fn create_table(
             config.insert("delta.columnMapping.mode".to_string(), json!("name"));
         }
         if writer_features.contains(&"rowTracking") {
+            config.insert("delta.enableRowTracking".to_string(), json!("true"));
             config.insert(
-                "delta.materializedRowIdColumnName".to_string(),
+                "delta.rowTracking.materializedRowIdColumnName".to_string(),
                 json!("some_dummy_column_name"),
             );
             config.insert(
-                "delta.materializedRowCommitVersionColumnName".to_string(),
+                "delta.rowTracking.materializedRowCommitVersionColumnName".to_string(),
                 json!("another_dummy_column_name"),
             );
         }
