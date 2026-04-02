@@ -87,7 +87,7 @@
 // Future extensions:
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
@@ -109,7 +109,6 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _}
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
-use crate::utils::FallibleLazy;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 
 use url::Url;
@@ -195,7 +194,7 @@ pub struct CheckpointWriter {
     version: i64,
 
     /// Cached checkpoint output schema.
-    checkpoint_output_schema: FallibleLazy<SchemaRef>,
+    checkpoint_output_schema: OnceLock<SchemaRef>,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -222,9 +221,28 @@ impl CheckpointWriter {
         Ok(Self {
             snapshot,
             version,
-            checkpoint_output_schema: FallibleLazy::new(),
+            checkpoint_output_schema: OnceLock::new(),
         })
     }
+    /// Returns the cached output schema, initializing it with `f` on first call.
+    ///
+    /// `OnceLock::get_or_try_init` is unstable, so we use a custom implementation.
+    /// (tracking issue: <https://github.com/rust-lang/rust/issues/109737>).
+    fn get_or_init_output_schema(
+        &self,
+        f: impl FnOnce() -> DeltaResult<SchemaRef>,
+    ) -> DeltaResult<SchemaRef> {
+        if let Some(schema) = self.checkpoint_output_schema.get() {
+            return Ok(schema.clone());
+        }
+        let schema = f()?;
+        let _ = self.checkpoint_output_schema.set(schema);
+        self.checkpoint_output_schema
+            .get()
+            .cloned()
+            .ok_or_else(|| Error::internal_error("OnceLock should be initialized"))
+    }
+
     /// Returns the URL where the checkpoint file should be written.
     ///
     /// This method generates the checkpoint path based on the table's root and the version
@@ -330,7 +348,7 @@ impl CheckpointWriter {
         )
         .process_actions_iter(actions);
 
-        let output_schema = self.checkpoint_output_schema.get_or_try_init(|| {
+        let output_schema = self.get_or_init_output_schema(|| {
             build_checkpoint_output_schema(
                 &config,
                 base_schema,
