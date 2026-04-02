@@ -19,10 +19,12 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use delta_kernel::schema::PrimitiveType;
 use delta_kernel::DeltaResult;
 use delta_kernel::Snapshot;
 
@@ -269,8 +271,16 @@ async fn test_checkpoint_partitioned_with_real_data(
         engine.as_ref(),
         batch,
         HashMap::from([
-            ("created_at".to_string(), "2024-01-15 10:30:00".to_string()),
-            ("tag".to_string(), "hello".to_string()),
+            (
+                "created_at".to_string(),
+                PrimitiveType::Timestamp
+                    .parse_scalar("2024-01-15 10:30:00")
+                    .unwrap(),
+            ),
+            (
+                "tag".to_string(),
+                Scalar::Binary("hello".as_bytes().to_vec()),
+            ),
         ]),
     )
     .await?;
@@ -298,9 +308,14 @@ async fn test_checkpoint_partitioned_with_real_data(
         HashMap::from([
             (
                 "created_at".to_string(),
-                "2025-03-01 09:15:30.123456".to_string(),
+                PrimitiveType::Timestamp
+                    .parse_scalar("2025-03-01 09:15:30.123456")
+                    .unwrap(),
             ),
-            ("tag".to_string(), "world".to_string()),
+            (
+                "tag".to_string(),
+                Scalar::Binary("world".as_bytes().to_vec()),
+            ),
         ]),
     )
     .await?;
@@ -478,7 +493,7 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
         &snapshot,
         engine.as_ref(),
         batch,
-        HashMap::from([("category".to_string(), "books".to_string())]),
+        HashMap::from([("category".to_string(), Scalar::String("books".to_string()))]),
     )
     .await?;
 

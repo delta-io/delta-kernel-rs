@@ -963,7 +963,7 @@ pub async fn write_batch_to_table(
     snapshot: &Arc<Snapshot>,
     engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
     data: RecordBatch,
-    partition_values: std::collections::HashMap<String, String>,
+    partition_values: std::collections::HashMap<String, delta_kernel::expressions::Scalar>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
         .clone()
