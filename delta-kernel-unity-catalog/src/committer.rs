@@ -11,6 +11,7 @@ use crate::constants::{
     CATALOG_MANAGED_FEATURE, CLUSTERING_DOMAIN_NAME, ENABLE_IN_COMMIT_TIMESTAMPS,
     IN_COMMIT_TIMESTAMP_FEATURE, UC_TABLE_ID_KEY, VACUUM_PROTOCOL_CHECK_FEATURE,
 };
+use crate::errors;
 
 /// Convenience macro: returns an error if a condition is not met.
 macro_rules! require {
@@ -62,45 +63,39 @@ impl<C: CommitClient> UCCommitter<C> {
     fn validate_catalog_managed_state(&self, commit_metadata: &CommitMetadata) -> DeltaResult<()> {
         require!(
             commit_metadata.commit_type() != CommitType::UpgradeToCatalogManaged,
-            crate::errors::upgrade_downgrade_unsupported("upgrade")
+            errors::upgrade_downgrade_unsupported("upgrade")
         );
         require!(
             commit_metadata.commit_type() != CommitType::DowngradeToPathBased,
-            crate::errors::upgrade_downgrade_unsupported("downgrade")
+            errors::upgrade_downgrade_unsupported("downgrade")
         );
         require!(
             Self::has_catalog_managed_feature(commit_metadata),
-            crate::errors::missing_feature(CATALOG_MANAGED_FEATURE)
+            errors::missing_feature(CATALOG_MANAGED_FEATURE)
+        );
+        require!(
+            commit_metadata.has_writer_feature(VACUUM_PROTOCOL_CHECK_FEATURE)
+                && commit_metadata.has_reader_feature(VACUUM_PROTOCOL_CHECK_FEATURE),
+            errors::missing_feature(VACUUM_PROTOCOL_CHECK_FEATURE)
         );
         require!(
             commit_metadata.has_writer_feature(IN_COMMIT_TIMESTAMP_FEATURE),
-            crate::errors::missing_feature(IN_COMMIT_TIMESTAMP_FEATURE)
+            errors::missing_feature(IN_COMMIT_TIMESTAMP_FEATURE)
         );
 
         let config = commit_metadata
             .metadata_configuration()
-            .ok_or_else(crate::errors::missing_metadata_configuration)?;
+            .ok_or_else(errors::missing_metadata_configuration)?;
         let table_id = config
             .get(UC_TABLE_ID_KEY)
-            .ok_or_else(|| crate::errors::missing_property(UC_TABLE_ID_KEY))?;
+            .ok_or_else(|| errors::missing_property(UC_TABLE_ID_KEY))?;
         require!(
             table_id == &self.table_id,
-            crate::errors::table_id_mismatch(&self.table_id, table_id)
+            errors::table_id_mismatch(&self.table_id, table_id)
         );
         require!(
             config.get(ENABLE_IN_COMMIT_TIMESTAMPS).map(String::as_str) == Some("true"),
-            crate::errors::ict_not_enabled()
-        );
-        Ok(())
-    }
-
-    /// Additional validation for version 0 (table creation). Checks that `vacuumProtocolCheck`
-    /// is present, which is required when creating new catalog-managed tables.
-    fn validate_version_0_features(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
-        require!(
-            commit_metadata.has_writer_feature(VACUUM_PROTOCOL_CHECK_FEATURE)
-                && commit_metadata.has_reader_feature(VACUUM_PROTOCOL_CHECK_FEATURE),
-            crate::errors::missing_feature(VACUUM_PROTOCOL_CHECK_FEATURE)
+            errors::ict_not_enabled()
         );
         Ok(())
     }
@@ -110,15 +105,15 @@ impl<C: CommitClient> UCCommitter<C> {
     fn validate_no_alter_table_changes(commit_metadata: &CommitMetadata) -> DeltaResult<()> {
         require!(
             !commit_metadata.has_protocol_change(),
-            crate::errors::alter_table_unsupported("protocol")
+            errors::alter_table_unsupported("protocol")
         );
         require!(
             !commit_metadata.has_metadata_change(),
-            crate::errors::alter_table_unsupported("metadata")
+            errors::alter_table_unsupported("metadata")
         );
         require!(
             !commit_metadata.has_domain_metadata_change(CLUSTERING_DOMAIN_NAME),
-            crate::errors::alter_table_unsupported("clustering columns")
+            errors::alter_table_unsupported("clustering columns")
         );
         Ok(())
     }
@@ -137,7 +132,6 @@ impl<C: CommitClient> UCCommitter<C> {
             commit_metadata.version()
         );
         self.validate_catalog_managed_state(commit_metadata)?;
-        Self::validate_version_0_features(commit_metadata)?;
         let published_commit_path = commit_metadata.published_commit_path()?;
         match engine.json_handler().write_json_file(
             &published_commit_path,

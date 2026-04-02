@@ -504,8 +504,8 @@ mod tests {
             schema,
             &[],
             true, // use v3/v7 protocol
-            vec!["catalogManaged"],
-            vec!["inCommitTimestamp", "catalogManaged"],
+            vec!["catalogManaged", "vacuumProtocolCheck"],
+            vec!["inCommitTimestamp", "catalogManaged", "vacuumProtocolCheck"],
         )
         .await?;
 
