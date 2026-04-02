@@ -442,7 +442,6 @@ impl LogRoot {
     }
 
     /// Create a new staged commit path (absolute path) for the given version.
-    #[allow(unused)] // TODO: Remove this once we remove catalog-managed feature
     pub(crate) fn new_staged_commit_path(
         &self,
         version: Version,

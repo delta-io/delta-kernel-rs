@@ -53,7 +53,6 @@ pub mod delta_kernel_unity_catalog;
 pub mod expressions;
 #[cfg(feature = "tracing")]
 pub mod ffi_tracing;
-#[cfg(feature = "catalog-managed")]
 pub mod log_path;
 pub mod scan;
 pub mod schema;
@@ -1614,7 +1613,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "catalog-managed")]
     #[tokio::test]
     async fn test_snapshot_log_tail() -> Result<(), Box<dyn std::error::Error>> {
         let table_root = "memory:///test_table/";

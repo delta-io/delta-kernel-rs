@@ -53,7 +53,6 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // VacuumProtocolCheck ensures consistent protocol checks during VACUUM
     TableFeature::VacuumProtocolCheck,
     // CatalogManaged enables catalog-managed table support
-    #[cfg(feature = "catalog-managed")]
     TableFeature::CatalogManaged,
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
@@ -386,7 +385,6 @@ fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProp
 
 /// Ensures that `inCommitTimestamp` is enabled when `catalogManaged` is present. Adds the ICT
 /// feature to the protocol and sets the enablement property if not already present.
-#[cfg(feature = "catalog-managed")]
 fn maybe_enable_ict_for_catalog_managed(
     validated: &mut ValidatedTableProperties,
 ) -> DeltaResult<()> {
@@ -725,7 +723,6 @@ impl CreateTableTransactionBuilder {
         maybe_auto_enable_property_driven_features(&mut validated);
 
         // Auto-enable inCommitTimestamp for catalogManaged tables
-        #[cfg(feature = "catalog-managed")]
         maybe_enable_ict_for_catalog_managed(&mut validated)?;
 
         // Create Protocol action with table features support
@@ -1177,6 +1174,7 @@ mod tests {
     #[case::append_only(TableFeature::AppendOnly, "appendOnly")]
     #[case::change_data_feed(TableFeature::ChangeDataFeed, "changeDataFeed")]
     #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
+    #[case::catalog_managed(TableFeature::CatalogManaged, "catalogManaged")]
     fn test_feature_signal_accepted(#[case] feature: TableFeature, #[case] feature_name: &str) {
         let key = format!("delta.feature.{feature_name}");
         let properties = HashMap::from([(key, "supported".to_string())]);
@@ -1200,30 +1198,6 @@ mod tests {
                 "{feature:?} is WriterOnly but reader_features is not empty"
             ),
         }
-    }
-
-    // TODO: Merge into `test_feature_signal_accepted` once the `catalog-managed` feature flag
-    // is removed.
-    #[cfg(feature = "catalog-managed")]
-    #[test]
-    fn test_feature_signal_accepted_catalog_managed() {
-        let key = "delta.feature.catalogManaged".to_string();
-        let properties = HashMap::from([(key, "supported".to_string())]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
-
-        assert!(
-            validated.properties.is_empty(),
-            "Feature signal should be removed from properties"
-        );
-        let feature = TableFeature::CatalogManaged;
-        assert!(
-            validated.writer_features.contains(&feature),
-            "{feature:?} should be in writer_features"
-        );
-        assert!(
-            validated.reader_features.contains(&feature),
-            "{feature:?} is ReaderWriter but missing from reader_features"
-        );
     }
 
     fn multi_column_schema() -> SchemaRef {
@@ -1403,7 +1377,6 @@ mod tests {
         assert!(validate_partition_columns(&schema, &columns).is_ok());
     }
 
-    #[cfg(feature = "catalog-managed")]
     #[test]
     fn test_catalog_managed_auto_enables_ict() {
         let properties = HashMap::from([(
@@ -1427,7 +1400,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "catalog-managed")]
     #[test]
     fn test_catalog_managed_with_ict_true_succeeds() {
         let properties = HashMap::from([
@@ -1453,7 +1425,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "catalog-managed")]
     #[test]
     fn test_catalog_managed_with_ict_false_fails() {
         let properties = HashMap::from([
