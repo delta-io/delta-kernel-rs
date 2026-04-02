@@ -162,8 +162,6 @@ impl Transaction {
     ///
     /// // Commit the transaction
     /// txn.commit(engine.as_ref())?;
-    /// # }
-    /// # Ok(())
     /// # Ok(())
     /// # }
     /// ```
