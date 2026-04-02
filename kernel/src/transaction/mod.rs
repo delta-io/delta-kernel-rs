@@ -503,6 +503,8 @@ impl<S> Transaction<S> {
             false
         };
 
+        // TODO: Handle UpgradeToCatalogManaged and DowngradeToPathBased when ALTER TABLE
+        // SET TBLPROPERTIES is supported.
         match (is_create, is_catalog_managed) {
             (true, true) => CommitType::CatalogManagedCreate,
             (true, false) => CommitType::PathBasedCreate,
@@ -517,8 +519,8 @@ impl<S> Transaction<S> {
         is_catalog_committer: bool,
         commit_type: &CommitType,
     ) -> DeltaResult<()> {
-        if is_catalog_committer != commit_type.is_catalog_managed() {
-            let msg = if commit_type.is_catalog_managed() {
+        if is_catalog_committer != commit_type.requires_catalog_committer() {
+            let msg = if commit_type.requires_catalog_committer() {
                 "A catalog committer must be used to commit to catalog-managed tables. \
                  Please provide a catalog committer via Snapshot::transaction()."
             } else {

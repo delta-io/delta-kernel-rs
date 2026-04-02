@@ -38,11 +38,15 @@ impl CommitType {
         matches!(self, Self::PathBasedCreate | Self::CatalogManagedCreate)
     }
 
-    /// Returns `true` if this is a catalog-managed commit.
-    pub fn is_catalog_managed(&self) -> bool {
+    /// Returns `true` if this commit includes a catalog-managed operation,
+    /// including upgrade/downgrade.
+    pub fn requires_catalog_committer(&self) -> bool {
         matches!(
             self,
-            Self::CatalogManagedCreate | Self::CatalogManagedWrite | Self::UpgradeToCatalogManaged
+            Self::CatalogManagedCreate
+                | Self::CatalogManagedWrite
+                | Self::UpgradeToCatalogManaged
+                | Self::DowngradeToPathBased
         )
     }
 }
@@ -63,19 +67,25 @@ pub(crate) struct CommitProtocolMetadata {
 }
 
 impl CommitProtocolMetadata {
-    /// Creates a new `CommitProtocolMetadata`, validating that at least one complete pair
-    /// (protocol + metadata) is present.
     pub(crate) fn try_new(
         read_protocol: Option<Protocol>,
         read_metadata: Option<Metadata>,
         new_protocol: Option<Protocol>,
         new_metadata: Option<Metadata>,
     ) -> DeltaResult<Self> {
-        let has_read_pair = read_protocol.is_some() && read_metadata.is_some();
-        let has_new_pair = new_protocol.is_some() && new_metadata.is_some();
-        if !has_read_pair && !has_new_pair {
+        if read_protocol.is_some() != read_metadata.is_some() {
             return Err(crate::Error::generic(
-                "CommitProtocolMetadata requires at least one complete protocol/metadata pair",
+                "read_protocol and read_metadata must both be present or both be absent",
+            ));
+        }
+        if read_protocol.is_none() && new_protocol.is_none() {
+            return Err(crate::Error::generic(
+                "CommitProtocolMetadata requires at least one protocol (read or new)",
+            ));
+        }
+        if read_metadata.is_none() && new_metadata.is_none() {
+            return Err(crate::Error::generic(
+                "CommitProtocolMetadata requires at least one metadata (read or new)",
             ));
         }
         Ok(Self {
