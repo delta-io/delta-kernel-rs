@@ -718,8 +718,7 @@ fn get_indices(
                         // (e.g. all children are nullable and missing from parquet, or the
                         // struct is empty), we still emit the struct so it isn't treated as a
                         // missing top-level field by the post-loop logic.
-                        let all_children_resolved =
-                            children.len() == requested_schema.num_fields();
+                        let all_children_resolved = children.len() == requested_schema.num_fields();
                         if mask_indices.len() > mask_before || all_children_resolved {
                             found_fields.insert(requested_field.name());
                             reorder_indices.push(ReorderIndex::nested(index, children));
@@ -2600,9 +2599,8 @@ mod tests {
             DataType::Struct(s) => s,
             other => panic!("expected struct, got: {other:?}"),
         };
-        let expected_age_field = Arc::new(
-            stats_struct.field("age").unwrap().try_into_arrow().unwrap(),
-        );
+        let expected_age_field =
+            Arc::new(stats_struct.field("age").unwrap().try_into_arrow().unwrap());
         let expect_reorder = vec![
             ReorderIndex::identity(0),
             ReorderIndex::nested(1, vec![ReorderIndex::missing(0, expected_age_field)]),
@@ -4315,11 +4313,7 @@ mod tests {
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", ArrowDataType::Int64, true),
-            ArrowField::new(
-                "empty",
-                ArrowDataType::Struct(ArrowFields::empty()),
-                false,
-            ),
+            ArrowField::new("empty", ArrowDataType::Struct(ArrowFields::empty()), false),
         ]));
         let result = get_requested_indices(&requested_schema, &parquet_schema);
         assert!(
