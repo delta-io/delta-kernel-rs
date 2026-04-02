@@ -2387,6 +2387,77 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Exercises the exact code path from `get_add_transform_expr` where a `struct_from`
+    /// expression wraps `column_expr!("add.stats_parsed")`. When the checkpoint parquet has
+    /// stats_parsed with physical column names (e.g. `col-abc-001`) but the output schema
+    /// uses logical names (e.g. `id`), `evaluate_struct_expression` calls
+    /// `evaluate_expression(Column, struct_result_type)` with mismatched field names.
+    /// Without ordinal-based validation this fails with a name mismatch error.
+    #[test]
+    fn struct_from_with_column_tolerates_nested_name_mismatch() {
+        // Build a batch mimicking checkpoint data: add.stats_parsed uses physical names
+        let stats_fields: Vec<ArrowField> = vec![
+            ArrowField::new("col-abc-001", ArrowDataType::Int64, true),
+            ArrowField::new("col-abc-002", ArrowDataType::Int64, true),
+        ];
+        let stats_array = StructArray::try_new(
+            stats_fields.clone().into(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1)])),
+                Arc::new(Int64Array::from(vec![Some(10)])),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let add_fields: Vec<ArrowField> = vec![
+            ArrowField::new("path", ArrowDataType::Utf8, true),
+            ArrowField::new(
+                "stats_parsed",
+                ArrowDataType::Struct(stats_fields.into()),
+                true,
+            ),
+        ];
+        let add_struct = StructArray::try_new(
+            add_fields.clone().into(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("file.parquet")])),
+                Arc::new(stats_array),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "add",
+            ArrowDataType::Struct(add_fields.into()),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(add_struct)]).unwrap();
+
+        // struct_from mimicking get_add_transform_expr: wraps a Column referencing stats_parsed
+        let expr = Expr::struct_from([
+            column_expr_ref!("add.path"),
+            column_expr_ref!("add.stats_parsed"),
+        ]);
+
+        // Output schema uses logical names (differs from physical names in the batch)
+        let output_type = DataType::try_struct_type([
+            StructField::nullable("path", DataType::STRING),
+            StructField::nullable(
+                "stats_parsed",
+                DataType::struct_type_unchecked([
+                    StructField::nullable("id", DataType::LONG),
+                    StructField::nullable("value", DataType::LONG),
+                ]),
+            ),
+        ])
+        .unwrap();
+
+        let result = evaluate_expression(&expr, &batch, Some(&output_type));
+        result.expect("struct_from with Column sub-expression should tolerate field name mismatch");
+    }
+
     #[test]
     fn column_extract_nested_struct_with_mismatched_names() {
         let inner_fields = vec![ArrowField::new("phys-inner", ArrowDataType::Int64, true)];
