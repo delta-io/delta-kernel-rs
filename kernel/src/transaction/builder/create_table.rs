@@ -65,9 +65,6 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::AppendOnly,
     TableFeature::ChangeDataFeed,
     TableFeature::TypeWidening,
-    // CatalogManaged enables catalog-managed table support (requires catalog-managed feature)
-    #[cfg(feature = "catalog-managed")]
-    TableFeature::CatalogManaged,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
