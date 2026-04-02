@@ -37,9 +37,9 @@ pub enum FileStatsState {
         histogram: Option<FileSizeHistogram>,
     },
 
-    /// Relative deltas from commits only. Checkpoint file actions were not read (the log
-    /// segment had >1000 files so we skipped checkpoint add.size during snapshot load).
-    /// Recovery: read checkpoint adds via checkpoint add scanner, merge with these deltas.
+    /// Relative deltas from commits only. Checkpoint file actions were not read during
+    /// snapshot load. Recovery: read checkpoint adds via checkpoint add scanner, merge with
+    /// these deltas.
     RequiresCheckpointRead {
         /// Net file count change from commits (NOT an absolute count).
         commit_delta_files: i64,
@@ -215,7 +215,6 @@ impl SetTransactionState {
         matches!(self, Self::Complete(_))
     }
 }
-
 
 #[cfg(test)]
 mod tests {

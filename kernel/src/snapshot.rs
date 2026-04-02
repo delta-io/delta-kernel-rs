@@ -15,7 +15,10 @@ use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
-use crate::crc::{try_read_crc_file, try_write_crc_file, Crc, CrcUpdate, FileStatsValidity, LazyCrc};
+use crate::crc::{
+    try_read_crc_file, try_write_crc_file, Crc, CrcUpdate, DomainMetadataState, FileStatsValidity,
+    LazyCrc, SetTransactionState,
+};
 use crate::expressions::ColumnName;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
@@ -332,8 +335,8 @@ impl Snapshot {
         )?;
 
         // Build the CRC. Try loading from CRC file first, otherwise build minimal from P&M.
-        let crc = Self::try_build_crc_from_file(&combined_log_segment, engine)
-            .unwrap_or_else(|| {
+        let crc =
+            Self::try_build_crc_from_file(&combined_log_segment, engine).unwrap_or_else(|| {
                 Arc::new(Crc {
                     metadata: table_configuration.metadata().clone(),
                     protocol: table_configuration.protocol().clone(),
@@ -401,10 +404,7 @@ impl Snapshot {
     /// Attempt to build a CRC from a CRC file on disk. Handles both CRC at target version
     /// (loaded directly) and stale CRC (loaded + incremental replay of commits after it).
     /// Returns `None` if no CRC file exists or loading/replay fails.
-    fn try_build_crc_from_file(
-        log_segment: &LogSegment,
-        engine: &dyn Engine,
-    ) -> Option<Arc<Crc>> {
+    fn try_build_crc_from_file(log_segment: &LogSegment, engine: &dyn Engine) -> Option<Arc<Crc>> {
         let crc_file = log_segment.listed.latest_crc_file.as_ref()?;
         let crc_version = crc_file.version;
         let target_version = log_segment.end_version;
@@ -427,8 +427,8 @@ impl Snapshot {
         if crc_version < target_version {
             info!(
                 "Building CRC: replaying commits {}..{} onto stale CRC at {}",
-                target_version,
                 crc_version + 1,
+                target_version,
                 crc_version,
             );
             let pruned = log_segment.segment_after_crc(crc_version);
@@ -454,12 +454,11 @@ impl Snapshot {
     /// producing a post-commit snapshot without a full log replay from storage.
     ///
     /// The `crc_update` captures the CRC-relevant changes from the committed transaction
-    /// (file stats, domain metadata, ICT, etc.). If the pre-commit snapshot had a loaded CRC
-    /// at its version, the delta is applied to produce a precomputed in-memory CRC for the new
-    /// version -- this CRC contains all important table metadata (protocol, metadata, domain
-    /// metadata, set transactions, ICT) and avoids re-reading them from storage. CREATE TABLE
-    /// always produces a CRC at v0. If no CRC was available on the pre-commit snapshot, the
-    /// existing lazy CRC is carried forward unchanged.
+    /// (file stats, domain metadata, ICT, etc.). The CRC is always present on the pre-commit
+    /// snapshot. The delta is applied to produce an updated in-memory CRC for the new
+    /// version, containing all important table metadata (protocol, metadata, domain
+    /// metadata, set transactions, ICT) and avoiding re-reading them from storage. CREATE
+    /// TABLE always produces a CRC at v0.
     ///
     /// TODO: Handle Protocol changes in CrcUpdate (when Kernel-RS supports protocol changes)
     /// TODO: Handle Metadata changes in CrcUpdate (when Kernel-RS supports metadata changes)
@@ -649,8 +648,9 @@ impl Snapshot {
         let expiration_timestamp =
             calculate_transaction_expiration_timestamp(self.table_properties())?;
 
-        // Fast path: serve from CRC if it tracks set transactions.
-        if let Some(txn_map) = self.crc.set_transaction_state().map() {
+        // Fast path: serve from CRC only when set transactions are Complete.
+        // Partial state has entries from newer commits but may be missing older entries.
+        if let SetTransactionState::Complete(txn_map) = self.crc.set_transaction_state() {
             return Ok(txn_map
                 .get(application_id)
                 .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
@@ -722,8 +722,9 @@ impl Snapshot {
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
     ) -> DeltaResult<DomainMetadataMap> {
-        // Fast path: serve from CRC if it tracks domain metadata.
-        if let Some(dm_map) = self.crc.domain_metadata_state().map() {
+        // Fast path: serve from CRC only when domain metadata is Complete.
+        // Partial state has entries from newer commits but may be missing older entries.
+        if let DomainMetadataState::Complete(dm_map) = self.crc.domain_metadata_state() {
             return Ok(match domains {
                 None => dm_map.clone(),
                 Some(filter) => dm_map
@@ -737,20 +738,21 @@ impl Snapshot {
         self.log_segment().scan_domain_metadatas(domains, engine)
     }
 
-    /// Returns file-level statistics, or `None` if no CRC with valid stats exists at this
-    /// snapshot's version.
+    /// Returns file-level statistics, or `None` if the CRC has no valid file stats.
+    ///
+    /// The `_engine` parameter is currently unused but reserved for future use when this
+    /// method may trigger I/O to load or recover file stats.
     ///
     /// NOTE: This is an unstable API expected to change in future releases.
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn get_or_load_file_stats(&self, _engine: &dyn Engine) -> Option<FileStats> {
-        self.crc.file_stats()
+        self.get_file_stats_if_loaded()
     }
 
-    /// Returns file-level statistics, or `None` if CRC is not loaded, not at this
-    /// version, or has no valid file stats.
+    /// Returns file-level statistics, or `None` if the CRC has no valid file stats.
     ///
-    /// NOTE: This API is purely opportunistic, no I/O.
+    /// This is purely opportunistic and performs no I/O.
     #[internal_api]
     pub(crate) fn get_file_stats_if_loaded(&self) -> Option<FileStats> {
         self.crc.file_stats()
@@ -775,10 +777,6 @@ impl Snapshot {
     /// Writes a version checksum (CRC) file for this snapshot. Writers should call this after
     /// every commit because checksums enable faster snapshot loading and table state validation.
     ///
-    /// Currently only supports writing from a post-commit snapshot that has pre-computed CRC
-    /// information in memory (i.e. the snapshot returned by
-    /// [`CommittedTransaction::post_commit_snapshot`]).
-    ///
     /// Returns a tuple of [`ChecksumWriteResult`] and a [`SnapshotRef`]. On
     /// [`ChecksumWriteResult::Written`], the returned snapshot has the CRC file recorded in
     /// its log segment. On [`ChecksumWriteResult::AlreadyExists`], the original snapshot is
@@ -786,12 +784,11 @@ impl Snapshot {
     ///
     /// # Errors
     ///
-    /// - [`Error::ChecksumWriteUnsupported`] if no in-memory CRC is available at this
-    ///   snapshot's version (e.g. a snapshot loaded from disk that has no CRC file), or if
-    ///   the CRC's file stats are not valid. File stats can be invalid for two reasons:
-    ///   (a) a non-incremental operation like ANALYZE STATS was encountered, which is
-    ///   recoverable with a full state reconstruction in the future; (b) a file action had a
-    ///   missing size (e.g. `remove.size` is null), which is permanently unrecoverable.
+    /// - [`Error::ChecksumWriteUnsupported`] if the CRC's file stats are not valid. File
+    ///   stats can be invalid for two reasons: (a) a non-incremental operation like ANALYZE
+    ///   STATS was encountered, which is recoverable with a full state reconstruction in the
+    ///   future; (b) a file action had a missing size (e.g. `remove.size` is null), which is
+    ///   permanently unrecoverable.
     /// - I/O errors from the engine's storage handler if the write fails.
     ///
     /// [`CommittedTransaction::post_commit_snapshot`]: crate::transaction::CommittedTransaction::post_commit_snapshot

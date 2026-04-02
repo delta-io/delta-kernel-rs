@@ -592,8 +592,6 @@ async fn test_ict_errors_when_crc_has_no_ict() {
 
     // With eager CRC, when the CRC has no ICT the system falls through to reading the
     // commit file directly. The commit at v1 has ICT=2000, so we get Ok(Some(2000)).
-    let result = snapshot
-        .get_in_commit_timestamp(&setup.engine)
-        .unwrap();
+    let result = snapshot.get_in_commit_timestamp(&setup.engine).unwrap();
     assert_eq!(result, Some(2000));
 }

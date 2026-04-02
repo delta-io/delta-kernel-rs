@@ -36,7 +36,9 @@ mod tests {
     use super::*;
     use crate::actions::{DomainMetadata, Protocol, SetTransaction};
     use crate::crc::reader::try_read_crc_file;
-    use crate::crc::{DomainMetadataState, FileSizeHistogram, FileStatsValidity, SetTransactionState};
+    use crate::crc::{
+        DomainMetadataState, FileSizeHistogram, FileStatsValidity, SetTransactionState,
+    };
     use crate::engine::default::DefaultEngineBuilder;
     use crate::object_store::memory::InMemory;
     use crate::path::{AsUrl, ParsedLogPath};

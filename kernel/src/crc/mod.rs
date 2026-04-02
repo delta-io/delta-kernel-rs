@@ -238,8 +238,8 @@ pub struct DeletedRecordCountsHistogram {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{DomainMetadataState, SetTransactionState};
     use super::Crc;
+    use super::{DomainMetadataState, SetTransactionState};
     use crate::actions::{DomainMetadata, SetTransaction};
 
     /// Helper to create a minimal `Crc` with only set_transactions and domain_metadata populated.

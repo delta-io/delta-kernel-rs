@@ -681,7 +681,10 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
         .get_all_domain_metadata(engine.as_ref())?
         .is_empty());
     let crc = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
-    assert_eq!(crc.domain_metadata, DomainMetadataState::Complete(Default::default()));
+    assert_eq!(
+        crc.domain_metadata,
+        DomainMetadataState::Complete(Default::default())
+    );
 
     Ok(())
 }
@@ -796,7 +799,10 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
 
     // Post-commit CRC has empty set_transactions (not null)
     let crc_v0 = write_and_verify_crc(snapshot_v0, &table_path, engine.as_ref());
-    assert_eq!(crc_v0.set_transactions, SetTransactionState::Complete(Default::default()));
+    assert_eq!(
+        crc_v0.set_transactions,
+        SetTransactionState::Complete(Default::default())
+    );
 
     // Fresh snapshot with CRC on disk serves queries via fast path (no log replay)
     let fresh_v0 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1002,6 +1008,70 @@ async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> DeltaR
     assert_eq!(
         fresh.get_app_id_version("null-app", engine.as_ref())?,
         Some(42)
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// CRC replay from scratch (build_crc_from_scratch integration)
+// ============================================================================
+
+/// Verifies that `build_crc_from_scratch` produces a correct and complete CRC when no CRC file
+/// exists on disk. Creates a table, inserts data across multiple commits, then loads a fresh
+/// snapshot (triggering full log replay) and checks all CRC fields.
+#[tokio::test]
+async fn test_build_crc_from_scratch_produces_complete_crc_with_valid_stats() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // v0: CREATE TABLE with schema (id: INT)
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+    let committed = create_table(&table_path, schema, "test_engine")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
+
+    // v1: Insert values 1..=5 (adds files with commitInfo "WRITE")
+    let col1: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]));
+    let committed = insert_data(snapshot_v0, &engine, vec![col1])
+        .await?
+        .unwrap_committed();
+    let snapshot_v1 = committed.post_commit_snapshot().unwrap().clone();
+
+    // v2: Insert values 6..=10 (adds more files with commitInfo "WRITE")
+    let col2: ArrayRef = Arc::new(Int32Array::from(vec![6, 7, 8, 9, 10]));
+    let _ = insert_data(snapshot_v1, &engine, vec![col2])
+        .await?
+        .unwrap_committed();
+
+    // Load a fresh snapshot from disk (no CRC file) via Snapshot::builder_for.
+    // This triggers build_crc_from_scratch internally.
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 2);
+
+    let crc = snapshot
+        .get_current_crc_if_loaded_for_testing()
+        .expect("CRC should be built from scratch when no CRC file exists");
+
+    // File stats should be Valid with correct counts
+    assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
+    let stats = crc.file_stats().expect("Valid CRC should have file stats");
+    assert_eq!(stats.num_files, 2); // one file per insert
+    assert!(stats.table_size_bytes > 0);
+
+    // DM and txns should be Complete (full log was replayed) and empty (none were written)
+    assert_eq!(
+        crc.domain_metadata,
+        DomainMetadataState::Complete(Default::default())
+    );
+    assert_eq!(
+        crc.set_transactions,
+        SetTransactionState::Complete(Default::default())
     );
 
     Ok(())

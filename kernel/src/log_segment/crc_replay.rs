@@ -19,14 +19,13 @@ use crate::actions::{
     COMMIT_INFO_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SET_TRANSACTION_NAME,
 };
-use crate::crc::{Crc, CrcUpdate, DomainMetadataState, FileStatsDelta, FileStatsValidity, SetTransactionState};
+use crate::crc::{Crc, CrcUpdate, FileStatsDelta};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::{DeltaResult, Engine, RowVisitor};
 
 use super::LogSegment;
 
-#[allow(dead_code)] // Used when snapshot construction integrates CRC replay (step 4).
 /// Schema for CRC incremental replay. Reads add.size, remove.path, remove.size, full P&M,
 /// DM, txns, and commitInfo from commit files. remove.path is included to detect remove
 /// actions with missing size (remove.path present but remove.size null). Does NOT read
@@ -70,39 +69,7 @@ impl LogSegment {
     /// Returns `Err` if P&M cannot be found in the log.
     #[instrument(name = "log_seg.build_crc_from_scratch", skip_all, err)]
     pub(crate) fn build_crc_from_scratch(&self, engine: &dyn Engine) -> DeltaResult<Crc> {
-        let update = self.replay_for_crc_update(engine)?;
-        let protocol = update.protocol.ok_or(crate::Error::MissingProtocol)?;
-        let metadata = update.metadata.ok_or(crate::Error::MissingMetadata)?;
-
-        // Determine file stats validity from the update flags
-        let file_stats_validity = if update.has_missing_file_size {
-            FileStatsValidity::Untrackable
-        } else if !update.operation_safe {
-            FileStatsValidity::Indeterminate
-        } else {
-            FileStatsValidity::Valid
-        };
-
-        Ok(Crc {
-            table_size_bytes: update.file_stats.net_bytes,
-            num_files: update.file_stats.net_files,
-            num_metadata: 1,
-            num_protocol: 1,
-            protocol,
-            metadata,
-            file_stats_validity,
-            // Full log was read, so DM and txns are Complete. Filter DM tombstones.
-            domain_metadata: DomainMetadataState::Complete(
-                update
-                    .domain_metadata
-                    .into_iter()
-                    .filter(|(_, dm)| !dm.is_removed())
-                    .collect(),
-            ),
-            set_transactions: SetTransactionState::Complete(update.set_transactions),
-            in_commit_timestamp_opt: update.in_commit_timestamp,
-            ..Default::default()
-        })
+        self.replay_for_crc_update(engine)?.into_fresh_crc()
     }
 
     /// Replay this log segment's commits in reverse order and accumulate a [`CrcUpdate`].
@@ -129,16 +96,7 @@ impl LogSegment {
             // Extract DM, txns, file stats, and commitInfo via visitor
             let mut visitor = CrcReplayVisitor {
                 is_log_batch: batch.is_log_batch,
-                domain_metadata: &mut accumulator.domain_metadata,
-                set_transactions: &mut accumulator.set_transactions,
-                add_count: &mut accumulator.add_count,
-                add_bytes: &mut accumulator.add_bytes,
-                remove_count: &mut accumulator.remove_count,
-                remove_bytes: &mut accumulator.remove_bytes,
-                has_missing_remove_size: &mut accumulator.has_missing_remove_size,
-                operation_safe: &mut accumulator.operation_safe,
-                in_commit_timestamp: &mut accumulator.in_commit_timestamp,
-                ict_seen: &mut accumulator.ict_seen,
+                acc: &mut accumulator,
             };
             visitor.visit_rows_of(data)?;
         }
@@ -152,7 +110,6 @@ impl LogSegment {
 // ============================================================================
 
 /// Accumulates CRC-relevant state from a reverse log replay pass.
-#[allow(dead_code)] // Constructed in replay_for_crc_update.
 struct CrcReplayAccumulator {
     protocol: Option<Protocol>,
     metadata: Option<Metadata>,
@@ -166,6 +123,10 @@ struct CrcReplayAccumulator {
     operation_safe: bool,
     in_commit_timestamp: Option<i64>,
     ict_seen: bool,
+    /// Whether any commitInfo action was seen across all commit batches. When no commitInfo
+    /// is found in any commit, the operation safety cannot be determined, so file stats are
+    /// treated as indeterminate.
+    has_commit_info: bool,
 }
 
 impl CrcReplayAccumulator {
@@ -183,10 +144,14 @@ impl CrcReplayAccumulator {
             operation_safe: true,
             in_commit_timestamp: None,
             ict_seen: false,
+            has_commit_info: false,
         }
     }
 
     fn into_crc_update(self) -> CrcUpdate {
+        // If no commitInfo was seen in any commit batch, we cannot determine operation
+        // safety, so treat it as unsafe.
+        let operation_safe = self.operation_safe && self.has_commit_info;
         CrcUpdate {
             file_stats: FileStatsDelta {
                 net_files: self.add_count - self.remove_count,
@@ -200,7 +165,7 @@ impl CrcReplayAccumulator {
             domain_metadata: self.domain_metadata,
             set_transactions: self.set_transactions,
             in_commit_timestamp: self.in_commit_timestamp,
-            operation_safe: self.operation_safe,
+            operation_safe,
             has_missing_file_size: self.has_missing_remove_size,
         }
     }
@@ -216,16 +181,7 @@ impl CrcReplayAccumulator {
 /// - commitInfo.inCommitTimestamp (ICT, from newest commit only)
 struct CrcReplayVisitor<'a> {
     is_log_batch: bool,
-    domain_metadata: &'a mut HashMap<String, DomainMetadata>,
-    set_transactions: &'a mut HashMap<String, SetTransaction>,
-    add_count: &'a mut i64,
-    add_bytes: &'a mut i64,
-    remove_count: &'a mut i64,
-    remove_bytes: &'a mut i64,
-    has_missing_remove_size: &'a mut bool,
-    operation_safe: &'a mut bool,
-    in_commit_timestamp: &'a mut Option<i64>,
-    ict_seen: &'a mut bool,
+    acc: &'a mut CrcReplayAccumulator,
 }
 
 impl RowVisitor for CrcReplayVisitor<'_> {
@@ -234,20 +190,20 @@ impl RowVisitor for CrcReplayVisitor<'_> {
             (
                 vec![
                     // File stats columns
-                    ColumnName::new(["add", "size"]),             // 0
-                    ColumnName::new(["remove", "path"]),          // 1: detect remove presence
-                    ColumnName::new(["remove", "size"]),          // 2
+                    ColumnName::new(["add", "size"]),    // 0
+                    ColumnName::new(["remove", "path"]), // 1: detect remove presence
+                    ColumnName::new(["remove", "size"]), // 2
                     // DomainMetadata columns
-                    ColumnName::new(["domainMetadata", "domain"]),        // 3
+                    ColumnName::new(["domainMetadata", "domain"]), // 3
                     ColumnName::new(["domainMetadata", "configuration"]), // 4
-                    ColumnName::new(["domainMetadata", "removed"]),       // 5
+                    ColumnName::new(["domainMetadata", "removed"]), // 5
                     // SetTransaction columns
-                    ColumnName::new(["txn", "appId"]),            // 6
-                    ColumnName::new(["txn", "version"]),          // 7
-                    ColumnName::new(["txn", "lastUpdated"]),      // 8
+                    ColumnName::new(["txn", "appId"]),       // 6
+                    ColumnName::new(["txn", "version"]),     // 7
+                    ColumnName::new(["txn", "lastUpdated"]), // 8
                     // CommitInfo columns
-                    ColumnName::new(["commitInfo", "operation"]),          // 9
-                    ColumnName::new(["commitInfo", "inCommitTimestamp"]),  // 10
+                    ColumnName::new(["commitInfo", "operation"]), // 9
+                    ColumnName::new(["commitInfo", "inCommitTimestamp"]), // 10
                 ],
                 vec![
                     DataType::LONG,    // add.size
@@ -273,8 +229,8 @@ impl RowVisitor for CrcReplayVisitor<'_> {
             // File stats: add.size (index 0)
             let add_size: Option<i64> = getters[0].get_opt(i, "add.size")?;
             if let Some(size) = add_size {
-                *self.add_count += 1;
-                *self.add_bytes += size;
+                self.acc.add_count += 1;
+                self.acc.add_bytes += size;
             }
 
             // File stats: remove (only from commit batches, not checkpoint tombstones).
@@ -282,25 +238,22 @@ impl RowVisitor for CrcReplayVisitor<'_> {
             // for the actual byte count. If remove.path is present but remove.size is null,
             // that is a remove with missing size which makes file stats untrackable.
             if self.is_log_batch {
-                let remove_path: Option<String> =
-                    getters[1].get_opt(i, "remove.path")?;
+                let remove_path: Option<String> = getters[1].get_opt(i, "remove.path")?;
                 if remove_path.is_some() {
-                    let remove_size: Option<i64> =
-                        getters[2].get_opt(i, "remove.size")?;
+                    let remove_size: Option<i64> = getters[2].get_opt(i, "remove.size")?;
                     if let Some(size) = remove_size {
-                        *self.remove_count += 1;
-                        *self.remove_bytes += size;
+                        self.acc.remove_count += 1;
+                        self.acc.remove_bytes += size;
                     } else {
-                        *self.has_missing_remove_size = true;
+                        self.acc.has_missing_remove_size = true;
                     }
                 }
             }
 
             // DomainMetadata: first-seen-wins per domain (index 3, 4, 5)
-            let dm_domain: Option<String> =
-                getters[3].get_opt(i, "domainMetadata.domain")?;
+            let dm_domain: Option<String> = getters[3].get_opt(i, "domainMetadata.domain")?;
             if let Some(domain) = dm_domain {
-                if let Entry::Vacant(e) = self.domain_metadata.entry(domain.clone()) {
+                if let Entry::Vacant(e) = self.acc.domain_metadata.entry(domain.clone()) {
                     let configuration: String = getters[4]
                         .get_opt(i, "domainMetadata.configuration")?
                         .unwrap_or_default();
@@ -319,10 +272,9 @@ impl RowVisitor for CrcReplayVisitor<'_> {
             // SetTransaction: first-seen-wins per app_id (index 6, 7, 8)
             let txn_app_id: Option<String> = getters[6].get_opt(i, "txn.appId")?;
             if let Some(app_id) = txn_app_id {
-                if let Entry::Vacant(e) = self.set_transactions.entry(app_id.clone()) {
+                if let Entry::Vacant(e) = self.acc.set_transactions.entry(app_id.clone()) {
                     let version: i64 = getters[7].get(i, "txn.version")?;
-                    let last_updated: Option<i64> =
-                        getters[8].get_opt(i, "txn.lastUpdated")?;
+                    let last_updated: Option<i64> = getters[8].get_opt(i, "txn.lastUpdated")?;
                     let txn = SetTransaction::new(app_id, version, last_updated);
                     e.insert(txn);
                 }
@@ -330,20 +282,21 @@ impl RowVisitor for CrcReplayVisitor<'_> {
 
             // CommitInfo: operation safety and ICT (only from commit batches, index 9, 10).
             // Only process rows that actually have a commitInfo action (operation is Some).
-            // Other rows (protocol, metadata, add, remove, etc.) have null commitInfo fields.
+            // Other rows (protocol, metadata, add, remove, etc.) have null commitInfo
+            // fields.
             if self.is_log_batch {
-                let operation: Option<String> =
-                    getters[9].get_opt(i, "commitInfo.operation")?;
+                let operation: Option<String> = getters[9].get_opt(i, "commitInfo.operation")?;
                 if let Some(op) = operation {
+                    self.acc.has_commit_info = true;
                     if !FileStatsDelta::is_incremental_safe(&op) {
-                        *self.operation_safe = false;
+                        self.acc.operation_safe = false;
                     }
 
-                    // ICT: from the newest commit only (first commitInfo seen going backwards)
-                    if !*self.ict_seen {
-                        *self.in_commit_timestamp =
+                    // ICT: newest commit only (first commitInfo seen going backwards)
+                    if !self.acc.ict_seen {
+                        self.acc.in_commit_timestamp =
                             getters[10].get_opt(i, "commitInfo.inCommitTimestamp")?;
-                        *self.ict_seen = true;
+                        self.acc.ict_seen = true;
                     }
                 }
             }
@@ -358,7 +311,7 @@ mod tests {
     use crate::crc::FileStatsValidity;
 
     #[test]
-    fn test_accumulator_produces_valid_crc_update_from_empty_state() {
+    fn test_accumulator_empty_state_has_unsafe_operation_due_to_missing_commit_info() {
         let acc = CrcReplayAccumulator::new();
         let update = acc.into_crc_update();
 
@@ -367,7 +320,8 @@ mod tests {
         assert!(update.domain_metadata.is_empty());
         assert!(update.set_transactions.is_empty());
         assert!(update.in_commit_timestamp.is_none());
-        assert!(update.operation_safe);
+        // No commitInfo was seen, so operations are treated as unsafe.
+        assert!(!update.operation_safe);
         assert!(!update.has_missing_file_size);
         assert_eq!(update.file_stats.net_files, 0);
         assert_eq!(update.file_stats.net_bytes, 0);
@@ -396,12 +350,23 @@ mod tests {
     }
 
     #[test]
-    fn test_accumulator_tracks_unsafe_operations() {
+    fn test_accumulator_unsafe_operation_with_commit_info_produces_unsafe_update() {
         let mut acc = CrcReplayAccumulator::new();
+        acc.has_commit_info = true;
         acc.operation_safe = false;
 
         let update = acc.into_crc_update();
         assert!(!update.operation_safe);
+    }
+
+    #[test]
+    fn test_accumulator_safe_operation_with_commit_info_produces_safe_update() {
+        let mut acc = CrcReplayAccumulator::new();
+        acc.has_commit_info = true;
+        acc.operation_safe = true;
+
+        let update = acc.into_crc_update();
+        assert!(update.operation_safe);
     }
 
     #[test]

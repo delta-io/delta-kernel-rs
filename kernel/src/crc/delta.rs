@@ -42,12 +42,12 @@ pub(crate) struct CrcUpdate {
     pub(crate) metadata: Option<Metadata>,
     /// Domain metadata changes keyed by domain name. In replay mode, first-seen-wins across
     /// all commits in the range. `apply()` only processes these when the base CRC's
-    /// `domain_metadata` is `Some` (tracked). Tombstones (`removed=true`) are included and
+    /// `domain_metadata` is not `Untracked`. Tombstones (`removed=true`) are included and
     /// handled by `apply()`.
     pub(crate) domain_metadata: HashMap<String, DomainMetadata>,
     /// Set transaction changes keyed by app_id. In replay mode, first-seen-wins across all
     /// commits in the range. `apply()` only processes these when the base CRC's
-    /// `set_transactions` is `Some` (tracked).
+    /// `set_transactions` is not `Untracked`.
     pub(crate) set_transactions: HashMap<String, SetTransaction>,
     /// In-commit timestamp, if present. In replay mode, from the newest commit.
     pub(crate) in_commit_timestamp: Option<i64>,
@@ -60,29 +60,46 @@ pub(crate) struct CrcUpdate {
 }
 
 impl CrcUpdate {
-    /// Convert this delta into a fresh [`Crc`]. Used when the delta represents the entire table
-    /// state (e.g. CREATE TABLE or the first commit in a forward replay from version zero).
+    /// Convert this update into a fresh [`Crc`] representing a complete table state.
     ///
-    /// Returns `None` if protocol or metadata are missing (both are required for a valid CRC).
-    pub(crate) fn into_crc_for_version_zero(self) -> Option<Crc> {
-        let protocol = self.protocol?;
-        let metadata = self.metadata?;
-        // For CREATE TABLE we always know the full domain metadata state: the transaction
-        // either included domain metadata actions or it didn't. Complete because we created
-        // the table -- an empty map means "no domain metadata", not "unknown". Filter tombstones.
+    /// Used when the update represents the entire table state (CREATE TABLE, full log replay
+    /// from version zero, or build-from-scratch). Protocol and metadata must be present.
+    ///
+    /// The resulting CRC has:
+    /// - DM/txns: Complete (the full state was captured)
+    /// - File stats validity: derived from `has_missing_file_size` and `operation_safe`
+    /// - Histogram: computed from added/removed histograms when available
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MissingProtocol`] or [`Error::MissingMetadata`] if either is absent.
+    pub(crate) fn into_fresh_crc(self) -> crate::DeltaResult<Crc> {
+        let protocol = self.protocol.ok_or(crate::Error::MissingProtocol)?;
+        let metadata = self.metadata.ok_or(crate::Error::MissingMetadata)?;
+
+        // Full state was captured, so DM and txns are Complete. Filter DM tombstones.
         let domain_metadata = DomainMetadataState::Complete(
             self.domain_metadata
                 .into_iter()
                 .filter(|(_, dm)| !dm.is_removed())
                 .collect(),
         );
-        // CREATE TABLE starts with a known-complete set of transactions (possibly empty).
         let set_transactions = SetTransactionState::Complete(self.set_transactions);
+
+        // Determine file stats validity from the update flags.
+        let file_stats_validity = if self.has_missing_file_size {
+            FileStatsValidity::Untrackable
+        } else if !self.operation_safe {
+            FileStatsValidity::Indeterminate
+        } else {
+            FileStatsValidity::Valid
+        };
+
         // Compute the initial histogram from the file stats. If both added and removed
         // histograms are present, subtract removals from additions. If only the added
         // histogram is present, use it directly. Otherwise, we cannot produce a histogram.
         //
-        // If try_sub fails for any reason (ie. histogram goes negative) then the histogram
+        // If try_sub fails for any reason (e.g. histogram goes negative) then the histogram
         // is silently dropped.
         let initial_histogram = match (
             self.file_stats.added_histogram,
@@ -92,7 +109,8 @@ impl CrcUpdate {
             (Some(added), None) => Some(added),
             _ => None,
         };
-        Some(Crc {
+
+        Ok(Crc {
             table_size_bytes: self.file_stats.net_bytes,
             num_files: self.file_stats.net_files,
             num_metadata: 1,
@@ -103,8 +121,16 @@ impl CrcUpdate {
             set_transactions,
             in_commit_timestamp_opt: self.in_commit_timestamp,
             file_size_histogram: initial_histogram,
+            file_stats_validity,
             ..Default::default()
         })
+    }
+
+    /// Convert this update into a fresh [`Crc`] for version zero (CREATE TABLE).
+    ///
+    /// Returns `None` if protocol or metadata are missing (both are required for a valid CRC).
+    pub(crate) fn into_crc_for_version_zero(self) -> Option<Crc> {
+        self.into_fresh_crc().ok()
     }
 }
 
