@@ -16,7 +16,7 @@ use crate::checkpoint::CheckpointWriter;
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 use crate::crc::{
-    try_read_crc_file, try_write_crc_file, Crc, CrcUpdate, DomainMetadataState, FileStatsValidity,
+    try_read_crc_file, try_write_crc_file, Crc, CrcUpdate, DomainMetadataState,
     LazyCrc, SetTransactionState,
 };
 use crate::expressions::ColumnName;
@@ -138,14 +138,10 @@ impl Snapshot {
     /// `RequiresCheckpointRead`, DM/txns are Untracked.
     #[internal_api]
     pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
-        let crc = Arc::new(Crc {
-            metadata: table_configuration.metadata().clone(),
-            protocol: table_configuration.protocol().clone(),
-            num_metadata: 1,
-            num_protocol: 1,
-            file_stats_validity: FileStatsValidity::RequiresCheckpointRead,
-            ..Default::default()
-        });
+        let crc = Arc::new(Crc::minimal_from_pm(
+            table_configuration.protocol().clone(),
+            table_configuration.metadata().clone(),
+        ));
         Self::new_with_crc(log_segment, table_configuration, crc)
     }
 
@@ -337,14 +333,10 @@ impl Snapshot {
         // Build the CRC. Try loading from CRC file first, otherwise build minimal from P&M.
         let crc =
             Self::try_build_crc_from_file(&combined_log_segment, engine).unwrap_or_else(|| {
-                Arc::new(Crc {
-                    metadata: table_configuration.metadata().clone(),
-                    protocol: table_configuration.protocol().clone(),
-                    num_metadata: 1,
-                    num_protocol: 1,
-                    file_stats_validity: FileStatsValidity::RequiresCheckpointRead,
-                    ..Default::default()
-                })
+                Arc::new(Crc::minimal_from_pm(
+                    table_configuration.protocol().clone(),
+                    table_configuration.metadata().clone(),
+                ))
             });
 
         Ok(Arc::new(Snapshot::new_with_crc(

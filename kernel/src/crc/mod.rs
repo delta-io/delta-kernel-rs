@@ -56,11 +56,11 @@ use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 pub struct Crc {
     // ===== Required fields =====
     /// Total size of the table in bytes, calculated as the sum of the `size` field of all live
-    /// [`Add`] actions. Use [`Crc::file_stats()`] to access safely (checks validity).
-    pub(crate) table_size_bytes: i64,
+    /// [`Add`] actions. Private; use [`Crc::file_stats()`] to access safely (checks validity).
+    table_size_bytes: i64,
     /// Number of live [`Add`] actions in this table version after action reconciliation.
-    /// Use [`Crc::file_stats()`] to access safely (checks validity).
-    pub(crate) num_files: i64,
+    /// Private; use [`Crc::file_stats()`] to access safely (checks validity).
+    num_files: i64,
     /// Number of [`Metadata`] actions. Must be 1.
     pub num_metadata: i64,
     /// Number of [`Protocol`] actions. Must be 1.
@@ -129,6 +129,22 @@ impl Crc {
                 file_size_histogram: self.file_size_histogram.clone(),
             }),
             _ => None,
+        }
+    }
+
+    /// Build a minimal CRC from Protocol and Metadata only. File stats are
+    /// `RequiresCheckpointRead`, DM/txns are `Untracked`, histogram is `None`.
+    ///
+    /// Used when no CRC file is available and full log replay was not performed
+    /// (e.g. the incremental snapshot update fallback path).
+    pub(crate) fn minimal_from_pm(protocol: Protocol, metadata: Metadata) -> Self {
+        Crc {
+            metadata,
+            protocol,
+            num_metadata: 1,
+            num_protocol: 1,
+            file_stats_validity: FileStatsValidity::RequiresCheckpointRead,
+            ..Default::default()
         }
     }
 
