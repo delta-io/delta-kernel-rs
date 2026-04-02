@@ -49,6 +49,7 @@ fn generate_checkpoint_parts(
     let output_schema = writer
         .checkpoint_output_schema
         .get()
+        .cloned()
         .expect("checkpoint_output_schema should be set by checkpoint_data");
 
     let splitter = SidecarSplitter::new(
@@ -670,6 +671,7 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
     let output_schema = writer
         .checkpoint_output_schema
         .get()
+        .cloned()
         .expect("checkpoint_output_schema should be set by checkpoint_data");
 
     let splitter = SidecarSplitter::new(
