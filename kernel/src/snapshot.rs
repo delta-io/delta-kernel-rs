@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
@@ -53,6 +53,15 @@ pub enum ChecksumWriteResult {
     /// overwrite existing version checksum files.
     AlreadyExists,
     /// The CRC file was successfully written to storage.
+    Written,
+}
+
+/// Result of attempting to write a checkpoint file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointWriteResult {
+    /// A checkpoint already exists at this version.
+    AlreadyExists,
+    /// The checkpoint was successfully written to storage.
     Written,
 }
 
@@ -477,9 +486,12 @@ impl Snapshot {
 
     /// Performs a complete checkpoint of this snapshot using the provided engine.
     ///
-    /// Writes a checkpoint parquet file and the `_last_checkpoint` file. Returns an updated
-    /// [`SnapshotRef`] whose log segment reflects the new checkpoint. Commits and compaction
-    /// files subsumed by the checkpoint are dropped from the returned snapshot.
+    /// If a checkpoint already exists at this version, returns
+    /// [`CheckpointWriteResult::AlreadyExists`] with the original snapshot unchanged.
+    /// Otherwise, writes a checkpoint parquet file and the `_last_checkpoint` file and returns
+    /// [`CheckpointWriteResult::Written`] with an updated [`SnapshotRef`] whose log segment
+    /// reflects the new checkpoint. Commits and compaction files subsumed by the checkpoint are
+    /// dropped from the returned snapshot.
     ///
     /// Note: This function uses [`crate::ParquetHandler::write_parquet_file`] and
     /// [`crate::StorageHandler::head`], which may not be implemented by all engines
@@ -488,15 +500,36 @@ impl Snapshot {
     /// If you are using the default engine, make sure to build it with the multi-threaded
     /// executor if you want to use this method.
     #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
-    pub fn checkpoint(self: &SnapshotRef, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+    pub fn checkpoint(
+        self: &SnapshotRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<(CheckpointWriteResult, SnapshotRef)> {
+        if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
+            info!(
+                "Checkpoint already exists for snapshot version {}",
+                self.version()
+            );
+            return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
+        }
+
         let writer = Arc::clone(self).create_checkpoint_writer()?;
         let checkpoint_path = writer.checkpoint_path()?;
         let data_iter = writer.checkpoint_data(engine)?;
         let state = data_iter.state();
         let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
-        engine
+        match engine
             .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
+            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))
+        {
+            Ok(_) => (),
+            Err(Error::FileAlreadyExists(_)) => {
+                // NOTE: Per write_parquet_file's documentation, it should silently overwrite existing files,
+                // so we log a warning but still return the correct result.
+                warn!("ParquetHandler::write_parquet_file unexpectedly failed on FileAlreadyExists for version {}", self.version());
+                return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
+            }
+            Err(e) => return Err(e),
+        }
 
         let file_meta = engine.storage_handler().head(&checkpoint_path)?;
 
@@ -509,11 +542,14 @@ impl Snapshot {
         let new_log_segment = self
             .log_segment
             .try_new_with_checkpoint(checkpoint_log_path)?;
-        Ok(Arc::new(Snapshot::new_with_crc(
-            new_log_segment,
-            self.table_configuration().clone(),
-            self.lazy_crc.clone(),
-        )))
+        Ok((
+            CheckpointWriteResult::Written,
+            Arc::new(Snapshot::new_with_crc(
+                new_log_segment,
+                self.table_configuration().clone(),
+                self.lazy_crc.clone(),
+            )),
+        ))
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
@@ -2303,6 +2339,40 @@ mod tests {
                 content.into(),
             )
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_returns_already_exists_when_checkpoint_at_version() -> DeltaResult<()>
+    {
+        let store = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(executor)
+            .build();
+
+        setup_test_table_with_commits(table_root, &store, 2).await?;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        let (result, snapshot_w_ckpt) = snapshot.checkpoint(&engine)?;
+        assert_eq!(result, CheckpointWriteResult::Written);
+
+        // The returned snapshot has checkpoint_version == end_version, so a second call
+        // should detect the existing checkpoint.
+        let (result, unchanged) = snapshot_w_ckpt.checkpoint(&engine)?;
+        assert_eq!(result, CheckpointWriteResult::AlreadyExists);
+        assert_eq!(unchanged.version(), snapshot_w_ckpt.version());
+
+        // A fresh snapshot loaded from storage also sees the checkpoint and returns
+        // AlreadyExists.
+        let fresh = Snapshot::builder_for(table_root).build(&engine)?;
+        assert_eq!(fresh.log_segment.checkpoint_version, Some(1));
+        let (result, _) = fresh.checkpoint(&engine)?;
+        assert_eq!(result, CheckpointWriteResult::AlreadyExists);
+
         Ok(())
     }
 
