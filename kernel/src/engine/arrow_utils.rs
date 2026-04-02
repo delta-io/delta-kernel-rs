@@ -708,20 +708,24 @@ fn get_indices(
                         // an actual index. Use saturating_sub to handle empty structs (0 fields).
                         parquet_offset += parquet_advance.saturating_sub(1);
                         // If no leaf columns were selected (mask unchanged), the parquet
-                        // reader will omit this struct entirely. Let the post-loop missing
-                        // field logic handle it instead of creating a Nested entry that
-                        // would index into a column that doesn't exist. The recursive call
-                        // is still needed for the correct `parquet_advance` value;
-                        // `children` is intentionally discarded in this case.
-                        //
-                        // However, if the recursive call fully resolved all requested children
-                        // (e.g. all children are nullable and missing from parquet, or the
-                        // struct is empty), we still emit the struct so it isn't treated as a
-                        // missing top-level field by the post-loop logic.
-                        let all_children_resolved = children.len() == requested_schema.num_fields();
-                        if mask_indices.len() > mask_before || all_children_resolved {
+                        // reader will omit this struct entirely. We cannot create a Nested
+                        // entry because it would index into a column that doesn't exist.
+                        // The recursive call is still needed for the correct
+                        // `parquet_advance` value.
+                        if mask_indices.len() > mask_before {
                             found_fields.insert(requested_field.name());
                             reorder_indices.push(ReorderIndex::nested(index, children));
+                        } else if children.len() == requested_schema.num_fields() {
+                            // All requested children were resolved (as nullable/missing or
+                            // the struct is empty), but no parquet leaves were selected. Emit
+                            // a Missing entry so the struct is synthesized as null rather than
+                            // falling through to the post-loop logic which would error for
+                            // non-nullable structs.
+                            found_fields.insert(requested_field.name());
+                            reorder_indices.push(ReorderIndex::missing(
+                                index,
+                                Arc::new(requested_field.try_into_arrow()?),
+                            ));
                         }
                     } else {
                         return Err(Error::unexpected_column_type(field.name()));
@@ -2594,16 +2598,18 @@ mod tests {
             get_requested_indices(&requested_schema, &parquet_schema).unwrap();
         // Only "a" should be in the mask (the struct's children don't match)
         assert_eq!(mask_indices, vec![0]);
-        // "a" at position 0 (identity) + "stats" as a nested struct with missing child "age"
-        let stats_struct = match &requested_schema.field("stats").unwrap().data_type {
-            DataType::Struct(s) => s,
-            other => panic!("expected struct, got: {other:?}"),
-        };
-        let expected_age_field =
-            Arc::new(stats_struct.field("age").unwrap().try_into_arrow().unwrap());
+        // "a" at position 0 (identity) + "stats" treated as missing (not nested), because
+        // no parquet leaves were selected for it
+        let expected_stats_field = Arc::new(
+            requested_schema
+                .field("stats")
+                .unwrap()
+                .try_into_arrow()
+                .unwrap(),
+        );
         let expect_reorder = vec![
             ReorderIndex::identity(0),
-            ReorderIndex::nested(1, vec![ReorderIndex::missing(0, expected_age_field)]),
+            ReorderIndex::missing(1, expected_stats_field),
         ];
         assert_eq!(reorder_indices, expect_reorder);
     }
