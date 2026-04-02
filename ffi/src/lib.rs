@@ -1343,6 +1343,8 @@ mod tests {
         Ok(())
     }
 
+    // TODO: (PR #2307) will introduce a helper function for setting up storage, engine.
+    // The test will need to refactor to use the helper function.
     #[tokio::test]
     async fn test_snapshot_timestamp_no_ict() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
@@ -1386,6 +1388,8 @@ mod tests {
         Ok(())
     }
 
+    // TODO: (PR #2307) will introduce a helper function for setting up storage, engine.
+    // The test will need to refactor to use the helper function.
     #[tokio::test]
     async fn test_snapshot_timestamp_ict_enabled() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
