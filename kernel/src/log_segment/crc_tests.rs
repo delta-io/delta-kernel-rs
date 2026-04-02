@@ -16,7 +16,7 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStore;
 use crate::Snapshot;
 
-use test_utils::{assert_result_error_with_message, delta_path_for_version};
+use test_utils::delta_path_for_version;
 
 // ============================================================================
 // Expected values
@@ -590,10 +590,10 @@ async fn test_ict_errors_when_crc_has_no_ict() {
         .build(&setup.engine)
         .unwrap();
 
-    let result = snapshot.get_in_commit_timestamp(&setup.engine);
-
-    assert_result_error_with_message(
-        result,
-        "In-Commit Timestamp not found in CRC file at version 1",
-    );
+    // With eager CRC, when the CRC has no ICT the system falls through to reading the
+    // commit file directly. The commit at v1 has ICT=2000, so we get Ok(Some(2000)).
+    let result = snapshot
+        .get_in_commit_timestamp(&setup.engine)
+        .unwrap();
+    assert_eq!(result, Some(2000));
 }

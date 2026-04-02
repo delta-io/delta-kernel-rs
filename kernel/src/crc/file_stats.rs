@@ -54,6 +54,7 @@ impl FileStatsDelta {
     /// file stats. Unknown or missing operations are treated as unsafe. For example, ANALYZE
     /// STATS re-adds existing files with updated statistics -- if we naively counted those
     /// adds, we'd double count file stats.
+    #[allow(dead_code)] // Used by CrcProcessor in follow-up steps.
     const INCREMENTAL_SAFE_OPS: &[&str] = &[
         "WRITE",
         "MERGE",
@@ -67,6 +68,7 @@ impl FileStatsDelta {
         "CREATE OR REPLACE TABLE AS SELECT",
     ];
 
+    #[allow(dead_code)] // Used by CrcProcessor in follow-up steps.
     pub(crate) fn is_incremental_safe(operation: &str) -> bool {
         Self::INCREMENTAL_SAFE_OPS.contains(&operation)
     }

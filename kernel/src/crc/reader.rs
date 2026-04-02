@@ -104,7 +104,7 @@ mod tests {
         assert_eq!(crc.metadata, expected_metadata);
 
         // Verify domain metadatas
-        let dms = crc.domain_metadata.unwrap();
+        let dms = crc.domain_metadata.map().unwrap();
         assert_eq!(dms.len(), 3);
 
         assert!(dms["delta.clustering"]
@@ -116,7 +116,7 @@ mod tests {
         assert!(dms["myApp.metadata"].configuration().contains("key"));
 
         // Verify set transactions
-        let txns = crc.set_transactions.unwrap();
+        let txns = crc.set_transactions.map().unwrap();
         assert_eq!(txns.len(), 2);
         assert_eq!(txns["spark-app-1"].version, 42);
         assert_eq!(txns["spark-app-1"].last_updated, Some(1694758250000));

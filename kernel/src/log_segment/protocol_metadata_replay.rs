@@ -18,6 +18,7 @@ impl LogSegment {
     ///
     /// This is the checked variant of [`Self::read_protocol_metadata_unchecked`], used for
     /// fresh snapshot creation where both Protocol and Metadata must exist.
+    #[allow(dead_code)] // Used by incremental snapshot path and tests.
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,

@@ -15,9 +15,7 @@ use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
-#[cfg(any(test, feature = "test-utils"))]
-use crate::crc::Crc;
-use crate::crc::{try_write_crc_file, CrcDelta, LazyCrc};
+use crate::crc::{try_read_crc_file, try_write_crc_file, Crc, CrcUpdate, FileStatsValidity, LazyCrc};
 use crate::expressions::ColumnName;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
@@ -65,7 +63,10 @@ pub struct Snapshot {
     span: tracing::Span,
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
-    lazy_crc: Arc<LazyCrc>,
+    /// CRC state for this snapshot. Always present. Contains P&M (from the table
+    /// configuration), and optionally DM, txns, file stats, histogram, ICT depending
+    /// on what was available during construction (CRC file, stale CRC + replay, etc.).
+    crc: Arc<Crc>,
 }
 
 impl PartialEq for Snapshot {
@@ -130,20 +131,26 @@ impl Snapshot {
     }
 
     /// Create a new [`Snapshot`] from a [`LogSegment`] and [`TableConfiguration`].
+    /// Builds a minimal CRC from the table configuration's P&M. File stats are
+    /// `RequiresCheckpointRead`, DM/txns are Untracked.
     #[internal_api]
     pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
-        Self::new_with_crc(
-            log_segment,
-            table_configuration,
-            Arc::new(LazyCrc::new(None)),
-        )
+        let crc = Arc::new(Crc {
+            metadata: table_configuration.metadata().clone(),
+            protocol: table_configuration.protocol().clone(),
+            num_metadata: 1,
+            num_protocol: 1,
+            file_stats_validity: FileStatsValidity::RequiresCheckpointRead,
+            ..Default::default()
+        });
+        Self::new_with_crc(log_segment, table_configuration, crc)
     }
 
-    /// Internal constructor that accepts an explicit [`LazyCrc`].
+    /// Internal constructor that accepts an explicit [`Crc`].
     pub(crate) fn new_with_crc(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
-        lazy_crc: Arc<LazyCrc>,
+        crc: Arc<Crc>,
     ) -> Self {
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
@@ -156,7 +163,7 @@ impl Snapshot {
             span,
             log_segment,
             table_configuration,
-            lazy_crc,
+            crc,
         }
     }
 
@@ -237,7 +244,7 @@ impl Snapshot {
         }
         if new_log_segment.checkpoint_version.is_some() {
             // We found a checkpoint in the new log segment, so build a fresh snapshot from it.
-            // TODO(#2217): reuse old LazyCrc when CRC file matches.
+            // TODO(#2217): reuse old CRC when CRC file matches.
             // TODO(#2218): consider incremental P&M replay instead of full rebuild.
             let snapshot = Self::try_new_from_log_segment_impl(
                 existing_snapshot.table_root().clone(),
@@ -279,16 +286,19 @@ impl Snapshot {
             .ascending_compaction_files
             .retain(|log_path| old_version < log_path.version);
 
-        // we have new commits and no new checkpoint: we replay new commits for P+M and then
-        // create a new snapshot by combining LogSegments and building a new TableConfiguration
-        let (crc_file, lazy_crc) = Self::resolve_crc(
-            &new_log_segment,
-            old_log_segment,
-            &existing_snapshot.lazy_crc,
-        );
+        // We have new commits and no new checkpoint: replay new commits for P+M and then
+        // create a new snapshot by combining LogSegments and building a new TableConfiguration.
+        // Prefer the new segment's CRC file, fall back to the old segment's.
+        let new_crc_file = new_log_segment.listed.latest_crc_file.clone();
+        let old_crc_file = old_log_segment.listed.latest_crc_file.clone();
+        let crc_file = new_crc_file.or(old_crc_file);
 
+        // P&M replay on just the new commits. Use a LazyCrc with the CRC file for the
+        // P&M optimization (read_protocol_metadata_opt can use it to skip log replay if
+        // P&M are in the CRC). This LazyCrc is local, not stored on the Snapshot.
+        let local_lazy_crc = LazyCrc::new(crc_file.clone());
         let (new_metadata, new_protocol) =
-            new_log_segment.read_protocol_metadata_opt(engine, &lazy_crc)?;
+            new_log_segment.read_protocol_metadata_opt(engine, &local_lazy_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
             new_metadata,
@@ -296,19 +306,14 @@ impl Snapshot {
             new_log_segment.end_version,
         )?;
 
-        // NB: we must add the new log segment to the existing snapshot's log segment
+        // Combine old and new log segments
         let mut ascending_commit_files = old_log_segment.listed.ascending_commit_files.clone();
         ascending_commit_files.extend(new_log_segment.listed.ascending_commit_files);
         let mut ascending_compaction_files =
             old_log_segment.listed.ascending_compaction_files.clone();
         ascending_compaction_files.extend(new_log_segment.listed.ascending_compaction_files);
-
-        // Use the new latest_commit if available, otherwise use the old one
-        // This handles the case where the new listing returned no commits
         let latest_commit_file =
             new_latest_commit_file.or_else(|| old_log_segment.listed.latest_commit_file.clone());
-        // we can pass in just the old checkpoint parts since by the time we reach this line, we
-        // know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
             LogSegmentFiles {
                 ascending_commit_files,
@@ -323,37 +328,27 @@ impl Snapshot {
             },
             log_root,
             requested_version,
-            // Preserve checkpoint schema from old segment
             old_log_segment.checkpoint_schema.clone(),
         )?;
+
+        // Build the CRC. Try loading from CRC file first, otherwise build minimal from P&M.
+        let crc = Self::try_build_crc_from_file(&combined_log_segment, engine)
+            .unwrap_or_else(|| {
+                Arc::new(Crc {
+                    metadata: table_configuration.metadata().clone(),
+                    protocol: table_configuration.protocol().clone(),
+                    num_metadata: 1,
+                    num_protocol: 1,
+                    file_stats_validity: FileStatsValidity::RequiresCheckpointRead,
+                    ..Default::default()
+                })
+            });
 
         Ok(Arc::new(Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
-            lazy_crc,
+            crc,
         )))
-    }
-
-    /// Determine the CRC file and LazyCrc for an incremental snapshot update.
-    ///
-    /// Prefers the new segment's CRC file, falls back to the old segment's. If the resolved
-    /// CRC version matches the existing snapshot's LazyCrc, reuses it to avoid redundant I/O
-    /// (it may already be loaded in memory).
-    fn resolve_crc(
-        new_log_segment: &LogSegment,
-        old_log_segment: &LogSegment,
-        existing_lazy_crc: &Arc<LazyCrc>,
-    ) -> (Option<ParsedLogPath>, Arc<LazyCrc>) {
-        let new_crc_file = new_log_segment.listed.latest_crc_file.clone();
-        let old_crc_file = old_log_segment.listed.latest_crc_file.clone();
-        let crc_file = new_crc_file.or(old_crc_file);
-        let crc_version = crc_file.as_ref().map(|f| f.version);
-        let lazy_crc = if crc_version == existing_lazy_crc.crc_version() {
-            existing_lazy_crc.clone()
-        } else {
-            Arc::new(LazyCrc::new(crc_file.clone()))
-        };
-        (crc_file, lazy_crc)
     }
 
     /// Implementation of snapshot creation from log segment.
@@ -366,15 +361,30 @@ impl Snapshot {
         operation_id: MetricId,
     ) -> DeltaResult<Self> {
         let reporter = engine.get_metrics_reporter();
-
-        // Create lazy CRC loader for P&M optimization
-        let lazy_crc = Arc::new(LazyCrc::new(log_segment.listed.latest_crc_file.clone()));
-
-        // Read protocol and metadata (may use CRC if available)
         let start = Instant::now();
-        let (metadata, protocol) = log_segment.read_protocol_metadata(engine, &lazy_crc)?;
-        let read_metadata_duration = start.elapsed();
 
+        // Try loading the CRC file first. If it exists (at target version or stale), we can
+        // extract P&M from it and skip the separate P&M replay pass entirely.
+        let crc = Self::try_build_crc_from_file(&log_segment, engine);
+
+        let (metadata, protocol, crc) = match crc {
+            Some(crc) => {
+                // CRC provided P&M. No log replay needed for P&M.
+                let metadata = crc.metadata.clone();
+                let protocol = crc.protocol.clone();
+                (metadata, protocol, crc)
+            }
+            None => {
+                // No CRC file. Replay the full log segment (checkpoint + commits) to
+                // build a CRC from scratch with P&M, DM, txns, and file stats.
+                let crc = Arc::new(log_segment.build_crc_from_scratch(engine)?);
+                let metadata = crc.metadata.clone();
+                let protocol = crc.protocol.clone();
+                (metadata, protocol, crc)
+            }
+        };
+
+        let read_metadata_duration = start.elapsed();
         reporter.as_ref().inspect(|r| {
             r.report(MetricEvent::ProtocolMetadataLoaded {
                 operation_id,
@@ -385,11 +395,57 @@ impl Snapshot {
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
 
-        Ok(Self::new_with_crc(
-            log_segment,
-            table_configuration,
-            lazy_crc,
-        ))
+        Ok(Self::new_with_crc(log_segment, table_configuration, crc))
+    }
+
+    /// Attempt to build a CRC from a CRC file on disk. Handles both CRC at target version
+    /// (loaded directly) and stale CRC (loaded + incremental replay of commits after it).
+    /// Returns `None` if no CRC file exists or loading/replay fails.
+    fn try_build_crc_from_file(
+        log_segment: &LogSegment,
+        engine: &dyn Engine,
+    ) -> Option<Arc<Crc>> {
+        let crc_file = log_segment.listed.latest_crc_file.as_ref()?;
+        let crc_version = crc_file.version;
+        let target_version = log_segment.end_version;
+
+        // Load the CRC from disk
+        let loaded = match try_read_crc_file(engine, crc_file) {
+            Ok(crc) => Arc::new(crc),
+            Err(e) => {
+                tracing::warn!("Failed to read CRC file at version {crc_version}: {e}");
+                return None;
+            }
+        };
+
+        if crc_version == target_version {
+            info!("CRC loaded from disk at target version {target_version}");
+            return Some(loaded);
+        }
+
+        // Stale CRC: replay commits after CRC version and apply to base
+        if crc_version < target_version {
+            info!(
+                "Building CRC: replaying commits {}..{} onto stale CRC at {}",
+                target_version,
+                crc_version + 1,
+                crc_version,
+            );
+            let pruned = log_segment.segment_after_crc(crc_version);
+            let mut crc = loaded.as_ref().clone();
+            match pruned.build_crc_from_stale(engine, &mut crc) {
+                Ok(()) => {
+                    info!("CRC built successfully at version {target_version}");
+                    return Some(Arc::new(crc));
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to build CRC from stale: {e}");
+                    return None;
+                }
+            }
+        }
+
+        None
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
@@ -397,7 +453,7 @@ impl Snapshot {
     /// Appends the newly committed file to this snapshot's log segment and bumps the version,
     /// producing a post-commit snapshot without a full log replay from storage.
     ///
-    /// The `crc_delta` captures the CRC-relevant changes from the committed transaction
+    /// The `crc_update` captures the CRC-relevant changes from the committed transaction
     /// (file stats, domain metadata, ICT, etc.). If the pre-commit snapshot had a loaded CRC
     /// at its version, the delta is applied to produce a precomputed in-memory CRC for the new
     /// version -- this CRC contains all important table metadata (protocol, metadata, domain
@@ -405,12 +461,12 @@ impl Snapshot {
     /// always produces a CRC at v0. If no CRC was available on the pre-commit snapshot, the
     /// existing lazy CRC is carried forward unchanged.
     ///
-    /// TODO: Handle Protocol changes in CrcDelta (when Kernel-RS supports protocol changes)
-    /// TODO: Handle Metadata changes in CrcDelta (when Kernel-RS supports metadata changes)
+    /// TODO: Handle Protocol changes in CrcUpdate (when Kernel-RS supports protocol changes)
+    /// TODO: Handle Metadata changes in CrcUpdate (when Kernel-RS supports metadata changes)
     pub(crate) fn new_post_commit(
         &self,
         commit: ParsedLogPath,
-        crc_delta: CrcDelta,
+        crc_update: CrcUpdate,
     ) -> DeltaResult<Self> {
         require!(
             commit.is_commit(),
@@ -435,35 +491,29 @@ impl Snapshot {
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
-        let new_lazy_crc = self.compute_post_commit_crc(new_version, crc_delta);
+        let new_crc = self.compute_post_commit_crc(crc_update);
 
         Ok(Snapshot::new_with_crc(
             new_log_segment,
             new_table_configuration,
-            new_lazy_crc,
+            new_crc,
         ))
     }
 
-    /// Compute the lazy CRC for a post-commit snapshot by applying a [`CrcDelta`].
+    /// Compute the CRC for a post-commit snapshot by applying a [`CrcUpdate`].
     ///
-    /// For CREATE TABLE, builds a fresh CRC from the `crc_delta`. For existing tables, applies
-    /// the `crc_delta` to the current CRC if loaded, otherwise carries forward the existing lazy CRC.
-    fn compute_post_commit_crc(&self, new_version: Version, crc_delta: CrcDelta) -> Arc<LazyCrc> {
-        let crc = if self.version() == crate::PRE_COMMIT_VERSION {
-            crc_delta.into_crc_for_version_zero()
+    /// For CREATE TABLE, builds a fresh CRC from the `crc_update`. For existing tables, clones
+    /// the current CRC and applies the update.
+    fn compute_post_commit_crc(&self, crc_update: CrcUpdate) -> Arc<Crc> {
+        if self.version() == crate::PRE_COMMIT_VERSION {
+            match crc_update.into_crc_for_version_zero() {
+                Some(c) => Arc::new(c),
+                None => self.crc.clone(),
+            }
         } else {
-            self.lazy_crc
-                .get_if_loaded_at_version(self.version())
-                .map(|base| {
-                    let mut crc = base.as_ref().clone();
-                    crc.apply(crc_delta);
-                    crc
-                })
-        };
-
-        match crc {
-            Some(c) => Arc::new(LazyCrc::new_precomputed(c, new_version)),
-            None => self.lazy_crc.clone(),
+            let mut crc = self.crc.as_ref().clone();
+            crc.apply(crc_update);
+            Arc::new(crc)
         }
     }
 
@@ -512,7 +562,7 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new_with_crc(
             new_log_segment,
             self.table_configuration().clone(),
-            self.lazy_crc.clone(),
+            self.crc.clone(),
         )))
     }
 
@@ -599,17 +649,12 @@ impl Snapshot {
         let expiration_timestamp =
             calculate_transaction_expiration_timestamp(self.table_properties())?;
 
-        // Fast path: serve from CRC if it tracks set transactions at this version.
-        if let Some(crc) = self
-            .lazy_crc
-            .get_or_load_if_at_version(engine, self.version())
-        {
-            if let Some(txn_map) = &crc.set_transactions {
-                return Ok(txn_map
-                    .get(application_id)
-                    .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
-                    .map(|txn| txn.version));
-            }
+        // Fast path: serve from CRC if it tracks set transactions.
+        if let Some(txn_map) = self.crc.set_transaction_state().map() {
+            return Ok(txn_map
+                .get(application_id)
+                .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
+                .map(|txn| txn.version));
         }
 
         // Fallback: full log replay.
@@ -677,21 +722,16 @@ impl Snapshot {
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
     ) -> DeltaResult<DomainMetadataMap> {
-        // Fast path: serve from CRC if it tracks domain metadata at this version.
-        if let Some(crc) = self
-            .lazy_crc
-            .get_or_load_if_at_version(engine, self.version())
-        {
-            if let Some(dm_map) = &crc.domain_metadata {
-                return Ok(match domains {
-                    None => dm_map.clone(),
-                    Some(filter) => dm_map
-                        .iter()
-                        .filter(|(k, _)| filter.contains(k.as_str()))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                });
-            }
+        // Fast path: serve from CRC if it tracks domain metadata.
+        if let Some(dm_map) = self.crc.domain_metadata_state().map() {
+            return Ok(match domains {
+                None => dm_map.clone(),
+                Some(filter) => dm_map
+                    .iter()
+                    .filter(|(k, _): &(&String, &DomainMetadata)| filter.contains(k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            });
         }
         // Fallback: full log replay.
         self.log_segment().scan_domain_metadatas(domains, engine)
@@ -703,11 +743,8 @@ impl Snapshot {
     /// NOTE: This is an unstable API expected to change in future releases.
     #[allow(unused)]
     #[internal_api]
-    pub(crate) fn get_or_load_file_stats(&self, engine: &dyn Engine) -> Option<FileStats> {
-        let crc = self
-            .lazy_crc
-            .get_or_load_if_at_version(engine, self.version())?;
-        crc.file_stats()
+    pub(crate) fn get_or_load_file_stats(&self, _engine: &dyn Engine) -> Option<FileStats> {
+        self.crc.file_stats()
     }
 
     /// Returns file-level statistics, or `None` if CRC is not loaded, not at this
@@ -716,27 +753,23 @@ impl Snapshot {
     /// NOTE: This API is purely opportunistic, no I/O.
     #[internal_api]
     pub(crate) fn get_file_stats_if_loaded(&self) -> Option<FileStats> {
-        let crc = self.lazy_crc.get_if_loaded_at_version(self.version())?;
-        crc.file_stats()
+        self.crc.file_stats()
     }
 
-    /// Returns the CRC if one has been loaded at this snapshot's version (no I/O).
+    /// Returns the CRC for this snapshot. Always available since `crc` is always present.
     ///
     /// This is a test-only helper for integration tests to inspect the CRC state.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn get_current_crc_if_loaded_for_testing(&self) -> Option<&Crc> {
-        if self.lazy_crc.crc_version() != Some(self.version()) {
-            return None;
-        }
-        self.lazy_crc.cached.get()?.get().map(|arc| arc.as_ref())
+        Some(self.crc.as_ref())
     }
 
-    /// Returns the CRC version tracked by this snapshot's LazyCrc, if any.
+    /// Returns the CRC version for this snapshot. The CRC is always at the snapshot version.
     ///
     /// This is a test-only helper for integration tests to inspect the CRC version.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn crc_version_for_testing(&self) -> Option<Version> {
-        self.lazy_crc.crc_version()
+        Some(self.version())
     }
 
     /// Writes a version checksum (CRC) file for this snapshot. Writers should call this after
@@ -782,14 +815,7 @@ impl Snapshot {
             return Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)));
         }
 
-        let crc = self
-            .lazy_crc
-            .get_if_loaded_at_version(self.version())
-            .ok_or_else(|| {
-                Error::ChecksumWriteUnsupported(
-                    "No in-memory CRC available at this snapshot version.".to_string(),
-                )
-            })?;
+        let crc = &self.crc;
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
@@ -801,7 +827,7 @@ impl Snapshot {
                 let new_snapshot = Arc::new(Snapshot::new_with_crc(
                     new_log_segment,
                     self.table_configuration().clone(),
-                    self.lazy_crc.clone(),
+                    self.crc.clone(),
                 ));
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
@@ -880,7 +906,7 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new_with_crc(
             self.log_segment().new_as_published()?,
             self.table_configuration().clone(),
-            self.lazy_crc.clone(),
+            self.crc.clone(),
         )))
     }
 
@@ -951,20 +977,9 @@ impl Snapshot {
             }
         }
 
-        // Fast path: try reading ICT from CRC file (if it is at this snapshot version)
-        if let Some(crc) = self
-            .lazy_crc
-            .get_or_load_if_at_version(engine, self.version())
-        {
-            match crc.in_commit_timestamp_opt {
-                Some(ict) => return Ok(Some(ict)),
-                None => {
-                    return Err(Error::generic(format!(
-                        "In-Commit Timestamp not found in CRC file at version {}",
-                        self.version()
-                    )));
-                }
-            }
+        // Fast path: try reading ICT from the CRC if it has one.
+        if let Some(ict) = self.crc.in_commit_timestamp_opt {
+            return Ok(Some(ict));
         }
 
         // Fallback: read the ICT from latest_commit_file
@@ -1496,8 +1511,8 @@ mod tests {
 
         // Test CRC handling during incremental snapshot update (v0 -> v1).
         // The new log listing starts at v1, so the new log segment doesn't find 0.crc.
-        // a) Only 0.crc exists: resolve_crc falls back to old segment's 0.crc.
-        // b) Both 0.crc and 1.crc exist: resolve_crc picks up 1.crc.
+        // a) Only 0.crc exists: CRC resolution falls back to old segment's 0.crc.
+        // b) Both 0.crc and 1.crc exist: CRC resolution picks up 1.crc.
         let crc = json!({
             "table_size_bytes": 100,
             "num_files": 1,
@@ -1531,7 +1546,7 @@ mod tests {
             0
         );
 
-        // b) both 0.crc and 1.crc exist -- resolve_crc picks up 1.crc
+        // b) both 0.crc and 1.crc exist -- CRC resolution picks up 1.crc
         let path = delta_path_for_version(1, "crc");
         let crc = json!({
             "table_size_bytes": 100,
@@ -2440,7 +2455,7 @@ mod tests {
         // WHEN
         let fake_new_commit = ParsedLogPath::create_parsed_published_commit(&url, next_version);
         let post_commit_snapshot = base_snapshot
-            .new_post_commit(fake_new_commit, CrcDelta::default())
+            .new_post_commit(fake_new_commit, CrcUpdate::default())
             .unwrap();
 
         // THEN

@@ -13,7 +13,7 @@ use crate::actions::{
     DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
-use crate::crc::{CrcDelta, FileStatsDelta};
+use crate::crc::{CrcUpdate, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::ColumnName;
@@ -421,13 +421,13 @@ impl<S> Transaction<S> {
                     .get_file_stats_if_loaded()
                     .and_then(|s| s.file_size_histogram)
                     .map(|h| h.sorted_bin_boundaries);
-                let crc_delta = self.build_crc_delta(
+                let crc_update = self.build_crc_update(
                     in_commit_timestamp,
                     dm_changes,
                     bin_boundaries.as_deref(),
                 )?;
                 Ok(CommitResult::CommittedTransaction(
-                    self.into_committed(file_meta, crc_delta)?,
+                    self.into_committed(file_meta, crc_update)?,
                 ))
             }
             Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
@@ -904,7 +904,7 @@ impl<S> Transaction<S> {
     fn into_committed(
         self,
         file_meta: FileMeta,
-        crc_delta: CrcDelta,
+        crc_update: CrcUpdate,
     ) -> DeltaResult<CommittedTransaction> {
         let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
 
@@ -925,34 +925,44 @@ impl<S> Transaction<S> {
             post_commit_stats,
             post_commit_snapshot: Some(Arc::new(
                 self.read_snapshot
-                    .new_post_commit(parsed_commit, crc_delta)?,
+                    .new_post_commit(parsed_commit, crc_update)?,
             )),
         })
     }
 
-    /// Build a [`CrcDelta`] from the transaction's staged file metadata and commit state.
-    fn build_crc_delta(
+    /// Build a [`CrcUpdate`] from the transaction's staged file metadata and commit state.
+    fn build_crc_update(
         &self,
         in_commit_timestamp: Option<i64>,
         dm_changes: Vec<DomainMetadata>,
         bin_boundaries: Option<&[i64]>,
-    ) -> DeltaResult<CrcDelta> {
+    ) -> DeltaResult<CrcUpdate> {
         let file_stats = FileStatsDelta::try_compute_for_txn(
             &self.add_files_metadata,
             &self.remove_files_metadata,
             bin_boundaries,
         )?;
         let is_create = self.is_create_table();
-        Ok(CrcDelta {
+        Ok(CrcUpdate {
             file_stats,
             protocol: is_create
                 .then(|| self.read_snapshot.table_configuration().protocol().clone()),
             metadata: is_create
                 .then(|| self.read_snapshot.table_configuration().metadata().clone()),
-            domain_metadata_changes: dm_changes,
-            set_transaction_changes: self.set_transactions.clone(),
+            domain_metadata: dm_changes
+                .into_iter()
+                .map(|dm| (dm.domain().to_string(), dm))
+                .collect(),
+            set_transactions: self
+                .set_transactions
+                .iter()
+                .map(|txn| (txn.app_id.clone(), txn.clone()))
+                .collect(),
             in_commit_timestamp,
-            operation: self.operation.clone(),
+            operation_safe: self
+                .operation
+                .as_deref()
+                .is_some_and(FileStatsDelta::is_incremental_safe),
             has_missing_file_size: false, // writes always have sizes
         })
     }

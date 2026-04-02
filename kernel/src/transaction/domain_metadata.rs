@@ -182,7 +182,7 @@ impl<S> Transaction<S> {
     ///
     /// Returns a tuple of `(action_iter, domain_metadata_vec)`.
     /// - The action iterator contains EngineData to be written to the commit file (`00N.json`).
-    /// - The `Vec<DomainMetadata>` is used to construct a [`CrcDelta`](crate::crc::CrcDelta),
+    /// - The `Vec<DomainMetadata>` is used to construct a [`CrcUpdate`](crate::crc::CrcUpdate),
     ///   which feeds the post-commit snapshot with the domain metadata written in this transaction
     ///   and powers CRC file writes.
     ///

@@ -68,6 +68,7 @@ impl LazyCrc {
     /// The CRC is immediately available via `get_or_load` without any I/O. The `version`
     /// parameter records which table version this CRC corresponds to, enabling
     /// `get_if_loaded_at_version` to work for chained commits.
+    #[allow(dead_code)] // May be useful for future optimizations.
     pub(crate) fn new_precomputed(crc: Crc, version: Version) -> Self {
         let cached = OnceLock::new();
         // OnceLock::set cannot fail here because we just created it
@@ -100,6 +101,7 @@ impl LazyCrc {
     }
 
     /// Returns the CRC only if the CRC file is at the given version, loading if necessary.
+    #[allow(dead_code)] // May be useful for future optimizations.
     pub(crate) fn get_or_load_if_at_version(
         &self,
         engine: &dyn Engine,
@@ -115,6 +117,7 @@ impl LazyCrc {
     ///
     /// This is purely opportunistic: it returns `Some` only when the CRC was previously loaded
     /// (via `get_or_load`) or precomputed (via `new_precomputed`) AND the version matches.
+    #[allow(dead_code)] // May be useful for future optimizations.
     pub(crate) fn get_if_loaded_at_version(&self, version: Version) -> Option<&Arc<Crc>> {
         if self.crc_version() != Some(version) {
             return None;
