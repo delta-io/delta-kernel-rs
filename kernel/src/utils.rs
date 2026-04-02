@@ -20,7 +20,6 @@ macro_rules! require {
 
 pub(crate) use require;
 
-
 /// Try to parse string uri into a URL for a table path. This will do it's best to handle things
 /// like `/local/paths`, and even `../relative/paths`.
 #[allow(unused)]
