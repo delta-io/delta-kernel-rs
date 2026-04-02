@@ -25,7 +25,7 @@ pub(crate) use file_stats::FileStats;
 pub(crate) use file_stats::FileStatsDelta;
 #[allow(unused)]
 pub use file_stats_state::{
-    DomainMetadataState, FileStatsState, FileStatsValidity, SetTransactionState,
+    DomainMetadataState, FileStatsValidity, SetTransactionState,
 };
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
