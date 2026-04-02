@@ -70,20 +70,13 @@ impl CrcDelta {
                 .map(|txn| (txn.app_id.clone(), txn))
                 .collect(),
         );
-        // Compute the initial histogram from the file stats. If both added and removed
-        // histograms are present, subtract removals from additions. If only the added
-        // histogram is present, use it directly. Otherwise, we cannot produce a histogram.
-        //
-        // If try_sub fails for any reason (ie. histogram goes negative) then the histogram
-        // is silently dropped.
-        let initial_histogram = match (
-            self.file_stats.added_histogram,
-            self.file_stats.removed_histogram,
-        ) {
-            (Some(added), Some(removed)) => added.try_sub(&removed).ok(),
-            (Some(added), None) => Some(added),
-            _ => None,
-        };
+        // For version zero the delta IS the full table histogram. Validate that all bins
+        // are non-negative (a real table can't have negative file counts). If validation
+        // fails, silently drop the histogram.
+        let initial_histogram = self
+            .file_stats
+            .net_histogram
+            .and_then(|delta| delta.check_non_negative().ok());
         Some(Crc {
             table_size_bytes: self.file_stats.net_bytes,
             num_files: self.file_stats.net_files,
@@ -180,21 +173,20 @@ impl Crc {
         self.num_files += delta.file_stats.net_files;
         self.table_size_bytes += delta.file_stats.net_bytes;
 
-        // Histogram: merge base + added - removed.
-        // Only update if the base CRC has a histogram AND the delta provides both histograms.
-        // If the merge fails (e.g. negative counts from corrupted data) or the delta is missing
-        // either histogram, drop it rather than leaving stale data.
-        if let (Some(base_hist), Some(added), Some(removed)) = (
+        // Histogram: merge base and delta.
+        // Only update if the base CRC has a histogram AND the delta provides one.
+        // If the merge fails (e.g. negative counts from corrupted data) or the delta is
+        // missing a histogram, drop it rather than leaving stale data.
+        if let (Some(base_hist), Some(delta_hist)) = (
             self.file_size_histogram.as_ref(),
-            &delta.file_stats.added_histogram,
-            &delta.file_stats.removed_histogram,
+            &delta.file_stats.net_histogram,
         ) {
-            match base_hist.try_add(added).and_then(|h| h.try_sub(removed)) {
+            match base_hist.try_apply_delta(delta_hist) {
                 Ok(merged) => self.file_size_histogram = Some(merged),
                 Err(_) => self.file_size_histogram = None,
             }
         } else if self.file_size_histogram.is_some() {
-            // The base had a histogram but the delta couldn't provide add/remove histograms
+            // The base had a histogram but the delta couldn't provide one
             // (e.g. forward log replay). Drop it rather than leaving a stale value.
             self.file_size_histogram = None;
         }
@@ -688,18 +680,22 @@ mod tests {
         }
     }
 
-    /// Helper: creates a CrcDelta with histogram data for adds and removes.
+    /// Helper: creates a CrcDelta with a delta histogram built from adds and removes.
     fn write_delta_with_histograms(add_sizes: &[i64], remove_sizes: &[i64]) -> CrcDelta {
-        let added = histogram_from_sizes(add_sizes);
-        let removed = histogram_from_sizes(remove_sizes);
+        let mut hist = FileSizeHistogram::create_default();
+        for &s in add_sizes {
+            hist.insert(s).unwrap();
+        }
+        for &s in remove_sizes {
+            hist.remove(s).unwrap();
+        }
         let net_files = add_sizes.len() as i64 - remove_sizes.len() as i64;
         let net_bytes: i64 = add_sizes.iter().sum::<i64>() - remove_sizes.iter().sum::<i64>();
         CrcDelta {
             file_stats: FileStatsDelta {
                 net_files,
                 net_bytes,
-                added_histogram: Some(added),
-                removed_histogram: Some(removed),
+                net_histogram: Some(hist),
             },
             operation: Some("WRITE".to_string()),
             ..Default::default()
@@ -746,27 +742,18 @@ mod tests {
     }
 
     #[rstest]
-    #[case::base_none_delta_none(None, None, None)]
-    #[case::base_some_delta_both_none(Some(vec![100i64, 200]), None, None)]
-    #[case::base_some_delta_added_only(Some(vec![100i64, 200]), Some(vec![500i64]), None)]
-    #[case::base_some_delta_removed_only(Some(vec![100i64, 200]), None, Some(vec![100i64]))]
-    fn apply_drops_histogram_when_delta_missing_histograms(
-        #[case] base_files: Option<Vec<i64>>,
-        #[case] added_sizes: Option<Vec<i64>>,
-        #[case] removed_sizes: Option<Vec<i64>>,
-    ) {
+    #[case::base_none_delta_none(None)]
+    #[case::base_some_delta_none(Some(vec![100i64, 200]))]
+    fn apply_drops_histogram_when_delta_missing_histogram(#[case] base_files: Option<Vec<i64>>) {
         let mut crc = match &base_files {
             Some(sizes) => base_crc_with_histogram(sizes),
             None => base_crc(),
         };
-        let added_histogram = added_sizes.map(|sizes| histogram_from_sizes(&sizes));
-        let removed_histogram = removed_sizes.map(|sizes| histogram_from_sizes(&sizes));
         let delta = CrcDelta {
             file_stats: FileStatsDelta {
                 net_files: 1,
                 net_bytes: 100,
-                added_histogram,
-                removed_histogram,
+                net_histogram: None,
             },
             operation: Some("WRITE".to_string()),
             ..Default::default()
@@ -774,7 +761,7 @@ mod tests {
         crc.apply(delta);
         assert!(
             crc.file_size_histogram.is_none(),
-            "histogram should be None when delta can't provide both add/remove histograms"
+            "histogram should be None when delta doesn't provide a histogram"
         );
     }
 
@@ -805,15 +792,14 @@ mod tests {
 
     #[test]
     fn into_crc_for_version_zero_includes_histogram() {
-        let added = histogram_from_sizes(&[500, 1000]);
+        let delta_hist = histogram_from_sizes(&[500, 1000]);
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
             metadata: Some(Metadata::default()),
             file_stats: FileStatsDelta {
                 net_files: 2,
                 net_bytes: 1500,
-                added_histogram: Some(added),
-                removed_histogram: Some(FileSizeHistogram::create_default()),
+                net_histogram: Some(delta_hist),
             },
             operation: Some("WRITE".to_string()),
             ..Default::default()
@@ -826,7 +812,7 @@ mod tests {
 
     #[test]
     fn into_crc_for_version_zero_without_histogram() {
-        // write_delta() produces a CrcDelta with no added/removed histograms, so
+        // write_delta() produces a CrcDelta with no histogram delta, so
         // into_crc_for_version_zero cannot construct a file size histogram.
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
@@ -856,20 +842,17 @@ mod tests {
             ..Default::default()
         };
 
-        // Delta with matching non-default boundaries
-        let mut added =
-            FileSizeHistogram::create_empty_with_boundaries(boundaries.clone()).unwrap();
-        added.insert(100).unwrap(); // bin 0
-        added.insert(1500).unwrap(); // bin 2
-        let mut removed = FileSizeHistogram::create_empty_with_boundaries(boundaries).unwrap();
-        removed.insert(150).unwrap(); // bin 0
+        // Delta with matching non-default boundaries: +100 and +1500, -150
+        let mut delta_hist = FileSizeHistogram::create_empty_with_boundaries(boundaries).unwrap();
+        delta_hist.insert(100).unwrap(); // bin 0
+        delta_hist.insert(1500).unwrap(); // bin 2
+        delta_hist.remove(150).unwrap(); // bin 0
 
         let delta = CrcDelta {
             file_stats: FileStatsDelta {
                 net_files: 1,    // +2 - 1
                 net_bytes: 1450, // (100 + 1500) - 150
-                added_histogram: Some(added),
-                removed_histogram: Some(removed),
+                net_histogram: Some(delta_hist),
             },
             operation: Some("WRITE".to_string()),
             ..Default::default()

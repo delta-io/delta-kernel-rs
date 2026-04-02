@@ -1,8 +1,8 @@
 //! File statistics and deltas for CRC tracking.
 //!
 //! [`FileStats`] represents absolute file-level statistics (count, size, histogram) for a table
-//! version. [`FileStatsDelta`] captures the net changes from a single commit, including per-side
-//! [`FileSizeHistogram`]s for incremental histogram updates.
+//! version. [`FileStatsDelta`] captures the net changes from a single commit as a single delta
+//! [`FileSizeHistogram`] (adds minus removes).
 //!
 //! [`FileStatsDelta`] captures how many files were added/removed and their total sizes. It can be
 //! produced from either:
@@ -32,19 +32,17 @@ pub struct FileStats {
     pub file_size_histogram: Option<FileSizeHistogram>,
 }
 
-/// Net file count and size changes from a single commit, with optional per-side histograms.
+/// Net file count and size changes from a single commit, with an optional net histogram.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FileStatsDelta {
     /// Net change in file count (files added minus files removed).
     pub(crate) net_files: i64,
     /// Net change in total bytes (bytes added minus bytes removed).
     pub(crate) net_bytes: i64,
-    /// Histogram of file sizes added in this delta. `None` when the delta source does not
-    /// provide histogram data (e.g. forward log replay without histogram support).
-    pub(crate) added_histogram: Option<FileSizeHistogram>,
-    /// Histogram of file sizes removed in this delta. `None` when the delta source does not
-    /// provide histogram data.
-    pub(crate) removed_histogram: Option<FileSizeHistogram>,
+    /// Net change in file size histogram (adds minus removes per bin). May contain negative
+    /// values in bins where more files were removed than added. `None` when the delta source
+    /// does not provide histogram data (e.g. forward log replay without histogram support).
+    pub(crate) net_histogram: Option<FileSizeHistogram>,
 }
 
 impl FileStatsDelta {
@@ -71,7 +69,8 @@ impl FileStatsDelta {
         Self::INCREMENTAL_SAFE_OPS.contains(&operation)
     }
 
-    /// Compute file stats and histograms from a transaction's staged add and remove metadata.
+    /// Compute file stats and a delta histogram from a transaction's staged add and remove
+    /// metadata.
     ///
     /// A commit writes three kinds of file actions:
     ///   (1) Add actions (from `add_files_metadata`)
@@ -83,88 +82,91 @@ impl FileStatsDelta {
     /// sizes, and histograms.
     ///
     /// `bin_boundaries` specifies the histogram bin boundaries to use. When `Some`, the
-    /// delta histograms are built with those boundaries (matching the previous CRC's histogram).
+    /// delta histogram is built with those boundaries (matching the previous CRC's histogram).
     /// When `None`, the standard default boundaries are used. Callers should pass the previous
-    /// CRC's boundaries when available so that `try_add`/`try_sub` in [`Crc::apply`] succeed.
+    /// CRC's boundaries when available so that `try_apply_delta` in [`Crc::apply`] succeeds.
     pub(crate) fn try_compute_for_txn(
         add_files_metadata: &[Box<dyn EngineData>],
         remove_files_metadata: &[FilteredEngineData],
         bin_boundaries: Option<&[i64]>,
     ) -> DeltaResult<Self> {
-        // Visit add files. Every row is a file being added (no selection vector).
-        let mut add_visitor = FileStatsVisitor::new(None, bin_boundaries)?;
+        let mut histogram = match bin_boundaries {
+            Some(b) => FileSizeHistogram::create_empty_with_boundaries(b.to_vec())?,
+            None => FileSizeHistogram::create_default(),
+        };
+        let mut net_files = 0i64;
+        let mut net_bytes = 0i64;
+
+        // Visit add files (insert into histogram). Every row is a file being added.
         for batch in add_files_metadata {
-            add_visitor.visit_rows_of(batch.as_ref())?;
+            let mut visitor = FileStatsVisitor::new(None, false, &mut histogram);
+            visitor.visit_rows_of(batch.as_ref())?;
+            net_files += visitor.count;
+            net_bytes += visitor.total_size;
         }
 
-        // Visit remove files. Each FilteredEngineData has its own selection vector, so we
-        // create a visitor per batch and accumulate counts and histograms.
-        let mut remove_count = 0i64;
-        let mut remove_size = 0i64;
-        let mut remove_histogram = create_histogram(bin_boundaries)?;
+        // Visit remove files (remove from histogram). Each FilteredEngineData has its own
+        // selection vector, so we create a visitor per batch.
         for filtered_batch in remove_files_metadata {
             let sv = filtered_batch.selection_vector();
             let sv_opt = if sv.is_empty() { None } else { Some(sv) };
-            let mut visitor = FileStatsVisitor::new(sv_opt, bin_boundaries)?;
+            let mut visitor = FileStatsVisitor::new(sv_opt, true, &mut histogram);
             visitor.visit_rows_of(filtered_batch.data())?;
-            remove_count += visitor.count;
-            remove_size += visitor.total_size;
-            remove_histogram = remove_histogram.try_add(&visitor.histogram)?;
+            net_files += visitor.count;
+            net_bytes += visitor.total_size;
         }
 
         Ok(FileStatsDelta {
-            net_files: add_visitor.count - remove_count,
-            net_bytes: add_visitor.total_size - remove_size,
-            added_histogram: Some(add_visitor.histogram),
-            removed_histogram: Some(remove_histogram),
+            net_files,
+            net_bytes,
+            net_histogram: Some(histogram),
         })
     }
 }
 
-/// Visitor that extracts the `size` column from file metadata and accumulates counts and totals.
+/// Visitor that extracts the `size` column from file metadata and updates a shared histogram.
+///
+/// When `is_remove` is false (add files), each visited row increments the histogram bin's count
+/// and bytes. When true (remove files), each row decrements them. This builds a single delta
+/// histogram directly without needing separate add/remove histograms.
 ///
 /// Accepts an optional selection vector to filter which rows are visited. AddFiles pass `None`
 /// (count every row); RemoveFiles may pass `Some(sv)` from [`FilteredEngineData`] to skip rows
 /// that are not actually being removed.
-///
-/// Tracks an `offset` across multiple `visit()` calls to correctly index into the selection
-/// vector when the engine delivers data in multiple batches.
-struct FileStatsVisitor<'sv> {
+struct FileStatsVisitor<'sv, 'h> {
     /// Optional selection vector. When `Some`, only rows marked `true` are counted. Rows beyond
     /// the SV length are implicitly selected.
     selection_vector: Option<&'sv [bool]>,
     /// Offset into the selection vector, tracking position across multiple visit calls.
     offset: usize,
+    /// Whether this visitor is processing remove files (decrements) vs add files (increments).
+    is_remove: bool,
+    /// Net file count contribution from this visitor. Negative for remove visitors.
     count: i64,
+    /// Net byte size contribution from this visitor. Negative for remove visitors.
     total_size: i64,
-    /// Histogram tracking file size distribution for the visited files.
-    histogram: FileSizeHistogram,
+    /// Shared histogram that all visitors (add and remove) write to.
+    histogram: &'h mut FileSizeHistogram,
 }
 
-impl<'sv> FileStatsVisitor<'sv> {
+impl<'sv, 'h> FileStatsVisitor<'sv, 'h> {
     fn new(
         selection_vector: Option<&'sv [bool]>,
-        bin_boundaries: Option<&[i64]>,
-    ) -> DeltaResult<Self> {
-        Ok(Self {
+        is_remove: bool,
+        histogram: &'h mut FileSizeHistogram,
+    ) -> Self {
+        Self {
             selection_vector,
             offset: 0,
+            is_remove,
             count: 0,
             total_size: 0,
-            histogram: create_histogram(bin_boundaries)?,
-        })
+            histogram,
+        }
     }
 }
 
-/// Creates an empty histogram using the given boundaries, or the default boundaries if `None`.
-fn create_histogram(bin_boundaries: Option<&[i64]>) -> DeltaResult<FileSizeHistogram> {
-    match bin_boundaries {
-        Some(b) => FileSizeHistogram::create_empty_with_boundaries(b.to_vec()),
-        None => Ok(FileSizeHistogram::create_default()),
-    }
-}
-
-impl RowVisitor for FileStatsVisitor<'_> {
+impl RowVisitor for FileStatsVisitor<'_, '_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| (vec![ColumnName::new(["size"])], vec![DataType::LONG]).into());
@@ -186,9 +188,15 @@ impl RowVisitor for FileStatsVisitor<'_> {
             };
             if selected {
                 let size: i64 = getters[0].get(i, "size")?;
-                self.count += 1;
-                self.total_size += size;
-                self.histogram.insert(size)?;
+                if self.is_remove {
+                    self.count -= 1;
+                    self.total_size -= size;
+                    self.histogram.remove(size)?;
+                } else {
+                    self.count += 1;
+                    self.total_size += size;
+                    self.histogram.insert(size)?;
+                }
             }
         }
         self.offset += row_count;
@@ -278,33 +286,30 @@ mod tests {
     }
 
     #[test]
-    fn try_compute_builds_histograms_from_add_and_remove_sizes() {
+    fn try_compute_builds_delta_histogram_from_add_and_remove_sizes() {
         let adds = vec![size_batch(vec![100, 200, 300])];
         let removes = vec![FilteredEngineData::with_all_rows_selected(size_batch(
             vec![500, 700],
         ))];
         let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
 
-        // All sizes < 8KB so they all land in bin 0
-        let added = stats.added_histogram.unwrap();
-        assert_eq!(added.file_counts[0], 3);
-        assert_eq!(added.total_bytes[0], 600);
-        let removed = stats.removed_histogram.unwrap();
-        assert_eq!(removed.file_counts[0], 2);
-        assert_eq!(removed.total_bytes[0], 1200);
+        // All sizes < 8KB so they all land in bin 0. Net: 3 adds - 2 removes = 1 file,
+        // 600 - 1200 = -600 bytes.
+        let delta = stats.net_histogram.unwrap();
+        assert_eq!(delta.file_counts[0], 1);
+        assert_eq!(delta.total_bytes[0], -600);
     }
 
     #[test]
-    fn try_compute_empty_batches_produce_zero_histograms() {
+    fn try_compute_empty_batches_produce_zero_histogram() {
         let stats = FileStatsDelta::try_compute_for_txn(&[], &[], None).unwrap();
-        let added = stats.added_histogram.unwrap();
-        assert!(added.file_counts.iter().all(|&c| c == 0));
-        let removed = stats.removed_histogram.unwrap();
-        assert!(removed.file_counts.iter().all(|&c| c == 0));
+        let delta = stats.net_histogram.unwrap();
+        assert!(delta.file_counts.iter().all(|&c| c == 0));
+        assert!(delta.total_bytes.iter().all(|&b| b == 0));
     }
 
     #[test]
-    fn try_compute_histograms_with_selection_vectors() {
+    fn try_compute_histogram_with_selection_vectors() {
         let adds = vec![size_batch(vec![100, 200])];
         let removes = vec![FilteredEngineData::try_new(
             size_batch(vec![300, 400, 500]),
@@ -313,13 +318,10 @@ mod tests {
         .unwrap()];
         let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
 
-        let added = stats.added_histogram.unwrap();
-        assert_eq!(added.file_counts[0], 2);
-        assert_eq!(added.total_bytes[0], 300);
-        // Only 300 and 500 are selected (400 skipped)
-        let removed = stats.removed_histogram.unwrap();
-        assert_eq!(removed.file_counts[0], 2);
-        assert_eq!(removed.total_bytes[0], 800);
+        // Net bin 0: 2 adds - 2 removes = 0 files, 300 - 800 = -500 bytes
+        let delta = stats.net_histogram.unwrap();
+        assert_eq!(delta.file_counts[0], 0);
+        assert_eq!(delta.total_bytes[0], -500);
     }
 
     #[test]
@@ -332,20 +334,17 @@ mod tests {
         ))];
         let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, Some(boundaries)).unwrap();
 
-        let added = stats.added_histogram.unwrap();
-        assert_eq!(added.sorted_bin_boundaries, vec![0, 200, 1000]);
-        assert_eq!(added.file_counts, vec![1, 1, 1]); // 50 in bin 0, 300 in bin 1, 1500 in bin 2
-        assert_eq!(added.total_bytes, vec![50, 300, 1500]);
-
-        let removed = stats.removed_histogram.unwrap();
-        assert_eq!(removed.sorted_bin_boundaries, vec![0, 200, 1000]);
-        assert_eq!(removed.file_counts, vec![1, 1, 0]); // 100 in bin 0, 500 in bin 1
-        assert_eq!(removed.total_bytes, vec![100, 500, 0]);
+        let delta = stats.net_histogram.unwrap();
+        assert_eq!(delta.sorted_bin_boundaries, vec![0, 200, 1000]);
+        // Net per bin: (1-1, 1-1, 1-0) = (0, 0, 1)
+        assert_eq!(delta.file_counts, vec![0, 0, 1]);
+        // Net per bin: (50-100, 300-500, 1500-0) = (-50, -200, 1500)
+        assert_eq!(delta.total_bytes, vec![-50, -200, 1500]);
     }
 
     #[test]
-    fn try_compute_with_custom_boundaries_produces_mergeable_histograms() {
-        // Build a base histogram with custom boundaries, then verify delta histograms merge.
+    fn try_compute_with_custom_boundaries_produces_mergeable_histogram() {
+        // Build a base histogram with custom boundaries, then verify delta merges correctly.
         let boundaries = vec![0, 200, 1000];
         let mut base = FileSizeHistogram::create_empty_with_boundaries(boundaries.clone()).unwrap();
         base.insert(150).unwrap(); // bin 0
@@ -358,14 +357,8 @@ mod tests {
         let stats =
             FileStatsDelta::try_compute_for_txn(&adds, &removes, Some(&boundaries)).unwrap();
 
-        let added = stats.added_histogram.unwrap();
-        let removed = stats.removed_histogram.unwrap();
-
-        // Merge: base + added - removed should succeed (boundaries match)
-        let merged = base
-            .try_add(&added)
-            .and_then(|h| h.try_sub(&removed))
-            .unwrap();
+        let delta = stats.net_histogram.unwrap();
+        let merged = base.try_apply_delta(&delta).unwrap();
         assert_eq!(merged.file_counts, vec![1, 2, 0]); // (1+1-1), (1+1-0), (0+0-0)
         assert_eq!(merged.total_bytes, vec![100, 800, 0]); // (150+100-150), (500+300-0)
     }
