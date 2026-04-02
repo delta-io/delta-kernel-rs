@@ -52,6 +52,9 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::InCommitTimestamp,
     // VacuumProtocolCheck ensures consistent protocol checks during VACUUM
     TableFeature::VacuumProtocolCheck,
+    // CatalogManaged enables catalog-managed table support
+    #[cfg(feature = "catalog-managed")]
+    TableFeature::CatalogManaged,
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
     // specifying clustering columns via `with_data_layout()`.

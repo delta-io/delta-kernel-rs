@@ -1,7 +1,10 @@
 //! UCKernelClient implements a high-level interface for interacting with Delta Tables in Unity Catalog.
 
 mod committer;
+mod constants;
+mod utils;
 pub use committer::UCCommitter;
+pub use utils::{get_final_required_properties_for_uc, get_required_properties_for_disk};
 
 use std::sync::Arc;
 
