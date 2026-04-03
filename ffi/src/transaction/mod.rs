@@ -827,9 +827,21 @@ mod tests {
                 engine.shallow_copy(),
             )
         });
-        // create_table does NOT consume the schema handle -- free it
+        // get_create_table_builder does NOT consume the schema handle -- free it
         unsafe { free_schema(schema_handle) };
         (table_path, engine, builder)
+    }
+
+    /// Build and commit a create-table builder, asserting that the committed version is 0.
+    fn build_and_commit(
+        builder: Handle<ExclusiveCreateTableBuilder>,
+        engine: &Handle<crate::SharedExternEngine>,
+    ) -> u64 {
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+        let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        assert_eq!(version, 0);
+        version
     }
 
     #[tokio::test]
@@ -845,11 +857,7 @@ mod tests {
         );
         let table_path_str = table_path.as_str();
 
-        // Build transaction, then commit -- should return version 0
-        let txn =
-            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
-        let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
-        assert_eq!(version, 0);
+        build_and_commit(builder, &engine);
 
         // Verify by opening a snapshot of the created table
         let snap = ok_or_panic(unsafe {
@@ -902,10 +910,7 @@ mod tests {
             )
         });
 
-        let txn =
-            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
-        let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
-        assert_eq!(version, 0);
+        build_and_commit(builder, &engine);
 
         // Verify properties by reading the commit log directly
         let commit_path = Path::from("_delta_log/00000000000000000000.json");
@@ -942,10 +947,7 @@ mod tests {
             &tmp_dir,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
-        let txn =
-            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
-        let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
-        assert_eq!(version, 0);
+        build_and_commit(builder, &engine);
 
         // Try to create the same table again -- build should error (table already exists)
         let (_, _, builder2) = create_table_builder(
