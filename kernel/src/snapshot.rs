@@ -493,12 +493,13 @@ impl Snapshot {
     /// reflects the new checkpoint. Commits and compaction files subsumed by the checkpoint are
     /// dropped from the returned snapshot.
     ///
-    /// Note: This function uses [`crate::ParquetHandler::write_parquet_file`] and
-    /// [`crate::StorageHandler::head`], which may not be implemented by all engines
-    /// (e.g., `SyncEngine`).
-    ///
-    /// If you are using the default engine, make sure to build it with the multi-threaded
-    /// executor if you want to use this method.
+    /// Note:
+    ///     - It is still possible that an existing checkpoint gets overwritten if that
+    ///       checkpoint was written by a concurrent writer.
+    ///     - This function uses [`crate::ParquetHandler::write_parquet_file`] and
+    ///       [`crate::StorageHandler::head`], which may not be implemented by all engines
+    ///       (e.g., `SyncEngine`). If you are using the default engine, make sure to build it
+    ///       with the multi-threaded executor if you want to use this method.
     #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
     pub fn checkpoint(
         self: &SnapshotRef,
