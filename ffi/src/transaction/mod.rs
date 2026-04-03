@@ -17,19 +17,6 @@ use delta_kernel::transaction::create_table::{
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
 
-// ============================================================================
-// Shared transaction FFI helpers (used by both existing-table and create-table)
-// ============================================================================
-
-/// Internal helper: parse engine info from a KernelStringSlice into a &str.
-///
-/// # Safety
-///
-/// Caller must ensure `engine_info` points to valid UTF-8 data.
-unsafe fn parse_engine_info(engine_info: &KernelStringSlice) -> DeltaResult<&str> {
-    unsafe { TryFromStringSlice::try_from_slice(engine_info) }
-}
-
 /// A handle for an existing-table transaction (`Transaction<ExistingTable>`).
 ///
 /// Returned by [`transaction`] and [`transaction_with_committer`]. Supports all transaction
@@ -149,16 +136,24 @@ pub unsafe extern "C" fn with_engine_info(
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let info = unsafe { parse_engine_info(&engine_info) };
-    (|| -> DeltaResult<_> { Ok(Box::new((*txn).with_engine_info(info?)).into()) })()
-        .into_extern_result(&engine)
+    with_engine_info_impl(*txn, engine_info).into_extern_result(&engine)
 }
 
-/// Add file metadata to an existing-table transaction.
+fn with_engine_info_impl(
+    txn: Transaction,
+    engine_info: KernelStringSlice,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
+    Ok(Box::new(txn.with_engine_info(info)).into())
+}
+
+/// Add file metadata to the transaction for files that have been written. The metadata contains
+/// information about files written during the transaction that will be added to the Delta log
+/// during commit.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing valid handles. Consumes `write_metadata`.
+/// Caller is responsible for passing a valid handle. Consumes write_metadata.
 #[no_mangle]
 pub unsafe extern "C" fn add_files(
     mut txn: Handle<ExclusiveTransaction>,
@@ -169,22 +164,24 @@ pub unsafe extern "C" fn add_files(
     txn.add_files(write_metadata);
 }
 
-/// Mark an existing-table transaction as having data changes or not.
+/// Mark the transaction as having data changes or not (these are recorded at the file level).
 ///
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn set_data_change(mut txn: Handle<ExclusiveTransaction>, data_change: bool) {
-    let txn = unsafe { txn.as_mut() };
-    txn.set_data_change(data_change);
+    let underlying_txn = unsafe { txn.as_mut() };
+    underlying_txn.set_data_change(data_change);
 }
 
-/// Commit an existing-table transaction. Returns the committed version number on success.
+/// Attempt to commit a transaction to the table. Returns version number if successful.
+/// Returns error if the commit fails.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid handle. MUST NOT use the transaction after this.
+/// Caller is responsible for passing a valid handle. And MUST NOT USE transaction after this
+/// method is called.
 #[no_mangle]
 pub unsafe extern "C" fn commit(
     txn: Handle<ExclusiveTransaction>,
@@ -223,16 +220,24 @@ pub unsafe extern "C" fn create_table_with_engine_info(
 ) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let info = unsafe { parse_engine_info(&engine_info) };
-    (|| -> DeltaResult<_> { Ok(Box::new((*txn).with_engine_info(info?)).into()) })()
-        .into_extern_result(&engine)
+    create_table_with_engine_info_impl(*txn, engine_info).into_extern_result(&engine)
 }
 
-/// Add file metadata to a create-table transaction.
+fn create_table_with_engine_info_impl(
+    txn: CreateTableTransaction,
+    engine_info: KernelStringSlice,
+) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
+    let info: &str = unsafe { TryFromStringSlice::try_from_slice(&engine_info) }?;
+    Ok(Box::new(txn.with_engine_info(info)).into())
+}
+
+/// Add file metadata to a create-table transaction for files that have been written. The metadata
+/// contains information about files written during the transaction that will be added to the
+/// Delta log during commit.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing valid handles. Consumes `write_metadata`.
+/// Caller is responsible for passing a valid handle. Consumes write_metadata.
 #[no_mangle]
 pub unsafe extern "C" fn create_table_add_files(
     mut txn: Handle<ExclusiveCreateTransaction>,
@@ -243,7 +248,8 @@ pub unsafe extern "C" fn create_table_add_files(
     txn.add_files(write_metadata);
 }
 
-/// Mark a create-table transaction as having data changes or not.
+/// Mark the create-table transaction as having data changes or not (these are recorded at the
+/// file level).
 ///
 /// # Safety
 ///
@@ -253,15 +259,17 @@ pub unsafe extern "C" fn create_table_set_data_change(
     mut txn: Handle<ExclusiveCreateTransaction>,
     data_change: bool,
 ) {
-    let txn = unsafe { txn.as_mut() };
-    txn.set_data_change(data_change);
+    let underlying_txn = unsafe { txn.as_mut() };
+    underlying_txn.set_data_change(data_change);
 }
 
-/// Commit a create-table transaction. Returns the committed version number on success.
+/// Attempt to commit a create-table transaction. Returns version number if successful.
+/// Returns error if the commit fails.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid handle. MUST NOT use the transaction after this.
+/// Caller is responsible for passing a valid handle. And MUST NOT USE transaction after this
+/// method is called.
 #[no_mangle]
 pub unsafe extern "C" fn create_table_commit(
     txn: Handle<ExclusiveCreateTransaction>,
@@ -360,36 +368,42 @@ fn create_table_builder_with_table_property_impl(
     Ok(Box::new(builder).into())
 }
 
-/// Build a create-table transaction from the configured builder. Returns a create-table
-/// transaction handle that can be used with [`create_table_add_files`],
+/// Build a create-table transaction using the default [`FileSystemCommitter`]. Returns a
+/// create-table transaction handle that can be used with [`create_table_add_files`],
 /// [`create_table_set_data_change`], [`create_table_with_engine_info`], and
 /// [`create_table_commit`] to optionally stage initial data before committing.
 ///
-/// If `committer` is non-null, the builder uses that committer (consuming the handle). If
-/// `committer` is null, defaults to [`FileSystemCommitter`].
-///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid builder and engine handle. The `committer`
-/// parameter may be null (to use the default committer) or a valid `MutableCommitter` handle.
-/// CONSUMES the builder handle and the committer handle (if non-null) -- caller must not use
-/// them after this call.
+/// Caller is responsible for passing valid builder and engine handles.
+/// CONSUMES the builder handle -- caller must not use it after this call.
 #[no_mangle]
 pub unsafe extern "C" fn create_table_builder_build(
     builder: Handle<ExclusiveCreateTableBuilder>,
-    committer: *mut MutableCommitter,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
     let builder = unsafe { *builder.into_inner() };
-    let committer: Box<dyn Committer> = if committer.is_null() {
-        Box::new(FileSystemCommitter::new())
-    } else {
-        // SAFETY: caller asserts that a non-null committer pointer is a valid MutableCommitter
-        // handle. Handle<MutableCommitter> is repr(transparent) over NonNull<MutableCommitter>,
-        // which has the same ABI as *mut MutableCommitter, so this transmute is sound.
-        let handle: Handle<MutableCommitter> = unsafe { std::mem::transmute(committer) };
-        unsafe { handle.into_inner() }
-    };
+    let extern_engine = unsafe { engine.as_ref() };
+    let committer = Box::new(FileSystemCommitter::new());
+    create_table_builder_build_impl(builder, committer, extern_engine)
+        .into_extern_result(&extern_engine)
+}
+
+/// Build a create-table transaction with a custom committer. Same as
+/// [`create_table_builder_build`] but uses the provided committer instead of the default.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles.
+/// CONSUMES both the builder and committer handles -- caller must not use them after this call.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_builder_build_with_committer(
+    builder: Handle<ExclusiveCreateTableBuilder>,
+    committer: Handle<MutableCommitter>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
+    let builder = unsafe { *builder.into_inner() };
+    let committer = unsafe { committer.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
     create_table_builder_build_impl(builder, committer, extern_engine)
         .into_extern_result(&extern_engine)
@@ -939,9 +953,8 @@ mod tests {
         builder: Handle<ExclusiveCreateTableBuilder>,
         engine: &Handle<SharedExternEngine>,
     ) -> u64 {
-        let txn = ok_or_panic(unsafe {
-            create_table_builder_build(builder, std::ptr::null_mut(), engine.shallow_copy())
-        });
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
         let version = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
         assert_eq!(version, 0);
         version
@@ -982,11 +995,10 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_create_table_with_properties() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
-        let (_table_path, engine, builder) = create_table_builder(
+    #[test]
+    fn test_create_table_with_properties() {
+        let tmp_dir = tempdir().unwrap();
+        let (table_path, engine, builder) = create_table_builder(
             &tmp_dir,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
@@ -1015,29 +1027,24 @@ mod tests {
 
         build_and_commit(builder, &engine);
 
-        // Verify properties by reading the commit log directly
-        let commit_path = Path::from("_delta_log/00000000000000000000.json");
-        let storage = LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap();
-        let commit_bytes = storage
-            .get(&commit_path)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
-        let commit_str = std::str::from_utf8(&commit_bytes).unwrap();
-        // Parse each line as a JSON action and find the metaData action
-        let metadata_action = commit_str
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .find(|v| v.get("metaData").is_some())
-            .expect("commit should contain a metaData action");
-        let config = &metadata_action["metaData"]["configuration"];
-        assert_eq!(config["delta.appendOnly"], "true");
-        assert_eq!(config["custom.key"], "custom_value");
+        // Verify properties via snapshot
+        let table_path_str = table_path.as_str();
+        let snap = ok_or_panic(unsafe {
+            snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        let snap_ref = unsafe { snap.as_ref() };
+        let props = snap_ref.table_properties();
+        assert_eq!(props.append_only, Some(true));
+        assert_eq!(
+            props
+                .unknown_properties
+                .get("custom.key")
+                .map(|s| s.as_str()),
+            Some("custom_value")
+        );
 
+        unsafe { free_snapshot(snap) };
         unsafe { free_engine(engine) };
-        Ok(())
     }
 
     #[tokio::test]
@@ -1057,9 +1064,7 @@ mod tests {
             &tmp_dir,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
-        let result = unsafe {
-            create_table_builder_build(builder2, std::ptr::null_mut(), engine2.shallow_copy())
-        };
+        let result = unsafe { create_table_builder_build(builder2, engine2.shallow_copy()) };
         match result {
             ExternResult::Err(e) => {
                 // Clean up the error to prevent leaks
@@ -1101,9 +1106,7 @@ mod tests {
         // An empty schema is always invalid for table creation
         let (_table_path, engine, builder) = create_table_builder(&tmp_dir, vec![]);
 
-        let result = unsafe {
-            create_table_builder_build(builder, std::ptr::null_mut(), engine.shallow_copy())
-        };
+        let result = unsafe { create_table_builder_build(builder, engine.shallow_copy()) };
         match result {
             ExternResult::Err(e) => {
                 let error = unsafe { crate::ffi_test_utils::recover_error(e) };
@@ -1135,20 +1138,15 @@ mod tests {
         );
         let table_path_str = table_path.as_str();
 
-        // Create a FileSystemCommitter handle and pass it directly to build
+        // Create a FileSystemCommitter handle and pass it to build_with_committer
         let committer: Box<dyn delta_kernel::committer::Committer> =
             Box::new(FileSystemCommitter::new());
         let committer_handle: Handle<MutableCommitter> = committer.into();
 
-        // Build and commit using the custom committer passed directly to build
         let txn = ok_or_panic(unsafe {
-            create_table_builder_build(
+            create_table_builder_build_with_committer(
                 builder,
-                // SAFETY: Handle<MutableCommitter> is repr(transparent) over NonNull, which
-                // has the same ABI as *mut MutableCommitter. We cast the handle's inner pointer.
-                std::mem::transmute::<Handle<MutableCommitter>, *mut MutableCommitter>(
-                    committer_handle,
-                ),
+                committer_handle,
                 engine.shallow_copy(),
             )
         });

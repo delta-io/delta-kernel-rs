@@ -14,7 +14,8 @@ use super::{ExclusiveCreateTransaction, ExclusiveTransaction};
 #[handle_descriptor(target=WriteContext, mutable=false, sized=true)]
 pub struct SharedWriteContext;
 
-/// Gets the write context from an existing-table transaction.
+/// Gets the write context from a transaction. The write context provides schema and path
+/// information needed for writing data.
 ///
 /// # Safety
 ///
@@ -27,7 +28,8 @@ pub unsafe extern "C" fn get_write_context(
     Arc::new(txn.get_write_context()).into()
 }
 
-/// Gets the write context from a create-table transaction.
+/// Gets the write context from a create-table transaction. The write context provides schema
+/// and path information needed for writing data.
 ///
 /// # Safety
 ///
