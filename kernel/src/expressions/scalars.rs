@@ -341,11 +341,12 @@ impl Scalar {
             | Self::Integer(_)
             | Self::Long(_)
             | Self::Boolean(_) => Ok(self.to_string()),
-            // Float/Double: Rust's Display uses "inf"/"-inf" but Java uses
-            // "Infinity"/"-Infinity". We must match Java for interop since
-            // Java's Float.parseFloat("inf") throws NumberFormatException.
-            Self::Float(v) => Ok(format_float_partition(*v as f64, v.to_string())),
-            Self::Double(v) => Ok(format_float_partition(*v, v.to_string())),
+            // Float/Double: format using ryu to match Java's Float.toString / Double.toString.
+            // Java uses uppercase "E" for scientific notation, "Infinity" / "-Infinity" / "NaN"
+            // for special values. Rust's default Display produces "inf" / "-inf" and uses full
+            // decimal notation, which diverges from the Java serialization format.
+            Self::Float(v) => Ok(format_float_partition(*v as f64, format_f32_java(*v))),
+            Self::Double(v) => Ok(format_float_partition(*v, format_f64_java(*v))),
             // Decimal: use dedicated serialization to handle negative values correctly.
             // Scalar::Display has a bug for negative decimals with scale > 0 (Rust's %
             // operator preserves sign, producing e.g. "-1.-23" instead of "-1.23").
@@ -481,6 +482,21 @@ impl Scalar {
         };
         Some(result)
     }
+}
+
+/// Formats an `f32` the same way Java's `Float.toString(float)` does. The `ryu` crate
+/// implements the same Ryu algorithm that Java uses, but outputs lowercase `e` for scientific
+/// notation. Java uses uppercase `E`, so we replace after formatting.
+fn format_f32_java(v: f32) -> String {
+    let mut buf = ryu::Buffer::new();
+    buf.format(v).replace('e', "E")
+}
+
+/// Formats an `f64` the same way Java's `Double.toString(double)` does. Same as
+/// [`format_f32_java`] but for double precision.
+fn format_f64_java(v: f64) -> String {
+    let mut buf = ryu::Buffer::new();
+    buf.format(v).replace('e', "E")
 }
 
 /// Formats a float/double for partition value serialization. For NaN and infinity, uses
@@ -1835,14 +1851,50 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_partition_value_float_normal_values_unchanged() {
+    fn test_serialize_partition_value_float_normal_values_match_java() {
         assert_eq!(
             Scalar::Float(1.25).serialize_partition_value().unwrap(),
             "1.25"
         );
         assert_eq!(
+            Scalar::Float(0.0).serialize_partition_value().unwrap(),
+            "0.0"
+        );
+        assert_eq!(
+            Scalar::Float(-0.0).serialize_partition_value().unwrap(),
+            "-0.0"
+        );
+        assert_eq!(
+            Scalar::Float(f32::MAX).serialize_partition_value().unwrap(),
+            "3.4028235E38"
+        );
+        assert_eq!(
+            Scalar::Float(f32::MIN_POSITIVE)
+                .serialize_partition_value()
+                .unwrap(),
+            "1.1754944E-38"
+        );
+        assert_eq!(
             Scalar::Double(0.0).serialize_partition_value().unwrap(),
-            "0"
+            "0.0"
+        );
+        assert_eq!(
+            Scalar::Double(-0.0).serialize_partition_value().unwrap(),
+            "-0.0"
+        );
+        assert_eq!(
+            Scalar::Double(99.99).serialize_partition_value().unwrap(),
+            "99.99"
+        );
+        assert_eq!(
+            Scalar::Double(f64::MIN).serialize_partition_value().unwrap(),
+            "-1.7976931348623157E308"
+        );
+        assert_eq!(
+            Scalar::Double(f64::MIN_POSITIVE)
+                .serialize_partition_value()
+                .unwrap(),
+            "2.2250738585072014E-308"
         );
     }
 
