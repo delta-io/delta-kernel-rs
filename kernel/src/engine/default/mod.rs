@@ -317,7 +317,9 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 let physical_name = field
                     .physical_name(write_context.column_mapping_mode())
                     .to_string();
-                // Serialize the typed scalar to a protocol-compliant string
+                // Serialize the typed scalar to a protocol-compliant string.
+                // None (null) becomes "" (empty string), which as_record_batch converts
+                // to a null map value per the Delta protocol convention.
                 let serialized = value.serialize_partition_value()?.unwrap_or_default();
                 Ok((physical_name, serialized))
             })

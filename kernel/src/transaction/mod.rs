@@ -688,12 +688,8 @@ impl<S> Transaction<S> {
 
     /// Returns the logical partition column names for this table.
     ///
-    /// Returns an empty slice for non-partitioned tables. The driver uses this to discover
-    /// partition columns and split data before distributing work to writers. This should be
-    /// called before [`get_write_context`] -- partition splitting happens at the driver level,
-    /// not per-writer.
-    ///
-    /// [`get_write_context`]: Transaction::get_write_context
+    /// Returns an empty slice for non-partitioned tables. Connectors typically call this to
+    /// discover partition columns and split data before writing.
     pub fn partition_columns(&self) -> &[String] {
         self.read_snapshot.table_configuration().partition_columns()
     }

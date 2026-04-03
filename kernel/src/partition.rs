@@ -49,7 +49,7 @@ pub const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 ///
 /// Escaped set (matches Hive/Spark):
 ///   - ASCII control characters 0x00-0x1F
-///   - `"` `#` `%` `'` `*` `/` `:` `=` `?` `\` DEL(0x7F) `{` `[` `]` `^`
+///   - `"` `#` `%` `'` `*` `/` `:` `=` `?` `\` DEL(0x7F) `{` `}` `[` `]` `^`
 fn needs_escaping(b: u8) -> bool {
     matches!(
         b,
@@ -66,6 +66,7 @@ fn needs_escaping(b: u8) -> bool {
             | b'\\'
             | 0x7F
             | b'{'
+            | b'}'
             | b'['
             | b']'
             | b'^'
@@ -74,9 +75,11 @@ fn needs_escaping(b: u8) -> bool {
 
 /// Percent-encodes a string for use in a Hive-style partition path segment.
 ///
-/// Only the characters listed above are encoded. Everything else, including spaces (0x20) and
-/// non-ASCII bytes (>= 0x80), passes through unchanged. This matches the behavior of Hive's
-/// `FileUtils.escapePathName` and Spark's `ExternalCatalogUtils.escapePathName`.
+/// Encodes ASCII control characters (0x00-0x1F), DEL (0x7F), and the characters
+/// `"` `#` `%` `'` `*` `/` `:` `=` `?` `\` `{` `}` `[` `]` `^`. Everything else,
+/// including spaces (0x20) and non-ASCII characters, passes through unchanged. This
+/// matches the behavior of Hive's `FileUtils.escapePathName` and Spark's
+/// `ExternalCatalogUtils.escapePathName`.
 ///
 /// This is a convenience utility. The Delta protocol does not require Hive-style paths.
 ///
@@ -95,16 +98,19 @@ pub fn escape_partition_value(s: &str) -> Cow<'_, str> {
         return Cow::Borrowed(s);
     };
 
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(bytes.len() + 16);
+    let mut out = String::with_capacity(s.len() + 16);
     out.push_str(&s[..first]);
-    for &b in &bytes[first..] {
-        if needs_escaping(b) {
+    // The escape set is entirely ASCII (< 0x80). UTF-8 guarantees that non-ASCII characters
+    // only contain bytes >= 0x80, so only single-byte ASCII characters can need escaping.
+    // We iterate by char to correctly handle multi-byte UTF-8 sequences.
+    for c in s[first..].chars() {
+        if c.is_ascii() && needs_escaping(c as u8) {
+            let b = c as u8;
             out.push('%');
             out.push(HEX_UPPER[(b >> 4) as usize] as char);
             out.push(HEX_UPPER[(b & 0x0F) as usize] as char);
         } else {
-            out.push(b as char);
+            out.push(c);
         }
     }
     Cow::Owned(out)
@@ -195,7 +201,23 @@ mod tests {
 
     #[test]
     fn test_non_ascii_not_encoded() {
-        assert_eq!(escape_partition_value("uber"), "uber");
+        assert_eq!(escape_partition_value("\u{00FC}ber"), "\u{00FC}ber");
+        assert_eq!(
+            escape_partition_value("\u{65E5}\u{672C}\u{8A9E}"),
+            "\u{65E5}\u{672C}\u{8A9E}"
+        );
+    }
+
+    #[test]
+    fn test_non_ascii_after_special_char_preserved() {
+        // Verifies multi-byte UTF-8 chars survive when escaping occurs earlier in the string.
+        // U+00FC = UTF-8 bytes [0xC3, 0xBC]. The "/" triggers the slow path, and the
+        // non-ASCII char must be preserved as-is (not corrupted by byte-level processing).
+        assert_eq!(escape_partition_value("a/\u{00FC}"), "a%2F\u{00FC}");
+        assert_eq!(
+            escape_partition_value("M\u{00FC}nchen/Bayern"),
+            "M\u{00FC}nchen%2FBayern"
+        );
     }
 
     #[test]
@@ -222,6 +244,7 @@ mod tests {
             ("[", "%5B"),
             ("]", "%5D"),
             ("^", "%5E"),
+            ("}", "%7D"),
         ];
         for (input, expected) in cases {
             assert_eq!(escape_partition_value(input), expected, "input: {input:?}");

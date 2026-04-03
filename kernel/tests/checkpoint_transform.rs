@@ -47,7 +47,7 @@ async fn write_commit(store: &Arc<InMemory>, content: &str, version: u64) -> Del
 const NON_PARTITIONED_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#;
 
 #[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
-const PARTITIONED_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"created_at","type":"timestamp","nullable":true,"metadata":{}},{"name":"tag","type":"binary","nullable":true,"metadata":{}}]}"#;
+const PARTITIONED_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"created_at","type":"timestamp","nullable":true,"metadata":{}},{"name":"tag","type":"string","nullable":true,"metadata":{}}]}"#;
 
 /// Builds a JSON commit string with optional protocol, metadata, and stats config.
 /// When `include_protocol` is true, includes the protocol action (for version 0 commits).
@@ -218,11 +218,12 @@ async fn test_checkpoint_stats_config_with_real_data(
 ///
 /// Two partition columns exercise different parsing paths:
 ///   - `created_at` (timestamp): "2024-01-15 10:30:00" → microseconds-since-epoch
-///   - `tag` (binary): "hello" → raw bytes
+///   - `tag` (string): "hello", "world"
 #[rstest::rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// Arrow 56's JSON reader rejects Binary typed fields. This test exercises checkpoint
-// JSON paths that include a binary partition column (`tag`), so we have to disable it.
+// TODO: The cfg gate below was needed when `tag` was a Binary partition column (Arrow 56's
+// JSON reader rejects Binary typed fields). Now that `tag` is String, this gate may be
+// removable. Keeping it for now to avoid introducing test changes on arrow-56.
 #[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
 async fn test_checkpoint_partitioned_with_real_data(
     #[values(true, false)] json1: bool,
@@ -277,10 +278,7 @@ async fn test_checkpoint_partitioned_with_real_data(
                     .parse_scalar("2024-01-15 10:30:00")
                     .unwrap(),
             ),
-            (
-                "tag".to_string(),
-                Scalar::Binary("hello".as_bytes().to_vec()),
-            ),
+            ("tag".to_string(), Scalar::String("hello".to_string())),
         ]),
     )
     .await?;
@@ -312,10 +310,7 @@ async fn test_checkpoint_partitioned_with_real_data(
                     .parse_scalar("2025-03-01 09:15:30.123456")
                     .unwrap(),
             ),
-            (
-                "tag".to_string(),
-                Scalar::Binary("world".as_bytes().to_vec()),
-            ),
+            ("tag".to_string(), Scalar::String("world".to_string())),
         ]),
     )
     .await?;
@@ -366,16 +361,14 @@ async fn test_checkpoint_partitioned_with_real_data(
             .collect();
         assert_eq!(add_rows.len(), 2, "should have 2 add actions");
 
-        // Verify tag (binary) partition values
+        // Verify tag (string) partition values
         let tag_col = pv_parsed
             .column_by_name("tag")
             .expect("partitionValues_parsed should have tag");
-        let mut tag_values: Vec<&[u8]> = add_rows
-            .iter()
-            .map(|&i| tag_col.as_binary::<i32>().value(i))
-            .collect();
+        let tag_col = tag_col.as_string::<i32>();
+        let mut tag_values: Vec<&str> = add_rows.iter().map(|&i| tag_col.value(i)).collect();
         tag_values.sort();
-        assert_eq!(tag_values, vec![b"hello", b"world"]);
+        assert_eq!(tag_values, vec!["hello", "world"]);
 
         // Verify created_at (timestamp) partition values
         let created_at_col = pv_parsed
@@ -425,9 +418,10 @@ async fn test_checkpoint_partitioned_with_real_data(
     assert_eq!(ids, vec![1, 2, 3, 4]);
 
     let tags = sorted.column_by_name("tag").unwrap();
-    let tags: Vec<&[u8]> = (0..4).map(|i| tags.as_binary::<i32>().value(i)).collect();
+    let tags = tags.as_string::<i32>();
+    let tags: Vec<&str> = (0..4).map(|i| tags.value(i)).collect();
     // Rows 1,2 have tag=hello; rows 3,4 have tag=world
-    assert_eq!(tags, vec![b"hello", b"hello", b"world", b"world"]);
+    assert_eq!(tags, vec!["hello", "hello", "world", "world"]);
 
     Ok(())
 }

@@ -292,17 +292,98 @@ impl Scalar {
     /// Returns an error if the scalar's type is not a valid partition column type (e.g.,
     /// struct, array, or map).
     ///
-    /// Connectors using [`DefaultEngine::write_parquet`] do not need to call this directly --
-    /// it is called internally. Custom engine implementations that build Add action metadata
-    /// manually should use this to serialize partition values for the `partitionValues` map.
+    /// This is the inverse of [`PrimitiveType::parse_scalar`]. For every non-null scalar `s`,
+    /// `parse_scalar(&s.serialize_partition_value()?)` must round-trip back to `s` (modulo
+    /// float precision).
     ///
-    /// See [`PrimitiveType::serialize_partition_value`] for details on the serialization format.
+    /// Connectors using [`DefaultEngine::write_parquet`] do not need to call this directly --
+    /// it is called internally. Custom engine implementations that bypass `DefaultEngine` and
+    /// construct Add action metadata directly should use this to produce correctly formatted
+    /// strings for the `partitionValues` map.
+    ///
+    /// `Scalar`'s `Display` impl and Arrow's `array_value_to_string` are NOT suitable for
+    /// partition value serialization. The following table shows why:
+    ///
+    /// | Type      | Scalar::Display          | array_value_to_string      | This method (correct)         | delta-spark                   |
+    /// |-----------|--------------------------|----------------------------|-------------------------------|-------------------------------|
+    /// | String    | `'hello'` (quoted)       | `hello`                    | `hello`                       | `hello`                       |
+    /// | Date      | `20178` (raw days)       | `2025-03-31`               | `2025-03-31`                  | `2025-03-31`                  |
+    /// | Timestamp | `1743437400000000` (raw) | `2025-03-31T15:30:00` (*)  | `2025-03-31T15:30:00.000000Z` | `2025-03-31T15:30:00.000000Z` |
+    /// | Boolean   | `true`                   | `true`                     | `true`                        | `true`                        |
+    /// | Null      | `null` (literal string)  | `` (empty string)          | `None`                        | `None`                        |
+    ///
+    /// (*) Arrow's `array_value_to_string` for timestamps without timezone uses `T` separator
+    /// but omits the `Z` suffix, producing a format that is not valid per the Delta protocol.
+    /// With timezone it produces RFC 3339 (`+00:00` suffix) which happens to parse but does
+    /// not match delta-spark.
+    ///
+    /// Note: `Scalar::String("")` produces `Some("")`, which per the Delta protocol is
+    /// indistinguishable from a null partition value. An empty string partition value will be
+    /// read back as null.
     ///
     /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
     pub fn serialize_partition_value(&self) -> DeltaResult<Option<String>> {
-        match self.data_type().as_primitive_opt() {
-            Some(primitive) => primitive.serialize_partition_value(self),
-            None => Err(Error::generic(format!(
+        match self {
+            Self::Null(_) => Ok(None),
+            // These types have Display output that matches the protocol format
+            Self::Byte(_)
+            | Self::Short(_)
+            | Self::Integer(_)
+            | Self::Long(_)
+            | Self::Float(_)
+            | Self::Double(_)
+            | Self::Boolean(_) => Ok(Some(self.to_string())),
+            // Decimal: use dedicated serialization to handle negative values correctly.
+            // Scalar::Display has a bug for negative decimals with scale > 0 (Rust's %
+            // operator preserves sign, producing e.g. "-1.-23" instead of "-1.23").
+            Self::Decimal(d) => {
+                let value = d.bits();
+                if d.scale() == 0 {
+                    Ok(Some(value.to_string()))
+                } else {
+                    let scale = d.scale() as u32;
+                    let scalar_multiple = 10_i128.pow(scale);
+                    let integer_part = value / scalar_multiple;
+                    let fractional_part = (value % scalar_multiple).abs();
+                    Ok(Some(format!(
+                        "{integer_part}.{fractional_part:0>width$}",
+                        width = scale as usize
+                    )))
+                }
+            }
+            // String Display wraps in quotes ('hello'), but protocol wants raw value
+            Self::String(s) => Ok(Some(s.clone())),
+            // Binary partition value serialization requires Unicode escape encoding per the
+            // Delta protocol (e.g. [0x01, 0x02] becomes "\u0001\u0002"), but the read-side
+            // parse_scalar does not yet decode this format. Return an error until both
+            // serialize and parse are implemented for Binary partition values.
+            Self::Binary(_) => Err(Error::generic(
+                "Binary partition value serialization is not yet supported. The Delta \
+                 protocol requires Unicode escape encoding, but the read-side parser does \
+                 not yet decode this format.",
+            )),
+            // Date Display prints raw days-since-epoch (20178), but protocol wants YYYY-MM-DD
+            Self::Date(days) => {
+                let date = DateTime::UNIX_EPOCH + chrono::Duration::days(*days as i64);
+                Ok(Some(date.format("%Y-%m-%d").to_string()))
+            }
+            // Timestamp: use ISO 8601 adjusted to UTC as recommended by the Delta protocol.
+            // The protocol allows both space-separated and ISO 8601 formats, but recommends:
+            // "modern writers adjust the timestamp to UTC and store the timestamp in ISO8601
+            // format". This matches delta-spark's serialization.
+            Self::Timestamp(micros) => {
+                let ts = DateTime::UNIX_EPOCH + chrono::Duration::microseconds(*micros);
+                Ok(Some(ts.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()))
+            }
+            // TimestampNtz: use space-separated format (no timezone info).
+            // The protocol says timestampNtz uses "{year}-{month}-{day} {hour}:{minute}:{second}"
+            // or with microseconds. No Z suffix because there is no timezone.
+            Self::TimestampNtz(micros) => {
+                let ts = DateTime::UNIX_EPOCH + chrono::Duration::microseconds(*micros);
+                Ok(Some(ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string()))
+            }
+            // Struct, Array, Map types are not valid partition column types
+            _ => Err(Error::generic(format!(
                 "Cannot serialize {self:?} as a partition value: type {:?} is not a \
                  valid partition column type",
                 self.data_type()
@@ -780,92 +861,6 @@ impl PrimitiveType {
                     _ => unreachable!(),
                 }
             }
-        }
-    }
-
-    /// Serializes a scalar to its partition value string representation per the Delta protocol's
-    /// "Partition Value Serialization" rules.
-    ///
-    /// Returns `Ok(None)` for null values (the caller should use a null map value in the Add
-    /// action's `partitionValues` map). Returns `Ok(Some(string))` for non-null values.
-    ///
-    /// This is the inverse of [`PrimitiveType::parse_scalar`]. For every non-null scalar `s`
-    /// and matching primitive type `t`, `t.parse_scalar(&t.serialize_partition_value(&s)?)` must
-    /// round-trip back to `s` (modulo float precision).
-    ///
-    /// Connectors using [`DefaultEngine::write_parquet`] do not need to call this directly --
-    /// it is called internally. Custom engine implementations that bypass `DefaultEngine` and
-    /// build Add action metadata via [`DataFileMetadata::as_record_batch`] should use this
-    /// (or [`Scalar::serialize_partition_value`]) to produce correctly formatted strings for
-    /// the `partitionValues` map.
-    ///
-    /// Note: [`Scalar`]'s `Display` impl is NOT suitable for partition value serialization
-    /// because it wraps strings in quotes, prints timestamps/dates as raw epoch values, and
-    /// prints nulls as the literal string `"null"`. This method produces the protocol-compliant
-    /// format instead.
-    ///
-    /// Before this method existed, connectors had to serialize partition values themselves.
-    /// The old `DefaultEngine::write_parquet` accepted `HashMap<String, String>` (pre-serialized
-    /// by the connector). Connectors that used Arrow's `array_value_to_string` or
-    /// `Scalar::Display` produced wrong values for dates, timestamps, strings, and nulls.
-    ///
-    /// Comparison of serialization formats:
-    ///
-    /// | Type      | Old: Scalar::Display     | Old: array_value_to_string | This method (correct)       | delta-spark                 |
-    /// |-----------|--------------------------|----------------------------|-----------------------------|-----------------------------|
-    /// | String    | `'hello'` (quoted)       | `hello`                    | `hello`                     | `hello`                     |
-    /// | Date      | `20178` (raw days)       | `2025-03-31`               | `2025-03-31`                | `2025-03-31`                |
-    /// | Timestamp | `1743437400000000` (raw) | `2025-03-31T15:30:00` (*)  | `2025-03-31T15:30:00.000000Z` | `2025-03-31T15:30:00.000000Z` |
-    /// | Boolean   | `true`                   | `true`                     | `true`                      | `true`                      |
-    /// | Null      | `null` (literal string)  | `` (empty string)          | `None`                      | `None`                      |
-    ///
-    /// (*) Arrow's `array_value_to_string` for timestamps without timezone uses `T` separator
-    /// but omits the `Z` suffix, producing a format that is not valid per the Delta protocol.
-    /// With timezone it produces RFC 3339 (`+00:00` suffix) which happens to parse but does
-    /// not match delta-spark.
-    ///
-    /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
-    /// [`DataFileMetadata::as_record_batch`]: crate::engine::default::parquet::DataFileMetadata::as_record_batch
-    pub fn serialize_partition_value(&self, value: &Scalar) -> DeltaResult<Option<String>> {
-        match value {
-            Scalar::Null(_) => Ok(None),
-            // These types have Display output that matches the protocol format
-            Scalar::Byte(_)
-            | Scalar::Short(_)
-            | Scalar::Integer(_)
-            | Scalar::Long(_)
-            | Scalar::Float(_)
-            | Scalar::Double(_)
-            | Scalar::Boolean(_)
-            | Scalar::Decimal(_) => Ok(Some(value.to_string())),
-            // String Display wraps in quotes ('hello'), but protocol wants raw value
-            Scalar::String(s) => Ok(Some(s.clone())),
-            // Binary Display uses debug format ([104, 105]), but protocol wants raw UTF-8
-            Scalar::Binary(v) => Ok(Some(std::string::String::from_utf8_lossy(v).into_owned())),
-            // Date Display prints raw days-since-epoch (20178), but protocol wants YYYY-MM-DD
-            Scalar::Date(days) => {
-                let date = DateTime::UNIX_EPOCH + chrono::Duration::days(*days as i64);
-                Ok(Some(date.format("%Y-%m-%d").to_string()))
-            }
-            // Timestamp: use ISO 8601 adjusted to UTC as recommended by the Delta protocol.
-            // The protocol allows both space-separated and ISO 8601 formats, but recommends:
-            // "modern writers adjust the timestamp to UTC and store the timestamp in ISO8601
-            // format". This matches delta-spark's serialization.
-            Scalar::Timestamp(micros) => {
-                let ts = DateTime::UNIX_EPOCH + chrono::Duration::microseconds(*micros);
-                Ok(Some(ts.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()))
-            }
-            // TimestampNtz: use space-separated format (no timezone info).
-            // The protocol says timestampNtz uses "{year}-{month}-{day} {hour}:{minute}:{second}"
-            // or with microseconds. No Z suffix because there is no timezone.
-            Scalar::TimestampNtz(micros) => {
-                let ts = DateTime::UNIX_EPOCH + chrono::Duration::microseconds(*micros);
-                Ok(Some(ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string()))
-            }
-            // Struct, Array, Map types are not valid partition column types
-            _ => Err(Error::generic(format!(
-                "Cannot serialize {value:?} as a partition value for type {self:?}"
-            ))),
         }
     }
 
@@ -1511,12 +1506,20 @@ mod tests {
     #[test]
     fn test_serialize_partition_value_date_round_trips_through_parse() {
         let days = 20178i32; // 2025-03-31
-        let serialized = PrimitiveType::Date
-            .serialize_partition_value(&Scalar::Date(days))
+        let serialized = Scalar::Date(days)
+            .serialize_partition_value()
             .unwrap()
             .unwrap();
         let parsed = PrimitiveType::Date.parse_scalar(&serialized).unwrap();
         assert_eq!(parsed, Scalar::Date(days));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_pre_epoch_date_round_trips() {
+        let result = Scalar::Date(-1).serialize_partition_value().unwrap();
+        assert_eq!(result, Some("1969-12-31".to_string()));
+        let parsed = PrimitiveType::Date.parse_scalar("1969-12-31").unwrap();
+        assert_eq!(parsed, Scalar::Date(-1));
     }
 
     #[test]
@@ -1530,12 +1533,84 @@ mod tests {
             .signed_duration_since(DateTime::UNIX_EPOCH)
             .num_microseconds()
             .unwrap();
-        let serialized = PrimitiveType::Timestamp
-            .serialize_partition_value(&Scalar::Timestamp(micros))
+        let serialized = Scalar::Timestamp(micros)
+            .serialize_partition_value()
             .unwrap()
             .unwrap();
         let parsed = PrimitiveType::Timestamp.parse_scalar(&serialized).unwrap();
         assert_eq!(parsed, Scalar::Timestamp(micros));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_timestamp_ntz_uses_space_separator_without_z() {
+        let ts = NaiveDate::from_ymd_opt(2025, 3, 31)
+            .unwrap()
+            .and_hms_micro_opt(15, 30, 0, 123456)
+            .unwrap();
+        let micros = Utc
+            .from_utc_datetime(&ts)
+            .signed_duration_since(DateTime::UNIX_EPOCH)
+            .num_microseconds()
+            .unwrap();
+        let result = Scalar::TimestampNtz(micros)
+            .serialize_partition_value()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, "2025-03-31 15:30:00.123456");
+        assert!(!result.contains('T'));
+        assert!(!result.contains('Z'));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_timestamp_ntz_round_trips_through_parse() {
+        let ts = NaiveDate::from_ymd_opt(2025, 3, 31)
+            .unwrap()
+            .and_hms_micro_opt(15, 30, 0, 123456)
+            .unwrap();
+        let micros = Utc
+            .from_utc_datetime(&ts)
+            .signed_duration_since(DateTime::UNIX_EPOCH)
+            .num_microseconds()
+            .unwrap();
+        let serialized = Scalar::TimestampNtz(micros)
+            .serialize_partition_value()
+            .unwrap()
+            .unwrap();
+        let parsed = PrimitiveType::TimestampNtz
+            .parse_scalar(&serialized)
+            .unwrap();
+        assert_eq!(parsed, Scalar::TimestampNtz(micros));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_decimal_positive_with_scale() {
+        let s = Scalar::decimal(12345, 5, 2).unwrap();
+        let result = s.serialize_partition_value().unwrap().unwrap();
+        assert_eq!(result, "123.45");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_decimal_negative_with_scale() {
+        let s = Scalar::decimal(-12345i128, 5, 2).unwrap();
+        let result = s.serialize_partition_value().unwrap().unwrap();
+        assert_eq!(result, "-123.45");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_decimal_round_trips_through_parse() {
+        let s = Scalar::decimal(12345, 5, 2).unwrap();
+        let serialized = s.serialize_partition_value().unwrap().unwrap();
+        let parsed = PrimitiveType::decimal(5, 2)
+            .unwrap()
+            .parse_scalar(&serialized)
+            .unwrap();
+        assert_eq!(parsed, s);
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_returns_error() {
+        let s = Scalar::Binary(vec![0x01, 0x02, 0x03]);
+        assert!(s.serialize_partition_value().is_err());
     }
 
     #[test]
