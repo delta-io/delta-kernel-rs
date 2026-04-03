@@ -1283,7 +1283,7 @@ mod tests {
     /// The caller is responsible for freeing the engine handle.
     fn create_table_with_one_file(
         tmp_dir: &tempfile::TempDir,
-    ) -> Result<(String, Handle<crate::SharedExternEngine>), Box<dyn std::error::Error>> {
+    ) -> Result<(String, Handle<SharedExternEngine>), Box<dyn std::error::Error>> {
         let table_path = tmp_dir.path().to_str().unwrap();
         let schema = Arc::new(StructType::try_new(vec![
             StructField::nullable("number", DataType::INTEGER),
@@ -1291,18 +1291,20 @@ mod tests {
         ])?);
 
         let engine = get_default_engine(table_path);
-        let schema_handle: Handle<crate::SharedSchema> = schema.into();
+        let schema_handle: Handle<SharedSchema> = schema.into();
 
         // Create the table
         let engine_info = "test-engine/1.0";
         let builder = ok_or_panic(unsafe {
             get_create_table_builder(
                 kernel_string_slice!(table_path),
-                schema_handle,
+                schema_handle.shallow_copy(),
                 kernel_string_slice!(engine_info),
                 engine.shallow_copy(),
             )
         });
+        // get_create_table_builder does NOT consume the schema handle -- free it
+        unsafe { free_schema(schema_handle) };
         build_and_commit(builder, &engine);
 
         // Write a parquet file and commit it
@@ -1397,7 +1399,7 @@ mod tests {
         assert_eq!(scan_meta_items.len(), 1);
 
         // Wrap the scan metadata in a SharedScanMetadata handle
-        let scan_meta_handle: Handle<crate::scan::SharedScanMetadata> =
+        let scan_meta_handle: Handle<SharedScanMetadata> =
             Arc::new(scan_meta_items.into_iter().next().unwrap()).into();
 
         // Start a removal transaction
@@ -1561,7 +1563,7 @@ mod tests {
         // Don't commit -- the from_raw_parts path has been exercised. Committing with
         // a non-empty SV triggers a different code path in generate_remove_actions that
         // requires additional scan row fields not present in this test setup.
-        unsafe { crate::transaction::free_transaction(txn) };
+        unsafe { free_transaction(txn) };
         unsafe { free_engine(engine) };
         Ok(())
     }
@@ -1588,7 +1590,7 @@ mod tests {
         let scan_meta_arc = Arc::new(scan_meta_items.into_iter().next().unwrap());
         // Hold a second Arc reference so Arc::try_unwrap will fail
         let _extra_ref = Arc::clone(&scan_meta_arc);
-        let scan_meta_handle: Handle<crate::scan::SharedScanMetadata> = scan_meta_arc.into();
+        let scan_meta_handle: Handle<SharedScanMetadata> = scan_meta_arc.into();
 
         let txn = ok_or_panic(unsafe {
             transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
@@ -1620,7 +1622,7 @@ mod tests {
         }
 
         // Clean up: free the txn (not committed) and engine
-        unsafe { crate::transaction::free_transaction(txn) };
+        unsafe { free_transaction(txn) };
         unsafe { free_engine(engine) };
         Ok(())
     }
