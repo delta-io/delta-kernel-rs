@@ -665,6 +665,10 @@ fn get_indices(
 ) -> DeltaResult<(usize, Vec<ReorderIndex>)> {
     let mut found_fields = HashSet::with_capacity(requested_schema.num_fields());
     let mut reorder_indices = Vec::with_capacity(requested_schema.num_fields());
+    // Missing entries for structs found in parquet but with no selected leaves. These must
+    // be appended after all input-consuming entries (Identity/Nested/Cast) because
+    // `reorder_struct_array` uses vec position as the index into the parquet reader output.
+    let mut deferred_missing = Vec::new();
     let mut parquet_offset = start_parquet_offset;
     // for each field, get its position in the parquet (via enumerate), a reference to the arrow
     // field, and info about where it appears in the requested_schema, or None if the field is not
@@ -718,12 +722,11 @@ fn get_indices(
                         } else {
                             // The recursive call resolved all children (as nullable/missing
                             // or the struct is empty), but no parquet leaves were selected.
-                            // Emit a Missing entry so the struct is synthesized rather than
-                            // falling through to the post-loop logic which would error for
-                            // non-nullable structs.
+                            // Defer the Missing entry so it appears after all entries that
+                            // consume parquet input columns.
                             debug_assert_eq!(children.len(), requested_schema.num_fields());
                             found_fields.insert(requested_field.name());
-                            reorder_indices.push(ReorderIndex::missing(
+                            deferred_missing.push(ReorderIndex::missing(
                                 index,
                                 Arc::new(requested_field.try_into_arrow()?),
                             ));
@@ -743,6 +746,7 @@ fn get_indices(
                             array_type.element_type.clone(),
                             array_type.contains_null,
                         )]);
+                        let mask_before = mask_indices.len();
                         let (parquet_advance, mut children) = get_indices(
                             parquet_index + parquet_offset,
                             &requested_schema,
@@ -752,17 +756,25 @@ fn get_indices(
                         // see comment above in struct match arm
                         parquet_offset += parquet_advance - 1;
                         found_fields.insert(requested_field.name());
-                        if children.len() != 1 {
+                        if mask_indices.len() <= mask_before {
+                            // No leaves selected inside this list (e.g. inner struct
+                            // with no matching children). Defer a Missing entry.
+                            deferred_missing.push(ReorderIndex::missing(
+                                index,
+                                Arc::new(requested_field.try_into_arrow()?),
+                            ));
+                        } else if children.len() != 1 {
                             return Err(Error::generic(
                                 "List call should not have generated more than one reorder index",
                             ));
+                        } else {
+                            // safety, checked that we have 1 element
+                            let mut children = children.swap_remove(0);
+                            // the index is wrong, as it's the index from the inner schema.
+                            // Adjust it to be our index
+                            children.index = index;
+                            reorder_indices.push(children);
                         }
-                        // safety, checked that we have 1 element
-                        let mut children = children.swap_remove(0);
-                        // the index is wrong, as it's the index from the inner schema. Adjust
-                        // it to be our index
-                        children.index = index;
-                        reorder_indices.push(children);
                     } else {
                         return Err(Error::unexpected_column_type(list_field.name()));
                     }
@@ -782,6 +794,7 @@ fn get_indices(
                                 return Err(Error::generic("map fields had more than 2 members"));
                             }
                             let inner_schema = map_type.as_struct_schema(key_name, val_name);
+                            let mask_before = mask_indices.len();
                             let (parquet_advance, mut children) = get_indices(
                                 parquet_index + parquet_offset,
                                 &inner_schema,
@@ -796,26 +809,33 @@ fn get_indices(
                             // note that we found this field
                             found_fields.insert(requested_field.name());
 
-                            if children.len() != 2 {
+                            if mask_indices.len() <= mask_before {
+                                // No leaves selected inside this map. Defer a Missing entry.
+                                deferred_missing.push(ReorderIndex::missing(
+                                    index,
+                                    Arc::new(requested_field.try_into_arrow()?),
+                                ));
+                            } else if children.len() != 2 {
                                 return Err(Error::generic(
                                     "Map call should have generated exactly two reorder indices",
                                 ));
+                            } else {
+                                // vec indexing is safe, we checked len above
+                                let mut num_identity_transforms = 0;
+                                if !children[0].needs_transform() {
+                                    children[0] = ReorderIndex::identity(0);
+                                    num_identity_transforms += 1;
+                                }
+                                if !children[1].needs_transform() {
+                                    children[1] = ReorderIndex::identity(1);
+                                    num_identity_transforms += 1;
+                                }
+                                let transform = match num_identity_transforms {
+                                    2 => ReorderIndex::identity(index),
+                                    _ => ReorderIndex::nested(index, children),
+                                };
+                                reorder_indices.push(transform);
                             }
-                            // vec indexing is safe, we checked len above
-                            let mut num_identity_transforms = 0;
-                            if !children[0].needs_transform() {
-                                children[0] = ReorderIndex::identity(0);
-                                num_identity_transforms += 1;
-                            }
-                            if !children[1].needs_transform() {
-                                children[1] = ReorderIndex::identity(1);
-                                num_identity_transforms += 1;
-                            }
-                            let transform = match num_identity_transforms {
-                                2 => ReorderIndex::identity(index),
-                                _ => ReorderIndex::nested(index, children),
-                            };
-                            reorder_indices.push(transform);
                         }
                         _ => {
                             return Err(Error::unexpected_column_type(field.name()));
@@ -857,6 +877,9 @@ fn get_indices(
             parquet_offset += count_cols(field).saturating_sub(1);
         }
     }
+
+    // Append deferred Missing entries after all input-consuming entries from the main loop.
+    reorder_indices.extend(deferred_missing);
 
     if found_fields.len() != requested_schema.num_fields() {
         // some fields are missing, but they might be nullable or metadata columns, need to insert them into the reorder_indices
@@ -2628,6 +2651,50 @@ mod tests {
             ReorderIndex::missing(1, expected_stats_field),
         ];
         assert_eq!(reorder_indices, expect_reorder);
+    }
+
+    #[test]
+    fn unmatched_struct_before_selected_leaf_ordering() {
+        // Regression: when a struct with no matching children appears BEFORE a selected
+        // leaf in parquet order, the Missing entry must be deferred so the leaf's
+        // Identity entry gets the correct parquet_position in reorder_struct_array.
+        let requested_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable(
+                "stats",
+                StructType::new_unchecked([StructField::nullable("age", DataType::LONG)]),
+            ),
+        ]));
+        // Parquet has stats BEFORE a
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "stats",
+                ArrowDataType::Struct(
+                    vec![ArrowField::new("id", ArrowDataType::Int64, true)].into(),
+                ),
+                true,
+            ),
+            ArrowField::new("a", ArrowDataType::Int64, true),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        // Only "a" should be in the mask (leaf index 1, after stats.id at index 0)
+        assert_eq!(mask_indices, vec![1]);
+        let expected_stats_field = Arc::new(
+            requested_schema
+                .field("stats")
+                .unwrap()
+                .try_into_arrow()
+                .unwrap(),
+        );
+        // Identity for "a" must come FIRST (parquet_position 0), then Missing for stats
+        assert_eq!(
+            reorder_indices,
+            vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::missing(1, expected_stats_field),
+            ]
+        );
     }
 
     #[test]
