@@ -188,27 +188,29 @@ pub unsafe extern "C" fn commit(
 
 /// A handle representing an exclusive [`CreateTableTransactionBuilder`].
 ///
-/// The caller must eventually either call [`create_table_build`] (which consumes the handle and
-/// returns a transaction) or [`free_create_table_builder`] (which drops it without creating
-/// anything).
+/// The caller must eventually either call [`create_table_builder_build`] (which consumes the
+/// handle and returns a transaction) or [`free_create_table_builder`] (which drops it without
+/// creating anything).
 #[handle_descriptor(target=CreateTableTransactionBuilder, mutable=true, sized=true)]
 pub struct ExclusiveCreateTableBuilder;
 
-// TODO: Add `create_table_set_data_layout` FFI function to support partitioned and clustered
-// table creation. The kernel's `CreateTableTransactionBuilder::with_data_layout(DataLayout)`
-// supports this but is not yet exposed through FFI.
+// TODO: Add `create_table_builder_with_data_layout` FFI function to support partitioned and
+// clustered table creation. The kernel's
+// `CreateTableTransactionBuilder::with_data_layout(DataLayout)` supports this but is not yet
+// exposed through FFI.
 
 /// Create a new [`CreateTableTransactionBuilder`] for creating a Delta table at the given path.
 ///
-/// The returned builder can be configured with [`create_table_set_property`] before building
-/// with [`create_table_build`]. The engine is only used for error reporting at this stage.
+/// The returned builder can be configured with [`create_table_builder_with_table_property`]
+/// before building with [`create_table_builder_build`]. The engine is only used for error
+/// reporting at this stage.
 ///
 /// # Safety
 ///
 /// Caller is responsible for passing a valid `path`, `schema`, `engine_info`, and `engine`.
 /// Does NOT consume the `schema` handle -- the caller is still responsible for freeing it.
 #[no_mangle]
-pub unsafe extern "C" fn create_table(
+pub unsafe extern "C" fn get_create_table_builder(
     path: KernelStringSlice,
     schema: Handle<SharedSchema>,
     engine_info: KernelStringSlice,
@@ -218,10 +220,10 @@ pub unsafe extern "C" fn create_table(
     let path: DeltaResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&path) };
     let info: DeltaResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
     let schema = unsafe { schema.clone_as_arc() };
-    create_table_impl(path, schema, info).into_extern_result(&engine)
+    get_create_table_builder_impl(path, schema, info).into_extern_result(&engine)
 }
 
-fn create_table_impl(
+fn get_create_table_builder_impl(
     path: DeltaResult<&str>,
     schema: Arc<delta_kernel::schema::Schema>,
     engine_info: DeltaResult<&str>,
@@ -234,7 +236,7 @@ fn create_table_impl(
     Ok(Box::new(builder).into())
 }
 
-/// Set a single table property on a [`CreateTableTransactionBuilder`].
+/// Add a single table property to a [`CreateTableTransactionBuilder`].
 ///
 /// This consumes the builder handle and returns a new one. The caller MUST replace their handle
 /// pointer with the returned handle. On error, the old builder handle is consumed and gone --
@@ -245,7 +247,7 @@ fn create_table_impl(
 /// Caller is responsible for passing a valid builder handle, `key`, `value`, and `engine`.
 /// CONSUMES the builder handle unconditionally (even on error).
 #[no_mangle]
-pub unsafe extern "C" fn create_table_set_property(
+pub unsafe extern "C" fn create_table_builder_with_table_property(
     builder: Handle<ExclusiveCreateTableBuilder>,
     key: KernelStringSlice,
     value: KernelStringSlice,
@@ -255,10 +257,10 @@ pub unsafe extern "C" fn create_table_set_property(
     let builder = unsafe { *builder.into_inner() };
     let key: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&key) };
     let value: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&value) };
-    create_table_set_property_impl(builder, key, value).into_extern_result(&engine)
+    create_table_builder_with_table_property_impl(builder, key, value).into_extern_result(&engine)
 }
 
-fn create_table_set_property_impl(
+fn create_table_builder_with_table_property_impl(
     builder: CreateTableTransactionBuilder,
     key: DeltaResult<String>,
     value: DeltaResult<String>,
@@ -278,16 +280,16 @@ fn create_table_set_property_impl(
 /// Caller is responsible for passing a valid builder and engine handle.
 /// CONSUMES the builder handle -- caller must not use it after this call.
 #[no_mangle]
-pub unsafe extern "C" fn create_table_build(
+pub unsafe extern "C" fn create_table_builder_build(
     builder: Handle<ExclusiveCreateTableBuilder>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
     let builder = unsafe { builder.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    create_table_build_impl(*builder, extern_engine).into_extern_result(&extern_engine)
+    create_table_builder_build_impl(*builder, extern_engine).into_extern_result(&extern_engine)
 }
 
-fn create_table_build_impl(
+fn create_table_builder_build_impl(
     builder: CreateTableTransactionBuilder,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
@@ -303,9 +305,9 @@ fn create_table_build_impl(
     Ok(Box::new(transaction).into())
 }
 
-/// Free a [`CreateTableTransactionBuilder`] without committing.
+/// Free a [`CreateTableTransactionBuilder`] without building.
 ///
-/// Use this on failure paths when the builder will not be committed.
+/// Use this on failure paths when the builder will not be built.
 ///
 /// # Safety
 ///
@@ -818,7 +820,7 @@ mod tests {
         let schema_handle: Handle<crate::SharedSchema> = schema.into();
         let engine_info = "test-engine/1.0";
         let builder = ok_or_panic(unsafe {
-            create_table(
+            get_create_table_builder(
                 kernel_string_slice!(table_path),
                 schema_handle.shallow_copy(),
                 kernel_string_slice!(engine_info),
@@ -844,7 +846,8 @@ mod tests {
         let table_path_str = table_path.as_str();
 
         // Build transaction, then commit -- should return version 0
-        let txn = ok_or_panic(unsafe { create_table_build(builder, engine.shallow_copy()) });
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
         let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
         assert_eq!(version, 0);
 
@@ -881,7 +884,7 @@ mod tests {
         let prop_key1 = "delta.appendOnly";
         let prop_val1 = "true";
         let builder = ok_or_panic(unsafe {
-            create_table_set_property(
+            create_table_builder_with_table_property(
                 builder,
                 kernel_string_slice!(prop_key1),
                 kernel_string_slice!(prop_val1),
@@ -891,7 +894,7 @@ mod tests {
         let prop_key2 = "custom.key";
         let prop_val2 = "custom_value";
         let builder = ok_or_panic(unsafe {
-            create_table_set_property(
+            create_table_builder_with_table_property(
                 builder,
                 kernel_string_slice!(prop_key2),
                 kernel_string_slice!(prop_val2),
@@ -899,7 +902,8 @@ mod tests {
             )
         });
 
-        let txn = ok_or_panic(unsafe { create_table_build(builder, engine.shallow_copy()) });
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
         let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
         assert_eq!(version, 0);
 
@@ -938,7 +942,8 @@ mod tests {
             &tmp_dir,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
-        let txn = ok_or_panic(unsafe { create_table_build(builder, engine.shallow_copy()) });
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
         let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
         assert_eq!(version, 0);
 
@@ -947,7 +952,7 @@ mod tests {
             &tmp_dir,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
-        let result = unsafe { create_table_build(builder2, engine.shallow_copy()) };
+        let result = unsafe { create_table_builder_build(builder2, engine.shallow_copy()) };
         match result {
             ExternResult::Err(e) => {
                 // Clean up the error to prevent leaks
@@ -988,7 +993,7 @@ mod tests {
         // An empty schema is always invalid for table creation
         let (_table_path, engine, builder) = create_table_builder(&tmp_dir, vec![]);
 
-        let result = unsafe { create_table_build(builder, engine.shallow_copy()) };
+        let result = unsafe { create_table_builder_build(builder, engine.shallow_copy()) };
         match result {
             ExternResult::Err(e) => {
                 let error = unsafe { crate::ffi_test_utils::recover_error(e) };
