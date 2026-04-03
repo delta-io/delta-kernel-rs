@@ -715,12 +715,13 @@ fn get_indices(
                         if mask_indices.len() > mask_before {
                             found_fields.insert(requested_field.name());
                             reorder_indices.push(ReorderIndex::nested(index, children));
-                        } else if children.len() == requested_schema.num_fields() {
-                            // All requested children were resolved (as nullable/missing or
-                            // the struct is empty), but no parquet leaves were selected. Emit
-                            // a Missing entry so the struct is synthesized as null rather than
+                        } else {
+                            // The recursive call resolved all children (as nullable/missing
+                            // or the struct is empty), but no parquet leaves were selected.
+                            // Emit a Missing entry so the struct is synthesized rather than
                             // falling through to the post-loop logic which would error for
                             // non-nullable structs.
+                            debug_assert_eq!(children.len(), requested_schema.num_fields());
                             found_fields.insert(requested_field.name());
                             reorder_indices.push(ReorderIndex::missing(
                                 index,
@@ -853,7 +854,7 @@ fn get_indices(
             debug!("Skipping over un-selected field: {}", field.name());
             // offset by number of inner fields. subtract one, because the enumerate still
             // counts this logical "parent" field
-            parquet_offset += count_cols(field) - 1;
+            parquet_offset += count_cols(field).saturating_sub(1);
         }
     }
 
@@ -1041,6 +1042,22 @@ pub(crate) fn ordering_needs_row_indexes(requested_ordering: &[ReorderIndex]) ->
 // of this type and then set elements of the Vec to Some(FieldArrayOpt) for each column
 type FieldArrayOpt = Option<(Arc<ArrowField>, Arc<dyn ArrowArray>)>;
 
+/// Creates an array for a missing field. For non-nullable structs, produces a non-null struct
+/// (no null buffer) with recursively missing children, preserving the non-null constraint at
+/// every level. For all other types (or nullable structs), produces an all-null array.
+fn new_missing_array(field: &ArrowField, num_rows: usize) -> Arc<dyn ArrowArray> {
+    match (field.is_nullable(), field.data_type()) {
+        (false, ArrowDataType::Struct(child_fields)) => {
+            let child_arrays: Vec<Arc<dyn ArrowArray>> = child_fields
+                .iter()
+                .map(|f| new_missing_array(f, num_rows))
+                .collect();
+            Arc::new(StructArray::new(child_fields.clone(), child_arrays, None))
+        }
+        _ => new_null_array(field.data_type(), num_rows),
+    }
+}
+
 /// Reorder a RecordBatch to match `requested_ordering`. For each non-zero value in
 /// `requested_ordering`, the column at that index will be added in order to the returned batch.
 ///
@@ -1130,20 +1147,7 @@ pub(crate) fn reorder_struct_array(
                     ));
                 }
                 ReorderIndexTransform::Missing(field) => {
-                    let array = match (field.is_nullable(), field.data_type()) {
-                        (false, ArrowDataType::Struct(child_fields)) => {
-                            // Non-nullable struct whose children are all missing: create a
-                            // non-null struct array with null children rather than a wholly
-                            // null array, which would violate the non-null constraint.
-                            let child_arrays: Vec<Arc<dyn ArrowArray>> = child_fields
-                                .iter()
-                                .map(|f| new_null_array(f.data_type(), num_rows))
-                                .collect();
-                            Arc::new(StructArray::new(child_fields.clone(), child_arrays, None))
-                                as Arc<dyn ArrowArray>
-                        }
-                        _ => new_null_array(field.data_type(), num_rows),
-                    };
+                    let array = new_missing_array(field, num_rows);
                     final_fields_cols[reorder_index.index] = Some((field.clone(), array));
                 }
                 ReorderIndexTransform::RowIndex(field) => {
@@ -1532,7 +1536,7 @@ mod tests {
 
     use crate::arrow::array::{
         Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, Int32Builder,
-        MapArray, MapBuilder, StringArray, StringBuilder, StructArray, StructBuilder,
+        Int64Array, MapArray, MapBuilder, StringArray, StringBuilder, StructArray, StructBuilder,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
@@ -4286,18 +4290,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn non_nullable_struct_with_all_nullable_children_unmatched() {
-        // Requested schema has a non-nullable struct `info` with a nullable child `z`.
-        // Parquet has `info` with different children `x` and `y` (no `z`).
-        // Since `z` is nullable, the struct should be returned with `z` as null rather
-        // than erroring because the non-nullable struct is "missing".
-        let requested_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("a", DataType::LONG),
+    #[rstest]
+    fn struct_with_all_nullable_children_unmatched_is_missing(
+        #[values(true, false)] struct_nullable: bool,
+    ) {
+        // When a struct exists in parquet but none of its children match the requested
+        // schema, the struct should be treated as missing regardless of its nullability.
+        let info_field = if struct_nullable {
+            StructField::nullable(
+                "info",
+                StructType::new_unchecked([StructField::nullable("z", DataType::LONG)]),
+            )
+        } else {
             StructField::not_null(
                 "info",
                 StructType::new_unchecked([StructField::nullable("z", DataType::LONG)]),
-            ),
+            )
+        };
+        let requested_schema = Arc::new(StructType::new_unchecked([
+            StructField::not_null("a", DataType::LONG),
+            info_field,
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", ArrowDataType::Int64, true),
@@ -4310,12 +4322,11 @@ mod tests {
                     ]
                     .into(),
                 ),
-                false,
+                !struct_nullable,
             ),
         ]));
         let (mask_indices, reorder_indices) =
             get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        // Only "a" should be in the mask; the struct's children don't match any leaves
         assert_eq!(mask_indices, vec![0]);
         let expected_info_field = Arc::new(
             requested_schema
@@ -4334,47 +4345,56 @@ mod tests {
     }
 
     #[test]
-    fn nullable_struct_with_all_nullable_children_unmatched() {
-        // Same as above but with a nullable struct. The struct should also be treated
-        // as missing (synthesized as null).
-        let requested_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("a", DataType::LONG),
-            StructField::nullable(
-                "info",
-                StructType::new_unchecked([StructField::nullable("z", DataType::LONG)]),
-            ),
-        ]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("a", ArrowDataType::Int64, true),
-            ArrowField::new(
-                "info",
-                ArrowDataType::Struct(
-                    vec![
-                        ArrowField::new("x", ArrowDataType::Int64, true),
-                        ArrowField::new("y", ArrowDataType::Utf8, true),
-                    ]
-                    .into(),
-                ),
-                true,
-            ),
-        ]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        assert_eq!(mask_indices, vec![0]);
-        let expected_info_field = Arc::new(
-            requested_schema
-                .field("info")
-                .unwrap()
-                .try_into_arrow()
-                .unwrap(),
-        );
-        assert_eq!(
-            reorder_indices,
-            vec![
-                ReorderIndex::identity(0),
-                ReorderIndex::missing(1, expected_info_field),
-            ]
-        );
+    fn reorder_non_nullable_missing_struct_produces_non_null_struct() {
+        // The Missing transform for a non-nullable struct should produce a struct with
+        // null_count == 0 and all-null children.
+        let a_array: Arc<dyn ArrowArray> = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let input = StructArray::from(vec![(
+            Arc::new(ArrowField::new("a", ArrowDataType::Int64, false)),
+            a_array,
+        )]);
+        let missing_field = Arc::new(ArrowField::new(
+            "info",
+            ArrowDataType::Struct(vec![ArrowField::new("z", ArrowDataType::Int64, true)].into()),
+            false,
+        ));
+        let reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::missing(1, missing_field),
+        ];
+        let ordered = reorder_struct_array(input, &reorder, None, None).unwrap();
+        assert_eq!(ordered.column_names(), vec!["a", "info"]);
+        let info = ordered.column(1).as_struct();
+        assert_eq!(info.null_count(), 0);
+        assert_eq!(info.column(0).null_count(), 3);
+    }
+
+    #[test]
+    fn reorder_nested_non_nullable_missing_struct_recurses() {
+        // Non-nullable struct containing a non-nullable struct child: both levels should
+        // have null_count == 0, with the leaf nullable child being all-null.
+        let a_array: Arc<dyn ArrowArray> = Arc::new(Int64Array::from(vec![1, 2]));
+        let input = StructArray::from(vec![(
+            Arc::new(ArrowField::new("a", ArrowDataType::Int64, false)),
+            a_array,
+        )]);
+        let inner_struct =
+            ArrowDataType::Struct(vec![ArrowField::new("leaf", ArrowDataType::Int64, true)].into());
+        let missing_field = Arc::new(ArrowField::new(
+            "outer",
+            ArrowDataType::Struct(vec![ArrowField::new("inner", inner_struct, false)].into()),
+            false,
+        ));
+        let reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::missing(1, missing_field),
+        ];
+        let ordered = reorder_struct_array(input, &reorder, None, None).unwrap();
+        let outer = ordered.column(1).as_struct();
+        assert_eq!(outer.null_count(), 0);
+        let inner = outer.column(0).as_struct();
+        assert_eq!(inner.null_count(), 0);
+        assert_eq!(inner.column(0).null_count(), 2);
     }
 
     #[test]
