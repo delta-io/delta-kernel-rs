@@ -188,8 +188,9 @@ pub unsafe extern "C" fn commit(
 
 /// A handle representing an exclusive [`CreateTableTransactionBuilder`].
 ///
-/// The caller must eventually either call [`create_table_commit`] (which consumes the handle and
-/// creates the table) or [`free_create_table_builder`] (which drops it without creating anything).
+/// The caller must eventually either call [`create_table_build`] (which consumes the handle and
+/// returns a transaction) or [`free_create_table_builder`] (which drops it without creating
+/// anything).
 #[handle_descriptor(target=CreateTableTransactionBuilder, mutable=true, sized=true)]
 pub struct ExclusiveCreateTableBuilder;
 
@@ -199,8 +200,8 @@ pub struct ExclusiveCreateTableBuilder;
 
 /// Create a new [`CreateTableTransactionBuilder`] for creating a Delta table at the given path.
 ///
-/// The returned builder can be configured with [`create_table_set_property`] before committing
-/// with [`create_table_commit`]. The engine is only used for error reporting at this stage.
+/// The returned builder can be configured with [`create_table_set_property`] before building
+/// with [`create_table_build`]. The engine is only used for error reporting at this stage.
 ///
 /// # Safety
 ///
@@ -266,8 +267,9 @@ fn create_table_set_property_impl(
     Ok(Box::new(builder).into())
 }
 
-/// Build and commit a create-table transaction. Returns the committed version on success. For
-/// new tables, this is always 0. This consumes the builder handle.
+/// Build a create-table transaction from the configured builder. Returns a transaction handle
+/// that can be used with the standard transaction functions ([`add_files`], [`set_data_change`],
+/// [`commit`], etc.) to optionally stage initial data before committing.
 ///
 /// Uses [`FileSystemCommitter`] by default.
 ///
@@ -276,23 +278,29 @@ fn create_table_set_property_impl(
 /// Caller is responsible for passing a valid builder and engine handle.
 /// CONSUMES the builder handle -- caller must not use it after this call.
 #[no_mangle]
-pub unsafe extern "C" fn create_table_commit(
+pub unsafe extern "C" fn create_table_build(
     builder: Handle<ExclusiveCreateTableBuilder>,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<u64> {
+) -> ExternResult<Handle<ExclusiveTransaction>> {
     let builder = unsafe { builder.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    create_table_commit_impl(*builder, extern_engine).into_extern_result(&extern_engine)
+    create_table_build_impl(*builder, extern_engine).into_extern_result(&extern_engine)
 }
 
-fn create_table_commit_impl(
+fn create_table_build_impl(
     builder: CreateTableTransactionBuilder,
     extern_engine: &dyn ExternEngine,
-) -> DeltaResult<u64> {
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
     let committer = Box::new(FileSystemCommitter::new());
-    let transaction = builder.build(engine.as_ref(), committer)?;
-    commit_result_to_version(transaction.commit(engine.as_ref()))
+    let create_txn = builder.build(engine.as_ref(), committer)?;
+    // SAFETY: `Transaction<CreateTable>` and `Transaction<ExistingTable>` have identical memory
+    // layouts -- the only difference is `PhantomData<S>` which is a zero-sized type. The FFI
+    // boundary erases the type parameter anyway. Runtime behavior (protocol/metadata action
+    // generation during commit) is controlled by the snapshot version (`PRE_COMMIT_VERSION`),
+    // not the type parameter.
+    let transaction: Transaction = unsafe { std::mem::transmute(create_txn) };
+    Ok(Box::new(transaction).into())
 }
 
 /// Free a [`CreateTableTransactionBuilder`] without committing.
@@ -835,8 +843,9 @@ mod tests {
         );
         let table_path_str = table_path.as_str();
 
-        // Commit -- should return version 0
-        let version = ok_or_panic(unsafe { create_table_commit(builder, engine.shallow_copy()) });
+        // Build transaction, then commit -- should return version 0
+        let txn = ok_or_panic(unsafe { create_table_build(builder, engine.shallow_copy()) });
+        let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
         assert_eq!(version, 0);
 
         // Verify by opening a snapshot of the created table
@@ -890,7 +899,8 @@ mod tests {
             )
         });
 
-        let version = ok_or_panic(unsafe { create_table_commit(builder, engine.shallow_copy()) });
+        let txn = ok_or_panic(unsafe { create_table_build(builder, engine.shallow_copy()) });
+        let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
         assert_eq!(version, 0);
 
         // Verify properties by reading the commit log directly
@@ -928,16 +938,16 @@ mod tests {
             &tmp_dir,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
-        let version = ok_or_panic(unsafe { create_table_commit(builder, engine.shallow_copy()) });
+        let txn = ok_or_panic(unsafe { create_table_build(builder, engine.shallow_copy()) });
+        let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
         assert_eq!(version, 0);
 
-        // Try to create the same table again -- should error
+        // Try to create the same table again -- build should error (table already exists)
         let (_, _, builder2) = create_table_builder(
             &tmp_dir,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
-        let result = unsafe { create_table_commit(builder2, engine.shallow_copy()) };
-        // The commit should fail because the table already exists
+        let result = unsafe { create_table_build(builder2, engine.shallow_copy()) };
         match result {
             ExternResult::Err(e) => {
                 // Clean up the error to prevent leaks
@@ -948,7 +958,10 @@ mod tests {
                     error.message
                 );
             }
-            ExternResult::Ok(_) => panic!("Expected error for table that already exists"),
+            ExternResult::Ok(txn) => {
+                unsafe { free_transaction(txn) };
+                panic!("Expected error for table that already exists");
+            }
         }
 
         unsafe { free_engine(engine) };
@@ -969,13 +982,13 @@ mod tests {
 
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
-    async fn test_create_table_commit_with_empty_schema_returns_error(
+    async fn test_create_table_build_with_empty_schema_returns_error(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_dir = tempdir()?;
         // An empty schema is always invalid for table creation
         let (_table_path, engine, builder) = create_table_builder(&tmp_dir, vec![]);
 
-        let result = unsafe { create_table_commit(builder, engine.shallow_copy()) };
+        let result = unsafe { create_table_build(builder, engine.shallow_copy()) };
         match result {
             ExternResult::Err(e) => {
                 let error = unsafe { crate::ffi_test_utils::recover_error(e) };
@@ -987,7 +1000,10 @@ mod tests {
                     error.message
                 );
             }
-            ExternResult::Ok(_) => panic!("Expected error for empty schema"),
+            ExternResult::Ok(txn) => {
+                unsafe { free_transaction(txn) };
+                panic!("Expected error for empty schema");
+            }
         }
 
         unsafe { free_engine(engine) };
