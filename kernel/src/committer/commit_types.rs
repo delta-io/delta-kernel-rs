@@ -1,13 +1,105 @@
 //! Commit metadata types for the committer module.
 
+#[cfg(any(test, feature = "test-utils"))]
+use std::collections::HashMap;
+#[cfg(any(test, feature = "test-utils"))]
+use std::sync::Arc;
+
 use url::Url;
 
+use crate::actions::{Metadata, Protocol};
 use crate::path::LogRoot;
 use crate::{DeltaResult, Version};
 
-/// `CommitMetadata` bundles the metadata about a commit operation. This currently includes the
-/// commit path and version but will expand to things like `Protocol`, `Metadata`, etc. to allow
-/// for catalogs to understand/cache/persist more information about the table at commit time.
+/// The type of commit operation being performed. This communicates to the committer whether this
+/// is a table creation or a write to an existing table, and whether the table is catalog-managed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitType {
+    /// Creating a new table via filesystem (no catalog involvement).
+    PathBasedCreate,
+    /// Creating a new catalog-managed table.
+    CatalogManagedCreate,
+    /// Writing to an existing path-based table.
+    PathBasedWrite,
+    /// Writing to an existing catalog-managed table.
+    CatalogManagedWrite,
+    // TODO: Wire these up when ALTER TABLE SET TBLPROPERTIES is supported.
+    /// Upgrading an existing path-based table to catalog-managed. Not currently supported.
+    #[allow(dead_code)]
+    UpgradeToCatalogManaged,
+    /// Downgrading an existing catalog-managed table to path-based. Not currently supported.
+    #[allow(dead_code)]
+    DowngradeToPathBased,
+}
+
+impl CommitType {
+    /// Returns `true` if this is a create-table commit (version 0).
+    pub fn is_create(&self) -> bool {
+        matches!(self, Self::PathBasedCreate | Self::CatalogManagedCreate)
+    }
+
+    /// Returns `true` if this commit includes a catalog-managed operation,
+    /// including upgrade/downgrade.
+    pub fn requires_catalog_committer(&self) -> bool {
+        matches!(
+            self,
+            Self::CatalogManagedCreate
+                | Self::CatalogManagedWrite
+                | Self::UpgradeToCatalogManaged
+                | Self::DowngradeToPathBased
+        )
+    }
+}
+
+/// The protocol and metadata state for this commit. Groups the read snapshot state (if any)
+/// and the new state being committed (if any).
+#[derive(Debug)]
+#[allow(dead_code)] // Fields read by delta-kernel-unity-catalog via effective_protocol/metadata
+pub(crate) struct CommitProtocolMetadata {
+    /// Existing table protocol from read snapshot. `None` for create-table.
+    read_protocol: Option<Protocol>,
+    /// Existing table metadata from read snapshot. `None` for create-table.
+    read_metadata: Option<Metadata>,
+    /// New protocol being committed. `Some` for create-table and future ALTER TABLE.
+    new_protocol: Option<Protocol>,
+    /// New metadata being committed. `Some` for create-table and future ALTER TABLE.
+    new_metadata: Option<Metadata>,
+}
+
+impl CommitProtocolMetadata {
+    pub(crate) fn try_new(
+        read_protocol: Option<Protocol>,
+        read_metadata: Option<Metadata>,
+        new_protocol: Option<Protocol>,
+        new_metadata: Option<Metadata>,
+    ) -> DeltaResult<Self> {
+        if read_protocol.is_some() != read_metadata.is_some() {
+            return Err(crate::Error::generic(
+                "read_protocol and read_metadata must both be present or both be absent",
+            ));
+        }
+        if read_protocol.is_none() && new_protocol.is_none() {
+            return Err(crate::Error::generic(
+                "CommitProtocolMetadata requires at least one protocol (read or new)",
+            ));
+        }
+        if read_metadata.is_none() && new_metadata.is_none() {
+            return Err(crate::Error::generic(
+                "CommitProtocolMetadata requires at least one metadata (read or new)",
+            ));
+        }
+        Ok(Self {
+            read_protocol,
+            read_metadata,
+            new_protocol,
+            new_metadata,
+        })
+    }
+}
+
+/// `CommitMetadata` bundles the metadata about a commit operation. This includes the commit path,
+/// version, and protocol/metadata state of the table being committed to. Catalog committers can
+/// use the protocol and metadata getters to validate or inspect the commit.
 ///
 /// Note that this struct cannot be constructed. It is handed to the [`Committer`] (in the
 /// [`commit`] method) by the kernel when a transaction is being committed.
@@ -21,23 +113,30 @@ use crate::{DeltaResult, Version};
 pub struct CommitMetadata {
     pub(crate) log_root: LogRoot,
     pub(crate) version: Version,
+    pub(crate) commit_type: CommitType,
     pub(crate) in_commit_timestamp: i64,
     pub(crate) max_published_version: Option<Version>,
-    // in the future this will include Protocol, Metadata, CommitInfo, Domain Metadata, etc.
+    /// Protocol and metadata state for this commit.
+    #[allow(dead_code)] // Read by delta-kernel-unity-catalog for commit validation
+    pub(crate) protocol_metadata: CommitProtocolMetadata,
 }
 
 impl CommitMetadata {
     pub(crate) fn new(
         log_root: LogRoot,
         version: Version,
+        commit_type: CommitType,
         in_commit_timestamp: i64,
         max_published_version: Option<Version>,
+        protocol_metadata: CommitProtocolMetadata,
     ) -> Self {
         Self {
             log_root,
             version,
+            commit_type,
             in_commit_timestamp,
             max_published_version,
+            protocol_metadata,
         }
     }
 
@@ -62,6 +161,11 @@ impl CommitMetadata {
         self.version
     }
 
+    /// The type of commit operation being performed.
+    pub fn commit_type(&self) -> CommitType {
+        self.commit_type
+    }
+
     /// The in-commit timestamp for the commit. Note that this may differ from the actual commit
     /// file modification time.
     pub fn in_commit_timestamp(&self) -> i64 {
@@ -73,15 +177,58 @@ impl CommitMetadata {
         self.max_published_version
     }
 
+    /// The root URL of the table being committed to.
     pub fn table_root(&self) -> &Url {
         self.log_root.table_root()
     }
 
+    /// Returns the effective protocol for this commit. Prefers new_protocol (create-table / ALTER
+    /// TABLE), falling back to the read snapshot's protocol.
+    #[allow(dead_code)] // Used by delta-kernel-unity-catalog for commit validation
+    pub(crate) fn effective_protocol(&self) -> DeltaResult<&Protocol> {
+        let pm = &self.protocol_metadata;
+        pm.new_protocol
+            .as_ref()
+            .or(pm.read_protocol.as_ref())
+            .ok_or_else(|| {
+                crate::Error::internal_error(
+                    "CommitProtocolMetadata should have at least one protocol",
+                )
+            })
+    }
+
+    /// Returns the effective metadata for this commit. Prefers new_metadata (create-table / ALTER
+    /// TABLE), falling back to the read snapshot's metadata.
+    #[allow(dead_code)] // Used by delta-kernel-unity-catalog for commit validation
+    pub(crate) fn effective_metadata(&self) -> DeltaResult<&Metadata> {
+        let pm = &self.protocol_metadata;
+        pm.new_metadata
+            .as_ref()
+            .or(pm.read_metadata.as_ref())
+            .ok_or_else(|| {
+                crate::Error::internal_error(
+                    "CommitProtocolMetadata should have at least one metadata",
+                )
+            })
+    }
+
     /// Creates a new `CommitMetadata` for the given `table_root` and `version`. Test-only.
+    ///
+    /// Uses a default modern protocol (empty features) and empty metadata.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_unchecked(table_root: Url, version: Version) -> DeltaResult<Self> {
         let log_root = crate::path::LogRoot::new(table_root)?;
-        Ok(Self::new(log_root, version, 0, None))
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new())?;
+        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new())?;
+        Ok(Self::new(
+            log_root,
+            version,
+            CommitType::PathBasedWrite,
+            0,
+            None,
+            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None)?,
+        ))
     }
 }
 
@@ -104,6 +251,8 @@ pub enum CommitResponse {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
     use crate::path::LogRoot;
     use url::Url;
 
@@ -114,8 +263,18 @@ mod tests {
         let version = 42;
         let ts = 1234;
         let max_published_version = Some(42);
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
+        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
-        let commit_metadata = CommitMetadata::new(log_root, version, ts, max_published_version);
+        let commit_metadata = CommitMetadata::new(
+            log_root,
+            version,
+            CommitType::PathBasedWrite,
+            ts,
+            max_published_version,
+            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None).unwrap(),
+        );
 
         // version
         assert_eq!(commit_metadata.version(), 42);

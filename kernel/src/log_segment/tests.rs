@@ -829,6 +829,62 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     assert_eq!(log_segment.listed.ascending_commit_files[0].version, 4);
 }
 
+#[rstest::rstest]
+#[case::no_hint(None)]
+#[case::stale_hint(Some(LastCheckpointHint {
+    version: 10, // stale: 10 > end_version 5, so it is discarded
+    size: 10,
+    parts: None,
+    size_in_bytes: None,
+    num_of_add_files: None,
+    checkpoint_schema: None,
+    checksum: None,
+    tags: None,
+}))]
+#[tokio::test]
+async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
+    #[case] hint: Option<LastCheckpointHint>,
+) {
+    let paths: Vec<Path> = (0..=5).map(|v| delta_path_for_version(v, "json")).collect();
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5)).unwrap();
+
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
+
+    assert_eq!(checkpoint_parts.len(), 0);
+    let versions = commit_files.into_iter().map(|x| x.version).collect_vec();
+    assert_eq!(versions, vec![0, 1, 2, 3, 4, 5]);
+}
+
+#[tokio::test]
+async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+        ],
+        None,
+    )
+    .await;
+
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5)).unwrap();
+
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(checkpoint_parts[0].version, 5);
+    assert_eq!(commit_files.len(), 0);
+}
+
 #[tokio::test]
 async fn build_table_changes_with_commit_versions() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -4176,4 +4232,156 @@ fn test_schema_to_is_not_null_predicate(
     #[case] expected: Option<PredicateRef>,
 ) {
     assert_eq!(schema_to_is_not_null_predicate(&schema), expected);
+}
+
+/// Verify that `read_actions` correctly handles null values in map fields across all
+/// action types. The Delta protocol allows null values in `partitionValues` maps (a null
+/// partition value means the partition column is null for that file) and in `tags` maps.
+///
+/// Spark defaults all `Map[String, String]` types to `valueContainsNull = true`, and
+/// checkpoint writing calls `schema.asNullable` which forces all maps nullable. The
+/// schema must match this behavior.
+///
+/// This test reads JSON actions through `DefaultEngine` + `InMemory` store +
+/// `log_segment.read_actions()`, then re-validates the resulting Arrow `StructArray` with
+/// `StructArray::try_new`. Without the fix, non-nullable map value fields cause:
+///   "Found unmasked nulls for non-nullable StructArray field 'value'"
+#[rstest]
+// remove.partitionValues.month: null
+#[case::remove_partition_values(
+    "remove",
+    "partitionValues",
+    r#"{"remove":{"path":"file.parquet","deletionTimestamp":1000,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{"year":"2024","month":null},"size":100}}"#
+)]
+// remove.tags.key2: null
+#[case::remove_tags(
+    "remove",
+    "tags",
+    r#"{"remove":{"path":"file.parquet","deletionTimestamp":1000,"dataChange":true,"tags":{"key1":"val1","key2":null}}}"#
+)]
+// add.partitionValues.month: null
+#[case::add_partition_values(
+    "add",
+    "partitionValues",
+    r#"{"add":{"path":"file.parquet","partitionValues":{"year":"2024","month":null},"size":100,"modificationTime":1000,"dataChange":true}}"#
+)]
+// add.tags.key2: null
+#[case::add_tags(
+    "add",
+    "tags",
+    r#"{"add":{"path":"file.parquet","partitionValues":{},"size":100,"modificationTime":1000,"dataChange":true,"tags":{"key1":"val1","key2":null}}}"#
+)]
+// cdc.partitionValues.month: null
+#[case::cdc_partition_values(
+    "cdc",
+    "partitionValues",
+    r#"{"cdc":{"path":"file.parquet","partitionValues":{"year":"2024","month":null},"size":100,"dataChange":false}}"#
+)]
+// cdc.tags.key2: null
+#[case::cdc_tags(
+    "cdc",
+    "tags",
+    r#"{"cdc":{"path":"file.parquet","partitionValues":{},"size":100,"dataChange":false,"tags":{"key1":"val1","key2":null}}}"#
+)]
+// sidecar.tags.key2: null
+#[case::sidecar_tags(
+    "sidecar",
+    "tags",
+    r#"{"sidecar":{"path":"sidecar.parquet","sizeInBytes":100,"modificationTime":1000,"tags":{"key1":"val1","key2":null}}}"#
+)]
+// checkpointMetadata.tags.key2: null
+#[case::checkpoint_metadata_tags(
+    "checkpointMetadata",
+    "tags",
+    r#"{"checkpointMetadata":{"version":0,"tags":{"key1":"val1","key2":null}}}"#
+)]
+// Known issues: these map fields don't yet have #[allow_null_container_values].
+// commitInfo.operationParameters.description: null
+#[should_panic(expected = "StructArray re-validation failed")]
+#[case::commit_info_operation_parameters_known_issue(
+    "commitInfo",
+    "operationParameters",
+    r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","description":null}}}"#
+)]
+// metaData.configuration.key2: null
+#[should_panic(expected = "StructArray re-validation failed")]
+#[case::metadata_configuration_known_issue(
+    "metaData",
+    "configuration",
+    r#"{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"key1":"val1","key2":null},"createdTime":1000}}"#
+)]
+#[tokio::test]
+async fn read_actions_with_null_map_values(
+    #[case] action_name: &str,
+    #[case] map_field: &str,
+    #[case] json_action: &str,
+) {
+    use crate::arrow::array::{Array, AsArray, MapArray, StructArray};
+
+    let store = Arc::new(InMemory::new());
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+
+    // Write a single commit file with the action containing null map values.
+    store
+        .put(
+            &delta_path_for_version(0, "json"),
+            json_action.to_string().into(),
+        )
+        .await
+        .unwrap();
+
+    // Build engine and read actions -- same as DeltaActionExtractor::get_actions.
+    let engine = DefaultEngineBuilder::new(store).build();
+    let log_segment =
+        LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, Some(0))
+            .unwrap();
+
+    // Use all_actions_schema to cover sidecar and checkpointMetadata (checkpoint-only actions).
+    let action_schema = get_all_actions_schema().clone();
+    let action_batches = log_segment
+        .read_actions(&engine, action_schema)
+        .expect("read_actions should succeed");
+
+    // Iterate batches and verify the map value field is nullable.
+    let mut found = false;
+    for batch_result in action_batches {
+        let actions_batch = batch_result.expect("Iterating action batches should succeed");
+
+        let data_any = actions_batch.actions.into_any();
+        let arrow_data = data_any
+            .downcast_ref::<ArrowEngineData>()
+            .expect("ArrowEngineData");
+        let rb = arrow_data.record_batch();
+
+        let Some(action_col) = rb.column_by_name(action_name) else {
+            continue;
+        };
+        let action_struct = action_col
+            .as_struct_opt()
+            .unwrap_or_else(|| panic!("{action_name} column should be a struct"));
+        let map_col = action_struct
+            .column_by_name(map_field)
+            .unwrap_or_else(|| panic!("{action_name}.{map_field} not found"));
+        let map_array = map_col
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap_or_else(|| panic!("{action_name}.{map_field} should be a MapArray"));
+        // Re-validate the entries StructArray with its own schema, same as what Arrow's
+        // IPC deserializer does. Without the fix, this fails with:
+        // "Found unmasked nulls for non-nullable StructArray field 'value'"
+        let entries = map_array.entries();
+        StructArray::try_new(
+            entries.fields().clone(),
+            entries.columns().to_vec(),
+            entries.nulls().cloned(),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "{action_name}.{map_field} entries StructArray re-validation failed: {e}. \
+                 This means the schema has non-nullable value field but the data has nulls."
+            )
+        });
+        found = true;
+    }
+    assert!(found, "Should have found a {action_name} action batch");
 }

@@ -19,8 +19,10 @@ use {
 };
 
 use delta_kernel::schema::Schema;
-use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
+use delta_kernel::snapshot::{Snapshot, SnapshotRef};
+#[cfg(feature = "catalog-managed")]
+use delta_kernel::LogPath;
+use delta_kernel::{DeltaResult, Engine, EngineData, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
@@ -690,7 +692,180 @@ pub struct SharedSchema;
 #[handle_descriptor(target=Snapshot, mutable=false, sized=true)]
 pub struct SharedSnapshot;
 
-/// Get the latest snapshot from the specified table
+/// Opaque builder for constructing a [`SharedSnapshot`].
+///
+/// Create with [`get_snapshot_builder`] (from a table path) or [`get_snapshot_builder_from`]
+/// (incrementally from an existing snapshot). Configure with [`snapshot_builder_set_version`] and
+/// (when the `catalog-managed` feature is enabled) [`snapshot_builder_set_log_tail`]. Finally,
+/// call [`snapshot_builder_build`] to consume the builder and obtain the snapshot. If you need to
+/// discard the builder without building, call [`free_snapshot_builder`].
+pub struct FfiSnapshotBuilder {
+    engine: Arc<dyn ExternEngine>,
+    source: FfiSnapshotBuilderSource,
+    version: Option<Version>,
+    #[cfg(feature = "catalog-managed")]
+    log_tail: Vec<LogPath>,
+}
+
+/// An opaque handle with exclusive (Box-like) ownership of a [`FfiSnapshotBuilder`].
+#[handle_descriptor(target=FfiSnapshotBuilder, mutable=true, sized=true)]
+pub struct MutableFfiSnapshotBuilder;
+
+enum FfiSnapshotBuilderSource {
+    TableRoot(Url),
+    ExistingSnapshot(SnapshotRef),
+}
+
+fn make_snapshot_builder(
+    source: FfiSnapshotBuilderSource,
+    engine: Arc<dyn ExternEngine>,
+) -> DeltaResult<Handle<MutableFfiSnapshotBuilder>> {
+    Ok(Box::new(FfiSnapshotBuilder {
+        engine,
+        source,
+        version: None,
+        #[cfg(feature = "catalog-managed")]
+        log_tail: Vec::new(),
+    })
+    .into())
+}
+
+/// Get a builder for creating a [`SharedSnapshot`] from a table path.
+///
+/// Use [`snapshot_builder_set_version`] to pin a specific version, then call
+/// [`snapshot_builder_build`] to obtain the snapshot. The caller owns the returned handle and must
+/// eventually call either [`snapshot_builder_build`] to produce a [`SharedSnapshot`], or
+/// [`free_snapshot_builder`] to drop it without building.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid path and engine handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_snapshot_builder(
+    path: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<MutableFfiSnapshotBuilder>> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let engine_arc = unsafe { engine.clone_as_arc() };
+    let url = unsafe { unwrap_and_parse_path_as_url(path) };
+    let source = match url {
+        Ok(url) => FfiSnapshotBuilderSource::TableRoot(url),
+        Err(e) => return DeltaResult::Err(e).into_extern_result(&engine_ref),
+    };
+    make_snapshot_builder(source, engine_arc).into_extern_result(&engine_ref)
+}
+
+/// Get a builder for incrementally updating an existing snapshot.
+///
+/// This avoids re-reading the full log. Use [`snapshot_builder_set_version`] to target a specific
+/// version, then call [`snapshot_builder_build`] to obtain the updated snapshot. The caller owns
+/// the returned handle and must eventually call either [`snapshot_builder_build`] to produce a
+/// [`SharedSnapshot`], or [`free_snapshot_builder`] to drop it without building.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles.
+#[no_mangle]
+pub unsafe extern "C" fn get_snapshot_builder_from(
+    prev_snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<MutableFfiSnapshotBuilder>> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let engine_arc = unsafe { engine.clone_as_arc() };
+    let snapshot_arc = unsafe { prev_snapshot.clone_as_arc() };
+    make_snapshot_builder(
+        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot_arc),
+        engine_arc,
+    )
+    .into_extern_result(&engine_ref)
+}
+
+/// Set the target version on a snapshot builder. When omitted, the snapshot is created at the
+/// latest version of the table.
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_builder_set_version(
+    builder: &mut Handle<MutableFfiSnapshotBuilder>,
+    version: Version,
+) {
+    unsafe { builder.as_mut() }.version = Some(version);
+}
+
+/// Set the log tail on a snapshot builder for catalog-managed tables.
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer. The log_tail array and its contents must remain valid
+/// for the duration of this call.
+#[cfg(feature = "catalog-managed")]
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_builder_set_log_tail(
+    builder: &mut Handle<MutableFfiSnapshotBuilder>,
+    log_tail: log_path::LogPathArray,
+) -> ExternResult<bool> {
+    let builder_mut = unsafe { builder.as_mut() };
+    let engine_arc = builder_mut.engine.clone();
+    let engine_ref = engine_arc.as_ref();
+    snapshot_builder_set_log_tail_impl(builder_mut, log_tail).into_extern_result(&engine_ref)
+}
+
+#[cfg(feature = "catalog-managed")]
+unsafe fn snapshot_builder_set_log_tail_impl(
+    builder: &mut FfiSnapshotBuilder,
+    log_tail: log_path::LogPathArray,
+) -> DeltaResult<bool> {
+    builder.log_tail = unsafe { log_tail.log_paths() }?;
+    Ok(true)
+}
+
+/// Consume the builder and return a snapshot. After calling, the builder pointer is _no longer
+/// valid_. The builder is always freed by this call, whether or not it succeeds.
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer and must not use it again after this call.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_builder_build(
+    mut builder: Handle<MutableFfiSnapshotBuilder>,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    // Clone the engine Arc before consuming the handle so we can still use it for error reporting
+    let engine_arc = unsafe { builder.as_mut() }.engine.clone();
+    let engine_ref = engine_arc.as_ref();
+    let builder_box = unsafe { builder.into_inner() };
+    snapshot_builder_build_impl(*builder_box).into_extern_result(&engine_ref)
+}
+
+fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handle<SharedSnapshot>> {
+    let engine = builder.engine.engine();
+    let mut rust_builder = match builder.source {
+        FfiSnapshotBuilderSource::TableRoot(url) => Snapshot::builder_for(url),
+        FfiSnapshotBuilderSource::ExistingSnapshot(snap) => Snapshot::builder_from(snap),
+    };
+    if let Some(v) = builder.version {
+        rust_builder = rust_builder.at_version(v);
+    }
+    #[cfg(feature = "catalog-managed")]
+    if !builder.log_tail.is_empty() {
+        rust_builder = rust_builder.with_log_tail(builder.log_tail);
+    }
+    let snapshot = rust_builder.build(engine.as_ref())?;
+    Ok(snapshot.into())
+}
+
+/// Free a snapshot builder without building a snapshot (e.g. on an error path).
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer and must not use it again after this call.
+#[no_mangle]
+pub unsafe extern "C" fn free_snapshot_builder(builder: Handle<MutableFfiSnapshotBuilder>) {
+    builder.drop_handle();
+}
+
+/// Get the latest snapshot from the specified table.
 ///
 /// # Safety
 ///
@@ -700,12 +875,14 @@ pub unsafe extern "C" fn snapshot(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let engine = unsafe { engine.as_ref() };
-    snapshot_impl(url, engine, None, Vec::new()).into_extern_result(&engine)
+    let builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
+        ExternResult::Ok(ptr) => ptr,
+        ExternResult::Err(e) => return ExternResult::Err(e),
+    };
+    unsafe { snapshot_builder_build(builder_ptr) }
 }
 
-/// Get the latest snapshot from the specified table with optional log tail
+/// Get the latest snapshot from the specified table with a log tail for catalog-managed tables.
 ///
 /// # Safety
 ///
@@ -718,16 +895,17 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
     engine: Handle<SharedExternEngine>,
     log_paths: log_path::LogPathArray,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let engine_ref = unsafe { engine.as_ref() };
-
-    // Convert LogPathArray to Vec<LogPath>
-    let log_tail = match unsafe { log_paths.log_paths() } {
-        Ok(paths) => paths,
-        Err(err) => return Err(err).into_extern_result(&engine_ref),
+    let mut builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
+        ExternResult::Ok(ptr) => ptr,
+        ExternResult::Err(e) => return ExternResult::Err(e),
     };
-
-    snapshot_impl(url, engine_ref, None, log_tail).into_extern_result(&engine_ref)
+    if let ExternResult::Err(e) =
+        unsafe { snapshot_builder_set_log_tail(&mut builder_ptr, log_paths) }
+    {
+        unsafe { free_snapshot_builder(builder_ptr) };
+        return ExternResult::Err(e);
+    }
+    unsafe { snapshot_builder_build(builder_ptr) }
 }
 
 /// Get the snapshot from the specified table at a specific version. Note this is only safe for
@@ -742,12 +920,15 @@ pub unsafe extern "C" fn snapshot_at_version(
     engine: Handle<SharedExternEngine>,
     version: Version,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let engine = unsafe { engine.as_ref() };
-    snapshot_impl(url, engine, version.into(), Vec::new()).into_extern_result(&engine)
+    let mut builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
+        ExternResult::Ok(ptr) => ptr,
+        ExternResult::Err(e) => return ExternResult::Err(e),
+    };
+    unsafe { snapshot_builder_set_version(&mut builder_ptr, version) };
+    unsafe { snapshot_builder_build(builder_ptr) }
 }
 
-/// Get the snapshot from the specified table at a specific version with log tail.
+/// Get the snapshot from the specified table at a specific version with a log tail.
 ///
 /// # Safety
 ///
@@ -761,37 +942,18 @@ pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
     version: Version,
     log_tail: log_path::LogPathArray,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let engine_ref = unsafe { engine.as_ref() };
-
-    // Convert LogPathArray to Vec<LogPath>
-    let log_tail = match unsafe { log_tail.log_paths() } {
-        Ok(paths) => paths,
-        Err(err) => return Err(err).into_extern_result(&engine_ref),
+    let mut builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
+        ExternResult::Ok(ptr) => ptr,
+        ExternResult::Err(e) => return ExternResult::Err(e),
     };
-
-    snapshot_impl(url, engine_ref, version.into(), log_tail).into_extern_result(&engine_ref)
-}
-
-fn snapshot_impl(
-    url: DeltaResult<Url>,
-    extern_engine: &dyn ExternEngine,
-    version: Option<Version>,
-    #[allow(unused_variables)] log_tail: Vec<LogPath>,
-) -> DeltaResult<Handle<SharedSnapshot>> {
-    let mut builder = Snapshot::builder_for(url?);
-
-    if let Some(v) = version {
-        builder = builder.at_version(v);
+    unsafe { snapshot_builder_set_version(&mut builder_ptr, version) };
+    if let ExternResult::Err(e) =
+        unsafe { snapshot_builder_set_log_tail(&mut builder_ptr, log_tail) }
+    {
+        unsafe { free_snapshot_builder(builder_ptr) };
+        return ExternResult::Err(e);
     }
-
-    #[cfg(feature = "catalog-managed")]
-    if !log_tail.is_empty() {
-        builder = builder.with_log_tail(log_tail);
-    }
-
-    let snapshot = builder.build(extern_engine.engine().as_ref())?;
-    Ok(snapshot.into())
+    unsafe { snapshot_builder_build(builder_ptr) }
 }
 
 /// # Safety
@@ -826,7 +988,9 @@ fn snapshot_checkpoint_impl(
     snapshot: Arc<Snapshot>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<bool> {
-    let _updated = snapshot.checkpoint(extern_engine.engine().as_ref())?;
+    let (_result, _updated) = snapshot.checkpoint(extern_engine.engine().as_ref())?;
+    // We ignore the CheckpointWriteResult because both Written and AlreadyExists are non-error
+    // outcomes at the FFI layer.
     Ok(true)
 }
 
@@ -1044,6 +1208,8 @@ mod tests {
     use rstest::rstest;
     use serde_json::Value;
     use std::collections::HashMap;
+    #[cfg(feature = "catalog-managed")]
+    use test_utils::add_staged_commit;
     use test_utils::{
         actions_to_string, actions_to_string_partitioned, actions_to_string_with_metadata,
         add_commit, TestAction, METADATA, METADATA_WITH_TABLE_PROPERTIES,
@@ -1069,6 +1235,36 @@ mod tests {
         }
     }
 
+    /// Create an in-memory table with a single version-0 metadata commit, returning the storage,
+    /// engine handle, and a snapshot at version 0. The caller is responsible for freeing the
+    /// engine and snapshot handles.
+    async fn make_engine_and_v0_snapshot(
+        path: &str,
+    ) -> Result<
+        (
+            Arc<InMemory>,
+            Handle<SharedExternEngine>,
+            Handle<SharedSnapshot>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            path,
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
+            allocate_err,
+        );
+        let snap =
+            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+        Ok((storage, engine, snap))
+    }
+
     pub(crate) fn get_default_engine(path: &str) -> Handle<SharedExternEngine> {
         let path = kernel_string_slice!(path);
         let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };
@@ -1085,25 +1281,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            0,
-            actions_to_string(vec![TestAction::Metadata]),
-        )
-        .await?;
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let (_, engine, snapshot1) = make_engine_and_v0_snapshot(table_root).await?;
 
         // Test getting latest snapshot
-        let snapshot1 = unsafe {
-            ok_or_panic(snapshot(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
         let version1 = unsafe { version(snapshot1.shallow_copy()) };
         assert_eq!(version1, 0);
 
@@ -1122,7 +1303,7 @@ mod tests {
         let snapshot_at_non_existent_version = unsafe {
             snapshot_at_version(kernel_string_slice!(table_root), engine.shallow_copy(), 1)
         };
-        assert_extern_result_error_with_message(snapshot_at_non_existent_version, KernelError::GenericError, "Generic delta kernel error: LogSegment end version 0 not the same as the specified end version 1");
+        assert_extern_result_error_with_message(snapshot_at_non_existent_version, KernelError::GenericError, Some("Generic delta kernel error: LogSegment end version 0 not the same as the specified end version 1"));
 
         let snapshot_table_root_str =
             unsafe { snapshot_table_root(snapshot1.shallow_copy(), allocate_str) };
@@ -1426,17 +1607,9 @@ mod tests {
     #[cfg(feature = "catalog-managed")]
     #[tokio::test]
     async fn test_snapshot_log_tail() -> Result<(), Box<dyn std::error::Error>> {
-        use test_utils::add_staged_commit;
-        let storage = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
-
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            0,
-            actions_to_string(vec![TestAction::Metadata]),
-        )
-        .await?;
+        let (storage, engine, snap) = make_engine_and_v0_snapshot(table_root).await?;
+        unsafe { free_snapshot(snap) };
         let commit1 = add_staged_commit(
             table_root,
             storage.as_ref(),
@@ -1444,8 +1617,6 @@ mod tests {
             actions_to_string(vec![TestAction::Add("path1".into())]),
         )
         .await?;
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let commit1_path = format!(
             "{}_delta_log/_staged_commits/{}",
@@ -1478,11 +1649,290 @@ mod tests {
                 log_tail,
             ))
         };
-        let snapshot_version = unsafe { version(snapshot.shallow_copy()) };
+        let snapshot_version = unsafe { version(snapshot2.shallow_copy()) };
         assert_eq!(snapshot_version, 1);
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_snapshot(snapshot2) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_builder_from_existing_snapshot_advances_to_latest_and_pinned_version(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = "memory:///";
+        let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
+        assert_eq!(unsafe { version(snapshot_at_v0.shallow_copy()) }, 0);
+
+        add_commit(
+            path,
+            storage.as_ref(),
+            1,
+            actions_to_string(vec![TestAction::Add("file1.parquet".into())]),
+        )
+        .await?;
+        add_commit(
+            path,
+            storage.as_ref(),
+            2,
+            actions_to_string(vec![TestAction::Add("file2.parquet".into())]),
+        )
+        .await?;
+
+        let snapshot_at_v2 = unsafe {
+            let ptr = ok_or_panic(get_snapshot_builder_from(
+                snapshot_at_v0.shallow_copy(),
+                engine.shallow_copy(),
+            ));
+            ok_or_panic(snapshot_builder_build(ptr))
+        };
+        assert_eq!(unsafe { version(snapshot_at_v2.shallow_copy()) }, 2);
+
+        let snapshot_at_v1 = unsafe {
+            let mut ptr = ok_or_panic(get_snapshot_builder_from(
+                snapshot_at_v0.shallow_copy(),
+                engine.shallow_copy(),
+            ));
+            snapshot_builder_set_version(&mut ptr, 1);
+            ok_or_panic(snapshot_builder_build(ptr))
+        };
+        assert_eq!(unsafe { version(snapshot_at_v1.shallow_copy()) }, 1);
+
+        unsafe { free_snapshot(snapshot_at_v2) }
+        unsafe { free_snapshot(snapshot_at_v1) }
+        unsafe { free_snapshot(snapshot_at_v0) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_builder_from_existing_snapshot_rejects_earlier_version(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = "memory:///";
+        let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
+
+        add_commit(
+            path,
+            storage.as_ref(),
+            1,
+            actions_to_string(vec![TestAction::Add("file1.parquet".into())]),
+        )
+        .await?;
+        add_commit(
+            path,
+            storage.as_ref(),
+            2,
+            actions_to_string(vec![TestAction::Add("file2.parquet".into())]),
+        )
+        .await?;
+
+        // build a v2 snapshot to use as the base
+        let snapshot_at_v2 = unsafe {
+            let ptr = ok_or_panic(get_snapshot_builder_from(
+                snapshot_at_v0.shallow_copy(),
+                engine.shallow_copy(),
+            ));
+            ok_or_panic(snapshot_builder_build(ptr))
+        };
+        assert_eq!(unsafe { version(snapshot_at_v2.shallow_copy()) }, 2);
+
+        // pinning to a version older than the hint snapshot is rejected
+        let result = unsafe {
+            let mut ptr = ok_or_panic(get_snapshot_builder_from(
+                snapshot_at_v2.shallow_copy(),
+                engine.shallow_copy(),
+            ));
+            snapshot_builder_set_version(&mut ptr, 1);
+            snapshot_builder_build(ptr)
+        };
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::GenericError,
+            Some("Generic delta kernel error: Requested snapshot version 1 is older than snapshot hint version 2"),
+        );
+
+        unsafe { free_snapshot(snapshot_at_v2) }
+        unsafe { free_snapshot(snapshot_at_v0) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[tokio::test]
+    async fn test_snapshot_with_prev_snapshot_and_log_tail(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = "memory:///";
+        let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
+        assert_eq!(unsafe { version(snapshot_at_v0.shallow_copy()) }, 0);
+
+        // Add staged commit (version 1)
+        let commit1 = add_staged_commit(
+            path,
+            storage.as_ref(),
+            1,
+            actions_to_string(vec![TestAction::Add("path1.parquet".into())]),
+        )
+        .await?;
+
+        // Add another staged commit (version 2)
+        let commit2 = add_staged_commit(
+            path,
+            storage.as_ref(),
+            2,
+            actions_to_string(vec![TestAction::Add("path2.parquet".into())]),
+        )
+        .await?;
+
+        // Build log tail with both commits
+        let commit1_path = format!(
+            "{}_delta_log/_staged_commits/{}",
+            path,
+            commit1.filename().unwrap()
+        );
+        let commit2_path = format!(
+            "{}_delta_log/_staged_commits/{}",
+            path,
+            commit2.filename().unwrap()
+        );
+        let log_path1 =
+            log_path::FfiLogPath::new(kernel_string_slice!(commit1_path), 123456789, 100);
+        let log_path2 =
+            log_path::FfiLogPath::new(kernel_string_slice!(commit2_path), 123456790, 101);
+        let log_tail = [log_path1, log_path2];
+        let log_tail_array = log_path::LogPathArray {
+            ptr: log_tail.as_ptr(),
+            len: log_tail.len(),
+        };
+
+        let snapshot_at_v2 = unsafe {
+            let mut ptr = ok_or_panic(get_snapshot_builder_from(
+                snapshot_at_v0.shallow_copy(),
+                engine.shallow_copy(),
+            ));
+            ok_or_panic(snapshot_builder_set_log_tail(
+                &mut ptr,
+                log_tail_array.clone(),
+            ));
+            ok_or_panic(snapshot_builder_build(ptr))
+        };
+        assert_eq!(unsafe { version(snapshot_at_v2.shallow_copy()) }, 2);
+
+        let snapshot_at_v1 = unsafe {
+            let mut ptr = ok_or_panic(get_snapshot_builder_from(
+                snapshot_at_v0.shallow_copy(),
+                engine.shallow_copy(),
+            ));
+            snapshot_builder_set_version(&mut ptr, 1);
+            ok_or_panic(snapshot_builder_set_log_tail(&mut ptr, log_tail_array));
+            ok_or_panic(snapshot_builder_build(ptr))
+        };
+        assert_eq!(unsafe { version(snapshot_at_v1.shallow_copy()) }, 1);
+
+        unsafe { free_snapshot(snapshot_at_v2) }
+        unsafe { free_snapshot(snapshot_at_v1) }
+        unsafe { free_snapshot(snapshot_at_v0) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_builder_from_table_path_builds_latest_version(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let path = "memory:///";
+        add_commit(
+            path,
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+        add_commit(
+            path,
+            storage.as_ref(),
+            1,
+            actions_to_string(vec![TestAction::Add("file1.parquet".into())]),
+        )
+        .await?;
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage).build()),
+            allocate_err,
+        );
+
+        let snapshot_at_v1 = unsafe {
+            let ptr = ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+            ));
+            ok_or_panic(snapshot_builder_build(ptr))
+        };
+        assert_eq!(unsafe { version(snapshot_at_v1.shallow_copy()) }, 1);
+
+        unsafe { free_snapshot(snapshot_at_v1) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_free_snapshot_builder_without_building() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let path = "memory:///";
+        let (_, engine, snap) = make_engine_and_v0_snapshot(path).await?;
+        unsafe { free_snapshot(snap) };
+
+        let ptr = unsafe {
+            ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+            ))
+        };
+
+        unsafe { free_snapshot_builder(ptr) };
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_builder_with_nonexistent_path_returns_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage).build()),
+            allocate_err,
+        );
+
+        let result = unsafe {
+            let invalid_path = "not a valid url!";
+            get_snapshot_builder(kernel_string_slice!(invalid_path), engine.shallow_copy())
+        };
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::InvalidTableLocationError,
+            None,
+        );
+
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_builder_at_nonexistent_version_returns_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = "memory:///";
+        let (_, engine, snap) = make_engine_and_v0_snapshot(path).await?;
+        unsafe { free_snapshot(snap) };
+
+        let result = unsafe {
+            let mut ptr = ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+            ));
+            snapshot_builder_set_version(&mut ptr, 99);
+            snapshot_builder_build(ptr)
+        };
+        assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+
         unsafe { free_engine(engine) }
         Ok(())
     }
