@@ -433,12 +433,13 @@ pub async fn create_table(
             config.insert("delta.columnMapping.mode".to_string(), json!("name"));
         }
         if writer_features.contains(&"rowTracking") {
+            config.insert("delta.enableRowTracking".to_string(), json!("true"));
             config.insert(
-                "delta.materializedRowIdColumnName".to_string(),
+                "delta.rowTracking.materializedRowIdColumnName".to_string(),
                 json!("some_dummy_column_name"),
             );
             config.insert(
-                "delta.materializedRowCommitVersionColumnName".to_string(),
+                "delta.rowTracking.materializedRowCommitVersionColumnName".to_string(),
                 json!("another_dummy_column_name"),
             );
         }
@@ -499,14 +500,14 @@ pub async fn create_table(
             b"\n".to_vec(),
             to_vec(&metadata).unwrap(),
         ]
-        .concat()
+            .concat()
     } else {
         [
             to_vec(&protocol).unwrap(),
             b"\n".to_vec(),
             to_vec(&metadata).unwrap(),
         ]
-        .concat()
+            .concat()
     };
 
     // put 0.json with protocol + metadata
@@ -552,7 +553,7 @@ pub async fn setup_test_tables(
                 vec![],
                 vec![],
             )
-            .await?,
+                .await?,
             engine_37,
             store_37,
             "test_table_37",
@@ -567,7 +568,7 @@ pub async fn setup_test_tables(
                 vec![],
                 vec![],
             )
-            .await?,
+                .await?,
             engine_11,
             store_11,
             "test_table_11",
@@ -690,7 +691,7 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
                  cities: Vec<Option<&str>>,
                  tags: Vec<Option<&str>>,
                  values: Vec<Option<i32>>|
-     -> Result<RecordBatch, Box<dyn std::error::Error>> {
+                 -> Result<RecordBatch, Box<dyn std::error::Error>> {
         let address_array = StructArray::new(
             address_fields.clone(),
             vec![
@@ -876,7 +877,7 @@ pub fn create_add_files_metadata(
                 Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
                 Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
             ]
-            .into(),
+                .into(),
         ),
         false,
     ));
