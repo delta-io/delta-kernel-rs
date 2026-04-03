@@ -108,6 +108,17 @@ pub const METADATA_WITH_TABLE_PROPERTIES: &str = r#"{"commitInfo":{"timestamp":1
 {"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
 {"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.appendOnly":"true","custom.key":"custom_value"},"createdTime":1587968585495}}"#;
 
+/// Like [`METADATA`] but with table-features protocol (v3/v7) including columnMapping (reader)
+/// and columnMapping + rowTracking (writer). Metadata includes a table name and column mapping
+/// configuration.
+pub const METADATA_WITH_FEATURES: &str = concat!(
+    r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
+    "\n",
+    r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping","rowTracking"]}}"#,
+    "\n",
+    r#"{"metaData":{"id":"deadbeef-1234-5678-abcd-000000000000","name":"test_table","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.rowTracking.enabled":"true","delta.rowTracking.materializedRowIdColumnName":"_row_id","delta.rowTracking.materializedRowCommitVersionColumnName":"_row_commit_version"},"createdTime":1234567890000}}"#,
+);
+
 pub enum TestAction {
     Add(String),
     Remove(String),

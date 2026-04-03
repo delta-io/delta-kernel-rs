@@ -1287,7 +1287,8 @@ mod tests {
     use test_utils::add_staged_commit;
     use test_utils::{
         actions_to_string, actions_to_string_partitioned, actions_to_string_with_metadata,
-        add_commit, create_table, TestAction, METADATA, METADATA_WITH_TABLE_PROPERTIES,
+        add_commit, create_table, TestAction, METADATA, METADATA_WITH_FEATURES,
+        METADATA_WITH_TABLE_PROPERTIES,
     };
     use url::Url;
 
@@ -2044,17 +2045,6 @@ mod tests {
         Ok(())
     }
 
-    // A modern (table-features) protocol + metadata commit for feature/config tests.
-    // Protocol: minReaderVersion=3, minWriterVersion=7 with columnMapping + rowTracking.
-    // Metadata: id set, name set, createdTime set, column mapping mode = "name".
-    const METADATA_WITH_FEATURES: &str = concat!(
-        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
-        "\n",
-        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping","rowTracking"]}}"#,
-        "\n",
-        r#"{"metaData":{"id":"deadbeef-1234-5678-abcd-000000000000","name":"test_table","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.rowTracking.enabled":"true","delta.rowTracking.materializedRowIdColumnName":"_row_id","delta.rowTracking.materializedRowCommitVersionColumnName":"_row_commit_version"},"createdTime":1234567890000}}"#,
-    );
-
     // ── Shared visitor state and callbacks for protocol/metadata tests ────────
 
     struct ProtocolVisitState {
@@ -2239,8 +2229,6 @@ mod tests {
         unsafe { free_engine(engine) };
         Ok(())
     }
-
-    // ── visit_metadata tests ──────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_visit_metadata_default() -> Result<(), Box<dyn std::error::Error>> {
