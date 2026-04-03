@@ -805,13 +805,13 @@ impl LogSegment {
             (None, vec![])
         };
 
-        // Check if checkpoint has compatible stats_parsed and add it to the schema if so
-        let has_stats_parsed =
-            stats_schema
-                .zip(file_actions_schema.as_ref())
-                .is_some_and(|(stats, file_schema)| {
-                    Self::schema_has_compatible_stats_parsed(file_schema, stats)
-                });
+        // Check if the checkpoint has a usable stats_parsed field. The parquet reader handles
+        // type mismatches for nullable fields by null-padding them, so we only need to verify
+        // that stats_parsed exists and is structurally usable (not that every field type matches).
+        let has_stats_parsed = stats_schema.is_some()
+            && file_actions_schema
+                .as_ref()
+                .is_some_and(|file_schema| Self::has_usable_stats_parsed(file_schema));
 
         let has_partition_values_parsed = partition_schema
             .zip(file_actions_schema.as_ref())
@@ -1131,86 +1131,30 @@ impl LogSegment {
 
     /// Checks if a checkpoint schema contains a usable `add.stats_parsed` field.
     ///
-    /// This validates that:
-    /// 1. The `add.stats_parsed` field exists in the checkpoint schema
-    /// 2. The types in `stats_parsed` are compatible with the stats schema for data skipping
+    /// Returns `true` if `add.stats_parsed` exists and is a struct. Type mismatches for
+    /// individual columns within the stats struct are handled gracefully by the parquet
+    /// reader, which null-pads nullable fields with incompatible types. This provides
+    /// per-column degradation: a type mismatch in one stats column only loses stats for
+    /// that column, not for the entire checkpoint.
     ///
-    /// The `stats_schema` parameter contains only the columns referenced in the data skipping
-    /// predicate. This is built from the predicate and passed in by the caller.
-    ///
-    /// Both the checkpoint's `stats_parsed` schema and the `stats_schema` for data skipping
-    /// use physical column names (not logical names), so direct name comparison is correct.
-    ///
-    /// Returns `false` if stats_parsed doesn't exist or has incompatible types.
-    pub(crate) fn schema_has_compatible_stats_parsed(
-        checkpoint_schema: &StructType,
-        stats_schema: &StructType,
-    ) -> bool {
-        // Get add.stats_parsed from the checkpoint schema
-        let Some(stats_parsed) = checkpoint_schema
+    /// Note: the null-padding behavior is implemented by the default engine's parquet
+    /// reader. Custom `ParquetHandler` implementations should handle type-mismatched
+    /// nullable fields similarly for correct stats_parsed degradation.
+    pub(crate) fn has_usable_stats_parsed(checkpoint_schema: &StructType) -> bool {
+        let usable = checkpoint_schema
             .field("add")
             .and_then(|f| match f.data_type() {
                 DataType::Struct(s) => s.field("stats_parsed"),
                 _ => None,
             })
-        else {
-            debug!("stats_parsed not compatible: checkpoint schema does not contain add.stats_parsed field");
-            return false;
-        };
-
-        let DataType::Struct(stats_struct) = stats_parsed.data_type() else {
-            debug!(
-                "stats_parsed not compatible: add.stats_parsed field is not a Struct, got {:?}",
-                stats_parsed.data_type()
-            );
-            return false;
-        };
-
-        // Check type compatibility for both minValues and maxValues structs.
-        // While these typically have the same schema, the protocol doesn't guarantee it,
-        // so we check both to be safe.
-        for field_name in ["minValues", "maxValues"] {
-            let Some(checkpoint_values_field) = stats_struct.field(field_name) else {
-                // stats_parsed exists but no minValues/maxValues - unusual but valid
-                continue;
-            };
-
-            // minValues/maxValues must be a Struct containing per-column statistics.
-            // If it exists but isn't a Struct, the schema is malformed and unusable.
-            let DataType::Struct(checkpoint_values) = checkpoint_values_field.data_type() else {
-                debug!(
-                    "stats_parsed not compatible: stats_parsed.{} is not a Struct, got {:?}",
-                    field_name,
-                    checkpoint_values_field.data_type()
-                );
-                return false;
-            };
-
-            // Get the corresponding field from stats_schema (e.g., stats_schema.minValues)
-            let Some(stats_values_field) = stats_schema.field(field_name) else {
-                // stats_schema doesn't have minValues/maxValues, skip this check
-                continue;
-            };
-            let DataType::Struct(stats_values) = stats_values_field.data_type() else {
-                // stats_schema.minValues/maxValues isn't a struct - shouldn't happen but skip
-                continue;
-            };
-
-            // Check type compatibility recursively for nested structs.
-            // Only fields that exist in both schemas need compatible types.
-            // Extra fields in checkpoint are ignored; missing fields return null.
-            if !Self::structs_have_compatible_types(checkpoint_values, stats_values, field_name) {
-                return false;
-            }
-        }
-
-        debug!("Checkpoint schema has compatible stats_parsed for data skipping");
-        true
+            .is_some_and(|f| matches!(f.data_type(), DataType::Struct(_)));
+        debug!("Checkpoint stats_parsed usable for data skipping: {usable}");
+        usable
     }
 
     /// Recursively checks if two struct types have compatible field types.
     ///
-    /// Used by both `stats_parsed` and `partitionValues_parsed` compatibility checks.
+    /// Used by `partitionValues_parsed` compatibility checks.
     /// For each field in `needed`, if it exists in `available` (checkpoint):
     /// - Primitive types: must be compatible via [`PrimitiveType::is_stats_type_compatible_with`]
     ///   (allows type widening and Parquet physical type reinterpretation)
@@ -1224,12 +1168,10 @@ impl LogSegment {
     ) -> bool {
         for needed_field in needed.fields() {
             let Some(available_field) = available.field(needed_field.name()) else {
-                // Field missing in checkpoint - that's OK, it will be null
+                // Field missing in checkpoint -- it will be null when accessed
                 continue;
             };
-
             match (available_field.data_type(), needed_field.data_type()) {
-                // Both are structs: recurse
                 (DataType::Struct(avail_struct), DataType::Struct(need_struct)) => {
                     let nested_context = format!("{}.{}", context, needed_field.name());
                     if !Self::structs_have_compatible_types(
@@ -1240,8 +1182,6 @@ impl LogSegment {
                         return false;
                     }
                 }
-                // Non-struct types: use stats-specific rules for primitives and standard
-                // schema rules otherwise.
                 (avail_type, need_type) => {
                     let compatible = match (avail_type, need_type) {
                         (DataType::Primitive(a), DataType::Primitive(b)) => {
@@ -1251,12 +1191,12 @@ impl LogSegment {
                     };
                     if !compatible {
                         debug!(
-                            "stats_parsed not compatible: incompatible type for '{}' in {}: \
-                             checkpoint has {:?}, stats schema needs {:?}",
+                            "Type incompatible for '{}' in {}: checkpoint has {:?}, \
+                             schema needs {:?}",
                             needed_field.name(),
                             context,
                             avail_type,
-                            need_type
+                            need_type,
                         );
                         return false;
                     }

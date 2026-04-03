@@ -467,6 +467,9 @@ pub(crate) fn coerce_batch_nullability(
 
 * 3. Also push a ReorderIndex element that indicates where this item should be in the final output,
 *    and if it needs any transformation (i.e. casting, create null column)
+* 3b. If a field exists in parquet but has an incompatible type and is nullable, it is treated as
+*     missing -- the missing-field handler inserts a `Missing` transform that null-pads it. This
+*     enables graceful degradation for schema evolution (e.g., stats_parsed type mismatches).
 * 4. If a nested element (struct/map/list) is encountered, recurse into it, pushing indices onto
 *    the same vector, but producing a new reorder level, which is added to the parent with a `Nested`
 *    transform
@@ -730,6 +733,15 @@ fn get_indices(
                                 Arc::new(requested_field.try_into_arrow()?),
                             ));
                         }
+                    } else if requested_field.nullable {
+                        // Parquet has a struct but we requested a non-struct type.
+                        // For nullable fields, treat as missing and null-pad.
+                        debug!(
+                            "Struct/non-struct mismatch for nullable field '{}'. Null-padding.",
+                            requested_field.name(),
+                        );
+                        parquet_offset += count_cols(field).saturating_sub(1);
+                        continue;
                     } else {
                         return Err(Error::unexpected_column_type(field.name()));
                     }
@@ -846,18 +858,37 @@ fn get_indices(
                         &requested_field.data_type,
                         field.data_type(),
                         super::ensure_data_types::ValidationMode::TypesAndNames,
-                    )? {
-                        DataTypeCompat::Identical => {
-                            reorder_indices.push(ReorderIndex::identity(index))
+                    ) {
+                        Ok(DataTypeCompat::Identical) => {
+                            reorder_indices.push(ReorderIndex::identity(index));
                         }
-                        DataTypeCompat::NeedsCast(target) => {
-                            reorder_indices.push(ReorderIndex::cast(index, target))
+                        Ok(DataTypeCompat::NeedsCast(target)) => {
+                            reorder_indices.push(ReorderIndex::cast(index, target));
                         }
-                        DataTypeCompat::Nested => {
+                        Ok(DataTypeCompat::Nested) => {
                             return Err(Error::internal_error(
                                 "Comparing nested types in get_indices",
-                            ))
+                            ));
                         }
+                        Err(_) if requested_field.nullable => {
+                            // Type mismatch on a nullable field: treat as missing and
+                            // null-pad. This gracefully handles schema evolution (e.g.,
+                            // a column's type changed after a checkpoint was written).
+                            // The field gets all nulls. Note: ensure_data_types only
+                            // errors on type incompatibility for leaf types in this arm.
+                            debug!(
+                                "Type mismatch for nullable field '{}': parquet has {:?}, \
+                                 requested {:?}. Null-padding.",
+                                requested_field.name(),
+                                field.data_type(),
+                                requested_field.data_type,
+                            );
+                            // Don't add to found_fields — the missing-field handler below
+                            // will insert a Missing transform.
+                            parquet_offset += count_cols(field).saturating_sub(1);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
                     }
                     found_fields.insert(requested_field.name());
                     mask_indices.push(parquet_offset + parquet_index);
@@ -1946,7 +1977,36 @@ mod tests {
     }
 
     #[test]
-    fn ensure_data_types_fails_correctly() {
+    fn ensure_data_types_fails_for_non_nullable() {
+        // Non-nullable fields with type mismatches must still error.
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new_unchecked([StructField::not_null(
+                logical_name(0),
+                DataType::STRING,
+            )
+            .with_metadata(column_mapping_metadata(0, mode))])
+            .make_physical(mode)
+            .unwrap()
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                parquet_name(0, mode),
+                ArrowDataType::Int32,
+                false,
+            )
+            .with_metadata(arrow_fid(0))]));
+            let res = get_requested_indices(&requested_schema, &parquet_schema);
+            assert_result_error_with_message(
+                res,
+                "Invalid argument error: Incorrect datatype. Expected Utf8, got Int32",
+            );
+        })
+    }
+
+    #[test]
+    fn nullable_type_mismatch_null_pads() {
+        // Nullable fields with type mismatches are null-padded instead of erroring.
+        // This handles schema evolution where a column's type changed (e.g.,
+        // stats_parsed after a checkpoint was written with a different schema).
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
@@ -1963,30 +2023,206 @@ mod tests {
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
                     .with_metadata(arrow_fid(1)),
             ]));
-            let res = get_requested_indices(&requested_schema, &parquet_schema);
-            assert_result_error_with_message(
-                res,
-                "Invalid argument error: Incorrect datatype. Expected integer, got Utf8",
-            );
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            // Only the first field is read from parquet; the second is null-padded.
+            assert_eq!(mask_indices, vec![0]);
+            // Field 0: identity (type matches). Field 1: Missing (type mismatch, null-padded).
+            assert_eq!(reorder_indices.len(), 2);
+            assert_eq!(reorder_indices[0], ReorderIndex::identity(0));
+            assert!(matches!(
+                &reorder_indices[1].transform,
+                ReorderIndexTransform::Missing(_)
+            ));
+        })
+    }
 
+    #[test]
+    fn nullable_struct_non_struct_mismatch_null_pads() {
+        // Parquet has a struct field but the requested schema wants a primitive (nullable).
+        // The struct's leaf columns should be skipped, and subsequent fields should still
+        // have correct indices.
+        column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
-                StructField::not_null(logical_name(0), DataType::INTEGER)
+                StructField::nullable(logical_name(0), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(0, mode)),
-                StructField::nullable(logical_name(1), DataType::STRING)
+                StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1, mode)),
             ])
             .make_physical(mode)
             .unwrap()
             .into();
+            // Parquet field 0 is a struct with 2 leaf children, field 1 is Int32.
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
-                ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false),
-                ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, true),
+                ArrowField::new(
+                    parquet_name(0, mode),
+                    ArrowDataType::Struct(
+                        vec![
+                            ArrowField::new("a", ArrowDataType::Int32, true),
+                            ArrowField::new("b", ArrowDataType::Int32, true),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                )
+                .with_metadata(arrow_fid(0)),
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(1)),
             ]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            // Field 0 (struct with 2 leaves) is null-padded; field 1 is read from parquet.
+            // count_cols for the struct = 2 (leaf children), so offset += 2 - 1 = 1.
+            // Field 1 is at parquet index 2: offset(1) + enumerate_index(1) = 2.
+            assert_eq!(mask_indices, vec![2]);
+            assert_eq!(reorder_indices.len(), 2);
+            // Found fields are pushed first (field 1 at identity(1)), then missing fields
+            // are appended (field 0 at Missing(0)).
+            assert_eq!(reorder_indices[0], ReorderIndex::identity(1));
+            assert!(matches!(
+                &reorder_indices[1].transform,
+                ReorderIndexTransform::Missing(_)
+            ));
+        })
+    }
+
+    #[test]
+    fn non_nullable_struct_non_struct_mismatch_errors() {
+        // Non-nullable field with a struct/non-struct mismatch must still error.
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new_unchecked([StructField::not_null(
+                logical_name(0),
+                DataType::INTEGER,
+            )
+            .with_metadata(column_mapping_metadata(0, mode))])
+            .make_physical(mode)
+            .unwrap()
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                parquet_name(0, mode),
+                ArrowDataType::Struct(
+                    vec![ArrowField::new("a", ArrowDataType::Int32, true)].into(),
+                ),
+                false,
+            )
+            .with_metadata(arrow_fid(0))]));
             let res = get_requested_indices(&requested_schema, &parquet_schema);
-            assert_result_error_with_message(
-                res,
-                "Invalid argument error: Incorrect datatype. Expected Utf8, got Int32",
-            );
+            assert!(res.is_err());
+        })
+    }
+
+    #[test]
+    fn all_nullable_fields_type_mismatched_produces_all_missing() {
+        // When every requested field has a type mismatch, mask_indices is empty and all
+        // fields get Missing transforms.
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new_unchecked([StructField::nullable(
+                logical_name(0),
+                DataType::INTEGER,
+            )
+            .with_metadata(column_mapping_metadata(0, mode))])
+            .make_physical(mode)
+            .unwrap()
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                parquet_name(0, mode),
+                ArrowDataType::Utf8,
+                true,
+            )
+            .with_metadata(arrow_fid(0))]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            assert!(mask_indices.is_empty());
+            assert_eq!(reorder_indices.len(), 1);
+            assert!(matches!(
+                &reorder_indices[0].transform,
+                ReorderIndexTransform::Missing(_)
+            ));
+        })
+    }
+
+    #[test]
+    fn multiple_consecutive_type_mismatches_correct_offset() {
+        // Multiple consecutive mismatches (primitive + struct) followed by a valid field.
+        // Stresses cumulative parquet_offset tracking across different mismatch types.
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new_unchecked([
+                StructField::nullable(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0, mode)),
+                StructField::nullable(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1, mode)),
+                StructField::not_null(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2, mode)),
+            ])
+            .make_physical(mode)
+            .unwrap()
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                // Field 0: primitive mismatch (Utf8 vs Int32)
+                ArrowField::new(parquet_name(0, mode), ArrowDataType::Utf8, true)
+                    .with_metadata(arrow_fid(0)),
+                // Field 1: struct/non-struct mismatch (struct with 2 leaves vs Int32)
+                ArrowField::new(
+                    parquet_name(1, mode),
+                    ArrowDataType::Struct(
+                        vec![
+                            ArrowField::new("a", ArrowDataType::Int32, true),
+                            ArrowField::new("b", ArrowDataType::Int32, true),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                )
+                .with_metadata(arrow_fid(1)),
+                // Field 2: correct type
+                ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(2)),
+            ]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            // Field 0 (1 leaf) skipped, field 1 (struct with 2 leaves, offset += 1),
+            // field 2 is at parquet index 3.
+            assert_eq!(mask_indices, vec![3]);
+            assert_eq!(reorder_indices.len(), 3);
+            assert_eq!(reorder_indices[0], ReorderIndex::identity(2));
+            assert!(matches!(
+                &reorder_indices[1].transform,
+                ReorderIndexTransform::Missing(_)
+            ));
+            assert!(matches!(
+                &reorder_indices[2].transform,
+                ReorderIndexTransform::Missing(_)
+            ));
+        })
+    }
+
+    #[test]
+    fn nullable_type_widening_produces_cast_not_null_pad() {
+        // Widenable types (e.g., Int32 -> Int64) should produce NeedsCast, not null-padding.
+        // Verifies that type-compatible widening (handled by ensure_data_types) takes
+        // priority over the nullable-field null-padding fallback.
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema =
+                StructType::new_unchecked([StructField::nullable(logical_name(0), DataType::LONG)
+                    .with_metadata(column_mapping_metadata(0, mode))])
+                .make_physical(mode)
+                .unwrap()
+                .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                parquet_name(0, mode),
+                ArrowDataType::Int32,
+                true,
+            )
+            .with_metadata(arrow_fid(0))]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            // The field should be read (not null-padded) and cast from Int32 to Int64.
+            assert_eq!(mask_indices, vec![0]);
+            assert_eq!(reorder_indices.len(), 1);
+            assert!(matches!(
+                &reorder_indices[0].transform,
+                ReorderIndexTransform::Cast(_)
+            ));
         })
     }
 
