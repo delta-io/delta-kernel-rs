@@ -1892,8 +1892,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_with_nonexistent_path_returns_error() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn test_builder_with_nonexistent_path_returns_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         let engine = engine_to_handle(
             Arc::new(DefaultEngineBuilder::new(storage).build()),
@@ -1904,7 +1904,11 @@ mod tests {
             let invalid_path = "not a valid url!";
             get_snapshot_builder(kernel_string_slice!(invalid_path), engine.shallow_copy())
         };
-        assert_extern_result_error_with_message(result, KernelError::InvalidTableLocationError, None);
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::InvalidTableLocationError,
+            None,
+        );
 
         unsafe { free_engine(engine) }
         Ok(())
