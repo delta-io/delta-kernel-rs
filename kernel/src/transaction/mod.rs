@@ -402,7 +402,16 @@ impl<S> Transaction<S> {
             .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
             Ok(CommitResponse::Committed { file_meta }) => {
-                let crc_delta = self.build_crc_delta(in_commit_timestamp, dm_changes)?;
+                let bin_boundaries = self
+                    .read_snapshot
+                    .get_file_stats_if_loaded()
+                    .and_then(|s| s.file_size_histogram)
+                    .map(|h| h.sorted_bin_boundaries);
+                let crc_delta = self.build_crc_delta(
+                    in_commit_timestamp,
+                    dm_changes,
+                    bin_boundaries.as_deref(),
+                )?;
                 Ok(CommitResult::CommittedTransaction(
                     self.into_committed(file_meta, crc_delta)?,
                 ))
@@ -1001,10 +1010,12 @@ impl<S> Transaction<S> {
         &self,
         in_commit_timestamp: Option<i64>,
         dm_changes: Vec<DomainMetadata>,
+        bin_boundaries: Option<&[i64]>,
     ) -> DeltaResult<CrcDelta> {
         let file_stats = FileStatsDelta::try_compute_for_txn(
             &self.add_files_metadata,
             &self.remove_files_metadata,
+            bin_boundaries,
         )?;
         let is_create = self.is_create_table();
         Ok(CrcDelta {
