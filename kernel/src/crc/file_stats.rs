@@ -7,7 +7,7 @@
 //! [`FileStatsDelta`] captures how many files were added/removed and their total sizes. It can be
 //! produced from either:
 //! 1. In-memory transaction data via [`FileStatsDelta::try_compute_for_txn`]
-//! 2. A parsed .json commit file during forward log replay (future)
+//! 2. A parsed .json commit file
 
 use std::sync::LazyLock;
 
@@ -41,7 +41,7 @@ pub(crate) struct FileStatsDelta {
     pub(crate) net_bytes: i64,
     /// Net change in file size histogram (adds minus removes per bin). May contain negative
     /// values in bins where more files were removed than added. `None` when the delta source
-    /// does not provide histogram data (e.g. forward log replay without histogram support).
+    /// does not provide histogram data.
     pub(crate) net_histogram: Option<FileSizeHistogram>,
 }
 

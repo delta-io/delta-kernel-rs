@@ -190,15 +190,13 @@ impl Crc {
             match base_hist.try_apply_delta(delta_hist) {
                 Ok(merged) => self.file_size_histogram = Some(merged),
                 Err(e) => {
-                    warn!(
-                        "Non-negative file count check failed, dropping file size histogram: {e}"
-                    );
+                    warn!("Histogram merge failed, dropping file size histogram: {e}");
                     self.file_size_histogram = None;
                 }
             }
         } else if self.file_size_histogram.is_some() {
-            // The base had a histogram but the delta couldn't provide one
-            // (e.g. forward log replay). Drop it rather than leaving a stale value.
+            // The base had a histogram but the delta couldn't provide one. Drop it rather than
+            // leaving a stale value.
             self.file_size_histogram = None;
         }
     }
@@ -286,7 +284,7 @@ mod tests {
         assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
     }
 
-    /// Simulates forward log replay: apply multiple commit deltas sequentially.
+    /// Applies multiple commit deltas sequentially.
     #[test]
     fn test_apply_multiple_deltas() {
         let mut crc = base_crc();
