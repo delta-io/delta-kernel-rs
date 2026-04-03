@@ -704,61 +704,25 @@ mod scan_builder_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use std::ffi::c_void;
-    use std::sync::Arc;
 
-    use delta_kernel::engine::default::DefaultEngineBuilder;
-    use delta_kernel::object_store::memory::InMemory;
-    use test_utils::{actions_to_string, add_commit, TestAction};
+    use test_utils::{actions_to_string, TestAction};
 
     use crate::error::KernelError;
     use crate::expressions::kernel_visitor::{
         visit_expression_column, visit_expression_literal_int, visit_predicate_lt,
         KernelExpressionVisitorState,
     };
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic, recover_error};
+    use crate::ffi_test_utils::{allocate_err, ok_or_panic, recover_error, setup_snapshot};
     use crate::schema_visitor::{
         visit_field_integer, visit_field_struct, KernelSchemaVisitorState,
     };
-    use crate::{
-        engine_to_handle, free_engine, free_schema, free_snapshot, get_snapshot_builder,
-        kernel_string_slice, snapshot_builder_build, ExternResult, SharedExternEngine,
-        SharedSnapshot,
-    };
+    use crate::{free_engine, free_schema, free_snapshot, kernel_string_slice, ExternResult};
 
     use super::{
         free_scan, free_scan_builder, scan_builder, scan_builder_build,
         scan_builder_with_predicate, scan_builder_with_schema, scan_logical_schema,
         EnginePredicate, EngineSchema,
     };
-
-    /// Builds an in-memory table with schema `{id: integer, val: string}` and returns handles
-    /// to the engine and the latest snapshot. The caller is responsible for freeing both handles.
-    async fn setup_test_table() -> (
-        crate::handle::Handle<SharedExternEngine>,
-        crate::handle::Handle<SharedSnapshot>,
-    ) {
-        let storage = Arc::new(InMemory::new());
-        let table_root = "memory:///test_scan_builder/";
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            0,
-            actions_to_string(vec![TestAction::Metadata]),
-        )
-        .await
-        .expect("add_commit failed");
-
-        let engine = DefaultEngineBuilder::new(storage).build();
-        let engine_handle = engine_to_handle(Arc::new(engine), allocate_err);
-        let snapshot_handle = unsafe {
-            let builder = ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(table_root),
-                engine_handle.shallow_copy(),
-            ));
-            ok_or_panic(snapshot_builder_build(builder))
-        };
-        (engine_handle, snapshot_handle)
-    }
 
     /// Schema visitor that produces `{id: integer (nullable)}` -- a single-column projection of
     /// the standard test table schema.
@@ -808,7 +772,9 @@ mod scan_builder_tests {
 
     #[tokio::test]
     async fn test_scan_builder_no_pushdown() {
-        let (engine, snapshot) = setup_test_table().await;
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
         let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
         let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
         // Full schema: both `id` and `val` columns
@@ -823,7 +789,9 @@ mod scan_builder_tests {
 
     #[tokio::test]
     async fn test_scan_builder_with_predicate() {
-        let (engine, snapshot) = setup_test_table().await;
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
         let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
         let mut predicate = EnginePredicate {
             predicate: std::ptr::null_mut(),
@@ -849,7 +817,9 @@ mod scan_builder_tests {
 
     #[tokio::test]
     async fn test_scan_builder_with_schema() {
-        let (engine, snapshot) = setup_test_table().await;
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
         let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
         let mut schema_arg = EngineSchema {
             schema: std::ptr::null_mut(),
@@ -876,7 +846,9 @@ mod scan_builder_tests {
 
     #[tokio::test]
     async fn test_scan_builder_with_predicate_and_schema() {
-        let (engine, snapshot) = setup_test_table().await;
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
         let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
         let mut predicate = EnginePredicate {
             predicate: std::ptr::null_mut(),
@@ -932,7 +904,9 @@ mod scan_builder_tests {
     #[tokio::test]
     async fn test_scan_builder_with_schema_then_predicate() {
         // Verify that applying schema before predicate produces the same result as the reverse
-        let (engine, snapshot) = setup_test_table().await;
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
         let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
         let mut schema_arg = EngineSchema {
             schema: std::ptr::null_mut(),
@@ -971,7 +945,9 @@ mod scan_builder_tests {
     #[tokio::test]
     async fn test_scan_builder_with_schema_error_propagates() {
         // An invalid schema (bare primitive field, no struct root) must return ExternResult::Err
-        let (engine, snapshot) = setup_test_table().await;
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
         let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
         let mut schema_arg = EngineSchema {
             schema: std::ptr::null_mut(),
@@ -993,7 +969,9 @@ mod scan_builder_tests {
 
     #[tokio::test]
     async fn test_free_scan_builder_without_build() {
-        let (engine, snapshot) = setup_test_table().await;
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
         let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
         // Drop without building -- must not panic or leak
         unsafe { free_scan_builder(builder) };
