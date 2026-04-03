@@ -31,12 +31,11 @@
 //! | timestamp (zero micros)   | `...T15:30:00.000000Z`   | `...T15:30:00.000000Z`   | `...T15:30:00Z` (omits .0)  |
 //! | timestamp_ntz (zero us)   | `...00:00:00.000000`     | `...00:00:00` (no frac)  | `...T00:00:00` (T, no frac) |
 //! | timestamp_ntz (non-zero)  | `... 12:00:00.000001`    | `... 12:00:00.000001`    | `...T12:00:00.000001` (T)   |
-//! | float: 0.0                | `0`                      | `0.0`                    | `0.0`                       |
-//! | double: -0.0              | `-0`                     | `-0.0`                   | `-0.0`                      |
-//! | float: MAX                | `340282350000...` (full) | `3.4028235E38` (sci)     | `3.4028235e38` (sci)        |
-//! | float: MIN_POSITIVE       | `0.0000...11754944`      | `1.17549435E-38` (sci)   | `1.1754944e-38` (sci)       |
-//! | double: MIN               | `-17976931...` (full)    | `-1.79769...E308` (sci)  | `-1.79769...e308` (sci)     |
-//! | double: MIN_POSITIVE      | `0.0000...2225...`       | `2.225...E-308` (sci)    | `2.225...e-308` (sci)       |
+//! | float: MIN_POSITIVE       | `1.1754944E-38`          | `1.17549435E-38`         | `1.1754944e-38` (lower e)   |
+//!
+//! The `f32::MIN_POSITIVE` difference is because `ryu` and Java's `Float.toString()` can
+//! differ in trailing digits for the shortest representation. Both round-trip to the same
+//! `f32` bit pattern.
 
 use std::collections::HashMap;
 use std::path::Path;
