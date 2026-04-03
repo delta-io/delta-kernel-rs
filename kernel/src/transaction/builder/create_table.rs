@@ -223,6 +223,43 @@ struct DataLayoutResult {
     partition_columns: Option<Vec<ColumnName>>,
 }
 
+/// Normalizes column name segments to match the casing in the schema.
+///
+/// Walks each path segment through the schema's struct hierarchy, replacing user-provided
+/// casing with the schema's canonical casing. If a segment isn't found case-insensitively,
+/// keeps the original (subsequent validation catches it).
+///
+/// Precondition: validation (validate_partition_columns or validate_clustering_columns) is
+/// called after this to catch unrecognized or invalid columns.
+fn normalize_column_names_to_schema_casing(
+    schema: &StructType,
+    columns: &[ColumnName],
+) -> Vec<ColumnName> {
+    columns
+        .iter()
+        .map(|col| {
+            let mut current_schema = schema;
+            let normalized_segments: Vec<String> = col
+                .path()
+                .iter()
+                .map(|segment| {
+                    let canonical = current_schema
+                        .fields()
+                        .find(|f| f.name().eq_ignore_ascii_case(segment))
+                        .map(|f| {
+                            if let DataType::Struct(inner) = f.data_type() {
+                                current_schema = inner;
+                            }
+                            f.name().to_string()
+                        });
+                    canonical.unwrap_or_else(|| segment.to_string())
+                })
+                .collect();
+            ColumnName::new(normalized_segments.iter().map(|s| s.as_str()))
+        })
+        .collect()
+}
+
 /// Validates partition columns against the table schema.
 ///
 /// Similar to [`validate_clustering_columns`] (duplicate check, schema lookup), but with
@@ -301,9 +338,10 @@ fn apply_data_layout(
         DataLayout::None => Ok(DataLayoutResult::default()),
 
         DataLayout::Clustered { columns } => {
-            validate_clustering_columns(effective_schema, columns)?;
+            let normalized = normalize_column_names_to_schema_casing(effective_schema, columns);
+            validate_clustering_columns(effective_schema, &normalized)?;
 
-            let physical_columns: Vec<ColumnName> = columns
+            let physical_columns: Vec<ColumnName> = normalized
                 .iter()
                 .map(|c| {
                     get_any_level_column_physical_name(effective_schema, c, column_mapping_mode)
@@ -331,11 +369,8 @@ fn apply_data_layout(
         }
 
         DataLayout::Partitioned { columns } => {
-            validate_partition_columns(effective_schema, columns)?;
-            let normalized = crate::schema::validation::case_preserving_partition_col_names(
-                effective_schema,
-                columns,
-            );
+            let normalized = normalize_column_names_to_schema_casing(effective_schema, columns);
+            validate_partition_columns(effective_schema, &normalized)?;
 
             Ok(DataLayoutResult {
                 system_domain_metadata: vec![],
@@ -1478,6 +1513,45 @@ mod tests {
         assert!(
             err.to_string().contains("enableInCommitTimestamps"),
             "expected ICT conflict error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_column_names_to_schema_casing() {
+        let inner =
+            StructType::new_unchecked(vec![StructField::new("City", DataType::STRING, false)]);
+        let schema = StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("EventDate", DataType::DATE, false),
+            StructField::new("Address", DataType::Struct(Box::new(inner)), false),
+        ]);
+
+        // Mismatched casing -> normalized to schema
+        let cols = vec![ColumnName::new(["eventdate"])];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["EventDate"]
+        );
+
+        // Nested path -> each segment normalized
+        let cols = vec![ColumnName::new(["address", "city"])];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["Address", "City"]
+        );
+
+        // Already matching -> unchanged
+        let cols = vec![ColumnName::new(["id"])];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["id"]
+        );
+
+        // Unrecognized -> keeps original
+        let cols = vec![ColumnName::new(["nonexistent"])];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["nonexistent"]
         );
     }
 }

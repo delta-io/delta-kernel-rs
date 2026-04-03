@@ -519,5 +519,15 @@ fn test_create_table_invalid_column_name_allowed_with_cm() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
 
+    let field_names: Vec<_> = snapshot
+        .schema()
+        .fields()
+        .map(|f| f.name().clone())
+        .collect();
+    assert!(
+        field_names.contains(&"bad column".to_string()),
+        "Schema should contain field 'bad column', got: {field_names:?}"
+    );
+
     Ok(())
 }
