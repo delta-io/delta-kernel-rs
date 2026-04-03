@@ -21,6 +21,7 @@ use self::parquet::DefaultParquetHandler;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
+use crate::expressions::Scalar;
 use crate::metrics::MetricsReporter;
 use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
@@ -277,14 +278,31 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     ///
     /// The `partition_values` keys should use **logical** column names. They will be
     /// automatically translated to physical names using the column mapping mode from
-    /// `write_context`.
+    /// `write_context`. Values are typed [`Scalar`]s that kernel serializes internally per
+    /// the Delta protocol's "Partition Value Serialization" rules. For non-partitioned tables,
+    /// pass an empty map.
+    ///
+    /// This method handles the full write pipeline: validating partition columns exist in the
+    /// schema, serializing typed values (e.g. `Scalar::Date(20178)` becomes `"2025-03-31"`),
+    /// translating logical to physical column names, stripping partition columns from the
+    /// parquet file, and constructing the Add action metadata.
+    ///
+    /// Custom engine implementations that bypass this method (e.g., for custom compression or
+    /// Hive-style partition paths) may use [`Scalar::serialize_partition_value`] to produce
+    /// correctly serialized strings for the `partitionValues` map, and the utilities in
+    /// [`partition`] for Hive-style path encoding.
+    ///
+    /// [`Scalar`]: crate::expressions::Scalar
+    /// [`Scalar::serialize_partition_value`]: crate::expressions::Scalar::serialize_partition_value
+    /// [`partition`]: crate::partition
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,
         write_context: &WriteContext,
-        partition_values: HashMap<String, String>,
+        partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        // Validate partition columns exist in the schema and translate logical names to physical names.
+        // Validate partition columns exist in the schema, serialize values, and translate
+        // logical names to physical names.
         let physical_partition_values: HashMap<String, String> = partition_values
             .into_iter()
             .map(|(logical_name, value)| -> DeltaResult<(String, String)> {
@@ -296,10 +314,19 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                             "Partition column '{logical_name}' not found in table schema"
                         ))
                     })?;
+                if !value.is_null() && field.data_type() != &value.data_type() {
+                    return Err(Error::generic(format!(
+                        "Partition column '{logical_name}' has type {} but got Scalar of \
+                         type {}",
+                        field.data_type(),
+                        value.data_type()
+                    )));
+                }
                 let physical_name = field
                     .physical_name(write_context.column_mapping_mode())
                     .to_string();
-                Ok((physical_name, value))
+                let serialized = value.serialize_partition_value()?;
+                Ok((physical_name, serialized))
             })
             .try_collect()?;
 

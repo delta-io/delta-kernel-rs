@@ -447,9 +447,11 @@ impl TableConfiguration {
         self.column_mapping_mode
     }
 
-    /// The partition columns of this table (empty if non-partitioned)
-    #[internal_api]
-    pub(crate) fn partition_columns(&self) -> &[String] {
+    /// The logical partition column names for this table (empty if non-partitioned).
+    ///
+    /// The returned names are logical column names in the order they were declared in the table
+    /// metadata. This order may differ from the column order in the table schema.
+    pub fn partition_columns(&self) -> &[String] {
         self.metadata().partition_columns()
     }
 

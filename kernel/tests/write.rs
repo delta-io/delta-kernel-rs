@@ -39,7 +39,7 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
-use delta_kernel::expressions::ColumnName;
+use delta_kernel::expressions::{ColumnName, Scalar};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
@@ -779,7 +779,10 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                         .write_parquet(
                             data.as_ref().unwrap(),
                             write_context.as_ref(),
-                            HashMap::from([(partition_col.to_string(), partition_val.to_string())]),
+                            HashMap::from([(
+                                partition_col.to_string(),
+                                Scalar::String(partition_val.to_string()),
+                            )]),
                         )
                         .await
                 })
@@ -3224,7 +3227,7 @@ async fn test_write_parquet_succeed_with_logical_partition_names(
             &snapshot,
             &engine,
             batch,
-            HashMap::from([("letter".to_string(), "a".to_string())]),
+            HashMap::from([("letter".to_string(), Scalar::String("a".to_string()))]),
         )
         .await;
         assert!(
@@ -3254,7 +3257,7 @@ async fn test_write_parquet_rejects_unknown_partition_column(
             &snapshot,
             &engine,
             batch,
-            HashMap::from([("nonexistent".to_string(), "val".to_string())]),
+            HashMap::from([("nonexistent".to_string(), Scalar::String("val".to_string()))]),
         )
         .await;
         let err = result.expect_err("write_parquet should fail with unknown partition column");
@@ -3598,7 +3601,8 @@ async fn test_column_mapping_partitioned_write(
         Arc::new(data_schema.as_ref().try_into_arrow()?),
         vec![Arc::new(Int32Array::from(vec![1, 2]))],
     )?;
-    let partition_values = HashMap::from([("category".to_string(), "A".to_string())]);
+    let partition_values =
+        HashMap::from([("category".to_string(), Scalar::String("A".to_string()))]);
     write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
 
     // Read commit log and verify add.partitionValues key uses physical name

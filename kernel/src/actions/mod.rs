@@ -328,8 +328,11 @@ impl Metadata {
         Ok(serde_json::from_str(&self.schema_string)?)
     }
 
-    #[internal_api]
-    pub(crate) fn partition_columns(&self) -> &[String] {
+    /// The logical partition column names for this table, or empty for non-partitioned tables.
+    ///
+    /// The returned names are logical column names in the order they were declared in the table
+    /// metadata. This order may differ from the column order in the table schema.
+    pub fn partition_columns(&self) -> &[String] {
         &self.partition_columns
     }
 

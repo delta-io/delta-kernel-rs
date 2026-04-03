@@ -285,6 +285,134 @@ impl Scalar {
         matches!(self, Self::Null(_))
     }
 
+    /// Serializes this scalar to a string for the Add action's `partitionValues` map, per the
+    /// Delta protocol's "Partition Value Serialization" rules.
+    ///
+    /// This method is **only** for producing values in the `partitionValues` JSON map stored
+    /// in commit log entries. It is **not** for Hive-style file path encoding. For that, see
+    /// [`escape_partition_value`] and [`build_partition_path`] in the [`partition`] module,
+    /// which handle percent-encoding of path segments independently.
+    ///
+    /// Returns `Ok("")` for null values. Callers that build the `partitionValues` JSON map
+    /// directly must convert `""` to a JSON `null` value (or omit the key entirely). Both
+    /// representations are equivalent on read: `""`, absent key, and JSON `null` all represent
+    /// a null partition value.
+    ///
+    /// Note: `Scalar::String("")` also serializes to `""`, which is indistinguishable from a
+    /// null partition value. An empty string partition value will be read back as null.
+    ///
+    /// Returns an error if the scalar's type is not a valid partition column type (e.g.,
+    /// struct, array, or map).
+    ///
+    /// Connectors using [`DefaultEngine::write_parquet`] do not need to call this directly
+    /// because it is called internally. Custom engine implementations that bypass
+    /// `DefaultEngine` and construct Add action metadata directly should use this to produce
+    /// correctly formatted strings for the `partitionValues` map.
+    ///
+    /// Neither `Scalar`'s `Display` impl nor Arrow's `array_value_to_string` produce
+    /// correct partition value strings. Arrow's `array_value_to_string` is wrong for:
+    ///
+    /// - **Binary**: produces hex (`4869`) instead of raw UTF-8 (`Hi`).
+    /// - **Timestamp**: drops microseconds when zero (`T15:30:00Z` vs `T15:30:00.000000Z`).
+    /// - **TimestampNtz**: uses `T` separator instead of space.
+    /// - **Decimal (negative)**: correct, but `Scalar::Display` is buggy (e.g. `-123.-45`).
+    ///
+    /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
+    /// [`escape_partition_value`]: crate::partition::escape_partition_value
+    /// [`build_partition_path`]: crate::partition::build_partition_path
+    /// [`partition`]: crate::partition
+    pub fn serialize_partition_value(&self) -> DeltaResult<String> {
+        match self {
+            Self::Null(dt) => {
+                if matches!(
+                    dt,
+                    DataType::Struct(_) | DataType::Array(_) | DataType::Map(_)
+                ) {
+                    return Err(Error::generic(format!(
+                        "Cannot serialize null partition value: type {dt:?} is not a \
+                         valid partition column type"
+                    )));
+                }
+                Ok(String::new())
+            }
+            // These types have Display output that matches the protocol format
+            Self::Byte(_)
+            | Self::Short(_)
+            | Self::Integer(_)
+            | Self::Long(_)
+            | Self::Boolean(_) => Ok(self.to_string()),
+            // Float/Double: Rust's Display uses "inf"/"-inf" but Java uses
+            // "Infinity"/"-Infinity". We must match Java for interop since
+            // Java's Float.parseFloat("inf") throws NumberFormatException.
+            Self::Float(v) => Ok(format_float_partition(*v as f64, v.to_string())),
+            Self::Double(v) => Ok(format_float_partition(*v, v.to_string())),
+            // Decimal: use dedicated serialization to handle negative values correctly.
+            // Scalar::Display has a bug for negative decimals with scale > 0 (Rust's %
+            // operator preserves sign, producing e.g. "-1.-23" instead of "-1.23").
+            Self::Decimal(d) => {
+                let value = d.bits();
+                if d.scale() == 0 {
+                    Ok(value.to_string())
+                } else {
+                    let scale = d.scale() as u32;
+                    let scalar_multiple = 10_i128.pow(scale);
+                    let integer_part = value / scalar_multiple;
+                    let fractional_part = (value % scalar_multiple).abs();
+                    // For values in (-1, 0), integer_part truncates to 0 and loses the
+                    // negative sign. We must re-add it explicitly.
+                    let sign = if value < 0 && integer_part == 0 {
+                        "-"
+                    } else {
+                        ""
+                    };
+                    Ok(format!(
+                        "{sign}{integer_part}.{fractional_part:0>width$}",
+                        width = scale as usize
+                    ))
+                }
+            }
+            // String Display wraps in quotes ('hello'), but protocol wants raw value
+            Self::String(s) => Ok(s.clone()),
+            // Binary: the Delta protocol spec says binary is "encoded as a string of
+            // escaped binary values", with the example "\u0001\u0002\u0003". However, Java
+            // kernel uses `new String(bytes, UTF_8)` which interprets bytes as UTF-8, not
+            // as escaped unicode sequences. We match Java kernel for interop.
+            // TODO: Should we match the spec (\uXXXX escapes) or Java kernel (UTF-8)?
+            // The spec example and Java kernel behavior are inconsistent.
+            Self::Binary(v) => Ok(String::from_utf8_lossy(v).into_owned()),
+            // Date Display prints raw days-since-epoch (20178), but protocol wants YYYY-MM-DD
+            Self::Date(days) => {
+                let date = NaiveDate::from_num_days_from_ce_opt(
+                    // UNIX epoch (1970-01-01) is CE day 719_163
+                    719_163 + *days,
+                )
+                .ok_or_else(|| Error::generic(format!("Date value {days} is out of range")))?;
+                Ok(date.format("%Y-%m-%d").to_string())
+            }
+            // Timestamp: use ISO 8601 adjusted to UTC as recommended by the Delta protocol.
+            // The protocol allows both space-separated and ISO 8601 formats, but recommends:
+            // "modern writers adjust the timestamp to UTC and store the timestamp in ISO8601
+            // format". This matches delta-spark's serialization.
+            Self::Timestamp(micros) => {
+                let ts = DateTime::UNIX_EPOCH + chrono::Duration::microseconds(*micros);
+                Ok(ts.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
+            }
+            // TimestampNtz: use space-separated format (no timezone info).
+            // The protocol says timestampNtz uses "{year}-{month}-{day} {hour}:{minute}:{second}"
+            // or with microseconds. No Z suffix because there is no timezone.
+            Self::TimestampNtz(micros) => {
+                let ts = DateTime::UNIX_EPOCH + chrono::Duration::microseconds(*micros);
+                Ok(ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+            }
+            // Struct, Array, Map types are not valid partition column types
+            Self::Struct(_) | Self::Array(_) | Self::Map(_) => Err(Error::generic(format!(
+                "Cannot serialize {self:?} as a partition value: type {:?} is not a \
+                 valid partition column type",
+                self.data_type()
+            ))),
+        }
+    }
+
     /// Constructs a Decimal value from raw parts
     pub fn decimal(bits: impl Into<i128>, precision: u8, scale: u8) -> DeltaResult<Self> {
         let dtype = DecimalType::try_new(precision, scale)?;
@@ -352,6 +480,25 @@ impl Scalar {
             _ => return None,
         };
         Some(result)
+    }
+}
+
+/// Formats a float/double for partition value serialization. For NaN and infinity, uses
+/// Java-compatible strings. Rust's `Display` produces `"inf"` and `"-inf"`, but Java's
+/// `Float.parseFloat` / `Double.parseDouble` require `"Infinity"` and `"-Infinity"`.
+/// The `normal` parameter carries the pre-formatted string for non-special values, which
+/// preserves the original type's precision (f32 vs f64).
+fn format_float_partition(v: f64, normal: String) -> String {
+    if v.is_nan() {
+        "NaN".to_string()
+    } else if v.is_infinite() {
+        if v.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        }
+    } else {
+        normal
     }
 }
 
@@ -702,7 +849,10 @@ impl PrimitiveType {
 
         match self {
             String => Ok(Scalar::String(raw.to_string())),
-            Binary => Ok(Scalar::Binary(raw.to_string().into_bytes())),
+            // Convert the partition value string back to raw UTF-8 bytes. This is the
+            // inverse of `serialize_partition_value`, which uses `String::from_utf8_lossy`
+            // to produce the string from binary data.
+            Binary => Ok(Scalar::Binary(raw.as_bytes().to_vec())),
             Byte => self.parse_str_as_scalar(raw, Scalar::Byte),
             Decimal(dtype) => Self::parse_decimal(raw, *dtype),
             Short => self.parse_str_as_scalar(raw, Scalar::Short),
@@ -1324,5 +1474,384 @@ mod tests {
         } else {
             panic!("Expected Binary scalar");
         }
+    }
+
+    // === serialize_partition_value tests ===
+
+    #[test]
+    fn test_serialize_partition_value_null_returns_empty_string() {
+        let result = Scalar::Null(DataType::STRING)
+            .serialize_partition_value()
+            .unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_string_no_quotes() {
+        let result = Scalar::String("hello".into())
+            .serialize_partition_value()
+            .unwrap();
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_integer() {
+        let result = Scalar::Integer(42).serialize_partition_value().unwrap();
+        assert_eq!(result, "42");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_boolean() {
+        assert_eq!(
+            Scalar::Boolean(true).serialize_partition_value().unwrap(),
+            "true"
+        );
+        assert_eq!(
+            Scalar::Boolean(false).serialize_partition_value().unwrap(),
+            "false"
+        );
+    }
+
+    #[test]
+    fn test_serialize_partition_value_date_formats_as_yyyy_mm_dd() {
+        // 2025-03-31 = 20178 days since epoch
+        let days = NaiveDate::from_ymd_opt(2025, 3, 31)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let days = Utc
+            .from_utc_datetime(&days)
+            .signed_duration_since(DateTime::UNIX_EPOCH)
+            .num_days() as i32;
+        let result = Scalar::Date(days).serialize_partition_value().unwrap();
+        assert_eq!(result, "2025-03-31");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_timestamp_uses_iso8601() {
+        // 2025-03-31 15:30:00 UTC
+        let ts = NaiveDate::from_ymd_opt(2025, 3, 31)
+            .unwrap()
+            .and_hms_opt(15, 30, 0)
+            .unwrap();
+        let micros = Utc
+            .from_utc_datetime(&ts)
+            .signed_duration_since(DateTime::UNIX_EPOCH)
+            .num_microseconds()
+            .unwrap();
+        let result = Scalar::Timestamp(micros)
+            .serialize_partition_value()
+            .unwrap();
+        // Protocol recommends ISO 8601 with T separator, microseconds, and Z suffix
+        assert_eq!(result, "2025-03-31T15:30:00.000000Z");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_date_round_trips_through_parse() {
+        let days = 20178i32; // 2025-03-31
+        let serialized = Scalar::Date(days).serialize_partition_value().unwrap();
+        let parsed = PrimitiveType::Date.parse_scalar(&serialized).unwrap();
+        assert_eq!(parsed, Scalar::Date(days));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_pre_epoch_date_round_trips() {
+        let result = Scalar::Date(-1).serialize_partition_value().unwrap();
+        assert_eq!(result, "1969-12-31");
+        let parsed = PrimitiveType::Date.parse_scalar("1969-12-31").unwrap();
+        assert_eq!(parsed, Scalar::Date(-1));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_timestamp_round_trips_through_parse() {
+        let ts = NaiveDate::from_ymd_opt(2025, 3, 31)
+            .unwrap()
+            .and_hms_micro_opt(15, 30, 0, 123456)
+            .unwrap();
+        let micros = Utc
+            .from_utc_datetime(&ts)
+            .signed_duration_since(DateTime::UNIX_EPOCH)
+            .num_microseconds()
+            .unwrap();
+        let serialized = Scalar::Timestamp(micros)
+            .serialize_partition_value()
+            .unwrap();
+        let parsed = PrimitiveType::Timestamp.parse_scalar(&serialized).unwrap();
+        assert_eq!(parsed, Scalar::Timestamp(micros));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_timestamp_ntz_uses_space_separator_without_z() {
+        let ts = NaiveDate::from_ymd_opt(2025, 3, 31)
+            .unwrap()
+            .and_hms_micro_opt(15, 30, 0, 123456)
+            .unwrap();
+        let micros = Utc
+            .from_utc_datetime(&ts)
+            .signed_duration_since(DateTime::UNIX_EPOCH)
+            .num_microseconds()
+            .unwrap();
+        let result = Scalar::TimestampNtz(micros)
+            .serialize_partition_value()
+            .unwrap();
+        assert_eq!(result, "2025-03-31 15:30:00.123456");
+        assert!(!result.contains('T'));
+        assert!(!result.contains('Z'));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_timestamp_ntz_round_trips_through_parse() {
+        let ts = NaiveDate::from_ymd_opt(2025, 3, 31)
+            .unwrap()
+            .and_hms_micro_opt(15, 30, 0, 123456)
+            .unwrap();
+        let micros = Utc
+            .from_utc_datetime(&ts)
+            .signed_duration_since(DateTime::UNIX_EPOCH)
+            .num_microseconds()
+            .unwrap();
+        let serialized = Scalar::TimestampNtz(micros)
+            .serialize_partition_value()
+            .unwrap();
+        let parsed = PrimitiveType::TimestampNtz
+            .parse_scalar(&serialized)
+            .unwrap();
+        assert_eq!(parsed, Scalar::TimestampNtz(micros));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_decimal_positive_with_scale() {
+        let s = Scalar::decimal(12345, 5, 2).unwrap();
+        let result = s.serialize_partition_value().unwrap();
+        assert_eq!(result, "123.45");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_decimal_negative_with_scale() {
+        let s = Scalar::decimal(-12345i128, 5, 2).unwrap();
+        let result = s.serialize_partition_value().unwrap();
+        assert_eq!(result, "-123.45");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_decimal_negative_between_zero_and_one_preserves_sign() {
+        let s = Scalar::decimal(-5i128, 3, 2).unwrap();
+        let result = s.serialize_partition_value().unwrap();
+        assert_eq!(result, "-0.05");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_decimal_zero_scale_produces_integer_string() {
+        let s = Scalar::decimal(42i128, 5, 0).unwrap();
+        assert_eq!(s.serialize_partition_value().unwrap(), "42");
+
+        let neg = Scalar::decimal(-42i128, 5, 0).unwrap();
+        assert_eq!(neg.serialize_partition_value().unwrap(), "-42");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_decimal_round_trips_through_parse() {
+        let s = Scalar::decimal(12345, 5, 2).unwrap();
+        let serialized = s.serialize_partition_value().unwrap();
+        let parsed = PrimitiveType::decimal(5, 2)
+            .unwrap()
+            .parse_scalar(&serialized)
+            .unwrap();
+        assert_eq!(parsed, s);
+    }
+
+    #[test]
+    fn test_serialize_partition_value_decimal_negative_round_trips_through_parse() {
+        let s = Scalar::decimal(-12345i128, 5, 2).unwrap();
+        let serialized = s.serialize_partition_value().unwrap();
+        assert_eq!(serialized, "-123.45");
+        let parsed = PrimitiveType::decimal(5, 2)
+            .unwrap()
+            .parse_scalar(&serialized)
+            .unwrap();
+        assert_eq!(parsed, s);
+    }
+
+    #[test]
+    fn test_serialize_partition_value_decimal_negative_fractional_round_trips_through_parse() {
+        let s = Scalar::decimal(-5i128, 3, 2).unwrap();
+        let serialized = s.serialize_partition_value().unwrap();
+        assert_eq!(serialized, "-0.05");
+        let parsed = PrimitiveType::decimal(3, 2)
+            .unwrap()
+            .parse_scalar(&serialized)
+            .unwrap();
+        assert_eq!(parsed, s);
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_ascii_passes_through() {
+        let s = Scalar::Binary(b"Hello".to_vec());
+        let result = s.serialize_partition_value().unwrap();
+        assert_eq!(result, "Hello");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_valid_utf8_round_trips() {
+        // Valid UTF-8 bytes round-trip correctly (matches Java kernel behavior)
+        let original = b"hello world".to_vec();
+        let serialized = Scalar::Binary(original.clone())
+            .serialize_partition_value()
+            .unwrap();
+        let parsed = PrimitiveType::Binary.parse_scalar(&serialized).unwrap();
+        assert_eq!(parsed, Scalar::Binary(original));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_multibyte_utf8_round_trips() {
+        // Multi-byte UTF-8 chars like emoji round-trip correctly.
+        // This matches the DAT test data where partition value is the emoji character.
+        let emoji = "\u{1F608}".as_bytes().to_vec(); // [0xf0, 0x9f, 0x98, 0x88]
+        let serialized = Scalar::Binary(emoji.clone())
+            .serialize_partition_value()
+            .unwrap();
+        assert_eq!(serialized, "\u{1F608}");
+        let parsed = PrimitiveType::Binary.parse_scalar(&serialized).unwrap();
+        assert_eq!(parsed, Scalar::Binary(emoji));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_empty_produces_empty_string() {
+        let s = Scalar::Binary(vec![]);
+        let result = s.serialize_partition_value().unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_invalid_utf8_is_lossy() {
+        // Non-UTF-8 bytes are replaced with the Unicode replacement character.
+        // This matches Java kernel's `new String(bytes, UTF_8)` behavior.
+        // Binary partition values with non-UTF-8 data do not round-trip faithfully.
+        let invalid = vec![0xFF, 0xFE];
+        let serialized = Scalar::Binary(invalid).serialize_partition_value().unwrap();
+        assert!(serialized.contains('\u{FFFD}')); // replacement character
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_various_emoji_round_trip() {
+        // Various multi-byte UTF-8 emoji and Unicode characters
+        let test_cases: Vec<(&str, &[u8])> = vec![
+            ("\u{1F608}", &[0xf0, 0x9f, 0x98, 0x88]), // smiling face with horns
+            ("\u{1F600}", &[0xf0, 0x9f, 0x98, 0x80]), // grinning face
+            ("\u{2764}", &[0xe2, 0x9d, 0xa4]),        // red heart (3-byte UTF-8)
+            ("\u{00FC}", &[0xc3, 0xbc]),              // u with umlaut (2-byte UTF-8)
+            ("\u{65E5}\u{672C}", &[0xe6, 0x97, 0xa5, 0xe6, 0x9c, 0xac]), // Japanese chars
+        ];
+        for (expected_str, bytes) in test_cases {
+            let serialized = Scalar::Binary(bytes.to_vec())
+                .serialize_partition_value()
+                .unwrap();
+            assert_eq!(serialized, expected_str, "failed for bytes: {bytes:?}");
+            let parsed = PrimitiveType::Binary.parse_scalar(&serialized).unwrap();
+            assert_eq!(
+                parsed,
+                Scalar::Binary(bytes.to_vec()),
+                "round-trip failed for bytes: {bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_mixed_ascii_and_multibyte() {
+        // Mix of ASCII and multi-byte UTF-8 (like the DAT test data patterns)
+        let mixed = "hello\u{1F608}world".as_bytes().to_vec();
+        let serialized = Scalar::Binary(mixed.clone())
+            .serialize_partition_value()
+            .unwrap();
+        assert_eq!(serialized, "hello\u{1F608}world");
+        let parsed = PrimitiveType::Binary.parse_scalar(&serialized).unwrap();
+        assert_eq!(parsed, Scalar::Binary(mixed));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_float_infinity_uses_java_format() {
+        assert_eq!(
+            Scalar::Float(f32::INFINITY)
+                .serialize_partition_value()
+                .unwrap(),
+            "Infinity"
+        );
+        assert_eq!(
+            Scalar::Float(f32::NEG_INFINITY)
+                .serialize_partition_value()
+                .unwrap(),
+            "-Infinity"
+        );
+    }
+
+    #[test]
+    fn test_serialize_partition_value_double_infinity_uses_java_format() {
+        assert_eq!(
+            Scalar::Double(f64::INFINITY)
+                .serialize_partition_value()
+                .unwrap(),
+            "Infinity"
+        );
+        assert_eq!(
+            Scalar::Double(f64::NEG_INFINITY)
+                .serialize_partition_value()
+                .unwrap(),
+            "-Infinity"
+        );
+    }
+
+    #[test]
+    fn test_serialize_partition_value_float_nan_uses_java_format() {
+        assert_eq!(
+            Scalar::Float(f32::NAN).serialize_partition_value().unwrap(),
+            "NaN"
+        );
+        assert_eq!(
+            Scalar::Double(f64::NAN)
+                .serialize_partition_value()
+                .unwrap(),
+            "NaN"
+        );
+    }
+
+    #[test]
+    fn test_serialize_partition_value_float_infinity_round_trips_through_parse() {
+        let serialized = Scalar::Float(f32::INFINITY)
+            .serialize_partition_value()
+            .unwrap();
+        assert_eq!(serialized, "Infinity");
+        let parsed = PrimitiveType::Float.parse_scalar(&serialized).unwrap();
+        assert_eq!(parsed, Scalar::Float(f32::INFINITY));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_double_infinity_round_trips_through_parse() {
+        let serialized = Scalar::Double(f64::NEG_INFINITY)
+            .serialize_partition_value()
+            .unwrap();
+        assert_eq!(serialized, "-Infinity");
+        let parsed = PrimitiveType::Double.parse_scalar(&serialized).unwrap();
+        assert_eq!(parsed, Scalar::Double(f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_float_normal_values_unchanged() {
+        assert_eq!(
+            Scalar::Float(1.25).serialize_partition_value().unwrap(),
+            "1.25"
+        );
+        assert_eq!(
+            Scalar::Double(0.0).serialize_partition_value().unwrap(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn test_serialize_partition_value_struct_returns_error() {
+        let s = Scalar::Struct(StructData {
+            fields: vec![],
+            values: vec![],
+        });
+        assert!(s.serialize_partition_value().is_err());
     }
 }
