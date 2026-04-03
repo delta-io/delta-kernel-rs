@@ -395,7 +395,8 @@ impl<S> Transaction<S> {
             .chain(dv_update_actions);
 
         // Step 7: Commit via the committer
-        let commit_metadata = self.create_commit_metadata(commit_version, protocol, metadata)?;
+        let commit_metadata =
+            self.create_commit_metadata(commit_version, protocol, metadata, dm_changes.clone())?;
         match self
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)
@@ -541,6 +542,7 @@ impl<S> Transaction<S> {
         commit_version: Version,
         new_protocol: Option<Protocol>,
         new_metadata: Option<Metadata>,
+        domain_metadata_changes: Vec<crate::actions::DomainMetadata>,
     ) -> DeltaResult<CommitMetadata> {
         let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
         let table_config = self.read_snapshot.table_configuration();
@@ -573,6 +575,7 @@ impl<S> Transaction<S> {
                 .listed
                 .max_published_version,
             protocol_metadata,
+            domain_metadata_changes,
         ))
     }
 

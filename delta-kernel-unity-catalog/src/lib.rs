@@ -2,6 +2,7 @@
 
 mod committer;
 mod constants;
+mod errors;
 mod utils;
 pub use committer::UCCommitter;
 pub use utils::{get_final_required_properties_for_uc, get_required_properties_for_disk};

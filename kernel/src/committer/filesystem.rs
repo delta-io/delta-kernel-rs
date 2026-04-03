@@ -109,7 +109,7 @@ mod tests {
         let actions = [
             r#"{"commitInfo":{"timestamp":12345678900,"inCommitTimestamp":12345678900}}"#,
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["catalogManaged"],"writerFeatures":["catalogManaged","inCommitTimestamp"]}}"#,
-            r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1234567890}}"#,
+            r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true"},"createdTime":1234567890}}"#,
         ].join("\n");
 
         let commit_path = Path::from("_delta_log/00000000000000000000.json");
@@ -149,6 +149,7 @@ mod tests {
             12345,
             Some(0),
             CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None).unwrap(),
+            vec![],
         );
         let actions = Box::new(std::iter::empty());
 
@@ -187,6 +188,7 @@ mod tests {
             Some(0),
             CommitProtocolMetadata::try_new(Some(protocol.clone()), Some(metadata1), None, None)
                 .unwrap(),
+            vec![],
         );
         let second_metadata = CommitMetadata::new(
             LogRoot::new(table_root).unwrap(),
@@ -195,6 +197,7 @@ mod tests {
             12346,
             Some(0),
             CommitProtocolMetadata::try_new(Some(protocol), Some(metadata2), None, None).unwrap(),
+            vec![],
         );
 
         let first = committer

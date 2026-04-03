@@ -504,8 +504,8 @@ mod tests {
             schema,
             &[],
             true, // use v3/v7 protocol
-            vec!["catalogManaged"],
-            vec!["inCommitTimestamp", "catalogManaged"],
+            vec!["catalogManaged", "vacuumProtocolCheck"],
+            vec!["inCommitTimestamp", "catalogManaged", "vacuumProtocolCheck"],
         )
         .await?;
 
@@ -524,7 +524,7 @@ mod tests {
             let context = get_test_context(false);
 
             let uc_client = unsafe { get_uc_commit_client(context, test_uc_commit) };
-            let table_id = "foo";
+            let table_id = "test_id";
             let uc_committer = unsafe {
                 ok_or_panic(get_uc_committer(
                     uc_client.shallow_copy(),
@@ -601,7 +601,7 @@ mod tests {
                 // scope so we don't hold mutex across the await lower down
                 let (last_table_id, _) = context.last_commit_request.unwrap();
                 assert_eq!(
-                    last_table_id, "foo",
+                    last_table_id, "test_id",
                     "Table ID should match the one passed to UCCommitter"
                 );
             }

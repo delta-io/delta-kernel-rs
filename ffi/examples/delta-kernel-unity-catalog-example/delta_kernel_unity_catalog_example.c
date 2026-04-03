@@ -129,7 +129,7 @@ int main(int argc, char* argv[])
     HandleSharedFfiUCCommitClient uc_client = get_uc_commit_client(context, commit_callback);
 
     // Create a UC committer for a specific table
-    const char* table_id = "my_catalog.my_schema.my_table";
+    const char* table_id = "64dcd182-b3b4-4ee0-88e0-63c159a4121c";
     KernelStringSlice table_id_slice = { .ptr = table_id, .len = strlen(table_id) };
 
     ExternResultHandleMutableCommitter committer_res =

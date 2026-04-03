@@ -1,13 +1,12 @@
 //! Commit metadata types for the committer module.
 
-#[cfg(any(test, feature = "test-utils"))]
 use std::collections::HashMap;
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::Arc;
 
 use url::Url;
 
-use crate::actions::{Metadata, Protocol};
+use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::path::LogRoot;
 use crate::{DeltaResult, Version};
 
@@ -54,7 +53,6 @@ impl CommitType {
 /// The protocol and metadata state for this commit. Groups the read snapshot state (if any)
 /// and the new state being committed (if any).
 #[derive(Debug)]
-#[allow(dead_code)] // Fields read by delta-kernel-unity-catalog via effective_protocol/metadata
 pub(crate) struct CommitProtocolMetadata {
     /// Existing table protocol from read snapshot. `None` for create-table.
     read_protocol: Option<Protocol>,
@@ -117,8 +115,9 @@ pub struct CommitMetadata {
     pub(crate) in_commit_timestamp: i64,
     pub(crate) max_published_version: Option<Version>,
     /// Protocol and metadata state for this commit.
-    #[allow(dead_code)] // Read by delta-kernel-unity-catalog for commit validation
     pub(crate) protocol_metadata: CommitProtocolMetadata,
+    /// Domain metadata actions in this commit (additions and removals).
+    pub(crate) domain_metadata_changes: Vec<DomainMetadata>,
 }
 
 impl CommitMetadata {
@@ -129,6 +128,7 @@ impl CommitMetadata {
         in_commit_timestamp: i64,
         max_published_version: Option<Version>,
         protocol_metadata: CommitProtocolMetadata,
+        domain_metadata_changes: Vec<DomainMetadata>,
     ) -> Self {
         Self {
             log_root,
@@ -137,6 +137,7 @@ impl CommitMetadata {
             in_commit_timestamp,
             max_published_version,
             protocol_metadata,
+            domain_metadata_changes,
         }
     }
 
@@ -184,7 +185,6 @@ impl CommitMetadata {
 
     /// Returns the effective protocol for this commit. Prefers new_protocol (create-table / ALTER
     /// TABLE), falling back to the read snapshot's protocol.
-    #[allow(dead_code)] // Used by delta-kernel-unity-catalog for commit validation
     pub(crate) fn effective_protocol(&self) -> DeltaResult<&Protocol> {
         let pm = &self.protocol_metadata;
         pm.new_protocol
@@ -199,7 +199,6 @@ impl CommitMetadata {
 
     /// Returns the effective metadata for this commit. Prefers new_metadata (create-table / ALTER
     /// TABLE), falling back to the read snapshot's metadata.
-    #[allow(dead_code)] // Used by delta-kernel-unity-catalog for commit validation
     pub(crate) fn effective_metadata(&self) -> DeltaResult<&Metadata> {
         let pm = &self.protocol_metadata;
         pm.new_metadata
@@ -212,15 +211,66 @@ impl CommitMetadata {
             })
     }
 
+    /// Check if the effective protocol has a specific writer feature by name.
+    pub fn has_writer_feature(&self, feature_name: &str) -> bool {
+        self.effective_protocol()
+            .ok()
+            .and_then(|p| p.writer_features())
+            .is_some_and(|features| features.iter().any(|f| f.as_ref() == feature_name))
+    }
+
+    /// Check if the effective protocol has a specific reader feature by name.
+    pub fn has_reader_feature(&self, feature_name: &str) -> bool {
+        self.effective_protocol()
+            .ok()
+            .and_then(|p| p.reader_features())
+            .is_some_and(|features| features.iter().any(|f| f.as_ref() == feature_name))
+    }
+
+    /// Get the raw metadata configuration for the effective metadata. Returns `None` if no
+    /// metadata is set.
+    pub fn metadata_configuration(&self) -> Option<&HashMap<String, String>> {
+        self.effective_metadata().ok().map(|m| m.configuration())
+    }
+
+    /// Returns `true` if this commit changes the table's protocol.
+    pub fn has_protocol_change(&self) -> bool {
+        self.protocol_metadata.new_protocol.is_some()
+    }
+
+    /// Returns `true` if this commit changes the table's metadata.
+    pub fn has_metadata_change(&self) -> bool {
+        self.protocol_metadata.new_metadata.is_some()
+    }
+
+    /// Returns `true` if this commit includes a domain metadata change for the given domain name.
+    pub fn has_domain_metadata_change(&self, domain: &str) -> bool {
+        self.domain_metadata_changes
+            .iter()
+            .any(|dm| dm.domain() == domain)
+    }
+
     /// Creates a new `CommitMetadata` for the given `table_root` and `version`. Test-only.
     ///
     /// Uses a default modern protocol (empty features) and empty metadata.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_unchecked(table_root: Url, version: Version) -> DeltaResult<Self> {
+        Self::new_unchecked_with(table_root, version, vec![], vec![], HashMap::new())
+    }
+
+    /// Creates a new `CommitMetadata` with specific features and configuration. Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_unchecked_with(
+        table_root: Url,
+        version: Version,
+        reader_features: Vec<&str>,
+        writer_features: Vec<&str>,
+        configuration: HashMap<String, String>,
+    ) -> DeltaResult<Self> {
         let log_root = crate::path::LogRoot::new(table_root)?;
-        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new())?;
+        let protocol = Protocol::try_new_modern(reader_features, writer_features)?;
         let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new())?;
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, configuration)?;
         Ok(Self::new(
             log_root,
             version,
@@ -228,7 +278,40 @@ impl CommitMetadata {
             0,
             None,
             CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None)?,
+            vec![],
         ))
+    }
+
+    /// Marks this `CommitMetadata` as having a protocol change. Test-only.
+    ///
+    /// that changes the protocol.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_protocol_change(mut self) -> Self {
+        let protocol = self.effective_protocol().ok().cloned();
+        self.protocol_metadata.new_protocol = protocol;
+        self
+    }
+
+    /// Marks this `CommitMetadata` as having a metadata change. Test-only.
+    ///
+    /// Copies the existing metadata into the `new_metadata` field to simulate an ALTER TABLE
+    /// that changes the metadata.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_metadata_change(mut self) -> Self {
+        let metadata = self.effective_metadata().ok().cloned();
+        self.protocol_metadata.new_metadata = metadata;
+        self
+    }
+
+    /// Adds a domain metadata change for the given domain name. Test-only.
+    ///
+    /// Creates a synthetic domain metadata entry to simulate a domain metadata change
+    /// (e.g. clustering column change via ALTER TABLE CLUSTER BY).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_domain_change(mut self, domain: &str) -> Self {
+        self.domain_metadata_changes
+            .push(DomainMetadata::new(domain.to_string(), String::new()));
+        self
     }
 }
 
@@ -274,13 +357,13 @@ mod tests {
             ts,
             max_published_version,
             CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None).unwrap(),
+            vec![],
         );
 
         // version
         assert_eq!(commit_metadata.version(), 42);
         // in_commit_timestamp
         assert_eq!(commit_metadata.in_commit_timestamp(), 1234);
-        // max_published_version
         assert_eq!(commit_metadata.max_published_version(), Some(42));
 
         // published commit path
