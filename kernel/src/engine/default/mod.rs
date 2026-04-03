@@ -314,6 +314,14 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                             "Partition column '{logical_name}' not found in table schema"
                         ))
                     })?;
+                if !value.is_null() && field.data_type() != &value.data_type() {
+                    return Err(Error::generic(format!(
+                        "Partition column '{logical_name}' has type {} but got Scalar of \
+                         type {}",
+                        field.data_type(),
+                        value.data_type()
+                    )));
+                }
                 let physical_name = field
                     .physical_name(write_context.column_mapping_mode())
                     .to_string();

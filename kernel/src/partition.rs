@@ -17,10 +17,9 @@
 //!   `"a%2Fb"`). The Delta protocol does not require any particular path format.
 //!
 //! These are **convenience utilities**. Connectors may use flat paths like
-//! `<table_root>/<uuid>.parquet` (which is what [`DefaultEngine::write_parquet`] does by
-//! default) or Hive-style paths -- the choice is entirely up to the connector. These
-//! utilities are primarily useful for custom engine implementations that construct file paths
-//! themselves.
+//! `<table_root>/<uuid>.parquet` (which is what [`DefaultEngine::write_parquet`] currently
+//! does) or Hive-style paths. The choice is entirely up to the connector. These utilities
+//! are primarily useful for custom engine implementations that construct file paths themselves.
 //!
 //! ## Partitioned write utilities overview
 //!
@@ -39,8 +38,6 @@
 //! [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
 
 use std::borrow::Cow;
-
-const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
 /// The placeholder used for null partition values in Hive-style directory paths.
 ///
@@ -102,6 +99,7 @@ pub fn escape_partition_value(s: &str) -> Cow<'_, str> {
         return Cow::Borrowed(s);
     };
 
+    const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len() + 16);
     out.push_str(&s[..first]);
     // The escape set is entirely ASCII (< 0x80). UTF-8 guarantees that non-ASCII characters
@@ -172,39 +170,39 @@ mod tests {
     // === escape_partition_value tests ===
 
     #[test]
-    fn test_plain_ascii_passes_through_unchanged() {
+    fn test_escape_partition_value_plain_ascii_passes_through_unchanged() {
         assert_eq!(escape_partition_value("hello"), "hello");
         assert_eq!(escape_partition_value("US"), "US");
         assert_eq!(escape_partition_value("2024-01-15"), "2024-01-15");
     }
 
     #[test]
-    fn test_empty_string_passes_through() {
+    fn test_escape_partition_value_empty_string_passes_through() {
         assert_eq!(escape_partition_value(""), "");
     }
 
     #[test]
-    fn test_slash_encoded() {
+    fn test_escape_partition_value_slash_is_percent_encoded() {
         assert_eq!(escape_partition_value("a/b"), "a%2Fb");
     }
 
     #[test]
-    fn test_equals_encoded() {
+    fn test_escape_partition_value_equals_is_percent_encoded() {
         assert_eq!(escape_partition_value("a=b"), "a%3Db");
     }
 
     #[test]
-    fn test_percent_encoded() {
+    fn test_escape_partition_value_percent_is_percent_encoded() {
         assert_eq!(escape_partition_value("100%"), "100%25");
     }
 
     #[test]
-    fn test_space_not_encoded() {
+    fn test_escape_partition_value_space_passes_through() {
         assert_eq!(escape_partition_value("a b"), "a b");
     }
 
     #[test]
-    fn test_non_ascii_not_encoded() {
+    fn test_escape_partition_value_non_ascii_passes_through() {
         assert_eq!(escape_partition_value("\u{00FC}ber"), "\u{00FC}ber");
         assert_eq!(
             escape_partition_value("\u{65E5}\u{672C}\u{8A9E}"),
@@ -213,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_ascii_after_special_char_preserved() {
+    fn test_escape_partition_value_non_ascii_after_special_char_is_preserved() {
         // Verifies multi-byte UTF-8 chars survive when escaping occurs earlier in the string.
         // U+00FC = UTF-8 bytes [0xC3, 0xBC]. The "/" triggers the slow path, and the
         // non-ASCII char must be preserved as-is (not corrupted by byte-level processing).
@@ -225,13 +223,13 @@ mod tests {
     }
 
     #[test]
-    fn test_control_chars_encoded() {
+    fn test_escape_partition_value_control_chars_are_percent_encoded() {
         assert_eq!(escape_partition_value("\x01"), "%01");
         assert_eq!(escape_partition_value("\n"), "%0A");
     }
 
     #[test]
-    fn test_all_special_chars_encoded() {
+    fn test_escape_partition_value_all_special_chars_are_percent_encoded() {
         let cases = vec![
             ("\"", "%22"),
             ("#", "%23"),
@@ -255,19 +253,19 @@ mod tests {
     }
 
     #[test]
-    fn test_closing_brace_not_escaped() {
+    fn test_escape_partition_value_closing_brace_passes_through() {
         // Per Hive source, only `{` is escaped, not `}`.
         assert_eq!(escape_partition_value("}"), "}");
         assert_eq!(escape_partition_value("a}b"), "a}b");
     }
 
     #[test]
-    fn test_mixed_value_with_special_chars() {
+    fn test_escape_partition_value_mixed_special_chars_are_encoded() {
         assert_eq!(escape_partition_value("Serbia/srb%"), "Serbia%2Fsrb%25");
     }
 
     #[test]
-    fn test_timestamp_value_colons_encoded() {
+    fn test_escape_partition_value_colons_are_percent_encoded() {
         assert_eq!(
             escape_partition_value("2024-01-15 12:30:45"),
             "2024-01-15 12%3A30%3A45"
@@ -277,31 +275,31 @@ mod tests {
     // === build_partition_path tests ===
 
     #[test]
-    fn test_build_path_single_column() {
+    fn test_build_partition_path_single_column_produces_hive_format() {
         let path = build_partition_path(&[("country", Some("US"))]);
         assert_eq!(path, "country=US/");
     }
 
     #[test]
-    fn test_build_path_multiple_columns() {
+    fn test_build_partition_path_multiple_columns_produces_hive_format() {
         let path = build_partition_path(&[("country", Some("US")), ("year", Some("2025"))]);
         assert_eq!(path, "country=US/year=2025/");
     }
 
     #[test]
-    fn test_build_path_null_value_uses_hive_default() {
+    fn test_build_partition_path_null_value_uses_hive_default() {
         let path = build_partition_path(&[("country", None)]);
         assert_eq!(path, "country=__HIVE_DEFAULT_PARTITION__/");
     }
 
     #[test]
-    fn test_build_path_special_chars_encoded() {
+    fn test_build_partition_path_special_chars_are_encoded() {
         let path = build_partition_path(&[("country", Some("US/A%B"))]);
         assert_eq!(path, "country=US%2FA%25B/");
     }
 
     #[test]
-    fn test_build_path_empty_columns_returns_empty() {
+    fn test_build_partition_path_empty_columns_returns_empty_string() {
         let path = build_partition_path(&[]);
         assert_eq!(path, "");
     }

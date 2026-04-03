@@ -3,7 +3,7 @@
 //!
 //! These tests write real parquet data through the transaction API, create checkpoints,
 //! change stats configuration, create new checkpoints, and read all data back to verify
-//! the full write → checkpoint → config change → checkpoint → read pipeline.
+//! the full write -> checkpoint -> config change -> checkpoint -> read pipeline.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -217,7 +217,7 @@ async fn test_checkpoint_stats_config_with_real_data(
 /// `COALESCE(partitionValues_parsed, MAP_TO_STRUCT(partitionValues, partition_schema))`.
 ///
 /// Two partition columns exercise different parsing paths:
-///   - `created_at` (timestamp): "2024-01-15 10:30:00" → microseconds-since-epoch
+///   - `created_at` (timestamp): "2024-01-15 10:30:00" -> microseconds-since-epoch
 ///   - `tag` (binary): "hello" -> raw bytes
 #[rstest::rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -289,12 +289,14 @@ impl Scalar {
     /// Delta protocol's "Partition Value Serialization" rules.
     ///
     /// This method is **only** for producing values in the `partitionValues` JSON map stored
-    /// in commit log entries. It is **not** for Hive-style file path encoding -- for that, see
+    /// in commit log entries. It is **not** for Hive-style file path encoding. For that, see
     /// [`escape_partition_value`] and [`build_partition_path`] in the [`partition`] module,
     /// which handle percent-encoding of path segments independently.
     ///
-    /// Returns `Ok("")` for null values. In the `partitionValues` map, `""` is equivalent to
-    /// an absent key or a JSON `null` value -- all represent a null partition value on read.
+    /// Returns `Ok("")` for null values. Callers that build the `partitionValues` JSON map
+    /// directly must convert `""` to a JSON `null` value (or omit the key entirely). Both
+    /// representations are equivalent on read: `""`, absent key, and JSON `null` all represent
+    /// a null partition value.
     ///
     /// Note: `Scalar::String("")` also serializes to `""`, which is indistinguishable from a
     /// null partition value. An empty string partition value will be read back as null.
@@ -302,17 +304,16 @@ impl Scalar {
     /// Returns an error if the scalar's type is not a valid partition column type (e.g.,
     /// struct, array, or map).
     ///
-    /// Connectors using [`DefaultEngine::write_parquet`] do not need to call this directly --
-    /// it is called internally. Custom engine implementations that bypass `DefaultEngine` and
-    /// construct Add action metadata directly should use this to produce correctly formatted
-    /// strings for the `partitionValues` map.
+    /// Connectors using [`DefaultEngine::write_parquet`] do not need to call this directly
+    /// because it is called internally. Custom engine implementations that bypass
+    /// `DefaultEngine` and construct Add action metadata directly should use this to produce
+    /// correctly formatted strings for the `partitionValues` map.
     ///
     /// Neither `Scalar`'s `Display` impl nor Arrow's `array_value_to_string` produce
     /// correct partition value strings. Arrow's `array_value_to_string` is wrong for:
     ///
     /// - **Binary**: produces hex (`4869`) instead of raw UTF-8 (`Hi`).
-    /// - **Timestamp**: drops microseconds when zero (`T15:30:00Z` vs `T15:30:00.000000Z`)
-    ///   and omits the `Z` suffix for timestamps without timezone.
+    /// - **Timestamp**: drops microseconds when zero (`T15:30:00Z` vs `T15:30:00.000000Z`).
     /// - **TimestampNtz**: uses `T` separator instead of space.
     /// - **Decimal (negative)**: correct, but `Scalar::Display` is buggy (e.g. `-123.-45`).
     ///
@@ -322,7 +323,18 @@ impl Scalar {
     /// [`partition`]: crate::partition
     pub fn serialize_partition_value(&self) -> DeltaResult<String> {
         match self {
-            Self::Null(_) => Ok(String::new()),
+            Self::Null(dt) => {
+                if matches!(
+                    dt,
+                    DataType::Struct(_) | DataType::Array(_) | DataType::Map(_)
+                ) {
+                    return Err(Error::generic(format!(
+                        "Cannot serialize null partition value: type {dt:?} is not a \
+                         valid partition column type"
+                    )));
+                }
+                Ok(String::new())
+            }
             // These types have Display output that matches the protocol format
             Self::Byte(_)
             | Self::Short(_)
@@ -332,8 +344,8 @@ impl Scalar {
             // Float/Double: Rust's Display uses "inf"/"-inf" but Java uses
             // "Infinity"/"-Infinity". We must match Java for interop since
             // Java's Float.parseFloat("inf") throws NumberFormatException.
-            Self::Float(v) => Ok(format_float_special(*v as f64, || v.to_string())),
-            Self::Double(v) => Ok(format_float_special(*v, || v.to_string())),
+            Self::Float(v) => Ok(format_float_partition(*v as f64, v.to_string())),
+            Self::Double(v) => Ok(format_float_partition(*v, v.to_string())),
             // Decimal: use dedicated serialization to handle negative values correctly.
             // Scalar::Display has a bug for negative decimals with scale > 0 (Rust's %
             // operator preserves sign, producing e.g. "-1.-23" instead of "-1.23").
@@ -370,7 +382,11 @@ impl Scalar {
             Self::Binary(v) => Ok(String::from_utf8_lossy(v).into_owned()),
             // Date Display prints raw days-since-epoch (20178), but protocol wants YYYY-MM-DD
             Self::Date(days) => {
-                let date = DateTime::UNIX_EPOCH + chrono::Duration::days(*days as i64);
+                let date = NaiveDate::from_num_days_from_ce_opt(
+                    // UNIX epoch (1970-01-01) is CE day 719_163
+                    719_163 + *days,
+                )
+                .ok_or_else(|| Error::generic(format!("Date value {days} is out of range")))?;
                 Ok(date.format("%Y-%m-%d").to_string())
             }
             // Timestamp: use ISO 8601 adjusted to UTC as recommended by the Delta protocol.
@@ -389,7 +405,7 @@ impl Scalar {
                 Ok(ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
             }
             // Struct, Array, Map types are not valid partition column types
-            _ => Err(Error::generic(format!(
+            Self::Struct(_) | Self::Array(_) | Self::Map(_) => Err(Error::generic(format!(
                 "Cannot serialize {self:?} as a partition value: type {:?} is not a \
                  valid partition column type",
                 self.data_type()
@@ -467,11 +483,12 @@ impl Scalar {
     }
 }
 
-/// Formats a float/double for partition value serialization. For special values (NaN, infinity),
-/// uses Java-compatible strings. Rust's `Display` produces `"inf"` and `"-inf"`, but Java's
+/// Formats a float/double for partition value serialization. For NaN and infinity, uses
+/// Java-compatible strings. Rust's `Display` produces `"inf"` and `"-inf"`, but Java's
 /// `Float.parseFloat` / `Double.parseDouble` require `"Infinity"` and `"-Infinity"`.
-/// For normal values, delegates to `normal_fmt` to preserve the original type's precision.
-fn format_float_special(v: f64, normal_fmt: impl FnOnce() -> String) -> String {
+/// The `normal` parameter carries the pre-formatted string for non-special values, which
+/// preserves the original type's precision (f32 vs f64).
+fn format_float_partition(v: f64, normal: String) -> String {
     if v.is_nan() {
         "NaN".to_string()
     } else if v.is_infinite() {
@@ -481,7 +498,7 @@ fn format_float_special(v: f64, normal_fmt: impl FnOnce() -> String) -> String {
             "-Infinity".to_string()
         }
     } else {
-        normal_fmt()
+        normal
     }
 }
 

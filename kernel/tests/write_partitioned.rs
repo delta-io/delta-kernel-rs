@@ -51,7 +51,6 @@ use delta_kernel::arrow::array::{
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::DefaultEngine;
@@ -121,11 +120,11 @@ async fn test_write_partitioned_all_types_and_edge_cases() -> Result<(), Box<dyn
         .build(&engine, Box::new(FileSystemCommitter::new()))?
         .commit(&engine)?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let mut snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     assert_eq!(snapshot.table_configuration().partition_columns().len(), 13);
-    let arrow_schema = Arc::new(table_schema.as_ref().try_into_arrow()?);
+    let arrow_schema: Arc<ArrowSchema> = Arc::new(table_schema.as_ref().try_into_arrow()?);
 
-    let rows: Vec<(Vec<ArrayRef>, HashMap<String, Scalar>)> = vec![
+    let rows = vec![
         normal_values(),
         zero_and_negative_values(),
         boundary_values(),
@@ -136,9 +135,9 @@ async fn test_write_partitioned_all_types_and_edge_cases() -> Result<(), Box<dyn
         pre_epoch_unicode_values(),
     ];
 
-    let mut snapshot = snapshot;
     for (i, (cols, pvs)) in rows.into_iter().enumerate() {
-        snapshot = write_row(&snapshot, &engine, &arrow_schema, cols, pvs).await?;
+        let batch = RecordBatch::try_new(arrow_schema.clone(), cols)?;
+        snapshot = test_utils::write_batch_to_table(&snapshot, &engine, batch, pvs).await?;
         assert_eq!(snapshot.version(), (i + 1) as u64);
     }
 
@@ -217,7 +216,7 @@ async fn test_write_partitioned_all_types_and_edge_cases() -> Result<(), Box<dyn
         .as_any()
         .downcast_ref::<TimestampMicrosecondArray>()
         .unwrap();
-    assert_eq!(col.value(0), ts_to_micros_sub("2025-03-31 15:30:00.123456"));
+    assert_eq!(col.value(0), ts_to_micros("2025-03-31 15:30:00.123456"));
     assert_eq!(col.value(1), 0); // epoch
 
     Ok(())
@@ -271,16 +270,7 @@ fn date_to_days(s: &str) -> i32 {
 }
 
 fn ts_to_micros(s: &str) -> i64 {
-    let ts = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap();
-    chrono::Utc
-        .from_utc_datetime(&ts)
-        .signed_duration_since(chrono::DateTime::UNIX_EPOCH)
-        .num_microseconds()
-        .unwrap()
-}
-
-fn ts_to_micros_sub(s: &str) -> i64 {
-    let ts = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.6f").unwrap();
+    let ts = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").unwrap();
     chrono::Utc
         .from_utc_datetime(&ts)
         .signed_duration_since(chrono::DateTime::UNIX_EPOCH)
@@ -504,7 +494,7 @@ fn normal_values() -> (Vec<ArrayRef>, HashMap<String, Scalar>) {
         s_ts(ts_to_micros("2025-03-31 15:30:00")),
         s_decimal(12345), // 123.45
         s_binary(b"Hello"),
-        s_ts_ntz(ts_to_micros_sub("2025-03-31 15:30:00.123456"))
+        s_ts_ntz(ts_to_micros("2025-03-31 15:30:00.123456"))
     )
 }
 
@@ -544,7 +534,7 @@ fn boundary_values() -> (Vec<ArrayRef>, HashMap<String, Scalar>) {
         s_ts(ts_to_micros("2000-01-01 00:00:00")),
         s_decimal(-5),                      // -0.05 (sign-loss regression)
         s_binary("Hi\u{1F608}".as_bytes()), // mixed ASCII + emoji
-        s_ts_ntz(ts_to_micros_sub("2000-06-15 12:00:00.000001"))
+        s_ts_ntz(ts_to_micros("2000-06-15 12:00:00.000001"))
     )
 }
 
@@ -644,45 +634,13 @@ fn pre_epoch_unicode_values() -> (Vec<ArrayRef>, HashMap<String, Scalar>) {
         s_ts(ts_to_micros("1969-01-01 00:00:00")),
         s_decimal(99999999), // 999999.99 (near max for precision 10, scale 2)
         s_binary("\u{00FC}".as_bytes()), // 2-byte UTF-8
-        s_ts_ntz(ts_to_micros_sub("1999-12-31 23:59:59.999999"))
+        s_ts_ntz(ts_to_micros("1999-12-31 23:59:59.999999"))
     )
 }
 
 // ============================================================================
 // Write/read helpers
 // ============================================================================
-
-/// Writes a single row and returns the post-commit snapshot.
-async fn write_row(
-    snapshot: &Arc<Snapshot>,
-    engine: &DefaultEngine<TokioBackgroundExecutor>,
-    arrow_schema: &Arc<ArrowSchema>,
-    columns: Vec<ArrayRef>,
-    partition_values: HashMap<String, Scalar>,
-) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
-        .with_engine_info("test")
-        .with_data_change(true);
-    let batch = RecordBatch::try_new(arrow_schema.clone(), columns)?;
-    let write_context = txn.get_write_context();
-    let add_meta = engine
-        .write_parquet(
-            &ArrowEngineData::new(batch),
-            &write_context,
-            partition_values,
-        )
-        .await?;
-    txn.add_files(add_meta);
-    match txn.commit(engine)? {
-        delta_kernel::transaction::CommitResult::CommittedTransaction(c) => Ok(c
-            .post_commit_snapshot()
-            .expect("post_commit_snapshot should exist")
-            .clone()),
-        _ => panic!("commit should succeed"),
-    }
-}
 
 /// Reads all rows from a snapshot sorted by the first column (assumed to be an int "value" column).
 fn read_sorted(
