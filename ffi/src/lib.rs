@@ -20,7 +20,6 @@ use {
 
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
-#[cfg(feature = "catalog-managed")]
 use delta_kernel::LogPath;
 use delta_kernel::{DeltaResult, Engine, EngineData, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -695,14 +694,13 @@ pub struct SharedSnapshot;
 ///
 /// Create with [`get_snapshot_builder`] (from a table path) or [`get_snapshot_builder_from`]
 /// (incrementally from an existing snapshot). Configure with [`snapshot_builder_set_version`] and
-/// (when the `catalog-managed` feature is enabled) [`snapshot_builder_set_log_tail`]. Finally,
+/// [`snapshot_builder_set_log_tail`] (for catalog-managed tables). Finally,
 /// call [`snapshot_builder_build`] to consume the builder and obtain the snapshot. If you need to
 /// discard the builder without building, call [`free_snapshot_builder`].
 pub struct FfiSnapshotBuilder {
     engine: Arc<dyn ExternEngine>,
     source: FfiSnapshotBuilderSource,
     version: Option<Version>,
-    #[cfg(feature = "catalog-managed")]
     log_tail: Vec<LogPath>,
 }
 
@@ -723,7 +721,6 @@ fn make_snapshot_builder(
         engine,
         source,
         version: None,
-        #[cfg(feature = "catalog-managed")]
         log_tail: Vec::new(),
     })
     .into())
@@ -799,7 +796,6 @@ pub unsafe extern "C" fn snapshot_builder_set_version(
 ///
 /// Caller must pass a valid builder pointer. The log_tail array and its contents must remain valid
 /// for the duration of this call.
-#[cfg(feature = "catalog-managed")]
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_builder_set_log_tail(
     builder: &mut Handle<MutableFfiSnapshotBuilder>,
@@ -811,7 +807,6 @@ pub unsafe extern "C" fn snapshot_builder_set_log_tail(
     snapshot_builder_set_log_tail_impl(builder_mut, log_tail).into_extern_result(&engine_ref)
 }
 
-#[cfg(feature = "catalog-managed")]
 unsafe fn snapshot_builder_set_log_tail_impl(
     builder: &mut FfiSnapshotBuilder,
     log_tail: log_path::LogPathArray,
@@ -846,7 +841,6 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
     if let Some(v) = builder.version {
         rust_builder = rust_builder.at_version(v);
     }
-    #[cfg(feature = "catalog-managed")]
     if !builder.log_tail.is_empty() {
         rust_builder = rust_builder.with_log_tail(builder.log_tail);
     }
@@ -1141,7 +1135,6 @@ mod tests {
     use rstest::rstest;
     use serde_json::Value;
     use std::collections::HashMap;
-    #[cfg(feature = "catalog-managed")]
     use test_utils::add_staged_commit;
     use test_utils::{
         actions_to_string, actions_to_string_partitioned, actions_to_string_with_metadata,
@@ -1768,7 +1761,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "catalog-managed")]
     #[tokio::test]
     async fn test_snapshot_with_prev_snapshot_and_log_tail(
     ) -> Result<(), Box<dyn std::error::Error>> {
