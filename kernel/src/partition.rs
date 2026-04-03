@@ -1,23 +1,26 @@
-//! Partition-related utilities for Delta table writes.
+//! Hive-style partition path encoding utilities for Delta table writes.
 //!
-//! This module provides:
-//!
-//! - **Hive-style partition path encoding**: [`escape_partition_value`] and
-//!   [`build_partition_path`] produce directory layouts like `col1=val1/col2=val2/` with
-//!   special characters encoded using the same rules as:
+//! [`escape_partition_value`] and [`build_partition_path`] produce directory layouts like
+//! `col1=val1/col2=val2/` with special characters percent-encoded using the same rules as:
 //!   - Hive's [`FileUtils.escapePathName`][hive]
 //!   - Spark's [`ExternalCatalogUtils.escapePathName`][spark]
 //!
-//! These are **convenience utilities**. The Delta protocol does not require any particular
-//! file path format. The `partitionValues` map in the Add action is the source of truth for
-//! partition column values, not the file path. Connectors may use flat paths like
-//! `<table_root>/<uuid>.parquet` (which is what [`DefaultEngine::write_parquet`] does by
-//! default) or Hive-style paths -- the choice is entirely up to the connector.
+//! These utilities handle **file path encoding only**. They are completely independent from
+//! the `partitionValues` map serialization in Add actions (which is handled by
+//! [`Scalar::serialize_partition_value`]). The two concerns are separate:
 //!
-//! These utilities are primarily useful for custom engine implementations that construct
-//! file paths themselves (e.g., to write files into Hive-style partition directories).
-//! Connectors using [`DefaultEngine::write_parquet`] write to flat paths and do not need
-//! these utilities.
+//! - **`partitionValues` map** (Add action metadata): [`Scalar::serialize_partition_value`]
+//!   converts typed values to protocol-compliant strings (e.g., `Date(20178)` -> `"2025-03-31"`).
+//!   This is the source of truth for partition column values.
+//! - **File paths** (this module): [`escape_partition_value`] and [`build_partition_path`]
+//!   percent-encode already-serialized strings for use in directory names (e.g., `"a/b"` ->
+//!   `"a%2Fb"`). The Delta protocol does not require any particular path format.
+//!
+//! These are **convenience utilities**. Connectors may use flat paths like
+//! `<table_root>/<uuid>.parquet` (which is what [`DefaultEngine::write_parquet`] does by
+//! default) or Hive-style paths -- the choice is entirely up to the connector. These
+//! utilities are primarily useful for custom engine implementations that construct file paths
+//! themselves.
 //!
 //! ## Partitioned write utilities overview
 //!

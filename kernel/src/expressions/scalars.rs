@@ -285,14 +285,16 @@ impl Scalar {
         matches!(self, Self::Null(_))
     }
 
-    /// Serializes this scalar to its partition value string representation per the Delta
-    /// protocol's "Partition Value Serialization" rules.
+    /// Serializes this scalar to a string for the Add action's `partitionValues` map, per the
+    /// Delta protocol's "Partition Value Serialization" rules.
     ///
-    /// Returns `Ok("")` for null values. The Delta protocol represents null partition values
-    /// as either `null` or `""` in the `partitionValues` map, and downstream code
-    /// (`as_record_batch`) converts `""` to a null map entry. Callers that need to
-    /// distinguish null from empty-string (e.g. for Hive-style `__HIVE_DEFAULT_PARTITION__`
-    /// paths) should check [`Scalar::is_null`] before calling this method.
+    /// This method is **only** for producing values in the `partitionValues` JSON map stored
+    /// in commit log entries. It is **not** for Hive-style file path encoding -- for that, see
+    /// [`escape_partition_value`] and [`build_partition_path`] in the [`partition`] module,
+    /// which handle percent-encoding of path segments independently.
+    ///
+    /// Returns `Ok("")` for null values. In the `partitionValues` map, `""` is equivalent to
+    /// an absent key or a JSON `null` value -- all represent a null partition value on read.
     ///
     /// Note: `Scalar::String("")` also serializes to `""`, which is indistinguishable from a
     /// null partition value. An empty string partition value will be read back as null.
@@ -305,23 +307,19 @@ impl Scalar {
     /// construct Add action metadata directly should use this to produce correctly formatted
     /// strings for the `partitionValues` map.
     ///
-    /// `Scalar`'s `Display` impl and Arrow's `array_value_to_string` are NOT suitable for
-    /// partition value serialization. The following table shows why:
+    /// Neither `Scalar`'s `Display` impl nor Arrow's `array_value_to_string` produce
+    /// correct partition value strings. Arrow's `array_value_to_string` is wrong for:
     ///
-    /// | Type      | Scalar::Display          | array_value_to_string      | This method (correct)         | delta-spark                   |
-    /// |-----------|--------------------------|----------------------------|-------------------------------|-------------------------------|
-    /// | String    | `'hello'` (quoted)       | `hello`                    | `hello`                       | `hello`                       |
-    /// | Date      | `20178` (raw days)       | `2025-03-31`               | `2025-03-31`                  | `2025-03-31`                  |
-    /// | Timestamp | `1743437400000000` (raw) | `2025-03-31T15:30:00` (*)  | `2025-03-31T15:30:00.000000Z` | `2025-03-31T15:30:00.000000Z` |
-    /// | Boolean   | `true`                   | `true`                     | `true`                        | `true`                        |
-    /// | Null      | `null` (literal string)  | `` (empty string)          | `""`                          | `null` in JSON                |
-    ///
-    /// (*) Arrow's `array_value_to_string` for timestamps without timezone uses `T` separator
-    /// but omits the `Z` suffix, producing a format that is not valid per the Delta protocol.
-    /// With timezone it produces RFC 3339 (`+00:00` suffix) which happens to parse but does
-    /// not match delta-spark.
+    /// - **Binary**: produces hex (`4869`) instead of raw UTF-8 (`Hi`).
+    /// - **Timestamp**: drops microseconds when zero (`T15:30:00Z` vs `T15:30:00.000000Z`)
+    ///   and omits the `Z` suffix for timestamps without timezone.
+    /// - **TimestampNtz**: uses `T` separator instead of space.
+    /// - **Decimal (negative)**: correct, but `Scalar::Display` is buggy (e.g. `-123.-45`).
     ///
     /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
+    /// [`escape_partition_value`]: crate::partition::escape_partition_value
+    /// [`build_partition_path`]: crate::partition::build_partition_path
+    /// [`partition`]: crate::partition
     pub fn serialize_partition_value(&self) -> DeltaResult<String> {
         match self {
             Self::Null(_) => Ok(String::new()),
@@ -330,9 +328,12 @@ impl Scalar {
             | Self::Short(_)
             | Self::Integer(_)
             | Self::Long(_)
-            | Self::Float(_)
-            | Self::Double(_)
             | Self::Boolean(_) => Ok(self.to_string()),
+            // Float/Double: Rust's Display uses "inf"/"-inf" but Java uses
+            // "Infinity"/"-Infinity". We must match Java for interop since
+            // Java's Float.parseFloat("inf") throws NumberFormatException.
+            Self::Float(v) => Ok(format_float_special(*v as f64, || v.to_string())),
+            Self::Double(v) => Ok(format_float_special(*v, || v.to_string())),
             // Decimal: use dedicated serialization to handle negative values correctly.
             // Scalar::Display has a bug for negative decimals with scale > 0 (Rust's %
             // operator preserves sign, producing e.g. "-1.-23" instead of "-1.23").
@@ -345,17 +346,27 @@ impl Scalar {
                     let scalar_multiple = 10_i128.pow(scale);
                     let integer_part = value / scalar_multiple;
                     let fractional_part = (value % scalar_multiple).abs();
+                    // For values in (-1, 0), integer_part truncates to 0 and loses the
+                    // negative sign. We must re-add it explicitly.
+                    let sign = if value < 0 && integer_part == 0 {
+                        "-"
+                    } else {
+                        ""
+                    };
                     Ok(format!(
-                        "{integer_part}.{fractional_part:0>width$}",
+                        "{sign}{integer_part}.{fractional_part:0>width$}",
                         width = scale as usize
                     ))
                 }
             }
             // String Display wraps in quotes ('hello'), but protocol wants raw value
             Self::String(s) => Ok(s.clone()),
-            // Binary: treat bytes as UTF-8 and store the resulting string.
-            // This matches Java kernel's `new String(bytes, UTF_8)` approach.
-            // Non-UTF-8 bytes are replaced with the Unicode replacement character.
+            // Binary: the Delta protocol spec says binary is "encoded as a string of
+            // escaped binary values", with the example "\u0001\u0002\u0003". However, Java
+            // kernel uses `new String(bytes, UTF_8)` which interprets bytes as UTF-8, not
+            // as escaped unicode sequences. We match Java kernel for interop.
+            // TODO: Should we match the spec (\uXXXX escapes) or Java kernel (UTF-8)?
+            // The spec example and Java kernel behavior are inconsistent.
             Self::Binary(v) => Ok(String::from_utf8_lossy(v).into_owned()),
             // Date Display prints raw days-since-epoch (20178), but protocol wants YYYY-MM-DD
             Self::Date(days) => {
@@ -453,6 +464,24 @@ impl Scalar {
             _ => return None,
         };
         Some(result)
+    }
+}
+
+/// Formats a float/double for partition value serialization. For special values (NaN, infinity),
+/// uses Java-compatible strings. Rust's `Display` produces `"inf"` and `"-inf"`, but Java's
+/// `Float.parseFloat` / `Double.parseDouble` require `"Infinity"` and `"-Infinity"`.
+/// For normal values, delegates to `normal_fmt` to preserve the original type's precision.
+fn format_float_special(v: f64, normal_fmt: impl FnOnce() -> String) -> String {
+    if v.is_nan() {
+        "NaN".to_string()
+    } else if v.is_infinite() {
+        if v.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        }
+    } else {
+        normal_fmt()
     }
 }
 
@@ -803,7 +832,9 @@ impl PrimitiveType {
 
         match self {
             String => Ok(Scalar::String(raw.to_string())),
-            // Treat the string as UTF-8 bytes, matching Java kernel's `string.getBytes()`.
+            // Convert the partition value string back to raw UTF-8 bytes. This is the
+            // inverse of `serialize_partition_value`, which uses `String::from_utf8_lossy`
+            // to produce the string from binary data.
             Binary => Ok(Scalar::Binary(raw.as_bytes().to_vec())),
             Byte => self.parse_str_as_scalar(raw, Scalar::Byte),
             Decimal(dtype) => Self::parse_decimal(raw, *dtype),
@@ -1501,9 +1532,7 @@ mod tests {
     #[test]
     fn test_serialize_partition_value_date_round_trips_through_parse() {
         let days = 20178i32; // 2025-03-31
-        let serialized = Scalar::Date(days)
-            .serialize_partition_value()
-            .unwrap();
+        let serialized = Scalar::Date(days).serialize_partition_value().unwrap();
         let parsed = PrimitiveType::Date.parse_scalar(&serialized).unwrap();
         assert_eq!(parsed, Scalar::Date(days));
     }
@@ -1588,10 +1617,50 @@ mod tests {
     }
 
     #[test]
+    fn test_serialize_partition_value_decimal_negative_between_zero_and_one_preserves_sign() {
+        let s = Scalar::decimal(-5i128, 3, 2).unwrap();
+        let result = s.serialize_partition_value().unwrap();
+        assert_eq!(result, "-0.05");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_decimal_zero_scale_produces_integer_string() {
+        let s = Scalar::decimal(42i128, 5, 0).unwrap();
+        assert_eq!(s.serialize_partition_value().unwrap(), "42");
+
+        let neg = Scalar::decimal(-42i128, 5, 0).unwrap();
+        assert_eq!(neg.serialize_partition_value().unwrap(), "-42");
+    }
+
+    #[test]
     fn test_serialize_partition_value_decimal_round_trips_through_parse() {
         let s = Scalar::decimal(12345, 5, 2).unwrap();
         let serialized = s.serialize_partition_value().unwrap();
         let parsed = PrimitiveType::decimal(5, 2)
+            .unwrap()
+            .parse_scalar(&serialized)
+            .unwrap();
+        assert_eq!(parsed, s);
+    }
+
+    #[test]
+    fn test_serialize_partition_value_decimal_negative_round_trips_through_parse() {
+        let s = Scalar::decimal(-12345i128, 5, 2).unwrap();
+        let serialized = s.serialize_partition_value().unwrap();
+        assert_eq!(serialized, "-123.45");
+        let parsed = PrimitiveType::decimal(5, 2)
+            .unwrap()
+            .parse_scalar(&serialized)
+            .unwrap();
+        assert_eq!(parsed, s);
+    }
+
+    #[test]
+    fn test_serialize_partition_value_decimal_negative_fractional_round_trips_through_parse() {
+        let s = Scalar::decimal(-5i128, 3, 2).unwrap();
+        let serialized = s.serialize_partition_value().unwrap();
+        assert_eq!(serialized, "-0.05");
+        let parsed = PrimitiveType::decimal(3, 2)
             .unwrap()
             .parse_scalar(&serialized)
             .unwrap();
@@ -1642,9 +1711,7 @@ mod tests {
         // This matches Java kernel's `new String(bytes, UTF_8)` behavior.
         // Binary partition values with non-UTF-8 data do not round-trip faithfully.
         let invalid = vec![0xFF, 0xFE];
-        let serialized = Scalar::Binary(invalid)
-            .serialize_partition_value()
-            .unwrap();
+        let serialized = Scalar::Binary(invalid).serialize_partition_value().unwrap();
         assert!(serialized.contains('\u{FFFD}')); // replacement character
     }
 
@@ -1682,6 +1749,84 @@ mod tests {
         assert_eq!(serialized, "hello\u{1F608}world");
         let parsed = PrimitiveType::Binary.parse_scalar(&serialized).unwrap();
         assert_eq!(parsed, Scalar::Binary(mixed));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_float_infinity_uses_java_format() {
+        assert_eq!(
+            Scalar::Float(f32::INFINITY)
+                .serialize_partition_value()
+                .unwrap(),
+            "Infinity"
+        );
+        assert_eq!(
+            Scalar::Float(f32::NEG_INFINITY)
+                .serialize_partition_value()
+                .unwrap(),
+            "-Infinity"
+        );
+    }
+
+    #[test]
+    fn test_serialize_partition_value_double_infinity_uses_java_format() {
+        assert_eq!(
+            Scalar::Double(f64::INFINITY)
+                .serialize_partition_value()
+                .unwrap(),
+            "Infinity"
+        );
+        assert_eq!(
+            Scalar::Double(f64::NEG_INFINITY)
+                .serialize_partition_value()
+                .unwrap(),
+            "-Infinity"
+        );
+    }
+
+    #[test]
+    fn test_serialize_partition_value_float_nan_uses_java_format() {
+        assert_eq!(
+            Scalar::Float(f32::NAN).serialize_partition_value().unwrap(),
+            "NaN"
+        );
+        assert_eq!(
+            Scalar::Double(f64::NAN)
+                .serialize_partition_value()
+                .unwrap(),
+            "NaN"
+        );
+    }
+
+    #[test]
+    fn test_serialize_partition_value_float_infinity_round_trips_through_parse() {
+        let serialized = Scalar::Float(f32::INFINITY)
+            .serialize_partition_value()
+            .unwrap();
+        assert_eq!(serialized, "Infinity");
+        let parsed = PrimitiveType::Float.parse_scalar(&serialized).unwrap();
+        assert_eq!(parsed, Scalar::Float(f32::INFINITY));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_double_infinity_round_trips_through_parse() {
+        let serialized = Scalar::Double(f64::NEG_INFINITY)
+            .serialize_partition_value()
+            .unwrap();
+        assert_eq!(serialized, "-Infinity");
+        let parsed = PrimitiveType::Double.parse_scalar(&serialized).unwrap();
+        assert_eq!(parsed, Scalar::Double(f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_float_normal_values_unchanged() {
+        assert_eq!(
+            Scalar::Float(1.25).serialize_partition_value().unwrap(),
+            "1.25"
+        );
+        assert_eq!(
+            Scalar::Double(0.0).serialize_partition_value().unwrap(),
+            "0"
+        );
     }
 
     #[test]
