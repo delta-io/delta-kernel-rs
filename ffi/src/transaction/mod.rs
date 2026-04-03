@@ -464,7 +464,7 @@ pub unsafe extern "C" fn remove_files(
     selection_vector: *const bool,
     selection_vector_len: usize,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<()> {
+) -> ExternResult<bool> {
     let engine = unsafe { engine.as_ref() };
     let data = unsafe { data.into_inner() };
     let txn = unsafe { txn.as_mut() };
@@ -481,10 +481,10 @@ fn remove_files_impl(
     data: Box<dyn delta_kernel::EngineData>,
     selection_vector: Vec<bool>,
     txn: &mut Transaction,
-) -> DeltaResult<()> {
+) -> DeltaResult<bool> {
     let filtered = FilteredEngineData::try_new(data, selection_vector)?;
     txn.remove_files(filtered);
-    Ok(())
+    Ok(true)
 }
 
 /// Remove files from a transaction using scan metadata obtained from
@@ -506,7 +506,7 @@ pub unsafe extern "C" fn remove_scan_metadata(
     mut txn: Handle<ExclusiveTransaction>,
     scan_metadata: Handle<SharedScanMetadata>,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<()> {
+) -> ExternResult<bool> {
     let engine = unsafe { engine.as_ref() };
     let arc = unsafe { scan_metadata.into_inner() };
     let txn = unsafe { txn.as_mut() };
@@ -516,7 +516,7 @@ pub unsafe extern "C" fn remove_scan_metadata(
 fn remove_scan_metadata_impl(
     scan_metadata: Arc<delta_kernel::scan::ScanMetadata>,
     txn: &mut Transaction,
-) -> DeltaResult<()> {
+) -> DeltaResult<bool> {
     let metadata = Arc::try_unwrap(scan_metadata).map_err(|_| {
         delta_kernel::Error::Generic(
             "scan_metadata handle has other outstanding references and cannot be consumed".into(),
@@ -529,7 +529,7 @@ fn remove_scan_metadata_impl(
         scan_file_transforms: _,
     } = metadata;
     txn.remove_files(scan_files);
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
