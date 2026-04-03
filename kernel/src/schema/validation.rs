@@ -1,13 +1,13 @@
 //! Schema validation utilities for Delta table creation.
 //!
-//! Provides validation functions to ensure schemas conform to Delta Lake protocol
-//! requirements before creating tables. Aligns with the Java kernel's
-//! `SchemaUtils.validateSchema()`.
+//! Validates schemas per the Delta protocol specification.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
-use crate::schema::{DataType, StructType};
+use crate::schema::{StructField, StructType};
 use crate::table_features::ColumnMappingMode;
+use crate::transforms::SchemaTransform;
 use crate::{DeltaResult, Error};
 
 /// Characters that are invalid in Parquet column names when column mapping is disabled.
@@ -20,7 +20,6 @@ const INVALID_PARQUET_CHARS: &[char] = &[' ', ',', ';', '{', '}', '(', ')', '\n'
 /// 1. Schema is non-empty
 /// 2. No duplicate column names (case-insensitive, including nested fields)
 /// 3. Column names contain only valid characters
-/// 4. All data types are supported by the Delta protocol
 pub(crate) fn validate_schema_for_create(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
@@ -28,145 +27,115 @@ pub(crate) fn validate_schema_for_create(
     if schema.num_fields() == 0 {
         return Err(Error::generic("Schema cannot be empty"));
     }
-
-    let paths = collect_all_field_paths(schema);
-
-    check_duplicate_columns(&paths)?;
-
-    let column_mapping_enabled = !matches!(column_mapping_mode, ColumnMappingMode::None);
-    validate_column_names(&paths, column_mapping_enabled)?;
-
-    Ok(())
+    let mut validator = SchemaValidator::new(column_mapping_mode);
+    // We reuse the SchemaTransform trait for its recursive traversal machinery.
+    // The validator never transforms the schema -- it only inspects fields and
+    // collects errors. The return value is intentionally discarded.
+    let _ = validator.transform_struct(schema);
+    validator.into_result()
 }
 
-/// Recursively collects all struct field paths in the schema.
+/// Schema visitor that validates field names and detects duplicates.
 ///
-/// Walks through structs, arrays, and maps to produce dot-joined paths for every struct
-/// field in the tree. For example, a schema `{a: struct<b: int, c: string>}` yields
-/// `["a", "a.b", "a.c"]`.
-fn collect_all_field_paths(schema: &StructType) -> Vec<String> {
-    let mut paths = Vec::new();
-    collect_paths_recursive(schema, "", &mut paths);
-    paths
+/// Implements `SchemaTransform` to reuse the existing recursive struct/array/map traversal.
+/// Collects all validation errors so the caller gets a complete list of violations in a
+/// single error message.
+///
+/// Note: `StructType::try_new` already catches same-level case-insensitive duplicates.
+/// This validator additionally detects cross-level path duplicates and catches schemas
+/// built with `new_unchecked`.
+struct SchemaValidator {
+    cm_enabled: bool,
+    seen_paths: HashSet<String>,
+    current_path: Vec<String>,
+    errors: Vec<String>,
 }
 
-fn collect_paths_recursive(schema: &StructType, prefix: &str, paths: &mut Vec<String>) {
-    for field in schema.fields() {
-        let path = if prefix.is_empty() {
-            field.name().to_string()
+impl SchemaValidator {
+    fn new(column_mapping_mode: ColumnMappingMode) -> Self {
+        Self {
+            cm_enabled: !matches!(column_mapping_mode, ColumnMappingMode::None),
+            seen_paths: HashSet::new(),
+            current_path: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    fn into_result(self) -> DeltaResult<()> {
+        if self.errors.is_empty() {
+            Ok(())
         } else {
-            format!("{prefix}.{}", field.name())
-        };
-        paths.push(path.clone());
-
-        match field.data_type() {
-            DataType::Struct(inner) => {
-                collect_paths_recursive(inner, &path, paths);
-            }
-            DataType::Array(arr) => {
-                if let DataType::Struct(inner) = &arr.element_type {
-                    collect_paths_recursive(inner, &format!("{path}.element"), paths);
-                }
-            }
-            DataType::Map(map) => {
-                if let DataType::Struct(inner) = &map.key_type {
-                    collect_paths_recursive(inner, &format!("{path}.key"), paths);
-                }
-                if let DataType::Struct(inner) = &map.value_type {
-                    collect_paths_recursive(inner, &format!("{path}.value"), paths);
-                }
-            }
-            _ => {}
+            Err(Error::generic(format!(
+                "Schema validation failed:\n- {}",
+                self.errors.join("\n- ")
+            )))
         }
     }
 }
 
-/// Checks for case-insensitive duplicate column paths.
-fn check_duplicate_columns(paths: &[String]) -> DeltaResult<()> {
-    let mut seen = HashSet::new();
-    let mut duplicates = Vec::new();
-
-    for path in paths {
-        let lower = path.to_lowercase();
-        if !seen.insert(lower) {
-            duplicates.push(path.as_str());
+impl<'a> SchemaTransform<'a> for SchemaValidator {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        if let Err(e) = validate_field_name(field.name(), self.cm_enabled) {
+            self.errors.push(e.to_string());
         }
-    }
 
-    if !duplicates.is_empty() {
-        duplicates.sort();
+        // Check duplicate paths. We use a null-byte separator instead of dots because
+        // column names can contain literal dots when column mapping is enabled. A dot
+        // separator would make column "a.b" indistinguishable from nested field b in
+        // struct a. Null bytes cannot appear in column names, so they are safe to use.
+        self.current_path.push(field.name().to_lowercase());
+        let key = self.current_path.join("\0");
+        if !self.seen_paths.insert(key) {
+            self.errors.push(format!(
+                "Schema contains duplicate column (case-insensitive): '{}'",
+                field.name()
+            ));
+        }
+
+        let result = self.recurse_into_struct_field(field);
+        self.current_path.pop();
+        result
+    }
+}
+
+/// Validates an individual field name.
+///
+/// When column mapping is disabled, rejects names containing Parquet special characters.
+/// When column mapping is enabled, only rejects newlines since physical names are
+/// auto-generated but newlines in column names break metadata serialization regardless
+/// of column mapping mode.
+fn validate_field_name(name: &str, cm_enabled: bool) -> DeltaResult<()> {
+    if name.is_empty() {
+        return Err(Error::generic("Column name cannot be empty"));
+    }
+    if cm_enabled {
+        // Newlines break metadata serialization regardless of column mapping mode.
+        if name.contains('\n') {
+            return Err(Error::generic(format!(
+                "Column name '{name}' contains a newline character, which is not allowed"
+            )));
+        }
+    } else if name.contains(INVALID_PARQUET_CHARS) {
+        let invalid: Vec<char> = name
+            .chars()
+            .filter(|c| INVALID_PARQUET_CHARS.contains(c))
+            .collect();
         return Err(Error::generic(format!(
-            "Schema contains duplicate columns (case-insensitive): {}",
-            duplicates.join(", ")
+            "Column name '{name}' contains invalid character(s) {invalid:?} that are not \
+             allowed in Parquet column names. \
+             Enable column mapping to use special characters in column names."
         )));
     }
     Ok(())
 }
 
-/// Validates column names contain only allowed characters.
-///
-/// When column mapping is disabled, rejects names containing Parquet special characters.
-/// When column mapping is enabled, only rejects newlines (physical names are auto-generated,
-/// but logical names with newlines cause issues in metadata serialization).
-fn validate_column_names(paths: &[String], column_mapping_enabled: bool) -> DeltaResult<()> {
-    for path in paths {
-        // Check each segment of the path individually
-        for segment in path.split('.') {
-            if column_mapping_enabled {
-                if segment.contains('\n') {
-                    return Err(Error::generic(format!(
-                        "Column name '{segment}' contains a newline character, \
-                         which is not allowed"
-                    )));
-                }
-            } else if segment.contains(INVALID_PARQUET_CHARS) {
-                let invalid: Vec<char> = segment
-                    .chars()
-                    .filter(|c| INVALID_PARQUET_CHARS.contains(c))
-                    .collect();
-                return Err(Error::generic(format!(
-                    "Column name '{segment}' contains invalid character(s) \
-                     {invalid:?} that are not allowed in Parquet column names. \
-                     Enable column mapping to use special characters in column names."
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Normalizes partition column names to match the casing in the schema.
-///
-/// Delta stores partition column names case-preserving as they appear in the schema.
-/// This function resolves case-insensitive partition column names to the canonical
-/// casing from the schema.
-pub(crate) fn case_preserving_partition_col_names(
-    schema: &StructType,
-    partition_columns: &[crate::expressions::ColumnName],
-) -> Vec<crate::expressions::ColumnName> {
-    let name_map: std::collections::HashMap<String, String> = schema
-        .fields()
-        .map(|f| (f.name().to_lowercase(), f.name().to_string()))
-        .collect();
-
-    partition_columns
-        .iter()
-        .map(|col| {
-            let path = col.path();
-            if path.len() == 1 {
-                if let Some(canonical) = name_map.get(&path[0].to_lowercase()) {
-                    return crate::expressions::ColumnName::new([canonical.as_str()]);
-                }
-            }
-            col.clone()
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::StructField;
+    use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use rstest::rstest;
+
+    // -- Schema builders for test cases --
 
     fn simple_schema() -> StructType {
         StructType::new_unchecked(vec![
@@ -175,135 +144,174 @@ mod tests {
         ])
     }
 
-    #[test]
-    fn empty_schema_rejected() {
-        let schema = StructType::new_unchecked(vec![]);
-        let result = validate_schema_for_create(&schema, ColumnMappingMode::None);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
-    }
-
-    #[test]
-    fn valid_schema_passes() {
-        let result = validate_schema_for_create(&simple_schema(), ColumnMappingMode::None);
-        assert!(result.is_ok());
-    }
-
-    // -- Column name validation --
-
-    #[test]
-    fn space_in_column_name_rejected_without_cm() {
-        let schema = StructType::new_unchecked(vec![StructField::new(
-            "my column",
-            DataType::INTEGER,
-            false,
-        )]);
-        let result = validate_schema_for_create(&schema, ColumnMappingMode::None);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid character"));
-    }
-
-    #[test]
-    fn semicolon_in_column_name_rejected_without_cm() {
-        let schema =
-            StructType::new_unchecked(vec![StructField::new("col;name", DataType::INTEGER, false)]);
-        let result = validate_schema_for_create(&schema, ColumnMappingMode::None);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid character"));
-    }
-
-    #[test]
-    fn special_chars_allowed_with_column_mapping() {
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("my column", DataType::INTEGER, false),
-            StructField::new("col;name", DataType::STRING, true),
-        ]);
-        let result = validate_schema_for_create(&schema, ColumnMappingMode::Name);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn newline_rejected_even_with_column_mapping() {
-        let schema = StructType::new_unchecked(vec![StructField::new(
-            "col\nname",
-            DataType::INTEGER,
-            false,
-        )]);
-        let result = validate_schema_for_create(&schema, ColumnMappingMode::Name);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("newline"));
-    }
-
-    #[test]
-    fn valid_names_with_underscores_and_digits() {
-        let schema = StructType::new_unchecked(vec![
+    fn schema_with_underscores() -> StructType {
+        StructType::new_unchecked(vec![
             StructField::new("col_1", DataType::INTEGER, false),
             StructField::new("_private", DataType::STRING, true),
             StructField::new("CamelCase123", DataType::LONG, false),
-        ]);
-        let result = validate_schema_for_create(&schema, ColumnMappingMode::None);
-        assert!(result.is_ok());
+        ])
     }
 
-    // -- Deep duplicate detection --
+    fn schema_with_special_chars() -> StructType {
+        StructType::new_unchecked(vec![
+            StructField::new("my column", DataType::INTEGER, false),
+            StructField::new("col;name", DataType::STRING, true),
+        ])
+    }
 
-    #[test]
-    fn nested_duplicate_detected() {
+    fn schema_with_dot() -> StructType {
+        StructType::new_unchecked(vec![
+            StructField::new("a.b", DataType::INTEGER, false),
+            StructField::new("c", DataType::STRING, true),
+        ])
+    }
+
+    fn schema_different_struct_children() -> StructType {
         let inner_a =
             StructType::new_unchecked(vec![StructField::new("child", DataType::INTEGER, false)]);
         let inner_b =
             StructType::new_unchecked(vec![StructField::new("CHILD", DataType::STRING, true)]);
-        let schema = StructType::new_unchecked(vec![
+        StructType::new_unchecked(vec![
             StructField::new("a", DataType::Struct(Box::new(inner_a)), false),
             StructField::new("b", DataType::Struct(Box::new(inner_b)), false),
-        ]);
-        // a.child vs b.CHILD are in different structs so not duplicates
-        let result = validate_schema_for_create(&schema, ColumnMappingMode::None);
-        assert!(result.is_ok());
+        ])
     }
 
-    #[test]
-    fn same_struct_path_duplicate_detected() {
-        // This is caught by StructType::try_new already, but validate_schema_for_create
-        // also catches it via the flattened path check
+    fn schema_with_space() -> StructType {
+        StructType::new_unchecked(vec![StructField::new(
+            "my column",
+            DataType::INTEGER,
+            false,
+        )])
+    }
+
+    fn schema_with_semicolon() -> StructType {
+        StructType::new_unchecked(vec![StructField::new("col;name", DataType::INTEGER, false)])
+    }
+
+    fn schema_with_newline() -> StructType {
+        StructType::new_unchecked(vec![StructField::new(
+            "col\nname",
+            DataType::INTEGER,
+            false,
+        )])
+    }
+
+    fn schema_with_empty_name() -> StructType {
+        StructType::new_unchecked(vec![StructField::new("", DataType::INTEGER, false)])
+    }
+
+    fn schema_nested_bad_char() -> StructType {
+        let inner = StructType::new_unchecked(vec![StructField::new(
+            "bad column",
+            DataType::INTEGER,
+            false,
+        )]);
+        StructType::new_unchecked(vec![StructField::new(
+            "parent",
+            DataType::Struct(Box::new(inner)),
+            false,
+        )])
+    }
+
+    fn schema_array_bad_char() -> StructType {
+        let inner =
+            StructType::new_unchecked(vec![StructField::new("bad col", DataType::INTEGER, false)]);
+        StructType::new_unchecked(vec![StructField::new(
+            "arr",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Struct(Box::new(inner)),
+                true,
+            ))),
+            false,
+        )])
+    }
+
+    fn schema_map_bad_char() -> StructType {
+        let inner =
+            StructType::new_unchecked(vec![StructField::new("bad;val", DataType::INTEGER, false)]);
+        StructType::new_unchecked(vec![StructField::new(
+            "m",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::Struct(Box::new(inner)),
+                true,
+            ))),
+            false,
+        )])
+    }
+
+    fn schema_top_level_dup() -> StructType {
         let inner =
             StructType::new_unchecked(vec![StructField::new("x", DataType::INTEGER, false)]);
-        let schema = StructType::new_unchecked(vec![
+        StructType::new_unchecked(vec![
             StructField::new("a", DataType::Struct(Box::new(inner)), false),
             StructField::new("A", DataType::STRING, true),
+        ])
+    }
+
+    fn schema_array_dup() -> StructType {
+        let inner = StructType::new_unchecked(vec![
+            StructField::new("x", DataType::INTEGER, false),
+            StructField::new("X", DataType::STRING, true),
         ]);
-        let result = validate_schema_for_create(&schema, ColumnMappingMode::None);
+        StructType::new_unchecked(vec![StructField::new(
+            "arr",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Struct(Box::new(inner)),
+                true,
+            ))),
+            false,
+        )])
+    }
+
+    fn schema_multi_bad() -> StructType {
+        StructType::new_unchecked(vec![
+            StructField::new("good", DataType::INTEGER, false),
+            StructField::new("bad column", DataType::STRING, true),
+            StructField::new("col;name", DataType::LONG, false),
+        ])
+    }
+
+    // -- Valid schemas --
+
+    #[rstest]
+    #[case::simple(simple_schema(), ColumnMappingMode::None)]
+    #[case::underscores_digits(schema_with_underscores(), ColumnMappingMode::None)]
+    #[case::special_chars_with_cm(schema_with_special_chars(), ColumnMappingMode::Name)]
+    #[case::dot_in_name_with_cm(schema_with_dot(), ColumnMappingMode::Name)]
+    #[case::different_struct_children(schema_different_struct_children(), ColumnMappingMode::None)]
+    fn valid_schema_accepted(#[case] schema: StructType, #[case] cm: ColumnMappingMode) {
+        assert!(validate_schema_for_create(&schema, cm).is_ok());
+    }
+
+    // -- Invalid schemas --
+
+    #[rstest]
+    #[case::empty_schema(StructType::new_unchecked(vec![]), ColumnMappingMode::None, &["cannot be empty"])]
+    #[case::space_without_cm(schema_with_space(), ColumnMappingMode::None, &["invalid character"])]
+    #[case::semicolon_without_cm(schema_with_semicolon(), ColumnMappingMode::None, &["invalid character"])]
+    #[case::newline_with_cm(schema_with_newline(), ColumnMappingMode::Name, &["newline"])]
+    #[case::empty_name(schema_with_empty_name(), ColumnMappingMode::None, &["cannot be empty"])]
+    #[case::nested_struct_bad_char(schema_nested_bad_char(), ColumnMappingMode::None, &["invalid character"])]
+    #[case::array_nested_bad_char(schema_array_bad_char(), ColumnMappingMode::None, &["invalid character"])]
+    #[case::map_nested_bad_char(schema_map_bad_char(), ColumnMappingMode::None, &["invalid character"])]
+    #[case::top_level_dup(schema_top_level_dup(), ColumnMappingMode::None, &["duplicate"])]
+    #[case::array_element_dup(schema_array_dup(), ColumnMappingMode::None, &["duplicate"])]
+    #[case::multi_error(schema_multi_bad(), ColumnMappingMode::None, &["bad column", "col;name"])]
+    fn invalid_schema_rejected(
+        #[case] schema: StructType,
+        #[case] cm: ColumnMappingMode,
+        #[case] expected_errs: &[&str],
+    ) {
+        let result = validate_schema_for_create(&schema, cm);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("duplicate"));
-    }
-
-    // -- Case-preserving partition column names --
-
-    #[test]
-    fn partition_column_name_case_preserved() {
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("EventDate", DataType::DATE, false),
-        ]);
-        let columns = vec![crate::expressions::ColumnName::new(["eventdate"])];
-        let result = case_preserving_partition_col_names(&schema, &columns);
-        assert_eq!(result[0].path(), ["EventDate"]);
-    }
-
-    #[test]
-    fn partition_column_name_already_matches() {
-        let schema = StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("date", DataType::DATE, false),
-        ]);
-        let columns = vec![crate::expressions::ColumnName::new(["date"])];
-        let result = case_preserving_partition_col_names(&schema, &columns);
-        assert_eq!(result[0].path(), ["date"]);
+        let err = result.unwrap_err().to_string();
+        for expected in expected_errs {
+            assert!(
+                err.contains(expected),
+                "Expected '{expected}' in error, got: {err}"
+            );
+        }
     }
 }
