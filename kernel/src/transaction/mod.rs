@@ -525,11 +525,11 @@ impl<S> Transaction<S> {
         ) {
             (true, true) | (false, false) => Ok(()),
             (false, true) => Err(Error::generic(
-                "A catalog committer must be used to commit to catalog-managed tables. \
+                "This table is catalog-managed and requires a catalog committer. \
                  Please provide a catalog committer via Snapshot::transaction().",
             )),
             (true, false) => Err(Error::generic(
-                "A catalog committer cannot be used to commit to path-based tables.",
+                "This table is path-based and cannot be committed to with a catalog committer.",
             )),
         }
     }
@@ -2303,7 +2303,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("A catalog committer cannot be used to commit to path-based tables")
+            crate::Error::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
 
@@ -2325,7 +2325,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("A catalog committer cannot be used to commit to path-based tables")
+            crate::Error::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
 }
