@@ -288,7 +288,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// parquet file, and constructing the Add action metadata.
     ///
     /// Custom engine implementations that bypass this method (e.g., for custom compression or
-    /// Hive-style partition paths) should use [`Scalar::serialize_partition_value`] to produce
+    /// Hive-style partition paths) may use [`Scalar::serialize_partition_value`] to produce
     /// correctly serialized strings for the `partitionValues` map, and the utilities in
     /// [`partition`] for Hive-style path encoding.
     ///
@@ -317,10 +317,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 let physical_name = field
                     .physical_name(write_context.column_mapping_mode())
                     .to_string();
-                // Serialize the typed scalar to a protocol-compliant string.
-                // None (null) becomes "" (empty string), which as_record_batch converts
-                // to a null map value per the Delta protocol convention.
-                let serialized = value.serialize_partition_value()?.unwrap_or_default();
+                let serialized = value.serialize_partition_value()?;
                 Ok((physical_name, serialized))
             })
             .try_collect()?;
