@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Display, Formatter, Write as _};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use itertools::Itertools;
@@ -353,15 +353,16 @@ impl Scalar {
             }
             // String Display wraps in quotes ('hello'), but protocol wants raw value
             Self::String(s) => Ok(Some(s.clone())),
-            // Binary partition value serialization requires Unicode escape encoding per the
-            // Delta protocol (e.g. [0x01, 0x02] becomes "\u0001\u0002"), but the read-side
-            // parse_scalar does not yet decode this format. Return an error until both
-            // serialize and parse are implemented for Binary partition values.
-            Self::Binary(_) => Err(Error::generic(
-                "Binary partition value serialization is not yet supported. The Delta \
-                 protocol requires Unicode escape encoding, but the read-side parser does \
-                 not yet decode this format.",
-            )),
+            // Binary: encoded as a string of escaped binary values per the Delta protocol.
+            // Example: [0x01, 0x02, 0x03] becomes "\u0001\u0002\u0003".
+            Self::Binary(v) => {
+                let mut s = std::string::String::with_capacity(v.len() * 6);
+                for &byte in v.iter() {
+                    write!(s, "\\u{byte:04X}")
+                        .map_err(|_| Error::generic("failed to format binary partition value"))?;
+                }
+                Ok(Some(s))
+            }
             // Date Display prints raw days-since-epoch (20178), but protocol wants YYYY-MM-DD
             Self::Date(days) => {
                 let date = DateTime::UNIX_EPOCH + chrono::Duration::days(*days as i64);
@@ -808,7 +809,31 @@ impl PrimitiveType {
 
         match self {
             String => Ok(Scalar::String(raw.to_string())),
-            Binary => Ok(Scalar::Binary(raw.to_string().into_bytes())),
+            Binary => {
+                // The Delta protocol encodes binary partition values as Unicode escape
+                // sequences like "\u0001\u0002\u0003". Decode them back to bytes.
+                if raw.contains("\\u") {
+                    let mut bytes = Vec::new();
+                    let mut chars = raw.chars().peekable();
+                    while let Some(c) = chars.next() {
+                        if c == '\\' && chars.peek() == Some(&'u') {
+                            chars.next(); // consume 'u'
+                            let hex: std::string::String = chars.by_ref().take(4).collect();
+                            let byte =
+                                u8::from_str_radix(&hex, 16).map_err(|_| self.parse_error(raw))?;
+                            bytes.push(byte);
+                        } else {
+                            // Non-escaped characters are stored as UTF-8 bytes
+                            let mut buf = [0u8; 4];
+                            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
+                    Ok(Scalar::Binary(bytes))
+                } else {
+                    // Fallback: treat the raw string as UTF-8 bytes (backwards compatibility)
+                    Ok(Scalar::Binary(raw.to_string().into_bytes()))
+                }
+            }
             Byte => self.parse_str_as_scalar(raw, Scalar::Byte),
             Decimal(dtype) => Self::parse_decimal(raw, *dtype),
             Short => self.parse_str_as_scalar(raw, Scalar::Short),
@@ -1608,9 +1633,67 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_partition_value_binary_returns_error() {
+    fn test_serialize_partition_value_binary_uses_unicode_escapes() {
         let s = Scalar::Binary(vec![0x01, 0x02, 0x03]);
-        assert!(s.serialize_partition_value().is_err());
+        let result = s.serialize_partition_value().unwrap().unwrap();
+        assert_eq!(result, "\\u0001\\u0002\\u0003");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_round_trips_through_parse() {
+        let original = vec![0x01, 0x48, 0x65, 0x6C, 0x6C, 0x6F]; // \x01Hello
+        let serialized = Scalar::Binary(original.clone())
+            .serialize_partition_value()
+            .unwrap()
+            .unwrap();
+        let parsed = PrimitiveType::Binary.parse_scalar(&serialized).unwrap();
+        assert_eq!(parsed, Scalar::Binary(original));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_empty_produces_empty_string() {
+        let s = Scalar::Binary(vec![]);
+        let result = s.serialize_partition_value().unwrap().unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_null_byte() {
+        let s = Scalar::Binary(vec![0x00]);
+        let result = s.serialize_partition_value().unwrap().unwrap();
+        assert_eq!(result, "\\u0000");
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_all_byte_values_round_trip() {
+        // Every possible byte value 0x00-0xFF should round-trip correctly
+        let all_bytes: Vec<u8> = (0x00..=0xFF).collect();
+        let serialized = Scalar::Binary(all_bytes.clone())
+            .serialize_partition_value()
+            .unwrap()
+            .unwrap();
+        let parsed = PrimitiveType::Binary.parse_scalar(&serialized).unwrap();
+        assert_eq!(parsed, Scalar::Binary(all_bytes));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_binary_high_bytes_round_trip() {
+        // Bytes >= 0x80 that would corrupt with `b as char` approach
+        let high_bytes = vec![0x80, 0xFF, 0xC3, 0xBC, 0xFE];
+        let serialized = Scalar::Binary(high_bytes.clone())
+            .serialize_partition_value()
+            .unwrap()
+            .unwrap();
+        assert_eq!(serialized, "\\u0080\\u00FF\\u00C3\\u00BC\\u00FE");
+        let parsed = PrimitiveType::Binary.parse_scalar(&serialized).unwrap();
+        assert_eq!(parsed, Scalar::Binary(high_bytes));
+    }
+
+    #[test]
+    fn test_parse_binary_without_escapes_falls_back_to_raw_utf8() {
+        // Backwards compatibility: strings without \u escapes are treated as raw UTF-8 bytes
+        let parsed = PrimitiveType::Binary.parse_scalar("hello").unwrap();
+        assert_eq!(parsed, Scalar::Binary(b"hello".to_vec()));
     }
 
     #[test]

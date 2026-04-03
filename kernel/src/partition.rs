@@ -49,7 +49,9 @@ pub const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 ///
 /// Escaped set (matches Hive/Spark):
 ///   - ASCII control characters 0x00-0x1F
-///   - `"` `#` `%` `'` `*` `/` `:` `=` `?` `\` DEL(0x7F) `{` `}` `[` `]` `^`
+///   - `"` `#` `%` `'` `*` `/` `:` `=` `?` `\` DEL(0x7F) `{` `[` `]` `^`
+///
+/// Note: `}` (0x7D) is NOT escaped, matching the Hive source. Only `{` is in the set.
 fn needs_escaping(b: u8) -> bool {
     matches!(
         b,
@@ -66,7 +68,6 @@ fn needs_escaping(b: u8) -> bool {
             | b'\\'
             | 0x7F
             | b'{'
-            | b'}'
             | b'['
             | b']'
             | b'^'
@@ -76,7 +77,7 @@ fn needs_escaping(b: u8) -> bool {
 /// Percent-encodes a string for use in a Hive-style partition path segment.
 ///
 /// Encodes ASCII control characters (0x00-0x1F), DEL (0x7F), and the characters
-/// `"` `#` `%` `'` `*` `/` `:` `=` `?` `\` `{` `}` `[` `]` `^`. Everything else,
+/// `"` `#` `%` `'` `*` `/` `:` `=` `?` `\` `{` `[` `]` `^`. Everything else,
 /// including spaces (0x20) and non-ASCII characters, passes through unchanged. This
 /// matches the behavior of Hive's `FileUtils.escapePathName` and Spark's
 /// `ExternalCatalogUtils.escapePathName`.
@@ -244,11 +245,17 @@ mod tests {
             ("[", "%5B"),
             ("]", "%5D"),
             ("^", "%5E"),
-            ("}", "%7D"),
         ];
         for (input, expected) in cases {
             assert_eq!(escape_partition_value(input), expected, "input: {input:?}");
         }
+    }
+
+    #[test]
+    fn test_closing_brace_not_escaped() {
+        // Per Hive source, only `{` is escaped, not `}`.
+        assert_eq!(escape_partition_value("}"), "}");
+        assert_eq!(escape_partition_value("a}b"), "a}b");
     }
 
     #[test]
