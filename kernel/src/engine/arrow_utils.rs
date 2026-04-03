@@ -1130,9 +1130,21 @@ pub(crate) fn reorder_struct_array(
                     ));
                 }
                 ReorderIndexTransform::Missing(field) => {
-                    let null_array = Arc::new(new_null_array(field.data_type(), num_rows));
-                    let field = field.clone(); // cheap Arc clone
-                    final_fields_cols[reorder_index.index] = Some((field, null_array));
+                    let array = match (field.is_nullable(), field.data_type()) {
+                        (false, ArrowDataType::Struct(child_fields)) => {
+                            // Non-nullable struct whose children are all missing: create a
+                            // non-null struct array with null children rather than a wholly
+                            // null array, which would violate the non-null constraint.
+                            let child_arrays: Vec<Arc<dyn ArrowArray>> = child_fields
+                                .iter()
+                                .map(|f| new_null_array(f.data_type(), num_rows))
+                                .collect();
+                            Arc::new(StructArray::new(child_fields.clone(), child_arrays, None))
+                                as Arc<dyn ArrowArray>
+                        }
+                        _ => new_null_array(field.data_type(), num_rows),
+                    };
+                    final_fields_cols[reorder_index.index] = Some((field.clone(), array));
                 }
                 ReorderIndexTransform::RowIndex(field) => {
                     let Some(ref mut row_index_iter) = row_indexes else {
@@ -4275,7 +4287,7 @@ mod tests {
     }
 
     #[test]
-    fn struct_with_all_nullable_children_unmatched_is_not_an_error() {
+    fn non_nullable_struct_with_all_nullable_children_unmatched() {
         // Requested schema has a non-nullable struct `info` with a nullable child `z`.
         // Parquet has `info` with different children `x` and `y` (no `z`).
         // Since `z` is nullable, the struct should be returned with `z` as null rather
@@ -4301,18 +4313,74 @@ mod tests {
                 false,
             ),
         ]));
-        let result = get_requested_indices(&requested_schema, &parquet_schema);
-        assert!(
-            result.is_ok(),
-            "Expected Ok when struct children are all nullable and unmatched, got: {:?}",
-            result.unwrap_err()
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        // Only "a" should be in the mask; the struct's children don't match any leaves
+        assert_eq!(mask_indices, vec![0]);
+        let expected_info_field = Arc::new(
+            requested_schema
+                .field("info")
+                .unwrap()
+                .try_into_arrow()
+                .unwrap(),
+        );
+        assert_eq!(
+            reorder_indices,
+            vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::missing(1, expected_info_field),
+            ]
+        );
+    }
+
+    #[test]
+    fn nullable_struct_with_all_nullable_children_unmatched() {
+        // Same as above but with a nullable struct. The struct should also be treated
+        // as missing (synthesized as null).
+        let requested_schema = Arc::new(StructType::new_unchecked([
+            StructField::not_null("a", DataType::LONG),
+            StructField::nullable(
+                "info",
+                StructType::new_unchecked([StructField::nullable("z", DataType::LONG)]),
+            ),
+        ]));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int64, true),
+            ArrowField::new(
+                "info",
+                ArrowDataType::Struct(
+                    vec![
+                        ArrowField::new("x", ArrowDataType::Int64, true),
+                        ArrowField::new("y", ArrowDataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        assert_eq!(mask_indices, vec![0]);
+        let expected_info_field = Arc::new(
+            requested_schema
+                .field("info")
+                .unwrap()
+                .try_into_arrow()
+                .unwrap(),
+        );
+        assert_eq!(
+            reorder_indices,
+            vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::missing(1, expected_info_field),
+            ]
         );
     }
 
     #[test]
     fn empty_struct_is_matched() {
         // Delta protocol allows empty structs. An empty struct has no children, so no
-        // leaf columns are selected — but the struct itself should still be matched.
+        // leaf columns are selected, but the struct itself should still be matched.
         let requested_schema = Arc::new(StructType::new_unchecked([
             StructField::not_null("a", DataType::LONG),
             StructField::not_null("empty", StructType::new_unchecked([])),
@@ -4321,11 +4389,22 @@ mod tests {
             ArrowField::new("a", ArrowDataType::Int64, true),
             ArrowField::new("empty", ArrowDataType::Struct(ArrowFields::empty()), false),
         ]));
-        let result = get_requested_indices(&requested_schema, &parquet_schema);
-        assert!(
-            result.is_ok(),
-            "Expected Ok for empty struct, got: {:?}",
-            result.unwrap_err()
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        assert_eq!(mask_indices, vec![0]);
+        let expected_empty_field = Arc::new(
+            requested_schema
+                .field("empty")
+                .unwrap()
+                .try_into_arrow()
+                .unwrap(),
+        );
+        assert_eq!(
+            reorder_indices,
+            vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::missing(1, expected_empty_field),
+            ]
         );
     }
 }
