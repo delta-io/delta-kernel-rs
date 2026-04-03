@@ -40,7 +40,7 @@ Snapshot builder API (`ffi/src/lib.rs`):
 - `get_snapshot_builder(path, engine)` -- fresh snapshot from a table path
 - `get_snapshot_builder_from(old_snapshot, engine)` -- incremental update reusing an existing snapshot (avoids re-reading the log)
 - `snapshot_builder_set_version(builder, version)` -- optional: pin to a specific version
-- `snapshot_builder_set_log_tail(builder, log_tail)` -- optional: set log tail (catalog-managed feature)
+- `snapshot_builder_set_log_tail(builder, log_tail)` -- optional: set log tail (for catalog-managed tables)
 - `snapshot_builder_build(builder)` -- consume the builder and produce a `SharedSnapshot`
 - `free_snapshot_builder(builder)` -- discard without building (e.g. on error paths)
 
