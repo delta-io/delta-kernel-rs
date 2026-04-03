@@ -83,7 +83,7 @@ pub(crate) struct RowTrackingVisitor {
 
 impl RowTrackingVisitor {
     /// Default value for an absent high water mark
-    const DEFAULT_HIGH_WATER_MARK: i64 = -1;
+    pub(crate) const DEFAULT_HIGH_WATER_MARK: i64 = -1;
 
     pub(crate) fn new(row_id_high_water_mark: Option<i64>, num_batches: Option<usize>) -> Self {
         // A table might not have a row ID high water mark yet, so we model the input as an Option<i64>

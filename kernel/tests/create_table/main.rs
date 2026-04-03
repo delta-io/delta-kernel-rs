@@ -5,6 +5,7 @@ mod column_mapping;
 mod ctas;
 mod ict;
 mod partitioned;
+mod row_tracking;
 mod timestamp_ntz;
 mod variant;
 
