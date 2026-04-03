@@ -771,11 +771,12 @@ mod tests {
             let engine = get_default_engine(table_path_str);
 
             let snapshot = unsafe {
-                ok_or_panic(crate::snapshot(
+                ok_or_panic(crate::get_snapshot_builder(
                     kernel_string_slice!(table_path_str),
                     engine.shallow_copy(),
                 ))
             };
+            let snapshot = unsafe { ok_or_panic(crate::snapshot_builder_build(snapshot)) };
 
             let context = get_test_context(false);
 

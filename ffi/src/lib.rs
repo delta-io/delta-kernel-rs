@@ -865,97 +865,6 @@ pub unsafe extern "C" fn free_snapshot_builder(builder: Handle<MutableFfiSnapsho
     builder.drop_handle();
 }
 
-/// Get the latest snapshot from the specified table.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles and path pointer.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot(
-    path: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<SharedSnapshot>> {
-    let builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
-        ExternResult::Ok(ptr) => ptr,
-        ExternResult::Err(e) => return ExternResult::Err(e),
-    };
-    unsafe { snapshot_builder_build(builder_ptr) }
-}
-
-/// Get the latest snapshot from the specified table with a log tail for catalog-managed tables.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles and path pointer.
-/// The log_paths array and its contents must remain valid for the duration of this call.
-#[cfg(feature = "catalog-managed")]
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_with_log_tail(
-    path: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-    log_paths: log_path::LogPathArray,
-) -> ExternResult<Handle<SharedSnapshot>> {
-    let mut builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
-        ExternResult::Ok(ptr) => ptr,
-        ExternResult::Err(e) => return ExternResult::Err(e),
-    };
-    if let ExternResult::Err(e) =
-        unsafe { snapshot_builder_set_log_tail(&mut builder_ptr, log_paths) }
-    {
-        unsafe { free_snapshot_builder(builder_ptr) };
-        return ExternResult::Err(e);
-    }
-    unsafe { snapshot_builder_build(builder_ptr) }
-}
-
-/// Get the snapshot from the specified table at a specific version. Note this is only safe for
-/// non-catalog-managed tables.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles and path pointer.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_at_version(
-    path: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-    version: Version,
-) -> ExternResult<Handle<SharedSnapshot>> {
-    let mut builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
-        ExternResult::Ok(ptr) => ptr,
-        ExternResult::Err(e) => return ExternResult::Err(e),
-    };
-    unsafe { snapshot_builder_set_version(&mut builder_ptr, version) };
-    unsafe { snapshot_builder_build(builder_ptr) }
-}
-
-/// Get the snapshot from the specified table at a specific version with a log tail.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles and path pointer.
-/// The log_tail array and its contents must remain valid for the duration of this call.
-#[cfg(feature = "catalog-managed")]
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
-    path: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-    version: Version,
-    log_tail: log_path::LogPathArray,
-) -> ExternResult<Handle<SharedSnapshot>> {
-    let mut builder_ptr = match unsafe { get_snapshot_builder(path, engine) } {
-        ExternResult::Ok(ptr) => ptr,
-        ExternResult::Err(e) => return ExternResult::Err(e),
-    };
-    unsafe { snapshot_builder_set_version(&mut builder_ptr, version) };
-    if let ExternResult::Err(e) =
-        unsafe { snapshot_builder_set_log_tail(&mut builder_ptr, log_tail) }
-    {
-        unsafe { free_snapshot_builder(builder_ptr) };
-        return ExternResult::Err(e);
-    }
-    unsafe { snapshot_builder_build(builder_ptr) }
-}
-
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
@@ -1286,8 +1195,13 @@ mod tests {
             Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
             allocate_err,
         );
-        let snap =
-            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+        let snap = unsafe {
+            ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+            ))
+        };
+        let snap = unsafe { ok_or_panic(snapshot_builder_build(snap)) };
         Ok((storage, engine, snap))
     }
 
@@ -1316,18 +1230,24 @@ mod tests {
 
         // Test getting snapshot at version
         let snapshot2 = unsafe {
-            ok_or_panic(snapshot_at_version(
+            let mut ptr = ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
-                0,
-            ))
+            ));
+            snapshot_builder_set_version(&mut ptr, 0);
+            ok_or_panic(snapshot_builder_build(ptr))
         };
         let version2 = unsafe { version(snapshot2.shallow_copy()) };
         assert_eq!(version2, 0);
 
         // Test getting non-existent snapshot
         let snapshot_at_non_existent_version = unsafe {
-            snapshot_at_version(kernel_string_slice!(table_root), engine.shallow_copy(), 1)
+            let mut ptr = ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ));
+            snapshot_builder_set_version(&mut ptr, 1);
+            snapshot_builder_build(ptr)
         };
         assert_extern_result_error_with_message(snapshot_at_non_existent_version, KernelError::GenericError, Some("Generic delta kernel error: LogSegment end version 0 not the same as the specified end version 1"));
 
@@ -1460,11 +1380,12 @@ mod tests {
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let snap = unsafe {
-            ok_or_panic(snapshot(
+            ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))
         };
+        let snap = unsafe { ok_or_panic(snapshot_builder_build(snap)) };
 
         extern "C" fn collect_property(
             engine_context: NullableCvoid,
@@ -1533,11 +1454,12 @@ mod tests {
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let snapshot = unsafe {
-            ok_or_panic(snapshot(
+            ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))
         };
+        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(snapshot)) };
 
         let did_checkpoint = unsafe {
             ok_or_panic(checkpoint_snapshot(
@@ -1633,11 +1555,12 @@ mod tests {
         let engine = unsafe { ok_or_panic(builder_build(builder)) };
 
         let snapshot = unsafe {
-            ok_or_panic(snapshot(
+            ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))
         };
+        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(snapshot)) };
 
         let did_checkpoint = unsafe {
             ok_or_panic(checkpoint_snapshot(
@@ -1668,11 +1591,12 @@ mod tests {
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let snapshot = unsafe {
-            ok_or_panic(snapshot(
+            ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))
         };
+        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(snapshot)) };
 
         let partition_count = unsafe { get_partition_column_count(snapshot.shallow_copy()) };
         assert_eq!(partition_count, 1, "Should have one partition");
@@ -1711,7 +1635,12 @@ mod tests {
 
         // Get a non-existent snapshot, this will call allocate_null_err
         let snapshot_at_non_existent_version = unsafe {
-            snapshot_at_version(kernel_string_slice!(table_root), engine.shallow_copy(), 1)
+            let mut ptr = ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ));
+            snapshot_builder_set_version(&mut ptr, 1);
+            snapshot_builder_build(ptr)
         };
         assert!(snapshot_at_non_existent_version.is_err());
 
@@ -1746,23 +1675,25 @@ mod tests {
             len: log_tail.len(),
         };
         let snapshot = unsafe {
-            ok_or_panic(snapshot_with_log_tail(
+            let mut ptr = ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
-                log_tail.clone(),
-            ))
+            ));
+            ok_or_panic(snapshot_builder_set_log_tail(&mut ptr, log_tail.clone()));
+            ok_or_panic(snapshot_builder_build(ptr))
         };
         let snapshot_version = unsafe { version(snapshot.shallow_copy()) };
         assert_eq!(snapshot_version, 1);
 
         // Test getting snapshot at version
         let snapshot2 = unsafe {
-            ok_or_panic(snapshot_at_version_with_log_tail(
+            let mut ptr = ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
-                1,
-                log_tail,
-            ))
+            ));
+            snapshot_builder_set_version(&mut ptr, 1);
+            ok_or_panic(snapshot_builder_set_log_tail(&mut ptr, log_tail));
+            ok_or_panic(snapshot_builder_build(ptr))
         };
         let snapshot_version = unsafe { version(snapshot2.shallow_copy()) };
         assert_eq!(snapshot_version, 1);

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::error::{EngineError, ExternResult, KernelError};
 #[cfg(test)]
-use crate::{engine_to_handle, kernel_string_slice, snapshot};
+use crate::{engine_to_handle, get_snapshot_builder, kernel_string_slice, snapshot_builder_build};
 use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 #[cfg(test)]
 use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -85,11 +85,12 @@ pub(crate) async fn setup_snapshot(
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
     let engine = engine_to_handle(Arc::new(engine), allocate_err);
     let snap = unsafe {
-        ok_or_panic(snapshot(
+        ok_or_panic(get_snapshot_builder(
             kernel_string_slice!(table_root),
             engine.shallow_copy(),
         ))
     };
+    let snap = unsafe { ok_or_panic(snapshot_builder_build(snap)) };
     Ok((engine, snap))
 }
 
