@@ -60,15 +60,17 @@ pub(crate) fn ok_or_panic<T>(result: ExternResult<T>) -> T {
 pub(crate) fn assert_extern_result_error_with_message<T>(
     res: ExternResult<T>,
     expected_etype: KernelError,
-    expected_message: &str,
+    opt_message: Option<&str>,
 ) {
     match res {
         ExternResult::Err(e) => {
             let error = unsafe { recover_error(e) };
             assert_eq!(error.etype, expected_etype);
-            assert_eq!(error.message, expected_message);
+            if let Some(expected_message) = opt_message {
+                assert_eq!(error.message, expected_message);
+            }
         }
-        _ => panic!("Expected error of type '{expected_etype:?}' and message '{expected_message}'"),
+        _ => panic!("Expected error of type '{expected_etype:?}' and message '{opt_message:?}'"),
     }
 }
 
