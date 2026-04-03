@@ -24,14 +24,14 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     assign_column_mapping_metadata, get_any_level_column_physical_name,
     get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
-    EnablementCheck, FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
-    SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    EnablementCheck, FeatureRequirement, FeatureType, TableFeature,
+    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
     ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_TYPE_WIDENING, SET_TRANSACTION_RETENTION_DURATION,
+    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -65,6 +65,7 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::AppendOnly,
     TableFeature::ChangeDataFeed,
     TableFeature::TypeWidening,
+    TableFeature::RowTracking,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
@@ -85,6 +86,7 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     ENABLE_CHANGE_DATA_FEED,
     ENABLE_TYPE_WIDENING,
     APPEND_ONLY,
+    ENABLE_ROW_TRACKING,
     // Set transaction retention duration: controls expiration of txn identifiers
     SET_TRANSACTION_RETENTION_DURATION,
 ];
@@ -181,8 +183,8 @@ fn add_feature_to_lists(
 
 /// Configures clustering support for table creation (used by unit tests).
 ///
-/// Validates clustering columns, adds required features (DomainMetadata, ClusteredTable),
-/// and creates the domain metadata action.
+/// Validates clustering columns, adds the `ClusteredTable` feature, and creates the domain
+/// metadata action.
 fn apply_clustering_for_table_create(
     logical_schema: &SchemaRef,
     logical_columns: &[ColumnName],
@@ -283,8 +285,8 @@ fn validate_partition_columns(
 /// Handles all [`DataLayout`] variants:
 ///
 /// - **None**: Returns defaults (no domain metadata, no clustering/partition columns).
-/// - **Clustered**: Validates clustering columns, resolves to physical names, adds
-///   `DomainMetadata` + `ClusteredTable` features, creates clustering domain metadata.
+/// - **Clustered**: Validates clustering columns, resolves to physical names, adds the
+///   `ClusteredTable` feature, creates clustering domain metadata.
 /// - **Partitioned**: Validates partition columns and stores logical names. No domain
 ///   metadata or special features are needed (partitioning is a core Delta feature).
 fn apply_data_layout(
@@ -306,11 +308,6 @@ fn apply_data_layout(
                 })
                 .try_collect()?;
 
-            add_feature_to_lists(
-                TableFeature::DomainMetadata,
-                &mut validated.reader_features,
-                &mut validated.writer_features,
-            );
             add_feature_to_lists(
                 TableFeature::ClusteredTable,
                 &mut validated.reader_features,
@@ -376,6 +373,48 @@ fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProp
                     &mut validated.writer_features,
                 );
             }
+        }
+    }
+}
+
+/// Resolves [`FeatureRequirement::Supported`] dependencies for all enabled features.
+///
+/// For each feature in `writer_features` and `reader_features`, checks its
+/// [`FeatureInfo::feature_requirements`] and adds any `Supported` dependencies that aren't
+/// already present. Other requirement variants (`Enabled`, `NotSupported`, `NotEnabled`,
+/// `Custom`) are validation checks enforced at read/write time, not enablement actions.
+///
+/// This must be called after all features have been added (property-driven enablement,
+/// schema-driven enablement, data layout features, catalog-managed ICT) so that the full
+/// set of dependencies is resolved.
+///
+/// Dependencies are resolved transitively: if feature A requires B and B requires C, all
+/// three will be present after this call.
+fn resolve_feature_dependencies(validated: &mut ValidatedTableProperties) {
+    loop {
+        let deps: Vec<TableFeature> = validated
+            .writer_features
+            .iter()
+            .chain(&validated.reader_features)
+            .flat_map(|f| f.info().feature_requirements)
+            .filter_map(|req| match req {
+                FeatureRequirement::Supported(dep) => Some(dep.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let mut changed = false;
+        for dep in deps {
+            let before = validated.writer_features.len() + validated.reader_features.len();
+            add_feature_to_lists(
+                dep,
+                &mut validated.reader_features,
+                &mut validated.writer_features,
+            );
+            changed |= validated.writer_features.len() + validated.reader_features.len() != before;
+        }
+        if !changed {
+            break;
         }
     }
 }
@@ -721,6 +760,10 @@ impl CreateTableTransactionBuilder {
 
         // Auto-enable inCommitTimestamp for catalogManaged tables
         maybe_enable_ict_for_catalog_managed(&mut validated)?;
+
+        // Resolve Supported dependencies for all enabled features (e.g. RowTracking and
+        // ClusteredTable both require DomainMetadata). Runs last so all features are present.
+        resolve_feature_dependencies(&mut validated);
 
         // Create Protocol action with table features support
         let protocol =
@@ -1258,6 +1301,9 @@ mod tests {
         )
         .unwrap();
 
+        // Resolve dependencies (e.g. ClusteredTable -> DomainMetadata)
+        resolve_feature_dependencies(&mut validated);
+
         assert_eq!(
             !result.system_domain_metadata.is_empty(),
             expectation.has_domain_metadata
@@ -1419,6 +1465,61 @@ mod tests {
         assert_eq!(
             validated.properties.get(ENABLE_IN_COMMIT_TIMESTAMPS),
             Some(&"true".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_row_tracking_property_enables_features() {
+        let properties: HashMap<String, String> =
+            [(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]
+                .into_iter()
+                .collect();
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        maybe_auto_enable_property_driven_features(&mut validated);
+        resolve_feature_dependencies(&mut validated);
+
+        // RowTracking should be in writer features (WriterOnly)
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::RowTracking),
+            "Expected RowTracking in writer_features"
+        );
+        // DomainMetadata dependency should also be added (WriterOnly)
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::DomainMetadata),
+            "Expected DomainMetadata in writer_features"
+        );
+    }
+
+    #[test]
+    fn test_row_tracking_feature_signal_enables_domain_metadata_dependency() {
+        let properties: HashMap<String, String> = [(
+            "delta.feature.rowTracking".to_string(),
+            "supported".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+
+        // Feature signal adds RowTracking directly
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::RowTracking));
+        // But DomainMetadata is not yet added (auto-enablement doesn't handle dependencies)
+        assert!(!validated
+            .writer_features
+            .contains(&TableFeature::DomainMetadata));
+
+        // resolve_feature_dependencies should add the DomainMetadata dependency
+        resolve_feature_dependencies(&mut validated);
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::DomainMetadata),
+            "Expected DomainMetadata dependency to be added"
         );
     }
 
