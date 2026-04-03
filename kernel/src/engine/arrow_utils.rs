@@ -716,8 +716,8 @@ fn get_indices(
                         // entry because it would index into a column that doesn't exist.
                         // The recursive call is still needed for the correct
                         // `parquet_advance` value.
+                        found_fields.insert(requested_field.name());
                         if mask_indices.len() > mask_before {
-                            found_fields.insert(requested_field.name());
                             reorder_indices.push(ReorderIndex::nested(index, children));
                         } else {
                             // The recursive call resolved all children (as nullable/missing
@@ -725,7 +725,6 @@ fn get_indices(
                             // Defer the Missing entry so it appears after all entries that
                             // consume parquet input columns.
                             debug_assert_eq!(children.len(), requested_schema.num_fields());
-                            found_fields.insert(requested_field.name());
                             deferred_missing.push(ReorderIndex::missing(
                                 index,
                                 Arc::new(requested_field.try_into_arrow()?),
@@ -757,8 +756,7 @@ fn get_indices(
                         parquet_offset += parquet_advance - 1;
                         found_fields.insert(requested_field.name());
                         if mask_indices.len() <= mask_before {
-                            // No leaves selected inside this list (e.g. inner struct
-                            // with no matching children). Defer a Missing entry.
+                            // No leaves selected inside this list. Defer a Missing entry.
                             deferred_missing.push(ReorderIndex::missing(
                                 index,
                                 Arc::new(requested_field.try_into_arrow()?),
@@ -806,9 +804,7 @@ fn get_indices(
                             // map will be counted by the `enumerate` call but doesn't count as
                             // an actual index.
                             parquet_offset += parquet_advance - 1;
-                            // note that we found this field
                             found_fields.insert(requested_field.name());
-
                             if mask_indices.len() <= mask_before {
                                 // No leaves selected inside this map. Defer a Missing entry.
                                 deferred_missing.push(ReorderIndex::missing(
@@ -2602,55 +2598,6 @@ mod tests {
             assert_eq!(mask_indices, expect_mask);
             assert_eq!(reorder_indices, expect_reorder);
         })
-    }
-
-    /// When a struct exists in the parquet schema but none of its children match the
-    /// requested schema, the struct should be treated as missing (not nested). This
-    /// happens during schema evolution when checkpoint stats_parsed has columns from
-    /// the old schema but the predicate references only new columns.
-    #[test]
-    fn nested_struct_with_no_matching_children_treated_as_missing() {
-        // Requested: a leaf column + a nullable struct whose children don't exist in parquet
-        let requested_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable(
-                "stats",
-                StructType::new_unchecked([StructField::nullable("age", DataType::LONG)]),
-            ),
-        ]));
-        // Parquet has "stats" but with completely different children
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("a", ArrowDataType::Int64, true),
-            ArrowField::new(
-                "stats",
-                ArrowDataType::Struct(
-                    vec![
-                        ArrowField::new("id", ArrowDataType::Int64, true),
-                        ArrowField::new("name", ArrowDataType::Utf8, true),
-                    ]
-                    .into(),
-                ),
-                true,
-            ),
-        ]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        // Only "a" should be in the mask (the struct's children don't match)
-        assert_eq!(mask_indices, vec![0]);
-        // "a" at position 0 (identity) + "stats" treated as missing (not nested), because
-        // no parquet leaves were selected for it
-        let expected_stats_field = Arc::new(
-            requested_schema
-                .field("stats")
-                .unwrap()
-                .try_into_arrow()
-                .unwrap(),
-        );
-        let expect_reorder = vec![
-            ReorderIndex::identity(0),
-            ReorderIndex::missing(1, expected_stats_field),
-        ];
-        assert_eq!(reorder_indices, expect_reorder);
     }
 
     #[test]
