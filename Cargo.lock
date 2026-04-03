@@ -1300,8 +1300,10 @@ name = "delta_kernel_benchmarks"
 version = "0.20.0"
 dependencies = [
  "criterion",
+ "delta-kernel-unity-catalog",
  "delta_kernel",
  "flate2",
+ "object_store",
  "rayon",
  "rstest",
  "serde",
@@ -1309,6 +1311,9 @@ dependencies = [
  "sqlparser",
  "tar",
  "test_utils",
+ "tokio",
+ "unity-catalog-delta-client-api",
+ "unity-catalog-delta-rest-client",
  "ureq",
  "url",
 ]

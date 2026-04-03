@@ -12,6 +12,7 @@ use delta_kernel_derive::internal_api;
 
 #[internal_api]
 pub(crate) use column_mapping::get_any_level_column_physical_name;
+pub(crate) use column_mapping::physical_to_logical_column_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
