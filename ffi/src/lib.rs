@@ -18,6 +18,7 @@ use {
     std::collections::HashMap,
 };
 
+use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::LogPath;
@@ -690,6 +691,12 @@ pub struct SharedSchema;
 #[handle_descriptor(target=Snapshot, mutable=false, sized=true)]
 pub struct SharedSnapshot;
 
+#[handle_descriptor(target=Protocol, mutable=false, sized=true)]
+pub struct SharedProtocol;
+
+#[handle_descriptor(target=Metadata, mutable=false, sized=true)]
+pub struct SharedMetadata;
+
 /// Opaque builder for constructing a [`SharedSnapshot`].
 ///
 /// Create with [`get_snapshot_builder`] (from a table path) or [`get_snapshot_builder_from`]
@@ -1023,6 +1030,147 @@ pub unsafe extern "C" fn visit_metadata_configuration(
             );
         });
 }
+// ── Protocol handle FFI ─────────────────────────────────────────────────────
+
+/// Get the protocol for this snapshot. The returned handle must be freed with [`free_protocol`].
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_get_protocol(
+    snapshot: Handle<SharedSnapshot>,
+) -> Handle<SharedProtocol> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    Arc::new(snapshot.table_configuration().protocol().clone()).into()
+}
+
+/// Free a protocol handle obtained from [`snapshot_get_protocol`].
+///
+/// # Safety
+/// Caller is responsible for providing a valid, non-freed protocol handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_protocol(protocol: Handle<SharedProtocol>) {
+    protocol.drop_handle();
+}
+
+/// Visit all fields of the protocol in a single FFI call. The caller provides:
+/// - `visit_versions`: called once with `(context, min_reader_version, min_writer_version)`
+/// - `visit_feature`: called once per feature with `(context, is_reader, feature_name)`.
+///   `is_reader` is `true` for reader features, `false` for writer features.
+///   If the protocol uses legacy versioning (no explicit feature lists), neither callback fires
+///   for features.
+///
+/// # Safety
+/// Caller is responsible for providing a valid protocol handle, a valid `context` pointer, and
+/// valid function pointers for `visit_versions` and `visit_feature`.
+#[no_mangle]
+pub unsafe extern "C" fn visit_protocol(
+    protocol: Handle<SharedProtocol>,
+    context: NullableCvoid,
+    visit_versions: extern "C" fn(context: NullableCvoid, min_reader: i32, min_writer: i32),
+    visit_feature: extern "C" fn(
+        context: NullableCvoid,
+        is_reader: bool,
+        feature: KernelStringSlice,
+    ),
+) {
+    let protocol = unsafe { protocol.as_ref() };
+    visit_versions(
+        context,
+        protocol.min_reader_version(),
+        protocol.min_writer_version(),
+    );
+    if let Some(features) = protocol.reader_features() {
+        for f in features {
+            let name = f.as_ref();
+            visit_feature(context, true, kernel_string_slice!(name));
+        }
+    }
+    if let Some(features) = protocol.writer_features() {
+        for f in features {
+            let name = f.as_ref();
+            visit_feature(context, false, kernel_string_slice!(name));
+        }
+    }
+}
+
+// ── Metadata handle FFI ─────────────────────────────────────────────────────
+
+/// Get the metadata for this snapshot. The returned handle must be freed with [`free_metadata`].
+///
+/// # Safety
+/// Caller is responsible for providing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_get_metadata(
+    snapshot: Handle<SharedSnapshot>,
+) -> Handle<SharedMetadata> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    Arc::new(snapshot.table_configuration().metadata().clone()).into()
+}
+
+/// Free a metadata handle obtained from [`snapshot_get_metadata`].
+///
+/// # Safety
+/// Caller is responsible for providing a valid, non-freed metadata handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_metadata(metadata: Handle<SharedMetadata>) {
+    metadata.drop_handle();
+}
+
+/// Visit all fields of the metadata in a single FFI call. String fields are allocated via
+/// `allocate_fn` (the caller controls memory). The visitor receives:
+/// - `id`: always non-null (allocated string pointer)
+/// - `name`: allocated string pointer or null if not set
+/// - `description`: allocated string pointer or null if not set
+/// - `format_provider`: always non-null (allocated string pointer)
+/// - `has_created_time`: whether `created_time_ms` is meaningful
+/// - `created_time_ms`: milliseconds since epoch (only valid when `has_created_time` is true)
+///
+/// # Safety
+/// Caller is responsible for providing a valid metadata handle, a valid `allocate_fn`, a valid
+/// `context` pointer, and a valid `visit_metadata_fields` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_metadata(
+    metadata: Handle<SharedMetadata>,
+    allocate_fn: AllocateStringFn,
+    context: NullableCvoid,
+    visit_metadata_fields: extern "C" fn(
+        context: NullableCvoid,
+        id: NullableCvoid,
+        name: NullableCvoid,
+        description: NullableCvoid,
+        format_provider: NullableCvoid,
+        has_created_time: bool,
+        created_time_ms: i64,
+    ),
+) {
+    let metadata = unsafe { metadata.as_ref() };
+    let id = metadata.id();
+    let id = allocate_fn(kernel_string_slice!(id));
+    let name = metadata
+        .name()
+        .and_then(|s| allocate_fn(kernel_string_slice!(s)));
+    let description = metadata
+        .description()
+        .and_then(|s| allocate_fn(kernel_string_slice!(s)));
+    let provider = metadata.format_provider();
+    let format_provider = allocate_fn(kernel_string_slice!(provider));
+    let (has_created_time, created_time_ms) = match metadata.created_time() {
+        Some(t) => (true, t),
+        None => (false, 0),
+    };
+    visit_metadata_fields(
+        context,
+        id,
+        name,
+        description,
+        format_provider,
+        has_created_time,
+        created_time_ms,
+    );
+}
+
+// ── Snapshot-level computed property FFI ─────────────────────────────────────
 
 type StringIter = dyn Iterator<Item = String> + Send;
 
@@ -1132,6 +1280,7 @@ mod tests {
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStore;
     use delta_kernel::schema::StructType;
+    use delta_kernel_ffi::ffi_test_utils::setup_snapshot;
     use rstest::rstest;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -1895,6 +2044,141 @@ mod tests {
         Ok(())
     }
 
+    // A modern (table-features) protocol + metadata commit for feature/config tests.
+    // Protocol: minReaderVersion=3, minWriterVersion=7 with columnMapping + rowTracking.
+    // Metadata: id set, name set, createdTime set, column mapping mode = "name".
+    const METADATA_WITH_FEATURES: &str = concat!(
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
+        "\n",
+        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping","rowTracking"]}}"#,
+        "\n",
+        r#"{"metaData":{"id":"deadbeef-1234-5678-abcd-000000000000","name":"test_table","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.rowTracking.enabled":"true","delta.rowTracking.materializedRowIdColumnName":"_row_id","delta.rowTracking.materializedRowCommitVersionColumnName":"_row_commit_version"},"createdTime":1234567890000}}"#,
+    );
+
+    // ── Shared visitor state and callbacks for protocol/metadata tests ────────
+
+    struct ProtocolVisitState {
+        min_reader: i32,
+        min_writer: i32,
+        reader_features: Vec<String>,
+        writer_features: Vec<String>,
+    }
+
+    impl ProtocolVisitState {
+        fn new() -> Self {
+            Self {
+                min_reader: 0,
+                min_writer: 0,
+                reader_features: Vec::new(),
+                writer_features: Vec::new(),
+            }
+        }
+    }
+
+    extern "C" fn protocol_version_cb(ctx: NullableCvoid, min_reader: i32, min_writer: i32) {
+        let state = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut ProtocolVisitState) };
+        state.min_reader = min_reader;
+        state.min_writer = min_writer;
+    }
+
+    extern "C" fn protocol_feature_cb(
+        ctx: NullableCvoid,
+        is_reader: bool,
+        feature: KernelStringSlice,
+    ) {
+        let state = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut ProtocolVisitState) };
+        let name = unsafe { String::try_from_slice(&feature) }.unwrap();
+        if is_reader {
+            state.reader_features.push(name);
+        } else {
+            state.writer_features.push(name);
+        }
+    }
+
+    /// Visit protocol on a snapshot and return the collected state.
+    fn collect_protocol_state(snap: &handle::Handle<SharedSnapshot>) -> ProtocolVisitState {
+        let proto = unsafe { snapshot_get_protocol(snap.shallow_copy()) };
+        let mut state = ProtocolVisitState::new();
+        let ctx = NonNull::new(&mut state as *mut ProtocolVisitState as *mut c_void);
+        unsafe {
+            visit_protocol(
+                proto.shallow_copy(),
+                ctx,
+                protocol_version_cb,
+                protocol_feature_cb,
+            )
+        };
+        unsafe { free_protocol(proto) };
+        state
+    }
+
+    struct MetadataVisitState {
+        id: Option<String>,
+        name: Option<String>,
+        description: Option<String>,
+        format_provider: Option<String>,
+        has_created_time: bool,
+        created_time_ms: i64,
+    }
+
+    impl MetadataVisitState {
+        fn new() -> Self {
+            Self {
+                id: None,
+                name: None,
+                description: None,
+                format_provider: None,
+                has_created_time: false,
+                created_time_ms: 0,
+            }
+        }
+    }
+
+    extern "C" fn metadata_visit_cb(
+        ctx: NullableCvoid,
+        id: NullableCvoid,
+        name: NullableCvoid,
+        description: NullableCvoid,
+        format_provider: NullableCvoid,
+        has_created_time: bool,
+        created_time_ms: i64,
+    ) {
+        let state = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut MetadataVisitState) };
+        state.id = id.map(recover_string);
+        state.name = name.map(recover_string);
+        state.description = description.map(recover_string);
+        state.format_provider = format_provider.map(recover_string);
+        state.has_created_time = has_created_time;
+        state.created_time_ms = created_time_ms;
+    }
+
+    /// Visit metadata on a snapshot and return the collected state.
+    fn collect_metadata_state(snap: &handle::Handle<SharedSnapshot>) -> MetadataVisitState {
+        let meta = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
+        let mut state = MetadataVisitState::new();
+        let ctx = NonNull::new(&mut state as *mut MetadataVisitState as *mut c_void);
+        unsafe { visit_metadata(meta.shallow_copy(), allocate_str, ctx, metadata_visit_cb) };
+        unsafe { free_metadata(meta) };
+        state
+    }
+
+    // ── visit_protocol tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_visit_protocol_legacy() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snap) = setup_snapshot(METADATA.to_string()).await?;
+        let state = collect_protocol_state(&snap);
+
+        assert_eq!(state.min_reader, 1);
+        assert_eq!(state.min_writer, 2);
+        assert!(state.reader_features.is_empty());
+        assert!(state.writer_features.is_empty());
+
+        unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_builder_with_nonexistent_path_returns_error(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1936,6 +2220,71 @@ mod tests {
         assert_extern_result_error_with_message(result, KernelError::GenericError, None);
 
         unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_visit_protocol_with_features() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snap) = setup_snapshot(METADATA_WITH_FEATURES.to_string()).await?;
+        let state = collect_protocol_state(&snap);
+
+        assert_eq!(state.min_reader, 3);
+        assert_eq!(state.min_writer, 7);
+        assert_eq!(state.reader_features, vec!["columnMapping"]);
+        let mut wf = state.writer_features.clone();
+        wf.sort();
+        assert_eq!(wf, vec!["columnMapping", "rowTracking"]);
+
+        unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    // ── visit_metadata tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_visit_metadata_default() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snap) = setup_snapshot(METADATA.to_string()).await?;
+        let state = collect_metadata_state(&snap);
+
+        assert_eq!(
+            state.id.as_deref(),
+            Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9")
+        );
+        assert!(
+            state.name.is_none(),
+            "name should be None for default metadata"
+        );
+        assert!(
+            state.description.is_none(),
+            "description should be None for default metadata"
+        );
+        assert_eq!(state.format_provider.as_deref(), Some("parquet"));
+        assert!(state.has_created_time);
+        assert_eq!(state.created_time_ms, 1587968585495);
+
+        unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_visit_metadata_with_name() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snap) = setup_snapshot(METADATA_WITH_FEATURES.to_string()).await?;
+        let state = collect_metadata_state(&snap);
+
+        assert_eq!(
+            state.id.as_deref(),
+            Some("deadbeef-1234-5678-abcd-000000000000")
+        );
+        assert_eq!(state.name.as_deref(), Some("test_table"));
+        assert!(state.description.is_none(), "description should be None");
+        assert_eq!(state.format_provider.as_deref(), Some("parquet"));
+        assert!(state.has_created_time);
+        assert_eq!(state.created_time_ms, 1234567890000);
+
+        unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
         Ok(())
     }
 }
