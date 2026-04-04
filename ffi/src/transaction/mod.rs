@@ -434,6 +434,7 @@ pub unsafe extern "C" fn free_create_table_builder(builder: Handle<ExclusiveCrea
 #[cfg(test)]
 mod tests {
     use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::table_features::TableFeature;
 
     use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
     use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
@@ -443,7 +444,6 @@ mod tests {
 
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStore;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
@@ -1033,6 +1033,8 @@ mod tests {
             snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy())
         });
         let snap_ref = unsafe { snap.as_ref() };
+
+        // Verify parsed table properties
         let props = snap_ref.table_properties();
         assert_eq!(props.append_only, Some(true));
         assert_eq!(
@@ -1042,6 +1044,10 @@ mod tests {
                 .map(|s| s.as_str()),
             Some("custom_value")
         );
+
+        // Verify feature is enabled in protocol (property set + protocol supports it)
+        let config = snap_ref.table_configuration();
+        assert!(config.is_feature_enabled(&TableFeature::AppendOnly));
 
         unsafe { free_snapshot(snap) };
         unsafe { free_engine(engine) };
