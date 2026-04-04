@@ -89,13 +89,10 @@ mod tests {
     use super::*;
     use crate::error::KernelError;
     use crate::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
-        recover_string,
+        allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
+        ok_or_panic, recover_string,
     };
-    use crate::{
-        engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, kernel_string_slice,
-        snapshot_builder_build,
-    };
+    use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice};
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::DeltaResult;
@@ -189,13 +186,8 @@ mod tests {
             .await
             .unwrap();
 
-        let snapshot = unsafe {
-            ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
-        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(snapshot)) };
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
         let get_domain_metadata_helper = |domain: &str| unsafe {
             get_domain_metadata(

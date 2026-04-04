@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use crate::error::{EngineError, ExternResult, KernelError};
 #[cfg(test)]
-use crate::{engine_to_handle, get_snapshot_builder, kernel_string_slice, snapshot_builder_build};
+use crate::{
+    engine_to_handle, get_snapshot_builder, kernel_string_slice, snapshot_builder_build,
+    SharedExternEngine, SharedSnapshot,
+};
 use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 #[cfg(test)]
 use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -67,6 +70,20 @@ pub(crate) fn ok_or_panic<T>(result: ExternResult<T>) -> T {
     }
 }
 
+/// Build a latest-version snapshot via the FFI builder API. Panics on error.
+///
+/// # Safety
+///
+/// Caller must pass valid engine handle and path.
+#[cfg(test)]
+pub(crate) unsafe fn build_snapshot(
+    path: KernelStringSlice,
+    engine: crate::handle::Handle<SharedExternEngine>,
+) -> crate::handle::Handle<SharedSnapshot> {
+    let builder = ok_or_panic(get_snapshot_builder(path, engine));
+    ok_or_panic(snapshot_builder_build(builder))
+}
+
 /// Create an in-memory engine and snapshot from the given commit data. Returns
 /// `(engine_handle, snapshot_handle)` -- the caller must free both when done.
 #[cfg(test)]
@@ -84,13 +101,7 @@ pub(crate) async fn setup_snapshot(
     add_commit(table_root, storage.as_ref(), 0, commit_data).await?;
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
     let engine = engine_to_handle(Arc::new(engine), allocate_err);
-    let snap = unsafe {
-        ok_or_panic(get_snapshot_builder(
-            kernel_string_slice!(table_root),
-            engine.shallow_copy(),
-        ))
-    };
-    let snap = unsafe { ok_or_panic(snapshot_builder_build(snap)) };
+    let snap = unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
     Ok((engine, snap))
 }
 

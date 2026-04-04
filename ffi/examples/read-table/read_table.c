@@ -306,7 +306,6 @@ int main(int argc, char* argv[])
 
   SharedExternEngine* engine = engine_res.ok;
 
-  // Build a snapshot using the builder API
   ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res = get_snapshot_builder(table_path_slice, engine);
   if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
     print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);

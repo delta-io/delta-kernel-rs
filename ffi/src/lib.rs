@@ -1130,8 +1130,8 @@ mod tests {
     use super::*;
     use crate::error::{EngineError, KernelError};
     use crate::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
-        recover_string,
+        allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
+        ok_or_panic, recover_string,
     };
     use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -1195,13 +1195,7 @@ mod tests {
             Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
             allocate_err,
         );
-        let snap = unsafe {
-            ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(path),
-                engine.shallow_copy(),
-            ))
-        };
-        let snap = unsafe { ok_or_panic(snapshot_builder_build(snap)) };
+        let snap = unsafe { build_snapshot(kernel_string_slice!(path), engine.shallow_copy()) };
         Ok((storage, engine, snap))
     }
 
@@ -1379,13 +1373,8 @@ mod tests {
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
-        let snap = unsafe {
-            ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
-        let snap = unsafe { ok_or_panic(snapshot_builder_build(snap)) };
+        let snap =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
         extern "C" fn collect_property(
             engine_context: NullableCvoid,
@@ -1453,13 +1442,8 @@ mod tests {
             .build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
-        let snapshot = unsafe {
-            ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
-        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(snapshot)) };
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
         let did_checkpoint = unsafe {
             ok_or_panic(checkpoint_snapshot(
@@ -1554,13 +1538,8 @@ mod tests {
         unsafe { set_builder_with_multithreaded_executor(builder.as_mut().unwrap(), 2, 0) };
         let engine = unsafe { ok_or_panic(builder_build(builder)) };
 
-        let snapshot = unsafe {
-            ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
-        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(snapshot)) };
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
         let did_checkpoint = unsafe {
             ok_or_panic(checkpoint_snapshot(
@@ -1590,13 +1569,8 @@ mod tests {
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
-        let snapshot = unsafe {
-            ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
-        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(snapshot)) };
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
         let partition_count = unsafe { get_partition_column_count(snapshot.shallow_copy()) };
         assert_eq!(partition_count, 1, "Should have one partition");
