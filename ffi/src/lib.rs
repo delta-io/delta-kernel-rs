@@ -1005,6 +1005,30 @@ pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
     snapshot.version()
 }
 
+/// Get the timestamp of the specified snapshot in milliseconds since the Unix epoch.
+///
+/// When In-Commit Timestamp (ICT) is enabled, returns the ICT value from the commit's
+/// `CommitInfo` action. Otherwise, falls back to the filesystem last-modified time of
+/// the latest commit file.
+///
+/// Returns an error if the commit file is missing, the ICT configuration is invalid, or the
+/// ICT value cannot be read.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid snapshot handle and engine handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_timestamp(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<i64> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .get_timestamp(engine_ref.engine().as_ref())
+        .into_extern_result(&engine_ref)
+}
+
 /// Get the logical schema of the specified snapshot
 ///
 /// # Safety
@@ -1205,6 +1229,7 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStore;
+    use delta_kernel::schema::StructType;
     use rstest::rstest;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -1212,8 +1237,9 @@ mod tests {
     use test_utils::add_staged_commit;
     use test_utils::{
         actions_to_string, actions_to_string_partitioned, actions_to_string_with_metadata,
-        add_commit, TestAction, METADATA, METADATA_WITH_TABLE_PROPERTIES,
+        add_commit, create_table, TestAction, METADATA, METADATA_WITH_TABLE_PROPERTIES,
     };
+    use url::Url;
 
     #[no_mangle]
     extern "C" fn allocate_null_err(_: KernelError, _: KernelStringSlice) -> *mut EngineError {
@@ -1313,6 +1339,95 @@ mod tests {
 
         unsafe { free_snapshot(snapshot1) }
         unsafe { free_snapshot(snapshot2) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // TODO: (PR #2307) will introduce a helper function for setting up storage, engine.
+    // The test will need to refactor to use the helper function.
+    #[tokio::test]
+    async fn test_snapshot_timestamp_no_ict() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        let ts = unsafe {
+            ok_or_panic(snapshot_timestamp(
+                snap.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        };
+        // ICT is not enabled -- falls back to commit file mtime (written "now").
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let two_days_ms = 2 * 24 * 60 * 60 * 1000_i64;
+        assert!(
+            (now_ms - two_days_ms..=now_ms).contains(&ts),
+            "timestamp {ts} not within 2 days of now {now_ms}"
+        );
+
+        unsafe { free_snapshot(snap) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // TODO: (PR #2307) will introduce a helper function for setting up storage, engine.
+    // The test will need to refactor to use the helper function.
+    #[tokio::test]
+    async fn test_snapshot_timestamp_ict_enabled() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///test_table/";
+
+        // create_table with "inCommitTimestamp" in writer_features sets up:
+        //   - protocol v3.7 with writerFeatures=["inCommitTimestamp"]
+        //   - metadata config: enableInCommitTimestamps=true, enablement version/timestamp
+        //   - commitInfo with inCommitTimestamp=1612345678 (fixed test value)
+        create_table(
+            storage.clone(),
+            Url::parse(table_root)?,
+            Arc::new(StructType::try_new([]).unwrap()),
+            &[],
+            true,
+            vec![],
+            vec!["inCommitTimestamp"],
+        )
+        .await?;
+
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let snap = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+
+        let ts = unsafe {
+            ok_or_panic(snapshot_timestamp(
+                snap.shallow_copy(),
+                engine.shallow_copy(),
+            ))
+        };
+        assert_eq!(ts, 1612345678_i64);
+
+        unsafe { free_snapshot(snap) }
         unsafe { free_engine(engine) }
         Ok(())
     }

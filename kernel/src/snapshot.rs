@@ -1123,7 +1123,7 @@ impl Snapshot {
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
     #[allow(unused)]
     #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
-    pub(crate) fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
+    pub fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         match self
             .table_configuration()
             .in_commit_timestamp_enablement()?
