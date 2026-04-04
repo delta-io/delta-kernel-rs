@@ -12,7 +12,9 @@ use url::Url;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::{is_set_txn_expired, SetTransactionScanner};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
-use crate::checkpoint::CheckpointWriter;
+use crate::checkpoint::{
+    CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
+};
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 #[cfg(any(test, feature = "test-utils"))]
@@ -556,6 +558,69 @@ impl Snapshot {
                 self.lazy_crc.clone(),
             )),
         ))
+    }
+
+    /// Writes a checkpoint with explicit format control via [`CheckpointSpec`].
+    ///
+    /// This method supports writing V2 checkpoints with sidecar files, where file actions
+    /// (add/remove) are written to separate parquet files under `_delta_log/_sidecars/` and
+    /// referenced from the main checkpoint file via sidecar actions.
+    ///
+    /// # Parameters
+    /// - `engine`: Engine for data processing and I/O
+    /// - `config`: Checkpoint format configuration. `None` uses the default single-file
+    ///   checkpoint (auto-detecting V1/V2 from table features).
+    ///
+    /// Note: This function uses [`crate::ParquetHandler::write_parquet_file`] and
+    /// [`crate::StorageHandler::head`], which may not be implemented by all engines
+    /// (e.g., `SyncEngine`).
+    ///
+    /// # Errors
+    /// - If `CheckpointSpec::V2` is used but the table does not support the `v2Checkpoint`
+    ///   feature.
+    /// - If `file_actions_per_sidecar_hint` is `Some(0)`.
+    ///
+    /// [`CheckpointSpec`]: crate::checkpoint::CheckpointSpec
+    #[internal_api]
+    #[instrument(parent = &self.span, name = "snap.checkpoint_placeholder", skip_all, err)]
+    #[allow(unused)]
+    // Next PR will replace snapshot.checkpoint with snapshot.checkpoint_placeholder.
+    pub(crate) fn snapshot_checkpoint_placeholder(
+        self: Arc<Self>,
+        engine: &dyn Engine,
+        config: Option<&CheckpointSpec>,
+    ) -> DeltaResult<()> {
+        if let Some(CheckpointSpec::V2(_)) = config {
+            if !self
+                .table_configuration()
+                .is_feature_supported(&TableFeature::V2Checkpoint)
+            {
+                return Err(Error::checkpoint_write(
+                    "CheckpointSpec::V2 requires the v2Checkpoint table feature to be enabled",
+                ));
+            }
+        }
+
+        let writer = self.create_checkpoint_writer()?;
+
+        match config {
+            Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+                file_actions_per_sidecar_hint,
+            })) => {
+                if file_actions_per_sidecar_hint == &Some(0) {
+                    return Err(Error::checkpoint_write(
+                        "file_actions_per_sidecar_hint must be greater than 0",
+                    ));
+                }
+                let hint =
+                    file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
+                writer.write_checkpoint_with_sidecars(engine, hint)
+            }
+            _ => {
+                // V1, V2::NoSidecar, or None (auto-detect) all use single-file path
+                writer.write_single_file_checkpoint(engine)
+            }
+        }
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
