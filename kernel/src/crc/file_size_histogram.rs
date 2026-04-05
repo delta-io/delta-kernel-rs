@@ -1,12 +1,9 @@
-// Placeholder for stacked pr
-#![allow(dead_code)]
-// Methods are consumed in follow-up steps (FileStatsVisitor, CrcDelta, Crc::apply).
 //! [`FileSizeHistogram`] tracks the distribution of file sizes across predefined bins.
 //!
 //! Used in CRC (version checksum) files to record the size distribution of active files in a
-//! table version. Supports incremental updates via [`insert`](FileSizeHistogram::insert),
-//! [`remove`](FileSizeHistogram::remove), [`try_add`](FileSizeHistogram::try_add), and
-//! [`try_sub`](FileSizeHistogram::try_sub).
+//! table version. Supports incremental updates via [`insert`](FileSizeHistogram::insert) and
+//! [`remove`](FileSizeHistogram::remove), and delta merging via
+//! [`try_apply_delta`](FileSizeHistogram::try_apply_delta).
 //!
 //! [FileSizeHistogram]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#file-size-histogram-schema
 
@@ -88,7 +85,6 @@ impl FileSizeHistogram {
     /// - All arrays have the same length (>= 2)
     /// - The first boundary is 0
     /// - Boundaries are sorted in ascending order
-    #[allow(dead_code)]
     pub(crate) fn try_new(
         sorted_bin_boundaries: Vec<i64>,
         file_counts: Vec<i64>,
@@ -129,6 +125,17 @@ impl FileSizeHistogram {
             file_counts,
             total_bytes,
         })
+    }
+
+    /// Creates an empty histogram with the given bin boundaries and zero counts/bytes.
+    ///
+    /// Used when a previous CRC has non-default boundaries and we need to build delta
+    /// histograms that match, so that `try_apply_delta` succeeds during merge.
+    pub(crate) fn create_empty_with_boundaries(
+        sorted_bin_boundaries: Vec<i64>,
+    ) -> DeltaResult<Self> {
+        let len = sorted_bin_boundaries.len();
+        Self::try_new(sorted_bin_boundaries, vec![0; len], vec![0; len])
     }
 
     /// Creates a default histogram with the standard 95 bin boundaries and zero counts.
@@ -172,73 +179,45 @@ impl FileSizeHistogram {
     }
 
     /// Removes a file of the given size from the histogram, decrementing the appropriate bin's
-    /// file count and total bytes.
+    /// file count by 1 and total bytes by `file_size`.
     ///
-    /// Returns an error if the bin does not have sufficient counts or bytes.
-    #[allow(dead_code)]
+    /// Does not validate that the bin remains non-negative, since this is used to build delta
+    /// histograms where removes may exceed adds in a given bin.
     pub(crate) fn remove(&mut self, file_size: i64) -> DeltaResult<()> {
         require!(
             file_size >= 0,
             Error::internal_error(format!("File size must be non-negative, got {}", file_size))
         );
         let idx = self.get_bin_index(file_size);
-        require!(
-            self.file_counts[idx] > 0 && self.total_bytes[idx] >= file_size,
-            Error::internal_error(format!(
-                "Cannot remove {} bytes from bin {} which has {} bytes and {} files",
-                file_size, idx, self.total_bytes[idx], self.file_counts[idx]
-            ))
-        );
         self.file_counts[idx] -= 1;
         self.total_bytes[idx] -= file_size;
         Ok(())
     }
 
-    /// Adds two histograms element-wise. Both must have the same bin boundaries.
+    /// Applies a delta histogram element-wise to this histogram. Both must have the same bin
+    /// boundaries.
     ///
+    /// The delta may contain negative values (more files removed than added in a bin).
     /// Returns a new histogram whose file counts and total bytes are the sum of the two inputs.
-    pub(crate) fn try_add(&self, other: &FileSizeHistogram) -> DeltaResult<FileSizeHistogram> {
+    /// Returns an error if any resulting bin would have negative file counts or total bytes.
+    pub(crate) fn try_apply_delta(
+        &self,
+        delta: &FileSizeHistogram,
+    ) -> DeltaResult<FileSizeHistogram> {
         require!(
-            self.sorted_bin_boundaries == other.sorted_bin_boundaries,
+            self.sorted_bin_boundaries == delta.sorted_bin_boundaries,
             Error::internal_error("Cannot add histograms with different bin boundaries")
-        );
-        let file_counts = self
-            .file_counts
-            .iter()
-            .zip(&other.file_counts)
-            .map(|(a, b)| a + b)
-            .collect();
-        let total_bytes = self
-            .total_bytes
-            .iter()
-            .zip(&other.total_bytes)
-            .map(|(a, b)| a + b)
-            .collect();
-        Ok(FileSizeHistogram {
-            sorted_bin_boundaries: self.sorted_bin_boundaries.clone(),
-            file_counts,
-            total_bytes,
-        })
-    }
-
-    /// Subtracts another histogram element-wise from this histogram. Both must have the same bin boundaries.
-    ///
-    /// Returns an error if any bin would have negative file counts or total bytes.
-    pub(crate) fn try_sub(&self, other: &FileSizeHistogram) -> DeltaResult<FileSizeHistogram> {
-        require!(
-            self.sorted_bin_boundaries == other.sorted_bin_boundaries,
-            Error::internal_error("Cannot subtract histograms with different bin boundaries")
         );
         let len = self.sorted_bin_boundaries.len();
         let mut file_counts = Vec::with_capacity(len);
         let mut total_bytes = Vec::with_capacity(len);
         for i in 0..len {
-            let count = self.file_counts[i] - other.file_counts[i];
-            let bytes = self.total_bytes[i] - other.total_bytes[i];
+            let count = self.file_counts[i] + delta.file_counts[i];
+            let bytes = self.total_bytes[i] + delta.total_bytes[i];
             require!(
                 count >= 0 && bytes >= 0,
                 Error::internal_error(format!(
-                    "Subtraction would result in negative counts or bytes at bin {}",
+                    "Merge would result in negative counts or bytes at bin {}",
                     i
                 ))
             );
@@ -250,6 +229,24 @@ impl FileSizeHistogram {
             file_counts,
             total_bytes,
         })
+    }
+
+    /// Checks that all bins have non-negative file counts and total bytes.
+    ///
+    /// Returns `Ok(self)` if valid, or an error indicating the first bin that is negative.
+    /// Used to validate a delta histogram before using it as an absolute histogram (e.g. for
+    /// version zero where the delta represents the full table state).
+    pub(crate) fn check_non_negative(self) -> DeltaResult<Self> {
+        for i in 0..self.sorted_bin_boundaries.len() {
+            require!(
+                self.file_counts[i] >= 0 && self.total_bytes[i] >= 0,
+                Error::internal_error(format!(
+                    "Histogram has negative counts or bytes at bin {}",
+                    i
+                ))
+            );
+        }
+        Ok(self)
     }
 }
 
@@ -270,6 +267,14 @@ mod tests {
         assert_eq!(hist.sorted_bin_boundaries[0], 0);
         assert!(hist.file_counts.iter().all(|&c| c == 0));
         assert!(hist.total_bytes.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn create_empty_with_boundaries_produces_zeroed_histogram() {
+        let hist = FileSizeHistogram::create_empty_with_boundaries(vec![0, 100, 1000]).unwrap();
+        assert_eq!(hist.sorted_bin_boundaries, vec![0, 100, 1000]);
+        assert_eq!(hist.file_counts, vec![0, 0, 0]);
+        assert_eq!(hist.total_bytes, vec![0, 0, 0]);
     }
 
     #[test]
@@ -355,15 +360,11 @@ mod tests {
     }
 
     #[test]
-    fn remove_from_empty_bin_returns_error() {
+    fn remove_allows_negative_bin_values() {
         let mut hist = FileSizeHistogram::try_new(vec![0, 100], vec![0, 0], vec![0, 0]).unwrap();
-        assert_result_error_with_message(hist.remove(50), "Cannot remove");
-    }
-
-    #[test]
-    fn remove_more_bytes_than_available_returns_error() {
-        let mut hist = FileSizeHistogram::try_new(vec![0, 100], vec![1, 0], vec![10, 0]).unwrap();
-        assert_result_error_with_message(hist.remove(50), "Cannot remove");
+        hist.remove(50).unwrap();
+        assert_eq!(hist.file_counts, vec![-1, 0]);
+        assert_eq!(hist.total_bytes, vec![-50, 0]);
     }
 
     #[test]
@@ -372,53 +373,47 @@ mod tests {
         assert_result_error_with_message(hist.remove(-1), "non-negative");
     }
 
-    // ===== try_add / try_sub =====
+    // ===== try_apply_delta =====
 
     #[test]
-    fn try_add_combines_counts_and_bytes() {
-        let a = FileSizeHistogram::try_new(vec![0, 100], vec![2, 3], vec![50, 400]).unwrap();
-        let b = FileSizeHistogram::try_new(vec![0, 100], vec![1, 4], vec![30, 600]).unwrap();
-        let result = a.try_add(&b).unwrap();
+    fn try_apply_delta_combines_counts_and_bytes() {
+        let base = FileSizeHistogram::try_new(vec![0, 100], vec![2, 3], vec![50, 400]).unwrap();
+        let delta = FileSizeHistogram::try_new(vec![0, 100], vec![1, 4], vec![30, 600]).unwrap();
+        let result = base.try_apply_delta(&delta).unwrap();
         assert_eq!(result.file_counts, vec![3, 7]);
         assert_eq!(result.total_bytes, vec![80, 1000]);
         assert_eq!(result.sorted_bin_boundaries, vec![0, 100]);
     }
 
     #[test]
-    fn try_add_mismatched_boundaries_returns_error() {
-        let a = FileSizeHistogram::try_new(vec![0, 100], vec![0; 2], vec![0; 2]).unwrap();
-        let b = FileSizeHistogram::try_new(vec![0, 200], vec![0; 2], vec![0; 2]).unwrap();
-        assert_result_error_with_message(a.try_add(&b), "different bin boundaries");
-    }
-
-    #[test]
-    fn try_sub_produces_difference() {
-        let a = FileSizeHistogram::try_new(vec![0, 100], vec![5, 8], vec![200, 900]).unwrap();
-        let b = FileSizeHistogram::try_new(vec![0, 100], vec![2, 3], vec![50, 400]).unwrap();
-        let result = a.try_sub(&b).unwrap();
+    fn try_apply_delta_with_negative_delta_succeeds() {
+        let base = FileSizeHistogram::try_new(vec![0, 100], vec![5, 8], vec![200, 900]).unwrap();
+        let delta =
+            FileSizeHistogram::try_new(vec![0, 100], vec![-2, -3], vec![-50, -400]).unwrap();
+        let result = base.try_apply_delta(&delta).unwrap();
         assert_eq!(result.file_counts, vec![3, 5]);
         assert_eq!(result.total_bytes, vec![150, 500]);
     }
 
     #[test]
-    fn try_sub_mismatched_boundaries_returns_error() {
+    fn try_apply_delta_mismatched_boundaries_returns_error() {
         let a = FileSizeHistogram::try_new(vec![0, 100], vec![0; 2], vec![0; 2]).unwrap();
         let b = FileSizeHistogram::try_new(vec![0, 200], vec![0; 2], vec![0; 2]).unwrap();
-        assert_result_error_with_message(a.try_sub(&b), "different bin boundaries");
+        assert_result_error_with_message(a.try_apply_delta(&b), "different bin boundaries");
     }
 
     #[test]
-    fn try_sub_negative_counts_returns_error() {
-        let a = FileSizeHistogram::try_new(vec![0, 100], vec![1, 0], vec![50, 0]).unwrap();
-        let b = FileSizeHistogram::try_new(vec![0, 100], vec![2, 0], vec![50, 0]).unwrap();
-        assert_result_error_with_message(a.try_sub(&b), "negative counts or bytes");
+    fn try_apply_delta_rejects_negative_result_counts() {
+        let base = FileSizeHistogram::try_new(vec![0, 100], vec![1, 0], vec![50, 0]).unwrap();
+        let delta = FileSizeHistogram::try_new(vec![0, 100], vec![-2, 0], vec![-50, 0]).unwrap();
+        assert_result_error_with_message(base.try_apply_delta(&delta), "negative counts or bytes");
     }
 
     #[test]
-    fn try_sub_negative_bytes_returns_error() {
-        let a = FileSizeHistogram::try_new(vec![0, 100], vec![2, 0], vec![50, 0]).unwrap();
-        let b = FileSizeHistogram::try_new(vec![0, 100], vec![1, 0], vec![100, 0]).unwrap();
-        assert_result_error_with_message(a.try_sub(&b), "negative counts or bytes");
+    fn try_apply_delta_rejects_negative_result_bytes() {
+        let base = FileSizeHistogram::try_new(vec![0, 100], vec![2, 0], vec![50, 0]).unwrap();
+        let delta = FileSizeHistogram::try_new(vec![0, 100], vec![-1, 0], vec![-100, 0]).unwrap();
+        assert_result_error_with_message(base.try_apply_delta(&delta), "negative counts or bytes");
     }
 
     // ===== Serde =====
