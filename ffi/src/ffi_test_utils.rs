@@ -71,10 +71,6 @@ pub(crate) fn ok_or_panic<T>(result: ExternResult<T>) -> T {
 }
 
 /// Build a latest-version snapshot via the FFI builder API. Panics on error.
-///
-/// # Safety
-///
-/// Caller must pass valid engine handle and path.
 #[cfg(test)]
 pub(crate) unsafe fn build_snapshot(
     path: KernelStringSlice,
