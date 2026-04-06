@@ -66,6 +66,9 @@ async fn scan_execute_contributes_parquet_data_file_reads() -> DeltaResult<()> {
     // scan calls read_parquet_files once per data file (not batched), so 2 calls for 2 files
     assert_eq!(reporter.parquet_read_calls.get(), 2);
     assert_eq!(reporter.parquet_files_read.get(), 2);
+    // On Windows (NTFS), listing a recently written file can return size=0 because the OS
+    // has not yet flushed size metadata to the directory entry.
+    #[cfg(not(windows))]
     assert!(reporter.parquet_bytes_read.get() > 0);
     // scan.execute() does its own log replay for Add/Remove scan metadata
     assert_eq!(reporter.json_read_calls.get(), 1);

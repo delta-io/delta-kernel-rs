@@ -100,7 +100,12 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
     assert_eq!(reporter.json_files_read.get(), 1);
     assert_eq!(reporter.parquet_read_calls.get(), 1);
     assert_eq!(reporter.parquet_files_read.get(), 1);
+    // On Windows (NTFS), listing a file written moments earlier can return size=0 because
+    // the OS has not yet flushed size metadata to the directory entry. bytes_read is sourced
+    // from these FileMeta::size values, so it can be 0 even when real I/O occurred.
+    #[cfg(not(windows))]
     assert!(reporter.json_bytes_read.get() > 0);
+    #[cfg(not(windows))]
     assert!(reporter.parquet_bytes_read.get() > 0);
 
     Ok(())
@@ -334,7 +339,10 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Delta
     assert_eq!(reporter.json_read_calls.get(), 1);
     assert_eq!(reporter.json_files_read.get(), 3);
     assert_eq!(reporter.parquet_read_calls.get(), 1);
+    // See Scenario 2 comment: Windows NTFS may report stale size=0 for recently written files.
+    #[cfg(not(windows))]
     assert!(reporter.json_bytes_read.get() > 0);
+    #[cfg(not(windows))]
     assert!(reporter.parquet_bytes_read.get() > 0);
 
     Ok(())
