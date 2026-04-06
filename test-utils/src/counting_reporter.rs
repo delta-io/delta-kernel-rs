@@ -91,10 +91,15 @@ pub struct CountingReporter {
     pub checkpoint_files: RelaxedCounter,
     /// Total log compaction files in the commit tail across all log segment loads.
     pub compaction_files: RelaxedCounter,
-    // TODO: add `crc_files` counter for version checksum (.crc) files read.
-    // Tracking CRC reads is critical for understanding snapshot load costs on tables
-    // that use CRC files heavily. Requires a new MetricEvent variant and emitting it
-    // from the CRC read path. See https://github.com/delta-io/delta-kernel-rs/issues/2257
+    /// Total number of times that a latest CRC file was found in the log segment, across all
+    /// log segment loads.
+    pub num_latest_crc_files_found: RelaxedCounter,
+
+    // CRC reader IO counters
+    /// Number of CRC read calls (one per [`MetricEvent::CrcReadCompleted`]).
+    pub crc_read_calls: RelaxedCounter,
+    /// Total number of bytes read from CRC files, across all CRC read calls.
+    pub crc_bytes_read: RelaxedCounter,
 }
 
 impl CountingReporter {
@@ -124,6 +129,9 @@ impl CountingReporter {
         self.commit_files.reset();
         self.checkpoint_files.reset();
         self.compaction_files.reset();
+        self.num_latest_crc_files_found.reset();
+        self.crc_read_calls.reset();
+        self.crc_bytes_read.reset();
     }
 
     /// Print a human-readable IO and operation summary.
@@ -144,16 +152,20 @@ impl CountingReporter {
         let parquet_calls = self.parquet_read_calls.get();
         let parquet_files = self.parquet_files_read.get();
         let parquet_kib = self.parquet_bytes_read.get() / 1024;
+        let crc_calls = self.crc_read_calls.get();
+        let crc_kib = self.crc_bytes_read.get() / 1024;
         let log_loads = self.log_segment_loads.get();
         let commits = self.commit_files.get();
         let checkpoints = self.checkpoint_files.get();
         let compactions = self.compaction_files.get();
+        let crc_files_found = self.num_latest_crc_files_found.get();
 
         println!("  [io] {label}");
         println!("    storage : {list_calls} list ({list_files} files seen)  {storage_reads} raw read ({storage_files} files, {storage_kib} KiB)  {copy_calls} copy");
         println!("    json    : {json_calls} call(s)  {json_files} files  {json_kib} KiB");
         println!("    parquet : {parquet_calls} call(s)  {parquet_files} files  {parquet_kib} KiB");
-        println!("    log     : {log_loads} segment load(s) -- {commits} commits  {checkpoints} checkpoints  {compactions} compactions");
+        println!("    crc     : {crc_calls} call(s)  {crc_kib} KiB");
+        println!("    log     : {log_loads} segment load(s) -- {commits} commits  {checkpoints} checkpoints  {compactions} compactions  {crc_files_found} latest_crc_files");
     }
 }
 
@@ -199,12 +211,19 @@ impl MetricsReporter for CountingReporter {
                 num_commit_files,
                 num_checkpoint_files,
                 num_compaction_files,
+                has_latest_crc_file,
                 ..
             } => {
                 self.log_segment_loads.inc();
                 self.commit_files.add(num_commit_files);
                 self.checkpoint_files.add(num_checkpoint_files);
                 self.compaction_files.add(num_compaction_files);
+                self.num_latest_crc_files_found
+                    .add(has_latest_crc_file as u64);
+            }
+            MetricEvent::CrcReadCompleted { bytes_read } => {
+                self.crc_read_calls.inc();
+                self.crc_bytes_read.add(bytes_read);
             }
             // Intentionally not tracked -- add counters if needed.
             MetricEvent::ProtocolMetadataLoaded { .. }
@@ -282,11 +301,22 @@ mod tests {
             num_commit_files: 7,
             num_checkpoint_files: 2,
             num_compaction_files: 1,
+            has_latest_crc_file: true,
         });
         assert_eq!(reporter.log_segment_loads.get(), 1);
         assert_eq!(reporter.commit_files.get(), 7);
         assert_eq!(reporter.checkpoint_files.get(), 2);
         assert_eq!(reporter.compaction_files.get(), 1);
+        assert_eq!(reporter.num_latest_crc_files_found.get(), 1);
+    }
+
+    #[test]
+    fn report_crc_read_completed_increments_crc_counters() {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::CrcReadCompleted { bytes_read: 512 });
+        reporter.report(MetricEvent::CrcReadCompleted { bytes_read: 256 });
+        assert_eq!(reporter.crc_read_calls.get(), 2);
+        assert_eq!(reporter.crc_bytes_read.get(), 768);
     }
 
     #[test]
@@ -322,7 +352,9 @@ mod tests {
             num_commit_files: 7,
             num_checkpoint_files: 2,
             num_compaction_files: 1,
+            has_latest_crc_file: true,
         });
+        reporter.report(MetricEvent::CrcReadCompleted { bytes_read: 512 });
 
         reporter.reset();
 
@@ -343,5 +375,8 @@ mod tests {
         assert_eq!(reporter.commit_files.get(), 0);
         assert_eq!(reporter.checkpoint_files.get(), 0);
         assert_eq!(reporter.compaction_files.get(), 0);
+        assert_eq!(reporter.num_latest_crc_files_found.get(), 0);
+        assert_eq!(reporter.crc_read_calls.get(), 0);
+        assert_eq!(reporter.crc_bytes_read.get(), 0);
     }
 }
