@@ -996,6 +996,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_create_table_with_properties() {
         let tmp_dir = tempdir().unwrap();
         let (table_path, engine, builder) = create_table_builder(
