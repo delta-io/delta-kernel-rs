@@ -1154,36 +1154,55 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_cmp() {
-        let a = Scalar::Integer(1);
-        let b = Scalar::Integer(2);
-        let c = Scalar::Null(DataType::INTEGER);
+    fn test_partial_cmp_integer() {
+        test_partial_cmp(Scalar::Integer(1), Scalar::Integer(2), DataType::INTEGER);
+    }
+
+    /// Compare two scalars of the given datatype; a should be smaller than b.
+    fn test_partial_cmp(a: Scalar, b: Scalar, dtype: DataType) {
+        let null = Scalar::Null(dtype);
 
         assert_eq!(a.logical_partial_cmp(&b), Some(Ordering::Less));
         assert_eq!(b.logical_partial_cmp(&a), Some(Ordering::Greater));
         assert_eq!(a.logical_partial_cmp(&a), Some(Ordering::Equal));
         assert_eq!(b.logical_partial_cmp(&b), Some(Ordering::Equal));
-        assert_eq!(a.logical_partial_cmp(&c), None);
-        assert_eq!(c.logical_partial_cmp(&a), None);
+        assert_eq!(a.logical_partial_cmp(&null), None);
+        assert_eq!(null.logical_partial_cmp(&a), None);
 
         // assert that NULL values are incomparable
-        let null = Scalar::Null(DataType::INTEGER);
         assert_eq!(null.logical_partial_cmp(&null), None);
     }
 
     #[test]
-    fn test_partial_eq() {
-        let a = Scalar::Integer(1);
-        let b = Scalar::Integer(2);
-        let c = Scalar::Null(DataType::INTEGER);
+    fn test_partial_eq_integer() {
+        test_partial_eq(Scalar::Integer(1), Scalar::Integer(2), DataType::INTEGER);
+    }
+
+    /// Compare two scalars of the given datatype; a should be different than b.
+    fn test_partial_eq(a: Scalar, b: Scalar, dtype: DataType) {
+        let null = Scalar::Null(dtype);
         assert!(!a.logical_eq(&b));
         assert!(a.logical_eq(&a));
-        assert!(!a.logical_eq(&c));
-        assert!(!c.logical_eq(&a));
+        assert!(!a.logical_eq(&null));
+        assert!(!null.logical_eq(&a));
 
         // assert that NULL values are incomparable
-        let null = Scalar::Null(DataType::INTEGER);
         assert!(!null.logical_eq(&null));
+    }
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[test]
+    fn test_partial_eq_cmp_timestamp_nanos() {
+        test_partial_eq(
+            Scalar::TimestampNanos(-123),
+            Scalar::TimestampNanos(123),
+            DataType::TIMESTAMP_NANOS,
+        );
+        test_partial_cmp(
+            Scalar::TimestampNanos(-123),
+            Scalar::TimestampNanos(123),
+            DataType::TIMESTAMP_NANOS,
+        );
     }
 
     #[test]
