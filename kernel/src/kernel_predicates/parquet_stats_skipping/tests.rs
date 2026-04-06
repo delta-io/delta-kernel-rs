@@ -35,7 +35,7 @@ impl ParquetStatsProvider for UnimplementedTestFilter {
         unimplemented!()
     }
 
-    fn get_parquet_rowcount_stat(&self) -> i64 {
+    fn get_parquet_rowcount_stat(&self) -> Option<i64> {
         unimplemented!()
     }
 }
@@ -148,7 +148,7 @@ impl ParquetStatsProvider for MinMaxTestFilter {
         unimplemented!()
     }
 
-    fn get_parquet_rowcount_stat(&self) -> i64 {
+    fn get_parquet_rowcount_stat(&self) -> Option<i64> {
         unimplemented!()
     }
 }
@@ -221,8 +221,8 @@ impl ParquetStatsProvider for NullCountTestFilter {
         self.nullcount
     }
 
-    fn get_parquet_rowcount_stat(&self) -> i64 {
-        self.rowcount
+    fn get_parquet_rowcount_stat(&self) -> Option<i64> {
+        Some(self.rowcount)
     }
 }
 
