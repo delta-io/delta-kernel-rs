@@ -452,11 +452,13 @@ mod tests {
     use delta_kernel_ffi::engine_data::get_engine_data;
     use delta_kernel_ffi::engine_data::ArrowFFIData;
 
-    use delta_kernel_ffi::ffi_test_utils::{allocate_str, ok_or_panic, recover_string};
+    use delta_kernel_ffi::ffi_test_utils::{
+        allocate_err, allocate_str, build_snapshot, ok_or_panic, recover_error, recover_string,
+    };
     use delta_kernel_ffi::tests::get_default_engine;
 
     use crate::{free_engine, free_schema, free_snapshot, kernel_string_slice};
-    use crate::{logical_schema, snapshot, version};
+    use crate::{logical_schema, version};
     use write_context::{free_write_context, get_write_context, get_write_path, get_write_schema};
 
     use test_utils::{set_json_value, setup_test_tables, test_read};
@@ -642,11 +644,7 @@ mod tests {
             )?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
-                get_engine_data(
-                    file_info.array,
-                    &file_info.schema,
-                    crate::ffi_test_utils::allocate_err,
-                )
+                get_engine_data(file_info.array, &file_info.schema, allocate_err)
             });
 
             unsafe { add_files(txn_with_engine_info.shallow_copy(), file_info_engine_data) };
@@ -771,10 +769,7 @@ mod tests {
             let engine = get_default_engine(table_path_str);
 
             let snapshot = unsafe {
-                crate::ffi_test_utils::build_snapshot(
-                    kernel_string_slice!(table_path_str),
-                    engine.shallow_copy(),
-                )
+                build_snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy())
             };
 
             let context = get_test_context(false);
@@ -785,7 +780,7 @@ mod tests {
                 ok_or_panic(get_uc_committer(
                     uc_client.shallow_copy(),
                     kernel_string_slice!(table_id),
-                    crate::ffi_test_utils::allocate_err,
+                    allocate_err,
                 ))
             };
 
@@ -832,11 +827,7 @@ mod tests {
             )?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
-                get_engine_data(
-                    file_info.array,
-                    &file_info.schema,
-                    crate::ffi_test_utils::allocate_err,
-                )
+                get_engine_data(file_info.array, &file_info.schema, allocate_err)
             });
 
             unsafe { add_files(txn_with_engine_info.shallow_copy(), file_info_engine_data) };
@@ -982,9 +973,8 @@ mod tests {
         build_and_commit(builder, &engine);
 
         // Verify by opening a snapshot of the created table
-        let snap = ok_or_panic(unsafe {
-            snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
+        let snap =
+            unsafe { build_snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy()) };
         let snap_version = unsafe { version(snap.shallow_copy()) };
         assert_eq!(snap_version, 0);
 
@@ -1036,9 +1026,8 @@ mod tests {
 
         // Verify properties via snapshot
         let table_path_str = table_path.as_str();
-        let snap = ok_or_panic(unsafe {
-            snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
+        let snap =
+            unsafe { build_snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy()) };
         let snap_ref = unsafe { snap.as_ref() };
 
         // Verify parsed table properties
@@ -1081,7 +1070,7 @@ mod tests {
         match result {
             ExternResult::Err(e) => {
                 // Clean up the error to prevent leaks
-                let error = unsafe { crate::ffi_test_utils::recover_error(e) };
+                let error = unsafe { recover_error(e) };
                 assert!(
                     error.message.contains("already exists"),
                     "Expected 'already exists' error, got: {}",
@@ -1122,7 +1111,7 @@ mod tests {
         let result = unsafe { create_table_builder_build(builder, engine.shallow_copy()) };
         match result {
             ExternResult::Err(e) => {
-                let error = unsafe { crate::ffi_test_utils::recover_error(e) };
+                let error = unsafe { recover_error(e) };
                 assert!(
                     error.message.contains("schema")
                         || error.message.contains("field")
@@ -1168,9 +1157,8 @@ mod tests {
         assert_eq!(committed_version, 0);
 
         // Verify the table was created
-        let snap = ok_or_panic(unsafe {
-            snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
+        let snap =
+            unsafe { build_snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy()) };
         assert_eq!(unsafe { version(snap.shallow_copy()) }, 0);
 
         unsafe { free_snapshot(snap) };
