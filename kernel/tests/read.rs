@@ -1198,6 +1198,21 @@ fn timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(feature = "nanosecond-timestamps")]
+#[test]
+fn timestamp_nanos() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+----+--------------------------------+",
+        "| id | ts                             |",
+        "+----+--------------------------------+",
+        "| 0  | 1970-01-01T00:00:00.000000123Z |",
+        "| 1  | 1969-12-31T23:59:59.999999877Z |",
+        "+----+--------------------------------+",
+    ];
+    read_table_data_str("./tests/data/timestamp-nanos/", None, None, expected)?;
+    Ok(())
+}
+
 #[test]
 fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
