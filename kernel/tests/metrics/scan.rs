@@ -61,7 +61,10 @@ async fn scan_execute_contributes_parquet_data_file_reads() -> DeltaResult<()> {
         result?;
         batches_seen += 1;
     }
-    assert!(batches_seen > 0, "scan should return rows");
+    assert_eq!(
+        batches_seen, 2,
+        "scan should return one batch per data file"
+    );
 
     // scan calls read_parquet_files once per data file (not batched), so 2 calls for 2 files
     assert_eq!(reporter.parquet_read_calls.get(), 2);
