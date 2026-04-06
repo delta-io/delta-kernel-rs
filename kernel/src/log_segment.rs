@@ -277,6 +277,7 @@ impl LogSegment {
                         num_checkpoint_files: log_segment.listed.checkpoint_parts.len() as u64,
                         num_compaction_files: log_segment.listed.ascending_compaction_files.len()
                             as u64,
+                        has_latest_crc_file: log_segment.listed.latest_crc_file.is_some(),
                     });
                 });
                 Ok(log_segment)

@@ -1,6 +1,7 @@
 //! CRC file reading functionality.
 
 use super::Crc;
+use crate::metrics::MetricEvent;
 use crate::path::{AsUrl as _, ParsedLogPath};
 use crate::{DeltaResult, Engine, Error};
 
@@ -18,6 +19,12 @@ pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -
         .next()
         .ok_or_else(|| Error::generic("CRC file read returned no data"))??;
     let crc: Crc = serde_json::from_slice(&data)?;
+
+    if let Some(reporter) = engine.get_metrics_reporter() {
+        reporter.report(MetricEvent::CrcReadCompleted {
+            bytes_read: data.len() as u64,
+        });
+    }
     Ok(crc)
 }
 
@@ -25,12 +32,15 @@ pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use super::*;
     use crate::actions::{Format, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
+    use crate::metrics::MetricEvent;
     use crate::path::ParsedLogPath;
     use crate::table_features::TableFeature;
+    use crate::utils::test_utils::CapturingReporter;
     use test_utils::assert_result_error_with_message;
 
     fn test_table_root(dir: &str) -> url::Url {
@@ -40,7 +50,8 @@ mod tests {
 
     #[test]
     fn test_read_crc_file() {
-        let engine = SyncEngine::new();
+        let reporter = Arc::new(CapturingReporter::default());
+        let engine = SyncEngine::with_reporter(reporter.clone());
         let table_root = test_table_root("./tests/data/crc-full/");
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
@@ -138,14 +149,32 @@ mod tests {
         assert!(crc.num_deleted_records_opt.is_none());
         assert!(crc.num_deletion_vectors_opt.is_none());
         assert!(crc.deleted_record_counts_histogram_opt.is_none());
+
+        // Verify CrcReadCompleted metric was emitted
+        let crc_events: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e, MetricEvent::CrcReadCompleted { .. }))
+            .collect();
+        assert_eq!(crc_events.len(), 1);
+        assert!(
+            matches!(&crc_events[0], MetricEvent::CrcReadCompleted { bytes_read } if *bytes_read > 0)
+        );
     }
 
     #[test]
     fn test_read_malformed_crc_file_fails() {
-        let engine = SyncEngine::new();
+        let reporter = Arc::new(CapturingReporter::default());
+        let engine = SyncEngine::with_reporter(reporter.clone());
         let table_root = test_table_root("./tests/data/crc-malformed/");
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
         assert_result_error_with_message(try_read_crc_file(&engine, &crc_path), "expected value");
+
+        // Verify no CrcReadCompleted metric was emitted on parse failure
+        assert!(reporter
+            .events()
+            .iter()
+            .all(|e| !matches!(e, MetricEvent::CrcReadCompleted { .. })));
     }
 }
