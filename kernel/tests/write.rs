@@ -3026,32 +3026,28 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             txn.remove_files(scan_metadata?.scan_files);
         }
 
-        match txn.commit(engine.as_ref())? {
-            CommitResult::CommittedTransaction(committed) => {
-                assert_eq!(committed.commit_version(), expected_commit_version);
+        let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        assert_eq!(committed.commit_version(), expected_commit_version);
 
-                let remove_actions =
-                    read_actions_from_commit(&table_url, expected_commit_version, "remove")?;
-                assert!(
-                    !remove_actions.is_empty(),
-                    "expected remove actions in commit"
-                );
+        let remove_actions =
+            read_actions_from_commit(&table_url, expected_commit_version, "remove")?;
+        assert!(
+            !remove_actions.is_empty(),
+            "expected remove actions in commit"
+        );
 
-                // stats must be populated in every remove action: stats_parsed is always present
-                // (via include_all_stats_columns), so the coalesce path handles even checkpoints
-                // that omit the raw JSON stats string (writeStatsAsJson=false).
-                for remove in &remove_actions {
-                    let stats_str = remove["stats"]
-                        .as_str()
-                        .expect("stats field should be a non-null JSON string");
-                    let stats: serde_json::Value = serde_json::from_str(stats_str)?;
-                    assert!(
-                        stats["numRecords"].as_i64().unwrap_or(0) > 0,
-                        "stats.numRecords should be populated, got: {stats}"
-                    );
-                }
-            }
-            _ => panic!("Transaction did not succeed"),
+        // stats must be populated in every remove action: stats_parsed is always present
+        // (via include_all_stats_columns), so the coalesce path handles even checkpoints
+        // that omit the raw JSON stats string (writeStatsAsJson=false).
+        for remove in &remove_actions {
+            let stats_str = remove["stats"]
+                .as_str()
+                .expect("stats field should be a non-null JSON string");
+            let stats: serde_json::Value = serde_json::from_str(stats_str)?;
+            assert!(
+                stats["numRecords"].as_i64().unwrap_or(0) > 0,
+                "stats.numRecords should be populated, got: {stats}"
+            );
         }
     }
     Ok(())
