@@ -232,8 +232,9 @@ impl Snapshot {
         // OR could be from 1 -> new_version
         // Save the latest_commit before moving new_listed_files
         let new_latest_commit_file = new_listed_files.latest_commit_file().clone();
-        // Note: new_log_segment won't have checkpoint_schema since we're listing without a hint.
-        // If it has a checkpoint, we use it as-is. Otherwise, we preserve the old checkpoint_schema.
+        // Note: new_log_segment won't have last_checkpoint_metadata since we're listing without a hint.
+        // If the new segment has a checkpoint, we will return it as is. Otherwise, we will preserve
+        // last_checkpoint_metadata when merging the new log segment with the old one.
         let mut new_log_segment =
             LogSegment::try_new(new_listed_files, log_root.clone(), requested_version, None)?;
 
@@ -332,8 +333,8 @@ impl Snapshot {
             },
             log_root,
             requested_version,
-            // Preserve checkpoint schema from old segment
-            old_log_segment.checkpoint_schema.clone(),
+            // Preserve last checkpoint metadata from old segment
+            old_log_segment.last_checkpoint_metadata.clone(),
         )?;
 
         Ok(Arc::new(Snapshot::new_with_crc(
@@ -2653,6 +2654,20 @@ mod tests {
         Ok(IncrementalSnapshotTestContext { store, url, engine })
     }
 
+    /// Compares two Snapshots field-by-field. LogSegment fields are compared individually,
+    /// intentionally skipping `last_checkpoint_metadata` which is only populated on the
+    /// from-scratch path (via `_last_checkpoint` hint) and not on the incremental update path.
+    fn compare_snapshots(left: &Snapshot, right: &Snapshot) {
+        assert_eq!(left.table_configuration, right.table_configuration);
+        assert_eq!(left.log_segment.end_version, right.log_segment.end_version);
+        assert_eq!(
+            left.log_segment.checkpoint_version,
+            right.log_segment.checkpoint_version
+        );
+        assert_eq!(left.log_segment.log_root, right.log_segment.log_root);
+        assert_eq!(left.log_segment.listed, right.log_segment.listed);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version(
     ) -> DeltaResult<()> {
@@ -2674,7 +2689,7 @@ mod tests {
         let updated = Snapshot::builder_from(snapshot_v1).build(ctx.engine.as_ref())?;
         assert_eq!(updated.version(), 1);
         assert_eq!(updated.log_segment.checkpoint_version, Some(1));
-        assert_eq!(updated, fresh);
+        compare_snapshots(&updated, &fresh);
 
         Ok(())
     }
@@ -2708,7 +2723,7 @@ mod tests {
         let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
         assert_eq!(updated.version(), 3);
         assert_eq!(updated.log_segment.checkpoint_version, Some(2));
-        assert_eq!(updated, fresh);
+        compare_snapshots(&updated, &fresh);
 
         Ok(())
     }
