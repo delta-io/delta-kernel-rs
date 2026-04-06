@@ -169,6 +169,7 @@ impl SnapshotBuilder {
                     log_segment,
                     engine,
                     operation_id,
+                    None,
                 )
                 .map(Into::into)
             })
