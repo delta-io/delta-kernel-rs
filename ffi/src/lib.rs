@@ -1273,12 +1273,8 @@ mod tests {
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let snap = unsafe {
-            ok_or_panic(snapshot(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
+        let snap =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
         let ts = unsafe {
             ok_or_panic(snapshot_timestamp(
@@ -1326,12 +1322,8 @@ mod tests {
 
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let snap = unsafe {
-            ok_or_panic(snapshot(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
+        let snap =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
         let ts = unsafe {
             ok_or_panic(snapshot_timestamp(
