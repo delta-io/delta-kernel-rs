@@ -1,12 +1,12 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
@@ -26,7 +26,7 @@ use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
-use crate::table_features::TableFeature;
+use crate::table_features::{physical_to_logical_column_name, ColumnMappingMode, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::utils::require;
@@ -53,6 +53,15 @@ pub enum ChecksumWriteResult {
     /// overwrite existing version checksum files.
     AlreadyExists,
     /// The CRC file was successfully written to storage.
+    Written,
+}
+
+/// Result of attempting to write a checkpoint file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointWriteResult {
+    /// A checkpoint already exists at this version.
+    AlreadyExists,
+    /// The checkpoint was successfully written to storage.
     Written,
 }
 
@@ -477,26 +486,55 @@ impl Snapshot {
 
     /// Performs a complete checkpoint of this snapshot using the provided engine.
     ///
-    /// Writes a checkpoint parquet file and the `_last_checkpoint` file. Returns an updated
-    /// [`SnapshotRef`] whose log segment reflects the new checkpoint. Commits and compaction
-    /// files subsumed by the checkpoint are dropped from the returned snapshot.
+    /// If a checkpoint already exists at this version, returns
+    /// [`CheckpointWriteResult::AlreadyExists`] with the original snapshot unchanged.
+    /// Otherwise, writes a checkpoint parquet file and the `_last_checkpoint` file and returns
+    /// [`CheckpointWriteResult::Written`] with an updated [`SnapshotRef`] whose log segment
+    /// reflects the new checkpoint. Commits and compaction files subsumed by the checkpoint are
+    /// dropped from the returned snapshot.
     ///
-    /// Note: This function uses [`crate::ParquetHandler::write_parquet_file`] and
-    /// [`crate::StorageHandler::head`], which may not be implemented by all engines
-    /// (e.g., `SyncEngine`).
-    ///
-    /// If you are using the default engine, make sure to build it with the multi-threaded
-    /// executor if you want to use this method.
+    /// Note:
+    ///     - It is still possible that an existing checkpoint gets overwritten if that
+    ///       checkpoint was written by a concurrent writer.
+    ///     - This function uses [`crate::ParquetHandler::write_parquet_file`] and
+    ///       [`crate::StorageHandler::head`], which may not be implemented by all engines.
+    ///       If you are using the default engine, make sure to build it with the multi-threaded
+    ///       executor if you want to use this method.
     #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
-    pub fn checkpoint(self: &SnapshotRef, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+    pub fn checkpoint(
+        self: &SnapshotRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<(CheckpointWriteResult, SnapshotRef)> {
+        if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
+            info!(
+                "Checkpoint already exists for snapshot version {}",
+                self.version()
+            );
+            return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
+        }
+
         let writer = Arc::clone(self).create_checkpoint_writer()?;
         let checkpoint_path = writer.checkpoint_path()?;
         let data_iter = writer.checkpoint_data(engine)?;
         let state = data_iter.state();
         let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
-        engine
+        match engine
             .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
+            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))
+        {
+            Ok(()) => (),
+            Err(Error::FileAlreadyExists(_)) => {
+                // NOTE: Per write_parquet_file's documentation, it should silently overwrite existing files,
+                // so we log a warning but still return the correct result.
+                warn!(
+                    "ParquetHandler::write_parquet_file unexpectedly failed on \
+                    FileAlreadyExists for version {}",
+                    self.version()
+                );
+                return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
+            }
+            Err(e) => return Err(e),
+        }
 
         let file_meta = engine.storage_handler().head(&checkpoint_path)?;
 
@@ -509,11 +547,14 @@ impl Snapshot {
         let new_log_segment = self
             .log_segment
             .try_new_with_checkpoint(checkpoint_log_path)?;
-        Ok(Arc::new(Snapshot::new_with_crc(
-            new_log_segment,
-            self.table_configuration().clone(),
-            self.lazy_crc.clone(),
-        )))
+        Ok((
+            CheckpointWriteResult::Written,
+            Arc::new(Snapshot::new_with_crc(
+                new_log_segment,
+                self.table_configuration().clone(),
+                self.lazy_crc.clone(),
+            )),
+        ))
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
@@ -560,6 +601,54 @@ impl Snapshot {
     /// Get the [`TableProperties`] for this [`Snapshot`].
     pub fn table_properties(&self) -> &TableProperties {
         self.table_configuration().table_properties()
+    }
+
+    /// Returns the protocol-derived table properties as a map of key-value pairs.
+    ///
+    /// This includes:
+    /// - `delta.minReaderVersion` and `delta.minWriterVersion`
+    /// - `delta.feature.<name> = "supported"` for each reader and writer feature (when using
+    ///   table features protocol, i.e. reader version 3 / writer version 7)
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn get_protocol_derived_properties(&self) -> HashMap<String, String> {
+        let protocol = self.table_configuration().protocol();
+
+        let mut properties = HashMap::from([
+            (
+                "delta.minReaderVersion".into(),
+                protocol.min_reader_version().to_string(),
+            ),
+            (
+                "delta.minWriterVersion".into(),
+                protocol.min_writer_version().to_string(),
+            ),
+        ]);
+
+        let features = protocol
+            .reader_features()
+            .into_iter()
+            .flatten()
+            .chain(protocol.writer_features().into_iter().flatten());
+
+        for feature in features {
+            properties
+                .entry(format!("delta.feature.{}", feature.as_ref()))
+                .or_insert_with(|| "supported".to_string());
+        }
+
+        properties
+    }
+
+    /// Get the raw metadata configuration for this table.
+    ///
+    /// This returns the `Metadata.configuration` map as stored in the Delta log, containing
+    /// user-defined properties, delta table properties (e.g., `delta.enableInCommitTimestamps`),
+    /// and application-specific properties (e.g., `io.unitycatalog.tableId`).
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn metadata_configuration(&self) -> &HashMap<String, String> {
+        self.table_configuration().metadata().configuration()
     }
 
     /// Get the [`TableConfiguration`] for this [`Snapshot`].
@@ -640,6 +729,50 @@ impl Snapshot {
         self.get_domain_metadata_internal(domain, engine)
     }
 
+    /// Get the logical clustering columns for this snapshot, if clustering is enabled.
+    ///
+    /// Returns `Ok(Some(columns))` if the ClusteredTable feature is enabled and clustering
+    /// columns are defined, `Ok(None)` if clustering is not enabled, or an error if the
+    /// clustering metadata is malformed.
+    ///
+    /// The columns are returned as logical [`ColumnName`]s. When column mapping is enabled,
+    /// this converts the physical names stored in domain metadata back to logical names using
+    /// the table schema.
+    ///
+    /// Note that this method performs log replay (fetches and processes metadata from storage).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the clustering domain metadata is malformed, or if a physical
+    /// column name cannot be resolved to a logical name in the schema.
+    ///
+    /// [`ColumnName`]: crate::expressions::ColumnName
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn get_logical_clustering_columns(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<Vec<ColumnName>>> {
+        let physical_columns = match self.get_physical_clustering_columns(engine)? {
+            Some(cols) => cols,
+            None => return Ok(None),
+        };
+        let column_mapping_mode = self.table_configuration.column_mapping_mode();
+        if column_mapping_mode == ColumnMappingMode::None {
+            // No column mapping: physical = logical
+            return Ok(Some(physical_columns));
+        }
+        // Convert physical column names to logical names by walking the schema
+        let logical_schema = self.table_configuration.logical_schema();
+        let logical_columns = physical_columns
+            .iter()
+            .map(|physical_col| {
+                physical_to_logical_column_name(&logical_schema, physical_col, column_mapping_mode)
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+        Ok(Some(logical_columns))
+    }
+
     /// Get the clustering columns for this snapshot, if the table has clustering enabled.
     ///
     /// Returns `Ok(Some(columns))` if the ClusteredTable feature is enabled and clustering
@@ -703,10 +836,20 @@ impl Snapshot {
     /// NOTE: This is an unstable API expected to change in future releases.
     #[allow(unused)]
     #[internal_api]
-    pub(crate) fn get_file_stats(&self, engine: &dyn Engine) -> Option<FileStats> {
+    pub(crate) fn get_or_load_file_stats(&self, engine: &dyn Engine) -> Option<FileStats> {
         let crc = self
             .lazy_crc
             .get_or_load_if_at_version(engine, self.version())?;
+        crc.file_stats()
+    }
+
+    /// Returns file-level statistics, or `None` if CRC is not loaded, not at this
+    /// version, or has no valid file stats.
+    ///
+    /// NOTE: This API is purely opportunistic, no I/O.
+    #[internal_api]
+    pub(crate) fn get_file_stats_if_loaded(&self) -> Option<FileStats> {
+        let crc = self.lazy_crc.get_if_loaded_at_version(self.version())?;
         crc.file_stats()
     }
 
@@ -914,8 +1057,8 @@ impl Snapshot {
     /// - `Ok(Some(timestamp))` - ICT is enabled and available for this version
     /// - `Ok(None)` - ICT is not enabled
     /// - `Err(...)` - ICT is enabled but cannot be read, or enablement version is invalid
-    #[internal_api]
     #[instrument(parent = &self.span, name = "snap.get_ict", skip_all, err)]
+    #[internal_api]
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
         let enablement = self
@@ -980,7 +1123,7 @@ impl Snapshot {
     /// [`get_in_commit_timestamp`]: Self::get_in_commit_timestamp
     #[allow(unused)]
     #[instrument(parent = &self.span, name = "snap.get_ts", skip_all, err)]
-    pub(crate) fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
+    pub fn get_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         match self
             .table_configuration()
             .in_commit_timestamp_enablement()?
@@ -2710,5 +2853,116 @@ mod tests {
         assert_eq!(versions_and_his, vec![(1, 2), (2, 2)]);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_get_protocol_derived_properties() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+        let props = snapshot.get_protocol_derived_properties();
+        assert_eq!(
+            props.get("delta.minReaderVersion").unwrap(),
+            &TABLE_FEATURES_MIN_READER_VERSION.to_string()
+        );
+        assert_eq!(
+            props.get("delta.minWriterVersion").unwrap(),
+            &TABLE_FEATURES_MIN_WRITER_VERSION.to_string()
+        );
+        assert_eq!(
+            props.get("delta.feature.deletionVectors").unwrap(),
+            "supported"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_configuration() {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+
+        // Create a commit with custom configuration
+        let actions = vec![
+            json!({"commitInfo": {"timestamp": 123, "operation": "CREATE TABLE"}}),
+            json!({"protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": []
+            }}),
+            json!({"metaData": {
+                "id": "test-id",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {
+                    "io.unitycatalog.tableId": "abc-123",
+                    "myapp.setting": "value"
+                },
+                "createdTime": 1234567890
+            }}),
+        ];
+        commit(table_root, &storage, 0, actions).await;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        let config = snapshot.metadata_configuration();
+        assert_eq!(
+            config.get("io.unitycatalog.tableId"),
+            Some(&"abc-123".to_string())
+        );
+        assert_eq!(config.get("myapp.setting"), Some(&"value".to_string()));
+    }
+
+    #[rstest::rstest]
+    #[case::no_clustering(None, None, None)]
+    #[case::clustered_no_column_mapping(
+        Some(vec!["region"]),
+        None,
+        Some(vec![ColumnName::new(["region"])])
+    )]
+    #[case::clustered_with_column_mapping(
+        Some(vec!["region"]),
+        Some("name"),
+        Some(vec![ColumnName::new(["region"])])
+    )]
+    fn test_get_logical_clustering_columns(
+        #[case] clustering_cols: Option<Vec<&str>>,
+        #[case] column_mapping_mode: Option<&str>,
+        #[case] expected: Option<Vec<ColumnName>>,
+    ) {
+        use crate::transaction::create_table::create_table;
+        use crate::transaction::data_layout::DataLayout;
+
+        let storage = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(storage).build();
+        let schema = Arc::new(
+            crate::schema::StructType::try_new(vec![
+                crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, false),
+                crate::schema::StructField::new("region", crate::schema::DataType::STRING, true),
+            ])
+            .unwrap(),
+        );
+        let mut builder = create_table("memory:///", schema, "test");
+        if let Some(cols) = &clustering_cols {
+            builder = builder.with_data_layout(DataLayout::clustered(cols.clone()));
+        }
+        if let Some(mode) = column_mapping_mode {
+            builder = builder.with_table_properties([("delta.columnMapping.mode", mode)]);
+        }
+        let _ = builder
+            .build(
+                &engine,
+                Box::new(crate::committer::FileSystemCommitter::new()),
+            )
+            .unwrap()
+            .commit(&engine)
+            .unwrap();
+        let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
+        let result = snapshot.get_logical_clustering_columns(&engine).unwrap();
+        assert_eq!(result, expected);
     }
 }
