@@ -1,8 +1,10 @@
 name: semver-checks
 
-# Trigger when a PR is opened or changed
+# Trigger when a PR is opened or changed. This runs with `pull_request` trigger, which means it has
+# only read perms. The adding of the label happens in semver-label.yml via workflow_run which will
+# will look at the status of this job, and always runs in the base-repo context.
 on:
-  pull_request_target:
+  pull_request:
     types:
       - opened
       - synchronize
@@ -17,11 +19,9 @@ jobs:
   check_if_pr_breaks_semver:
     runs-on: ubuntu-latest
     permissions:
-      # this job runs with read because it checks out the PR head which could contain malicious code
       contents: read
     steps:
-      - uses: actions/checkout@v4
-        name: checkout full rep
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           ref: >-
@@ -29,77 +29,60 @@ jobs:
                 && github.event.merge_group.head_sha
                 || github.event.pull_request.head.sha }}
       - name: Install minimal stable
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
       # See build.yml top-level comment for why save-if is restricted to main.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install cargo-semver-checks
-        shell: bash
-        run: |
-          cargo install cargo-semver-checks --locked
+        uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
+        with:
+          tool: cargo-semver-checks
       - name: Compute baseline revision
         id: baseline
         shell: bash
+        env:
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           if [ "${{ github.event_name }}" = "merge_group" ]; then
-            echo "rev=${{ github.event.merge_group.base_sha }}" >> "$GITHUB_OUTPUT"
+            echo "rev=${MERGE_GROUP_BASE_SHA}" >> "$GITHUB_OUTPUT"
           else
             # Use the merge-base instead of the PR base SHA. The base SHA is the tip of
             # the target branch when the webhook fires, which can differ from where the PR
             # actually diverged. Using merge-base avoids false positives when the PR branch
             # is behind the target branch.
-            MERGE_BASE=$(git merge-base ${{ github.event.pull_request.head.sha }} ${{ github.event.pull_request.base.sha }})
+            MERGE_BASE=$(git merge-base "$PR_HEAD_SHA" "$PR_BASE_SHA")
             echo "rev=${MERGE_BASE}" >> "$GITHUB_OUTPUT"
           fi
-      - name: Run check
+      - name: Run semver check
         id: check
         continue-on-error: true
         shell: bash
+        env:
+          BASELINE_REV: ${{ steps.baseline.outputs.rev }}
         # only check semver on released crates (delta_kernel and delta_kernel_ffi).
         # note that this won't run on proc macro/derive crates, so don't need to include
         # delta_kernel_derive etc.
         run: |
           cargo semver-checks -p delta_kernel -p delta_kernel_ffi --all-features \
-            --baseline-rev ${{ steps.baseline.outputs.rev }}
-      - name: On Failure
-        id: set_failure
-        if: ${{ steps.check.outcome == 'failure' }}
-        run: |
-          echo "Checks failed"
-          echo "check_status=failure" >> $GITHUB_OUTPUT
-      - name: On Success
-        id: set_success
-        if: ${{ steps.check.outcome == 'success' }}
-        run: |
-          echo "Checks succeed"
-          echo "check_status=success" >> $GITHUB_OUTPUT
-    outputs:
-      check_status: ${{ steps.set_failure.outputs.check_status || steps.set_success.outputs.check_status }}
-  update_label_if_needed:
-    needs: check_if_pr_breaks_semver
-    runs-on: ubuntu-latest
-    permissions:
-      # this job only looks at previous output and then sets a label, so malicious code in the PR
-      # isn't a concern
-      pull-requests: write
-    steps:
-      - name: On Failure
-        if: github.event_name == 'pull_request_target' && needs.check_if_pr_breaks_semver.outputs.check_status == 'failure'
-        uses: actions-ecosystem/action-add-labels@v1
+            --baseline-rev "$BASELINE_REV"
+      # Upload the step outcome as an artifact so semver-label.yml can read it via workflow_run.
+      # steps.check.outcome is the raw result *before* continue-on-error converts it to "success",
+      # so it correctly reflects whether a breaking change was detected.
+      # Only upload for pull_request events; merge_group runs have no PR to label.
+      - name: Save semver outcome
+        if: github.event_name == 'pull_request'
+        env:
+          SEMVER_OUTCOME: ${{ steps.check.outcome }}
+        run: echo "$SEMVER_OUTCOME" > semver-outcome.txt
+      - name: Upload semver outcome
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          labels: breaking-change
-      - name: Remove breaking-change label
-        if: github.event_name == 'pull_request_target' && needs.check_if_pr_breaks_semver.outputs.check_status == 'success' && contains(github.event.pull_request.labels.*.name, 'breaking-change')
-        uses: actions-ecosystem/action-remove-labels@v1
-        with:
-          labels: breaking-change
-      - name: On Success
-        if: needs.check_if_pr_breaks_semver.outputs.check_status == 'success'
-        run: |
-          echo "Checks succeed"
-      - name: Fail On Incorrect Previous Output
-        if: needs.check_if_pr_breaks_semver.outputs.check_status != 'success' && needs.check_if_pr_breaks_semver.outputs.check_status != 'failure'
-        run: exit 1
+          name: semver-outcome
+          path: semver-outcome.txt
+          retention-days: 1

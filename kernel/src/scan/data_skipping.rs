@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
@@ -14,6 +15,7 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
+use crate::scan::metrics::ScanMetrics;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::require;
 use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
@@ -73,6 +75,8 @@ pub(crate) struct DataSkippingFilter {
     stats_evaluator: Arc<dyn ExpressionEvaluator>,
     skipping_evaluator: Arc<dyn PredicateEvaluator>,
     filter_evaluator: Arc<dyn PredicateEvaluator>,
+    /// Metrics to record data skipping statistics.
+    metrics: Option<Arc<ScanMetrics>>,
 }
 
 impl DataSkippingFilter {
@@ -97,6 +101,8 @@ impl DataSkippingFilter {
     ///   `partitionValues` string map into a typed struct. Only used when `partition_schema` is
     ///   `Some`.
     /// - `input_schema`: Schema of the batch that will be passed to [`apply()`](Self::apply)
+    /// - `metrics`: Optional metrics to record data skipping statistics.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         engine: &dyn Engine,
         predicate: Option<PredicateRef>,
@@ -105,9 +111,16 @@ impl DataSkippingFilter {
         partition_schema: Option<&SchemaRef>,
         partition_expr: ExpressionRef,
         input_schema: SchemaRef,
+        metrics: Option<Arc<ScanMetrics>>,
     ) -> Option<Self> {
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
+        static FILTER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                "output",
+                DataType::BOOLEAN,
+            )]))
+        });
 
         let predicate = predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
@@ -157,9 +170,11 @@ impl DataSkippingFilter {
             .inspect_err(|e| error!("Failed to create skipping evaluator: {e}"))
             .ok()?;
 
+        // The filter evaluator operates on the skipping evaluator's output, which is a single
+        // boolean column named "output" (not the unified stats schema).
         let filter_evaluator = engine
             .evaluation_handler()
-            .new_predicate_evaluator(unified_schema, FILTER_PRED.clone())
+            .new_predicate_evaluator(FILTER_SCHEMA.clone(), FILTER_PRED.clone())
             .inspect_err(|e| error!("Failed to create filter evaluator: {e}"))
             .ok()?;
 
@@ -167,6 +182,7 @@ impl DataSkippingFilter {
             stats_evaluator,
             skipping_evaluator,
             filter_evaluator,
+            metrics,
         })
     }
 
@@ -203,24 +219,34 @@ impl DataSkippingFilter {
                 DataType::Struct(Box::new(ps.as_ref().clone())),
             )
         };
+        let is_add_field = StructField::not_null("is_add", DataType::BOOLEAN);
 
+        // When partition columns are present, include an `is_add` boolean so that partition
+        // predicates can guard against filtering Remove rows. Derived from `path IS NOT NULL`
+        // in the input batch (Add rows have non-null path, Remove/non-file rows have null).
         let unified_schema = match (physical_stats_schema, physical_partition_schema) {
             (Some(stats), Some(ps)) => Arc::new(StructType::new_unchecked([
                 stats_field(stats),
                 partition_field(ps),
+                is_add_field,
             ])),
             (Some(stats), None) => Arc::new(StructType::new_unchecked([stats_field(stats)])),
-            (None, Some(ps)) => Arc::new(StructType::new_unchecked([partition_field(ps)])),
+            (None, Some(ps)) => Arc::new(StructType::new_unchecked([
+                partition_field(ps),
+                is_add_field,
+            ])),
             (None, None) => return None,
         };
+
+        let is_add_expr: ExpressionRef = Arc::new(Pred::is_not_null(column_expr!("path")).into());
 
         let unified_expr = match (
             physical_stats_schema.is_some(),
             physical_partition_schema.is_some(),
         ) {
-            (true, true) => Arc::new(Expr::struct_from([stats_expr, partition_expr])),
+            (true, true) => Arc::new(Expr::struct_from([stats_expr, partition_expr, is_add_expr])),
             (true, false) => Arc::new(Expr::struct_from([stats_expr])),
-            (false, true) => Arc::new(Expr::struct_from([partition_expr])),
+            (false, true) => Arc::new(Expr::struct_from([partition_expr, is_add_expr])),
             (false, false) => return None,
         };
 
@@ -230,10 +256,10 @@ impl DataSkippingFilter {
     /// Apply the DataSkippingFilter to an EngineData batch. Returns a selection vector
     /// which can be applied to the batch to find rows that passed data skipping.
     pub(crate) fn apply(&self, batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+        let start_time = Instant::now();
         let batch_len = batch.len();
 
         let file_stats = self.stats_evaluator.evaluate(batch)?;
-        debug_assert_eq!(file_stats.len(), batch_len);
         require!(
             file_stats.len() == batch_len,
             Error::internal_error(format!(
@@ -244,7 +270,6 @@ impl DataSkippingFilter {
         );
 
         let skipping_predicate = self.skipping_evaluator.evaluate(&*file_stats)?;
-        debug_assert_eq!(skipping_predicate.len(), batch_len);
         require!(
             skipping_predicate.len() == batch_len,
             Error::internal_error(format!(
@@ -270,13 +295,16 @@ impl DataSkippingFilter {
         let mut visitor = SelectionVectorVisitor::default();
         visitor.visit_rows_of(selection_vector.as_ref())?;
 
-        let skipped = visitor
-            .selection_vector
-            .iter()
-            .filter(|&&kept| !kept)
-            .count();
-        if skipped > 0 {
-            info!("data skipping filtered {skipped}/{batch_len} rows from batch",);
+        if visitor.num_filtered > 0 {
+            debug!(
+                "data skipping filtered {}/{batch_len} rows from batch",
+                visitor.num_filtered
+            );
+        }
+
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.add_predicate_filtered(visitor.num_filtered);
+            metrics.add_predicate_eval_time_ns(start_time.elapsed().as_nanos() as u64)
         }
 
         Ok(visitor.selection_vector)
@@ -340,6 +368,27 @@ fn collect_junction_preds(
     Pred::junction(op, preds)
 }
 
+/// Adjusts a comparison value before comparing against a max stat, to account for the Delta
+/// protocol allowing timestamp stats to be truncated to millisecond precision (see Per-file
+/// Statistics: "Timestamp columns are truncated down to milliseconds"). Truncation floors to
+/// the nearest millisecond, so: `stored_max <= actual_max <= stored_max + 999us`. We subtract
+/// 999us from the comparison value to avoid incorrectly pruning files whose actual max may be
+/// higher than the stored (truncated) max.
+///
+/// For example, if a file's actual max is `4_000_500us` (4.000500s), Spark truncates the
+/// stored max stat to `4_000_000us` (4.000s). A predicate `ts > 4_000_400` would incorrectly
+/// prune this file by comparing against the truncated max. By adjusting the comparison value
+/// to `4_000_400 - 999 = 3_999_401`, we ensure the file is kept.
+///
+/// Non-timestamp values pass through unchanged.
+fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Scalar {
+    match val {
+        Scalar::Timestamp(micros) => Scalar::Timestamp(micros.saturating_sub(999)),
+        Scalar::TimestampNtz(micros) => Scalar::TimestampNtz(micros.saturating_sub(999)),
+        other => other.clone(),
+    }
+}
+
 /// Rewrites user predicates into stats-based predicates for data skipping.
 ///
 /// For data columns, rewrites to `stats_parsed.minValues.*`/`stats_parsed.maxValues.*`/
@@ -361,6 +410,14 @@ impl<'a> DataSkippingPredicateCreator<'a> {
         let path = col.path();
         path.len() == 1 && self.partition_columns.contains(path[0].as_str())
     }
+
+    /// Wraps a partition predicate with `OR(NOT is_add, pred)` to protect Remove rows from
+    /// being filtered. Remove rows have null add-side partition values, which would cause
+    /// partition predicates to incorrectly evaluate to false. The `is_add` column (derived
+    /// from `path IS NOT NULL`) ensures Removes always pass the partition filter.
+    fn guard_for_removes(&self, pred: Pred) -> Pred {
+        Pred::or(Pred::not(Pred::from(column_name!("is_add"))), pred)
+    }
 }
 
 impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
@@ -378,20 +435,32 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     }
 
     /// Retrieves the maximum value of a column. For partition columns, returns the exact
-    /// partition value. For data columns, excludes timestamps due to millisecond truncation.
-    // TODO(#1002): we currently don't support file skipping on timestamp columns' max stat since
-    // they are truncated to milliseconds in add.stats.
-    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
+    /// partition value.
+    fn get_max_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
         if self.is_partition_column(col) {
             Some(joined_column_expr!("partitionValues_parsed", col))
         } else {
-            match data_type {
-                &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => None,
-                #[cfg(feature = "nanosecond-timestamps")]
-                &DataType::TIMESTAMP_NANOS => None,
-                _ => Some(Expr::from(column_name!("stats_parsed.maxValues").join(col))),
-            }
+            Some(Expr::from(column_name!("stats_parsed.maxValues").join(col)))
         }
+    }
+
+    /// Compares a column's max stat against a literal value, adjusting for timestamp
+    /// truncation on non-partition columns. Partition values are exact and not subject to
+    /// JSON stats truncation, so no adjustment is needed. For data columns, the comparison
+    /// value is adjusted by [`adjust_scalar_for_max_stat_truncation`].
+    fn partial_cmp_max_stat(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        ord: Ordering,
+        inverted: bool,
+    ) -> Option<Pred> {
+        let max = self.get_max_stat(col, &val.data_type())?;
+        if self.is_partition_column(col) {
+            return self.eval_partial_cmp(ord, max, val, inverted);
+        }
+        let adjusted = adjust_scalar_for_max_stat_truncation(val);
+        self.eval_partial_cmp(ord, max, &adjusted, inverted)
     }
 
     /// Retrieves the null count of a column. Partition columns don't have nullCount stats.
@@ -408,6 +477,8 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         Some(column_expr!("stats_parsed.numRecords"))
     }
 
+    /// For partition columns, wraps the comparison with `OR(NOT is_add, comparison)` so that
+    /// Remove rows (which have null add-side partition values) are never filtered.
     fn eval_partial_cmp(
         &self,
         ord: Ordering,
@@ -415,7 +486,15 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         val: &Scalar,
         inverted: bool,
     ) -> Option<Pred> {
-        Some(comparison_predicate(ord, col, val, inverted))
+        // Detect partition columns by the prefix set in get_min_stat/get_max_stat.
+        let is_partition = matches!(&col, Expr::Column(name)
+            if name.path().first().is_some_and(|f| f == "partitionValues_parsed"));
+        let cmp = comparison_predicate(ord, col, val, inverted);
+        Some(if is_partition {
+            self.guard_for_removes(cmp)
+        } else {
+            cmp
+        })
     }
 
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
@@ -426,16 +505,18 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Pred::literal)
     }
 
-    /// For partition columns, checks `partitionValues_parsed.<col> IS [NOT] NULL` directly.
+    /// For partition columns, checks `partitionValues_parsed.<col> IS [NOT] NULL` directly,
+    /// wrapped with `OR(NOT is_add, ...)` to protect Remove rows from being filtered.
     /// For data columns, uses nullCount stats.
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
         if self.is_partition_column(col) {
             let pv_expr = joined_column_expr!("partitionValues_parsed", col);
-            if inverted {
-                Some(Pred::is_not_null(pv_expr))
+            let pred = if inverted {
+                Pred::is_not_null(pv_expr)
             } else {
-                Some(Pred::is_null(pv_expr))
-            }
+                Pred::is_null(pv_expr)
+            };
+            Some(self.guard_for_removes(pred))
         } else {
             let safe_to_skip = match inverted {
                 true => self.get_rowcount_stat()?, // all-null
@@ -505,16 +586,11 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
         Some(joined_column_expr!("minValues", col))
     }
 
-    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
+    fn get_max_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
         if self.is_partition_column(col) {
             return None;
         }
-        match data_type {
-            &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => None,
-            #[cfg(feature = "nanosecond-timestamps")]
-            &DataType::TIMESTAMP_NANOS => None,
-            _ => Some(joined_column_expr!("maxValues", col)),
-        }
+        Some(joined_column_expr!("maxValues", col))
     }
 
     fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Expr> {
@@ -526,6 +602,23 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
 
     fn get_rowcount_stat(&self) -> Option<Expr> {
         Some(column_expr!("numRecords"))
+    }
+
+    /// Compares a column's max stat against a literal value, adjusting for timestamp
+    /// truncation. See [`adjust_scalar_for_max_stat_truncation`].
+    ///
+    /// No partition column guard needed: `get_max_stat` returns `None` for partition columns,
+    /// so their exact values never reach the adjustment.
+    fn partial_cmp_max_stat(
+        &self,
+        col: &ColumnName,
+        val: &Scalar,
+        ord: Ordering,
+        inverted: bool,
+    ) -> Option<Pred> {
+        let max = self.get_max_stat(col, &val.data_type())?;
+        let adjusted = adjust_scalar_for_max_stat_truncation(val);
+        self.eval_partial_cmp(ord, max, &adjusted, inverted)
     }
 
     /// Wraps a stat column comparison with an IS NULL guard.

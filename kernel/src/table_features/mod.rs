@@ -12,6 +12,7 @@ use delta_kernel_derive::internal_api;
 
 #[internal_api]
 pub(crate) use column_mapping::get_any_level_column_physical_name;
+pub(crate) use column_mapping::physical_to_logical_column_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
@@ -30,6 +31,9 @@ mod column_mapping;
 #[cfg(feature = "nanosecond-timestamps")]
 mod timestamp_nanos;
 mod timestamp_ntz;
+
+/// Minimum reader/writer protocol version that the kernel can handle.
+pub const MIN_VALID_RW_VERSION: i32 = 1;
 
 /// Maximum reader protocol version that the kernel can handle.
 pub const MAX_VALID_READER_VERSION: i32 = 3;

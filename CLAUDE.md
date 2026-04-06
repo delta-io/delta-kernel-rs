@@ -34,6 +34,10 @@ cargo fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
   && cargo doc --workspace --all-features --no-deps
 
+# Workspace no-default-features lint for crates that depend on kernel's Arrow APIs
+cargo clippy --workspace --no-default-features --features arrow \
+  --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
+
 # Quick pre-push check (mimics CI)
 cargo fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
@@ -43,16 +47,17 @@ cargo fmt \
 
 ### Crate Names for `-p` Flag
 
-| Crate                  | Directory       | Description                                    |
-|------------------------|-----------------|------------------------------------------------|
-| `delta_kernel`         | `kernel/`       | Core library                                   |
-| `delta_kernel_ffi`     | `ffi/`          | C/C++ FFI bindings                             |
-| `delta_kernel_derive`  | `derive-macros/`| Proc macros                                    |
-| `acceptance`           | `acceptance/`   | Acceptance tests (DAT)                         |
-| `test_utils`           | `test-utils/`   | Shared test utilities                          |
-| `feature_tests`        | `feature-tests/`| Feature flag tests                             |
-| `uc-catalog`           | `uc-catalog/`   | Unity Catalog integration (UCCatalog, UCCommitter) |
-| `uc-client`            | `uc-client/`    | Unity Catalog REST client                      |
+| Crate                                    | Directory                                  | Description                                             |
+|------------------------------------------|--------------------------------------------|---------------------------------------------------------|
+| `delta_kernel`                           | `kernel/`                                  | Core library                                            |
+| `delta_kernel_ffi`                       | `ffi/`                                     | C/C++ FFI bindings                                      |
+| `delta_kernel_derive`                    | `derive-macros/`                           | Proc macros                                             |
+| `acceptance`                             | `acceptance/`                              | Acceptance tests (DAT)                                  |
+| `test_utils`                             | `test-utils/`                              | Shared test utilities                                   |
+| `feature_tests`                          | `feature-tests/`                           | Feature flag tests                                      |
+| `delta-kernel-unity-catalog`             | `delta-kernel-unity-catalog/`              | Unity Catalog integration (UCKernelClient, UCCommitter) |
+| `unity-catalog-delta-client-api`         | `unity-catalog-delta-client-api/`          | Unity Catalog client traits and shared models           |
+| `unity-catalog-delta-rest-client`        | `unity-catalog-delta-rest-client/`         | Unity Catalog REST client                               |
 
 ### Feature Flags
 
@@ -62,11 +67,12 @@ cargo fmt \
   major Arrow releases; `arrow` defaults to latest). Kernel itself does not depend on Arrow,
   but default-engine does.
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
+- `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `catalog-managed` -- catalog-managed table support (experimental)
 - `clustered-table` -- clustered table write support (experimental)
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
-- `test-utils`, `integration-test` -- development only
+- `test-utils`, `integration-test` -- development only (`test-utils` enables `prettyprint`)
 
 ## Architecture at a Glance
 
@@ -93,7 +99,9 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
 - **Unit tests** test internal APIs and module internals. It is fine to use public APIs
   like `create_table` in a unit test as setup (e.g. to create a table for testing reads,
   writes, or state loading).
-- **Integration tests** exercise only public APIs end-to-end.
+- **Integration tests** exercise only public APIs end-to-end. See `kernel/tests/README.md`
+  for a catalog of available test tables (schema, protocol, features, and which tests use
+  them). Consult it before creating new test data to avoid duplication.
 - Consider how the feature interacts with Delta table features (see Protocol TLDR below).
 - Consider write paths: normal commits, checkpointing, CRC files, log compaction files.
 - Consider read paths: loading a snapshot from scratch at latest version, at a specific
@@ -164,6 +172,9 @@ Keep this list updated when new protocol features are added to kernel.
 
 ## Code Style / Documentation
 
+- Line width is 100 characters. Wrap comments and string literals at 100, not 80.
+- Use `==` as a visual section divider in comments (e.g. `// === Helpers ===` or
+  `// ============`).
 - MUST include doc comments for all public functions, structs, enums, and methods.
 - MUST document function parameters, return values, and errors.
 - Keep comments up-to-date with code changes.
@@ -194,6 +205,32 @@ Breaking change examples: `feat!: make_physical takes column mapping and sets pa
 **Description:** follow the template in `.github/PULL_REQUEST_TEMPLATE.md`. Error on the
 side of simplicity -- don't list every change. Focus on key API changes, functionality,
 and data flow. Keep it concise.
+
+### CI Jobs and Github Actions
+
+**Supply chain security:** every `cargo` command in CI that resolves dependencies MUST use
+`--locked` to enforce the committed `Cargo.lock`. This prevents CI from silently picking up
+a newer (potentially compromised) transitive dependency. If `Cargo.lock` is out of sync with
+`Cargo.toml`, the build fails immediately, forcing dependency changes to be explicit and
+reviewable. See the top-level comment in `build.yml` for full rationale. Commands exempt from
+`--locked`: `cargo fmt` (no dep resolution), `cargo msrv verify/show` (wrapper tool),
+`cargo miri setup` (tooling setup).
+
+Ensure that when writing any github action you are considering safety including thinking of
+and mitigating common attack vectors such expression injection and pull request target attacks.
+
+Example:
+```yaml
+# The code below is vulnerable to expression injection
+run: |
+    echo "Comment: ${{ github.event.comment.body }}"
+
+# To mitigate instead use environment variables
+env:
+    COMMENT_BODY: ${{ github.event.comment.body }}
+run: |
+    echo "Comment: $COMMENT_BODY"
+```
 
 ## Deep Context
 

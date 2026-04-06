@@ -1,0 +1,77 @@
+name: semver-label
+
+# Apply or remove the breaking-change label based on the outcome of the semver-checks workflow.
+# This must be a separate workflow from semver-checks.yml: label writes require pull-requests:write,
+# which is unavailable in pull_request workflows triggered by fork PRs. workflow_run always runs
+# in the base-repo context with full write permissions, and never executes PR code.
+on:
+  workflow_run:
+    workflows: ["semver-checks"]
+    types: [completed]
+
+jobs:
+  update_label_if_needed:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      actions: read
+    # Label updates only apply to PRs; merge_group runs have no associated PR to label.
+    if: github.event.workflow_run.event == 'pull_request'
+    steps:
+      # Resolve PR number from the triggering workflow run's branch. For fork PRs the branch
+      # must be prefixed with `<owner>:` so gh pr view can locate it.
+      # Pattern from: https://github.com/orgs/community/discussions/25220#discussioncomment-11316244
+      - name: Find PR number
+        id: pr-context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_TARGET_REPO: ${{ github.repository }}
+          PR_BRANCH: |-
+            ${{
+              (github.event.workflow_run.head_repository.owner.login != github.event.workflow_run.repository.owner.login)
+                && format('{0}:{1}', github.event.workflow_run.head_repository.owner.login, github.event.workflow_run.head_branch)
+                || github.event.workflow_run.head_branch
+            }}
+        run: |
+          echo "Looking up PR for branch '${PR_BRANCH}' in repo '${PR_TARGET_REPO}'"
+          gh pr view --repo "${PR_TARGET_REPO}" "${PR_BRANCH}" \
+            --json 'number' --jq '"number=\(.number)"' \
+            >> "${GITHUB_OUTPUT}"
+          echo "PR lookup complete: $(cat "${GITHUB_OUTPUT}")"
+
+      # Download the semver outcome artifact written by semver-checks.yml.
+      # steps.check.outcome in that workflow is the raw result before continue-on-error
+      # converts it to "success", so it correctly reflects whether a breaking change was found.
+      - name: Download semver outcome
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: semver-outcome
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Update breaking-change label
+        if: steps.pr-context.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.number }}
+        run: |
+          STEP_OUTCOME=$(cat semver-outcome.txt)
+          echo "Semver check outcome: '${STEP_OUTCOME}' for PR #${PR_NUMBER}"
+
+          if [[ "$STEP_OUTCOME" == "failure" ]]; then
+            echo "Breaking change detected -- adding 'breaking-change' label to PR #$PR_NUMBER"
+            gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "breaking-change"
+          elif [[ "$STEP_OUTCOME" == "success" ]]; then
+            # Remove the label only if it is currently present; gh pr edit fails on absent labels.
+            CURRENT_LABELS=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name]')
+            echo "Current PR labels: $CURRENT_LABELS"
+            if echo "$CURRENT_LABELS" | jq -e '.[] | select(. == "breaking-change")' > /dev/null 2>&1; then
+              echo "Semver check passed -- removing 'breaking-change' label from PR #$PR_NUMBER"
+              gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label "breaking-change"
+            else
+              echo "Semver check passed -- 'breaking-change' label not present, nothing to do"
+            fi
+          else
+            echo "ERROR: unexpected semver outcome '${STEP_OUTCOME}' in semver-outcome.txt"
+            exit 1
+          fi

@@ -176,6 +176,9 @@ mod tests {
         columns: Vec<ArrayRef>,
     ) -> (Box<dyn EngineData>, SchemaRef) {
         let arrow_schema = ArrowSchema::new(arrow_fields);
+        #[cfg(all(feature = "arrow-56", not(feature = "arrow-57")))]
+        let kernel_schema: Schema = (&arrow_schema).try_into_kernel().unwrap();
+        #[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
         let kernel_schema: Schema = arrow_schema.as_ref().try_into_kernel().unwrap();
         let batch =
             RecordBatch::try_new(Arc::new(arrow_schema), columns).expect("valid RecordBatch");

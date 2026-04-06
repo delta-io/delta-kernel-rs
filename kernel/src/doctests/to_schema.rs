@@ -52,6 +52,33 @@ pub struct MacroTestStructWithAttributedField;
 #[cfg(doctest)]
 pub struct MacroTestStructWithInvalidAttributeTarget;
 
+/// Verify that `#[allow_null_container_values]` works on `Option<HashMap<_, _>>` fields.
+/// This is needed for optional map fields like `Remove.partition_values` that can contain
+/// null values.
+/// ```
+/// # use delta_kernel_derive::ToSchema;
+/// # use std::collections::HashMap;
+/// #[derive(ToSchema)]
+/// pub struct WithOptionalAttributedField {
+///     #[allow_null_container_values]
+///     map_field: Option<HashMap<String, String>>,
+/// }
+/// ```
+#[cfg(doctest)]
+pub struct MacroTestStructWithOptionalAttributedField;
+
+/// Verify that `#[allow_null_container_values]` fails on `Option<_>` fields that are not maps.
+/// ```compile_fail
+/// # use delta_kernel_derive::ToSchema;
+/// #[derive(ToSchema)]
+/// pub struct WithInvalidOptionalAttributeTarget {
+///     #[allow_null_container_values]
+///     some_name: Option<String>,
+/// }
+/// ```
+#[cfg(doctest)]
+pub struct MacroTestStructWithInvalidOptionalAttributeTarget;
+
 /// ```compile_fail
 /// # use delta_kernel_derive::ToSchema;
 /// # use syn::Token;

@@ -625,16 +625,22 @@ mod tests {
         verifier.verify(&[engine_data]).unwrap();
     }
 
-    /// Round-trip test: collect_stats produces stats that pass verification for non-null data.
-    #[test]
-    fn test_collected_stats_pass_verification() {
-        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)]));
+    /// Round-trip test: collect_stats produces stats that pass verification for all null
+    /// patterns. The all-null and empty cases are regression tests -- collect_stats must keep
+    /// the field present (with null value) so the verifier's all_null check can run.
+    #[rstest]
+    #[case::non_null(vec![Some(1i64), Some(2), Some(3)])]
+    #[case::all_null(vec![None, None, None])]
+    #[case::empty(vec![])]
+    fn test_collected_stats_pass_verification(#[case] values: Vec<Option<i64>>) {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "col",
-            values.data_type().clone(),
+            ArrowDataType::Int64,
             true,
         )]));
-        let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef])
+                .unwrap();
 
         let stats = collect_stats(&batch, &[column_name!("col")]).unwrap();
 
@@ -659,7 +665,8 @@ mod tests {
     }
 
     /// Verify collect_stats produces correct stats shape for all-null and empty batches.
-    /// These cases omit the column from minValues/maxValues entirely.
+    /// These cases keep the column in minValues/maxValues with null values (so that
+    /// StatsVerifier can find the field via visit_rows and check nullCount == numRecords).
     #[rstest]
     #[case::all_null_values(Arc::new(Int64Array::from(vec![None::<i64>, None, None])) as ArrayRef)]
     #[case::empty_batch(Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef)]
@@ -683,14 +690,21 @@ mod tests {
             .unwrap();
         assert_eq!(num_records.value(0), num_rows as i64);
 
-        // All-null/empty columns are omitted from minValues/maxValues
-        assert!(
-            stats.column_by_name("minValues").is_none(),
-            "minValues should be absent when all stats columns are all-null"
-        );
-        assert!(
-            stats.column_by_name("maxValues").is_none(),
-            "maxValues should be absent when all stats columns are all-null"
-        );
+        // All-null/empty columns are present in minValues/maxValues with null values
+        let min_values = stats
+            .column_by_name("minValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(min_values.column_by_name("col").unwrap().is_null(0));
+
+        let max_values = stats
+            .column_by_name("maxValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(max_values.column_by_name("col").unwrap().is_null(0));
     }
 }

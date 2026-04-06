@@ -45,12 +45,12 @@ start a `Transaction` to write data, or create a checkpoint.
 
 `Snapshot` -> `ScanBuilder` -> `Scan` -> data
 
-The scan pipeline: log replay (build active file list) -> data skipping (prune files via stats)
--> file reading -> physical-to-logical transform (partition values, column mapping, schema
-evolution) -> deletion vector filtering.
+The scan pipeline: log replay (build active file list) -> data skipping (prune files via stats
+and partition values) -> file reading -> physical-to-logical transform (partition values,
+column mapping, schema evolution) -> deletion vector filtering.
 
 **Key modules** (`kernel/src/scan/`): `log_replay.rs` (reconcile Add/Remove into active file
-set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats).
+set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and partition values).
 
 **Execution paths:**
 - `scan.execute(engine)` -- kernel handles everything end-to-end, returns `EngineData`
@@ -143,7 +143,7 @@ writes. Kernel doesn't know about catalogs -- the catalog client provides a log 
 `SnapshotBuilder::with_log_tail()` and a custom `Committer` for staging/ratifying/publishing
 commits. Requires `catalog-managed` feature flag.
 
-The `UCCommitter` (in the `uc-catalog` crate) is the reference implementation of a catalog
+The `UCCommitter` (in the `delta-kernel-unity-catalog` crate) is the reference implementation of a catalog
 committer for Unity Catalog. It stages commits to `_staged_commits/`, calls the UC commit API to
 ratify them, and publishes by copying to `_delta_log/`.
 

@@ -335,6 +335,105 @@ impl<'a> TypedGetData<'a, HashMap<String, String>> for dyn GetData<'a> + '_ {
     }
 }
 
+/// An iterator over the indices of selected rows in an engine-data batch.
+///
+/// Each call to [`Iterator::next`] returns the index of the next selected row.
+///
+/// Constructed internally and passed (alongside the column getters) to
+/// [`FilteredRowVisitor::visit_filtered`].
+pub struct RowIndexIterator<'sv> {
+    sv_pos: usize,
+    selection_vector: &'sv [bool],
+    row_count: usize,
+}
+
+impl<'sv> RowIndexIterator<'sv> {
+    pub(crate) fn new(row_count: usize, selection_vector: &'sv [bool]) -> Self {
+        Self {
+            sv_pos: 0,
+            selection_vector,
+            row_count,
+        }
+    }
+
+    /// Returns the total number of rows in the batch (selected and deselected).
+    pub fn num_rows(&self) -> usize {
+        self.row_count
+    }
+}
+
+impl<'sv> Iterator for RowIndexIterator<'sv> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        while self.sv_pos < self.row_count {
+            let pos = self.sv_pos;
+            self.sv_pos += 1;
+            if pos >= self.selection_vector.len() || self.selection_vector[pos] {
+                return Some(pos);
+            }
+        }
+        None
+    }
+}
+
+/// A visitor that processes [`FilteredEngineData`] with automatic row filtering.
+///
+/// Implementors provide [`visit_filtered`] which receives the column getters and a
+/// [`RowIndexIterator`] that yields the index of each selected row.
+/// The default [`visit_rows_of`] method handles all the plumbing: extracting the selection
+/// vector, building the bridge, and calling [`EngineData::visit_rows`].
+///
+/// [`visit_filtered`]: FilteredRowVisitor::visit_filtered
+/// [`visit_rows_of`]: FilteredRowVisitor::visit_rows_of
+pub trait FilteredRowVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]);
+
+    /// Process this batch. `getters` contains one [`GetData`] item per requested column.
+    /// Iterate `rows` to receive the index of each selected row. Use
+    /// [`RowIndexIterator::num_rows`] to get the total row count (for padding output
+    /// vectors with null values for deselected rows).
+    fn visit_filtered<'a>(
+        &mut self,
+        getters: &[&'a dyn GetData<'a>],
+        rows: RowIndexIterator<'_>,
+    ) -> DeltaResult<()>;
+
+    /// Visit the rows of a [`FilteredEngineData`], automatically respecting the selection vector.
+    ///
+    /// Extracts the selection vector and passes a [`RowIndexIterator`] of selected row indices
+    /// to [`FilteredRowVisitor::visit_filtered`].
+    fn visit_rows_of(&mut self, data: &FilteredEngineData) -> DeltaResult<()>
+    where
+        Self: Sized,
+    {
+        // column_names is 'static so this borrow ends immediately, before bridge borrows self
+        let column_names = self.selected_column_names_and_types().0;
+        let mut bridge = FilteredVisitorBridge {
+            visitor: self,
+            selection_vector: data.selection_vector(),
+        };
+        data.data().visit_rows(column_names, &mut bridge)
+    }
+}
+
+/// Private bridge that implements [`RowVisitor`] and forwards to a [`FilteredRowVisitor`].
+struct FilteredVisitorBridge<'bridge, V: FilteredRowVisitor> {
+    visitor: &'bridge mut V,
+    selection_vector: &'bridge [bool],
+}
+
+impl<V: FilteredRowVisitor> RowVisitor for FilteredVisitorBridge<'_, V> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        self.visitor.selected_column_names_and_types()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        let rows = RowIndexIterator::new(row_count, self.selection_vector);
+        self.visitor.visit_filtered(getters, rows)
+    }
+}
+
 /// A `RowVisitor` can be called back to visit extracted data. Aside from calling
 /// [`RowVisitor::visit`] on the visitor passed to [`EngineData::visit_rows`], engines do
 /// not need to worry about this trait.
@@ -459,6 +558,7 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::engine::arrow_data::ArrowEngineData;
+    use rstest::rstest;
     use std::sync::Arc;
 
     fn get_engine_data(rows: usize) -> Box<dyn EngineData> {
@@ -565,7 +665,6 @@ mod tests {
     }
 
     #[test]
-
     fn test_get_binary_some_value() {
         use crate::arrow::array::BinaryArray;
 
@@ -667,5 +766,29 @@ mod tests {
         let filtered = FilteredEngineData::try_new(data, vec![true, false]).unwrap();
         let data = filtered.apply_selection_vector().unwrap();
         assert_eq!(data.len(), 3);
+    }
+
+    fn collect_indices(row_count: usize, selection: &[bool]) -> Vec<usize> {
+        RowIndexIterator::new(row_count, selection).collect()
+    }
+
+    #[rstest]
+    #[case(0, &[], vec![])]
+    #[case(3, &[], vec![0, 1, 2])]
+    #[case(3, &[true, true, true], vec![0, 1, 2])]
+    #[case(3, &[false, false, false], vec![])]
+    #[case(5, &[true, false, false, true, true], vec![0, 3, 4])]
+    #[case(4, &[false, false, true, true], vec![2, 3])]
+    #[case(3, &[true, false, false], vec![0])]
+    // sv shorter than row_count: tail rows implicitly selected
+    #[case(4, &[false, true], vec![1, 2, 3])]
+    #[case(4, &[true, false], vec![0, 2, 3])]
+    #[case(4, &[false, true, false, true], vec![1, 3])]
+    fn row_index_iter(
+        #[case] row_count: usize,
+        #[case] selection: &[bool],
+        #[case] expected: Vec<usize>,
+    ) {
+        assert_eq!(collect_indices(row_count, selection), expected);
     }
 }
