@@ -147,6 +147,71 @@ fn with_engine_info_impl(
     Ok(Box::new(txn.with_engine_info(info)).into())
 }
 
+/// Add domain metadata to the transaction. The domain metadata will be written to the Delta log
+/// as a `domainMetadata` action when the transaction is committed.
+///
+/// `domain` identifies the metadata domain (e.g. `"myApp"`). `configuration` is an arbitrary
+/// string value associated with the domain (typically JSON).
+///
+/// Each domain can only appear once per transaction. Setting metadata for multiple distinct
+/// domains is allowed. Duplicate domains or setting and removing the same domain in a single
+/// transaction will cause the commit to fail.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
+/// a new one.
+#[no_mangle]
+pub unsafe extern "C" fn with_domain_metadata(
+    txn: Handle<ExclusiveTransaction>,
+    domain: KernelStringSlice,
+    configuration: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    with_domain_metadata_impl(*txn, domain, configuration).into_extern_result(&engine)
+}
+
+fn with_domain_metadata_impl(
+    txn: Transaction,
+    domain: KernelStringSlice,
+    configuration: KernelStringSlice,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let domain: String = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
+    let configuration: String = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
+    Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
+}
+
+/// Remove domain metadata from the table in this transaction. A tombstone action with
+/// `removed: true` will be written to the Delta log when the transaction is committed.
+///
+/// The caller does not need to provide a configuration value -- the existing value is
+/// automatically preserved in the tombstone.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
+/// a new one.
+#[no_mangle]
+pub unsafe extern "C" fn with_domain_metadata_removed(
+    txn: Handle<ExclusiveTransaction>,
+    domain: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    with_domain_metadata_removed_impl(*txn, domain).into_extern_result(&engine)
+}
+
+fn with_domain_metadata_removed_impl(
+    txn: Transaction,
+    domain: KernelStringSlice,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let domain: String = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
+    Ok(Box::new(txn.with_domain_metadata_removed(domain)).into())
+}
+
 /// Add file metadata to the transaction for files that have been written. The metadata contains
 /// information about files written during the transaction that will be added to the Delta log
 /// during commit.
@@ -705,6 +770,200 @@ mod tests {
             unsafe { free_engine(engine) };
         }
 
+        Ok(())
+    }
+
+    /// Read the commit log at `version` and return the `domainMetadata` action JSON.
+    async fn read_domain_metadata_action(
+        store: &dyn ObjectStore,
+        table_url: &Url,
+        version: u64,
+    ) -> serde_json::Value {
+        let path = format!("_delta_log/{version:020}.json");
+        let commit_url = table_url.join(&path).unwrap();
+        let data = store
+            .get(&Path::from_url_path(commit_url.path()).unwrap())
+            .await
+            .unwrap();
+        let actions: Vec<serde_json::Value> =
+            Deserializer::from_slice(&data.bytes().await.unwrap())
+                .into_iter::<serde_json::Value>()
+                .try_collect()
+                .unwrap();
+        actions
+            .into_iter()
+            .find(|a| a.get("domainMetadata").is_some())
+            .expect("commit should contain a domainMetadata action")
+    }
+
+    /// Create a table with the `domainMetadata` writer feature enabled and return the table
+    /// URL, object store, and FFI engine handle.
+    async fn setup_domain_metadata_table(
+        dir_url: &Url,
+        name: &str,
+    ) -> Result<
+        (
+            Url,
+            Arc<dyn ObjectStore>,
+            crate::handle::Handle<crate::SharedExternEngine>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )])?);
+        let (store, _test_engine, table_location) =
+            test_utils::engine_store_setup(name, Some(dir_url));
+        let table_url = test_utils::create_table(
+            store.clone(),
+            table_location,
+            schema,
+            &[],
+            true,
+            vec![],
+            vec!["domainMetadata"],
+        )
+        .await?;
+        let table_path = table_url.to_file_path().unwrap();
+        let table_path_str = table_path.to_str().unwrap();
+        let engine = get_default_engine(table_path_str);
+        Ok((table_url, store, engine))
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_domain_metadata_add_and_remove() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_test_dir = tempdir()?;
+        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+        let (table_url, store, engine) =
+            setup_domain_metadata_table(&tmp_dir_url, "test_dm").await?;
+        let table_path = table_url.to_file_path().unwrap();
+        let table_path_str = table_path.to_str().unwrap();
+
+        // === Transaction 1: add domain metadata ===
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        unsafe { set_data_change(txn.shallow_copy(), false) };
+
+        let domain = "testDomain";
+        let configuration = r#"{"key": "value"}"#;
+        let txn = ok_or_panic(unsafe {
+            with_domain_metadata(
+                txn,
+                kernel_string_slice!(domain),
+                kernel_string_slice!(configuration),
+                engine.shallow_copy(),
+            )
+        });
+
+        let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        assert_eq!(version, 1);
+
+        let dm = read_domain_metadata_action(&*store, &table_url, 1).await;
+        assert_eq!(dm["domainMetadata"]["domain"], "testDomain");
+        assert_eq!(dm["domainMetadata"]["configuration"], r#"{"key": "value"}"#);
+        assert_eq!(dm["domainMetadata"]["removed"], false);
+
+        // === Transaction 2: remove domain metadata ===
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        unsafe { set_data_change(txn.shallow_copy(), false) };
+
+        let txn = ok_or_panic(unsafe {
+            with_domain_metadata_removed(txn, kernel_string_slice!(domain), engine.shallow_copy())
+        });
+
+        let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        assert_eq!(version, 2);
+
+        let dm = read_domain_metadata_action(&*store, &table_url, 2).await;
+        assert_eq!(dm["domainMetadata"]["domain"], "testDomain");
+        assert_eq!(dm["domainMetadata"]["removed"], true);
+        assert_eq!(dm["domainMetadata"]["configuration"], r#"{"key": "value"}"#);
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_domain_metadata_system_domain_rejected_at_commit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_test_dir = tempdir()?;
+        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table(&tmp_dir_url, "test_dm_sys").await?;
+        let table_path = table_url.to_file_path().unwrap();
+        let table_path_str = table_path.to_str().unwrap();
+
+        // with_domain_metadata succeeds (validation is lazy), but commit should fail
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        unsafe { set_data_change(txn.shallow_copy(), false) };
+
+        let sys_domain = "delta.system";
+        let config = "config";
+        let txn = ok_or_panic(unsafe {
+            with_domain_metadata(
+                txn,
+                kernel_string_slice!(sys_domain),
+                kernel_string_slice!(config),
+                engine.shallow_copy(),
+            )
+        });
+
+        let result = unsafe { commit(txn, engine.shallow_copy()) };
+        assert!(result.is_err());
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_domain_metadata_duplicate_domain_rejected_at_commit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_test_dir = tempdir()?;
+        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table(&tmp_dir_url, "test_dm_dup").await?;
+        let table_path = table_url.to_file_path().unwrap();
+        let table_path_str = table_path.to_str().unwrap();
+
+        // Adding the same domain twice should cause commit to fail
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        unsafe { set_data_change(txn.shallow_copy(), false) };
+
+        let dup_domain = "dup";
+        let config_a = "a";
+        let config_b = "b";
+        let txn = ok_or_panic(unsafe {
+            with_domain_metadata(
+                txn,
+                kernel_string_slice!(dup_domain),
+                kernel_string_slice!(config_a),
+                engine.shallow_copy(),
+            )
+        });
+        let txn = ok_or_panic(unsafe {
+            with_domain_metadata(
+                txn,
+                kernel_string_slice!(dup_domain),
+                kernel_string_slice!(config_b),
+                engine.shallow_copy(),
+            )
+        });
+
+        let result = unsafe { commit(txn, engine.shallow_copy()) };
+        assert!(result.is_err());
+
+        unsafe { free_engine(engine) };
         Ok(())
     }
 
