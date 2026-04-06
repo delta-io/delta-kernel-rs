@@ -298,20 +298,38 @@ impl LogSegment {
             .as_ref()
             .and_then(|hint| hint.checkpoint_schema.clone());
 
-        let listed_files = match (checkpoint_hint, time_travel_version) {
-            (Some(cp), None) => {
-                LogSegmentFiles::list_with_checkpoint_hint(&cp, storage, &log_root, log_tail, None)?
-            }
-            (Some(cp), Some(end_version)) if cp.version <= end_version => {
-                LogSegmentFiles::list_with_checkpoint_hint(
-                    &cp,
-                    storage,
-                    &log_root,
-                    log_tail,
-                    Some(end_version),
-                )?
-            }
-            _ => LogSegmentFiles::list(storage, &log_root, log_tail, None, time_travel_version)?,
+        // The end_version is the time_travel_version, if present
+        // TODO: When max catalog version is implemented, we would use that as end_version if
+        // time_travel_version is not present
+        let end_version = time_travel_version;
+
+        // Keep the hint only if it points at or before end_version, or if there is no end_version bound
+        let usable_hint = checkpoint_hint.filter(|cp| end_version.is_none_or(|v| cp.version <= v));
+
+        // Cases:
+        //
+        // 1. usable_hint present, end_version is Some  --> list_with_checkpoint_hint from hint.version TO end_version
+        // 2. usable_hint present, end_version is None  --> list_with_checkpoint_hint from hint.version unbounded
+        // 3. no usable_hint,      end_version is Some  --> backward-scan for checkpoint before end_version,
+        //                                                  list from that checkpoint TO end_version
+        //                                                  (falls back to v0 if no checkpoint found)
+        // 4. no usable_hint,      end_version is None  --> list from v0 unbounded
+
+        let listed_files = match (usable_hint, end_version) {
+            // Cases 1 and 2
+            (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
+                &cp,
+                storage,
+                &log_root,
+                log_tail,
+                end_version,
+            )?,
+            // Case 3
+            (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
+                storage, &log_root, log_tail, end,
+            )?,
+            // Case 4
+            (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
         LogSegment::try_new(
@@ -445,6 +463,84 @@ impl LogSegment {
             _ => self.listed.max_published_version,
         };
 
+        Ok(new_log_segment)
+    }
+
+    /// Creates a new LogSegment reflecting a checkpoint written at this segment's version.
+    /// The checkpoint must be at `end_version`. Kernel does not write multi-part checkpoints,
+    /// so the checkpoint must be a single file (classic parquet or V2 UUID).
+    pub(crate) fn try_new_with_checkpoint(&self, checkpoint: ParsedLogPath) -> DeltaResult<Self> {
+        require!(
+            matches!(
+                checkpoint.file_type,
+                LogPathFileType::SinglePartCheckpoint | LogPathFileType::UuidCheckpoint
+            ),
+            Error::internal_error(format!(
+                "Cannot update LogSegment with checkpoint. Path is not a single-file \
+                checkpoint. Path: {}, Type: {:?}.",
+                checkpoint.location.location, checkpoint.file_type
+            ))
+        );
+        require!(
+            checkpoint.version == self.end_version,
+            Error::internal_error(format!(
+                "Cannot update LogSegment with checkpoint. Checkpoint version ({}) does not \
+                equal LogSegment end_version ({}).",
+                checkpoint.version, self.end_version
+            ))
+        );
+
+        let mut new_log_segment = self.clone();
+        new_log_segment.checkpoint_version = Some(checkpoint.version);
+        new_log_segment.listed.checkpoint_parts = vec![checkpoint];
+        // A snapshot at version N only contains commits and compactions at versions <= N,
+        // so a checkpoint at N covers everything and we can clear them entirely.
+        new_log_segment.listed.ascending_commit_files.clear();
+        new_log_segment.listed.ascending_compaction_files.clear();
+        // TODO(#839): Once CheckpointWriter exposes the output schema, thread it through
+        // here instead of None. Today the schema is computed inside checkpoint_data() but
+        // not returned. With None, the next scan will read the checkpoint parquet footer
+        // to determine the schema (e.g. whether stats_parsed or sidecar columns exist).
+        new_log_segment.checkpoint_schema = None;
+        Ok(new_log_segment)
+    }
+
+    /// Creates a new LogSegment with the given CRC file recorded as the latest.
+    /// The CRC file must be at `end_version`.
+    pub(crate) fn try_new_with_crc_file(&self, crc_file: ParsedLogPath<Url>) -> DeltaResult<Self> {
+        require!(
+            crc_file.file_type == LogPathFileType::Crc,
+            Error::internal_error(format!(
+                "Cannot update LogSegment with CRC. Path is not a CRC file. \
+                Path: {}, Type: {:?}.",
+                crc_file.location, crc_file.file_type
+            ))
+        );
+        require!(
+            crc_file.version == self.end_version,
+            Error::internal_error(format!(
+                "Cannot update LogSegment with CRC. CRC version ({}) does not \
+                equal LogSegment end_version ({}).",
+                crc_file.version, self.end_version
+            ))
+        );
+        // Convert to FileMeta with placeholder metadata (size=0, last_modified=0).
+        // Only the URL matters for CRC files: downstream code uses it for version
+        // tracking and reading CRC content via `try_read_crc_file`. Neither `size`
+        // nor `last_modified` is ever accessed.
+        let crc_file = ParsedLogPath {
+            location: FileMeta {
+                location: crc_file.location,
+                last_modified: 0,
+                size: 0,
+            },
+            filename: crc_file.filename,
+            extension: crc_file.extension,
+            version: crc_file.version,
+            file_type: crc_file.file_type,
+        };
+        let mut new_log_segment = self.clone();
+        new_log_segment.listed.latest_crc_file = Some(crc_file);
         Ok(new_log_segment)
     }
 

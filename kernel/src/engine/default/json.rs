@@ -20,6 +20,7 @@ use crate::engine::arrow_utils::{
     to_json_bytes,
 };
 use crate::engine_data::FilteredEngineData;
+use crate::metrics::{MetricEvent, MetricsReporter};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
@@ -38,6 +39,8 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// Limit the number of rows per batch. That is, for batch_size = N, then each RecordBatch
     /// yielded by the stream will have at most N rows.
     batch_size: usize,
+    /// Optional reporter for emitting [`MetricEvent::JsonReadCompleted`] events.
+    reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl<E: TaskExecutor> DefaultJsonHandler<E> {
@@ -47,7 +50,14 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
             task_executor,
             buffer_size: super::DEFAULT_BUFFER_SIZE,
             batch_size: super::DEFAULT_BATCH_SIZE,
+            reporter: None,
         }
+    }
+
+    /// Set a metrics reporter to receive [`MetricEvent::JsonReadCompleted`] events.
+    pub fn with_reporter(mut self, reporter: Option<Arc<dyn MetricsReporter>>) -> Self {
+        self.reporter = reporter;
+        self
     }
 
     /// Set the maximum number read requests to buffer in memory at once in
@@ -169,7 +179,23 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             self.batch_size,
             self.buffer_size,
         );
-        super::stream_future_to_iter(self.task_executor.clone(), future)
+        let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        if let Some(reporter) = &self.reporter {
+            let num_files = files.len() as u64;
+            let bytes_read = files.iter().map(|f| f.size).sum();
+            Ok(Box::new(super::ReadMetricsIterator::new(
+                inner,
+                reporter.clone(),
+                num_files,
+                bytes_read,
+                |num_files, bytes_read| MetricEvent::JsonReadCompleted {
+                    num_files,
+                    bytes_read,
+                },
+            )))
+        } else {
+            Ok(inner)
+        }
     }
 
     // note: for now we just buffer all the data and write it out all at once

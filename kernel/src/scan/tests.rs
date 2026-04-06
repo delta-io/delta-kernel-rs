@@ -23,6 +23,10 @@ use crate::schema::{
     ColumnMetadataKey, DataType, LogicalSchema, PrimitiveType, StructField, StructType,
 };
 use crate::table_features::ColumnMappingMode;
+use crate::{
+    Engine, EvaluationHandler, FileDataReadResultIterator, FileMeta, JsonHandler, ParquetFooter,
+    ParquetHandler, PredicateRef, StorageHandler,
+};
 use crate::{EngineData, Snapshot};
 
 use super::*;
@@ -1417,5 +1421,208 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
             stats_parsed.column_by_name("numRecords").is_some(),
             "Should still have numRecords"
         );
+    }
+}
+
+/// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.
+/// Used to simulate a buggy connector that drops all data for a file.
+struct EmptyParquetHandler;
+
+impl ParquetHandler for EmptyParquetHandler {
+    fn read_parquet_files(
+        &self,
+        _files: &[FileMeta],
+        _schema: crate::schema::SchemaRef,
+        _predicate: Option<PredicateRef>,
+    ) -> crate::DeltaResult<FileDataReadResultIterator> {
+        Ok(Box::new(std::iter::empty()))
+    }
+
+    fn read_parquet_footer(&self, _file: &FileMeta) -> crate::DeltaResult<ParquetFooter> {
+        unimplemented!()
+    }
+
+    fn write_parquet_file(
+        &self,
+        _location: url::Url,
+        _data: Box<dyn Iterator<Item = crate::DeltaResult<Box<dyn EngineData>>> + Send>,
+    ) -> crate::DeltaResult<()> {
+        unimplemented!()
+    }
+}
+
+/// An [`Engine`] that delegates everything to a [`SyncEngine`] except `parquet_handler`, which
+/// returns [`EmptyParquetHandler`].
+struct EmptyParquetEngine(Arc<SyncEngine>);
+
+impl Engine for EmptyParquetEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        self.0.evaluation_handler()
+    }
+
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.0.json_handler()
+    }
+
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        Arc::new(EmptyParquetHandler)
+    }
+
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.0.storage_handler()
+    }
+}
+
+/// When a file's Add action stats report `numRecords > 0` and the parquet handler returns an empty
+/// iterator, `execute` must surface an error rather than silently producing no rows.
+#[test]
+fn execute_errors_when_parquet_returns_empty_for_file_with_positive_stats() {
+    let path =
+        std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(EmptyParquetEngine(Arc::new(SyncEngine::new())));
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let scan = snapshot.scan_builder().build().unwrap();
+
+    let results: Vec<_> = scan.execute(engine).unwrap().collect();
+    assert_eq!(results.len(), 1, "should emit exactly one error item");
+    assert!(results[0].is_err(), "the result should be an error, got Ok");
+    let err = results[0].as_ref().err().unwrap().to_string();
+    assert!(
+        err.contains("ParquetHandler returned no data"),
+        "unexpected error message: {err}"
+    );
+}
+
+/// When a file's Add action has no stats, an empty iterator from the parquet handler is allowed
+/// -- we conservatively treat the file as possibly legitimately empty.
+#[test]
+fn execute_does_not_error_when_parquet_returns_empty_and_stats_absent() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-cdf/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(EmptyParquetEngine(Arc::new(SyncEngine::new())));
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let scan = snapshot.scan_builder().build().unwrap();
+
+    // All Add files in this table have no stats -- empty iterators should be silently ignored.
+    let results: Vec<_> = scan.execute(engine).unwrap().collect();
+    assert!(
+        results.iter().all(|r| r.is_ok()),
+        "expected no errors for stats-absent files"
+    );
+}
+
+/// Tests for ScanMetadataCompleted event emission
+mod scan_metadata_completed_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use rstest::rstest;
+
+    use crate::engine::default::DefaultEngineBuilder;
+    use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
+    use crate::metrics::MetricEvent;
+    use crate::object_store::local::LocalFileSystem;
+    use crate::utils::test_utils::CapturingReporter;
+    use crate::Snapshot;
+
+    fn run_scan(table: &str, predicate: Option<Arc<Pred>>) -> (Arc<CapturingReporter>, usize) {
+        let path = std::fs::canonicalize(PathBuf::from(table)).unwrap();
+        let url = url::Url::from_directory_path(&path).unwrap();
+        let reporter = Arc::new(CapturingReporter::default());
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+                .with_metrics_reporter(reporter.clone())
+                .build(),
+        );
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let mut builder = snapshot.scan_builder();
+        if let Some(pred) = predicate {
+            builder = builder.with_predicate(pred);
+        }
+        let scan = builder.build().unwrap();
+        let results: Vec<_> = scan
+            .scan_metadata(engine.as_ref())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        (reporter, results.len())
+    }
+
+    fn get_scan_event(reporter: &CapturingReporter) -> MetricEvent {
+        reporter
+            .events()
+            .into_iter()
+            .find(|e| matches!(e, MetricEvent::ScanMetadataCompleted { .. }))
+            .expect("expected ScanMetadataCompleted event")
+    }
+
+    #[rstest]
+    #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 0, 0)]
+    #[case::static_skip_all(
+        "./tests/data/parsed-stats/",
+        Some(Arc::new(Pred::literal(false))),
+        0,
+        0,
+        0,
+        0
+    )]
+    #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 2, 0)]
+    #[case::with_removes("./tests/data/with_checkpoint_no_last_checkpoint/", None, 2, 1, 1, 0)]
+    #[case::partition_filter(
+        "./tests/data/basic_partitioned/",
+        Some(Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))),
+        2, 2, 0, 4
+    )]
+    fn test_scan_metrics(
+        #[case] table: &str,
+        #[case] predicate: Option<Arc<Pred>>,
+        #[case] expected_add_seen: u64,
+        #[case] expected_active: u64,
+        #[case] expected_removes: u64,
+        #[case] expected_filtered: u64,
+    ) {
+        let (reporter, _) = run_scan(table, predicate);
+        let MetricEvent::ScanMetadataCompleted {
+            total_duration,
+            num_add_files_seen,
+            num_active_add_files,
+            num_remove_files_seen,
+            num_predicate_filtered,
+            ..
+        } = get_scan_event(&reporter)
+        else {
+            panic!("expected ScanMetadataCompleted");
+        };
+        assert!(total_duration > Duration::ZERO);
+        assert_eq!(num_add_files_seen, expected_add_seen);
+        assert_eq!(num_active_add_files, expected_active);
+        assert_eq!(num_remove_files_seen, expected_removes);
+        assert_eq!(num_predicate_filtered, expected_filtered);
+    }
+
+    #[test]
+    fn test_no_metrics_on_early_drop() {
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+        let url = url::Url::from_directory_path(&path).unwrap();
+        let reporter = Arc::new(CapturingReporter::default());
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+                .with_metrics_reporter(reporter.clone())
+                .build(),
+        );
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
+        {
+            let mut iter = scan.scan_metadata(engine.as_ref()).unwrap();
+            let _ = iter.next();
+        }
+        assert!(reporter
+            .events()
+            .iter()
+            .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted { .. })));
     }
 }

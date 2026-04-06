@@ -2,13 +2,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::array::{AsArray as _, RecordBatch};
+use delta_kernel::arrow::array::{AsArray as _, RecordBatch, TimestampMicrosecondArray};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
-use delta_kernel::arrow::datatypes::{Field as ArrowField, Int64Type, Schema as ArrowSchema};
+use delta_kernel::arrow::datatypes::{
+    Field as ArrowField, Int64Type, Schema as ArrowSchema, TimeUnit,
+};
+use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{
-    column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
+    column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred, Scalar,
 };
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -2060,4 +2063,289 @@ fn partition_values_parsed_skipping() -> Result<(), Box<dyn std::error::Error>> 
         expected,
     )?;
     Ok(())
+}
+
+// In-memory test with crafted truncated JSON stats. Three files:
+//   file 1: ts_col [1s, 2s]           -- max at ms boundary
+//   file 2: ts_col [3s, 4.000500s]    -- JSON max truncated to 4.000s
+//   file 3: ts_col [7s, 8s]           -- max at ms boundary
+//
+// Predicate `ts_col > 4_000_400us`:
+//   file 1: max=2s << adjusted predicate (3_999_401) -> pruned (skipping works)
+//   file 2: truncated max=4s > adjusted predicate (3_999_401) -> kept (truncation safe)
+//   file 3: max=8s >> adjusted predicate -> kept
+#[tokio::test]
+async fn timestamp_max_stat_truncation_does_not_over_prune(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ts_metadata = "{\
+        \"id\":\"test-ts-table\",\
+        \"format\":{\"provider\":\"parquet\",\"options\":{}},\
+        \"schemaString\":\"{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[\
+            {\\\"name\\\":\\\"ts_col\\\",\\\"type\\\":\\\"timestamp\\\",\\\"nullable\\\":true,\\\"metadata\\\":{}}\
+        ]}\",\
+        \"partitionColumns\":[],\
+        \"configuration\":{},\
+        \"createdTime\":1700000000000\
+    }";
+
+    let ts_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "ts_col",
+        delta_kernel::arrow::datatypes::DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ),
+        true,
+    )]));
+
+    // file1: max at ms boundary, will be pruned
+    let file1_stats = r#"{"numRecords":2,"nullCount":{"ts_col":0},"minValues":{"ts_col":"1970-01-01T00:00:01.000Z"},"maxValues":{"ts_col":"1970-01-01T00:00:02.000Z"}}"#;
+    // file2: max truncated from 4.000500s to 4.000s -- truncation adjustment must keep this
+    let file2_stats = r#"{"numRecords":2,"nullCount":{"ts_col":0},"minValues":{"ts_col":"1970-01-01T00:00:03.000Z"},"maxValues":{"ts_col":"1970-01-01T00:00:04.000Z"}}"#;
+    // file3: max clearly above predicate
+    let file3_stats = r#"{"numRecords":2,"nullCount":{"ts_col":0},"minValues":{"ts_col":"1970-01-01T00:00:07.000Z"},"maxValues":{"ts_col":"1970-01-01T00:00:08.000Z"}}"#;
+
+    let batch1 = RecordBatch::try_new(
+        ts_schema.clone(),
+        vec![Arc::new(
+            TimestampMicrosecondArray::from(vec![1_000_000i64, 2_000_000]).with_timezone("UTC"),
+        )],
+    )?;
+    let batch2 = RecordBatch::try_new(
+        ts_schema.clone(),
+        vec![Arc::new(
+            TimestampMicrosecondArray::from(vec![3_000_000i64, 4_000_500]).with_timezone("UTC"),
+        )],
+    )?;
+    let batch3 = RecordBatch::try_new(
+        ts_schema,
+        vec![Arc::new(
+            TimestampMicrosecondArray::from(vec![7_000_000i64, 8_000_000]).with_timezone("UTC"),
+        )],
+    )?;
+
+    let file1_bytes = record_batch_to_bytes(&batch1);
+    let file2_bytes = record_batch_to_bytes(&batch2);
+    let file3_bytes = record_batch_to_bytes(&batch3);
+
+    let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
+
+    let make_add = |name: &str, size: usize, stats: &str| -> String {
+        format!(
+            "{{\"add\":{{\"path\":\"{name}\",\"partitionValues\":{{}},\"size\":{size},\
+             \"modificationTime\":1700000000000,\"dataChange\":true,\
+             \"stats\":\"{stats_escaped}\"}}}}",
+            stats_escaped = stats.replace('"', "\\\""),
+        )
+    };
+
+    let commit0 = format!(
+        "{{\"protocol\":{{\"minReaderVersion\":1,\"minWriterVersion\":2}}}}\n\
+         {{\"metaData\":{ts_metadata}}}\n\
+         {}",
+        make_add("file1.parquet", file1_bytes.len(), file1_stats)
+    );
+    add_commit(table_root, storage.as_ref(), 0, commit0).await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        make_add("file2.parquet", file2_bytes.len(), file2_stats),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        2,
+        make_add("file3.parquet", file3_bytes.len(), file3_stats),
+    )
+    .await?;
+
+    storage
+        .put(&Path::from("file1.parquet"), file1_bytes.into())
+        .await?;
+    storage
+        .put(&Path::from("file2.parquet"), file2_bytes.into())
+        .await?;
+    storage
+        .put(&Path::from("file3.parquet"), file3_bytes.into())
+        .await?;
+
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+
+    let row_count = |predicate_us: i64| -> Result<usize, Box<dyn std::error::Error>> {
+        let predicate = Arc::new(Pred::gt(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(predicate_us)),
+        ));
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(predicate)
+            .build()?;
+        let batches = read_scan(&scan, engine.clone())?;
+        Ok(batches.iter().map(|b| b.num_rows()).sum())
+    };
+
+    // Mid-ms value (4.000400s): adjusted to 3_999_401
+    //   file1 max=2s < 3_999_401 -> pruned; file2+3 kept (4 rows)
+    assert_eq!(row_count(4_000_400)?, 4, "mid-ms: file2+file3 kept");
+
+    // Exact ms boundary (4.000000s = truncated max of file2): adjusted to 3_999_001
+    //   file1 max=2s < 3_999_001 -> pruned; file2 max=4s > 3_999_001 -> kept (4 rows)
+    assert_eq!(
+        row_count(4_000_000)?,
+        4,
+        "exact ms boundary: file2+file3 kept"
+    );
+
+    // 1us above ms boundary (4.000001s): adjusted to 3_999_002
+    //   file1 pruned; file2 max=4s > 3_999_002 -> kept (4 rows)
+    assert_eq!(row_count(4_000_001)?, 4, "1us above ms: file2+file3 kept");
+
+    // 998us above ms boundary (4.000998s): adjusted to 3_999_999
+    //   file2 max=4s > 3_999_999 -> kept (just not prunable)
+    assert_eq!(
+        row_count(4_000_998)?,
+        4,
+        "just not prunable: file2+file3 kept"
+    );
+
+    // 999us above ms boundary (4.000999s): adjusted to 4_000_000
+    //   file2 max=4s == 4_000_000 -> NOT strictly greater -> pruned (just prunable)
+    assert_eq!(row_count(4_000_999)?, 2, "just prunable: only file3 kept");
+
+    // Next ms boundary (4.001000s): adjusted to 4_000_001
+    //   file2 max=4s < 4_000_001 -> pruned (2 rows)
+    assert_eq!(
+        row_count(4_001_000)?,
+        2,
+        "next ms boundary: only file3 kept"
+    );
+
+    Ok(())
+}
+
+// End-to-end tests using a Spark-written Delta table with real truncated JSON stats.
+// Table has three files:
+//   file 1: id=[1,2], ts_col=[1s, 2s]           -- max at ms boundary
+//   file 2: id=[3,4], ts_col=[3s, 4.000500s]    -- max truncated to 4.000s in JSON stats
+//   file 3: id=[5,6], ts_col=[7s, 8s]           -- max at ms boundary
+//
+// Predicate value 4.000400s sits between the truncated max (4.000s) and actual max
+// (4.000500s) of file 2, exercising the truncation adjustment.
+
+// GT: file1 pruned (max=2s < adjusted 3.999401s), file2+3 kept
+#[test]
+fn timestamp_truncation_real_table_gt() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::gt(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "| 5  | 1970-01-01T00:00:07Z        |",
+            "| 6  | 1970-01-01T00:00:08Z        |",
+            "+----+-----------------------------+",
+        ],
+    )
+}
+
+// GE: file1 pruned (max=2s < adjusted 3.999401s), file2+3 kept
+#[test]
+fn timestamp_truncation_real_table_ge() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::ge(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "| 5  | 1970-01-01T00:00:07Z        |",
+            "| 6  | 1970-01-01T00:00:08Z        |",
+            "+----+-----------------------------+",
+        ],
+    )
+}
+
+// LT: file3 pruned (min=7s > 4.000400s), file1+2 kept
+#[test]
+fn timestamp_truncation_real_table_lt() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::lt(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 1  | 1970-01-01T00:00:01Z        |",
+            "| 2  | 1970-01-01T00:00:02Z        |",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "+----+-----------------------------+",
+        ],
+    )
+}
+
+// LE: file3 pruned (min=7s > 4.000400s), file1+2 kept
+#[test]
+fn timestamp_truncation_real_table_le() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::le(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 1  | 1970-01-01T00:00:01Z        |",
+            "| 2  | 1970-01-01T00:00:02Z        |",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "+----+-----------------------------+",
+        ],
+    )
+}
+
+// EQ: file1 pruned (max=2s < adjusted 3.999401s), file3 pruned (min=7s > 4.000400s).
+// Only file2 kept (ids 3,4).
+#[test]
+fn timestamp_truncation_real_table_eq() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::eq(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "+----+-----------------------------+",
+        ],
+    )
 }

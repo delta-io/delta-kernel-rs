@@ -825,7 +825,6 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             &self.checkpoint_transform
         };
         let transformed = transform.evaluate(actions.as_ref())?;
-        debug_assert_eq!(transformed.len(), actions.len());
         require!(
             transformed.len() == actions.len(),
             Error::internal_error(format!(
@@ -883,9 +882,12 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 }
 
 /// Given an iterator of [`ActionsBatch`]s (batches of actions read from the log) and a predicate,
-/// returns an iterator of [`ScanMetadata`]s (which includes the files to be scanned as
-/// [`FilteredEngineData`] and transforms that must be applied to correctly read the data). Each row
-/// that is selected in the returned `engine_data` _must_ be processed to complete the scan.
+/// returns a tuple of:
+/// 1. An iterator of [`ScanMetadata`]s (which includes the files to be scanned as
+///    [`FilteredEngineData`] and transforms that must be applied to correctly read the data).
+/// 2. An `Arc<ScanMetrics>` containing metrics collected during log replay.
+///
+/// Each row that is selected in the returned `engine_data` _must_ be processed to complete the scan.
 /// Non-selected rows _must_ be ignored.
 ///
 /// When `skip_stats` is true, file statistics are not read from checkpoint parquet files and
@@ -899,11 +901,13 @@ pub(crate) fn scan_action_iter(
     state_info: Arc<StateInfo>,
     checkpoint_info: CheckpointReadInfo,
     skip_stats: bool,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-    Ok(
-        ScanLogReplayProcessor::new(engine, state_info, checkpoint_info, skip_stats)?
-            .process_actions_iter(action_iter),
-    )
+) -> DeltaResult<(
+    impl Iterator<Item = DeltaResult<ScanMetadata>>,
+    Arc<ScanMetrics>,
+)> {
+    let processor = ScanLogReplayProcessor::new(engine, state_info, checkpoint_info, skip_stats)?;
+    let metrics = processor.metrics.clone();
+    Ok((processor.process_actions_iter(action_iter), metrics))
 }
 
 #[cfg(test)]
@@ -911,10 +915,13 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
+    use rstest::rstest;
+
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
-        BinaryExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
+        BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate, Scalar,
+        ScalarExpressionEvaluator,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -929,7 +936,7 @@ mod tests {
     use crate::scan::state_info::StateInfo;
     use crate::scan::test_utils::{
         add_batch_for_row_id, add_batch_simple, add_batch_with_partition_col,
-        add_batch_with_remove, run_with_validate_callback,
+        add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
     use crate::scan::PhysicalPredicate;
     use crate::schema::MetadataColumnSpec;
@@ -1042,7 +1049,7 @@ mod tests {
             physical_stats_schema: None,
             logical_stats_schema: None,
         });
-        let iter = scan_action_iter(
+        let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
@@ -1070,7 +1077,7 @@ mod tests {
         let partition_cols = vec!["date".to_string()];
         let state_info = get_simple_state_info(schema, partition_cols).unwrap();
         let batch = vec![add_batch_with_partition_col()];
-        let iter = scan_action_iter(
+        let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
@@ -1155,7 +1162,7 @@ mod tests {
         );
 
         let batch = vec![add_batch_for_row_id(get_commit_schema().clone())];
-        let iter = scan_action_iter(
+        let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
@@ -1534,7 +1541,7 @@ mod tests {
         ]));
         let state_info = get_simple_state_info(schema, vec!["date".to_string()]).unwrap();
 
-        let iter = scan_action_iter(
+        let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
@@ -1556,5 +1563,105 @@ mod tests {
             found_add = true;
         }
         assert!(found_add);
+    }
+
+    /// Verify that Remove actions are not pruned by data skipping. The transform reads from
+    /// `add.*` columns, so Remove rows produce null `stats_parsed` and `partitionValues_parsed`
+    /// (Remove actions have their own `remove.partitionValues` and `remove.stats`, but those
+    /// are not read by the transform). If a Remove were pruned, it would not be recorded in
+    /// `seen_file_keys`, and a subsequent Add for the same path could incorrectly survive
+    /// deduplication.
+    ///
+    /// Stats-based skipping is safe because null stats evaluate to NULL via ISNULL guards in
+    /// the predicate construction. Partition-based skipping requires the `is_add` guard
+    /// (`OR(NOT is_add, pred)`) because `eval_sql_where` adds IS NOT NULL guards that would
+    /// otherwise turn null partition values into `false`, filtering the Remove.
+    #[rstest]
+    #[case::stats_only(
+        Arc::new(StructType::new_unchecked([
+            StructField::new("value", DataType::INTEGER, true),
+        ])),
+        vec![],
+        Arc::new(Expression::column(["value"]).gt(Expression::literal(5i32))),
+        false, // use batch without partition column
+    )]
+    #[case::partition_predicate(
+        Arc::new(StructType::new_unchecked([
+            StructField::new("value", DataType::INTEGER, true),
+            StructField::new("date", DataType::DATE, true),
+        ])),
+        vec!["date".to_string()],
+        Arc::new(Expression::column(["date"]).eq(Expression::literal(Scalar::Date(17_510)))),
+        true, // use batch with partition column
+    )]
+    #[case::mixed_stats_and_partition(
+        Arc::new(StructType::new_unchecked([
+            StructField::new("value", DataType::INTEGER, true),
+            StructField::new("date", DataType::DATE, true),
+        ])),
+        vec!["date".to_string()],
+        Arc::new(Predicate::and(
+            Expression::column(["value"]).gt(Expression::literal(5i32)),
+            Expression::column(["date"]).eq(Expression::literal(Scalar::Date(17_510))),
+        )),
+        true, // use batch with partition column
+    )]
+    fn data_skipping_does_not_prune_remove_actions(
+        #[case] schema: SchemaRef,
+        #[case] partition_columns: Vec<String>,
+        #[case] predicate: Arc<Predicate>,
+        #[case] with_partition: bool,
+    ) {
+        let state_info = get_state_info(
+            schema,
+            partition_columns,
+            Some(predicate),
+            &[],
+            HashMap::new(),
+            vec![],
+        )
+        .unwrap();
+
+        // Batch: [Remove c001, Add c001, Add c000, Metadata]
+        // The Remove must not be pruned -- it records c001 as seen, suppressing the c001 Add.
+        let batch = if with_partition {
+            vec![add_batch_with_remove_and_partition(
+                get_commit_schema().clone(),
+            )]
+        } else {
+            vec![add_batch_with_remove(get_commit_schema().clone())]
+        };
+        let (iter, _metrics) = scan_action_iter(
+            &SyncEngine::new(),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            Arc::new(state_info),
+            test_checkpoint_info(),
+            false,
+        )
+        .unwrap();
+
+        let mut add_paths: Vec<String> = Vec::new();
+        for res in iter {
+            let scan_metadata = res.unwrap();
+            let paths = scan_metadata
+                .visit_scan_files(
+                    Vec::new(),
+                    |paths: &mut Vec<String>, scan_file: ScanFile| {
+                        paths.push(scan_file.path.to_string());
+                    },
+                )
+                .unwrap();
+            add_paths.extend(paths);
+        }
+
+        // Only c000 should survive: Remove suppressed c001 via deduplication
+        assert_eq!(add_paths.len(), 1, "Expected exactly one add to survive");
+        assert!(
+            add_paths[0].contains("c000"),
+            "Expected c000 add to survive, got: {}",
+            add_paths[0]
+        );
     }
 }

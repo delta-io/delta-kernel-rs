@@ -454,11 +454,11 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "uc-catalog")]
+    #[cfg(feature = "delta-kernel-unity-catalog")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg_attr(miri, ignore)]
     async fn test_transaction_with_uc_committer() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::uc_catalog::{
+        use crate::delta_kernel_unity_catalog::{
             free_uc_commit_client, get_uc_commit_client, get_uc_committer,
             tests::{cast_test_context, get_test_context, recover_test_context},
             CommitRequest,
@@ -494,15 +494,21 @@ mod tests {
 
         let tmp_test_dir = tempdir()?;
         let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
-        let partition_columns = vec![];
 
-        for (table_url, _engine, store, _table_name) in setup_test_tables(
+        // Create a catalog-managed table so UCCommitter (a catalog committer) is allowed.
+        let (store, _test_engine, table_location) =
+            test_utils::engine_store_setup("test_uc_table", Some(&tmp_dir_local_url));
+        let table_url = test_utils::create_table(
+            store.clone(),
+            table_location,
             schema,
-            &partition_columns,
-            Some(&tmp_dir_local_url),
-            "test_uc_table",
+            &[],
+            true, // use v3/v7 protocol
+            vec!["catalogManaged", "vacuumProtocolCheck"],
+            vec!["inCommitTimestamp", "catalogManaged", "vacuumProtocolCheck"],
         )
-        .await?
+        .await?;
+
         {
             let table_path = table_url.to_file_path().unwrap();
             let table_path_str = table_path.to_str().unwrap();
@@ -518,7 +524,7 @@ mod tests {
             let context = get_test_context(false);
 
             let uc_client = unsafe { get_uc_commit_client(context, test_uc_commit) };
-            let table_id = "foo";
+            let table_id = "test_id";
             let uc_committer = unsafe {
                 ok_or_panic(get_uc_committer(
                     uc_client.shallow_copy(),
@@ -595,7 +601,7 @@ mod tests {
                 // scope so we don't hold mutex across the await lower down
                 let (last_table_id, _) = context.last_commit_request.unwrap();
                 assert_eq!(
-                    last_table_id, "foo",
+                    last_table_id, "test_id",
                     "Table ID should match the one passed to UCCommitter"
                 );
             }

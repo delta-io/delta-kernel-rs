@@ -1,5 +1,8 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
+pub mod counting_reporter;
+pub use counting_reporter::CountingReporter;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -452,6 +455,9 @@ pub async fn create_table(
         }
         if writer_features.contains(&"changeDataFeed") {
             config.insert("delta.enableChangeDataFeed".to_string(), json!("true"));
+        }
+        if reader_features.contains(&"catalogManaged") {
+            config.insert("io.unitycatalog.tableId".to_string(), json!(table_id));
         }
 
         config

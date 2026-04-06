@@ -332,8 +332,9 @@ impl LogicalSchema {
     /// Returns the physical schema for partition columns, or `None` if there are no partition
     /// columns or none of the partition columns are found in the logical schema.
     ///
-    /// Field names are physical column names (respecting column mapping mode), and field types are
-    /// the actual partition column data types with their original nullability.
+    /// Field names are physical column names (respecting column mapping mode). All fields are
+    /// nullable because the `partitionValues_parsed` struct can be null for non-Add rows (e.g.
+    /// Remove actions), which requires all leaf fields to allow nulls.
     pub(crate) fn physical_partition_schema(&self) -> Option<SchemaRef> {
         if self.partition_columns.is_empty() {
             return None;
@@ -349,10 +350,9 @@ impl LogicalSchema {
                 field
             })
             .map(|field| {
-                StructField::new(
+                StructField::nullable(
                     field.physical_name(self.column_mapping_mode).to_owned(),
                     field.data_type().clone(),
-                    field.is_nullable(),
                 )
             })
             .collect();

@@ -1,9 +1,20 @@
 //! Utility functions used for tests in this crate.
 
-use crate::error::{EngineError, ExternResult, KernelError};
-use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 use std::os::raw::c_void;
 use std::ptr::NonNull;
+#[cfg(test)]
+use std::sync::Arc;
+
+use crate::error::{EngineError, ExternResult, KernelError};
+#[cfg(test)]
+use crate::{engine_to_handle, kernel_string_slice, snapshot};
+use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
+#[cfg(test)]
+use delta_kernel::engine::default::DefaultEngineBuilder;
+#[cfg(test)]
+use delta_kernel::object_store::memory::InMemory;
+#[cfg(test)]
+use test_utils::add_commit;
 
 // Used to allocate EngineErrors with test information from Rust tests
 #[cfg(test)]
@@ -56,19 +67,47 @@ pub(crate) fn ok_or_panic<T>(result: ExternResult<T>) -> T {
     }
 }
 
+/// Create an in-memory engine and snapshot from the given commit data. Returns
+/// `(engine_handle, snapshot_handle)` -- the caller must free both when done.
+#[cfg(test)]
+pub(crate) async fn setup_snapshot(
+    commit_data: String,
+) -> Result<
+    (
+        crate::handle::Handle<crate::SharedExternEngine>,
+        crate::handle::Handle<crate::SharedSnapshot>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let table_root = "memory:///";
+    let storage = Arc::new(InMemory::new());
+    add_commit(table_root, storage.as_ref(), 0, commit_data).await?;
+    let engine = DefaultEngineBuilder::new(storage.clone()).build();
+    let engine = engine_to_handle(Arc::new(engine), allocate_err);
+    let snap = unsafe {
+        ok_or_panic(snapshot(
+            kernel_string_slice!(table_root),
+            engine.shallow_copy(),
+        ))
+    };
+    Ok((engine, snap))
+}
+
 /// Check error type and message while also recovering the error to prevent leaks
 pub(crate) fn assert_extern_result_error_with_message<T>(
     res: ExternResult<T>,
     expected_etype: KernelError,
-    expected_message: &str,
+    opt_message: Option<&str>,
 ) {
     match res {
         ExternResult::Err(e) => {
             let error = unsafe { recover_error(e) };
             assert_eq!(error.etype, expected_etype);
-            assert_eq!(error.message, expected_message);
+            if let Some(expected_message) = opt_message {
+                assert_eq!(error.message, expected_message);
+            }
         }
-        _ => panic!("Expected error of type '{expected_etype:?}' and message '{expected_message}'"),
+        _ => panic!("Expected error of type '{expected_etype:?}' and message '{opt_message:?}'"),
     }
 }
 
