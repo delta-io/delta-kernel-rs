@@ -67,7 +67,7 @@ pub struct CountingReporter {
     pub compaction_files: AtomicU64,
     /// Total number of times that a latest CRC file was found in the log segment, across all
     /// log segment loads.
-    pub num_latest_crc_files_found: AtomicU64,
+    pub latest_crc_files_found: AtomicU64,
 
     // CRC reader IO counters
     /// Number of CRC read calls (one per [`MetricEvent::CrcReadCompleted`]).
@@ -103,7 +103,7 @@ impl CountingReporter {
         self.commit_files.store(0, Ordering::Relaxed);
         self.checkpoint_files.store(0, Ordering::Relaxed);
         self.compaction_files.store(0, Ordering::Relaxed);
-        self.num_latest_crc_files_found.store(0, Ordering::Relaxed);
+        self.latest_crc_files_found.store(0, Ordering::Relaxed);
         self.crc_read_calls.store(0, Ordering::Relaxed);
         self.crc_bytes_read.store(0, Ordering::Relaxed);
     }
@@ -132,7 +132,7 @@ impl CountingReporter {
         let commits = self.commit_files.load(Ordering::Relaxed);
         let checkpoints = self.checkpoint_files.load(Ordering::Relaxed);
         let compactions = self.compaction_files.load(Ordering::Relaxed);
-        let crc_files_found = self.num_latest_crc_files_found.load(Ordering::Relaxed);
+        let crc_files_found = self.latest_crc_files_found.load(Ordering::Relaxed);
 
         println!("  [io] {label}");
         println!("    storage : {list_calls} list ({list_files} files seen)  {storage_reads} raw read ({storage_files} files, {storage_kib} KiB)  {copy_calls} copy");
@@ -200,10 +200,10 @@ impl MetricsReporter for CountingReporter {
                     .fetch_add(num_checkpoint_files, Ordering::Relaxed);
                 self.compaction_files
                     .fetch_add(num_compaction_files, Ordering::Relaxed);
-                self.num_latest_crc_files_found
+                self.latest_crc_files_found
                     .fetch_add(has_latest_crc_file as u64, Ordering::Relaxed);
             }
-            MetricEvent::CrcReadCompleted { bytes_read } => {
+            MetricEvent::CrcReadCompleted { bytes_read, .. } => {
                 self.crc_read_calls.fetch_add(1, Ordering::Relaxed);
                 self.crc_bytes_read.fetch_add(bytes_read, Ordering::Relaxed);
             }
@@ -289,17 +289,35 @@ mod tests {
         assert_eq!(reporter.commit_files.load(Ordering::Relaxed), 7);
         assert_eq!(reporter.checkpoint_files.load(Ordering::Relaxed), 2);
         assert_eq!(reporter.compaction_files.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            reporter.num_latest_crc_files_found.load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(reporter.latest_crc_files_found.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn report_log_segment_loaded_without_crc_does_not_increment_crc_counter() {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::LogSegmentLoaded {
+            operation_id: MetricId::new(),
+            duration: dur(),
+            num_commit_files: 3,
+            num_checkpoint_files: 1,
+            num_compaction_files: 0,
+            has_latest_crc_file: false,
+        });
+        assert_eq!(reporter.log_segment_loads.load(Ordering::Relaxed), 1);
+        assert_eq!(reporter.latest_crc_files_found.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn report_crc_read_completed_increments_crc_counters() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::CrcReadCompleted { bytes_read: 512 });
-        reporter.report(MetricEvent::CrcReadCompleted { bytes_read: 256 });
+        reporter.report(MetricEvent::CrcReadCompleted {
+            duration: dur(),
+            bytes_read: 512,
+        });
+        reporter.report(MetricEvent::CrcReadCompleted {
+            duration: dur(),
+            bytes_read: 256,
+        });
         assert_eq!(reporter.crc_read_calls.load(Ordering::Relaxed), 2);
         assert_eq!(reporter.crc_bytes_read.load(Ordering::Relaxed), 768);
     }
@@ -339,7 +357,10 @@ mod tests {
             num_compaction_files: 1,
             has_latest_crc_file: true,
         });
-        reporter.report(MetricEvent::CrcReadCompleted { bytes_read: 512 });
+        reporter.report(MetricEvent::CrcReadCompleted {
+            duration: dur(),
+            bytes_read: 512,
+        });
 
         reporter.reset();
 
@@ -360,10 +381,7 @@ mod tests {
         assert_eq!(reporter.commit_files.load(Ordering::Relaxed), 0);
         assert_eq!(reporter.checkpoint_files.load(Ordering::Relaxed), 0);
         assert_eq!(reporter.compaction_files.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            reporter.num_latest_crc_files_found.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(reporter.latest_crc_files_found.load(Ordering::Relaxed), 0);
         assert_eq!(reporter.crc_read_calls.load(Ordering::Relaxed), 0);
         assert_eq!(reporter.crc_bytes_read.load(Ordering::Relaxed), 0);
     }
