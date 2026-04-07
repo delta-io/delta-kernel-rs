@@ -517,8 +517,10 @@ mod tests {
     use delta_kernel_ffi::engine_data::get_engine_data;
     use delta_kernel_ffi::engine_data::ArrowFFIData;
 
+    use delta_kernel_ffi::error::KernelError;
     use delta_kernel_ffi::ffi_test_utils::{
-        allocate_err, allocate_str, build_snapshot, ok_or_panic, recover_error, recover_string,
+        allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
+        ok_or_panic, recover_error, recover_string,
     };
     use delta_kernel_ffi::tests::get_default_engine;
 
@@ -917,7 +919,11 @@ mod tests {
         });
 
         let result = unsafe { commit(txn, engine.shallow_copy()) };
-        assert!(result.is_err());
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::GenericError,
+            "Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled",
+        );
 
         unsafe { free_engine(engine) };
         Ok(())
@@ -961,7 +967,66 @@ mod tests {
         });
 
         let result = unsafe { commit(txn, engine.shallow_copy()) };
-        assert!(result.is_err());
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::GenericError,
+            "Generic delta kernel error: Metadata for domain dup already specified in this transaction",
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_domain_metadata_rejected_without_feature(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_test_dir = tempdir()?;
+        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+
+        // Create a table WITHOUT the domainMetadata writer feature (v1/v1 protocol)
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )])?);
+        let (store, _test_engine, table_location) =
+            test_utils::engine_store_setup("test_dm_no_feature", Some(&tmp_dir_url));
+        let table_url = test_utils::create_table(
+            store.clone(),
+            table_location,
+            schema,
+            &[],
+            false,
+            vec![],
+            vec![],
+        )
+        .await?;
+        let table_path = table_url.to_file_path().unwrap();
+        let table_path_str = table_path.to_str().unwrap();
+        let engine = get_default_engine(table_path_str);
+
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        unsafe { set_data_change(txn.shallow_copy(), false) };
+
+        let domain = "myDomain";
+        let config = "config";
+        let txn = ok_or_panic(unsafe {
+            with_domain_metadata(
+                txn,
+                kernel_string_slice!(domain),
+                kernel_string_slice!(config),
+                engine.shallow_copy(),
+            )
+        });
+
+        let result = unsafe { commit(txn, engine.shallow_copy()) };
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::UnsupportedError,
+            "Unsupported: Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature",
+        );
 
         unsafe { free_engine(engine) };
         Ok(())
