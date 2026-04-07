@@ -63,6 +63,7 @@ pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION: &str =
     "delta.inCommitTimestampEnablementVersion";
 pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP: &str =
     "delta.inCommitTimestampEnablementTimestamp";
+pub(crate) const WRITE_PARTITION_COLUMNS_TO_PARQUET: &str = "delta.writePartitionColumnsToParquet";
 
 /// Delta table properties. These are parsed from the 'configuration' map in the most recent
 /// 'Metadata' action of a table.
@@ -215,6 +216,12 @@ pub struct TableProperties {
     /// The timestamp of the table at which in-commit timestamps were enabled. This must be the same
     /// as the inCommitTimestamp of the commit when this feature was enabled.
     pub in_commit_timestamp_enablement_timestamp: Option<i64>,
+
+    /// Whether partition columns should be written to Parquet data files. When unset or `true`,
+    /// partition columns are materialized in parquet. When `false`, partition columns are omitted
+    /// from parquet unless the `materializePartitionColumns` table feature is supported in the
+    /// protocol (in which case partition columns are always written regardless of this property).
+    pub write_partition_columns_to_parquet: Option<bool>,
 
     /// any unrecognized properties are passed through and ignored by the parser
     pub unknown_properties: HashMap<String, String>,
@@ -382,6 +389,10 @@ mod tests {
             IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
             "delta.inCommitTimestampEnablementTimestamp"
         );
+        assert_eq!(
+            WRITE_PARTITION_COLUMNS_TO_PARQUET,
+            "delta.writePartitionColumnsToParquet"
+        );
     }
 
     #[test]
@@ -489,6 +500,7 @@ mod tests {
             (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "15"),
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, "1612345678"),
+            (WRITE_PARTITION_COLUMNS_TO_PARQUET, "false"),
         ];
         let actual = TableProperties::from(properties.into_iter());
         let expected = TableProperties {
@@ -525,6 +537,7 @@ mod tests {
             enable_in_commit_timestamps: Some(true),
             in_commit_timestamp_enablement_version: Some(15),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
+            write_partition_columns_to_parquet: Some(false),
             unknown_properties: HashMap::new(),
         };
         assert_eq!(actual, expected);

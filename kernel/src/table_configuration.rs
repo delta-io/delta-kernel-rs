@@ -412,15 +412,34 @@ impl TableConfiguration {
         self.physical_schemas.full.clone()
     }
 
-    /// The physical schema for writing data files.
+    /// Returns whether partition columns should be written to Parquet data files.
     ///
-    /// When [`MaterializePartitionColumns`] is enabled, returns the full physical schema
-    /// (partition columns are materialized in data files). Otherwise, returns the physical
-    /// schema with partition columns excluded.
+    /// Partition columns are written when any of the following hold:
+    /// - The [`MaterializePartitionColumns`] feature is enabled in the protocol
+    /// - The `delta.writePartitionColumnsToParquet` table property is unset or `true`
+    ///
+    /// In other words, `delta.writePartitionColumnsToParquet = false` only suppresses
+    /// partition column writing when [`MaterializePartitionColumns`] is not enabled.
     ///
     /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
-    pub(crate) fn physical_write_schema(&self) -> SchemaRef {
+    pub(crate) fn should_write_partition_columns(&self) -> bool {
         if self.is_feature_enabled(&TableFeature::MaterializePartitionColumns) {
+            return true;
+        }
+        self.table_properties
+            .write_partition_columns_to_parquet
+            .unwrap_or(true)
+    }
+
+    /// The physical schema for writing data files.
+    ///
+    /// When partition columns should be written (see [`should_write_partition_columns`]),
+    /// returns the full physical schema. Otherwise, returns the physical schema with
+    /// partition columns excluded.
+    ///
+    /// [`should_write_partition_columns`]: Self::should_write_partition_columns
+    pub(crate) fn physical_write_schema(&self) -> SchemaRef {
+        if self.should_write_partition_columns() {
             self.physical_schema()
         } else {
             self.physical_data_schema_without_partition_columns()
@@ -2066,5 +2085,91 @@ mod test {
             config.ensure_operation_supported(Operation::Write).is_ok(),
             "ClusteredTable with DomainMetadata should be supported for writes"
         );
+    }
+
+    /// Helper to create a partitioned table configuration with optional writer features and
+    /// table properties. The schema has two columns: `value` (int) and `part` (string), where
+    /// `part` is the partition column. Only used in tests.
+    fn create_partitioned_table_config(
+        props: &[(&str, &str)],
+        writer_features: Option<&[TableFeature]>,
+    ) -> TableConfiguration {
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("value", DataType::INTEGER),
+            StructField::nullable("part", DataType::STRING),
+        ]));
+        let configuration =
+            HashMap::from_iter(props.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec!["part".to_string()],
+            0,
+            configuration,
+        )
+        .unwrap();
+        let protocol = if let Some(features) = writer_features {
+            Protocol::try_new(
+                TABLE_FEATURES_MIN_READER_VERSION,
+                TABLE_FEATURES_MIN_WRITER_VERSION,
+                Some(std::iter::empty::<TableFeature>()),
+                Some(features.iter().cloned()),
+            )
+            .unwrap()
+        } else {
+            Protocol::try_new_legacy(1, 2).unwrap()
+        };
+        let table_root = Url::try_from("file:///").unwrap();
+        TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
+    }
+
+    #[test]
+    fn should_write_partition_columns_defaults_true_without_feature_or_property() {
+        let config = create_partitioned_table_config(&[], None);
+        assert!(config.should_write_partition_columns());
+        // physical_write_schema should include the partition column
+        assert!(config.physical_write_schema().field("part").is_some());
+    }
+
+    #[test]
+    fn should_write_partition_columns_true_when_property_explicitly_true() {
+        use crate::table_properties::WRITE_PARTITION_COLUMNS_TO_PARQUET;
+        let config =
+            create_partitioned_table_config(&[(WRITE_PARTITION_COLUMNS_TO_PARQUET, "true")], None);
+        assert!(config.should_write_partition_columns());
+        assert!(config.physical_write_schema().field("part").is_some());
+    }
+
+    #[test]
+    fn should_not_write_partition_columns_when_property_false() {
+        use crate::table_properties::WRITE_PARTITION_COLUMNS_TO_PARQUET;
+        let config =
+            create_partitioned_table_config(&[(WRITE_PARTITION_COLUMNS_TO_PARQUET, "false")], None);
+        assert!(!config.should_write_partition_columns());
+        // physical_write_schema should exclude the partition column
+        assert!(config.physical_write_schema().field("part").is_none());
+    }
+
+    #[test]
+    fn should_write_partition_columns_when_materialize_feature_overrides_false_property() {
+        use crate::table_properties::WRITE_PARTITION_COLUMNS_TO_PARQUET;
+        let config = create_partitioned_table_config(
+            &[(WRITE_PARTITION_COLUMNS_TO_PARQUET, "false")],
+            Some(&[TableFeature::MaterializePartitionColumns]),
+        );
+        // materializePartitionColumns overrides the property
+        assert!(config.should_write_partition_columns());
+        assert!(config.physical_write_schema().field("part").is_some());
+    }
+
+    #[test]
+    fn should_write_partition_columns_when_materialize_feature_without_property() {
+        let config = create_partitioned_table_config(
+            &[],
+            Some(&[TableFeature::MaterializePartitionColumns]),
+        );
+        assert!(config.should_write_partition_columns());
+        assert!(config.physical_write_schema().field("part").is_some());
     }
 }
