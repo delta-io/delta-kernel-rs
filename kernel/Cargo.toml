@@ -112,10 +112,6 @@ arrow-57 = ["dep:arrow_57", "dep:parquet_57", "dep:object_store_12"]
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow"]
 
-# WARNING: experimental feature, still under active development
-# enables new experimental catalog-managed tables support
-catalog-managed = []
-
 # Schema diffing functionality (experimental)
 schema-diff = []
 
@@ -137,7 +133,7 @@ default-engine-rustls = ["default-engine-base", "reqwest/rustls"]
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-delta_kernel = { path = ".", features = ["catalog-managed", "test-utils"] }
+delta_kernel = { path = ".", features = ["test-utils"] }
 # NOTE: test_utils forcibly pulls the default engine and arrow-56. By default it ALSO pulls
 # arrow-57, which takes precedence and would make it impossible to test against arrow-56.
 test_utils = { path = "../test-utils", default-features = false }
