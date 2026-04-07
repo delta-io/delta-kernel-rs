@@ -70,7 +70,8 @@ protocol compliance (table features, schema validation), and delegates the atomi
 
 **Steps:**
 1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)
-2. Get `WriteContext` for target dir, physical schema, and stats columns
+2. Get `WriteContext` via `partitioned_write_context()` or `unpartitioned_write_context()` for
+   target dir, physical schema, and stats columns
 3. Write Parquet files (via engine), collect file metadata
 4. Register files via `txn.add_files(metadata)`
 5. Commit: returns `CommittedTransaction`, `ConflictedTransaction`, or `RetryableTransaction`
@@ -129,6 +130,7 @@ all returned batches -- the engine may split a single file across multiple batch
   `column_expr!` macro
 - `kernel/src/transforms/` -- generic recursive transforms (`ExpressionTransform`,
   `SchemaTransform`)
+- `kernel/src/partition.rs` -- Hive-style partition path encoding utilities
 - `kernel/src/checkpoint/` -- checkpoint writing (V1 and V2 single-file classic-named)
 - `kernel/src/table_configuration.rs` -- table metadata, properties, feature management
 - `kernel/src/table_features/` -- protocol feature definitions, `TableFeature` enum

@@ -248,13 +248,13 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         &self,
         path: &url::Url,
         data: Box<dyn EngineData>,
-        partition_values: HashMap<String, Option<String>>,
+        partition_values: &HashMap<String, Option<String>>,
         stats_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let parquet_metadata = self
             .write_parquet(path, data, stats_columns.unwrap_or(&[]))
             .await?;
-        parquet_metadata.as_record_batch(&partition_values)
+        parquet_metadata.as_record_batch(partition_values)
     }
 }
 

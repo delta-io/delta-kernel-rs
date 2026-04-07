@@ -974,7 +974,7 @@ pub async fn write_batch_to_table(
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
-    let write_context = if partition_values.is_empty() {
+    let write_context = if txn.partition_columns().is_empty() {
         txn.unpartitioned_write_context()?
     } else {
         txn.partitioned_write_context(partition_values)?

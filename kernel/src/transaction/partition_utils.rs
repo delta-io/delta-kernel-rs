@@ -17,7 +17,7 @@ use crate::{DeltaResult, Error};
 
 // === Partition Value Serialization ===
 //
-// Serialization spec verified against DBR:
+// Serialization rules per Delta protocol spec (Partition Value Serialization section):
 //
 // Type           Serialization                             Notes
 // Null           None
@@ -30,7 +30,7 @@ use crate::{DeltaResult, Error};
 // Float          Java Float.toString() format              format_f32
 // Double         Java Double.toString() format             format_f64
 // Date           "YYYY-MM-DD"                              chrono
-// Timestamp      "YYYY-MM-DDTHH:MM:SS.ffffffZ" (ISO 8601) DBR uses T+Z, match DBR
+// Timestamp      "YYYY-MM-DDTHH:MM:SS.ffffffZ" (ISO 8601) ISO 8601 (T separator, microseconds, Z suffix)
 // TimestampNtz   "YYYY-MM-DD HH:MM:SS.ffffff" (space)
 // Decimal        "42.00", "-0.05"                          preserves scale
 // Binary         Raw UTF-8: String::from_utf8              strict, error on invalid
@@ -65,7 +65,13 @@ pub(crate) fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<St
         Scalar::Timestamp(us) => Ok(Some(format_timestamp(*us)?)),
         Scalar::TimestampNtz(us) => Ok(Some(format_timestamp_ntz(*us)?)),
         Scalar::Decimal(d) => Ok(Some(format_decimal(d))),
-        Scalar::Binary(b) => Ok(Some(format_binary(b)?)),
+        Scalar::Binary(b) => {
+            if b.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(format_binary(b)?))
+            }
+        }
         Scalar::Struct(_) | Scalar::Array(_) | Scalar::Map(_) => Err(Error::generic(format!(
             "cannot serialize partition value: type {:?} is not a valid partition column type",
             value.data_type()
@@ -164,32 +170,29 @@ fn format_date(days: i32) -> DeltaResult<String> {
         .ok_or_else(|| Error::generic(format!("date value {days} days from epoch is out of range")))
 }
 
-/// Formats a timestamp (microseconds since epoch) as ISO 8601: "YYYY-MM-DDTHH:MM:SS.ffffffZ".
-/// This matches DBR's serialization format (T separator, microseconds, Z suffix).
-fn format_timestamp(micros: i64) -> DeltaResult<String> {
+/// Converts microseconds since epoch to a [`DateTime`], returning an error if out of range.
+fn micros_to_datetime(micros: i64, label: &str) -> DeltaResult<DateTime<chrono::Utc>> {
     let secs = micros.div_euclid(1_000_000);
     let subsec_nanos = (micros.rem_euclid(1_000_000) as u32) * 1000;
-    DateTime::from_timestamp(secs, subsec_nanos)
+    DateTime::from_timestamp(secs, subsec_nanos).ok_or_else(|| {
+        Error::generic(format!(
+            "{label} value {micros} microseconds from epoch is out of range"
+        ))
+    })
+}
+
+/// Formats a timestamp (microseconds since epoch) as ISO 8601: "YYYY-MM-DDTHH:MM:SS.ffffffZ".
+/// ISO 8601 format matching modern Delta writers (T separator, microseconds, Z suffix).
+fn format_timestamp(micros: i64) -> DeltaResult<String> {
+    micros_to_datetime(micros, "timestamp")
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
-        .ok_or_else(|| {
-            Error::generic(format!(
-                "timestamp value {micros} microseconds from epoch is out of range"
-            ))
-        })
 }
 
 /// Formats a timestamp without timezone (microseconds) as "YYYY-MM-DD HH:MM:SS.ffffff".
 /// Space separator, no Z suffix (there is no timezone).
 fn format_timestamp_ntz(micros: i64) -> DeltaResult<String> {
-    let secs = micros.div_euclid(1_000_000);
-    let subsec_nanos = (micros.rem_euclid(1_000_000) as u32) * 1000;
-    DateTime::from_timestamp(secs, subsec_nanos)
+    micros_to_datetime(micros, "timestamp_ntz")
         .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string())
-        .ok_or_else(|| {
-            Error::generic(format!(
-                "timestamp_ntz value {micros} microseconds from epoch is out of range"
-            ))
-        })
 }
 
 /// Formats a decimal value preserving scale (trailing zeros).
@@ -214,7 +217,8 @@ fn format_decimal(d: &crate::expressions::DecimalData) -> String {
 /// Formats binary data as raw UTF-8, matching Java's `new String(bytes, UTF_8)`.
 /// Returns an error if the bytes are not valid UTF-8.
 fn format_binary(bytes: &[u8]) -> DeltaResult<String> {
-    String::from_utf8(bytes.to_vec())
+    std::str::from_utf8(bytes)
+        .map(|s| s.to_string())
         .map_err(|e| Error::generic(format!("binary partition value is not valid UTF-8: {e}")))
 }
 
@@ -319,16 +323,10 @@ mod tests {
 
     #[test]
     fn test_serialize_partition_value_null_complex_type_returns_none() {
-        // Null with a struct type still returns None (null is null regardless of type).
-        // The error only fires for non-null complex scalars.
-        // Wait, actually the plan says error for Null(Struct). Let me re-check...
-        // The spec says Null -> Ok(None). The match arm for Null(_) returns Ok(None)
-        // without checking the inner type. This is correct because null is null.
+        // Null serialization returns None regardless of inner type. Complex-typed partition
+        // columns are rejected by validate_partition_value_types before reaching serialization.
         let result =
             serialize_partition_value(&Scalar::Null(DataType::struct_type_unchecked(vec![])));
-        // Actually, a null struct could theoretically exist. But the _type check_ in
-        // validate_partition_value_types would catch struct-typed partition columns before
-        // we reach serialization. So just returning None here is fine.
         assert_eq!(result.unwrap(), None);
     }
 
@@ -621,15 +619,19 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_partition_value_array_returns_error() {
+    fn test_serialize_partition_value_empty_binary_returns_none() {
+        let result = serialize_partition_value(&Scalar::Binary(vec![])).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_serialize_partition_value_null_with_array_type_returns_none() {
+        // Cannot construct a non-null Array Scalar (ArrayData has private fields), so we
+        // verify that Null(Array) still returns Ok(None).
         let val = Scalar::Null(DataType::Array(Box::new(crate::schema::ArrayType::new(
             DataType::INTEGER,
             false,
         ))));
-        // Null with array type returns None (null is null).
-        // But a non-null Array would error. We test with a real Array scalar:
-        // Actually, constructing a non-null Array Scalar requires ArrayData which has private
-        // fields. Instead, verify the error path by checking the Null path returns None.
         assert_eq!(serialize_partition_value(&val).unwrap(), None);
     }
 
@@ -673,6 +675,24 @@ mod tests {
             .parse_scalar(&serialized)
             .unwrap();
         assert_eq!(parsed, Scalar::TimestampNtz(micros));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_timestamp_roundtrip_with_parse_scalar() {
+        let ts = chrono::NaiveDate::from_ymd_opt(2025, 3, 31)
+            .unwrap()
+            .and_hms_micro_opt(15, 30, 0, 123456)
+            .unwrap();
+        let micros = chrono::Utc
+            .from_utc_datetime(&ts)
+            .signed_duration_since(DateTime::UNIX_EPOCH)
+            .num_microseconds()
+            .unwrap();
+        let serialized = serialize_partition_value(&Scalar::Timestamp(micros))
+            .unwrap()
+            .unwrap();
+        let parsed = PrimitiveType::Timestamp.parse_scalar(&serialized).unwrap();
+        assert_eq!(parsed, Scalar::Timestamp(micros));
     }
 
     // === validate_partition_keys tests ===

@@ -6,10 +6,10 @@
 //!   - Spark's [`ExternalCatalogUtils.escapePathName`][spark]
 //!
 //! These utilities handle **file path encoding only**. They are completely independent from
-//! the `partitionValues` map serialization in Add actions (which is handled by
-//! [`serialize_partition_value`]). The two concerns are separate:
+//! the `partitionValues` map serialization in Add actions (which is handled internally by
+//! [`Transaction::partitioned_write_context`]). The two concerns are separate:
 //!
-//! - **`partitionValues` map** (Add action metadata): [`serialize_partition_value`] converts
+//! - **`partitionValues` map** (Add action metadata): partition value serialization converts
 //!   typed values to protocol-compliant strings (e.g., `Date(20178)` -> `"2025-03-31"`).
 //!   This is the source of truth for partition column values.
 //! - **File paths** (this module): [`escape_partition_value`] and [`build_partition_path`]
@@ -20,7 +20,7 @@
 //! `<table_root>/<uuid>.parquet` (which is what [`DefaultEngine::write_parquet`] currently
 //! does) or Hive-style paths. The choice is entirely up to the connector.
 //!
-//! [`serialize_partition_value`]: crate::transaction::partition_utils::serialize_partition_value
+//! [`Transaction::partitioned_write_context`]: crate::transaction::Transaction::partitioned_write_context
 //! [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
 //!
 //! [hive]: https://github.com/apache/hive/blob/trunk/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
@@ -89,7 +89,7 @@ pub fn escape_partition_value(s: &str) -> Cow<'_, str> {
     };
 
     const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(s.len() + 16);
+    let mut out = String::with_capacity(s.len() + 16); // room for a few percent-encoded chars
     out.push_str(&s[..first]);
     // The escape set is entirely ASCII (< 0x80). UTF-8 guarantees that non-ASCII characters
     // only contain bytes >= 0x80, so only single-byte ASCII characters can need escaping.

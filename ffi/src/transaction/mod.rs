@@ -201,7 +201,9 @@ mod tests {
     use delta_kernel_ffi::tests::get_default_engine;
 
     use crate::{free_engine, free_schema, kernel_string_slice};
-    use write_context::{free_write_context, get_write_context, get_write_path, get_write_schema};
+    use write_context::{
+        free_write_context, get_unpartitioned_write_context, get_write_path, get_write_schema,
+    };
 
     use test_utils::{set_json_value, setup_test_tables, test_read};
 
@@ -332,7 +334,10 @@ mod tests {
             };
 
             let write_context = ok_or_panic(unsafe {
-                get_write_context(txn_with_engine_info.shallow_copy(), engine.shallow_copy())
+                get_unpartitioned_write_context(
+                    txn_with_engine_info.shallow_copy(),
+                    engine.shallow_copy(),
+                )
             });
 
             // Ensure we get the correct schema
@@ -551,7 +556,10 @@ mod tests {
             };
 
             let write_context = ok_or_panic(unsafe {
-                get_write_context(txn_with_engine_info.shallow_copy(), engine.shallow_copy())
+                get_unpartitioned_write_context(
+                    txn_with_engine_info.shallow_copy(),
+                    engine.shallow_copy(),
+                )
             });
 
             let batch = RecordBatch::try_from_iter(vec![

@@ -296,7 +296,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             .write_parquet_file(
                 write_context.target_dir(),
                 physical_data,
-                write_context.partition_values().clone(),
+                write_context.partition_values(),
                 Some(write_context.stats_columns()),
             )
             .await

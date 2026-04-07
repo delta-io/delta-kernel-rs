@@ -82,8 +82,7 @@ async fn test_write_partitioned_normal_values_roundtrip(
     ]);
 
     let batch = RecordBatch::try_new(arrow_schema, columns)?;
-    let snapshot =
-        test_utils::write_batch_to_table(&snapshot, engine.as_ref(), batch, pvs).await?;
+    let snapshot = test_utils::write_batch_to_table(&snapshot, engine.as_ref(), batch, pvs).await?;
 
     // Read before checkpoint
     let sorted = read_sorted(&snapshot, engine.clone())?;
@@ -145,10 +144,7 @@ async fn test_write_partitioned_null_values_roundtrip(
         ("p_boolean".into(), Scalar::Null(DataType::BOOLEAN)),
         ("p_date".into(), Scalar::Null(DataType::DATE)),
         ("p_timestamp".into(), Scalar::Null(DataType::TIMESTAMP)),
-        (
-            "p_decimal".into(),
-            Scalar::Null(DataType::decimal(10, 2)?),
-        ),
+        ("p_decimal".into(), Scalar::Null(DataType::decimal(10, 2)?)),
         ("p_binary".into(), Scalar::Null(DataType::BINARY)),
         (
             "p_timestamp_ntz".into(),
@@ -157,8 +153,7 @@ async fn test_write_partitioned_null_values_roundtrip(
     ]);
 
     let batch = RecordBatch::try_new(arrow_schema, columns)?;
-    let snapshot =
-        test_utils::write_batch_to_table(&snapshot, engine.as_ref(), batch, pvs).await?;
+    let snapshot = test_utils::write_batch_to_table(&snapshot, engine.as_ref(), batch, pvs).await?;
 
     // Read before checkpoint
     let sorted = read_sorted(&snapshot, engine.clone())?;
@@ -201,28 +196,56 @@ async fn test_write_partitioned_null_values_roundtrip(
 fn assert_normal_values(sorted: &RecordBatch, date_days: i32) {
     assert_eq!(sorted.num_rows(), 1);
     assert_eq!(
-        sorted.column(1).as_any().downcast_ref::<StringArray>().unwrap().value(0),
+        sorted
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
         "hello"
     );
     assert_eq!(
-        sorted.column(2).as_any().downcast_ref::<Int32Array>().unwrap().value(0),
+        sorted
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
         42
     );
     assert_eq!(
-        sorted.column(9).as_any().downcast_ref::<Date32Array>().unwrap().value(0),
+        sorted
+            .column(9)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap()
+            .value(0),
         date_days
     );
     assert_eq!(
-        sorted.column(11).as_any().downcast_ref::<Decimal128Array>().unwrap().value(0),
+        sorted
+            .column(11)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap()
+            .value(0),
         12345
     );
     assert_eq!(
-        sorted.column(12).as_any().downcast_ref::<BinaryArray>().unwrap().value(0),
+        sorted
+            .column(12)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .value(0),
         b"Hello"
     );
-    assert!(
-        sorted.column(8).as_any().downcast_ref::<BooleanArray>().unwrap().value(0)
-    );
+    assert!(sorted
+        .column(8)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap()
+        .value(0));
 }
 
 /// Asserts all partition columns (indices 1-13) are null for the single row.
@@ -343,14 +366,11 @@ fn read_sorted(
     let batches = read_scan(&scan, engine)?;
     assert!(!batches.is_empty(), "expected at least one batch");
     let merged = delta_kernel::arrow::compute::concat_batches(&batches[0].schema(), &batches)?;
-    let sort_indices =
-        delta_kernel::arrow::compute::sort_to_indices(merged.column(0), None, None)?;
+    let sort_indices = delta_kernel::arrow::compute::sort_to_indices(merged.column(0), None, None)?;
     let sorted_columns: Vec<ArrayRef> = merged
         .columns()
         .iter()
-        .map(|col| {
-            delta_kernel::arrow::compute::take(col.as_ref(), &sort_indices, None).unwrap()
-        })
+        .map(|col| delta_kernel::arrow::compute::take(col.as_ref(), &sort_indices, None).unwrap())
         .collect();
     Ok(RecordBatch::try_new(merged.schema(), sorted_columns)?)
 }

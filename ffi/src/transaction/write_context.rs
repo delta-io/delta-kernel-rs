@@ -26,7 +26,7 @@ pub struct SharedWriteContext;
 ///
 /// Caller is responsible for passing a [valid][Handle#Validity] transaction handle and engine.
 #[no_mangle]
-pub unsafe extern "C" fn get_write_context(
+pub unsafe extern "C" fn get_unpartitioned_write_context(
     txn: Handle<ExclusiveTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {

@@ -19,7 +19,9 @@ use crate::crc::{CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::ColumnName;
+use crate::expressions::Scalar;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
+use crate::partition::build_partition_path;
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
@@ -232,8 +234,7 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
-    // Cached shared write state (computed lazily on first write context request).
-    // Valid for Transaction lifetime because metadata mutations aren't supported yet.
+    // See `shared_write_state()` method.
     shared_write_state: OnceLock<Arc<SharedWriteState>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
@@ -782,8 +783,11 @@ impl<S> Transaction<S> {
         self.read_snapshot.table_configuration().partition_columns()
     }
 
-    /// Lazily builds and caches the shared write state for this transaction. This is called
-    /// internally by `partitioned_write_context` and `unpartitioned_write_context`.
+    /// Lazily builds and caches the [`SharedWriteState`] for this transaction via `OnceLock`.
+    /// The state is shared via `Arc` so that per-partition `WriteContext` creation is cheap
+    /// (just an Arc refcount bump plus a small HashMap). Valid for the Transaction lifetime
+    /// because metadata mutations are not supported yet. Called internally by
+    /// `partitioned_write_context` and `unpartitioned_write_context`.
     fn shared_write_state(&self) -> &Arc<SharedWriteState> {
         self.shared_write_state.get_or_init(|| {
             let target_dir = self.read_snapshot.table_root().clone();
@@ -817,7 +821,7 @@ impl<S> Transaction<S> {
     /// partition keys are missing/extra, or if value types don't match the schema.
     pub fn partitioned_write_context(
         &self,
-        partition_values: HashMap<String, crate::expressions::Scalar>,
+        partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
         let shared = self.shared_write_state();
         require!(
@@ -845,8 +849,13 @@ impl<S> Transaction<S> {
             let physical_name = shared
                 .logical_schema
                 .field(logical_name)
-                .map(|f| f.physical_name(shared.column_mapping_mode).to_string())
-                .unwrap_or_else(|| logical_name.clone());
+                .ok_or_else(|| {
+                    Error::generic(format!(
+                        "partition column '{logical_name}' not found in schema after validation"
+                    ))
+                })?
+                .physical_name(shared.column_mapping_mode)
+                .to_string();
             serialized.insert(physical_name, value);
         }
 
@@ -1216,10 +1225,8 @@ impl<S> Transaction<S> {
 }
 
 /// Table-wide write state shared across all [`WriteContext`] instances created by a
-/// [`Transaction`]. Cached in `OnceLock` on the transaction and shared via `Arc` so that
-/// per-partition `WriteContext` creation is cheap (just an Arc refcount bump + small HashMap).
-///
-/// Valid for the lifetime of the Transaction because metadata mutations are not supported yet.
+/// [`Transaction`]. Holds the target directory, schemas, column mapping mode, stats columns,
+/// and logical partition column names.
 struct SharedWriteState {
     target_dir: Url,
     logical_schema: SchemaRef,
@@ -1240,12 +1247,11 @@ struct SharedWriteState {
 /// metadata.
 ///
 /// For custom engines that bypass `DefaultEngine`, use [`partition_values`] to build the
-/// `partitionValues` map in Add actions, and [`hive_style_target_dir`] or
-/// [`unique_target_dir`] for file path construction.
+/// `partitionValues` map in Add actions, and [`unique_target_dir`] for file path
+/// construction. A Hive-style target directory helper is also available as an internal API.
 ///
 /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
 /// [`partition_values`]: WriteContext::partition_values
-/// [`hive_style_target_dir`]: WriteContext::hive_style_target_dir
 /// [`unique_target_dir`]: WriteContext::unique_target_dir
 pub struct WriteContext {
     shared: Arc<SharedWriteState>,
@@ -1312,7 +1318,6 @@ impl WriteContext {
     /// [`HIVE_DEFAULT_PARTITION`]: crate::partition::HIVE_DEFAULT_PARTITION
     #[internal_api]
     pub(crate) fn hive_style_target_dir(&self) -> Url {
-        use crate::partition::build_partition_path;
         if self.shared.logical_partition_columns.is_empty() {
             return self.shared.target_dir.clone();
         }
@@ -1344,8 +1349,7 @@ impl WriteContext {
     ///
     /// Returns `table_root/<uuid-v4>/`. This is an alternative to hive-style paths for
     /// connectors that prefer flat file layouts.
-    #[internal_api]
-    pub(crate) fn unique_target_dir(&self) -> Url {
+    pub fn unique_target_dir(&self) -> Url {
         let uuid = uuid::Uuid::new_v4();
         let mut url = self.shared.target_dir.clone();
         url.set_path(&format!("{}{}/", url.path(), uuid));
@@ -1767,7 +1771,7 @@ mod tests {
         let txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let wc = if partition_values.is_empty() {
+        let wc = if txn.partition_columns().is_empty() {
             txn.unpartitioned_write_context()?
         } else {
             txn.partitioned_write_context(partition_values)?
@@ -2543,8 +2547,7 @@ mod tests {
     #[test]
     fn test_unpartitioned_write_context_on_partitioned_table_returns_error() {
         let engine = SyncEngine::new();
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
         let txn = snapshot

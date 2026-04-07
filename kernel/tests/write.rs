@@ -1297,7 +1297,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         .write_parquet_file(
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
-            HashMap::new(),
+            &HashMap::new(),
             Some(write_context.stats_columns()),
         )
         .await?;
@@ -1471,7 +1471,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
         .write_parquet_file(
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
-            HashMap::new(),
+            &HashMap::new(),
             Some(write_context.stats_columns()),
         )
         .await?;
@@ -3214,7 +3214,7 @@ async fn test_write_parquet_succeed_with_logical_partition_names(
 }
 
 #[tokio::test]
-async fn test_write_parquet_rejects_unknown_partition_column(
+async fn test_write_parquet_rejects_partitioned_write_context_on_unpartitioned_table(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_int_schema();
 
@@ -3222,21 +3222,18 @@ async fn test_write_parquet_rejects_unknown_partition_column(
         setup_test_tables(schema.clone(), &[], None, "test_partition_reject").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_engine_info("test");
 
-        let batch = RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
-            vec![Arc::new(Int32Array::from(vec![1, 2]))],
-        )?;
-
-        let result = write_batch_to_table(
-            &snapshot,
-            &engine,
-            batch,
-            HashMap::from([("nonexistent".to_string(), Scalar::String("val".into()))]),
-        )
-        .await;
-        let err =
-            result.expect_err("should fail with unknown partition column on unpartitioned table");
+        let result = txn.partitioned_write_context(HashMap::from([(
+            "nonexistent".to_string(),
+            Scalar::String("val".into()),
+        )]));
+        let err = result
+            .err()
+            .expect("should fail with partitioned_write_context on unpartitioned table");
         let err_msg = err.to_string();
         assert!(
             err_msg.contains("table is not partitioned"),
