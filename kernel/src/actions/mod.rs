@@ -318,6 +318,7 @@ impl Metadata {
     }
 
     #[internal_api]
+    #[allow(dead_code)]
     pub(crate) fn format_provider(&self) -> &str {
         &self.format.provider
     }

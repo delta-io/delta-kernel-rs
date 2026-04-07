@@ -1150,10 +1150,7 @@ pub unsafe extern "C" fn visit_metadata(
     let metadata = unsafe { metadata.as_ref() };
     let id_str = metadata.id();
     let id = kernel_string_slice!(id_str);
-    let name = metadata
-        .name()
-        .map(|s| kernel_string_slice!(s))
-        .into();
+    let name = metadata.name().map(|s| kernel_string_slice!(s)).into();
     let description = metadata
         .description()
         .map(|s| kernel_string_slice!(s))
