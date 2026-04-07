@@ -1321,7 +1321,6 @@ mod tests {
         )
         .unwrap();
 
-        // Resolve dependencies (e.g. ClusteredTable -> DomainMetadata)
         resolve_feature_dependencies(&mut validated);
 
         assert_eq!(
@@ -1498,14 +1497,12 @@ mod tests {
         maybe_auto_enable_property_driven_features(&mut validated);
         resolve_feature_dependencies(&mut validated);
 
-        // RowTracking should be in writer features (WriterOnly)
         assert!(
             validated
                 .writer_features
                 .contains(&TableFeature::RowTracking),
             "Expected RowTracking in writer_features"
         );
-        // DomainMetadata dependency should also be added (WriterOnly)
         assert!(
             validated
                 .writer_features
@@ -1533,7 +1530,6 @@ mod tests {
             .writer_features
             .contains(&TableFeature::DomainMetadata));
 
-        // resolve_feature_dependencies should add the DomainMetadata dependency
         resolve_feature_dependencies(&mut validated);
         assert!(
             validated

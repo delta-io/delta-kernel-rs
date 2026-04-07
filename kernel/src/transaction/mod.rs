@@ -1007,8 +1007,6 @@ impl<S> Transaction<S> {
             // For create-table, there is no prior log to read the high water mark from, so
             // start from the default (-1). For existing tables, read from the snapshot.
             let row_id_high_water_mark = if self.is_create_table() {
-                // No prior log to read from; RowTrackingVisitor::new treats None as
-                // DEFAULT_HIGH_WATER_MARK (-1).
                 None
             } else {
                 RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?
