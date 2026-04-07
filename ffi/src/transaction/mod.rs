@@ -444,8 +444,11 @@ pub unsafe extern "C" fn free_create_table_builder(builder: Handle<ExclusiveCrea
 /// `selection_vector_len` is 0, the `selection_vector` pointer is not accessed and may be null
 /// or any arbitrary value.
 ///
-/// The `data` schema must match the scan row schema returned by
-/// [`scan_metadata_next`](crate::scan::scan_metadata_next).
+/// The `data` and `selection_vector` should be derived from
+/// [`scan_metadata_next`](crate::scan::scan_metadata_next): `data` is the engine data batch and
+/// `selection_vector` is the scan's selection vector, modified to select only the rows (files) to
+/// remove. Selecting rows that were not active in the original scan selection vector produces
+/// invalid Remove actions in the commit log.
 ///
 /// Note: Unlike [`add_files`], this function takes an `engine` handle and returns
 /// [`ExternResult`] because the selection vector validation can fail. Returns `true` on
