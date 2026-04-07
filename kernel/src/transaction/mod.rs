@@ -55,6 +55,7 @@ pub(crate) mod data_layout;
 
 mod commit_info;
 mod domain_metadata;
+pub(crate) mod partition_utils;
 mod stats_verifier;
 mod update;
 use stats_verifier::StatsVerifier;
