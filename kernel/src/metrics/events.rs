@@ -120,8 +120,12 @@ pub enum MetricEvent {
 
     /// CRC file read operation completed (one event per CRC file read).
     ///
+    /// Emitted after the raw bytes are read from storage, regardless of whether JSON
+    /// deserialization succeeds.
+    ///
     /// `bytes_read` is the number of bytes read from the CRC file.
-    CrcReadCompleted { bytes_read: u64 },
+    /// `duration` is the duration of the read operation (not including deserialization).
+    CrcReadCompleted { duration: Duration, bytes_read: u64 },
 
     /// Scan metadata iteration completed.
     ///
@@ -229,8 +233,11 @@ impl fmt::Display for MetricEvent {
                 f,
                 "ParquetReadCompleted(files={num_files}, bytes={bytes_read})"
             ),
-            MetricEvent::CrcReadCompleted { bytes_read } => {
-                write!(f, "CrcReadCompleted(bytes={bytes_read})")
+            MetricEvent::CrcReadCompleted {
+                duration,
+                bytes_read,
+            } => {
+                write!(f, "CrcReadCompleted(duration={duration:?}, bytes={bytes_read})")
             }
             MetricEvent::ScanMetadataCompleted {
                 operation_id,

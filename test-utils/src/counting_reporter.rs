@@ -93,7 +93,7 @@ pub struct CountingReporter {
     pub compaction_files: RelaxedCounter,
     /// Total number of times that a latest CRC file was found in the log segment, across all
     /// log segment loads.
-    pub num_latest_crc_files_found: RelaxedCounter,
+    pub latest_crc_files_found: RelaxedCounter,
 
     // CRC reader IO counters
     /// Number of CRC read calls (one per [`MetricEvent::CrcReadCompleted`]).
@@ -129,7 +129,7 @@ impl CountingReporter {
         self.commit_files.reset();
         self.checkpoint_files.reset();
         self.compaction_files.reset();
-        self.num_latest_crc_files_found.reset();
+        self.latest_crc_files_found.reset();
         self.crc_read_calls.reset();
         self.crc_bytes_read.reset();
     }
@@ -158,7 +158,7 @@ impl CountingReporter {
         let commits = self.commit_files.get();
         let checkpoints = self.checkpoint_files.get();
         let compactions = self.compaction_files.get();
-        let crc_files_found = self.num_latest_crc_files_found.get();
+        let crc_files_found = self.latest_crc_files_found.get();
 
         println!("  [io] {label}");
         println!("    storage : {list_calls} list ({list_files} files seen)  {storage_reads} raw read ({storage_files} files, {storage_kib} KiB)  {copy_calls} copy");
@@ -218,10 +218,9 @@ impl MetricsReporter for CountingReporter {
                 self.commit_files.add(num_commit_files);
                 self.checkpoint_files.add(num_checkpoint_files);
                 self.compaction_files.add(num_compaction_files);
-                self.num_latest_crc_files_found
-                    .add(has_latest_crc_file as u64);
+                self.latest_crc_files_found.add(has_latest_crc_file as u64);
             }
-            MetricEvent::CrcReadCompleted { bytes_read } => {
+            MetricEvent::CrcReadCompleted { bytes_read, .. } => {
                 self.crc_read_calls.inc();
                 self.crc_bytes_read.add(bytes_read);
             }
@@ -307,14 +306,35 @@ mod tests {
         assert_eq!(reporter.commit_files.get(), 7);
         assert_eq!(reporter.checkpoint_files.get(), 2);
         assert_eq!(reporter.compaction_files.get(), 1);
-        assert_eq!(reporter.num_latest_crc_files_found.get(), 1);
+        assert_eq!(reporter.latest_crc_files_found.get(), 1);
+    }
+
+    #[test]
+    fn report_log_segment_loaded_without_crc_does_not_increment_crc_counter() {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::LogSegmentLoaded {
+            operation_id: MetricId::new(),
+            duration: dur(),
+            num_commit_files: 3,
+            num_checkpoint_files: 1,
+            num_compaction_files: 0,
+            has_latest_crc_file: false,
+        });
+        assert_eq!(reporter.log_segment_loads.get(), 1);
+        assert_eq!(reporter.latest_crc_files_found.get(), 0);
     }
 
     #[test]
     fn report_crc_read_completed_increments_crc_counters() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::CrcReadCompleted { bytes_read: 512 });
-        reporter.report(MetricEvent::CrcReadCompleted { bytes_read: 256 });
+        reporter.report(MetricEvent::CrcReadCompleted {
+            duration: dur(),
+            bytes_read: 512,
+        });
+        reporter.report(MetricEvent::CrcReadCompleted {
+            duration: dur(),
+            bytes_read: 256,
+        });
         assert_eq!(reporter.crc_read_calls.get(), 2);
         assert_eq!(reporter.crc_bytes_read.get(), 768);
     }
@@ -354,7 +374,10 @@ mod tests {
             num_compaction_files: 1,
             has_latest_crc_file: true,
         });
-        reporter.report(MetricEvent::CrcReadCompleted { bytes_read: 512 });
+        reporter.report(MetricEvent::CrcReadCompleted {
+            duration: dur(),
+            bytes_read: 512,
+        });
 
         reporter.reset();
 
@@ -375,7 +398,7 @@ mod tests {
         assert_eq!(reporter.commit_files.get(), 0);
         assert_eq!(reporter.checkpoint_files.get(), 0);
         assert_eq!(reporter.compaction_files.get(), 0);
-        assert_eq!(reporter.num_latest_crc_files_found.get(), 0);
+        assert_eq!(reporter.latest_crc_files_found.get(), 0);
         assert_eq!(reporter.crc_read_calls.get(), 0);
         assert_eq!(reporter.crc_bytes_read.get(), 0);
     }

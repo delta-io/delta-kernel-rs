@@ -39,7 +39,8 @@ impl SyncEngine {
         }
     }
 
-    pub(crate) fn with_reporter(reporter: Arc<dyn MetricsReporter>) -> Self {
+    /// Create a new `SyncEngine` with the given metrics reporter.
+    pub(crate) fn new_with_reporter(reporter: Arc<dyn MetricsReporter>) -> Self {
         SyncEngine {
             metrics_reporter: Some(reporter),
             ..Self::new()
