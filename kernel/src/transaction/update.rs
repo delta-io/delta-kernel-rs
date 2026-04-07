@@ -142,11 +142,8 @@ impl Transaction {
     /// # use std::sync::Arc;
     /// # use delta_kernel::Engine;
     /// # use delta_kernel::snapshot::Snapshot;
-    /// # #[cfg(feature = "catalog-managed")]
     /// # use delta_kernel::committer::FileSystemCommitter;
     /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::DeltaResult<()> {
-    /// # #[cfg(feature = "catalog-managed")]
-    /// # {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
@@ -165,7 +162,6 @@ impl Transaction {
     ///
     /// // Commit the transaction
     /// txn.commit(engine.as_ref())?;
-    /// # }
     /// # Ok(())
     /// # }
     /// ```

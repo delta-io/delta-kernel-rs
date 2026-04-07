@@ -72,7 +72,6 @@ impl SnapshotBuilder {
     ///
     /// Note that the log tail must be a contiguous sequence of commits from M..=N where N is the
     /// latest version of the table and 0 <= M <= N.
-    #[cfg(feature = "catalog-managed")]
     pub fn with_log_tail(mut self, log_tail: Vec<LogPath>) -> Self {
         self.log_tail = log_tail;
         self
