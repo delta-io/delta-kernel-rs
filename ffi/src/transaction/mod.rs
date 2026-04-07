@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
-use crate::scan::SharedScanMetadata;
 use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
 use crate::{DeltaResult, ExternEngine, Snapshot, Url};
 use crate::{ExclusiveEngineData, SharedExternEngine};
@@ -440,7 +439,7 @@ pub unsafe extern "C" fn free_create_table_builder(builder: Handle<ExclusiveCrea
 /// Remove files from a transaction using engine data and a selection vector.
 ///
 /// The `data` handle is consumed. The selection vector indicates which rows in `data` represent
-/// files to remove: `true` means the row is selected for removal, `false` means it is skipped.
+/// files to remove: nonzero means the row is selected for removal, `0` means it is skipped.
 /// If `selection_vector` is null or `selection_vector_len` is 0, all rows are selected. When
 /// `selection_vector_len` is 0, the `selection_vector` pointer is not accessed and may be null
 /// or any arbitrary value.
@@ -449,19 +448,19 @@ pub unsafe extern "C" fn free_create_table_builder(builder: Handle<ExclusiveCrea
 /// [`scan_metadata_next`](crate::scan::scan_metadata_next).
 ///
 /// Note: Unlike [`add_files`], this function takes an `engine` handle and returns
-/// [`ExternResult`] because the selection vector validation can fail.
+/// [`ExternResult`] because the selection vector validation can fail. Returns `true` on
+/// success (the value itself is not meaningful).
 ///
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles. The `selection_vector` pointer must be valid
-/// for `selection_vector_len` bool elements (1 byte each), or null. Each byte must be exactly
-/// `0x00` (false) or `0x01` (true) -- any other byte value is undefined behavior. Consumes the
-/// `data` handle. Does NOT consume the `txn` handle.
+/// for `selection_vector_len` bytes, or null. Consumes the `data` handle. Does NOT consume
+/// the `txn` handle.
 #[no_mangle]
 pub unsafe extern "C" fn remove_files(
     mut txn: Handle<ExclusiveTransaction>,
     data: Handle<ExclusiveEngineData>,
-    selection_vector: *const bool,
+    selection_vector: *const u8,
     selection_vector_len: usize,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
@@ -472,64 +471,15 @@ pub unsafe extern "C" fn remove_files(
     let sv = if selection_vector.is_null() || selection_vector_len == 0 {
         vec![]
     } else {
-        unsafe { std::slice::from_raw_parts(selection_vector, selection_vector_len) }.to_vec()
+        let raw = unsafe { std::slice::from_raw_parts(selection_vector, selection_vector_len) };
+        raw.iter().map(|&b| b != 0).collect()
     };
-    remove_files_impl(data, sv, txn).into_extern_result(&engine)
-}
-
-fn remove_files_impl(
-    data: Box<dyn delta_kernel::EngineData>,
-    selection_vector: Vec<bool>,
-    txn: &mut Transaction,
-) -> DeltaResult<bool> {
-    let filtered = FilteredEngineData::try_new(data, selection_vector)?;
-    txn.remove_files(filtered);
-    Ok(true)
-}
-
-/// Remove files from a transaction using scan metadata obtained from
-/// [`scan_metadata_next`](crate::scan::scan_metadata_next).
-///
-/// This is a convenience function that extracts the scan files from `ScanMetadata` and passes
-/// them to [`Transaction::remove_files`]. The `scan_metadata` handle is always consumed
-/// regardless of whether the function succeeds or fails -- do not use or free the handle after
-/// calling this function. If the underlying `Arc` has other outstanding references (e.g. from
-/// `shallow_copy()`), this function returns an error.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles. The `scan_metadata` handle is consumed
-/// unconditionally -- do not call `free_scan_metadata` after this function, even on error.
-/// Does NOT consume the `txn` handle.
-#[no_mangle]
-pub unsafe extern "C" fn remove_scan_metadata(
-    mut txn: Handle<ExclusiveTransaction>,
-    scan_metadata: Handle<SharedScanMetadata>,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<bool> {
-    let engine = unsafe { engine.as_ref() };
-    let arc = unsafe { scan_metadata.into_inner() };
-    let txn = unsafe { txn.as_mut() };
-    remove_scan_metadata_impl(arc, txn).into_extern_result(&engine)
-}
-
-fn remove_scan_metadata_impl(
-    scan_metadata: Arc<delta_kernel::scan::ScanMetadata>,
-    txn: &mut Transaction,
-) -> DeltaResult<bool> {
-    let metadata = Arc::try_unwrap(scan_metadata).map_err(|_| {
-        delta_kernel::Error::Generic(
-            "scan_metadata handle has other outstanding references and cannot be consumed".into(),
-        )
-    })?;
-    // scan_file_transforms are only needed for read-path data transformations, not for
-    // identifying which files to remove. Destructure to make the discard explicit.
-    let delta_kernel::scan::ScanMetadata {
-        scan_files,
-        scan_file_transforms: _,
-    } = metadata;
-    txn.remove_files(scan_files);
-    Ok(true)
+    let result: DeltaResult<bool> = (|| {
+        let filtered = FilteredEngineData::try_new(data, sv)?;
+        txn.remove_files(filtered);
+        Ok(true)
+    })();
+    result.into_extern_result(&engine)
 }
 
 #[cfg(test)]
@@ -1378,142 +1328,24 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_remove_scan_metadata() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
-        let (table_path, engine) = create_table_with_one_file(&tmp_dir)?;
-        let table_path_str = table_path.as_str();
-
-        // Use kernel APIs to get scan metadata
-        let kernel_engine = unsafe { engine.as_ref() }.engine();
-        let snapshot = delta_kernel::snapshot::Snapshot::builder_for(delta_kernel::try_parse_uri(
-            table_path_str,
-        )?)
-        .build(kernel_engine.as_ref())?;
-        assert_eq!(snapshot.version(), 1);
-
-        let scan = snapshot.scan_builder().build()?;
-        let scan_meta_iter = scan.scan_metadata(kernel_engine.as_ref())?;
-        let scan_meta_items: Vec<_> = scan_meta_iter.collect::<Result<_, _>>()?;
-        assert_eq!(scan_meta_items.len(), 1);
-
-        // Wrap the scan metadata in a SharedScanMetadata handle
-        let scan_meta_handle: Handle<SharedScanMetadata> =
-            Arc::new(scan_meta_items.into_iter().next().unwrap()).into();
-
-        // Start a removal transaction
-        let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
-        let engine_info = "test-engine/1.0";
-        let txn = ok_or_panic(unsafe {
-            with_engine_info(
-                txn,
-                kernel_string_slice!(engine_info),
-                engine.shallow_copy(),
-            )
-        });
-
-        // Remove via scan metadata
-        ok_or_panic(unsafe {
-            remove_scan_metadata(txn.shallow_copy(), scan_meta_handle, engine.shallow_copy())
-        });
-
-        ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
-        assert_no_active_files(&kernel_engine, table_path_str)?;
-
-        unsafe { free_engine(engine) };
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_remove_files_with_selection_vector() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
-        let (table_path, engine) = create_table_with_one_file(&tmp_dir)?;
-        let table_path_str = table_path.as_str();
-
-        let kernel_engine = unsafe { engine.as_ref() }.engine();
-        let snapshot = delta_kernel::snapshot::Snapshot::builder_for(delta_kernel::try_parse_uri(
-            table_path_str,
-        )?)
-        .build(kernel_engine.as_ref())?;
-
-        let scan = snapshot.scan_builder().build()?;
-        let scan_meta_iter = scan.scan_metadata(kernel_engine.as_ref())?;
-        let scan_meta_items: Vec<_> = scan_meta_iter.collect::<Result<_, _>>()?;
-        assert_eq!(scan_meta_items.len(), 1);
-
-        // Extract the raw engine data and selection vector from scan metadata
-        let scan_meta = scan_meta_items.into_iter().next().unwrap();
-        let (data, sv) = scan_meta.scan_files.into_parts();
-        let data_handle: Handle<ExclusiveEngineData> = data.into();
-
-        let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
-        let engine_info = "test-engine/1.0";
-        let txn = ok_or_panic(unsafe {
-            with_engine_info(
-                txn,
-                kernel_string_slice!(engine_info),
-                engine.shallow_copy(),
-            )
-        });
-
-        // Remove using the original selection vector from the scan metadata
-        let sv_ptr = if sv.is_empty() {
-            std::ptr::null()
-        } else {
-            sv.as_ptr()
-        };
-        ok_or_panic(unsafe {
-            remove_files(
-                txn.shallow_copy(),
-                data_handle,
-                sv_ptr,
-                sv.len(),
-                engine.shallow_copy(),
-            )
-        });
-
-        ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
-        assert_no_active_files(&kernel_engine, table_path_str)?;
-
-        unsafe { free_engine(engine) };
-        Ok(())
-    }
-
-    #[test]
-    fn test_remove_files_null_sv_creates_empty_filtered_data() {
-        // Verify that the null-pointer / zero-length selection vector path in remove_files
-        // correctly creates a FilteredEngineData with an empty selection vector (all rows
-        // selected). We test FilteredEngineData construction directly since the null-pointer
-        // handling occurs in the extern "C" wrapper before calling remove_files_impl.
-        let batch = RecordBatch::try_from_iter(vec![(
-            "id",
-            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
-        )])
-        .unwrap();
-        let data: Box<dyn delta_kernel::EngineData> = Box::new(ArrowEngineData::from(batch));
-
-        // Empty selection vector means "all rows selected"
-        let filtered = FilteredEngineData::try_new(data, vec![]).unwrap();
-        assert_eq!(filtered.selection_vector().len(), 0);
-        assert_eq!(filtered.data().len(), 3);
-    }
-
-    #[tokio::test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_remove_files_with_non_empty_selection_vector(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // Exercises the from_raw_parts code path in the remove_files FFI wrapper by passing
-        // a non-null selection vector pointer with non-zero length. The existing
-        // test_remove_files_with_selection_vector always passes a null SV because
-        // scan_metadata for a single-file table returns an empty selection vector.
-        let tmp_dir = tempdir()?;
-        let (table_path, engine) = create_table_with_one_file(&tmp_dir)?;
+    /// Helper: create a table with one file, build a snapshot, extract scan metadata, and
+    /// return the components needed for remove_files tests. Caller must free the engine handle
+    /// (and txn if not committed).
+    #[allow(clippy::type_complexity)]
+    fn setup_remove_files_test(
+        tmp_dir: &tempfile::TempDir,
+    ) -> Result<
+        (
+            Box<dyn delta_kernel::EngineData>,
+            Vec<bool>,
+            Handle<ExclusiveTransaction>,
+            Handle<SharedExternEngine>,
+            Arc<dyn delta_kernel::Engine>,
+            String,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let (table_path, engine) = create_table_with_one_file(tmp_dir)?;
         let table_path_str = table_path.as_str();
 
         let kernel_engine = unsafe { engine.as_ref() }.engine();
@@ -1529,10 +1361,7 @@ mod tests {
         assert_eq!(scan_meta_items.len(), 1);
 
         let scan_meta = scan_meta_items.into_iter().next().unwrap();
-        let (data, _original_sv) = scan_meta.scan_files.into_parts();
-        let num_rows = data.len();
-        assert!(num_rows > 0);
-        let data_handle: Handle<ExclusiveEngineData> = data.into();
+        let (data, sv) = scan_meta.scan_files.into_parts();
 
         let txn = ok_or_panic(unsafe {
             transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
@@ -1546,10 +1375,76 @@ mod tests {
             )
         });
 
-        // Construct a non-empty all-true SV selecting every row. This exercises the
-        // from_raw_parts code path (non-null pointer with non-zero length) rather than the
-        // null-pointer shortcut taken when the SV is empty.
-        let sv: Vec<bool> = vec![true; num_rows];
+        Ok((data, sv, txn, engine, kernel_engine, table_path))
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_remove_files_with_null_sv_commits_and_removes_all(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let (data, sv, txn, engine, kernel_engine, table_path) = setup_remove_files_test(&tmp_dir)?;
+        let data_handle: Handle<ExclusiveEngineData> = data.into();
+
+        // Pass the original SV as u8 values
+        let sv_u8: Vec<u8> = sv.iter().map(|&b| b as u8).collect();
+        let sv_ptr = if sv_u8.is_empty() {
+            std::ptr::null()
+        } else {
+            sv_u8.as_ptr()
+        };
+        ok_or_panic(unsafe {
+            remove_files(
+                txn.shallow_copy(),
+                data_handle,
+                sv_ptr,
+                sv_u8.len(),
+                engine.shallow_copy(),
+            )
+        });
+
+        ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        assert_no_active_files(&kernel_engine, table_path.as_str())?;
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_sv_creates_filtered_data_selecting_all_rows() {
+        // Verifies the FilteredEngineData contract that an empty selection vector means
+        // "all rows selected". The remove_files FFI wrapper normalizes null/zero-length
+        // pointers to an empty vec before constructing FilteredEngineData.
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+        )])
+        .unwrap();
+        let data: Box<dyn delta_kernel::EngineData> = Box::new(ArrowEngineData::from(batch));
+
+        let filtered = FilteredEngineData::try_new(data, vec![]).unwrap();
+        assert_eq!(filtered.selection_vector().len(), 0);
+        assert_eq!(filtered.data().len(), 3);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_remove_files_with_non_empty_sv_exercises_from_raw_parts(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Exercises the from_raw_parts code path in the remove_files FFI wrapper by passing
+        // a non-null selection vector pointer with non-zero length. The null-SV test always
+        // passes a null pointer because scan_metadata for a single-file table returns an
+        // empty selection vector.
+        let tmp_dir = tempdir()?;
+        let (data, _sv, txn, engine, _kernel_engine, _table_path) =
+            setup_remove_files_test(&tmp_dir)?;
+        let num_rows = data.len();
+        assert!(num_rows > 0);
+        let data_handle: Handle<ExclusiveEngineData> = data.into();
+
+        // Construct a non-empty all-true SV selecting every row. Uses u8 values to match
+        // the FFI signature (nonzero = selected).
+        let sv: Vec<u8> = vec![1; num_rows];
         ok_or_panic(unsafe {
             remove_files(
                 txn.shallow_copy(),
@@ -1563,65 +1458,6 @@ mod tests {
         // Don't commit -- the from_raw_parts path has been exercised. Committing with
         // a non-empty SV triggers a different code path in generate_remove_actions that
         // requires additional scan row fields not present in this test setup.
-        unsafe { free_transaction(txn) };
-        unsafe { free_engine(engine) };
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_remove_scan_metadata_fails_with_multiple_arc_refs(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
-        let (table_path, engine) = create_table_with_one_file(&tmp_dir)?;
-        let table_path_str = table_path.as_str();
-
-        let kernel_engine = unsafe { engine.as_ref() }.engine();
-        let snapshot = delta_kernel::snapshot::Snapshot::builder_for(delta_kernel::try_parse_uri(
-            table_path_str,
-        )?)
-        .build(kernel_engine.as_ref())?;
-
-        let scan = snapshot.scan_builder().build()?;
-        let scan_meta_items: Vec<_> = scan
-            .scan_metadata(kernel_engine.as_ref())?
-            .collect::<Result<_, _>>()?;
-
-        let scan_meta_arc = Arc::new(scan_meta_items.into_iter().next().unwrap());
-        // Hold a second Arc reference so Arc::try_unwrap will fail
-        let _extra_ref = Arc::clone(&scan_meta_arc);
-        let scan_meta_handle: Handle<SharedScanMetadata> = scan_meta_arc.into();
-
-        let txn = ok_or_panic(unsafe {
-            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
-        });
-        let engine_info = "test-engine/1.0";
-        let txn = ok_or_panic(unsafe {
-            with_engine_info(
-                txn,
-                kernel_string_slice!(engine_info),
-                engine.shallow_copy(),
-            )
-        });
-
-        let result = unsafe {
-            remove_scan_metadata(txn.shallow_copy(), scan_meta_handle, engine.shallow_copy())
-        };
-        match result {
-            ExternResult::Err(e) => {
-                let error = unsafe { crate::ffi_test_utils::recover_error(e) };
-                assert!(
-                    error.message.contains("outstanding references"),
-                    "Expected error about outstanding references, got: {}",
-                    error.message
-                );
-            }
-            ExternResult::Ok(_) => {
-                panic!("Expected error when Arc has multiple references")
-            }
-        }
-
-        // Clean up: free the txn (not committed) and engine
         unsafe { free_transaction(txn) };
         unsafe { free_engine(engine) };
         Ok(())
