@@ -25,6 +25,14 @@ impl RowTrackingDomainMetadata {
         }
     }
 
+    /// Creates the initial row tracking domain metadata for a newly created table.
+    ///
+    /// Sets the high water mark to -1, which means no rows have been assigned IDs yet.
+    /// The first file written will receive `baseRowId = 0`.
+    pub(crate) fn initial() -> Self {
+        Self::new(RowTrackingVisitor::DEFAULT_HIGH_WATER_MARK)
+    }
+
     /// Retrieves the row ID high water mark from the [`Snapshot`]'s row tracking domain metadata.
     ///
     /// This method searches through the snapshot's log segment for domain metadata actions
@@ -83,7 +91,7 @@ pub(crate) struct RowTrackingVisitor {
 
 impl RowTrackingVisitor {
     /// Default value for an absent high water mark
-    pub(crate) const DEFAULT_HIGH_WATER_MARK: i64 = -1;
+    const DEFAULT_HIGH_WATER_MARK: i64 = -1;
 
     pub(crate) fn new(row_id_high_water_mark: Option<i64>, num_batches: Option<usize>) -> Self {
         // A table might not have a row ID high water mark yet, so we model the input as an Option<i64>

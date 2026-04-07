@@ -995,9 +995,8 @@ impl<S> Transaction<S> {
         if self.add_files_metadata.is_empty() {
             // For empty create-table with row tracking, return the initial HWM = -1 domain
             // metadata so it gets written to the commit.
-            let row_tracking_dm = (needs_row_tracking && self.is_create_table()).then(|| {
-                RowTrackingDomainMetadata::new(RowTrackingVisitor::DEFAULT_HIGH_WATER_MARK)
-            });
+            let row_tracking_dm = (needs_row_tracking && self.is_create_table())
+                .then(RowTrackingDomainMetadata::initial);
             return Ok((Box::new(iter::empty()), row_tracking_dm));
         }
 
@@ -1008,6 +1007,8 @@ impl<S> Transaction<S> {
             // For create-table, there is no prior log to read the high water mark from, so
             // start from the default (-1). For existing tables, read from the snapshot.
             let row_id_high_water_mark = if self.is_create_table() {
+                // No prior log to read from; RowTrackingVisitor::new treats None as
+                // DEFAULT_HIGH_WATER_MARK (-1).
                 None
             } else {
                 RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?
@@ -1019,8 +1020,8 @@ impl<S> Transaction<S> {
                 Some(self.add_files_metadata.len()),
             );
 
-            // We visit all files with the row visitor before creating the add action iterator
-            // because we need to know the final row ID high water mark to create the domain metadata action
+            // We visit all files with the row visitor before creating the add action iterator because
+            // we need to know the final row ID high water mark to create the domain metadata action.
             for add_files_batch in &self.add_files_metadata {
                 row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
             }
