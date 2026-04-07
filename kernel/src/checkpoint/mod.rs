@@ -690,7 +690,7 @@ impl CheckpointWriter {
         let mut sidecar_metas: Vec<(String, FileMeta)> = Vec::new();
         loop {
             let mut single_sidecar_iter =
-                SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)
+                SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?
                     .peekable();
             if single_sidecar_iter.peek().is_some() {
                 // Per the protocol, a checkpoint sidecar is a uniquely-named parquet

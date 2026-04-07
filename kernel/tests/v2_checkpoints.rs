@@ -390,7 +390,9 @@ async fn v2_table_with_domain_metadata<E: delta_kernel::engine::default::executo
 
     // Insert 8 files (one per commit) -> ids 1..=8
     let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let names = ["alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi"];
+    let names = [
+        "alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi",
+    ];
     for (i, name) in names.iter().enumerate() {
         snapshot = insert_data(snapshot, engine, make_columns(i as i32 + 1, name))
             .await?
@@ -423,10 +425,7 @@ async fn v2_table_with_domain_metadata<E: delta_kernel::engine::default::executo
             "app.analytics".to_string(),
             r#"{"tracking":false}"#.to_string(),
         )
-        .with_domain_metadata(
-            "app.settings".to_string(),
-            r#"{"version":2}"#.to_string(),
-        )
+        .with_domain_metadata("app.settings".to_string(), r#"{"version":2}"#.to_string())
         .commit(engine.as_ref())?
         .unwrap_committed()
         .post_commit_snapshot()
@@ -450,7 +449,9 @@ async fn v2_table_with_domain_metadata<E: delta_kernel::engine::default::executo
         .clone();
 
     // Insert 8 fresh files (one per commit) -> ids 9..=16
-    let names = ["ivan", "judy", "karl", "lena", "mike", "nina", "omar", "pat"];
+    let names = [
+        "ivan", "judy", "karl", "lena", "mike", "nina", "omar", "pat",
+    ];
     for (i, name) in names.iter().enumerate() {
         snapshot = insert_data(snapshot, engine, make_columns(i as i32 + 9, name))
             .await?
@@ -489,9 +490,7 @@ fn get_nested_struct_column<'a>(parent: &'a StructArray, name: &str) -> &'a Stru
 }
 
 /// Lists all sidecar parquet files in the `_sidecars` directory.
-fn read_sidecar_parquet_files(
-    sidecars_dir: &std::path::Path,
-) -> Vec<std::fs::DirEntry> {
+fn read_sidecar_parquet_files(sidecars_dir: &std::path::Path) -> Vec<std::fs::DirEntry> {
     std::fs::read_dir(sidecars_dir)
         .expect("failed to list sidecars dir")
         .filter_map(|e| e.ok())
@@ -841,8 +840,7 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
-    let snapshot2 =
-        create_partitioned_stats_table(&table_path, &table_url, &engine).await?;
+    let snapshot2 = create_partitioned_stats_table(&table_path, &table_url, &engine).await?;
 
     // Write V2 checkpoint with sidecars at version 2
     let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
@@ -1028,7 +1026,8 @@ async fn test_v1_checkpoint_rejected_on_v2_table() -> DeltaResult<()> {
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
-    let result = snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&CheckpointSpec::V1));
+    let result =
+        snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&CheckpointSpec::V1));
     assert!(
         result.is_err(),
         "V1 spec on table with v2Checkpoint feature should fail"
