@@ -31,7 +31,8 @@ use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
     ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, SET_TRANSACTION_RETENTION_DURATION,
+    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    MATERIALIZED_ROW_ID_COLUMN_NAME, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -181,10 +182,10 @@ fn add_feature_to_lists(
     }
 }
 
-/// Configures clustering support for table creation.
+/// Test-only helper for clustering support during table creation.
 ///
-/// Validates clustering columns, adds the `DomainMetadata` and `ClusteredTable` features, and
-/// creates the domain metadata action.
+/// Validates clustering columns, adds the `DomainMetadata` and `ClusteredTable` features
+/// directly, and creates the domain metadata action.
 #[cfg(test)]
 fn apply_clustering_for_table_create(
     logical_schema: &SchemaRef,
@@ -418,6 +419,37 @@ fn resolve_feature_dependencies(validated: &mut ValidatedTableProperties) {
             break;
         }
     }
+}
+
+/// Sets materialized column name properties when row tracking is enabled.
+///
+/// Writes `delta.rowTracking.materializedRowIdColumnName` and
+/// `delta.rowTracking.materializedRowCommitVersionColumnName` into the table
+/// properties using UUID-based column names. These properties record which physical
+/// columns store materialized row IDs and commit versions.
+///
+/// Column names use the format `_row-id-col-{uuid}` and
+/// `_row-commit-version-col-{uuid}` to avoid collisions with user-defined columns.
+/// If the properties are already set (e.g. user supplied them), they are left unchanged.
+fn maybe_set_materialized_row_tracking_column_names(validated: &mut ValidatedTableProperties) {
+    // Only assign when row tracking is explicitly enabled via the enablement property.
+    // Feature-signal-only tables (delta.feature.rowTracking=supported without
+    // delta.enableRowTracking=true) do not require materialized column names.
+    if validated
+        .properties
+        .get(ENABLE_ROW_TRACKING)
+        .is_none_or(|v| v != "true")
+    {
+        return;
+    }
+    validated
+        .properties
+        .entry(MATERIALIZED_ROW_ID_COLUMN_NAME.to_string())
+        .or_insert_with(|| format!("_row-id-col-{}", uuid::Uuid::new_v4()));
+    validated
+        .properties
+        .entry(MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME.to_string())
+        .or_insert_with(|| format!("_row-commit-version-col-{}", uuid::Uuid::new_v4()));
 }
 
 /// Ensures that `inCommitTimestamp` is enabled when `catalogManaged` is present. Adds the ICT
@@ -765,6 +797,9 @@ impl CreateTableTransactionBuilder {
         // Resolve Supported dependencies for all enabled features (e.g. RowTracking and
         // ClusteredTable both require DomainMetadata). Runs last so all features are present.
         resolve_feature_dependencies(&mut validated);
+
+        // Set materialized row tracking column names when row tracking is enabled.
+        maybe_set_materialized_row_tracking_column_names(&mut validated);
 
         // Create Protocol action with table features support
         let protocol =
@@ -1517,6 +1552,42 @@ mod tests {
                 .writer_features
                 .contains(&TableFeature::DomainMetadata),
             "Expected DomainMetadata dependency to be added"
+        );
+    }
+
+    #[test]
+    fn test_user_supplied_materialized_column_names_are_preserved() {
+        // Simulate a user supplying explicit materialized column names alongside the enablement
+        // property. maybe_set_materialized_row_tracking_column_names must not overwrite them.
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::from([
+                (ENABLE_ROW_TRACKING.to_string(), "true".to_string()),
+                (
+                    MATERIALIZED_ROW_ID_COLUMN_NAME.to_string(),
+                    "my_row_id_col".to_string(),
+                ),
+                (
+                    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME.to_string(),
+                    "my_commit_version_col".to_string(),
+                ),
+            ]),
+            reader_features: vec![],
+            writer_features: vec![TableFeature::RowTracking],
+        };
+
+        maybe_set_materialized_row_tracking_column_names(&mut validated);
+
+        assert_eq!(
+            validated.properties.get(MATERIALIZED_ROW_ID_COLUMN_NAME),
+            Some(&"my_row_id_col".to_string()),
+            "User-supplied materializedRowIdColumnName must not be overwritten"
+        );
+        assert_eq!(
+            validated
+                .properties
+                .get(MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME),
+            Some(&"my_commit_version_col".to_string()),
+            "User-supplied materializedRowCommitVersionColumnName must not be overwritten"
         );
     }
 

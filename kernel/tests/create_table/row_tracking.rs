@@ -75,12 +75,15 @@ fn assert_row_tracking_protocol(snapshot: &Snapshot) {
 
 /// Verifies that enabling row tracking (via property or feature signal) adds the required
 /// protocol features and writes the initial row tracking domain metadata (HWM = -1).
+/// The `expect_materialized_columns` flag reflects that materialized column name properties
+/// are only assigned when `delta.enableRowTracking=true` is set.
 #[rstest]
-#[case::enablement_property("delta.enableRowTracking", "true")]
-#[case::feature_signal("delta.feature.rowTracking", "supported")]
+#[case::enablement_property("delta.enableRowTracking", "true", true)]
+#[case::feature_signal("delta.feature.rowTracking", "supported", false)]
 fn test_create_empty_table_with_row_tracking(
     #[case] key: &str,
     #[case] value: &str,
+    #[case] expect_materialized_columns: bool,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
@@ -120,6 +123,45 @@ fn test_create_empty_table_with_row_tracking(
         config["rowIdHighWaterMark"], -1,
         "Initial high water mark should be -1"
     );
+
+    // Materialized column name properties are only set when delta.enableRowTracking=true.
+    // Feature-signal-only tables do not get them.
+    let metadata_actions: Vec<_> = actions.iter().filter_map(|a| a.get("metaData")).collect();
+    assert_eq!(metadata_actions.len(), 1);
+    let meta_config = metadata_actions[0].get("configuration").unwrap();
+
+    if expect_materialized_columns {
+        let row_id_col = meta_config
+            .get("delta.rowTracking.materializedRowIdColumnName")
+            .and_then(|v| v.as_str())
+            .expect("materializedRowIdColumnName should be set");
+        assert!(
+            row_id_col.starts_with("_row-id-col-"),
+            "Expected _row-id-col-<uuid>, got {row_id_col}"
+        );
+
+        let commit_version_col = meta_config
+            .get("delta.rowTracking.materializedRowCommitVersionColumnName")
+            .and_then(|v| v.as_str())
+            .expect("materializedRowCommitVersionColumnName should be set");
+        assert!(
+            commit_version_col.starts_with("_row-commit-version-col-"),
+            "Expected _row-commit-version-col-<uuid>, got {commit_version_col}"
+        );
+    } else {
+        assert!(
+            meta_config
+                .get("delta.rowTracking.materializedRowIdColumnName")
+                .is_none(),
+            "materializedRowIdColumnName should NOT be set for feature-signal-only tables"
+        );
+        assert!(
+            meta_config
+                .get("delta.rowTracking.materializedRowCommitVersionColumnName")
+                .is_none(),
+            "materializedRowCommitVersionColumnName should NOT be set for feature-signal-only tables"
+        );
+    }
 
     Ok(())
 }
