@@ -485,80 +485,10 @@ impl Snapshot {
     ///
     /// If a checkpoint already exists at this version, returns
     /// [`CheckpointWriteResult::AlreadyExists`] with the original snapshot unchanged.
-    /// Otherwise, writes a checkpoint parquet file and the `_last_checkpoint` file and returns
+    /// Otherwise, writes a checkpoint according to the [`CheckpointSpec`] and returns
     /// [`CheckpointWriteResult::Written`] with an updated [`SnapshotRef`] whose log segment
     /// reflects the new checkpoint. Commits and compaction files subsumed by the checkpoint are
     /// dropped from the returned snapshot.
-    ///
-    /// Note:
-    ///     - It is still possible that an existing checkpoint gets overwritten if that
-    ///       checkpoint was written by a concurrent writer.
-    ///     - This function uses [`crate::ParquetHandler::write_parquet_file`] and
-    ///       [`crate::StorageHandler::head`], which may not be implemented by all engines.
-    ///       If you are using the default engine, make sure to build it with the multi-threaded
-    ///       executor if you want to use this method.
-    #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
-    pub fn checkpoint(
-        self: &SnapshotRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<(CheckpointWriteResult, SnapshotRef)> {
-        if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
-            info!(
-                "Checkpoint already exists for snapshot version {}",
-                self.version()
-            );
-            return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
-        }
-
-        let writer = Arc::clone(self).create_checkpoint_writer()?;
-        let checkpoint_path = writer.checkpoint_path()?;
-        let data_iter = writer.checkpoint_data(engine)?;
-        let state = data_iter.state();
-        let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
-        match engine
-            .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))
-        {
-            Ok(()) => (),
-            Err(Error::FileAlreadyExists(_)) => {
-                // NOTE: Per write_parquet_file's documentation, it should silently overwrite existing files,
-                // so we log a warning but still return the correct result.
-                warn!(
-                    "ParquetHandler::write_parquet_file unexpectedly failed on \
-                    FileAlreadyExists for version {}",
-                    self.version()
-                );
-                return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
-            }
-            Err(e) => return Err(e),
-        }
-
-        let file_meta = engine.storage_handler().head(&checkpoint_path)?;
-
-        // Build checkpoint stats from the iterator state, then finalize(writes `_last_checkpoint`).
-        let state = Arc::into_inner(state).ok_or_else(|| {
-            Error::internal_error("ActionReconciliationIteratorState Arc has other references")
-        })?;
-        let action_stats = CheckpointActionStats::from_reconciliation_state(state)?;
-        writer.finalize(engine, &file_meta, &action_stats)?;
-
-        let checkpoint_log_path = ParsedLogPath::try_from(file_meta)?.ok_or_else(|| {
-            Error::internal_error("Checkpoint path could not be parsed as a log path")
-        })?;
-        let new_log_segment = self
-            .log_segment
-            .try_new_with_checkpoint(checkpoint_log_path)?;
-        Ok((
-            CheckpointWriteResult::Written,
-            Arc::new(Snapshot::new_with_crc(
-                new_log_segment,
-                self.table_configuration().clone(),
-                self.lazy_crc.clone(),
-            )),
-        ))
-    }
-
-    /// Writes a checkpoint according to the [`CheckpointSpec`].
     ///
     /// # Parameters
     /// - `engine`: Engine for data processing and I/O
@@ -571,16 +501,32 @@ impl Snapshot {
     ///   feature.
     /// - If `CheckpointSpec::V1` is used but the table supports `v2Checkpoint` feature.
     /// - If `file_actions_per_sidecar_hint` is `Some(0)`.
+    /// - If the checkpoint write fails (e.g. I/O, parquet write). A `FileAlreadyExists` error
+    ///   is not propagated; it returns [`CheckpointWriteResult::AlreadyExists`] instead.
+    ///
+    /// Note:
+    ///     - It is still possible that an existing checkpoint gets overwritten if that
+    ///       checkpoint was written by a concurrent writer.
+    ///     - This function uses [`crate::ParquetHandler::write_parquet_file`] and
+    ///       [`crate::StorageHandler::head`], which may not be implemented by all engines.
+    ///       If you are using the default engine, make sure to build it with the multi-threaded
+    ///       executor if you want to use this method.
     ///
     /// [`CheckpointSpec`]: crate::checkpoint::CheckpointSpec
-    /// This method is for review only, and will be merged into snapshot::checkpoint() in the next PR:
-    /// https://github.com/delta-io/delta-kernel-rs/pull/2333
-    #[instrument(parent = &self.span, name = "snap.checkpoint_placeholder", skip_all, err)]
-    pub fn snapshot_checkpoint_placeholder(
-        self: Arc<Self>,
+    #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
+    pub fn checkpoint(
+        self: &SnapshotRef,
         engine: &dyn Engine,
         spec: Option<&CheckpointSpec>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<(CheckpointWriteResult, SnapshotRef)> {
+        if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
+            info!(
+                "Checkpoint already exists for snapshot version {}",
+                self.version()
+            );
+            return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
+        }
+
         let v2_supported = self
             .table_configuration()
             .is_feature_supported(&TableFeature::V2Checkpoint);
@@ -598,20 +544,48 @@ impl Snapshot {
             _ => {}
         }
 
-        let writer = self.create_checkpoint_writer()?;
+        let writer = Arc::clone(self).create_checkpoint_writer()?;
 
-        let info = match spec {
+        let write_result = match spec {
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
                 file_actions_per_sidecar_hint,
             })) => {
                 let hint =
                     file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
-                writer.write_checkpoint_with_sidecars(engine, hint)?
+                writer.write_checkpoint_with_sidecars(engine, hint)
             }
-            _ => writer.write_checkpoint_without_sidecars(engine)?,
+            _ => writer.write_checkpoint_without_sidecars(engine),
         };
 
-        writer.finalize(engine, &info.file_meta, &info.action_stats)
+        let info = match write_result {
+            Ok(info) => info,
+            Err(Error::FileAlreadyExists(_)) => {
+                warn!(
+                    "ParquetHandler::write_parquet_file unexpectedly failed on \
+                    FileAlreadyExists for version {}",
+                    self.version()
+                );
+                return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
+            }
+            Err(e) => return Err(e),
+        };
+
+        writer.finalize(engine, &info.file_meta, &info.action_stats)?;
+
+        let checkpoint_log_path = ParsedLogPath::try_from(info.file_meta)?.ok_or_else(|| {
+            Error::internal_error("Checkpoint path could not be parsed as a log path")
+        })?;
+        let new_log_segment = self
+            .log_segment
+            .try_new_with_checkpoint(checkpoint_log_path)?;
+        Ok((
+            CheckpointWriteResult::Written,
+            Arc::new(Snapshot::new_with_crc(
+                new_log_segment,
+                self.table_configuration().clone(),
+                self.lazy_crc.clone(),
+            )),
+        ))
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
