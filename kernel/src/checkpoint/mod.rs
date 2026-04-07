@@ -121,7 +121,8 @@ mod checkpoint_transform;
 // Used once sidecar checkpoint writing is enabled
 mod sidecar;
 
-#[allow(unused_imports)] //SIDECAR_TODO: Will be removed in the PR officially provides sidecar support.
+#[allow(unused_imports)]
+//SIDECAR_TODO: Will be removed in the PR officially provides sidecar support.
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator};
 
 use checkpoint_transform::{
@@ -610,7 +611,9 @@ impl CheckpointWriter {
         };
         let sidecar_fields: Vec<StructField> = sidecar_struct.fields().cloned().collect();
 
-        let null_row = engine.evaluation_handler().null_row(checkpoint_data_schema.clone())?;
+        let null_row = engine
+            .evaluation_handler()
+            .null_row(checkpoint_data_schema.clone())?;
 
         let mut batches = Vec::with_capacity(sidecar_metas.len());
         // Construct [`EngineData`] batches for sidecar files.
@@ -654,15 +657,10 @@ impl CheckpointWriter {
 
     /// Writes a V2 checkpoint with sidecar files.
     ///
-    /// File actions (add/remove) are split into sidecar parquet files under
-    /// `_delta_log/_sidecars/`, and the main checkpoint file contains non-file actions
-    /// (protocol, metadata, txn, domainMetadata, checkpointMetadata) plus sidecar action
-    /// rows referencing each sidecar file.
-    ///
     /// # Parameters
     /// - `engine`: Engine for data processing and I/O
     /// - `file_actions_per_sidecar_hint`: Approximate number of file actions per sidecar
-    #[allow(dead_code)] // Called from Snapshot::write_checkpoint
+    #[allow(dead_code)] // SIDECAR_TODO: Will be removed in the PR officially provides sidecar support.
     pub(crate) fn write_checkpoint_with_sidecars(
         self,
         engine: &dyn Engine,
@@ -695,11 +693,18 @@ impl CheckpointWriter {
                 SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)
                     .peekable();
             if single_sidecar_iter.peek().is_some() {
+                // Per the protocol, a checkpoint sidecar is a uniquely-named parquet
+                // file: `{unique}.parquet` where `unique` is some unique string such
+                // as a UUID.
+                // We use `<version>.checkpoint.<uuid>.parquet` here.
                 let filename = format!(
                     "{:020}.checkpoint.{}.parquet",
                     self.version,
                     uuid::Uuid::new_v4()
                 );
+                // Per the protocol, sidecar path should be URI-encoded.
+                // All characters in the filename here are Unreserved Characters, so we can just retain them.
+                // Ref: https://www.ietf.org/rfc/rfc2396.txt
                 let sidecar_url = sidecars_base.join(&filename)?;
                 engine
                     .parquet_handler()
@@ -717,7 +722,7 @@ impl CheckpointWriter {
             }
         }
 
-        // Collect non-file batches (protocol, metadata, txn, domainMetadata, checkpointMetadata)
+        // Collect non-file batches
         let non_file_batches = splitter
             .lock()
             .map_err(|e| Error::generic(format!("sidecar splitter lock poisoned: {e}")))?
@@ -739,9 +744,9 @@ impl CheckpointWriter {
         self.finalize(engine, &file_meta, &iter_state)
     }
 
-    /// Writes a single-file checkpoint (V1 or V2 without sidecars).
-    #[allow(dead_code)] // Called from Snapshot::write_checkpoint
-    pub(crate) fn write_single_file_checkpoint(self, engine: &dyn Engine) -> DeltaResult<()> {
+    /// Writes a checkpoint (V1 or V2 without sidecars).
+    #[allow(dead_code)] // SIDECAR_TODO: Will be removed in the PR officially provides sidecar support.
+    pub(crate) fn write_checkpoint_without_sidecars(self, engine: &dyn Engine) -> DeltaResult<()> {
         let checkpoint_path = self.checkpoint_path()?;
         let data_iter = self.checkpoint_data(engine)?;
         let state = data_iter.state();

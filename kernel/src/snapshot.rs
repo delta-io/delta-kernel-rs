@@ -560,24 +560,17 @@ impl Snapshot {
         ))
     }
 
-    /// Writes a checkpoint with explicit format control via [`CheckpointSpec`].
-    ///
-    /// This method supports writing V2 checkpoints with sidecar files, where file actions
-    /// (add/remove) are written to separate parquet files under `_delta_log/_sidecars/` and
-    /// referenced from the main checkpoint file via sidecar actions.
+    /// Writes a checkpoint according to the [`CheckpointSpec`].
     ///
     /// # Parameters
     /// - `engine`: Engine for data processing and I/O
-    /// - `config`: Checkpoint format configuration. `None` uses the default single-file
+    /// - `spec`: Checkpoint format specification. `None` uses the default single-file
     ///   checkpoint (auto-detecting V1/V2 from table features).
-    ///
-    /// Note: This function uses [`crate::ParquetHandler::write_parquet_file`] and
-    /// [`crate::StorageHandler::head`], which may not be implemented by all engines
-    /// (e.g., `SyncEngine`).
     ///
     /// # Errors
     /// - If `CheckpointSpec::V2` is used but the table does not support the `v2Checkpoint`
     ///   feature.
+    /// - If `CheckpointSpec::V1` is used but the table supports `v2Checkpoint` feature.
     /// - If `file_actions_per_sidecar_hint` is `Some(0)`.
     ///
     /// [`CheckpointSpec`]: crate::checkpoint::CheckpointSpec
@@ -588,22 +581,28 @@ impl Snapshot {
     pub(crate) fn snapshot_checkpoint_placeholder(
         self: Arc<Self>,
         engine: &dyn Engine,
-        config: Option<&CheckpointSpec>,
+        spec: Option<&CheckpointSpec>,
     ) -> DeltaResult<()> {
-        if let Some(CheckpointSpec::V2(_)) = config {
-            if !self
-                .table_configuration()
-                .is_feature_supported(&TableFeature::V2Checkpoint)
-            {
+        let v2_supported = self
+            .table_configuration()
+            .is_feature_supported(&TableFeature::V2Checkpoint);
+        match spec {
+            Some(CheckpointSpec::V2(_)) if !v2_supported => {
                 return Err(Error::checkpoint_write(
-                    "CheckpointSpec::V2 requires the v2Checkpoint table feature to be enabled",
+                    "CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
                 ));
             }
+            Some(CheckpointSpec::V1) if v2_supported => {
+                return Err(Error::checkpoint_write(
+                    "Kernel does not support writing V1 checkpoints when the table supports v2Checkpoint",
+                ));
+            }
+            _ => {}
         }
 
         let writer = self.create_checkpoint_writer()?;
 
-        match config {
+        match spec {
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
                 file_actions_per_sidecar_hint,
             })) => {
@@ -618,7 +617,7 @@ impl Snapshot {
             }
             _ => {
                 // V1, V2::NoSidecar, or None (auto-detect) all use single-file path
-                writer.write_single_file_checkpoint(engine)
+                writer.write_checkpoint_without_sidecars(engine)
             }
         }
     }
