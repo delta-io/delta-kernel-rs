@@ -313,13 +313,11 @@ impl Metadata {
     }
 
     #[internal_api]
-    #[allow(dead_code)]
     pub(crate) fn configuration(&self) -> &HashMap<String, String> {
         &self.configuration
     }
 
     #[internal_api]
-    #[allow(dead_code)]
     pub(crate) fn format_provider(&self) -> &str {
         &self.format.provider
     }

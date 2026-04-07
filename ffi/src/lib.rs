@@ -1030,7 +1030,7 @@ pub unsafe extern "C" fn visit_metadata_configuration(
             );
         });
 }
-// ── Protocol handle FFI ─────────────────────────────────────────────────────
+// === Protocol handle FFI ===
 
 /// Get the protocol for this snapshot. The returned handle must be freed with [`free_protocol`].
 ///
@@ -1057,8 +1057,8 @@ pub unsafe extern "C" fn free_protocol(protocol: Handle<SharedProtocol>) {
 /// - `visit_versions`: called once with `(context, min_reader_version, min_writer_version)`
 /// - `visit_feature`: called once per feature with `(context, is_reader, feature_name)`.
 ///   `is_reader` is `true` for reader features, `false` for writer features.
-///   If the protocol uses legacy versioning (no explicit feature lists), neither callback fires
-///   for features.
+///   If the protocol uses legacy versioning (no explicit feature lists), the `visit_feature`
+///   callback will not fire.
 ///
 /// # Safety
 /// Caller is responsible for providing a valid protocol handle, a valid `context` pointer, and
@@ -1094,7 +1094,7 @@ pub unsafe extern "C" fn visit_protocol(
     }
 }
 
-// ── Metadata handle FFI ─────────────────────────────────────────────────────
+// === Metadata handle FFI ===
 
 /// Get the metadata for this snapshot. The returned handle must be freed with [`free_metadata`].
 ///
@@ -1117,44 +1117,49 @@ pub unsafe extern "C" fn free_metadata(metadata: Handle<SharedMetadata>) {
     metadata.drop_handle();
 }
 
-/// Visit all fields of the metadata in a single FFI call. String fields are allocated via
-/// `allocate_fn` (the caller controls memory). The visitor receives:
-/// - `id`: always non-null (allocated string pointer)
-/// - `name`: allocated string pointer or null if not set
-/// - `description`: allocated string pointer or null if not set
-/// - `format_provider`: always non-null (allocated string pointer)
+/// Visit all fields of the metadata in a single FFI call. String fields are passed as
+/// [`KernelStringSlice`] references that borrow from the metadata handle -- they are only valid
+/// for the duration of the callback.
+///
+/// The visitor receives:
+/// - `id`: always present
+/// - `name`: `OptionalValue::None` if not set
+/// - `description`: `OptionalValue::None` if not set
+/// - `format_provider`: always present
 /// - `has_created_time`: whether `created_time_ms` is meaningful
 /// - `created_time_ms`: milliseconds since epoch (only valid when `has_created_time` is true)
 ///
 /// # Safety
-/// Caller is responsible for providing a valid metadata handle, a valid `allocate_fn`, a valid
-/// `context` pointer, and a valid `visit_metadata_fields` function pointer.
+/// Caller is responsible for providing a valid metadata handle, a valid `context` pointer, and
+/// a valid `visit_metadata_fields` function pointer. String slices must not be retained past
+/// the callback return.
 #[no_mangle]
 pub unsafe extern "C" fn visit_metadata(
     metadata: Handle<SharedMetadata>,
-    allocate_fn: AllocateStringFn,
     context: NullableCvoid,
     visit_metadata_fields: extern "C" fn(
         context: NullableCvoid,
-        id: NullableCvoid,
-        name: NullableCvoid,
-        description: NullableCvoid,
-        format_provider: NullableCvoid,
+        id: KernelStringSlice,
+        name: OptionalValue<KernelStringSlice>,
+        description: OptionalValue<KernelStringSlice>,
+        format_provider: KernelStringSlice,
         has_created_time: bool,
         created_time_ms: i64,
     ),
 ) {
     let metadata = unsafe { metadata.as_ref() };
-    let id = metadata.id();
-    let id = allocate_fn(kernel_string_slice!(id));
+    let id_str = metadata.id();
+    let id = kernel_string_slice!(id_str);
     let name = metadata
         .name()
-        .and_then(|s| allocate_fn(kernel_string_slice!(s)));
+        .map(|s| kernel_string_slice!(s))
+        .into();
     let description = metadata
         .description()
-        .and_then(|s| allocate_fn(kernel_string_slice!(s)));
-    let provider = metadata.format_provider();
-    let format_provider = allocate_fn(kernel_string_slice!(provider));
+        .map(|s| kernel_string_slice!(s))
+        .into();
+    let fp_str = metadata.format_provider();
+    let format_provider = kernel_string_slice!(fp_str);
     let (has_created_time, created_time_ms) = match metadata.created_time() {
         Some(t) => (true, t),
         None => (false, 0),
@@ -1170,7 +1175,7 @@ pub unsafe extern "C" fn visit_metadata(
     );
 }
 
-// ── Snapshot-level computed property FFI ─────────────────────────────────────
+// === Snapshot-level computed property FFI ===
 
 type StringIter = dyn Iterator<Item = String> + Send;
 
@@ -1272,7 +1277,7 @@ mod tests {
     use crate::error::{EngineError, KernelError};
     use crate::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
-        ok_or_panic, recover_string,
+        ok_or_panic, recover_string, setup_snapshot,
     };
     use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -1280,7 +1285,6 @@ mod tests {
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStore;
     use delta_kernel::schema::StructType;
-    use delta_kernel_ffi::ffi_test_utils::setup_snapshot;
     use rstest::rstest;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -2045,7 +2049,7 @@ mod tests {
         Ok(())
     }
 
-    // ── Shared visitor state and callbacks for protocol/metadata tests ────────
+    // === Shared visitor state and callbacks for protocol/metadata tests ===
 
     struct ProtocolVisitState {
         min_reader: i32,
@@ -2124,20 +2128,31 @@ mod tests {
         }
     }
 
+    /// Convert a [`KernelStringSlice`] to a [`String`] (test-only helper).
+    fn slice_to_string(slice: KernelStringSlice) -> String {
+        unsafe { String::try_from_slice(&slice) }.unwrap()
+    }
+
     extern "C" fn metadata_visit_cb(
         ctx: NullableCvoid,
-        id: NullableCvoid,
-        name: NullableCvoid,
-        description: NullableCvoid,
-        format_provider: NullableCvoid,
+        id: KernelStringSlice,
+        name: OptionalValue<KernelStringSlice>,
+        description: OptionalValue<KernelStringSlice>,
+        format_provider: KernelStringSlice,
         has_created_time: bool,
         created_time_ms: i64,
     ) {
         let state = unsafe { &mut *(ctx.unwrap().as_ptr() as *mut MetadataVisitState) };
-        state.id = id.map(recover_string);
-        state.name = name.map(recover_string);
-        state.description = description.map(recover_string);
-        state.format_provider = format_provider.map(recover_string);
+        state.id = Some(slice_to_string(id));
+        state.name = match name {
+            OptionalValue::Some(s) => Some(slice_to_string(s)),
+            OptionalValue::None => None,
+        };
+        state.description = match description {
+            OptionalValue::Some(s) => Some(slice_to_string(s)),
+            OptionalValue::None => None,
+        };
+        state.format_provider = Some(slice_to_string(format_provider));
         state.has_created_time = has_created_time;
         state.created_time_ms = created_time_ms;
     }
@@ -2147,12 +2162,12 @@ mod tests {
         let meta = unsafe { snapshot_get_metadata(snap.shallow_copy()) };
         let mut state = MetadataVisitState::new();
         let ctx = NonNull::new(&mut state as *mut MetadataVisitState as *mut c_void);
-        unsafe { visit_metadata(meta.shallow_copy(), allocate_str, ctx, metadata_visit_cb) };
+        unsafe { visit_metadata(meta.shallow_copy(), ctx, metadata_visit_cb) };
         unsafe { free_metadata(meta) };
         state
     }
 
-    // ── visit_protocol tests ──────────────────────────────────────────────────
+    // === visit_protocol tests ===
 
     #[tokio::test]
     async fn test_visit_protocol_legacy() -> Result<(), Box<dyn std::error::Error>> {
@@ -2223,7 +2238,7 @@ mod tests {
         assert_eq!(state.reader_features, vec!["columnMapping"]);
         let mut wf = state.writer_features.clone();
         wf.sort();
-        assert_eq!(wf, vec!["columnMapping", "rowTracking"]);
+        assert_eq!(wf, vec!["columnMapping", "domainMetadata", "rowTracking"]);
 
         unsafe { free_snapshot(snap) };
         unsafe { free_engine(engine) };
@@ -2270,6 +2285,52 @@ mod tests {
         assert_eq!(state.format_provider.as_deref(), Some("parquet"));
         assert!(state.has_created_time);
         assert_eq!(state.created_time_ms, 1234567890000);
+
+        unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_visit_metadata_with_description() -> Result<(), Box<dyn std::error::Error>> {
+        let metadata_with_desc = concat!(
+            r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
+            "\n",
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            "\n",
+            r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","name":"my_table","description":"A test table","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#,
+        );
+        let (engine, snap) = setup_snapshot(metadata_with_desc.to_string()).await?;
+        let state = collect_metadata_state(&snap);
+
+        assert_eq!(state.name.as_deref(), Some("my_table"));
+        assert_eq!(state.description.as_deref(), Some("A test table"));
+        assert_eq!(state.format_provider.as_deref(), Some("parquet"));
+        assert!(state.has_created_time);
+
+        unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_visit_metadata_without_created_time() -> Result<(), Box<dyn std::error::Error>> {
+        let metadata_no_time = concat!(
+            r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
+            "\n",
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            "\n",
+            r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}}"#,
+        );
+        let (engine, snap) = setup_snapshot(metadata_no_time.to_string()).await?;
+        let state = collect_metadata_state(&snap);
+
+        assert_eq!(
+            state.id.as_deref(),
+            Some("5fba94ed-9794-4965-ba6e-6ee3c0d22af9")
+        );
+        assert!(!state.has_created_time);
+        assert_eq!(state.created_time_ms, 0);
 
         unsafe { free_snapshot(snap) };
         unsafe { free_engine(engine) };
