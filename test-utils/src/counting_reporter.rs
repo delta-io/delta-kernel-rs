@@ -207,7 +207,9 @@ impl MetricsReporter for CountingReporter {
                 self.compaction_files.add(num_compaction_files);
             }
             // Intentionally not tracked -- add counters if needed.
-            MetricEvent::ProtocolMetadataLoaded { .. } | MetricEvent::SnapshotFailed { .. } => {}
+            MetricEvent::ProtocolMetadataLoaded { .. }
+            | MetricEvent::SnapshotFailed { .. }
+            | MetricEvent::ScanMetadataCompleted { .. } => {}
         }
     }
 }

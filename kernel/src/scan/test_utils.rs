@@ -171,7 +171,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         physical_partition_schema: None,
     });
     let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
-    let iter = scan_action_iter(
+    let (iter, _metrics) = scan_action_iter(
         &SyncEngine::new(),
         batch
             .into_iter()
