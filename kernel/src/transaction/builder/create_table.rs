@@ -379,19 +379,9 @@ fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProp
     }
 }
 
-/// Resolves [`FeatureRequirement::Supported`] dependencies for all enabled features.
-///
 /// For each feature in `writer_features` and `reader_features`, checks its
 /// [`FeatureInfo::feature_requirements`] and adds any `Supported` dependencies that aren't
-/// already present. Other requirement variants (`Enabled`, `NotSupported`, `NotEnabled`,
-/// `Custom`) are validation checks enforced at read/write time, not enablement actions.
-///
-/// This must be called after all features have been added (property-driven enablement,
-/// schema-driven enablement, data layout features, catalog-managed ICT) so that the full
-/// set of dependencies is resolved.
-///
-/// Dependencies are resolved transitively: if feature A requires B and B requires C, all
-/// three will be present after this call.
+/// already present.
 ///
 /// Note: cycles in [`FeatureRequirement::Supported`] chains (feature A requires B, B requires A)
 /// would cause an infinite loop. The feature dependency graph must remain acyclic.
@@ -430,11 +420,8 @@ fn resolve_feature_dependencies(validated: &mut ValidatedTableProperties) {
 ///
 /// Column names use the format `_row-id-col-{uuid}` and
 /// `_row-commit-version-col-{uuid}` to avoid collisions with user-defined columns.
-/// If the properties are already set (e.g. user supplied them), they are left unchanged.
+/// If the properties are already set, they are left unchanged.
 fn maybe_set_materialized_row_tracking_column_names(validated: &mut ValidatedTableProperties) {
-    // Only assign when row tracking is explicitly enabled via the enablement property.
-    // Feature-signal-only tables (delta.feature.rowTracking=supported without
-    // delta.enableRowTracking=true) do not require materialized column names.
     if validated
         .properties
         .get(ENABLE_ROW_TRACKING)
