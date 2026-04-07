@@ -176,6 +176,8 @@ async fn new_checkpoint_triggers_full_rebuild() -> DeltaResult<()> {
 
     assert_eq!(updated.version(), 3);
     assert_eq!(reporter.snapshot_completions.get(), 1);
+    // LogSegmentLoaded is emitted for the listed files before the checkpoint rebuild
+    assert_eq!(reporter.log_segment_loads.get(), 1);
     // Checkpoint read via Parquet; tail commits (v2, v3) via JSON
     assert_eq!(reporter.parquet_read_calls.get(), 1);
     assert_eq!(reporter.json_read_calls.get(), 1);

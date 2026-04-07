@@ -4,16 +4,17 @@
 //! fast-path, CRC at prior version, checkpoint with tail commits) plus on-demand API calls
 //! (`get_domain_metadata`) that incur additional I/O after a snapshot is already built.
 
-use super::{measuring_engine, setup_table_with_v1_checkpoint, simple_schema};
+use super::{
+    insert_rows, measuring_engine, setup_in_memory_table, setup_table_with_v1_checkpoint,
+    simple_schema,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStore as _;
 use delta_kernel::transaction::create_table::create_table;
@@ -30,20 +31,7 @@ use url::Url;
 /// commit files.
 #[tokio::test]
 async fn delta_only_snapshot_emits_expected_metrics() -> DeltaResult<()> {
-    let store = Arc::new(InMemory::new());
-    let table_url = Url::parse("memory:///").unwrap();
-    let setup_engine = Arc::new(DefaultEngineBuilder::new(store.clone() as Arc<_>).build());
-
-    let _ = create_table("memory:///", simple_schema(), "Test/1.0")
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(setup_engine.as_ref())?;
-    let snap0 = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
-    let _ = insert_data(
-        snap0,
-        &setup_engine,
-        vec![Arc::new(Int32Array::from(vec![1]))],
-    )
-    .await?;
+    let (table_url, _setup_engine, store) = setup_in_memory_table(1).await?;
 
     let (engine, reporter) = measuring_engine(store);
     let _snap = Snapshot::builder_for(table_url).build(&engine)?;
@@ -84,7 +72,8 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
         &setup_engine,
         vec![Arc::new(Int32Array::from(vec![2]))],
     )
-    .await?;
+    .await?
+    .unwrap_committed();
 
     let (measure_engine, reporter) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
@@ -149,23 +138,7 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> DeltaResult<()> 
 /// compaction file and the tail commit in a single call (the minimal cover).
 #[tokio::test]
 async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()> {
-    let store = Arc::new(InMemory::new());
-    let table_url = Url::parse("memory:///").unwrap();
-    let setup_engine = Arc::new(DefaultEngineBuilder::new(store.clone() as Arc<_>).build());
-
-    let _ = create_table("memory:///", simple_schema(), "Test/1.0")
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(setup_engine.as_ref())?;
-
-    for val in [1i32, 2] {
-        let snap = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
-        let _ = insert_data(
-            snap,
-            &setup_engine,
-            vec![Arc::new(Int32Array::from(vec![val]))],
-        )
-        .await?;
-    }
+    let (table_url, setup_engine, store) = setup_in_memory_table(2).await?;
 
     // Write a compacted log file covering versions 0-2 using the public API
     let snap2 = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
@@ -183,13 +156,7 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
     // commit 3: tail commit after the compaction
-    let snap3 = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
-    let _ = insert_data(
-        snap3,
-        &setup_engine,
-        vec![Arc::new(Int32Array::from(vec![3]))],
-    )
-    .await?;
+    insert_rows(&table_url, &setup_engine, 3, 1).await?;
 
     let (engine, reporter) = measuring_engine(store);
     let _snap = Snapshot::builder_for(table_url).build(&engine)?;
@@ -277,14 +244,22 @@ async fn crc_at_prior_version_triggers_tail_replay_then_falls_back_to_crc() -> D
         .write_checksum(setup_engine.as_ref())?;
 
     // commits 1 and 2: pure Add actions, no Protocol/Metadata changes
+    let mut snap = create_committed
+        .post_commit_snapshot()
+        .expect("post-commit snapshot")
+        .clone();
     for val in [1i32, 2] {
-        let snap = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
-        let _ = insert_data(
+        let c = insert_data(
             snap,
             &setup_engine,
             vec![Arc::new(Int32Array::from(vec![val]))],
         )
-        .await?;
+        .await?
+        .unwrap_committed();
+        snap = c
+            .post_commit_snapshot()
+            .expect("post-commit snapshot")
+            .clone();
     }
 
     // Measurement: build snapshot at latest (v2); CRC is at v0 (two versions behind)
@@ -317,14 +292,19 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Delta
     let (table_url, setup_engine, _temp_dir) = setup_table_with_v1_checkpoint().await?;
 
     // commits 2, 3, 4: insert more data after the checkpoint
+    let mut snap = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
     for val in [2i32, 3, 4] {
-        let snap = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
-        let _ = insert_data(
+        let c = insert_data(
             snap,
             &setup_engine,
             vec![Arc::new(Int32Array::from(vec![val]))],
         )
-        .await?;
+        .await?
+        .unwrap_committed();
+        snap = c
+            .post_commit_snapshot()
+            .expect("post-commit snapshot")
+            .clone();
     }
 
     let (measure_engine, reporter) = measuring_engine(Arc::new(LocalFileSystem::new()));
@@ -361,20 +341,7 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Delta
 /// checkpoint, no CRC. Tables with different log structures will produce different counts.
 #[tokio::test]
 async fn get_domain_metadata_incurs_additional_log_replay() -> DeltaResult<()> {
-    let store = Arc::new(InMemory::new());
-    let table_url = Url::parse("memory:///").unwrap();
-    let setup_engine = Arc::new(DefaultEngineBuilder::new(store.clone() as Arc<_>).build());
-
-    let _ = create_table("memory:///", simple_schema(), "Test/1.0")
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(setup_engine.as_ref())?;
-    let snap0 = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
-    let _ = insert_data(
-        snap0,
-        &setup_engine,
-        vec![Arc::new(Int32Array::from(vec![1]))],
-    )
-    .await?;
+    let (table_url, _setup_engine, store) = setup_in_memory_table(1).await?;
 
     let (engine, reporter) = measuring_engine(store);
     let snap = Snapshot::builder_for(table_url).build(&engine)?;
