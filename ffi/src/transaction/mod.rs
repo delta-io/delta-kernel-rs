@@ -178,8 +178,8 @@ fn with_domain_metadata_impl(
     domain: KernelStringSlice,
     configuration: KernelStringSlice,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    let domain: String = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
-    let configuration: String = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
+    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
+    let configuration = unsafe { TryFromStringSlice::try_from_slice(&configuration) }?;
     Ok(Box::new(txn.with_domain_metadata(domain, configuration)).into())
 }
 
@@ -787,11 +787,10 @@ mod tests {
             .get(&Path::from_url_path(commit_url.path()).unwrap())
             .await
             .unwrap();
-        let actions: Vec<serde_json::Value> =
-            Deserializer::from_slice(&data.bytes().await.unwrap())
-                .into_iter::<serde_json::Value>()
-                .try_collect()
-                .unwrap();
+        let actions: Vec<serde_json::Value> = Deserializer::from_slice(&data.bytes().await.unwrap())
+            .into_iter::<serde_json::Value>()
+            .try_collect()
+            .unwrap();
         actions
             .into_iter()
             .find(|a| a.get("domainMetadata").is_some())
@@ -803,14 +802,8 @@ mod tests {
     async fn setup_domain_metadata_table(
         dir_url: &Url,
         name: &str,
-    ) -> Result<
-        (
-            Url,
-            Arc<dyn ObjectStore>,
-            crate::handle::Handle<crate::SharedExternEngine>,
-        ),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> Result<(Url, Arc<dyn ObjectStore>, Handle<SharedExternEngine>), Box<dyn std::error::Error>>
+    {
         let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
             "id",
             DataType::INTEGER,
@@ -922,7 +915,7 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             KernelError::GenericError,
-            "Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled",
+            Some("Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled"),
         );
 
         unsafe { free_engine(engine) };
@@ -970,7 +963,7 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             KernelError::GenericError,
-            "Generic delta kernel error: Metadata for domain dup already specified in this transaction",
+            Some("Generic delta kernel error: Metadata for domain dup already specified in this transaction"),
         );
 
         unsafe { free_engine(engine) };
@@ -1025,7 +1018,7 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             KernelError::UnsupportedError,
-            "Unsupported: Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature",
+            Some("Unsupported: Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"),
         );
 
         unsafe { free_engine(engine) };
