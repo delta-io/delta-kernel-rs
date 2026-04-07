@@ -17,6 +17,7 @@ use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -48,6 +49,64 @@ fn simple_schema() -> Arc<StructType> {
         StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)])
             .expect("valid schema"),
     )
+}
+
+/// Create an in-memory table with `num_inserts` commits after the initial create-table
+/// commit. Returns `(table_url, setup_engine, store)`. Table is at version `num_inserts`.
+async fn setup_in_memory_table(
+    num_inserts: usize,
+) -> DeltaResult<(
+    Url,
+    Arc<DefaultEngine<delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor>>,
+    Arc<InMemory>,
+)> {
+    let store = Arc::new(InMemory::new());
+    let table_url = Url::parse("memory:///").unwrap();
+    let engine = Arc::new(DefaultEngineBuilder::new(store.clone() as Arc<_>).build());
+
+    let _ = create_table("memory:///", simple_schema(), "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let mut snap = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    for val in 1..=num_inserts {
+        let committed = insert_data(
+            snap.clone(),
+            &engine,
+            vec![Arc::new(Int32Array::from(vec![val as i32]))],
+        )
+        .await?
+        .unwrap_committed();
+        snap = committed
+            .post_commit_snapshot()
+            .expect("post-commit snapshot")
+            .clone();
+    }
+
+    Ok((table_url, engine, store))
+}
+
+/// Insert `count` rows (starting from `start_val`) into an existing table, using
+/// `post_commit_snapshot` to chain snapshots instead of rebuilding from scratch.
+async fn insert_rows(
+    table_url: &Url,
+    engine: &Arc<
+        DefaultEngine<delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor>,
+    >,
+    start_val: i32,
+    count: i32,
+) -> DeltaResult<()> {
+    let mut snap = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    for val in start_val..(start_val + count) {
+        let committed = insert_data(snap, engine, vec![Arc::new(Int32Array::from(vec![val]))])
+            .await?
+            .unwrap_committed();
+        snap = committed
+            .post_commit_snapshot()
+            .expect("post-commit snapshot")
+            .clone();
+    }
+    Ok(())
 }
 
 /// Create a table at v0, insert one row, and write a v1 parquet checkpoint.

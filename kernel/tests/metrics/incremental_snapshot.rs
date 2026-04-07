@@ -1,89 +1,28 @@
 //! Incremental snapshot update metrics tests.
 //!
-//! `Snapshot::builder_from(existing)` applies a simple heuristic to minimize I/O when
-//! advancing a snapshot to a newer version. The behavior depends on what the log listing
-//! finds between the existing snapshot's checkpoint version and the target version:
+//! Verifies I/O expectations when advancing an existing snapshot to a newer version via
+//! `Snapshot::builder_from`. Scenarios covered:
 //!
-//! - **No new commits:** returns the existing snapshot unchanged; `SnapshotCompleted` is
-//!   emitted but no `LogSegmentLoaded` (no log replay occurred).
+//! - **No new commits:** returns the existing snapshot unchanged; no log replay I/O.
 //! - **New commits only (no new checkpoint):** incrementally replays only the net-new
-//!   commits for Protocol/Metadata changes, then merges with the existing log segment.
-//!   `LogSegmentLoaded` is emitted with the net-new commit count.
-//! - **New checkpoint found:** ignores the existing snapshot entirely and constructs a
-//!   fresh snapshot from the new checkpoint (plus any tail commits after it). This path
-//!   is equivalent to a full `builder_for` build -- nothing is incremental.
-//!   `LogSegmentLoaded` is not emitted (the checkpoint path uses `LogSegment::try_new`
-//!   rather than `LogSegment::for_snapshot`).
-//! - **Compaction overlapping old version:** the incremental path conservatively filters
-//!   out compaction files whose start version is at or before the existing snapshot version.
+//!   commits; `LogSegmentLoaded` is emitted with the net-new commit count.
+//! - **New checkpoint found:** discards the existing snapshot and builds fresh from
+//!   the new checkpoint (plus any tail commits after it).
+//! - **Compaction overlapping old version:** conservatively filters out compaction files
+//!   whose start version is at or before the existing snapshot version.
 
-use super::{measuring_engine, simple_schema};
+use super::{insert_rows, measuring_engine, setup_in_memory_table, simple_schema};
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStore as _;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
 use test_utils::{insert_data, test_table_setup_mt};
-use url::Url;
-
-/// Create an in-memory table with `num_inserts` commits after the initial create-table
-/// commit. Returns `(table_url, setup_engine, store)`. Table is at version `num_inserts`.
-async fn setup_in_memory_table(
-    num_inserts: usize,
-) -> DeltaResult<(
-    Url,
-    Arc<
-        delta_kernel::engine::default::DefaultEngine<
-            delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor,
-        >,
-    >,
-    Arc<InMemory>,
-)> {
-    let store = Arc::new(InMemory::new());
-    let table_url = Url::parse("memory:///").unwrap();
-    let engine = Arc::new(DefaultEngineBuilder::new(store.clone() as Arc<_>).build());
-
-    let _ = create_table("memory:///", simple_schema(), "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
-
-    for val in 1..=num_inserts {
-        let snap = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        let _ = insert_data(
-            snap,
-            &engine,
-            vec![Arc::new(Int32Array::from(vec![val as i32]))],
-        )
-        .await?;
-    }
-
-    Ok((table_url, engine, store))
-}
-
-/// Insert `count` rows (starting from `start_val`) into an existing table.
-async fn insert_rows(
-    table_url: &Url,
-    engine: &Arc<
-        delta_kernel::engine::default::DefaultEngine<
-            delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor,
-        >,
-    >,
-    start_val: i32,
-    count: i32,
-) -> DeltaResult<()> {
-    for val in start_val..(start_val + count) {
-        let snap = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        let _ = insert_data(snap, engine, vec![Arc::new(Int32Array::from(vec![val]))]).await?;
-    }
-    Ok(())
-}
 
 // ============================================================================
 // Scenario 1: no new commits -- returns existing snapshot unchanged
@@ -176,11 +115,8 @@ async fn incremental_update_batches_multiple_new_commits() -> DeltaResult<()> {
 
 /// When a new checkpoint appears after the existing snapshot was built, `builder_from`
 /// discards the existing snapshot and builds a fresh one from the new checkpoint.
-///
-/// The incremental path's `LogSegmentLoaded` is NOT emitted -- the checkpoint rebuild
-/// uses `LogSegment::try_new` (not `for_snapshot`). However, `try_new_from_log_segment_impl`
-/// triggers a full P+M replay from the new log segment. The metrics reflect the fresh
-/// rebuild: checkpoint read via parquet, tail commits via JSON.
+/// The metrics reflect the fresh rebuild: checkpoint read via parquet, tail commits
+/// via JSON.
 ///
 /// Table setup: v0 (create) + v1 (insert). Existing snapshot captured at v1 (NO
 /// checkpoint exists yet). Then checkpoint written at v1 + commits v2 and v3 added.
@@ -217,14 +153,22 @@ async fn new_checkpoint_triggers_full_rebuild() -> DeltaResult<()> {
         .checkpoint(setup_engine.as_ref())?;
 
     // Add commits v2 and v3 after the checkpoint
+    let mut snap = committed
+        .post_commit_snapshot()
+        .expect("post-commit snapshot")
+        .clone();
     for val in [2i32, 3] {
-        let snap = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
-        let _ = insert_data(
+        let c = insert_data(
             snap,
             &setup_engine,
             vec![Arc::new(Int32Array::from(vec![val]))],
         )
-        .await?;
+        .await?
+        .unwrap_committed();
+        snap = c
+            .post_commit_snapshot()
+            .expect("post-commit snapshot")
+            .clone();
     }
 
     let (measure_engine, reporter) = measuring_engine(Arc::new(LocalFileSystem::new()));

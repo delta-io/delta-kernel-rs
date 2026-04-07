@@ -4,20 +4,13 @@
 //! through `DefaultParquetHandler::read_parquet_files` and the JSON log replay that
 //! `scan.execute()` performs internally to collect Add/Remove scan metadata.
 
-use super::{measuring_engine, simple_schema};
+use super::{measuring_engine, setup_in_memory_table};
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::Int32Array;
-use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::default::DefaultEngineBuilder;
-use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
-use test_utils::insert_data;
-use url::Url;
 
 // ============================================================================
-// Scenario 10: scan.execute() contributes parquet data-file reads
+// scan.execute() contributes parquet data-file reads
 // ============================================================================
 
 /// `scan.execute()` reads the actual parquet data files written during inserts.
@@ -30,24 +23,7 @@ use url::Url;
 /// reporter reset.
 #[tokio::test]
 async fn scan_execute_contributes_parquet_data_file_reads() -> DeltaResult<()> {
-    let store = Arc::new(InMemory::new());
-    let table_url = Url::parse("memory:///").unwrap();
-    let setup_engine = Arc::new(DefaultEngineBuilder::new(store.clone() as Arc<_>).build());
-
-    let _ = create_table("memory:///", simple_schema(), "Test/1.0")
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(setup_engine.as_ref())?;
-
-    // Two inserts, each writing one parquet data file
-    for val in [1i32, 2] {
-        let snap = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
-        let _ = insert_data(
-            snap,
-            &setup_engine,
-            vec![Arc::new(Int32Array::from(vec![val]))],
-        )
-        .await?;
-    }
+    let (table_url, _setup_engine, store) = setup_in_memory_table(2).await?;
 
     let (engine, reporter) = measuring_engine(store);
     let snap = Snapshot::builder_for(table_url).build(&engine)?;
