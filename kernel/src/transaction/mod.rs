@@ -2517,4 +2517,45 @@ mod tests {
             crate::Error::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
     }
+
+    #[test]
+    fn test_partitioned_write_context_on_unpartitioned_table_returns_error() {
+        let engine = SyncEngine::new();
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .unwrap();
+
+        let result = txn.partitioned_write_context(HashMap::from([(
+            "col".to_string(),
+            crate::expressions::Scalar::String("val".into()),
+        )]));
+        let err = result.err().expect("should be an error").to_string();
+        assert!(
+            err.contains("table is not partitioned"),
+            "expected 'not partitioned' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_unpartitioned_write_context_on_partitioned_table_returns_error() {
+        let engine = SyncEngine::new();
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .unwrap();
+
+        let result = txn.unpartitioned_write_context();
+        let err = result.err().expect("should be an error").to_string();
+        assert!(
+            err.contains("table is partitioned"),
+            "expected 'is partitioned' error, got: {err}"
+        );
+    }
 }
