@@ -1,5 +1,8 @@
+use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
-use crate::{kernel_string_slice, AllocateStringFn, NullableCvoid, SharedSchema};
+use crate::{
+    kernel_string_slice, AllocateStringFn, NullableCvoid, SharedExternEngine, SharedSchema,
+};
 use delta_kernel::transaction::WriteContext;
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -14,18 +17,24 @@ use super::ExclusiveTransaction;
 #[handle_descriptor(target=WriteContext, mutable=false, sized=true)]
 pub struct SharedWriteContext;
 
-/// Gets the write context from a transaction. The write context provides schema and path information
-/// needed for writing data.
+/// Gets the write context from a transaction for an unpartitioned table. The write context
+/// provides schema and path information needed for writing data.
+///
+/// For partitioned tables, use a partitioned write context instead (not yet exposed via FFI).
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle.
+/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle and engine.
 #[no_mangle]
 pub unsafe extern "C" fn get_write_context(
     txn: Handle<ExclusiveTransaction>,
-) -> Handle<SharedWriteContext> {
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedWriteContext>> {
     let txn = unsafe { txn.as_ref() };
-    Arc::new(txn.get_write_context()).into()
+    let engine = unsafe { engine.as_ref() };
+    txn.unpartitioned_write_context()
+        .map(|wc| Arc::new(wc).into())
+        .into_extern_result(&engine)
 }
 
 #[no_mangle]

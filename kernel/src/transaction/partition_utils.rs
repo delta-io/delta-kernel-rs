@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, NaiveDate};
 
 use crate::expressions::Scalar;
-use crate::schema::{DataType, StructType};
+use crate::schema::StructType;
 use crate::{DeltaResult, Error};
 
 // === Partition Value Serialization ===
@@ -96,7 +96,7 @@ fn format_f64(v: f64) -> String {
         };
     }
     let abs = v.abs();
-    if abs >= 1e-3 && abs < 1e7 {
+    if (1e-3..1e7).contains(&abs) {
         let s = v.to_string();
         if s.contains('.') {
             s
@@ -135,7 +135,7 @@ fn format_f32(v: f32) -> String {
         };
     }
     let abs = v.abs();
-    if abs >= 1e-3 && abs < 1e7 {
+    if (1e-3..1e7).contains(&abs) {
         let s = v.to_string();
         if s.contains('.') {
             s
@@ -161,9 +161,7 @@ fn format_date(days: i32) -> DeltaResult<String> {
     })?;
     NaiveDate::from_num_days_from_ce_opt(ce_days)
         .map(|d| d.format("%Y-%m-%d").to_string())
-        .ok_or_else(|| {
-            Error::generic(format!("date value {days} days from epoch is out of range"))
-        })
+        .ok_or_else(|| Error::generic(format!("date value {days} days from epoch is out of range")))
 }
 
 /// Formats a timestamp (microseconds since epoch) as ISO 8601: "YYYY-MM-DDTHH:MM:SS.ffffffZ".
@@ -216,11 +214,8 @@ fn format_decimal(d: &crate::expressions::DecimalData) -> String {
 /// Formats binary data as raw UTF-8, matching Java's `new String(bytes, UTF_8)`.
 /// Returns an error if the bytes are not valid UTF-8.
 fn format_binary(bytes: &[u8]) -> DeltaResult<String> {
-    String::from_utf8(bytes.to_vec()).map_err(|e| {
-        Error::generic(format!(
-            "binary partition value is not valid UTF-8: {e}"
-        ))
-    })
+    String::from_utf8(bytes.to_vec())
+        .map_err(|e| Error::generic(format!("binary partition value is not valid UTF-8: {e}")))
 }
 
 // === Partition Key Validation ===
@@ -304,9 +299,9 @@ pub(crate) fn validate_partition_value_types(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use crate::expressions::Scalar;
-    use crate::schema::{PrimitiveType, StructField};
+    use crate::schema::{DataType, PrimitiveType, StructField};
+    use chrono::TimeZone;
 
     // === serialize_partition_value tests ===
 
@@ -408,8 +403,8 @@ mod tests {
     #[test]
     fn test_serialize_partition_value_float_normal() {
         assert_eq!(
-            serialize_partition_value(&Scalar::Float(3.14)).unwrap(),
-            Some("3.14".into())
+            serialize_partition_value(&Scalar::Float(3.125)).unwrap(),
+            Some("3.125".into())
         );
     }
 
@@ -461,8 +456,8 @@ mod tests {
     #[test]
     fn test_serialize_partition_value_double_normal() {
         assert_eq!(
-            serialize_partition_value(&Scalar::Double(3.14)).unwrap(),
-            Some("3.14".into())
+            serialize_partition_value(&Scalar::Double(3.125)).unwrap(),
+            Some("3.125".into())
         );
     }
 
@@ -598,19 +593,13 @@ mod tests {
     #[test]
     fn test_serialize_partition_value_decimal_negative_between_zero_and_one_preserves_sign() {
         let d = Scalar::decimal(-5i128, 3, 2).unwrap();
-        assert_eq!(
-            serialize_partition_value(&d).unwrap(),
-            Some("-0.05".into())
-        );
+        assert_eq!(serialize_partition_value(&d).unwrap(), Some("-0.05".into()));
     }
 
     #[test]
     fn test_serialize_partition_value_decimal_preserves_trailing_zeros() {
         let d = Scalar::decimal(4200i128, 5, 2).unwrap();
-        assert_eq!(
-            serialize_partition_value(&d).unwrap(),
-            Some("42.00".into())
-        );
+        assert_eq!(serialize_partition_value(&d).unwrap(), Some("42.00".into()));
     }
 
     #[test]
@@ -763,10 +752,8 @@ mod tests {
 
     #[test]
     fn test_validate_partition_value_types_mismatch_returns_error() {
-        let schema = StructType::new_unchecked(vec![StructField::not_null(
-            "year",
-            DataType::INTEGER,
-        )]);
+        let schema =
+            StructType::new_unchecked(vec![StructField::not_null("year", DataType::INTEGER)]);
         let values = HashMap::from([("year".to_string(), Scalar::String("2024".into()))]);
         let result = validate_partition_value_types(&schema, &values);
         assert!(result.is_err());
@@ -776,10 +763,8 @@ mod tests {
 
     #[test]
     fn test_validate_partition_value_types_null_skips_type_check() {
-        let schema = StructType::new_unchecked(vec![StructField::not_null(
-            "year",
-            DataType::INTEGER,
-        )]);
+        let schema =
+            StructType::new_unchecked(vec![StructField::not_null("year", DataType::INTEGER)]);
         let values = HashMap::from([("year".to_string(), Scalar::Null(DataType::STRING))]);
         // Null skips the type check even though the null's inner type is STRING, not INTEGER.
         validate_partition_value_types(&schema, &values).unwrap();

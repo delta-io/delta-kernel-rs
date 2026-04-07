@@ -331,7 +331,9 @@ mod tests {
                 ))
             };
 
-            let write_context = unsafe { get_write_context(txn_with_engine_info.shallow_copy()) };
+            let write_context = ok_or_panic(unsafe {
+                get_write_context(txn_with_engine_info.shallow_copy(), engine.shallow_copy())
+            });
 
             // Ensure we get the correct schema
             let write_schema = unsafe { get_write_schema(write_context.shallow_copy()) };
@@ -548,7 +550,9 @@ mod tests {
                 ))
             };
 
-            let write_context = unsafe { get_write_context(txn_with_engine_info.shallow_copy()) };
+            let write_context = ok_or_panic(unsafe {
+                get_write_context(txn_with_engine_info.shallow_copy(), engine.shallow_copy())
+            });
 
             let batch = RecordBatch::try_from_iter(vec![
                 (

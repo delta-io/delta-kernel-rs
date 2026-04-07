@@ -271,7 +271,7 @@ mod tests {
             .await?;
         println!("latest snapshot version: {:?}", snapshot.version());
         let txn = snapshot.clone().transaction(committer, &engine)?;
-        let _write_context = txn.get_write_context();
+        let _write_context = txn.unpartitioned_write_context();
 
         match txn.commit(&engine)? {
             CommitResult::CommittedTransaction(t) => {

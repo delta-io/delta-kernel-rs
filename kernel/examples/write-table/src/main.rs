@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs::create_dir_all;
 use std::path::Path;
 use std::process::ExitCode;
@@ -95,10 +94,8 @@ async fn try_main() -> DeltaResult<()> {
         .with_data_change(true);
 
     // Write the data using the engine
-    let write_context = Arc::new(txn.get_write_context());
-    let file_metadata = engine
-        .write_parquet(&sample_data, write_context.as_ref(), HashMap::new())
-        .await?;
+    let write_context = txn.unpartitioned_write_context()?;
+    let file_metadata = engine.write_parquet(&sample_data, &write_context).await?;
 
     // Add the file metadata to the transaction
     txn.add_files(file_metadata);

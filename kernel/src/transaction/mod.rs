@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use tracing::{info, instrument};
 use url::Url;
@@ -232,6 +232,9 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
+    // Cached shared write state (computed lazily on first write context request).
+    // Valid for Transaction lifetime because metadata mutations aren't supported yet.
+    shared_write_state: OnceLock<Arc<SharedWriteState>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -771,33 +774,102 @@ impl<S> Transaction<S> {
         Expression::transform(transform)
     }
 
-    /// Get the write context for this transaction. At the moment, this is constant for the whole
-    /// transaction.
-    // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
-    // that engines cannot call this method after a metadata change, since the write context could
-    // have invalid metadata.
-    // Note: Callers that use get_write_context may be writing data to the table and they might
-    // have invalid metadata.
-    pub fn get_write_context(&self) -> WriteContext {
-        let target_dir = self.read_snapshot.table_root();
-        let snapshot_schema = self.read_snapshot.schema();
-        let logical_to_physical = self.generate_logical_to_physical();
-        let table_config = self.read_snapshot.table_configuration();
-        let column_mapping_mode = table_config.column_mapping_mode();
+    /// Returns the logical partition column names for this table.
+    ///
+    /// Returns an empty slice for non-partitioned tables. Connectors use this to discover
+    /// partition columns and split data before writing.
+    pub fn partition_columns(&self) -> &[String] {
+        self.read_snapshot.table_configuration().partition_columns()
+    }
 
-        let physical_schema = table_config.physical_write_schema();
+    /// Lazily builds and caches the shared write state for this transaction. This is called
+    /// internally by `partitioned_write_context` and `unpartitioned_write_context`.
+    fn shared_write_state(&self) -> &Arc<SharedWriteState> {
+        self.shared_write_state.get_or_init(|| {
+            let target_dir = self.read_snapshot.table_root().clone();
+            let logical_schema = self.read_snapshot.schema();
+            let logical_to_physical = self.generate_logical_to_physical();
+            let table_config = self.read_snapshot.table_configuration();
+            let column_mapping_mode = table_config.column_mapping_mode();
+            let physical_schema = table_config.physical_write_schema();
+            let stats_columns = self.stats_columns();
+            let logical_partition_columns = table_config.partition_columns().to_vec();
+            Arc::new(SharedWriteState {
+                target_dir,
+                logical_schema,
+                physical_schema,
+                logical_to_physical: Arc::new(logical_to_physical),
+                column_mapping_mode,
+                stats_columns,
+                logical_partition_columns,
+            })
+        })
+    }
 
-        // Get stats columns from table configuration
-        let stats_columns = self.stats_columns();
+    /// Creates a write context for writing data to a specific partition.
+    ///
+    /// Validates that the provided partition values match the table's partition columns
+    /// (case-insensitive key matching, type checking), serializes the values per the Delta
+    /// protocol, and translates logical column names to physical names.
+    ///
+    /// Returns an error if the table is not partitioned (use
+    /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead), if
+    /// partition keys are missing/extra, or if value types don't match the schema.
+    pub fn partitioned_write_context(
+        &self,
+        partition_values: HashMap<String, crate::expressions::Scalar>,
+    ) -> DeltaResult<WriteContext> {
+        let shared = self.shared_write_state();
+        require!(
+            !shared.logical_partition_columns.is_empty(),
+            Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
+        );
 
-        WriteContext::new(
-            target_dir.clone(),
-            snapshot_schema,
-            physical_schema,
-            Arc::new(logical_to_physical),
-            column_mapping_mode,
-            stats_columns,
-        )
+        // Validate and normalize keys (case-insensitive, detect duplicates).
+        let normalized = partition_utils::validate_partition_keys(
+            &shared.logical_partition_columns,
+            partition_values,
+        )?;
+        // Validate value types match schema column types.
+        partition_utils::validate_partition_value_types(&shared.logical_schema, &normalized)?;
+
+        // Serialize values and translate keys from logical to physical names.
+        let mut serialized = HashMap::with_capacity(normalized.len());
+        for logical_name in &shared.logical_partition_columns {
+            let scalar = normalized.get(logical_name).ok_or_else(|| {
+                Error::generic(format!(
+                    "partition column '{logical_name}' missing after validation"
+                ))
+            })?;
+            let value = partition_utils::serialize_partition_value(scalar)?;
+            let physical_name = shared
+                .logical_schema
+                .field(logical_name)
+                .map(|f| f.physical_name(shared.column_mapping_mode).to_string())
+                .unwrap_or_else(|| logical_name.clone());
+            serialized.insert(physical_name, value);
+        }
+
+        Ok(WriteContext {
+            shared: shared.clone(),
+            partition_values: serialized,
+        })
+    }
+
+    /// Creates a write context for writing data to an unpartitioned table.
+    ///
+    /// Returns an error if the table has partition columns (use
+    /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
+    pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
+        let shared = self.shared_write_state();
+        require!(
+            shared.logical_partition_columns.is_empty(),
+            Error::generic("table is partitioned; use partitioned_write_context() instead")
+        );
+        Ok(WriteContext {
+            shared: shared.clone(),
+            partition_values: HashMap::new(),
+        })
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
@@ -1143,65 +1215,141 @@ impl<S> Transaction<S> {
     }
 }
 
-/// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
-/// write table data.
+/// Table-wide write state shared across all [`WriteContext`] instances created by a
+/// [`Transaction`]. Cached in `OnceLock` on the transaction and shared via `Arc` so that
+/// per-partition `WriteContext` creation is cheap (just an Arc refcount bump + small HashMap).
 ///
-/// [`Transaction`]: struct.Transaction.html
-pub struct WriteContext {
+/// Valid for the lifetime of the Transaction because metadata mutations are not supported yet.
+struct SharedWriteState {
     target_dir: Url,
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
     column_mapping_mode: ColumnMappingMode,
-    /// Column names that should have statistics collected during writes.
     stats_columns: Vec<ColumnName>,
+    /// Logical partition column names in metadata-defined order.
+    logical_partition_columns: Vec<String>,
+}
+
+/// A write context for a specific partition (or an unpartitioned table). Created by
+/// [`Transaction::partitioned_write_context`] or [`Transaction::unpartitioned_write_context`].
+///
+/// Contains both table-wide state (shared cheaply via `Arc`) and per-partition state
+/// (serialized partition values with physical column names as keys). Pass this to
+/// [`DefaultEngine::write_parquet`] to write data files with correctly formatted partition
+/// metadata.
+///
+/// For custom engines that bypass `DefaultEngine`, use [`partition_values`] to build the
+/// `partitionValues` map in Add actions, and [`hive_style_target_dir`] or
+/// [`unique_target_dir`] for file path construction.
+///
+/// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
+/// [`partition_values`]: WriteContext::partition_values
+/// [`hive_style_target_dir`]: WriteContext::hive_style_target_dir
+/// [`unique_target_dir`]: WriteContext::unique_target_dir
+pub struct WriteContext {
+    shared: Arc<SharedWriteState>,
+    /// Physical column name -> serialized value (`None` = null partition value).
+    /// Empty for unpartitioned tables. Ordering for hive-style paths comes from
+    /// `shared.logical_partition_columns`, not from this map.
+    partition_values: HashMap<String, Option<String>>,
 }
 
 impl WriteContext {
-    fn new(
-        target_dir: Url,
-        logical_schema: SchemaRef,
-        physical_schema: SchemaRef,
-        logical_to_physical: ExpressionRef,
-        column_mapping_mode: ColumnMappingMode,
-        stats_columns: Vec<ColumnName>,
-    ) -> Self {
-        WriteContext {
-            target_dir,
-            logical_schema,
-            physical_schema,
-            logical_to_physical,
-            column_mapping_mode,
-            stats_columns,
-        }
-    }
-
+    /// Returns the table root URL.
     pub fn target_dir(&self) -> &Url {
-        &self.target_dir
+        &self.shared.target_dir
     }
 
+    /// Returns the logical (user-facing) table schema. Connectors use this to determine
+    /// the schema of data to write.
     pub fn logical_schema(&self) -> &SchemaRef {
-        &self.logical_schema
+        &self.shared.logical_schema
     }
 
+    /// Returns the physical schema (partition columns removed, column mapping applied).
     pub fn physical_schema(&self) -> &SchemaRef {
-        &self.physical_schema
+        &self.shared.physical_schema
     }
 
+    /// Returns the expression that transforms logical data to physical data for writing.
     pub fn logical_to_physical(&self) -> ExpressionRef {
-        self.logical_to_physical.clone()
+        self.shared.logical_to_physical.clone()
     }
 
     /// The [`ColumnMappingMode`] for this table.
     pub fn column_mapping_mode(&self) -> ColumnMappingMode {
-        self.column_mapping_mode
+        self.shared.column_mapping_mode
     }
 
     /// Returns the column names that should have statistics collected during writes.
     ///
     /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
     pub fn stats_columns(&self) -> &[ColumnName] {
-        &self.stats_columns
+        &self.shared.stats_columns
+    }
+
+    /// Returns the serialized partition values for this write context. Keys are physical
+    /// column names; values are protocol-serialized strings (`None` = null).
+    ///
+    /// For unpartitioned tables, this is empty.
+    pub fn partition_values(&self) -> &HashMap<String, Option<String>> {
+        &self.partition_values
+    }
+
+    /// Returns a Hive-style target directory URL for this partition.
+    ///
+    /// The path uses **logical** column names for directory segments (matching Spark) and
+    /// percent-encodes special characters via [`escape_partition_value`]. Null values use
+    /// [`HIVE_DEFAULT_PARTITION`] as the directory name.
+    ///
+    /// For unpartitioned tables, returns the table root.
+    ///
+    /// Computed on each call (not cached). This is a convenience utility; the Delta protocol
+    /// does not require Hive-style paths.
+    ///
+    /// [`escape_partition_value`]: crate::partition::escape_partition_value
+    /// [`HIVE_DEFAULT_PARTITION`]: crate::partition::HIVE_DEFAULT_PARTITION
+    #[internal_api]
+    pub(crate) fn hive_style_target_dir(&self) -> Url {
+        use crate::partition::build_partition_path;
+        if self.shared.logical_partition_columns.is_empty() {
+            return self.shared.target_dir.clone();
+        }
+        // Iterate logical partition columns in metadata-defined order.
+        // Look up the physical key to find the serialized value.
+        let columns: Vec<(&str, Option<&str>)> = self
+            .shared
+            .logical_partition_columns
+            .iter()
+            .map(|logical_name| {
+                let field = self.shared.logical_schema.field(logical_name);
+                let physical_name = field
+                    .map(|f| f.physical_name(self.shared.column_mapping_mode))
+                    .unwrap_or(logical_name.as_str());
+                let value = self
+                    .partition_values
+                    .get(physical_name)
+                    .and_then(|v| v.as_deref());
+                (logical_name.as_str(), value)
+            })
+            .collect();
+        let path_suffix = build_partition_path(&columns);
+        let mut url = self.shared.target_dir.clone();
+        url.set_path(&format!("{}{}", url.path(), path_suffix));
+        url
+    }
+
+    /// Returns a unique target directory URL using a UUID.
+    ///
+    /// Returns `table_root/<uuid-v4>/`. This is an alternative to hive-style paths for
+    /// connectors that prefer flat file layouts.
+    #[internal_api]
+    pub(crate) fn unique_target_dir(&self) -> Url {
+        let uuid = uuid::Uuid::new_v4();
+        let mut url = self.shared.target_dir.clone();
+        url.set_path(&format!("{}{}/", url.path(), uuid));
+        url
     }
 
     /// Generate a new unique absolute URL for a deletion vector file.
@@ -1213,19 +1361,17 @@ impl WriteContext {
     ///
     /// * `random_prefix` - A random prefix to use for the deletion vector file name.
     ///   Making this non-empty can help distributed load on object storage when writing/reading
-    ///   to avoid throttling.  Typically a random string fo 2-4 characters is sufficient
+    ///   to avoid throttling.  Typically a random string of 2-4 characters is sufficient
     ///   for this purpose.
-    ///
     ///
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let write_context = transaction.get_write_context();
+    /// let write_context = transaction.unpartitioned_write_context()?;
     /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
-    /// // dv_url might be: s3://bucket/table/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin
     /// ```
     pub fn new_deletion_vector_path(&self, random_prefix: String) -> DeletionVectorPath {
-        DeletionVectorPath::new(self.target_dir.clone(), random_prefix)
+        DeletionVectorPath::new(self.shared.target_dir.clone(), random_prefix)
     }
 }
 
@@ -1544,7 +1690,7 @@ mod tests {
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
-        let write_context = txn.get_write_context();
+        let write_context = txn.unpartitioned_write_context()?;
 
         // Test with empty prefix
         let dv_path1 = write_context.new_deletion_vector_path(String::from(""));
@@ -1576,7 +1722,10 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
-        let write_context = txn.get_write_context();
+        let write_context = txn.partitioned_write_context(HashMap::from([(
+            "letter".to_string(),
+            crate::expressions::Scalar::String("a".into()),
+        )]))?;
         let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
 
@@ -1609,6 +1758,7 @@ mod tests {
     /// Helper: loads a test table snapshot and returns both the snapshot and its write context.
     fn snapshot_and_write_context(
         table_path: &str,
+        partition_values: HashMap<String, crate::expressions::Scalar>,
     ) -> Result<(Arc<Snapshot>, WriteContext), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
@@ -1617,7 +1767,12 @@ mod tests {
         let txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        Ok((snapshot, txn.get_write_context()))
+        let wc = if partition_values.is_empty() {
+            txn.unpartitioned_write_context()?
+        } else {
+            txn.partitioned_write_context(partition_values)?
+        };
+        Ok((snapshot, wc))
     }
 
     /// Helper: evaluates the logical-to-physical transform on the given batch and returns the
@@ -1646,8 +1801,13 @@ mod tests {
     fn test_materialize_partition_columns_in_write_context(
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Without materializePartitionColumns, partition column should be dropped
-        let (snap_without, wc_without) =
-            snapshot_and_write_context("./tests/data/basic_partitioned/")?;
+        let (snap_without, wc_without) = snapshot_and_write_context(
+            "./tests/data/basic_partitioned/",
+            HashMap::from([(
+                "letter".to_string(),
+                crate::expressions::Scalar::String("a".into()),
+            )]),
+        )?;
         let partition_cols = snap_without.table_configuration().partition_columns();
         assert_eq!(partition_cols.len(), 1);
         assert_eq!(partition_cols[0], "letter");
@@ -1665,8 +1825,13 @@ mod tests {
         );
 
         // With materializePartitionColumns, no columns should be dropped (identity transform)
-        let (snap_with, wc_with) =
-            snapshot_and_write_context("./tests/data/partitioned_with_materialize_feature/")?;
+        let (snap_with, wc_with) = snapshot_and_write_context(
+            "./tests/data/partitioned_with_materialize_feature/",
+            HashMap::from([(
+                "letter".to_string(),
+                crate::expressions::Scalar::String("a".into()),
+            )]),
+        )?;
         let partition_cols = snap_with.table_configuration().partition_columns();
         assert_eq!(partition_cols.len(), 1);
         assert_eq!(partition_cols[0], "letter");
@@ -1699,7 +1864,10 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
 
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let write_context = txn.get_write_context();
+        let write_context = txn.partitioned_write_context(HashMap::from([(
+            "letter".to_string(),
+            crate::expressions::Scalar::String("a".into()),
+        )]))?;
         let physical_schema = write_context.physical_schema();
 
         assert!(
@@ -1978,7 +2146,7 @@ mod tests {
         #[case] mode: ColumnMappingMode,
     ) -> DeltaResult<()> {
         let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
-        let write_context = txn.get_write_context();
+        let write_context = txn.unpartitioned_write_context()?;
         crate::utils::test_utils::validate_physical_schema_column_mapping(
             write_context.logical_schema(),
             write_context.physical_schema(),
@@ -2025,7 +2193,7 @@ mod tests {
     fn validate_logical_to_physical_transform(mode: ColumnMappingMode) -> DeltaResult<()> {
         let schema = test_schema_nested();
         let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
-        let write_context = txn.get_write_context();
+        let write_context = txn.unpartitioned_write_context()?;
         let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
         let logical_to_physical_expression = write_context.logical_to_physical();
@@ -2083,7 +2251,13 @@ mod tests {
         #[case] expected_partition_cols: &[&str],
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::arrow::array::Float64Array;
-        let (_snap, wc) = snapshot_and_write_context(table_path)?;
+        let (_snap, wc) = snapshot_and_write_context(
+            table_path,
+            HashMap::from([(
+                "letter".to_string(),
+                crate::expressions::Scalar::String("a".into()),
+            )]),
+        )?;
         let batch = RecordBatch::try_new(
             Arc::new(wc.logical_schema().as_ref().try_into_arrow()?),
             vec![

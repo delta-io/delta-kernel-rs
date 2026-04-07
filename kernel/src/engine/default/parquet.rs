@@ -86,7 +86,7 @@ impl DataFileMetadata {
     #[internal_api]
     pub(crate) fn as_record_batch(
         &self,
-        partition_values: &HashMap<String, String>,
+        partition_values: &HashMap<String, Option<String>>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let DataFileMetadata {
             file_meta:
@@ -110,11 +110,9 @@ impl DataFileMetadata {
         let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
         for (k, v) in partition_values {
             builder.keys().append_value(k);
-            if v.is_empty() {
-                // convert empty string to null as per the Delta Spec
-                builder.values().append_null();
-            } else {
-                builder.values().append_value(v);
+            match v {
+                Some(val) => builder.values().append_value(val),
+                None => builder.values().append_null(),
             }
         }
         builder.append(true)?;
@@ -250,7 +248,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         &self,
         path: &url::Url,
         data: Box<dyn EngineData>,
-        partition_values: HashMap<String, String>,
+        partition_values: HashMap<String, Option<String>>,
         stats_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let parquet_metadata = self
@@ -755,17 +753,17 @@ mod tests {
             ]
             .into(),
             vec![
-                Arc::new(Int64Array::from(vec![num_records as i64])),
+                Arc::new(Int64Array::from(vec![num_records])),
                 Arc::new(BooleanArray::from(vec![true])),
             ],
             None,
         )
         .unwrap();
         let data_file_metadata = DataFileMetadata::new(file_metadata, stats.clone());
-        let partition_value = if test_empty_str {
-            "".to_string()
+        let partition_value: Option<String> = if test_empty_str {
+            None // null partition value (serialize_partition_value converts "" -> None upstream)
         } else {
-            "a".to_string()
+            Some("a".to_string())
         };
         let partition_values = HashMap::from([("partition1".to_string(), partition_value)]);
         let actual = data_file_metadata

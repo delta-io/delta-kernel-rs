@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
@@ -75,13 +74,9 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
     )?;
 
     let engine_arc = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = txn.unpartitioned_write_context()?;
     let add_files_metadata = engine_arc
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            write_context.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
 
     txn.add_files(add_files_metadata);
