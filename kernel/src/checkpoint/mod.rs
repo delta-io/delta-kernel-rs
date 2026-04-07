@@ -715,7 +715,7 @@ impl CheckpointWriter {
 
             let is_exhausted = splitter
                 .lock()
-                .map_err(|e| Error::generic(format!("sidecar splitter lock poisoned: {e}")))?
+                .map_err(|e| Error::internal_error(format!("sidecar splitter lock poisoned: {e}")))?
                 .is_exhausted();
             if is_exhausted {
                 break;
@@ -725,7 +725,7 @@ impl CheckpointWriter {
         // Collect non-file batches
         let non_file_batches = splitter
             .lock()
-            .map_err(|e| Error::generic(format!("sidecar splitter lock poisoned: {e}")))?
+            .map_err(|e| Error::internal_error(format!("sidecar splitter lock poisoned: {e}")))?
             .take_non_file_batches();
 
         // Create sidecar action rows for the main checkpoint file

@@ -564,8 +564,9 @@ impl Snapshot {
     ///
     /// # Parameters
     /// - `engine`: Engine for data processing and I/O
-    /// - `spec`: Checkpoint format specification. `None` uses the default single-file
-    ///   checkpoint (auto-detecting V1/V2 from table features).
+    /// - `spec`: Checkpoint format specification. `None` uses the default checkpoint
+    ///   settings (auto-detecting V1/V2 from table features). For V2 checkpoints, the
+    ///   default is to not write sidecar files.
     ///
     /// # Errors
     /// - If `CheckpointSpec::V2` is used but the table does not support the `v2Checkpoint`
@@ -606,19 +607,11 @@ impl Snapshot {
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
                 file_actions_per_sidecar_hint,
             })) => {
-                if file_actions_per_sidecar_hint == &Some(0) {
-                    return Err(Error::checkpoint_write(
-                        "file_actions_per_sidecar_hint must be greater than 0",
-                    ));
-                }
                 let hint =
                     file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
                 writer.write_checkpoint_with_sidecars(engine, hint)
             }
-            _ => {
-                // V1, V2::NoSidecar, or None (auto-detect) all use single-file path
-                writer.write_checkpoint_without_sidecars(engine)
-            }
+            _ => writer.write_checkpoint_without_sidecars(engine),
         }
     }
 

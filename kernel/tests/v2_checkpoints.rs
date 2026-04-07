@@ -12,7 +12,7 @@ use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Snapshot};
 
 mod common;
 
@@ -465,7 +465,7 @@ async fn v2_table_with_domain_metadata<E: delta_kernel::engine::default::executo
 }
 
 /// Extracts a named struct column from a `RecordBatch`, panicking if missing or wrong type.
-fn get_struct_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a StructArray {
+fn get_struct_column_from_record_batch<'a>(batch: &'a RecordBatch, name: &str) -> &'a StructArray {
     batch
         .column_by_name(name)
         .unwrap_or_else(|| panic!("batch should have column '{name}'"))
@@ -480,7 +480,7 @@ fn valid_row_indices(col: &dyn Array, num_rows: usize) -> Vec<usize> {
 }
 
 /// Extracts a named struct sub-column from a `StructArray`, panicking if missing or wrong type.
-fn get_nested_struct_column<'a>(parent: &'a StructArray, name: &str) -> &'a StructArray {
+fn get_struct_column_from_struct_array<'a>(parent: &'a StructArray, name: &str) -> &'a StructArray {
     parent
         .column_by_name(name)
         .unwrap_or_else(|| panic!("struct should have field '{name}'"))
@@ -490,7 +490,7 @@ fn get_nested_struct_column<'a>(parent: &'a StructArray, name: &str) -> &'a Stru
 }
 
 /// Lists all sidecar parquet files in the `_sidecars` directory.
-fn read_sidecar_parquet_files(sidecars_dir: &std::path::Path) -> Vec<std::fs::DirEntry> {
+fn list_sidecar_parquet_files(sidecars_dir: &std::path::Path) -> Vec<std::fs::DirEntry> {
     std::fs::read_dir(sidecars_dir)
         .expect("failed to list sidecars dir")
         .filter_map(|e| e.ok())
@@ -504,6 +504,7 @@ fn assert_sidecar_actions_match_disk(
     sidecar_col: &StructArray,
     sidecar_rows: &[usize],
     table_path: &str,
+    engine: &dyn Engine,
 ) {
     let sidecar_path_col = sidecar_col
         .column_by_name("path")
@@ -514,7 +515,10 @@ fn assert_sidecar_actions_match_disk(
     let sidecar_mtime_col = sidecar_col
         .column_by_name("modificationTime")
         .expect("sidecar should have modificationTime field");
-    let sidecars_dir = std::path::Path::new(table_path).join("_delta_log/_sidecars");
+    let sidecars_base = delta_kernel::try_parse_uri(table_path)
+        .unwrap()
+        .join("_delta_log/_sidecars/")
+        .unwrap();
 
     for &row in sidecar_rows {
         let path = sidecar_path_col.as_string::<i32>().value(row);
@@ -523,29 +527,25 @@ fn assert_sidecar_actions_match_disk(
             "sidecar path should be a parquet file, got: {path}"
         );
 
-        let file_meta = std::fs::metadata(sidecars_dir.join(path))
-            .unwrap_or_else(|e| panic!("sidecar file {path} should exist on disk: {e}"));
+        let sidecar_url = sidecars_base.join(path).unwrap();
+        let file_meta = engine
+            .storage_handler()
+            .head(&sidecar_url)
+            .unwrap_or_else(|e| panic!("sidecar file {path} should exist: {e}"));
 
         let recorded_size = sidecar_size_col
             .as_primitive::<delta_kernel::arrow::datatypes::Int64Type>()
             .value(row);
         assert_eq!(
-            recorded_size,
-            file_meta.len() as i64,
+            recorded_size, file_meta.size as i64,
             "sidecar sizeInBytes should match actual file size for {path}"
         );
 
         let recorded_mtime = sidecar_mtime_col
             .as_primitive::<delta_kernel::arrow::datatypes::Int64Type>()
             .value(row);
-        let file_mtime_ms = file_meta
-            .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
         assert_eq!(
-            recorded_mtime, file_mtime_ms,
+            recorded_mtime, file_meta.last_modified,
             "sidecar modificationTime should match actual file mtime for {path}"
         );
     }
@@ -557,7 +557,7 @@ fn assert_sidecar_actions_match_disk(
 fn assert_sidecars_contain_only_file_actions(
     sidecars_dir: &std::path::Path,
 ) -> Vec<(usize, usize)> {
-    let sidecar_files = read_sidecar_parquet_files(sidecars_dir);
+    let sidecar_files = list_sidecar_parquet_files(sidecars_dir);
     assert!(
         !sidecar_files.is_empty(),
         "should have at least one sidecar parquet file in _delta_log/_sidecars/"
@@ -655,7 +655,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     }
 
     // Validate sidecar actions in the main checkpoint
-    let sidecar_col = get_struct_column(&ckpt_batch, "sidecar");
+    let sidecar_col = get_struct_column_from_record_batch(&ckpt_batch, "sidecar");
     let sidecar_rows = valid_row_indices(sidecar_col, ckpt_batch.num_rows());
     // 1 sidecar for the bulk-remove batch (8 removes) + 4 sidecars for adds (2 each)
     assert_eq!(
@@ -664,11 +664,11 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
         "checkpoint should contain 5 sidecar action rows"
     );
 
-    assert_sidecar_actions_match_disk(sidecar_col, &sidecar_rows, &table_path);
+    assert_sidecar_actions_match_disk(sidecar_col, &sidecar_rows, &table_path, engine.as_ref());
 
     // Main checkpoint must NOT contain add/remove actions (they live in sidecars)
     for action in ["add", "remove"] {
-        let col = get_struct_column(&ckpt_batch, action);
+        let col = get_struct_column_from_record_batch(&ckpt_batch, action);
         let rows = valid_row_indices(col, ckpt_batch.num_rows());
         assert!(
             rows.is_empty(),
@@ -689,7 +689,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     );
 
     // Validate checkpointMetadata action
-    let ckpt_meta_col = get_struct_column(&ckpt_batch, "checkpointMetadata");
+    let ckpt_meta_col = get_struct_column_from_record_batch(&ckpt_batch, "checkpointMetadata");
     let ckpt_meta_rows = valid_row_indices(ckpt_meta_col, ckpt_batch.num_rows());
     assert_eq!(
         ckpt_meta_rows.len(),
@@ -708,7 +708,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     );
 
     // Validate domainMetadata actions: exactly 3 (app.settings, app.feature_flags, app.analytics)
-    let dm_col = get_struct_column(&ckpt_batch, "domainMetadata");
+    let dm_col = get_struct_column_from_record_batch(&ckpt_batch, "domainMetadata");
     let dm_rows = valid_row_indices(dm_col, ckpt_batch.num_rows());
     assert_eq!(
         dm_rows.len(),
@@ -859,7 +859,7 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
     );
 
     // === Read sidecar files and validate stats_parsed / partitionValues_parsed ===
-    let sidecar_files = read_sidecar_parquet_files(&sidecars_dir);
+    let sidecar_files = list_sidecar_parquet_files(&sidecars_dir);
 
     let mut all_record_counts = Vec::new();
     let mut all_part_values = Vec::new();
@@ -868,13 +868,13 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
 
     for sidecar_entry in &sidecar_files {
         let sidecar_batch = read_parquet_file(&sidecar_entry.path());
-        let add_col = get_struct_column(&sidecar_batch, "add");
+        let add_col = get_struct_column_from_record_batch(&sidecar_batch, "add");
         let add_rows = valid_row_indices(add_col, sidecar_batch.num_rows());
         if add_rows.is_empty() {
             continue;
         }
 
-        let stats_parsed = get_nested_struct_column(add_col, "stats_parsed");
+        let stats_parsed = get_struct_column_from_struct_array(add_col, "stats_parsed");
 
         let num_records_col = stats_parsed
             .column_by_name("numRecords")
@@ -887,7 +887,7 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
             );
         }
 
-        let min_values = get_nested_struct_column(stats_parsed, "minValues");
+        let min_values = get_struct_column_from_struct_array(stats_parsed, "minValues");
         let min_id_col = min_values
             .column_by_name("id")
             .expect("minValues should have id");
@@ -899,7 +899,7 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
             );
         }
 
-        let max_values = get_nested_struct_column(stats_parsed, "maxValues");
+        let max_values = get_struct_column_from_struct_array(stats_parsed, "maxValues");
         let max_id_col = max_values
             .column_by_name("id")
             .expect("maxValues should have id");
@@ -911,7 +911,7 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
             );
         }
 
-        let pv_parsed = get_nested_struct_column(add_col, "partitionValues_parsed");
+        let pv_parsed = get_struct_column_from_struct_array(add_col, "partitionValues_parsed");
         let part_key_col = pv_parsed
             .column_by_name("part_key")
             .expect("partitionValues_parsed should have part_key field");
