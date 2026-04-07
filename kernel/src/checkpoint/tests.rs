@@ -758,6 +758,49 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
     Ok(())
 }
 
+/// Verifies that `finalize` does NOT overwrite the `_last_checkpoint` hint file when the
+/// snapshot's `last_checkpoint_metadata` already records a version >= the checkpoint being written.
+/// This prevents a concurrent or time-traveled checkpoint from regressing the hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer() -> DeltaResult<()>
+{
+    let (store, _) = new_in_memory_store();
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_task_executor(executor)
+        .build();
+
+    // Version 0
+    write_commit_to_store(
+        &store,
+        vec![create_metadata_action(), create_basic_protocol_action()],
+        0,
+    )
+    .await?;
+
+    // Version 1
+    write_commit_to_store(&store, vec![create_add_action("file1.parquet")], 1).await?;
+
+    // Version 2
+    write_commit_to_store(&store, vec![create_add_action("file2.parquet")], 2).await?;
+
+    // Checkpoint at version 2
+    let table_root = Url::parse("memory:///")?;
+    let snapshot_v2 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    assert_eq!(snapshot_v2.version(), 2);
+    snapshot_v2.checkpoint(&engine)?;
+    assert_last_checkpoint_contents(&store, 2, 4, 2, 12984).await?;
+
+    // Time-travel to version 1 and writing a checkpoint should not override _last_checkpoint
+    let snapshot_v1 = Snapshot::builder_for(table_root)
+        .at_version(1)
+        .build(&engine)?;
+    snapshot_v1.checkpoint(&engine)?;
+    assert_last_checkpoint_contents(&store, 2, 4, 2, 12984).await
+}
+
 // TODO: Add test that checkpoint does not contain tombstoned domain metadata.
 
 /// Helper to create metadata action with specific stats settings

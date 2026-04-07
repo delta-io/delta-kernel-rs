@@ -89,6 +89,8 @@
 //   multi-file support, but the current implementation only supports single-file checkpoints.
 use std::sync::{Arc, LazyLock, OnceLock};
 
+use tracing::info;
+
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
 };
@@ -418,6 +420,19 @@ impl CheckpointWriter {
             return Err(Error::checkpoint_write(
                 "The checkpoint data iterator must be fully consumed and written to storage before calling finalize"
             ));
+        }
+
+        // Skip writing `_last_checkpoint` if the existing hint already points to a checkpoint
+        // at the same or newer version, to avoid regressing the hint.
+        if let Some(lcp) = &self.snapshot.log_segment().last_checkpoint_metadata {
+            if lcp.version >= self.snapshot.version() {
+                info!(
+                    "Skipping _last_checkpoint write: existing hint version {} >= checkpoint version {}",
+                    lcp.version,
+                    self.snapshot.version()
+                );
+                return Ok(());
+            }
         }
 
         let size_in_bytes = i64::try_from(metadata.size).map_err(|e| {
