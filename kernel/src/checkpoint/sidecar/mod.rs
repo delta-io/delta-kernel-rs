@@ -206,7 +206,7 @@ pub(super) struct SingleSidecarDataIterator {
 }
 
 impl SingleSidecarDataIterator {
-    pub(super) fn new(splitter: Arc<Mutex<SidecarSplitter>>, max_file_actions: usize) -> Self {
+    pub(super) fn new(splitter: Arc<Mutex<SidecarSplitter>>, max_file_actions_hint: usize) -> Self {
         Self {
             splitter,
             max_file_actions_hint: max_file_actions,
