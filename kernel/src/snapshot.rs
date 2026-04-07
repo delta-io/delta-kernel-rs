@@ -2386,10 +2386,7 @@ mod tests {
 
     #[test]
     fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
-        let table = TestTableBuilder::new()
-            .log_state(LogState::commits(1))
-            .build()
-            .map_err(|e| Error::generic(e.to_string()))?;
+        let table = TestTableBuilder::new().build().unwrap();
         let engine = DefaultEngineBuilder::new(table.store().clone()).build();
 
         let base_snapshot = Snapshot::builder_for(table.table_root())

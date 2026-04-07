@@ -1,10 +1,9 @@
 //! A composable test table builder for delta-kernel-rs.
 //!
-//! Provides four orthogonal axes for parameterized testing:
+//! Provides three orthogonal axes for parameterized testing:
 //! - [`LogState`] -- what log files exist on disk (commits, checkpoints, CRC)
 //! - [`FeatureSet`] -- which Delta table features are enabled
 //! - [`VersionTarget`] -- how the snapshot is loaded (latest, time travel, incremental)
-//! - [`PartitionConfig`] -- partition column configuration
 //!
 //! # Quick start
 //!
@@ -40,9 +39,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::default::executor::tokio::{
-    TokioBackgroundExecutor, TokioMultiThreadExecutor,
-};
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::DynObjectStore;
@@ -65,16 +62,16 @@ pub enum LogState {
 impl LogState {
     /// Table with `n` total versions as JSON commit files.
     ///
-    /// `n` must be >= 1. Version 0 is the create-table commit. For example, `commits(3)`
-    /// produces versions 0, 1, 2 where version 0 has only metadata and versions 1-2 have
-    /// data files.
+    /// `n` must be >= 1. Version 0 is a metadata-only create-table commit (not CTAS).
+    /// For example, `commits(3)` produces versions 0, 1, 2 where version 0 has only
+    /// metadata and versions 1-2 contain data.
     pub fn commits(n: u64) -> Self {
         assert!(n >= 1, "commits() requires at least 1 version (the create-table commit)");
         LogState::CommitsOnly { num_commits: n }
     }
 
-    /// Total number of versions in this log state.
-    pub(crate) fn total_versions(&self) -> u64 {
+    /// Number of commit files on disk (versions 0 through `num_versions - 1`).
+    pub(crate) fn num_versions(&self) -> u64 {
         match self {
             LogState::CommitsOnly { num_commits } => *num_commits,
         }
@@ -141,11 +138,8 @@ impl fmt::Display for FeatureSet {
 
 /// How the snapshot should be loaded from the built table.
 ///
-/// Designed for use as an rstest `#[values]` parameter. Use [`build_snapshot`] to load a
-/// snapshot according to this target, or define a local fixture in `kernel/src/` tests
-/// (see module-level docs for an example).
-///
-/// [`build_snapshot`]: VersionTarget::build_snapshot
+/// Designed for use as an rstest `#[values]` parameter. Use the [`build_snapshot!`] macro
+/// or [`test_context!`] macro to load a snapshot according to this target.
 #[derive(Clone, Debug)]
 pub enum VersionTarget {
     /// Load the latest version.
@@ -154,38 +148,8 @@ pub enum VersionTarget {
     AtVersion(u64),
     /// Load at `from`, then incrementally update to `to`.
     Incremental { from: u64, to: u64 },
-}
-
-impl VersionTarget {
-    /// Load a snapshot from the given table root according to this target.
-    ///
-    /// Returns test_utils's `Snapshot` type. For unit tests inside `kernel/src/`, define
-    /// a local fixture instead (see module-level docs).
-    pub fn build_snapshot(
-        &self,
-        table_root: &str,
-        engine: &impl delta_kernel::Engine,
-    ) -> Arc<Snapshot> {
-        match self {
-            VersionTarget::Latest => Snapshot::builder_for(table_root)
-                .build(engine)
-                .expect("failed to load latest snapshot"),
-            VersionTarget::AtVersion(v) => Snapshot::builder_for(table_root)
-                .at_version(*v)
-                .build(engine)
-                .expect("failed to load snapshot at version"),
-            VersionTarget::Incremental { from, to } => {
-                let base = Snapshot::builder_for(table_root)
-                    .at_version(*from)
-                    .build(engine)
-                    .expect("failed to load base snapshot");
-                Snapshot::builder_from(base)
-                    .at_version(*to)
-                    .build(engine)
-                    .expect("failed to load incremental snapshot")
-            }
-        }
-    }
+    /// Load at `from`, then incrementally update to latest.
+    IncrementalToLatest { from: u64 },
 }
 
 impl fmt::Display for VersionTarget {
@@ -195,6 +159,9 @@ impl fmt::Display for VersionTarget {
             VersionTarget::AtVersion(v) => write!(f, "at_version({v})"),
             VersionTarget::Incremental { from, to } => {
                 write!(f, "incremental({from}->{to})")
+            }
+            VersionTarget::IncrementalToLatest { from } => {
+                write!(f, "incremental({from}->latest)")
             }
         }
     }
@@ -212,7 +179,7 @@ impl fmt::Display for VersionTarget {
 pub struct TestTableBuilder {
     log_state: LogState,
     features: FeatureSet,
-    schema: Option<SchemaRef>,
+    schema: SchemaRef,
 }
 
 impl Default for TestTableBuilder {
@@ -227,7 +194,7 @@ impl TestTableBuilder {
         Self {
             log_state: LogState::commits(1),
             features: FeatureSet::empty(),
-            schema: None,
+            schema: default_schema(),
         }
     }
 
@@ -245,28 +212,16 @@ impl TestTableBuilder {
 
     /// Override the default schema.
     pub fn schema(mut self, s: SchemaRef) -> Self {
-        self.schema = Some(s);
+        self.schema = s;
         self
     }
 
     /// Build the table and return a [`TestTable`] handle to the store.
     pub fn build(self) -> DeltaResult<TestTable> {
-        tokio::runtime::Runtime::new()
-            .map_err(|e| delta_kernel::Error::generic(e.to_string()))?
-            .block_on(self.build_async())
-    }
-
-    async fn build_async(self) -> DeltaResult<TestTable> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine = Arc::new(
-            DefaultEngineBuilder::new(store.clone())
-                .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
-                    tokio::runtime::Handle::current(),
-                )))
-                .build(),
-        );
-        let schema = self.schema.clone().unwrap_or_else(default_schema);
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let schema = self.schema;
 
         // Version 0: CreateTable
         let mut builder = create_table(table_root, schema, "TestTableBuilder/1.0");
@@ -279,13 +234,13 @@ impl TestTableBuilder {
             );
         }
         let committed = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
             .unwrap_committed();
         let mut snapshot = committed.post_commit_snapshot().unwrap().clone();
 
         // Data commits (versions 1..N)
-        let total = self.log_state.total_versions();
+        let total = self.log_state.num_versions();
         for _v in 1..total {
             let result = write_empty_commit(snapshot.clone(), &engine)?;
             snapshot = result
@@ -310,12 +265,12 @@ impl TestTableBuilder {
 /// Write an empty commit (no data files) using kernel's transaction path.
 fn write_empty_commit(
     snapshot: Arc<Snapshot>,
-    engine: &Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+    engine: &dyn delta_kernel::Engine,
 ) -> DeltaResult<delta_kernel::transaction::CommitResult> {
     let txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_operation("WRITE".to_string());
-    txn.commit(engine.as_ref())
+    txn.commit(engine)
 }
 
 // ===========================================================================
@@ -371,12 +326,9 @@ impl fmt::Display for TestTable {
 // rstest fixtures
 // ===========================================================================
 
-/// Build a [`TestTable`] from a `log_state` and `feature_set`.
-///
-/// Designed for use as an rstest fixture. In an rstest test, declare `log_state: LogState`
-/// and `feature_set: FeatureSet` with `#[values(...)]`, then add `table: TestTable` as a
-/// parameter -- rstest will auto-inject it using this function.
-pub fn table(log_state: LogState, feature_set: FeatureSet) -> TestTable {
+/// Convenience wrapper: build a [`TestTable`] from a `log_state` and `feature_set`.
+/// Used by the [`test_context!`] macro and available for direct use in tests.
+pub fn test_table(log_state: LogState, feature_set: FeatureSet) -> TestTable {
     TestTableBuilder::new()
         .log_state(log_state)
         .features(feature_set)
@@ -416,6 +368,15 @@ macro_rules! build_snapshot {
                     .build($engine)
                     .unwrap()
             }
+            $crate::table_builder::VersionTarget::IncrementalToLatest { from } => {
+                let base = Snapshot::builder_for($table_root)
+                    .at_version(*from)
+                    .build($engine)
+                    .unwrap();
+                Snapshot::builder_from(base)
+                    .build($engine)
+                    .unwrap()
+            }
         }
     };
 }
@@ -433,7 +394,7 @@ macro_rules! build_snapshot {
 #[macro_export]
 macro_rules! test_context {
     ($log_state:expr, $feature_set:expr, $version_target:expr) => {{
-        let table = $crate::table_builder::table($log_state, $feature_set);
+        let table = $crate::table_builder::test_table($log_state, $feature_set);
         let engine = DefaultEngineBuilder::new(table.store().clone()).build();
         let snap = $crate::build_snapshot!($version_target, table.table_root(), &engine);
         (engine, snap, table)
@@ -503,7 +464,7 @@ mod tests {
         let (_engine, snap, _table) =
             test_context!(log_state, feature_set, version_target);
         let expected = match &version_target {
-            VersionTarget::Latest => 4,
+            VersionTarget::Latest | VersionTarget::IncrementalToLatest { .. } => 4,
             VersionTarget::AtVersion(v) => *v,
             VersionTarget::Incremental { to, .. } => *to,
         };
