@@ -758,9 +758,6 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
     Ok(())
 }
 
-/// Verifies that `finalize` does NOT overwrite the `_last_checkpoint` hint file when the
-/// snapshot's `last_checkpoint_metadata` already records a version >= the checkpoint being written.
-/// This prevents a concurrent or time-traveled checkpoint from regressing the hint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer() -> DeltaResult<()>
 {

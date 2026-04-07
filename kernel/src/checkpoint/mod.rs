@@ -422,14 +422,15 @@ impl CheckpointWriter {
             ));
         }
 
-        // Skip writing `_last_checkpoint` if the existing hint already points to a checkpoint
-        // at the same or newer version, to avoid regressing the hint.
+        // Skip writing `_last_checkpoint` if the existing hint already points to a newer
+        // checkpoint, to avoid regressing the hint.
+        let checkpoint_version = self.snapshot.version();
         if let Some(lcp) = &self.snapshot.log_segment().last_checkpoint_metadata {
-            if lcp.version >= self.snapshot.version() {
+            if lcp.version > checkpoint_version {
                 info!(
-                    "Skipping _last_checkpoint write: existing hint version {} >= checkpoint version {}",
-                    lcp.version,
-                    self.snapshot.version()
+                    hint_version = lcp.version,
+                    checkpoint_version,
+                    "Skipping _last_checkpoint write: existing hint is newer than checkpoint"
                 );
                 return Ok(());
             }

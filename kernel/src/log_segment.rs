@@ -124,7 +124,7 @@ pub(crate) struct LogSegment {
     pub end_version: Version,
     pub checkpoint_version: Option<Version>,
     pub log_root: Url,
-    /// Metadata from the `_last_checkpoint` hint file
+    /// Metadata from the `_last_checkpoint` hint file.
     pub last_checkpoint_metadata: Option<LastCheckpointMetadata>,
     /// The set of log files found during listing.
     pub listed: LogSegmentFiles,
