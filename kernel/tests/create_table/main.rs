@@ -352,6 +352,7 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
 // WriterOnly features (EnabledIf -- feature signal alone does not enable)
 #[case("appendOnly", TableFeature::AppendOnly, false, false)]
 #[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false)]
+#[case("rowTracking", TableFeature::RowTracking, false, false)]
 fn test_create_table_with_feature_signal(
     #[case] feature_name: &str,
     #[case] feature: TableFeature,
@@ -433,6 +434,7 @@ fn test_create_table_with_checkpoint_stats_properties(
 // WriterOnly features
 #[case("delta.enableChangeDataFeed", TableFeature::ChangeDataFeed, false)]
 #[case("delta.appendOnly", TableFeature::AppendOnly, false)]
+#[case("delta.enableRowTracking", TableFeature::RowTracking, false)]
 fn test_create_table_with_enablement_property(
     #[case] property: &str,
     #[case] feature: TableFeature,

@@ -181,10 +181,11 @@ fn add_feature_to_lists(
     }
 }
 
-/// Configures clustering support for table creation (used by unit tests).
+/// Configures clustering support for table creation.
 ///
-/// Validates clustering columns, adds the `ClusteredTable` feature, and creates the domain
-/// metadata action.
+/// Validates clustering columns, adds the `DomainMetadata` and `ClusteredTable` features, and
+/// creates the domain metadata action.
+#[cfg(test)]
 fn apply_clustering_for_table_create(
     logical_schema: &SchemaRef,
     logical_columns: &[ColumnName],
@@ -390,8 +391,12 @@ fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProp
 ///
 /// Dependencies are resolved transitively: if feature A requires B and B requires C, all
 /// three will be present after this call.
+///
+/// Note: cycles in [`FeatureRequirement::Supported`] chains (feature A requires B, B requires A)
+/// would cause an infinite loop. The feature dependency graph must remain acyclic.
 fn resolve_feature_dependencies(validated: &mut ValidatedTableProperties) {
     loop {
+        let before = validated.writer_features.len() + validated.reader_features.len();
         let deps: Vec<TableFeature> = validated
             .writer_features
             .iter()
@@ -402,18 +407,14 @@ fn resolve_feature_dependencies(validated: &mut ValidatedTableProperties) {
                 _ => None,
             })
             .collect();
-
-        let mut changed = false;
         for dep in deps {
-            let before = validated.writer_features.len() + validated.reader_features.len();
             add_feature_to_lists(
                 dep,
                 &mut validated.reader_features,
                 &mut validated.writer_features,
             );
-            changed |= validated.writer_features.len() + validated.reader_features.len() != before;
         }
-        if !changed {
+        if validated.writer_features.len() + validated.reader_features.len() == before {
             break;
         }
     }
