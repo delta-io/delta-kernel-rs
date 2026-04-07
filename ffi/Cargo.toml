@@ -49,7 +49,6 @@ rstest = "0.23"
 default = ["default-engine-rustls", "arrow"]
 default-engine-native-tls = ["delta_kernel/default-engine-native-tls", "default-engine-base"]
 default-engine-rustls = ["delta_kernel/default-engine-rustls", "default-engine-base"]
-catalog-managed = ["delta_kernel/catalog-managed"]
 delta-kernel-unity-catalog = [ "dep:delta-kernel-unity-catalog", "dep:unity-catalog-delta-client-api" ]
 arrow = ["arrow-57"]
 arrow-57 = ["delta_kernel/arrow-57"]

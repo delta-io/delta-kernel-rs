@@ -505,13 +505,7 @@ impl<S> Transaction<S> {
         is_create: bool,
         table_config: &crate::table_configuration::TableConfiguration,
     ) -> CommitType {
-        #[cfg(feature = "catalog-managed")]
         let is_catalog_managed = table_config.is_catalog_managed();
-        #[cfg(not(feature = "catalog-managed"))]
-        let is_catalog_managed = {
-            let _ = table_config;
-            false
-        };
 
         // TODO: Handle UpgradeToCatalogManaged and DowngradeToPathBased when ALTER TABLE
         // SET TBLPROPERTIES is supported.
@@ -1419,10 +1413,8 @@ mod tests {
     }
 
     /// A mock catalog committer, used to test catalog committer validation.
-    #[cfg(feature = "catalog-managed")]
     struct MockCatalogCommitter;
 
-    #[cfg(feature = "catalog-managed")]
     impl Committer for MockCatalogCommitter {
         fn commit(
             &self,
@@ -2287,7 +2279,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "catalog-managed")]
     #[test]
     fn disallow_catalog_committer_for_non_catalog_managed_table() {
         let storage = Arc::new(InMemory::new());
@@ -2321,7 +2312,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "catalog-managed")]
     #[test]
     fn disallow_catalog_committer_for_non_catalog_managed_create_table() {
         let storage = Arc::new(InMemory::new());
