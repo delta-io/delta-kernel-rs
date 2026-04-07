@@ -117,7 +117,7 @@ use url::Url;
 
 mod checkpoint_transform;
 #[allow(unused)]
-// The mod will be used in the PR officially provides sidecar support.
+// Used once sidecar checkpoint writing is enabled
 mod sidecar;
 
 use checkpoint_transform::{
