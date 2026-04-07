@@ -7,7 +7,6 @@ use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
@@ -17,7 +16,9 @@ use delta_kernel::{DeltaResult, Snapshot};
 
 mod common;
 
-use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
 use itertools::Itertools;
 use test_utils::{
     insert_data, load_test_data, read_scan, test_table_setup_mt, write_batch_to_table,
@@ -327,7 +328,7 @@ fn read_parquet_file(path: &std::path::Path) -> RecordBatch {
 }
 
 /// Finds the checkpoint parquet file in the `_delta_log` directory for a given version.
-fn find_checkpoint_file(table_path: &str, version: u64) -> std::path::PathBuf {
+fn load_checkpoint_path(table_path: &str, version: u64) -> std::path::PathBuf {
     let log_dir = std::path::Path::new(table_path).join("_delta_log");
     let prefix = format!("{version:020}.checkpoint");
     for entry in std::fs::read_dir(&log_dir).expect("failed to read _delta_log") {
@@ -347,22 +348,39 @@ fn read_last_checkpoint(table_path: &str) -> serde_json::Value {
     serde_json::from_str(&content).expect("failed to parse _last_checkpoint JSON")
 }
 
-/// E2e test: create a v2 table with domain metadata, write checkpoint with sidecars,
-/// validate `_last_checkpoint`, read the raw checkpoint parquet to verify sidecar action
-/// rows and non-file actions (protocol, metadata, domainMetadata, checkpointMetadata),
-/// then scan to verify data correctness.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_checkpoint_with_domain_metadata_and_sidecars() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+/// Creates a v2Checkpoint + domainMetadata table with a nested schema (`id: int`,
+/// `info: struct { name: string }`). Inserts 8 files across several commits, removes all of
+/// them, adds domain metadata (with a update for same domain), then inserts 8 fresh files.
+/// Returns the final snapshot. The table should have 8 live adds and 8 remove tombstones.
+async fn v2_table_with_domain_metadata<E: delta_kernel::engine::default::executor::TaskExecutor>(
+    table_path: &str,
+    table_url: &url::Url,
+    engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
+) -> DeltaResult<Arc<Snapshot>> {
+    fn make_info_array(names: &[&str]) -> ArrayRef {
+        let name_array: ArrayRef = Arc::new(StringArray::from(
+            names.iter().map(|s| Some(*s)).collect::<Vec<_>>(),
+        ));
+        let field = Arc::new(ArrowField::new("name", ArrowDataType::Utf8, true));
+        Arc::new(StructArray::from(vec![(field, name_array)]))
+    }
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "value",
-        DataType::INTEGER,
-    )])?);
+    fn make_columns(id: i32, name: &str) -> Vec<ArrayRef> {
+        vec![
+            Arc::new(Int32Array::from(vec![id])) as ArrayRef,
+            make_info_array(&[name]),
+        ]
+    }
 
-    // Create table with v2Checkpoint + domainMetadata features
-    let _ = create_table(&table_path, schema.clone(), "Test/1.0")
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "info",
+            DataType::try_struct_type([StructField::nullable("name", DataType::STRING)])?,
+        ),
+    ])?);
+
+    let _ = create_table(table_path, schema.clone(), "Test/1.0")
         .with_table_properties([
             ("delta.feature.v2Checkpoint", "supported"),
             ("delta.feature.domainMetadata", "supported"),
@@ -370,172 +388,123 @@ async fn test_v2_checkpoint_with_domain_metadata_and_sidecars() -> DeltaResult<(
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
-    // Commit 1: insert data
-    let snapshot0 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let result = insert_data(
-        snapshot0,
-        &engine,
-        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-    )
-    .await?;
-    let CommitResult::CommittedTransaction(committed) = result else {
-        panic!("Expected CommittedTransaction");
-    };
+    // Insert 8 files (one per commit) -> ids 1..=8
+    let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let names = ["alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi"];
+    for (i, name) in names.iter().enumerate() {
+        snapshot = insert_data(snapshot, engine, make_columns(i as i32 + 1, name))
+            .await?
+            .unwrap_committed()
+            .post_commit_snapshot()
+            .expect("expected post-commit snapshot")
+            .clone();
+    }
 
-    // Commit 2: insert more data with domain metadata
-    let snapshot1 = committed
-        .post_commit_snapshot()
-        .expect("expected post-commit snapshot")
-        .clone();
-    let mut txn = snapshot1
+    // Domain metadata commit (no data) -- exercises the empty-file-batch skip path in the
+    // sidecar splitter. Sets two domains initially.
+    snapshot = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_operation("WRITE".to_string())
-        .with_data_change(true);
-    txn = txn
         .with_domain_metadata("app.settings".to_string(), r#"{"version":1}"#.to_string())
         .with_domain_metadata(
             "app.feature_flags".to_string(),
             r#"{"dark_mode":true}"#.to_string(),
-        );
-    let write_context = txn.get_write_context();
-    let arrow_schema = ArrowSchema::try_from_kernel(schema.as_ref()).unwrap();
-    let batch = RecordBatch::try_new(
-        Arc::new(arrow_schema),
-        vec![Arc::new(Int32Array::from(vec![4, 5])) as ArrayRef],
-    )
-    .unwrap();
-    let add_meta = engine
-        .write_parquet(&ArrowEngineData::new(batch), &write_context, HashMap::new())
-        .await?;
-    txn.add_files(add_meta);
-    let result2 = txn.commit(engine.as_ref())?;
-    let CommitResult::CommittedTransaction(committed2) = result2 else {
-        panic!("Expected CommittedTransaction");
-    };
-    let snapshot2 = committed2
+        )
+        .commit(engine.as_ref())?
+        .unwrap_committed()
         .post_commit_snapshot()
         .expect("expected post-commit snapshot")
         .clone();
 
-    // Commit 3: domain metadata only (no data). During reconciliation this batch has no
-    // file actions, exercising the zero-selected / empty-file-batch skip path in the
-    // sidecar splitter.
-    let txn3 = snapshot2
+    // Another domain metadata commit -- updates "app.settings" to verify reconciliation
+    // picks the latest value, and adds a new domain.
+    snapshot = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_domain_metadata(
             "app.analytics".to_string(),
             r#"{"tracking":false}"#.to_string(),
-        );
-    let result3 = txn3.commit(engine.as_ref())?;
-    let CommitResult::CommittedTransaction(committed3) = result3 else {
-        panic!("Expected CommittedTransaction");
-    };
-    let snapshot3 = committed3
+        )
+        .with_domain_metadata(
+            "app.settings".to_string(),
+            r#"{"version":2}"#.to_string(),
+        )
+        .commit(engine.as_ref())?
+        .unwrap_committed()
         .post_commit_snapshot()
         .expect("expected post-commit snapshot")
         .clone();
 
-    // Write V2 checkpoint with sidecars at version 3
-    let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
-        file_actions_per_sidecar_hint: Some(1), // force small sidecars
-    });
-    snapshot3.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&checkpoint_spec))?;
+    // Remove all 8 files -> 8 remove tombstones
+    let scan = snapshot.clone().scan_builder().build()?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("DELETE".to_string())
+        .with_data_change(true);
+    for sm in scan.scan_metadata(engine.as_ref())? {
+        txn.remove_files(sm?.scan_files);
+    }
+    snapshot = txn
+        .commit(engine.as_ref())?
+        .unwrap_committed()
+        .post_commit_snapshot()
+        .expect("expected post-commit snapshot")
+        .clone();
 
-    // === Validate _last_checkpoint (all kernel-supported fields) ===
-    let last_ckpt = read_last_checkpoint(&table_path);
-    assert_eq!(
-        last_ckpt["version"], 3,
-        "_last_checkpoint should be at version 3"
-    );
-    assert!(
-        last_ckpt["size"].as_i64().unwrap() > 0,
-        "_last_checkpoint size (action count) should be positive"
-    );
-    assert!(
-        last_ckpt["parts"].is_null(),
-        "_last_checkpoint parts should be null for single-file checkpoints"
-    );
-    // sizeInBytes should match the actual checkpoint file size on disk
-    let ckpt_file = find_checkpoint_file(&table_path, 3);
-    let ckpt_file_size = std::fs::metadata(&ckpt_file).unwrap().len() as i64;
-    assert_eq!(
-        last_ckpt["sizeInBytes"].as_i64().unwrap(),
-        ckpt_file_size,
-        "_last_checkpoint sizeInBytes should match actual checkpoint file size"
-    );
-    assert_eq!(
-        last_ckpt["numOfAddFiles"].as_i64().unwrap(),
-        2,
-        "_last_checkpoint numOfAddFiles should be 2 (commit 3 has no data, only domain metadata)"
-    );
+    // Insert 8 fresh files (one per commit) -> ids 9..=16
+    let names = ["ivan", "judy", "karl", "lena", "mike", "nina", "omar", "pat"];
+    for (i, name) in names.iter().enumerate() {
+        snapshot = insert_data(snapshot, engine, make_columns(i as i32 + 9, name))
+            .await?
+            .unwrap_committed()
+            .post_commit_snapshot()
+            .expect("expected post-commit snapshot")
+            .clone();
+    }
 
-    // === Read raw checkpoint parquet and validate fields ===
-    let ckpt_batch = read_parquet_file(&ckpt_file);
-    let ckpt_schema = ckpt_batch.schema();
+    Ok(snapshot)
+}
 
-    // Checkpoint should have these top-level action columns
-    assert!(
-        ckpt_schema.field_with_name("protocol").is_ok(),
-        "should have protocol"
-    );
-    assert!(
-        ckpt_schema.field_with_name("metaData").is_ok(),
-        "should have metaData"
-    );
-    assert!(
-        ckpt_schema.field_with_name("checkpointMetadata").is_ok(),
-        "should have checkpointMetadata (V2)"
-    );
-    assert!(
-        ckpt_schema.field_with_name("domainMetadata").is_ok(),
-        "should have domainMetadata"
-    );
-    assert!(
-        ckpt_schema.field_with_name("sidecar").is_ok(),
-        "should have sidecar"
-    );
-
-    // Validate sidecar actions exist in the main checkpoint (file actions are in sidecars)
-    let sidecar_col = ckpt_batch
-        .column_by_name("sidecar")
-        .unwrap()
+/// Extracts a named struct column from a `RecordBatch`, panicking if missing or wrong type.
+fn get_struct_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a StructArray {
+    batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("batch should have column '{name}'"))
         .as_any()
         .downcast_ref::<StructArray>()
-        .unwrap();
-    let sidecar_rows: Vec<usize> = (0..ckpt_batch.num_rows())
-        .filter(|&i| sidecar_col.is_valid(i))
-        .collect();
-    assert!(
-        !sidecar_rows.is_empty(),
-        "checkpoint should contain sidecar action rows referencing sidecar files"
-    );
+        .unwrap_or_else(|| panic!("column '{name}' should be a StructArray"))
+}
 
-    // Validate sidecar action has path field
+/// Returns indices of non-null (valid) rows for a column in a batch.
+fn valid_row_indices(col: &dyn Array, num_rows: usize) -> Vec<usize> {
+    (0..num_rows).filter(|&i| col.is_valid(i)).collect()
+}
+
+/// Validates that sidecar action rows in the main checkpoint have correct path, sizeInBytes,
+/// and modificationTime matching actual files on disk.
+fn assert_sidecar_actions_match_disk(
+    sidecar_col: &StructArray,
+    sidecar_rows: &[usize],
+    table_path: &str,
+) {
     let sidecar_path_col = sidecar_col
         .column_by_name("path")
         .expect("sidecar should have path field");
-    for &row in &sidecar_rows {
-        let path = sidecar_path_col.as_string::<i32>().value(row);
-        assert!(
-            path.ends_with(".parquet"),
-            "sidecar path should be a parquet file, got: {path}"
-        );
-    }
-
-    // Validate sidecar action sizeInBytes and modificationTime match actual files on disk
     let sidecar_size_col = sidecar_col
         .column_by_name("sizeInBytes")
         .expect("sidecar should have sizeInBytes field");
     let sidecar_mtime_col = sidecar_col
         .column_by_name("modificationTime")
         .expect("sidecar should have modificationTime field");
-    let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
-    for &row in &sidecar_rows {
-        let sidecar_path_str = sidecar_path_col.as_string::<i32>().value(row);
-        let sidecar_file_path = sidecars_dir.join(sidecar_path_str);
-        let file_meta = std::fs::metadata(&sidecar_file_path).unwrap_or_else(|e| {
-            panic!("sidecar file {sidecar_path_str} should exist on disk: {e}")
-        });
+    let sidecars_dir = std::path::Path::new(table_path).join("_delta_log/_sidecars");
+
+    for &row in sidecar_rows {
+        let path = sidecar_path_col.as_string::<i32>().value(row);
+        assert!(
+            path.ends_with(".parquet"),
+            "sidecar path should be a parquet file, got: {path}"
+        );
+
+        let file_meta = std::fs::metadata(sidecars_dir.join(path))
+            .unwrap_or_else(|e| panic!("sidecar file {path} should exist on disk: {e}"));
 
         let recorded_size = sidecar_size_col
             .as_primitive::<delta_kernel::arrow::datatypes::Int64Type>()
@@ -543,7 +512,7 @@ async fn test_v2_checkpoint_with_domain_metadata_and_sidecars() -> DeltaResult<(
         assert_eq!(
             recorded_size,
             file_meta.len() as i64,
-            "sidecar sizeInBytes should match actual file size for {sidecar_path_str}"
+            "sidecar sizeInBytes should match actual file size for {path}"
         );
 
         let recorded_mtime = sidecar_mtime_col
@@ -557,44 +526,16 @@ async fn test_v2_checkpoint_with_domain_metadata_and_sidecars() -> DeltaResult<(
             .as_millis() as i64;
         assert_eq!(
             recorded_mtime, file_mtime_ms,
-            "sidecar modificationTime should match actual file mtime for {sidecar_path_str}"
+            "sidecar modificationTime should match actual file mtime for {path}"
         );
     }
+}
 
-    // Main checkpoint must NOT contain add/remove actions (they live in sidecars)
-    let add_col = ckpt_batch
-        .column_by_name("add")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .unwrap();
-    let add_rows_in_main: Vec<usize> = (0..ckpt_batch.num_rows())
-        .filter(|&i| add_col.is_valid(i))
-        .collect();
-    assert!(
-        add_rows_in_main.is_empty(),
-        "main checkpoint should not contain add actions when sidecars are used, \
-         but found {} add rows",
-        add_rows_in_main.len()
-    );
-    let remove_col = ckpt_batch
-        .column_by_name("remove")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .unwrap();
-    let remove_rows_in_main: Vec<usize> = (0..ckpt_batch.num_rows())
-        .filter(|&i| remove_col.is_valid(i))
-        .collect();
-    assert!(
-        remove_rows_in_main.is_empty(),
-        "main checkpoint should not contain remove actions when sidecars are used, \
-         but found {} remove rows",
-        remove_rows_in_main.len()
-    );
-
-    // Validate sidecar files contain ONLY add/remove file actions
-    let sidecar_files: Vec<_> = std::fs::read_dir(&sidecars_dir)
+/// Reads all sidecar parquet files from the `_sidecars` directory. Asserts each sidecar
+/// contains only add/remove file actions (no non-file actions). Returns the total number
+/// of non-null add rows across all sidecars.
+fn assert_sidecars_contain_only_file_actions(sidecars_dir: &std::path::Path) -> usize {
+    let sidecar_files: Vec<_> = std::fs::read_dir(sidecars_dir)
         .expect("failed to list sidecars dir")
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
@@ -604,8 +545,7 @@ async fn test_v2_checkpoint_with_domain_metadata_and_sidecars() -> DeltaResult<(
         "should have at least one sidecar parquet file in _delta_log/_sidecars/"
     );
 
-    // Read each sidecar parquet and verify it contains file actions
-    let mut total_add_rows_in_sidecars = 0usize;
+    let mut total_add_rows = 0usize;
     for sidecar_entry in &sidecar_files {
         let sidecar_batch = read_parquet_file(&sidecar_entry.path());
         let sidecar_schema = sidecar_batch.schema();
@@ -627,45 +567,101 @@ async fn test_v2_checkpoint_with_domain_metadata_and_sidecars() -> DeltaResult<(
             "sidecar",
         ] {
             if let Ok(field) = sidecar_schema.field_with_name(forbidden) {
-                // Field may exist in schema but all rows must be null
                 let col = sidecar_batch.column_by_name(forbidden).unwrap();
-                let non_null_count = (0..sidecar_batch.num_rows())
-                    .filter(|&i| col.is_valid(i))
-                    .count();
+                let non_null = valid_row_indices(col, sidecar_batch.num_rows()).len();
                 assert_eq!(
-                    non_null_count, 0,
+                    non_null, 0,
                     "sidecar should not contain non-null {forbidden} actions, \
-                     but found {non_null_count} (field type: {field:?})"
+                     but found {non_null} (field type: {field:?})"
                 );
             }
         }
 
-        // Count add rows
-        if let Some(sidecar_add_col) = sidecar_batch.column_by_name("add") {
-            let sidecar_add = sidecar_add_col
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .unwrap();
-            total_add_rows_in_sidecars += (0..sidecar_batch.num_rows())
-                .filter(|&i| sidecar_add.is_valid(i))
-                .count();
+        if let Some(add_col) = sidecar_batch.column_by_name("add") {
+            total_add_rows += valid_row_indices(add_col, sidecar_batch.num_rows()).len();
         }
     }
+    total_add_rows
+}
+
+/// E2e test: create a v2 table with non-file action(domain metadata), write checkpoint with
+/// sidecars, validate `_last_checkpoint`, read the raw checkpoint parquet to verify sidecar
+/// action rows and non-file actions (protocol, metadata, domainMetadata, checkpointMetadata),
+/// then scan to verify data correctness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+
+    let snapshot = v2_table_with_domain_metadata(&table_path, &table_url, &engine).await?;
+    let version = snapshot.version() as i64;
+
+    // Write V2 checkpoint with sidecars (hint=2 so file actions split across sidecars)
+    let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: Some(2),
+    });
+    snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&checkpoint_spec))?;
+
+    // === Validate _last_checkpoint ===
+    let last_ckpt = read_last_checkpoint(&table_path);
+    let ckpt_file = load_checkpoint_path(&table_path, version as _);
+    let ckpt_file_size = std::fs::metadata(&ckpt_file).unwrap().len() as i64;
+
+    assert_eq!(last_ckpt["version"], version);
+    assert!(last_ckpt["size"].as_i64().unwrap() > 0);
+    assert_eq!(last_ckpt["sizeInBytes"].as_i64().unwrap(), ckpt_file_size);
+    assert_eq!(last_ckpt["numOfAddFiles"], 8);
+
+    // === Read raw checkpoint parquet and validate fields ===
+    let ckpt_batch = read_parquet_file(&ckpt_file);
+    let ckpt_schema = ckpt_batch.schema();
+
+    for field_name in [
+        "protocol",
+        "metaData",
+        "checkpointMetadata",
+        "domainMetadata",
+        "sidecar",
+    ] {
+        assert!(
+            ckpt_schema.field_with_name(field_name).is_ok(),
+            "checkpoint should have {field_name}"
+        );
+    }
+
+    // Validate sidecar actions in the main checkpoint
+    let sidecar_col = get_struct_column(&ckpt_batch, "sidecar");
+    let sidecar_rows = valid_row_indices(sidecar_col, ckpt_batch.num_rows());
     assert!(
-        total_add_rows_in_sidecars > 0,
-        "sidecar files should contain add actions (the file actions from the table)"
+        !sidecar_rows.is_empty(),
+        "checkpoint should contain sidecar action rows referencing sidecar files"
+    );
+
+    assert_sidecar_actions_match_disk(sidecar_col, &sidecar_rows, &table_path);
+
+    // Main checkpoint must NOT contain add/remove actions (they live in sidecars)
+    for action in ["add", "remove"] {
+        let col = get_struct_column(&ckpt_batch, action);
+        let rows = valid_row_indices(col, ckpt_batch.num_rows());
+        assert!(
+            rows.is_empty(),
+            "main checkpoint should not contain {action} actions when sidecars are used, \
+             but found {} rows",
+            rows.len()
+        );
+    }
+
+    // Validate sidecar files contain ONLY add/remove file actions
+    let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
+    let total_add_rows = assert_sidecars_contain_only_file_actions(&sidecars_dir);
+    assert_eq!(
+        total_add_rows, 8,
+        "sidecar files should contain exactly 8 add actions"
     );
 
     // Validate checkpointMetadata action
-    let ckpt_meta_col = ckpt_batch
-        .column_by_name("checkpointMetadata")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .unwrap();
-    let ckpt_meta_rows: Vec<usize> = (0..ckpt_batch.num_rows())
-        .filter(|&i| ckpt_meta_col.is_valid(i))
-        .collect();
+    let ckpt_meta_col = get_struct_column(&ckpt_batch, "checkpointMetadata");
+    let ckpt_meta_rows = valid_row_indices(ckpt_meta_col, ckpt_batch.num_rows());
     assert_eq!(
         ckpt_meta_rows.len(),
         1,
@@ -678,20 +674,13 @@ async fn test_v2_checkpoint_with_domain_metadata_and_sidecars() -> DeltaResult<(
         version_col
             .as_primitive::<delta_kernel::arrow::datatypes::Int64Type>()
             .value(ckpt_meta_rows[0]),
-        3,
+        version,
         "checkpointMetadata version should match checkpoint version"
     );
 
     // Validate domainMetadata actions: exactly 3 (app.settings, app.feature_flags, app.analytics)
-    let dm_col = ckpt_batch
-        .column_by_name("domainMetadata")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .unwrap();
-    let dm_rows: Vec<usize> = (0..ckpt_batch.num_rows())
-        .filter(|&i| dm_col.is_valid(i))
-        .collect();
+    let dm_col = get_struct_column(&ckpt_batch, "domainMetadata");
+    let dm_rows = valid_row_indices(dm_col, ckpt_batch.num_rows());
     assert_eq!(
         dm_rows.len(),
         3,
@@ -700,13 +689,13 @@ async fn test_v2_checkpoint_with_domain_metadata_and_sidecars() -> DeltaResult<(
 
     // === Scan from fresh snapshot to verify data correctness ===
     let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    assert_eq!(fresh_snapshot.version(), 3);
+    assert_eq!(fresh_snapshot.version(), version as u64);
 
     // Verify all 3 domain metadata are retrievable after checkpoint
     assert_eq!(
         fresh_snapshot.get_domain_metadata("app.settings", engine.as_ref())?,
-        Some(r#"{"version":1}"#.to_string()),
-        "app.settings domain metadata should be preserved across checkpoint"
+        Some(r#"{"version":2}"#.to_string()),
+        "app.settings domain metadata should reflect the latest update after reconciliation"
     );
     assert_eq!(
         fresh_snapshot.get_domain_metadata("app.feature_flags", engine.as_ref())?,
@@ -723,15 +712,18 @@ async fn test_v2_checkpoint_with_domain_metadata_and_sidecars() -> DeltaResult<(
     let batches = read_scan(&scan, engine.clone() as Arc<dyn delta_kernel::Engine>)?;
     assert_batches_sorted_eq!(
         vec![
-            "+-------+",
-            "| value |",
-            "+-------+",
-            "| 1     |",
-            "| 2     |",
-            "| 3     |",
-            "| 4     |",
-            "| 5     |",
-            "+-------+",
+            "+----+--------------+",
+            "| id | info         |",
+            "+----+--------------+",
+            "| 10 | {name: judy} |",
+            "| 11 | {name: karl} |",
+            "| 12 | {name: lena} |",
+            "| 13 | {name: mike} |",
+            "| 14 | {name: nina} |",
+            "| 15 | {name: omar} |",
+            "| 16 | {name: pat}  |",
+            "| 9  | {name: ivan} |",
+            "+----+--------------+",
         ],
         &batches
     );
@@ -961,6 +953,42 @@ async fn test_v2_checkpoint_spec_requires_v2checkpoint_feature() -> DeltaResult<
     assert!(
         err_msg.contains("v2Checkpoint"),
         "error should mention v2Checkpoint feature, got: {err_msg}"
+    );
+
+    Ok(())
+}
+
+/// V1 checkpoint spec is not allowed when the table supports v2Checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v1_checkpoint_rejected_on_v2_table() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "info",
+            DataType::try_struct_type([StructField::nullable("name", DataType::STRING)])?,
+        ),
+    ])?);
+
+    // Create table WITH v2Checkpoint feature
+    let _ = create_table(&table_path, schema, "DefaultEngine")
+        .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
+    let result = snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&CheckpointSpec::V1));
+    assert!(
+        result.is_err(),
+        "V1 spec on table with v2Checkpoint feature should fail"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("V1") && err_msg.contains("v2Checkpoint"),
+        "error should mention V1 and v2Checkpoint, got: {err_msg}"
     );
 
     Ok(())
