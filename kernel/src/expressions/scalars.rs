@@ -345,49 +345,27 @@ impl Scalar {
             // Java uses uppercase "E" for scientific notation, "Infinity" / "-Infinity" / "NaN"
             // for special values. Rust's default Display produces "inf" / "-inf" and uses full
             // decimal notation, which diverges from the Java serialization format.
-            Self::Float(v) => Ok(format_float_partition(*v as f64, format_f32_java(*v))),
-            Self::Double(v) => Ok(format_float_partition(*v, format_f64_java(*v))),
-            // Decimal: use dedicated serialization to handle negative values correctly.
-            // Scalar::Display has a bug for negative decimals with scale > 0 (Rust's %
-            // operator preserves sign, producing e.g. "-1.-23" instead of "-1.23").
-            Self::Decimal(d) => {
-                let value = d.bits();
-                if d.scale() == 0 {
-                    Ok(value.to_string())
-                } else {
-                    let scale = d.scale() as u32;
-                    let scalar_multiple = 10_i128.pow(scale);
-                    let integer_part = value / scalar_multiple;
-                    let fractional_part = (value % scalar_multiple).abs();
-                    // For values in (-1, 0), integer_part truncates to 0 and loses the
-                    // negative sign. We must re-add it explicitly.
-                    let sign = if value < 0 && integer_part == 0 {
-                        "-"
-                    } else {
-                        ""
-                    };
-                    Ok(format!(
-                        "{sign}{integer_part}.{fractional_part:0>width$}",
-                        width = scale as usize
-                    ))
-                }
-            }
+            Self::Float(v) => Ok(format_f32_partition(*v)),
+            Self::Double(v) => Ok(format_f64_partition(*v)),
+            // Decimal: use the shared format_decimal helper which handles negative values
+            // correctly, including the (-1, 0) range where integer truncation loses the sign.
+            Self::Decimal(d) => Ok(format_decimal(d)),
             // String Display wraps in quotes ('hello'), but protocol wants raw value
             Self::String(s) => Ok(s.clone()),
-            // Binary: the Delta protocol spec says binary is "encoded as a string of
-            // escaped binary values", with the example "\u0001\u0002\u0003". However, Java
-            // kernel uses `new String(bytes, UTF_8)` which interprets bytes as UTF-8, not
-            // as escaped unicode sequences. We match Java kernel for interop.
-            // TODO: Should we match the spec (\uXXXX escapes) or Java kernel (UTF-8)?
-            // The spec example and Java kernel behavior are inconsistent.
+            // Binary encoding: the spec says "a string of escaped binary values" with example
+            // \u0001\u0002\u0003, but Java kernel (and delta-spark) use raw UTF-8 interpretation
+            // via `new String(bytes, UTF_8)`. We match Java/delta-spark for interop. Invalid
+            // UTF-8 sequences are replaced with U+FFFD (replacement character).
             Self::Binary(v) => Ok(String::from_utf8_lossy(v).into_owned()),
             // Date Display prints raw days-since-epoch (20178), but protocol wants YYYY-MM-DD
             Self::Date(days) => {
-                let date = NaiveDate::from_num_days_from_ce_opt(
-                    // UNIX epoch (1970-01-01) is CE day 719_163
-                    719_163 + *days,
-                )
-                .ok_or_else(|| Error::generic(format!("Date value {days} is out of range")))?;
+                // UNIX epoch (1970-01-01) is CE day 719_163. Use checked_add to avoid
+                // overflow for extreme values like i32::MAX.
+                let ce_days = 719_163_i32
+                    .checked_add(*days)
+                    .ok_or_else(|| Error::generic(format!("Date value {days} is out of range")))?;
+                let date = NaiveDate::from_num_days_from_ce_opt(ce_days)
+                    .ok_or_else(|| Error::generic(format!("Date value {days} is out of range")))?;
                 Ok(date.format("%Y-%m-%d").to_string())
             }
             // Timestamp: use ISO 8601 adjusted to UTC as recommended by the Delta protocol.
@@ -484,27 +462,36 @@ impl Scalar {
     }
 }
 
-/// Formats an `f32` the same way Java's `Float.toString(float)` does. The `ryu` crate
-/// implements the same Ryu algorithm that Java uses, but outputs lowercase `e` for scientific
-/// notation. Java uses uppercase `E`, so we replace after formatting.
-fn format_f32_java(v: f32) -> String {
-    let mut buf = ryu::Buffer::new();
-    buf.format(v).replace('e', "E")
+/// Formats a [`DecimalData`] value as a string with the correct number of decimal places.
+/// Handles negative values in the (-1, 0) range correctly by explicitly prepending the sign,
+/// since integer division truncates toward zero and loses the negative sign for those values.
+fn format_decimal(d: &DecimalData) -> String {
+    let value = d.bits();
+    if d.scale() == 0 {
+        return value.to_string();
+    }
+    let scale = d.scale() as u32;
+    let scalar_multiple = 10_i128.pow(scale);
+    let integer_part = value / scalar_multiple;
+    let fractional_part = (value % scalar_multiple).abs();
+    // For values in (-1, 0), integer_part truncates to 0 and loses the negative sign.
+    // We must re-add it explicitly.
+    let sign = if value < 0 && integer_part == 0 {
+        "-"
+    } else {
+        ""
+    };
+    format!(
+        "{sign}{integer_part}.{fractional_part:0>width$}",
+        width = scale as usize
+    )
 }
 
-/// Formats an `f64` the same way Java's `Double.toString(double)` does. Same as
-/// [`format_f32_java`] but for double precision.
-fn format_f64_java(v: f64) -> String {
-    let mut buf = ryu::Buffer::new();
-    buf.format(v).replace('e', "E")
-}
-
-/// Formats a float/double for partition value serialization. For NaN and infinity, uses
-/// Java-compatible strings. Rust's `Display` produces `"inf"` and `"-inf"`, but Java's
-/// `Float.parseFloat` / `Double.parseDouble` require `"Infinity"` and `"-Infinity"`.
-/// The `normal` parameter carries the pre-formatted string for non-special values, which
-/// preserves the original type's precision (f32 vs f64).
-fn format_float_partition(v: f64, normal: String) -> String {
+/// Formats an `f32` for partition value serialization using Java's `Float.toString(float)`
+/// format. For NaN and infinity, uses Java-compatible strings ("NaN", "Infinity",
+/// "-Infinity"). For normal values, uses the `ryu` crate (same Ryu algorithm as Java) with
+/// lowercase `e` replaced by uppercase `E` for scientific notation.
+fn format_f32_partition(v: f32) -> String {
     if v.is_nan() {
         "NaN".to_string()
     } else if v.is_infinite() {
@@ -514,7 +501,25 @@ fn format_float_partition(v: f64, normal: String) -> String {
             "-Infinity".to_string()
         }
     } else {
-        normal
+        let mut buf = ryu::Buffer::new();
+        buf.format(v).replace('e', "E")
+    }
+}
+
+/// Formats an `f64` for partition value serialization using Java's `Double.toString(double)`
+/// format. Same as [`format_f32_partition`] but for double precision.
+fn format_f64_partition(v: f64) -> String {
+    if v.is_nan() {
+        "NaN".to_string()
+    } else if v.is_infinite() {
+        if v.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        }
+    } else {
+        let mut buf = ryu::Buffer::new();
+        buf.format(v).replace('e', "E")
     }
 }
 
@@ -533,31 +538,7 @@ impl Display for Scalar {
             Self::TimestampNtz(ts) => write!(f, "{ts}"),
             Self::Date(d) => write!(f, "{d}"),
             Self::Binary(b) => write!(f, "{b:?}"),
-            Self::Decimal(d) => match d.scale().cmp(&0) {
-                Ordering::Equal => {
-                    write!(f, "{}", d.bits())
-                }
-                Ordering::Greater => {
-                    let scale = d.scale();
-                    let scalar_multiple = 10_i128.pow(scale as u32);
-                    let value = d.bits();
-                    write!(f, "{}", value / scalar_multiple)?;
-                    write!(f, ".")?;
-                    write!(
-                        f,
-                        "{:0>scale$}",
-                        value % scalar_multiple,
-                        scale = scale as usize
-                    )
-                }
-                Ordering::Less => {
-                    write!(f, "{}", d.bits())?;
-                    for _ in 0..d.scale() {
-                        write!(f, "0")?;
-                    }
-                    Ok(())
-                }
-            },
+            Self::Decimal(d) => write!(f, "{}", format_decimal(d)),
             Self::Null(_) => write!(f, "null"),
             Self::Struct(data) => {
                 write!(f, "{{")?;
@@ -1530,15 +1511,7 @@ mod tests {
 
     #[test]
     fn test_serialize_partition_value_date_formats_as_yyyy_mm_dd() {
-        // 2025-03-31 = 20178 days since epoch
-        let days = NaiveDate::from_ymd_opt(2025, 3, 31)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap();
-        let days = Utc
-            .from_utc_datetime(&days)
-            .signed_duration_since(DateTime::UNIX_EPOCH)
-            .num_days() as i32;
+        let days = 20178i32; // 2025-03-31
         let result = Scalar::Date(days).serialize_partition_value().unwrap();
         assert_eq!(result, "2025-03-31");
     }
@@ -1887,7 +1860,9 @@ mod tests {
             "99.99"
         );
         assert_eq!(
-            Scalar::Double(f64::MIN).serialize_partition_value().unwrap(),
+            Scalar::Double(f64::MIN)
+                .serialize_partition_value()
+                .unwrap(),
             "-1.7976931348623157E308"
         );
         assert_eq!(
@@ -1905,5 +1880,90 @@ mod tests {
             values: vec![],
         });
         assert!(s.serialize_partition_value().is_err());
+    }
+
+    #[test]
+    fn test_serialize_partition_value_array_returns_error() {
+        let array = Scalar::Array(ArrayData {
+            tpe: ArrayType::new(DataType::INTEGER, false),
+            elements: vec![Scalar::Integer(1)],
+        });
+        let err = array.serialize_partition_value();
+        assert!(err.is_err());
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("not a valid partition column type"),);
+    }
+
+    #[test]
+    fn test_serialize_partition_value_null_complex_types_return_error() {
+        let null_array = Scalar::Null(DataType::Array(Box::new(ArrayType::new(
+            DataType::INTEGER,
+            false,
+        ))));
+        let err = null_array.serialize_partition_value();
+        assert!(err.is_err());
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("not a valid partition column type"),);
+
+        let null_map = Scalar::Null(DataType::Map(Box::new(MapType::new(
+            DataType::STRING,
+            DataType::INTEGER,
+            false,
+        ))));
+        let err = null_map.serialize_partition_value();
+        assert!(err.is_err());
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("not a valid partition column type"),);
+    }
+
+    #[test]
+    fn test_serialize_partition_value_date_out_of_range_returns_error() {
+        let err = Scalar::Date(i32::MAX).serialize_partition_value();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn test_serialize_partition_value_float_nan_round_trips_through_parse() {
+        let serialized = Scalar::Float(f32::NAN).serialize_partition_value().unwrap();
+        assert_eq!(serialized, "NaN");
+        let parsed = PrimitiveType::Float.parse_scalar(&serialized).unwrap();
+        // NaN != NaN by IEEE 754, so use is_nan() instead of assert_eq!
+        match parsed {
+            Scalar::Float(v) => assert!(v.is_nan()),
+            other => panic!("expected Float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_serialize_partition_value_double_nan_round_trips_through_parse() {
+        let serialized = Scalar::Double(f64::NAN)
+            .serialize_partition_value()
+            .unwrap();
+        assert_eq!(serialized, "NaN");
+        let parsed = PrimitiveType::Double.parse_scalar(&serialized).unwrap();
+        // NaN != NaN by IEEE 754, so use is_nan() instead of assert_eq!
+        match parsed {
+            Scalar::Double(v) => assert!(v.is_nan()),
+            other => panic!("expected Double, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_display_decimal_negative_with_scale_formats_correctly() {
+        // Verify that the Display impl for negative decimals with scale > 0 does not
+        // produce the buggy "-1.-23" format (Rust's % preserves sign on fractional part).
+        let s = Scalar::decimal(-12345i128, 5, 2).unwrap();
+        assert_eq!(s.to_string(), "-123.45");
+
+        // Negative value in the (-1, 0) range
+        let s = Scalar::decimal(-5i128, 3, 2).unwrap();
+        assert_eq!(s.to_string(), "-0.05");
     }
 }

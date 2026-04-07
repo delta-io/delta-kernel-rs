@@ -3270,6 +3270,50 @@ async fn test_write_parquet_rejects_unknown_partition_column(
     Ok(())
 }
 
+#[tokio::test]
+async fn test_write_parquet_rejects_type_mismatch_partition_value(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("part", DataType::STRING),
+    ])?);
+
+    for (table_url, engine, _store, _table_name) in setup_test_tables(
+        schema.clone(),
+        &["part"],
+        None,
+        "test_partition_type_mismatch",
+    )
+    .await?
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+        let data_schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)]).unwrap(),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(data_schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+
+        // Pass an Integer partition value for a STRING partition column
+        let result = write_batch_to_table(
+            &snapshot,
+            &engine,
+            batch,
+            HashMap::from([("part".to_string(), Scalar::Integer(42))]),
+        )
+        .await;
+        let err = result.expect_err("write_parquet should fail with type mismatch");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("has type") && err_msg.contains("but got Scalar of type"),
+            "Error should mention type mismatch, got: {err_msg}"
+        );
+    }
+    Ok(())
+}
+
 /// 1. Creates a table with the given column mapping mode
 /// 2. Writes two batches of data
 /// 3. Checkpoints and verifies add.stats uses physical column names in the checkpoint
