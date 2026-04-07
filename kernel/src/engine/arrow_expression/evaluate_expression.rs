@@ -3,7 +3,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use tracing::warn;
 
@@ -41,7 +40,6 @@ use crate::expressions::{
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 
-#[internal_api]
 pub(super) trait ProvidesColumnByName {
     fn schema_fields(&self) -> &ArrowFields;
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;
@@ -80,7 +78,6 @@ impl ProvidesColumnByName for StructArray {
 // }
 // ```
 // The path ["b", "d", "f"] would retrieve the int64 column while ["a", "b"] would produce an error.
-#[internal_api]
 pub(super) fn extract_column(
     mut parent: &dyn ProvidesColumnByName,
     col: &[impl AsRef<str>],

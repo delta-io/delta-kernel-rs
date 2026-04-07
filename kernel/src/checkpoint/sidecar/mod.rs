@@ -201,17 +201,27 @@ impl SidecarSplitter {
 /// - The underlying data stream is exhausted.
 pub(super) struct SingleSidecarDataIterator {
     splitter: Arc<Mutex<SidecarSplitter>>,
+    /// Soft cap on the number of file-action rows per sidecar. The actual count may exceed this
+    /// because we operate on whole `EngineData` batches, which cannot be split.
     max_file_actions_hint: usize,
     yielded_row_count: usize,
 }
 
 impl SingleSidecarDataIterator {
-    pub(super) fn new(splitter: Arc<Mutex<SidecarSplitter>>, max_file_actions_hint: usize) -> Self {
-        Self {
-            splitter,
-            max_file_actions_hint: max_file_actions,
-            yielded_row_count: 0,
+    pub(super) fn new(
+        splitter: Arc<Mutex<SidecarSplitter>>,
+        max_file_actions_hint: usize,
+    ) -> DeltaResult<Self> {
+        if max_file_actions_hint == 0 {
+            return Err(Error::checkpoint_write(
+                "max_file_actions_hint must be greater than 0",
+            ));
         }
+        Ok(Self {
+            splitter,
+            max_file_actions_hint,
+            yielded_row_count: 0,
+        })
     }
 }
 

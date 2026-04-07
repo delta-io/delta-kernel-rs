@@ -4,7 +4,7 @@ use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState,
 };
 use crate::actions::{Add, ADD_NAME};
-use crate::arrow::array::{Array, AsArray, RecordBatch, StructArray};
+use crate::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{ArrowPrimitiveType, Int32Type, Int64Type};
 use crate::checkpoint::sidecar::{SidecarSplitter, SingleSidecarDataIterator};
 use crate::checkpoint::tests::{
@@ -14,7 +14,6 @@ use crate::checkpoint::tests::{
 };
 use crate::checkpoint::CheckpointWriter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
-use crate::engine::arrow_expression::evaluate_expression::extract_column;
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngineBuilder;
@@ -63,7 +62,7 @@ fn generate_checkpoint_parts(
     let mut sidecar_index = 1usize;
     loop {
         let mut single_sidecar_iter =
-            SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)
+            SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?
                 .peekable();
         if single_sidecar_iter.peek().is_some() {
             let sidecar_url = sidecars_base.join(&format!("sidecar_{sidecar_index}.parquet"))?;
@@ -137,13 +136,21 @@ async fn read_sidecar_batches(store: &Arc<InMemory>, sidecar_urls: &[Url]) -> Ve
     batches
 }
 
+fn get_column_by_path<'a>(rb: &'a RecordBatch, path: &[&str]) -> Option<&'a ArrayRef> {
+    let mut col = rb.column_by_name(path.first()?)?;
+    for segment in &path[1..] {
+        col = col.as_struct_opt()?.column_by_name(segment)?;
+    }
+    Some(col)
+}
+
 /// Collects non-null string values at the given column path across all batches, sorted.
 /// Checks validity of the immediate parent struct and the leaf column.
 fn collect_string_column(batches: &[RecordBatch], path: &[&str]) -> Vec<String> {
     assert!(!path.is_empty());
     let mut values = Vec::new();
     for rb in batches {
-        let Ok(parent) = extract_column(rb, &path[..path.len() - 1]) else {
+        let Some(parent) = get_column_by_path(rb, &path[..path.len() - 1]) else {
             continue;
         };
         let Some(leaf) = parent.as_struct().column_by_name(path.last().unwrap()) else {
@@ -680,7 +687,7 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
         output_schema,
     )?;
 
-    let iter = SingleSidecarDataIterator::new(splitter.clone(), usize::MAX);
+    let iter = SingleSidecarDataIterator::new(splitter.clone(), usize::MAX)?;
     let total_file_rows: usize = iter.map(|batch| batch.unwrap().len()).sum();
     assert_eq!(total_file_rows, 0, "should have no file-action rows");
 
@@ -740,5 +747,24 @@ fn test_splitter_rejects_invalid_schema(#[case] schema: StructType, #[case] expe
     assert!(
         err.to_string().contains(expected_msg),
         "error '{err}' should contain '{expected_msg}'"
+    );
+}
+
+#[test]
+fn test_single_sidecar_data_iterator_rejects_zero_max_file_actions_hint() {
+    let schema: Arc<StructType> = StructType::new_unchecked([
+        StructField::nullable("add", dummy_struct()),
+        StructField::nullable("remove", dummy_struct()),
+    ])
+    .into();
+    let iter = ActionReconciliationIterator::new(Box::new(std::iter::empty()));
+    let splitter = SidecarSplitter::new(iter, &ArrowEvaluationHandler, schema).unwrap();
+    let result = SingleSidecarDataIterator::new(splitter, 0);
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(
+        err.to_string()
+            .contains("max_file_actions_hint must be greater than 0"),
+        "error '{err}' should mention max_file_actions_hint"
     );
 }
