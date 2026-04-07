@@ -478,6 +478,27 @@ fn valid_row_indices(col: &dyn Array, num_rows: usize) -> Vec<usize> {
     (0..num_rows).filter(|&i| col.is_valid(i)).collect()
 }
 
+/// Extracts a named struct sub-column from a `StructArray`, panicking if missing or wrong type.
+fn get_nested_struct_column<'a>(parent: &'a StructArray, name: &str) -> &'a StructArray {
+    parent
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("struct should have field '{name}'"))
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap_or_else(|| panic!("field '{name}' should be a StructArray"))
+}
+
+/// Lists all sidecar parquet files in the `_sidecars` directory.
+fn read_sidecar_parquet_files(
+    sidecars_dir: &std::path::Path,
+) -> Vec<std::fs::DirEntry> {
+    std::fs::read_dir(sidecars_dir)
+        .expect("failed to list sidecars dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
+        .collect()
+}
+
 /// Validates that sidecar action rows in the main checkpoint have correct path, sizeInBytes,
 /// and modificationTime matching actual files on disk.
 fn assert_sidecar_actions_match_disk(
@@ -532,20 +553,18 @@ fn assert_sidecar_actions_match_disk(
 }
 
 /// Reads all sidecar parquet files from the `_sidecars` directory. Asserts each sidecar
-/// contains only add/remove file actions (no non-file actions). Returns the total number
-/// of non-null add rows across all sidecars.
-fn assert_sidecars_contain_only_file_actions(sidecars_dir: &std::path::Path) -> usize {
-    let sidecar_files: Vec<_> = std::fs::read_dir(sidecars_dir)
-        .expect("failed to list sidecars dir")
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
-        .collect();
+/// contains only add/remove file actions (no non-file actions). Returns a sorted list of
+/// `(add_count, remove_count)` per sidecar.
+fn assert_sidecars_contain_only_file_actions(
+    sidecars_dir: &std::path::Path,
+) -> Vec<(usize, usize)> {
+    let sidecar_files = read_sidecar_parquet_files(sidecars_dir);
     assert!(
         !sidecar_files.is_empty(),
         "should have at least one sidecar parquet file in _delta_log/_sidecars/"
     );
 
-    let mut total_add_rows = 0usize;
+    let mut per_sidecar_counts: Vec<(usize, usize)> = Vec::new();
     for sidecar_entry in &sidecar_files {
         let sidecar_batch = read_parquet_file(&sidecar_entry.path());
         let sidecar_schema = sidecar_batch.schema();
@@ -577,11 +596,18 @@ fn assert_sidecars_contain_only_file_actions(sidecars_dir: &std::path::Path) -> 
             }
         }
 
-        if let Some(add_col) = sidecar_batch.column_by_name("add") {
-            total_add_rows += valid_row_indices(add_col, sidecar_batch.num_rows()).len();
-        }
+        let adds = sidecar_batch
+            .column_by_name("add")
+            .map(|c| valid_row_indices(c, sidecar_batch.num_rows()).len())
+            .unwrap_or(0);
+        let removes = sidecar_batch
+            .column_by_name("remove")
+            .map(|c| valid_row_indices(c, sidecar_batch.num_rows()).len())
+            .unwrap_or(0);
+        per_sidecar_counts.push((adds, removes));
     }
-    total_add_rows
+    per_sidecar_counts.sort();
+    per_sidecar_counts
 }
 
 /// E2e test: create a v2 table with non-file action(domain metadata), write checkpoint with
@@ -632,9 +658,11 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     // Validate sidecar actions in the main checkpoint
     let sidecar_col = get_struct_column(&ckpt_batch, "sidecar");
     let sidecar_rows = valid_row_indices(sidecar_col, ckpt_batch.num_rows());
-    assert!(
-        !sidecar_rows.is_empty(),
-        "checkpoint should contain sidecar action rows referencing sidecar files"
+    // 1 sidecar for the bulk-remove batch (8 removes) + 4 sidecars for adds (2 each)
+    assert_eq!(
+        sidecar_rows.len(),
+        5,
+        "checkpoint should contain 5 sidecar action rows"
     );
 
     assert_sidecar_actions_match_disk(sidecar_col, &sidecar_rows, &table_path);
@@ -653,10 +681,12 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
 
     // Validate sidecar files contain ONLY add/remove file actions
     let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
-    let total_add_rows = assert_sidecars_contain_only_file_actions(&sidecars_dir);
+    let per_sidecar = assert_sidecars_contain_only_file_actions(&sidecars_dir);
+    // 1 sidecar has 8 removes (bulk delete can't be split), 4 sidecars have 2 adds each
     assert_eq!(
-        total_add_rows, 8,
-        "sidecar files should contain exactly 8 add actions"
+        per_sidecar,
+        vec![(0, 8), (2, 0), (2, 0), (2, 0), (2, 0)],
+        "per-sidecar (adds, removes) distribution"
     );
 
     // Validate checkpointMetadata action
@@ -731,23 +761,23 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     Ok(())
 }
 
-/// E2e test: create a partitioned table with stats, write several commits, checkpoint,
-/// then read the raw checkpoint parquet to verify `stats_parsed` and `partitionValues_parsed`
-/// fields are correctly populated.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let table_url = delta_kernel::try_parse_uri(&table_path)?;
-
+/// Creates a partitioned table with stats (`id: long`, `name: string`, partition `part_key`),
+/// writes two commits (partition "a" with 2 rows, partition "b" with 3 rows), and returns
+/// the snapshot after both commits.
+async fn create_partitioned_stats_table<
+    E: delta_kernel::engine::default::executor::TaskExecutor,
+>(
+    table_path: &str,
+    table_url: &url::Url,
+    engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![
         StructField::not_null("id", DataType::LONG),
         StructField::nullable("name", DataType::STRING),
         StructField::nullable("part_key", DataType::STRING),
     ])?);
 
-    // Create table with v2Checkpoint, partition column, and writeStatsAsStruct=true
-    let _ = create_table(&table_path, schema.clone(), "Test/1.0")
+    let _ = create_table(table_path, schema.clone(), "Test/1.0")
         .with_table_properties([
             ("delta.feature.v2Checkpoint", "supported"),
             ("delta.checkpoint.writeStatsAsStruct", "true"),
@@ -756,21 +786,21 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
-    // Commit 1: write data with partition key "a"
-    let snapshot0 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let data_schema = StructType::try_new(vec![
         StructField::not_null("id", DataType::LONG),
         StructField::nullable("name", DataType::STRING),
     ])?;
-    let arrow_schema = ArrowSchema::try_from_kernel(&data_schema)?;
+    let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(&data_schema)?);
+
     let batch1 = RecordBatch::try_new(
-        Arc::new(arrow_schema.clone()),
+        arrow_schema.clone(),
         vec![
             Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
             Arc::new(StringArray::from(vec![Some("alice"), Some("bob")])) as ArrayRef,
         ],
     )
     .unwrap();
+    let snapshot0 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let snapshot1 = write_batch_to_table(
         &snapshot0,
         engine.as_ref(),
@@ -779,9 +809,8 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
     )
     .await?;
 
-    // Commit 2: write data with partition key "b"
     let batch2 = RecordBatch::try_new(
-        Arc::new(arrow_schema),
+        arrow_schema,
         vec![
             Arc::new(Int64Array::from(vec![3, 4, 5])) as ArrayRef,
             Arc::new(StringArray::from(vec![
@@ -800,52 +829,54 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
     )
     .await?;
 
+    Ok(snapshot2)
+}
+
+/// E2e test: create a partitioned table with stats, write several commits, checkpoint,
+/// then read the raw checkpoint parquet to verify `stats_parsed` and `partitionValues_parsed`
+/// fields are correctly populated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+
+    let snapshot2 =
+        create_partitioned_stats_table(&table_path, &table_url, &engine).await?;
+
     // Write V2 checkpoint with sidecars at version 2
     let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(1),
     });
     snapshot2.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&checkpoint_spec))?;
 
-    // === Read sidecar files and validate stats_parsed / partitionValues_parsed ===
+    // === Validate sidecar structure ===
     let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
-    let sidecar_files: Vec<_> = std::fs::read_dir(&sidecars_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
-        .collect();
-    assert!(
-        !sidecar_files.is_empty(),
-        "should have sidecar files for stats/partition validation"
+    let per_sidecar = assert_sidecars_contain_only_file_actions(&sidecars_dir);
+    // 2 adds with hint=1 -> 2 sidecars with 1 add each
+    assert_eq!(
+        per_sidecar,
+        vec![(1, 0), (1, 0)],
+        "per-sidecar (adds, removes) distribution"
     );
 
-    // Collect add actions across all sidecar files
+    // === Read sidecar files and validate stats_parsed / partitionValues_parsed ===
+    let sidecar_files = read_sidecar_parquet_files(&sidecars_dir);
+
     let mut all_record_counts = Vec::new();
     let mut all_part_values = Vec::new();
-    let mut found_min_values = false;
-    let mut found_max_values = false;
+    let mut all_min_ids = Vec::new();
+    let mut all_max_ids = Vec::new();
 
     for sidecar_entry in &sidecar_files {
         let sidecar_batch = read_parquet_file(&sidecar_entry.path());
-        let Some(add_array) = sidecar_batch.column_by_name("add") else {
-            continue;
-        };
-        let add_col = add_array
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("add should be a struct");
-        let add_rows: Vec<usize> = (0..sidecar_batch.num_rows())
-            .filter(|&i| add_col.is_valid(i))
-            .collect();
+        let add_col = get_struct_column(&sidecar_batch, "add");
+        let add_rows = valid_row_indices(add_col, sidecar_batch.num_rows());
         if add_rows.is_empty() {
             continue;
         }
 
-        // Validate stats_parsed in sidecar
-        let stats_parsed = add_col
-            .column_by_name("stats_parsed")
-            .expect("sidecar add should have stats_parsed when writeStatsAsStruct=true")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("stats_parsed should be a struct");
+        let stats_parsed = get_nested_struct_column(add_col, "stats_parsed");
 
         let num_records_col = stats_parsed
             .column_by_name("numRecords")
@@ -857,21 +888,32 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
                     .value(row),
             );
         }
-        if stats_parsed.column_by_name("minValues").is_some() {
-            found_min_values = true;
-        }
-        if stats_parsed.column_by_name("maxValues").is_some() {
-            found_max_values = true;
+
+        let min_values = get_nested_struct_column(stats_parsed, "minValues");
+        let min_id_col = min_values
+            .column_by_name("id")
+            .expect("minValues should have id");
+        for &row in &add_rows {
+            all_min_ids.push(
+                min_id_col
+                    .as_primitive::<delta_kernel::arrow::datatypes::Int64Type>()
+                    .value(row),
+            );
         }
 
-        // Validate partitionValues_parsed in sidecar
-        let pv_parsed = add_col
-            .column_by_name("partitionValues_parsed")
-            .expect("sidecar add should have partitionValues_parsed")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("partitionValues_parsed should be a struct");
+        let max_values = get_nested_struct_column(stats_parsed, "maxValues");
+        let max_id_col = max_values
+            .column_by_name("id")
+            .expect("maxValues should have id");
+        for &row in &add_rows {
+            all_max_ids.push(
+                max_id_col
+                    .as_primitive::<delta_kernel::arrow::datatypes::Int64Type>()
+                    .value(row),
+            );
+        }
 
+        let pv_parsed = get_nested_struct_column(add_col, "partitionValues_parsed");
         let part_key_col = pv_parsed
             .column_by_name("part_key")
             .expect("partitionValues_parsed should have part_key field");
@@ -884,22 +926,28 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
     assert_eq!(
         all_record_counts,
         vec![2, 3],
-        "sidecar stats_parsed.numRecords should be [2, 3] (one per partition)"
+        "stats_parsed.numRecords should be [2, 3] (one per partition)"
     );
-    assert!(
-        found_min_values,
-        "sidecar stats_parsed should have minValues"
+
+    all_min_ids.sort();
+    assert_eq!(
+        all_min_ids,
+        vec![1, 3],
+        "stats_parsed.minValues.id should be [1, 3] (min id per partition)"
     );
-    assert!(
-        found_max_values,
-        "sidecar stats_parsed should have maxValues"
+
+    all_max_ids.sort();
+    assert_eq!(
+        all_max_ids,
+        vec![2, 5],
+        "stats_parsed.maxValues.id should be [2, 5] (max id per partition)"
     );
 
     all_part_values.sort();
     assert_eq!(
         all_part_values,
         vec!["a", "b"],
-        "sidecar partitionValues_parsed.part_key should be ['a', 'b']"
+        "partitionValues_parsed.part_key should be ['a', 'b']"
     );
 
     // === Verify scan reads all data correctly after sidecar checkpoint ===
