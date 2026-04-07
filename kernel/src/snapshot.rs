@@ -239,6 +239,20 @@ impl Snapshot {
             // We found a checkpoint in the new log segment, so build a fresh snapshot from it.
             // TODO(#2217): reuse old LazyCrc when CRC file matches.
             // TODO(#2218): consider incremental P&M replay instead of full rebuild.
+            //
+            // Emit LogSegmentLoaded before consuming new_log_segment, since the checkpoint
+            // rebuild path (try_new_from_log_segment_impl) does not emit this event itself.
+            let reporter = engine.get_metrics_reporter();
+            reporter.inspect(|r| {
+                r.report(MetricEvent::LogSegmentLoaded {
+                    operation_id,
+                    duration: start.elapsed(),
+                    num_commit_files: new_log_segment.listed.ascending_commit_files.len() as u64,
+                    num_checkpoint_files: new_log_segment.listed.checkpoint_parts.len() as u64,
+                    num_compaction_files: new_log_segment.listed.ascending_compaction_files.len()
+                        as u64,
+                });
+            });
             let snapshot = Self::try_new_from_log_segment_impl(
                 existing_snapshot.table_root().clone(),
                 new_log_segment,

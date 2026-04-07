@@ -9,6 +9,7 @@
 //! - [`snapshot_load`]: snapshot-loading scenarios (delta-only, checkpoint, compaction, CRC,
 //!   and on-demand API calls like `get_domain_metadata`)
 //! - [`scan`]: scan execution scenarios (`scan.execute()` parquet data-file reads)
+//! - [`incremental_snapshot`]: incremental update scenarios via `Snapshot::builder_from`
 
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ use delta_kernel::{DeltaResult, Snapshot};
 use test_utils::{insert_data, test_table_setup_mt, CountingReporter};
 use url::Url;
 
+mod incremental_snapshot;
 mod scan;
 mod snapshot_load;
 
