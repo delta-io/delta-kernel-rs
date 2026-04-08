@@ -1318,43 +1318,69 @@ impl WriteContext {
         &self.physical_partition_values
     }
 
-    /// Returns a Hive-style target directory URL for this partition.
+    /// Returns the target directory where data files for this partition should be written.
     ///
-    /// The path uses **logical** column names for directory segments (matching Spark) and
-    /// percent-encodes special characters via [`escape_partition_value`]. Null values use
-    /// [`HIVE_DEFAULT_PARTITION`] as the directory name.
+    /// The directory structure depends on the table's column mapping mode:
     ///
-    /// For unpartitioned tables, returns the table root.
+    /// | | Not Partitioned | Partitioned |
+    /// |---|---|---|
+    /// | **CM OFF** | `<table_root>/` | `<table_root>/col=val/.../` |
+    /// | **CM ON** | `<table_root>/<2char>/` | `<table_root>/<2char>/` |
     ///
-    /// Computed on each call (not cached). This is a convenience utility; the Delta protocol
-    /// does not require Hive-style paths.
+    /// With column mapping OFF and partitioned tables, the path uses **logical** column names
+    /// and Hive-style encoding (matching Spark). With column mapping ON, a random 2-character
+    /// alphanumeric prefix is used unconditionally (matching Spark's
+    /// `getRandomPrefix`). Column mapping forces random prefixes to avoid S3 hotspots and
+    /// to prevent leaking physical UUID column names into directory paths.
     ///
-    /// # Example
+    /// The engine appends the filename (e.g., `<uuid>.parquet`) to this directory to form
+    /// the full file path.
     ///
-    /// For a table at `s3://bucket/my_table/` with partition columns `["year", "region"]`
-    /// and partition values `year=2024, region=US`:
+    /// # Examples
     ///
     /// ```text
-    /// hive_style_target_dir() -> "s3://bucket/my_table/year=2024/region=US/"
+    /// // CM OFF, partitioned: year=2024, region=US
+    /// write_dir() -> "s3://bucket/table/year=2024/region=US/"
+    ///
+    /// // CM OFF, not partitioned
+    /// write_dir() -> "s3://bucket/table/"
+    ///
+    /// // CM ON (partitioned or not)
+    /// write_dir() -> "s3://bucket/table/3v/"
     /// ```
-    ///
-    /// With a null region: `"s3://bucket/my_table/year=2024/region=__HIVE_DEFAULT_PARTITION__/"`
-    ///
-    /// [`escape_partition_value`]: crate::partition::escape_partition_value
-    /// [`HIVE_DEFAULT_PARTITION`]: crate::partition::HIVE_DEFAULT_PARTITION
-    #[internal_api]
-    pub(crate) fn hive_style_target_dir(&self) -> Url {
-        if self.shared.logical_partition_columns.is_empty() {
-            return self.shared.target_dir.clone();
+    pub fn write_dir(&self) -> Url {
+        let mut url = self.shared.target_dir.clone();
+        match self.shared.column_mapping_mode {
+            ColumnMappingMode::None => {
+                // No column mapping: use Hive-style partition directories for partitioned
+                // tables, or just the table root for unpartitioned tables.
+                if !self.shared.logical_partition_columns.is_empty() {
+                    let path_suffix = self.hive_partition_path_suffix();
+                    url.set_path(&format!("{}{}", url.path(), path_suffix));
+                }
+            }
+            ColumnMappingMode::Id | ColumnMappingMode::Name => {
+                // Column mapping ON: use a random 2-char alphanumeric prefix (matching
+                // Spark's getRandomPrefix). This avoids S3 hotspots and prevents leaking
+                // physical UUID column names into directory paths.
+                let prefix = random_alphanumeric_prefix();
+                url.set_path(&format!("{}{}/", url.path(), prefix));
+            }
         }
-        // physical_partition_values is keyed by physical name (for AddFile.partitionValues), but
-        // hive-style paths use logical column names. We iterate logical columns for path
-        // ordering and look up values by their physical key.
+        url
+    }
+
+    /// Builds the Hive-style partition path suffix (e.g., `year=2024/region=US/`).
+    /// Only valid when column mapping is OFF. Uses logical column names for path segments
+    /// and looks up serialized values by physical key.
+    fn hive_partition_path_suffix(&self) -> String {
         let columns: Vec<(&str, Option<&str>)> = self
             .shared
             .logical_partition_columns
             .iter()
             .map(|logical_name| {
+                // physical_partition_values is keyed by physical name (for
+                // AddFile.partitionValues), but hive-style paths use logical column names.
                 let field = self.shared.logical_schema.field(logical_name);
                 let physical_name = field
                     .map(|f| f.physical_name(self.shared.column_mapping_mode))
@@ -1366,10 +1392,7 @@ impl WriteContext {
                 (logical_name.as_str(), value)
             })
             .collect();
-        let path_suffix = build_partition_path(&columns);
-        let mut url = self.shared.target_dir.clone();
-        url.set_path(&format!("{}{}", url.path(), path_suffix));
-        url
+        build_partition_path(&columns)
     }
 
     /// Generate a new unique absolute URL for a deletion vector file.
@@ -1393,6 +1416,18 @@ impl WriteContext {
     pub fn new_deletion_vector_path(&self, random_prefix: String) -> DeletionVectorPath {
         DeletionVectorPath::new(self.shared.target_dir.clone(), random_prefix)
     }
+}
+
+/// Generates a random 2-character alphanumeric prefix for partition directory paths, matching
+/// Spark's `Utils.getRandomPrefix` (`Random.alphanumeric.take(2)`). Used when column mapping
+/// is enabled to avoid S3 hotspots and prevent leaking physical UUID column names into paths.
+fn random_alphanumeric_prefix() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::rng();
+    (0..2)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect()
 }
 
 /// Kernel exposes information about the state of the table that engines might want to use to

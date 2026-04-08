@@ -1275,6 +1275,7 @@ dependencies = [
  "parquet 56.2.0",
  "parquet 57.3.0",
  "paste",
+ "rand 0.9.2",
  "reqwest 0.13.2",
  "roaring",
  "rstest",

@@ -292,9 +292,10 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             output_schema.clone().into(),
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
+        let write_dir = write_context.write_dir();
         self.parquet
             .write_parquet_file(
-                write_context.target_dir(),
+                &write_dir,
                 physical_data,
                 write_context.partition_values(),
                 Some(write_context.stats_columns()),

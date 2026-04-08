@@ -54,6 +54,7 @@ thiserror = "2"
 tracing = { version = "0.1", features = ["log"] }
 url = "2"
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
+rand = "0.9"
 z85 = "3.0.6"
 
 # optional deps
