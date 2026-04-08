@@ -709,15 +709,17 @@ pub struct SharedMetadata;
 /// Opaque builder for constructing a [`SharedSnapshot`].
 ///
 /// Create with [`get_snapshot_builder`] (from a table path) or [`get_snapshot_builder_from`]
-/// (incrementally from an existing snapshot). Configure with [`snapshot_builder_set_version`] and
-/// [`snapshot_builder_set_log_tail`] (for catalog-managed tables). Finally,
-/// call [`snapshot_builder_build`] to consume the builder and obtain the snapshot. If you need to
-/// discard the builder without building, call [`free_snapshot_builder`].
+/// (incrementally from an existing snapshot). Configure with [`snapshot_builder_set_version`],
+/// [`snapshot_builder_set_log_tail`], and [`snapshot_builder_set_max_catalog_version`] (for
+/// catalog-managed tables). Finally, call [`snapshot_builder_build`] to consume the builder and
+/// obtain the snapshot. If you need to discard the builder without building, call
+/// [`free_snapshot_builder`].
 pub struct FfiSnapshotBuilder {
     engine: Arc<dyn ExternEngine>,
     source: FfiSnapshotBuilderSource,
     version: Option<Version>,
     log_tail: Vec<LogPath>,
+    max_catalog_version: Option<Version>,
 }
 
 /// An opaque handle with exclusive (Box-like) ownership of a [`FfiSnapshotBuilder`].
@@ -738,6 +740,7 @@ fn make_snapshot_builder(
         source,
         version: None,
         log_tail: Vec::new(),
+        max_catalog_version: None,
     })
     .into())
 }
@@ -831,6 +834,20 @@ unsafe fn snapshot_builder_set_log_tail_impl(
     Ok(true)
 }
 
+/// Set the max catalog version on a snapshot builder for catalog-managed tables. This bounds the
+/// snapshot version to what the catalog has ratified.
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_builder_set_max_catalog_version(
+    builder: &mut Handle<MutableFfiSnapshotBuilder>,
+    max_catalog_version: Version,
+) {
+    unsafe { builder.as_mut() }.max_catalog_version = Some(max_catalog_version);
+}
+
 /// Consume the builder and return a snapshot. After calling, the builder pointer is _no longer
 /// valid_. The builder is always freed by this call, whether or not it succeeds.
 ///
@@ -859,6 +876,9 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
     }
     if !builder.log_tail.is_empty() {
         rust_builder = rust_builder.with_log_tail(builder.log_tail);
+    }
+    if let Some(mcv) = builder.max_catalog_version {
+        rust_builder = rust_builder.with_max_catalog_version(mcv);
     }
     let snapshot = rust_builder.build(engine.as_ref())?;
     Ok(snapshot.into())
@@ -1296,9 +1316,9 @@ mod tests {
     use std::collections::HashMap;
     use test_utils::add_staged_commit;
     use test_utils::{
-        actions_to_string, actions_to_string_partitioned, actions_to_string_with_metadata,
-        add_commit, create_table, TestAction, METADATA, METADATA_WITH_FEATURES,
-        METADATA_WITH_TABLE_PROPERTIES,
+        actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
+        actions_to_string_with_metadata, add_commit, create_table, TestAction, METADATA,
+        METADATA_WITH_FEATURES, METADATA_WITH_TABLE_PROPERTIES,
     };
     use url::Url;
 
@@ -1349,6 +1369,59 @@ mod tests {
         );
         let snap = unsafe { build_snapshot(kernel_string_slice!(path), engine.shallow_copy()) };
         Ok((storage, engine, snap))
+    }
+
+    /// Like [`make_engine_and_v0_snapshot`] but creates a catalog-managed table. The returned
+    /// snapshot is built with `max_catalog_version = 0`.
+    async fn make_catalog_managed_engine_and_v0_snapshot(
+        path: &str,
+    ) -> Result<
+        (
+            Arc<InMemory>,
+            Handle<SharedExternEngine>,
+            Handle<SharedSnapshot>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            path,
+            storage.as_ref(),
+            0,
+            actions_to_string_catalog_managed(vec![TestAction::Metadata]),
+        )
+        .await?;
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage.clone()).build()),
+            allocate_err,
+        );
+        let snap = unsafe {
+            let mut ptr = ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+            ));
+            snapshot_builder_set_max_catalog_version(&mut ptr, 0);
+            ok_or_panic(snapshot_builder_build(ptr))
+        };
+        Ok((storage, engine, snap))
+    }
+
+    /// Build a snapshot with version, log tail, and optional max catalog version via the FFI
+    /// builder API. Returns the raw `ExternResult` so callers can test error cases.
+    unsafe fn snapshot_at_version_with_log_tail(
+        path: KernelStringSlice,
+        engine: Handle<SharedExternEngine>,
+        version: Version,
+        log_tail: log_path::LogPathArray,
+        max_catalog_version: Option<Version>,
+    ) -> ExternResult<Handle<SharedSnapshot>> {
+        let mut ptr = ok_or_panic(get_snapshot_builder(path, engine));
+        snapshot_builder_set_version(&mut ptr, version);
+        ok_or_panic(snapshot_builder_set_log_tail(&mut ptr, log_tail));
+        if let Some(mcv) = max_catalog_version {
+            snapshot_builder_set_max_catalog_version(&mut ptr, mcv);
+        }
+        snapshot_builder_build(ptr)
     }
 
     pub(crate) fn get_default_engine(path: &str) -> Handle<SharedExternEngine> {
@@ -1769,7 +1842,8 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_log_tail() -> Result<(), Box<dyn std::error::Error>> {
         let table_root = "memory:///test_table/";
-        let (storage, engine, snap) = make_engine_and_v0_snapshot(table_root).await?;
+        let (storage, engine, snap) =
+            make_catalog_managed_engine_and_v0_snapshot(table_root).await?;
         unsafe { free_snapshot(snap) };
         let commit1 = add_staged_commit(
             table_root,
@@ -1797,6 +1871,7 @@ mod tests {
                 engine.shallow_copy(),
             ));
             ok_or_panic(snapshot_builder_set_log_tail(&mut ptr, log_tail.clone()));
+            snapshot_builder_set_max_catalog_version(&mut ptr, 1);
             ok_or_panic(snapshot_builder_build(ptr))
         };
         let snapshot_version = unsafe { version(snapshot.shallow_copy()) };
@@ -1809,17 +1884,17 @@ mod tests {
                 engine.shallow_copy(),
                 1,
                 log_tail.clone(),
-                OptionalValue::None, // max_catalog_version
+                None, // max_catalog_version
             )
         };
         assert_extern_result_error_with_message(
             invalid_snapshot,
             KernelError::GenericError,
-            concat!(
+            Some(concat!(
                 "Generic delta kernel error: Staged commits in log_tail require ",
                 "max_catalog_version to be set. Use with_max_catalog_version() ",
                 "when providing staged commits."
-            ),
+            )),
         );
 
         // Test getting snapshot at version
@@ -1830,6 +1905,7 @@ mod tests {
             ));
             snapshot_builder_set_version(&mut ptr, 1);
             ok_or_panic(snapshot_builder_set_log_tail(&mut ptr, log_tail));
+            snapshot_builder_set_max_catalog_version(&mut ptr, 1);
             ok_or_panic(snapshot_builder_build(ptr))
         };
         let snapshot_version = unsafe { version(snapshot2.shallow_copy()) };
@@ -1945,7 +2021,8 @@ mod tests {
     async fn test_snapshot_with_prev_snapshot_and_log_tail(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let path = "memory:///";
-        let (storage, engine, snapshot_at_v0) = make_engine_and_v0_snapshot(path).await?;
+        let (storage, engine, snapshot_at_v0) =
+            make_catalog_managed_engine_and_v0_snapshot(path).await?;
         assert_eq!(unsafe { version(snapshot_at_v0.shallow_copy()) }, 0);
 
         // Add staged commit (version 1)
@@ -1996,6 +2073,7 @@ mod tests {
                 &mut ptr,
                 log_tail_array.clone(),
             ));
+            snapshot_builder_set_max_catalog_version(&mut ptr, 2);
             ok_or_panic(snapshot_builder_build(ptr))
         };
         assert_eq!(unsafe { version(snapshot_at_v2.shallow_copy()) }, 2);
@@ -2007,6 +2085,7 @@ mod tests {
             ));
             snapshot_builder_set_version(&mut ptr, 1);
             ok_or_panic(snapshot_builder_set_log_tail(&mut ptr, log_tail_array));
+            snapshot_builder_set_max_catalog_version(&mut ptr, 2);
             ok_or_panic(snapshot_builder_build(ptr))
         };
         assert_eq!(unsafe { version(snapshot_at_v1.shallow_copy()) }, 1);
