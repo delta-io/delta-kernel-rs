@@ -10,9 +10,8 @@ use std::cmp::Ordering;
 #[cfg(test)]
 mod tests;
 
-/// A helper trait (mostly exposed for testing). It provides the four stats getters needed by
-/// [`DataSkippingStatsProvider`]. From there, we can automatically derive a
-/// [`DataSkippingPredicateEvaluator`].
+/// A helper trait (mostly exposed for testing). It provides the four stats getters needed to
+/// derive a [`DataSkippingPredicateEvaluator`] via the blanket impl below.
 pub(crate) trait ParquetStatsProvider {
     /// The min-value stat for this column, if the column exists in this file, has the expected
     /// type, and the parquet footer provides stats for it.
@@ -26,8 +25,10 @@ pub(crate) trait ParquetStatsProvider {
     /// type, and the parquet footer provides stats for it.
     fn get_parquet_nullcount_stat(&self, col: &ColumnName) -> Option<i64>;
 
-    /// The rowcount stat for this row group. It is always available in the parquet footer.
-    fn get_parquet_rowcount_stat(&self) -> i64;
+    /// The rowcount stat for this row group. Returns `None` if the rowcount is not meaningful
+    /// (e.g. in checkpoint files where the footer rowcount is the number of add file rows, not
+    /// the sum of data file row counts).
+    fn get_parquet_rowcount_stat(&self) -> Option<i64>;
 }
 
 // Blanket implementation for all types that impl ParquetStatsProvider.
@@ -48,7 +49,7 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
     }
 
     fn get_rowcount_stat(&self) -> Option<Scalar> {
-        Some(Scalar::from(self.get_parquet_rowcount_stat()))
+        self.get_parquet_rowcount_stat().map(Scalar::from)
     }
 
     fn eval_partial_cmp(
