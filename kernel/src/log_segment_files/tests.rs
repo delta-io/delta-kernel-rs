@@ -997,6 +997,54 @@ async fn test_zero_byte_crc_skipped() {
     assert_eq!(crc.version, 1);
 }
 
+// v1005.checkpoint.parquet is 0 bytes in window 1 -> scan continues to window 2,
+// finds valid checkpoint at v5. Verifies the fix in find_complete_checkpoint_version.
+#[tokio::test]
+async fn test_zero_byte_checkpoint_backward_scan_crosses_windows() {
+    // Commits v0..=1005, valid checkpoint at v5, 0-byte checkpoint at v1005.
+    // Window 1 [6, 1006): sees 0-byte checkpoint at v1005, must NOT stop.
+    // Window 2 [0, 6): finds valid checkpoint at v5 -> stop.
+    let mut log_files: Vec<(Version, LogPathFileType, bool)> = (0u64..=1005)
+        .map(|v| (v, LogPathFileType::Commit, false))
+        .collect();
+    log_files.push((5, LogPathFileType::SinglePartCheckpoint, false));
+    log_files.push((1005, LogPathFileType::SinglePartCheckpoint, true));
+
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+    let counter = CountingStorageHandler::new(storage);
+
+    let result =
+        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
+            .unwrap();
+
+    // Needed 2 windows because the 0-byte checkpoint at v1005 was skipped
+    assert_eq!(counter.call_count(), 2);
+    assert_eq!(result.checkpoint_parts.len(), 1);
+    assert_eq!(result.checkpoint_parts[0].version, 5);
+    // Commits after checkpoint v5: v6 through v1005
+    assert_eq!(result.ascending_commit_files.len(), 1000);
+    assert_eq!(result.ascending_commit_files[0].version, 6);
+    assert_eq!(result.ascending_commit_files[999].version, 1005);
+}
+
+// 0-byte commit in list_commits -> error
+#[tokio::test]
+async fn test_list_commits_zero_byte_commit_errors() {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, false),
+        (1, LogPathFileType::Commit, false),
+        (2, LogPathFileType::Commit, true), // empty
+    ];
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+
+    let result = LogSegmentFiles::list_commits(storage.as_ref(), &log_root, Some(0), Some(2));
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("empty (0 bytes)"),
+        "Expected 'empty (0 bytes)' in error, got: {err}"
+    );
+}
+
 // ===== find_complete_checkpoint_version direct unit tests (other cases already covered by tests above) =====
 
 fn incomplete_then_complete_files() -> Vec<ParsedLogPath> {

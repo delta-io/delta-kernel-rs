@@ -132,11 +132,11 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
 }
 
 /// Returns the version of the latest complete checkpoint in `files`, or `None` if no complete
-/// checkpoint exists.
+/// checkpoint exists. Skips 0-byte checkpoint files so they don't count toward completeness.
 fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option<Version> {
     ascending_files
         .iter()
-        .filter(|f| f.is_checkpoint())
+        .filter(|f| f.is_checkpoint() && should_process_log_file(f).unwrap_or(false))
         .chunk_by(|f| f.version)
         .into_iter()
         .filter_map(|(version, parts)| {
@@ -147,6 +147,49 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
                 .then_some(version)
         })
         .last()
+}
+
+/// Validates a log file's size. Returns `Ok(true)` to keep the file, `Ok(false)` to skip it
+/// (with a warning already emitted), or `Err` for unrecoverable corruption.
+///
+/// - Commit/StagedCommit: error (no fallback exists for a corrupt commit)
+/// - CompactedCommit: warn and skip (individual commits are the fallback)
+/// - Checkpoint: warn and skip (won't count toward a "complete" checkpoint)
+/// - CRC: warn and skip (optional optimization file)
+fn should_process_log_file(file: &ParsedLogPath) -> DeltaResult<bool> {
+    if file.location.size > 0 {
+        return Ok(true);
+    }
+    use LogPathFileType::*;
+    match file.file_type {
+        Commit | StagedCommit => Err(Error::generic(format!(
+            "{:?} file is empty (0 bytes): {}",
+            file.file_type, file.location.location,
+        ))),
+        CompactedCommit { .. } => {
+            warn!(
+                "Skipping empty (0 byte) compacted log file {}, \
+                 falling back to individual commits",
+                file.location.location,
+            );
+            Ok(false)
+        }
+        SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
+            warn!(
+                "Skipping empty (0 byte) checkpoint file: {}",
+                file.location.location,
+            );
+            Ok(false)
+        }
+        Crc => {
+            warn!(
+                "Skipping empty (0 byte) CRC file: {}",
+                file.location.location,
+            );
+            Ok(false)
+        }
+        Unknown => Ok(true),
+    }
 }
 
 /// Accumulates and groups log files during listing. Each "group" consists of all files that
@@ -173,49 +216,26 @@ struct ListingAccumulator {
 
 impl ListingAccumulator {
     fn process_file(&mut self, file: ParsedLogPath) -> DeltaResult<()> {
+        if !should_process_log_file(&file)? {
+            return Ok(());
+        }
         use LogPathFileType::*;
         match file.file_type {
-            Commit | StagedCommit => {
-                if file.location.size == 0 {
-                    return Err(Error::generic(format!(
-                        "Commit file is empty (0 bytes): {}",
-                        file.location.location,
-                    )));
-                }
-                self.output.ascending_commit_files.push(file);
+            Commit | StagedCommit => self.output.ascending_commit_files.push(file),
+            CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
+                self.output.ascending_compaction_files.push(file);
             }
-            CompactedCommit { hi } => {
-                if file.location.size == 0 {
-                    warn!(
-                        "Skipping empty (0 byte) compacted log file {}, \
-                         falling back to individual commits",
-                        file.location.location,
-                    );
-                } else if self.end_version.is_none_or(|end| hi <= end) {
-                    self.output.ascending_compaction_files.push(file);
-                }
-            }
+            CompactedCommit { .. } => (), // failed the bounds check above
             SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
-                if file.location.size == 0 {
-                    warn!(
-                        "Skipping empty (0 byte) checkpoint file: {}",
-                        file.location.location,
-                    );
-                } else {
-                    self.pending_checkpoint_parts.push(file);
-                }
+                self.pending_checkpoint_parts.push(file)
             }
             Crc => {
-                if file.location.size > 0 {
-                    self.output.latest_crc_file.replace(file);
-                } else {
-                    warn!(
-                        "Skipping empty (0 byte) CRC file: {}",
-                        file.location.location,
-                    );
-                }
+                self.output.latest_crc_file.replace(file);
             }
             Unknown => {
+                // It is possible that there are other files being stashed away into
+                // _delta_log/  This is not necessarily forbidden, but something we
+                // want to know about in a debugging scenario
                 debug!(
                     "Found file {} with unknown file type {:?} at version {}",
                     file.filename, file.file_type, file.version
@@ -413,6 +433,7 @@ impl LogSegmentFiles {
         for file_result in fs_iter {
             let file = file_result?;
             if matches!(file.file_type, LogPathFileType::Commit) {
+                should_process_log_file(&file)?;
                 max_published_version = max_published_version.max(Some(file.version));
                 listed_commits.push(file);
             }
