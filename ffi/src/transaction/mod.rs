@@ -208,7 +208,7 @@ fn with_domain_metadata_removed_impl(
     txn: Transaction,
     domain: KernelStringSlice,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    let domain: String = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
+    let domain = unsafe { TryFromStringSlice::try_from_slice(&domain) }?;
     Ok(Box::new(txn.with_domain_metadata_removed(domain)).into())
 }
 
@@ -787,10 +787,11 @@ mod tests {
             .get(&Path::from_url_path(commit_url.path()).unwrap())
             .await
             .unwrap();
-        let actions: Vec<serde_json::Value> = Deserializer::from_slice(&data.bytes().await.unwrap())
-            .into_iter::<serde_json::Value>()
-            .try_collect()
-            .unwrap();
+        let actions: Vec<serde_json::Value> =
+            Deserializer::from_slice(&data.bytes().await.unwrap())
+                .into_iter::<serde_json::Value>()
+                .try_collect()
+                .unwrap();
         actions
             .into_iter()
             .find(|a| a.get("domainMetadata").is_some())
