@@ -12,6 +12,7 @@ use delta_kernel_derive::internal_api;
 
 #[internal_api]
 pub(crate) use column_mapping::get_any_level_column_physical_name;
+pub(crate) use column_mapping::physical_to_logical_column_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
@@ -24,6 +25,9 @@ pub(crate) use timestamp_ntz::{
 };
 mod column_mapping;
 mod timestamp_ntz;
+
+/// Minimum reader/writer protocol version that the kernel can handle.
+pub const MIN_VALID_RW_VERSION: i32 = 1;
 
 /// Maximum reader protocol version that the kernel can handle.
 pub const MAX_VALID_READER_VERSION: i32 = 3;
@@ -433,15 +437,12 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    #[cfg(feature = "catalog-managed")]
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(Error::unsupported(
             "Feature 'catalogManaged' is not supported for CDF",
         )),
     }),
-    #[cfg(not(feature = "catalog-managed"))]
-    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -449,15 +450,12 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    #[cfg(feature = "catalog-managed")]
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(Error::unsupported(
             "Feature 'catalogOwned-preview' is not supported for CDF",
         )),
     }),
-    #[cfg(not(feature = "catalog-managed"))]
-    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 

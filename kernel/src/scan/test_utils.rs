@@ -111,6 +111,26 @@ pub(crate) fn add_batch_with_remove(output_schema: SchemaRef) -> Box<ArrowEngine
     ArrowEngineData::try_from_engine_data(parsed).unwrap()
 }
 
+// A batch with a Remove action and a partition column (`date`). The Remove has
+// `partitionValues: {"date": "2017-12-10"}` but the transform reads from `add.*` columns,
+// so the Remove's partition values are not visible to the data skipping filter.
+pub(crate) fn add_batch_with_remove_and_partition(
+    output_schema: SchemaRef,
+) -> Box<ArrowEngineData> {
+    let handler = SyncJsonHandler {};
+    let json_strings: StringArray = vec![
+        r#"{"remove":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","deletionTimestamp":1677811194426,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{"date":"2017-12-10"},"size":635}}"#,
+        r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues":{"date":"2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0}}"}}"#,
+        r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{"date":"2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0}}"}}"#,
+        r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["date"],"configuration":{"delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
+    ]
+        .into();
+    let parsed = handler
+        .parse_json(string_array_to_engine_data(json_strings), output_schema)
+        .unwrap();
+    ArrowEngineData::try_from_engine_data(parsed).unwrap()
+}
+
 // add batch with a `date` partition col
 pub(crate) fn add_batch_with_partition_col() -> Box<ArrowEngineData> {
     let handler = SyncJsonHandler {};
@@ -151,7 +171,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         physical_partition_schema: None,
     });
     let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
-    let iter = scan_action_iter(
+    let (iter, _metrics) = scan_action_iter(
         &SyncEngine::new(),
         batch
             .into_iter()

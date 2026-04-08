@@ -361,10 +361,8 @@ fn test_sql_where() {
     do_test(ALL_NULL, pred, MISSING, None, None);
 }
 
-// TODO(#1002): we currently don't support file skipping on timestamp columns' max stat since they
-// are truncated to milliseconds in add.stats.
 #[test]
-fn test_timestamp_skipping_disabled() {
+fn test_timestamp_stats_enabled() {
     let empty = HashSet::new();
     let creator = DataSkippingPredicateCreator {
         partition_columns: &empty,
@@ -373,23 +371,52 @@ fn test_timestamp_skipping_disabled() {
 
     assert!(
         creator.get_min_stat(col, &DataType::TIMESTAMP).is_some(),
-        "get_min_stat should return Some: allow data skipping on timestamp minValues"
+        "get_min_stat should return Some for timestamp minValues"
     );
-    assert_eq!(
-        creator.get_max_stat(col, &DataType::TIMESTAMP),
-        None,
-        "get_max_stat should return None: no data skipping on timestamp maxValues"
+    assert!(
+        creator.get_max_stat(col, &DataType::TIMESTAMP).is_some(),
+        "get_max_stat should return Some for timestamp maxValues"
     );
     assert!(
         creator
             .get_min_stat(col, &DataType::TIMESTAMP_NTZ)
             .is_some(),
-        "get_min_stat should return Some: allow data skipping on timestamp_ntz minValues"
+        "get_min_stat should return Some for timestamp_ntz minValues"
     );
+    assert!(
+        creator
+            .get_max_stat(col, &DataType::TIMESTAMP_NTZ)
+            .is_some(),
+        "get_max_stat should return Some for timestamp_ntz maxValues"
+    );
+}
+
+#[test]
+fn test_adjust_scalar_for_max_stat_truncation() {
+    // Timestamp: subtracts 999us
     assert_eq!(
-        creator.get_max_stat(col, &DataType::TIMESTAMP_NTZ),
-        None,
-        "get_max_stat should return None: no data skipping on timestamp_ntz maxValues"
+        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(1_000_000)),
+        Scalar::Timestamp(999_001)
+    );
+    // TimestampNtz: subtracts 999us
+    assert_eq!(
+        adjust_scalar_for_max_stat_truncation(&Scalar::TimestampNtz(1_000_000)),
+        Scalar::TimestampNtz(999_001)
+    );
+    // Non-timestamp: unchanged
+    assert_eq!(
+        adjust_scalar_for_max_stat_truncation(&Scalar::from(42i64)),
+        Scalar::from(42i64)
+    );
+    // Saturating at i64::MIN
+    assert_eq!(
+        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(i64::MIN)),
+        Scalar::Timestamp(i64::MIN)
+    );
+    // Near-zero: goes negative
+    assert_eq!(
+        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(500)),
+        Scalar::Timestamp(-499)
     );
 }
 
@@ -430,14 +457,14 @@ fn test_checkpoint_skipping_null_guard_vs_regular() {
     expect_eq!(
         filter.eval(&guarded),
         TRUE,
-        "guarded pred with null stats → TRUE (keep)"
+        "guarded pred with null stats -> TRUE (keep)"
     );
 
     let regular = as_data_skipping_predicate(&pred).unwrap();
     expect_eq!(
         filter.eval(&regular),
         NULL,
-        "regular pred with null stats → NULL (unknown)"
+        "regular pred with null stats -> NULL (unknown)"
     );
 }
 
@@ -458,7 +485,7 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
     );
     let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
 
-    // Both stats present and both allow pruning → skip
+    // Both stats present and both allow pruning -> skip
     let resolver = HashMap::from_iter([
         (column_name!("maxValues.col_a"), Scalar::from(50)),
         (column_name!("minValues.col_b"), Scalar::from(60)),
@@ -467,10 +494,10 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
     expect_eq!(
         filter.eval(&skipping_pred),
         FALSE,
-        "both cols prunable → skip"
+        "both cols prunable -> skip"
     );
 
-    // col_a stats null, but col_b stats alone are enough to prune → still skip
+    // col_a stats null, but col_b stats alone are enough to prune -> still skip
     let resolver = HashMap::from_iter([
         (
             column_name!("maxValues.col_a"),
@@ -482,10 +509,10 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
     expect_eq!(
         filter.eval(&skipping_pred),
         FALSE,
-        "col_a null but col_b prunable → still skip"
+        "col_a null but col_b prunable -> still skip"
     );
 
-    // col_a stats null and col_b doesn't allow pruning → keep
+    // col_a stats null and col_b doesn't allow pruning -> keep
     let resolver = HashMap::from_iter([
         (
             column_name!("maxValues.col_a"),
@@ -497,46 +524,100 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
     expect_eq!(
         filter.eval(&skipping_pred),
         TRUE,
-        "col_a null and col_b not prunable → keep"
+        "col_a null and col_b not prunable -> keep"
     );
 }
 
-// TODO(#1002): we currently don't support file skipping on timestamp columns' max stat since they
-// are truncated to milliseconds in add.stats.
-#[test]
-fn test_timestamp_predicates_dont_data_skip() {
+// Verifies the null-guarded checkpoint skipping path also applies the 999us timestamp
+// truncation adjustment to max stat comparisons.
+#[rstest]
+fn test_checkpoint_skipping_timestamp_adjustment(
+    #[values(Scalar::Timestamp(1_000_000), Scalar::TimestampNtz(1_000_000))] timestamp: Scalar,
+) {
     let col = &column_expr!("ts_col");
-    for timestamp in [&Scalar::Timestamp(1000000), &Scalar::TimestampNtz(1000000)] {
-        // LT will do minValues -> OK
-        let pred = Pred::lt(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert_eq!(
-            skipping_pred.unwrap().to_string(),
-            "Column(stats_parsed.minValues.ts_col) < 1000000"
-        );
 
-        // GT will do maxValues -> BLOCKED
-        let pred = Pred::gt(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert!(
-            skipping_pred.is_none(),
-            "Expected no data skipping for timestamp predicate: {pred:#?}, got {skipping_pred:#?}"
-        );
+    // GT: should produce OR(maxValues.ts_col IS NULL, maxValues.ts_col > 999001)
+    let pred = Pred::gt(col.clone(), timestamp.clone());
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
+    assert_eq!(
+        skipping_pred.to_string(),
+        "OR(Column(maxValues.ts_col) IS NULL, Column(maxValues.ts_col) > 999001)"
+    );
 
-        let pred = Pred::eq(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert_eq!(
-            skipping_pred.unwrap().to_string(),
-            "AND(NOT(Column(stats_parsed.minValues.ts_col) > 1000000), null)"
-        );
+    // EQ: max stat leg should use adjusted literal
+    let pred = Pred::eq(col.clone(), timestamp.clone());
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
+    assert_eq!(
+        skipping_pred.to_string(),
+        "AND(OR(Column(minValues.ts_col) IS NULL, NOT(Column(minValues.ts_col) > 1000000)), \
+         OR(Column(maxValues.ts_col) IS NULL, NOT(Column(maxValues.ts_col) < 999001)))"
+    );
+}
 
-        let pred = Pred::ne(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert_eq!(
-            skipping_pred.unwrap().to_string(),
-            "OR(NOT(Column(stats_parsed.minValues.ts_col) = 1000000), null)"
-        );
-    }
+// Timestamp predicates use max stats with a 999us adjustment to account for millisecond
+// truncation in Delta JSON stats.
+#[rstest]
+fn test_timestamp_predicates_use_adjusted_max_stats(
+    #[values(Scalar::Timestamp(1_000_000), Scalar::TimestampNtz(1_000_000))] timestamp: Scalar,
+) {
+    let col = &column_expr!("ts_col");
+
+    // LT uses minValues (no adjustment needed for min stats)
+    let pred = Pred::lt(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "Column(stats_parsed.minValues.ts_col) < 1000000"
+    );
+
+    // GT uses maxValues with adjusted literal (1000000 - 999 = 999001)
+    let pred = Pred::gt(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "Column(stats_parsed.maxValues.ts_col) > 999001"
+    );
+
+    // EQ uses both min (unadjusted) and max (adjusted)
+    let pred = Pred::eq(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "AND(NOT(Column(stats_parsed.minValues.ts_col) > 1000000), \
+         NOT(Column(stats_parsed.maxValues.ts_col) < 999001))"
+    );
+
+    // NE uses both min (unadjusted) and max (adjusted)
+    let pred = Pred::ne(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "OR(NOT(Column(stats_parsed.minValues.ts_col) = 1000000), \
+         NOT(Column(stats_parsed.maxValues.ts_col) = 999001))"
+    );
+
+    // GE (col >= val) uses maxValues with adjusted literal
+    let pred = Pred::ge(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "NOT(Column(stats_parsed.maxValues.ts_col) < 999001)"
+    );
+
+    // LE (col <= val) uses minValues only (no adjustment needed)
+    let pred = Pred::le(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "NOT(Column(stats_parsed.minValues.ts_col) > 1000000)"
+    );
+}
+
+// Partition timestamp columns use exact values (not truncated), so no adjustment is applied.
+#[test]
+fn test_partition_timestamp_column_no_adjustment() {
+    let partition_columns: HashSet<String> = ["ts_part".to_string()].into();
+    let pred = Pred::gt(column_expr!("ts_part"), Scalar::Timestamp(1_000_000));
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, &partition_columns).unwrap();
+    assert_eq!(
+        skipping_pred.to_string(),
+        "OR(NOT(Column(is_add)), Column(partitionValues_parsed.ts_part) > 1000000)"
+    );
 }
 
 // Tests for partition-aware data skipping
@@ -560,6 +641,7 @@ fn mixed_resolver(
             column_name!("stats_parsed.maxValues.data_col"),
             Scalar::from(max_data),
         ),
+        (column_name!("is_add"), Scalar::from(true)),
     ]))
 }
 
@@ -599,11 +681,11 @@ fn test_partition_column_rewrite() {
 #[rstest]
 #[case::is_null(
     Pred::is_null(column_expr!("part_col")),
-    "Column(partitionValues_parsed.part_col) IS NULL"
+    "OR(NOT(Column(is_add)), Column(partitionValues_parsed.part_col) IS NULL)"
 )]
 #[case::is_not_null(
     Pred::is_not_null(column_expr!("part_col")),
-    "NOT(Column(partitionValues_parsed.part_col) IS NULL)"
+    "OR(NOT(Column(is_add)), NOT(Column(partitionValues_parsed.part_col) IS NULL))"
 )]
 fn test_partition_column_is_null(#[case] pred: Pred, #[case] expected: &str) {
     let partition_columns = test_partition_columns();
@@ -710,17 +792,23 @@ fn test_partition_column_comparison_uses_exact_value() {
         .expect("should exist");
 
     // part_col='A': 'A' > 'B' is false -> skip
-    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
-        column_name!("partitionValues_parsed.part_col"),
-        Scalar::from("A"),
-    )]));
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_col"),
+            Scalar::from("A"),
+        ),
+        (column_name!("is_add"), Scalar::from(true)),
+    ]));
     assert_eq!(resolver.eval(&skipping_pred), FALSE);
 
     // part_col='C': 'C' > 'B' is true -> keep
-    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
-        column_name!("partitionValues_parsed.part_col"),
-        Scalar::from("C"),
-    )]));
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_col"),
+            Scalar::from("C"),
+        ),
+        (column_name!("is_add"), Scalar::from(true)),
+    ]));
     assert_eq!(resolver.eval(&skipping_pred), TRUE);
 }
 
@@ -792,12 +880,200 @@ fn test_sql_where_mixed_partition_and_data_evaluation(
             column_name!("stats_parsed.maxValues.data_col"),
             Scalar::from(max_data),
         ),
+        (column_name!("is_add"), Scalar::from(true)),
     ]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     assert_eq!(
         filter.eval(&sql_pred),
         expected,
         "part_col='{part_val}' max(data_col)={max_data}"
+    );
+}
+
+// The is_add guard (OR(NOT is_add, pred)) ensures Remove rows are never pruned by
+// partition predicates, regardless of whether the partition value matches.
+#[rstest]
+#[case::non_matching_partition("Y", false, TRUE, "non-matching partition, Remove kept via guard")]
+#[case::matching_partition("X", false, TRUE, "matching partition, Remove kept via guard")]
+#[case::add_non_matching("Y", true, FALSE, "non-matching partition, Add correctly pruned")]
+#[case::add_matching("X", true, TRUE, "matching partition, Add correctly kept")]
+fn is_add_guard_keeps_remove_rows(
+    #[case] part_val: &str,
+    #[case] is_add: bool,
+    #[case] expected: Option<bool>,
+    #[case] _scenario: &str,
+) {
+    let partition_columns = test_partition_columns();
+    let pred = Pred::eq(column_expr!("part_col"), Scalar::from("X"));
+    let skipping_pred = as_data_skipping_predicate_with_partitions(&pred, &partition_columns)
+        .expect("should exist");
+
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_col"),
+            Scalar::from(part_val),
+        ),
+        (column_name!("is_add"), Scalar::from(is_add)),
+    ]));
+    assert_eq!(
+        resolver.eval(&skipping_pred),
+        expected,
+        "part_col='{part_val}' is_add={is_add}"
+    );
+}
+
+// Mixed AND with is_add=false and null stats: Remove rows have null data stats, so the data
+// arm evaluates to NULL. AND(true_from_guard, NULL) = NULL, which the DISTINCT filter treats
+// as "keep". This verifies Removes are not pruned even when the data arm cannot be satisfied.
+#[rstest]
+#[case::remove_null_stats("Y", false, "Remove: AND(guard=true, stats=NULL) = NULL -> kept")]
+#[case::add_null_stats_partition_match("X", true, "Add: AND(true, NULL) = NULL -> kept")]
+#[case::add_null_stats_partition_miss("Y", true, "Add: AND(false, NULL) = false -> pruned")]
+fn mixed_and_with_null_stats_and_is_add_guard(
+    #[case] part_val: &str,
+    #[case] is_add: bool,
+    #[case] _scenario: &str,
+) {
+    let partition_columns = test_partition_columns();
+    let pred = Pred::and(
+        Pred::eq(column_expr!("part_col"), Scalar::from("X")),
+        Pred::gt(column_expr!("data_col"), Scalar::from(100)),
+    );
+    let skipping_pred = as_data_skipping_predicate_with_partitions(&pred, &partition_columns)
+        .expect("should exist");
+
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_col"),
+            Scalar::from(part_val),
+        ),
+        (
+            column_name!("stats_parsed.maxValues.data_col"),
+            Scalar::Null(DataType::INTEGER),
+        ),
+        (column_name!("is_add"), Scalar::from(is_add)),
+    ]));
+    let result = resolver.eval(&skipping_pred);
+    if !is_add {
+        assert_ne!(result, FALSE, "Remove rows must never be pruned");
+    }
+}
+
+// Null partition values: IS NULL / IS NOT NULL predicates on partition columns must
+// correctly evaluate against null values in partitionValues_parsed.
+#[rstest]
+#[case::is_null_with_null_value(
+    Pred::is_null(column_expr!("part_col")),
+    Scalar::Null(DataType::STRING),
+    TRUE,
+    "null partition value matches IS NULL"
+)]
+#[case::is_null_with_non_null_value(
+    Pred::is_null(column_expr!("part_col")),
+    Scalar::from("X"),
+    FALSE,
+    "non-null partition value rejected by IS NULL"
+)]
+#[case::is_not_null_with_null_value(
+    Pred::is_not_null(column_expr!("part_col")),
+    Scalar::Null(DataType::STRING),
+    FALSE,
+    "null partition value rejected by IS NOT NULL"
+)]
+#[case::is_not_null_with_non_null_value(
+    Pred::is_not_null(column_expr!("part_col")),
+    Scalar::from("X"),
+    TRUE,
+    "non-null partition value matches IS NOT NULL"
+)]
+fn null_partition_value_evaluation(
+    #[case] pred: Pred,
+    #[case] part_val: Scalar,
+    #[case] expected: Option<bool>,
+    #[case] _scenario: &str,
+) {
+    let partition_columns = test_partition_columns();
+    let skipping_pred = as_data_skipping_predicate_with_partitions(&pred, &partition_columns)
+        .expect("should exist");
+
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (column_name!("partitionValues_parsed.part_col"), part_val),
+        (column_name!("is_add"), Scalar::from(true)),
+    ]));
+    assert_eq!(resolver.eval(&skipping_pred), expected);
+}
+
+// Multiple partition columns: predicates referencing two partition columns should both
+// rewrite to partitionValues_parsed and both get is_add guards.
+#[test]
+fn multiple_partition_columns_rewrite_and_evaluation() {
+    let partition_columns: HashSet<String> =
+        ["part_a", "part_b"].iter().map(|s| s.to_string()).collect();
+
+    let pred = Pred::and(
+        Pred::eq(column_expr!("part_a"), Scalar::from("X")),
+        Pred::eq(column_expr!("part_b"), Scalar::from("Y")),
+    );
+    let skipping_pred = as_data_skipping_predicate_with_partitions(&pred, &partition_columns)
+        .expect("should exist");
+    let pred_str = skipping_pred.to_string();
+    assert!(
+        pred_str.contains("partitionValues_parsed.part_a"),
+        "Should reference partitionValues_parsed.part_a, got {pred_str}"
+    );
+    assert!(
+        pred_str.contains("partitionValues_parsed.part_b"),
+        "Should reference partitionValues_parsed.part_b, got {pred_str}"
+    );
+    assert!(
+        !pred_str.contains("stats_parsed"),
+        "Should not reference stats_parsed for partition-only pred, got {pred_str}"
+    );
+
+    // Both match -> kept
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_a"),
+            Scalar::from("X"),
+        ),
+        (
+            column_name!("partitionValues_parsed.part_b"),
+            Scalar::from("Y"),
+        ),
+        (column_name!("is_add"), Scalar::from(true)),
+    ]));
+    assert_eq!(resolver.eval(&skipping_pred), TRUE);
+
+    // First misses -> pruned
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_a"),
+            Scalar::from("Z"),
+        ),
+        (
+            column_name!("partitionValues_parsed.part_b"),
+            Scalar::from("Y"),
+        ),
+        (column_name!("is_add"), Scalar::from(true)),
+    ]));
+    assert_eq!(resolver.eval(&skipping_pred), FALSE);
+
+    // Remove row: both miss but is_add=false -> kept via guard
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
+        (
+            column_name!("partitionValues_parsed.part_a"),
+            Scalar::from("Z"),
+        ),
+        (
+            column_name!("partitionValues_parsed.part_b"),
+            Scalar::from("W"),
+        ),
+        (column_name!("is_add"), Scalar::from(false)),
+    ]));
+    assert_ne!(
+        resolver.eval(&skipping_pred),
+        FALSE,
+        "Remove must not be pruned"
     );
 }
 
@@ -813,4 +1089,275 @@ fn single_unsupported_pred_in_junction_disables_checkpoint_pushdown() {
         skipping_pred.is_none(),
         "Single unsupported predicate in a junction should disable pushdown, got: {skipping_pred:?}"
     );
+}
+
+// -- Integration tests: end-to-end data skipping with real tables -------------------
+//
+// Two test tables are used:
+//
+// `app-txn-checkpoint` (4 files, partitioned by `modified` (string)):
+//   - 2 files: modified="2021-02-01", value in [4, 11]
+//   - 2 files: modified="2021-02-02", value in [1, 3]
+//   - Version 0 (JSON) + version 1 (JSON + checkpoint) exercises both code paths.
+//
+// `parsed-stats` (6 files, non-partitioned):
+//   - File 1-6: id ranges [1,100]..[501,600], ts_col min values 1M..11M microseconds
+//   - Version 3 checkpoint + versions 4-5 JSON commits.
+
+use std::path::PathBuf;
+
+use crate::engine::sync::SyncEngine;
+use crate::Snapshot;
+
+/// Counts files selected after data skipping for the given predicate and table.
+fn count_selected(table_dir: &str, pred: PredicateRef) -> usize {
+    let path = std::fs::canonicalize(PathBuf::from(table_dir)).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let scan = Snapshot::builder_for(url)
+        .build(engine.as_ref())
+        .unwrap()
+        .scan_builder()
+        .with_predicate(pred)
+        .build()
+        .unwrap();
+    scan.scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .iter()
+        .flat_map(|sm| sm.scan_files.selection_vector())
+        .filter(|&&s| s)
+        .count()
+}
+
+const PARTITIONED_TABLE: &str = "./tests/data/app-txn-checkpoint/";
+const STATS_TABLE: &str = "./tests/data/parsed-stats/";
+
+// -- Partition-only predicates (app-txn-checkpoint) ---------------------------
+
+#[rstest]
+#[case::eq_match(Pred::eq(column_expr!("modified"), Expr::literal("2021-02-01")), 2)]
+#[case::eq_no_match(Pred::eq(column_expr!("modified"), Expr::literal("2099-01-01")), 0)]
+#[case::neq(Pred::ne(column_expr!("modified"), Expr::literal("2021-02-01")), 2)]
+#[case::gt(Pred::gt(column_expr!("modified"), Expr::literal("2021-02-01")), 2)]
+#[case::lt(Pred::lt(column_expr!("modified"), Expr::literal("2021-02-02")), 2)]
+#[case::gte_all(Pred::ge(column_expr!("modified"), Expr::literal("2021-02-01")), 4)]
+#[case::lte_all(Pred::le(column_expr!("modified"), Expr::literal("2021-02-02")), 4)]
+#[case::range_anded(
+    Pred::and(
+        Pred::ge(column_expr!("modified"), Expr::literal("2021-02-01")),
+        Pred::le(column_expr!("modified"), Expr::literal("2021-02-01")),
+    ),
+    2
+)]
+fn partition_only_skipping(#[case] pred: Pred, #[case] expected: usize) {
+    assert_eq!(count_selected(PARTITIONED_TABLE, Arc::new(pred)), expected);
+}
+
+// -- Data-stats-only predicates (app-txn-checkpoint) --------------------------
+
+#[rstest]
+#[case::gt_prunes_low(Pred::gt(column_expr!("value"), Expr::literal(9i32)), 2)]
+#[case::lt_prunes_high(Pred::lt(column_expr!("value"), Expr::literal(4i32)), 2)]
+#[case::gt_above_max(Pred::gt(column_expr!("value"), Expr::literal(11i32)), 0)]
+#[case::le_at_max(Pred::le(column_expr!("value"), Expr::literal(11i32)), 4)]
+#[case::range_anded(
+    Pred::and(
+        Pred::ge(column_expr!("value"), Expr::literal(1i32)),
+        Pred::le(column_expr!("value"), Expr::literal(3i32)),
+    ),
+    2
+)]
+fn data_stats_only_skipping(#[case] pred: Pred, #[case] expected: usize) {
+    assert_eq!(count_selected(PARTITIONED_TABLE, Arc::new(pred)), expected);
+}
+
+// -- Mixed AND: both partition and data conditions must hold -------------------
+
+#[rstest]
+#[case::partition_match_data_match(
+    "2021-02-01",
+    3i32,
+    2,
+    "partition prunes 02-02; data keeps 02-01 (max=11 > 3)"
+)]
+#[case::partition_match_data_miss(
+    "2021-02-02",
+    3i32,
+    0,
+    "partition keeps 02-02 but max=3 NOT >3; partition prunes 02-01"
+)]
+#[case::partition_miss("2099-01-01", 0i32, 0, "no files match partition")]
+fn mixed_and_skipping(
+    #[case] partition_val: &str,
+    #[case] data_threshold: i32,
+    #[case] expected: usize,
+    #[case] _scenario: &str,
+) {
+    let pred = Arc::new(Pred::and(
+        column_expr!("modified").eq(Expr::literal(partition_val)),
+        column_expr!("value").gt(Expr::literal(data_threshold)),
+    ));
+    assert_eq!(count_selected(PARTITIONED_TABLE, pred), expected);
+}
+
+// -- Mixed OR: a file survives if either leg matches --------------------------
+
+#[rstest]
+#[case::both_match("2021-02-02", 9i32, 4, "02-02 matches partition; 02-01 has max=11 > 9")]
+#[case::partition_saves_some(
+    "2021-02-02",
+    11i32,
+    2,
+    "02-02 matches partition; 02-01 max=11 NOT >11 -> pruned"
+)]
+#[case::data_saves_some(
+    "2099-01-01", -1i32, 4,
+    "no partition match; all files have max >= 0 so value > -1 keeps all"
+)]
+#[case::both_miss(
+    "2099-01-01",
+    11i32,
+    0,
+    "no partition match; max=11 NOT >11 -> all pruned"
+)]
+fn mixed_or_skipping(
+    #[case] partition_val: &str,
+    #[case] data_threshold: impl Into<Scalar>,
+    #[case] expected: usize,
+    #[case] _scenario: &str,
+) {
+    let pred = Arc::new(Pred::or(
+        column_expr!("modified").eq(Expr::literal(partition_val)),
+        column_expr!("value").gt(Expr::literal(data_threshold.into())),
+    ));
+    assert_eq!(count_selected(PARTITIONED_TABLE, pred), expected);
+}
+
+// -- Nested AND(partition, OR(data, data)) ------------------------------------
+
+#[rstest]
+#[case::loose_bound(10i32, 4, "max=11 > 10 keeps 02-01; min=1 < 2 keeps 02-02")]
+#[case::strict_bound(11i32, 2, "max=11 NOT >11 prunes 02-01; min=1 < 2 keeps 02-02")]
+fn nested_and_or_skipping(
+    #[case] upper_bound: i32,
+    #[case] expected: usize,
+    #[case] _scenario: &str,
+) {
+    let pred = Arc::new(Pred::and(
+        Pred::ge(column_expr!("modified"), Expr::literal("2021-02-01")),
+        Pred::or(
+            Pred::lt(column_expr!("value"), Expr::literal(2i32)),
+            Pred::gt(column_expr!("value"), Expr::literal(upper_bound)),
+        ),
+    ));
+    assert_eq!(count_selected(PARTITIONED_TABLE, pred), expected);
+}
+
+// -- Parsed stats skipping (non-partitioned table) ----------------------------
+
+#[test]
+fn parsed_stats_skipping() {
+    // id > 400 should skip files 1-4 (max id: 100, 200, 300, 400) and keep files 5-6
+    let pred = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    assert_eq!(count_selected(STATS_TABLE, pred), 2);
+}
+
+// -- Timestamp predicate skipping (parsed-stats table) ------------------------
+// Timestamp predicates now use max stats with a 999us adjustment for truncation.
+// Table has 6 files with ts_col ranges: [1M,2M], [3M,4M], [5M,6M], [7M,8M], [9M,10M], [11M,12M]
+
+#[rstest]
+#[case::bare_ts_gt_keeps_all(
+    // ts_col > 2M -> adjusted: max > 1,999,001 -> all 6 files have max >= 2M -> 6
+    Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+    6
+)]
+#[case::bare_ts_lt_skips(
+    // ts_col < 3M -> min < 3M -> file 1 (min=1M) -> 1
+    Pred::lt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(3_000_000))),
+    1
+)]
+#[case::and_mixed_id_and_ts(
+    // id > 400 keeps files 5-6; ts_col > 2M keeps all 6; AND -> 2
+    Pred::and(
+        Pred::gt(column_expr!("id"), Expr::literal(400i64)),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+    ),
+    2
+)]
+#[case::or_mixed_id_and_ts(
+    // id > 400 keeps 5-6; ts_col > 2M keeps 1-6; OR -> 6
+    Pred::or(
+        Pred::gt(column_expr!("id"), Expr::literal(400i64)),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+    ),
+    6
+)]
+#[case::and_two_ts_predicates(
+    // ts_col > 2M (adjusted max > 1,999,001 -> all) AND ts_col > 5M (adjusted max > 4,999,001
+    // -> files 3-6) -> 4
+    Pred::and(
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
+    ),
+    4
+)]
+#[case::or_two_ts_predicates(
+    // ts_col > 2M keeps all; ts_col > 5M keeps files 3-6; OR -> 6
+    Pred::or(
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
+    ),
+    6
+)]
+fn timestamp_predicate_skipping(#[case] pred: Pred, #[case] expected: usize) {
+    assert_eq!(count_selected(STATS_TABLE, Arc::new(pred)), expected);
+}
+
+// -- Unsupported predicate handling (parsed-stats table) ----------------------
+// Column-column comparisons are unsupported for data skipping (no literal to infer type).
+// Verifies that junctions degrade gracefully when one or both legs can't be evaluated.
+
+#[rstest]
+#[case::bare_unsupported_returns_all(
+    // col > col is unsupported -> None -> keep all files
+    Pred::gt(column_expr!("id"), column_expr!("salary")),
+    6
+)]
+#[case::and_supported_with_unsupported(
+    // id > 400 keeps files 5-6; id > salary is unsupported; AND -> 2
+    Pred::and(
+        Pred::gt(column_expr!("id"), Expr::literal(400i64)),
+        Pred::gt(column_expr!("id"), column_expr!("salary")),
+    ),
+    2
+)]
+#[case::or_supported_with_unsupported(
+    // id > 400 keeps 5-6; id > salary is unsupported; OR -> all 6
+    Pred::or(
+        Pred::gt(column_expr!("id"), Expr::literal(400i64)),
+        Pred::gt(column_expr!("id"), column_expr!("salary")),
+    ),
+    6
+)]
+#[case::and_all_unsupported(
+    // Both legs unsupported -> None -> keep all 6
+    Pred::and(
+        Pred::gt(column_expr!("id"), column_expr!("salary")),
+        Pred::gt(column_expr!("id"), column_expr!("age")),
+    ),
+    6
+)]
+#[case::or_all_unsupported(
+    // Both legs unsupported -> None -> keep all 6
+    Pred::or(
+        Pred::gt(column_expr!("id"), column_expr!("salary")),
+        Pred::gt(column_expr!("id"), column_expr!("age")),
+    ),
+    6
+)]
+fn unsupported_predicate_skipping(#[case] pred: Pred, #[case] expected: usize) {
+    assert_eq!(count_selected(STATS_TABLE, Arc::new(pred)), expected);
 }

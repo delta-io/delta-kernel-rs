@@ -18,11 +18,13 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::expressions::column_expr;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::DeltaResult;
+use delta_kernel::Expression;
 use delta_kernel::Snapshot;
 
 use serde_json::json;
@@ -527,6 +529,99 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
     let batches = read_scan(&scan, engine.clone())?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2);
+
+    Ok(())
+}
+
+const WIDE_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"age","type":"long","nullable":true,"metadata":{}}]}"#;
+
+/// Regression test for https://github.com/delta-io/delta-kernel-rs/issues/2165
+///
+/// When a schema-evolved table has a checkpoint with stats_parsed covering only the
+/// pre-evolution columns, scanning with a predicate on a newly added column should
+/// not panic. The missing stats column should be treated as unknown (no data skipping).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, table_root) = new_in_memory_store();
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(executor)
+            .build(),
+    );
+
+    // Version 0: protocol + metadata with schema [id, name], stats as struct enabled
+    write_commit(
+        &store,
+        &build_commit(NON_PARTITIONED_SCHEMA, &[], true, true, true),
+        0,
+    )
+    .await?;
+
+    // Version 1: write data with [id, name]
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    let result = insert_data(
+        snapshot,
+        &engine,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+        ],
+    )
+    .await?;
+    assert!(result.is_committed());
+
+    // Checkpoint at V1: stats_parsed covers only [id, name]
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref())?;
+
+    // Version 2: schema evolution - add `age` column via new metadata action
+    write_commit(
+        &store,
+        &build_commit(WIDE_SCHEMA, &[], true, true, false),
+        2,
+    )
+    .await?;
+
+    // Version 3: write data with [id, name, age]
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    let result = insert_data(
+        snapshot,
+        &engine,
+        vec![
+            Arc::new(Int64Array::from(vec![4, 5, 6])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["Diana", "Eve", "Frank"])),
+            Arc::new(Int64Array::from(vec![25, 35, 45])),
+        ],
+    )
+    .await?;
+    assert!(result.is_committed());
+
+    // Scan with predicate on `id` (present in checkpoint stats_parsed) should work
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    let predicate = Arc::new(column_expr!("id").gt(Expression::literal(2i64)));
+    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    let batches = read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows > 0, "should return rows matching id > 2");
+
+    // Scan with predicate on `age` (missing from checkpoint stats_parsed) should NOT panic.
+    // The kernel should handle the missing stats column gracefully.
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+    let predicate = Arc::new(column_expr!("age").gt(Expression::literal(30i64)));
+    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    let batches = read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    // The predicate is used for data skipping only (not row-level filtering).
+    // All 6 rows should be returned since data skipping cannot skip any files:
+    // V1 data has no stats for `age`, and V3 data's age range includes values > 30.
+    assert_eq!(
+        total_rows, 6,
+        "all rows returned when data skipping cannot filter"
+    );
 
     Ok(())
 }

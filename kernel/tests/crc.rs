@@ -9,12 +9,12 @@ use delta_kernel::crc::{Crc, FileStatsValidity};
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::snapshot::{ChecksumWriteResult, FileStats, Snapshot};
+use delta_kernel::snapshot::{ChecksumWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Engine};
 use rstest::rstest;
-use test_utils::{insert_data, test_table_setup};
+use test_utils::{add_commit, insert_data, test_table_setup};
 
 // ============================================================================
 // File stats from CRC on disk
@@ -31,12 +31,10 @@ async fn test_get_file_stats_from_crc() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 0);
 
-    let file_stats = snapshot.get_file_stats(&engine);
-    let expected = FileStats {
-        table_size_bytes: 5259,
-        num_files: 10,
-    };
-    assert_eq!(file_stats, Some(expected));
+    let file_stats = snapshot.get_or_load_file_stats(&engine).unwrap();
+    assert_eq!(file_stats.num_files, 10);
+    assert_eq!(file_stats.table_size_bytes, 5259);
+    assert!(file_stats.file_size_histogram.is_some());
 
     Ok(())
 }
@@ -58,7 +56,7 @@ async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
 
-    let file_stats = snapshot.get_file_stats(engine.as_ref());
+    let file_stats = snapshot.get_or_load_file_stats(engine.as_ref());
     assert_eq!(file_stats, None);
 
     Ok(())
@@ -78,7 +76,7 @@ async fn test_get_file_stats_crc_not_at_snapshot_version() -> DeltaResult<()> {
     // Verify the table starts at version 0 with valid CRC stats
     let snapshot = Snapshot::builder_for(table_path.clone()).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
-    assert!(snapshot.get_file_stats(engine.as_ref()).is_some());
+    assert!(snapshot.get_or_load_file_stats(engine.as_ref()).is_some());
 
     // ===== WHEN =====
     // Empty commit to advance to version 1 (no new CRC file written)
@@ -91,7 +89,7 @@ async fn test_get_file_stats_crc_not_at_snapshot_version() -> DeltaResult<()> {
     assert_eq!(snapshot.version(), 1);
 
     // No CRC at version 1, so file stats should be None
-    let file_stats = snapshot.get_file_stats(engine.as_ref());
+    let file_stats = snapshot.get_or_load_file_stats(engine.as_ref());
     assert_eq!(file_stats, None);
 
     Ok(())
@@ -256,7 +254,7 @@ async fn test_post_commit_crc_chains_only_if_read_snapshot_has_crc(
 /// Writes the in-memory CRC to disk, reloads a fresh snapshot, and asserts that the
 /// round-tripped CRC matches the in-memory one. Returns the loaded CRC for further assertions.
 fn write_and_verify_crc(
-    snapshot: &Snapshot,
+    snapshot: &SnapshotRef,
     table_path: &str,
     engine: &dyn delta_kernel::Engine,
 ) -> Crc {
@@ -419,7 +417,7 @@ async fn test_write_checksum_success_simple() -> DeltaResult<()> {
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
     let snapshot = committed.post_commit_snapshot().unwrap();
 
-    let result = snapshot.write_checksum(engine.as_ref())?;
+    let (result, _updated) = snapshot.write_checksum(engine.as_ref())?;
     assert_eq!(result, ChecksumWriteResult::Written);
 
     // Verify the CRC file is readable by loading a fresh snapshot from disk
@@ -442,14 +440,16 @@ async fn test_write_checksum_double_write_returns_already_exists(
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
     let snapshot = committed.post_commit_snapshot().unwrap();
 
-    let first = snapshot.write_checksum(engine.as_ref())?;
+    let (first, updated) = snapshot.write_checksum(engine.as_ref())?;
     assert_eq!(first, ChecksumWriteResult::Written);
 
     let second = if reload_snapshot {
         let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-        fresh.write_checksum(engine.as_ref())?
+        let (result, _) = fresh.write_checksum(engine.as_ref())?;
+        result
     } else {
-        snapshot.write_checksum(engine.as_ref())?
+        let (result, _) = updated.write_checksum(engine.as_ref())?;
+        result
     };
     assert_eq!(second, ChecksumWriteResult::AlreadyExists);
 
@@ -497,6 +497,117 @@ async fn test_in_memory_crc_chains_across_multiple_commits_then_writes() -> Delt
     let crc_stats = crc.file_stats().unwrap();
     assert_eq!(crc_stats.num_files, 5);
     assert!(crc_stats.table_size_bytes > 0);
+
+    Ok(())
+}
+
+// When an incremental snapshot update picks up a CRC file from the new log segment, the loaded
+// CRC data should be preserved in the resulting snapshot (not discarded by creating a second
+// LazyCrc). This verifies that compute_post_commit_crc can find the CRC without additional I/O.
+#[tokio::test]
+async fn test_incremental_snapshot_preserves_loaded_crc() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // Create table at v0 and write its CRC to disk
+    let committed_v0 = create_table_and_commit(&table_path, engine.as_ref())?;
+    let snapshot_v0 = committed_v0.post_commit_snapshot().unwrap();
+    snapshot_v0.write_checksum(engine.as_ref())?;
+
+    // Insert data at v1 and write its CRC to disk
+    let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+    let committed_v1 = insert_data(snapshot_v0.clone(), &engine, vec![col])
+        .await?
+        .unwrap_committed();
+    committed_v1
+        .post_commit_snapshot()
+        .unwrap()
+        .write_checksum(engine.as_ref())?;
+
+    // Load a fresh snapshot at v0 (from disk, not post-commit)
+    let fresh_v0 = Snapshot::builder_for(&table_path)
+        .at_version(0)
+        .build(engine.as_ref())?;
+    assert_eq!(fresh_v0.version(), 0);
+
+    // Incrementally update from v0 -> v1
+    let incremental_v1 = Snapshot::builder_from(fresh_v0).build(engine.as_ref())?;
+    assert_eq!(incremental_v1.version(), 1);
+
+    // The CRC at v1 should be loaded from the incremental update (not discarded)
+    assert_eq!(incremental_v1.crc_version_for_testing(), Some(1));
+    assert!(
+        incremental_v1
+            .get_current_crc_if_loaded_for_testing()
+            .is_some(),
+        "CRC should be loaded at v1 after incremental snapshot update"
+    );
+
+    // Committing from this snapshot should produce a post-commit CRC (proves
+    // compute_post_commit_crc found the loaded CRC and applied the delta)
+    let col: ArrayRef = Arc::new(Int32Array::from(vec![4, 5, 6]));
+    let committed_v2 = insert_data(incremental_v1, &engine, vec![col])
+        .await?
+        .unwrap_committed();
+    assert_eq!(committed_v2.commit_version(), 2);
+    let snapshot_v2 = committed_v2.post_commit_snapshot().unwrap();
+    assert!(
+        snapshot_v2
+            .get_current_crc_if_loaded_for_testing()
+            .is_some(),
+        "Post-commit CRC should chain from incremental snapshot's CRC"
+    );
+
+    Ok(())
+}
+
+// Incremental update where only the old segment has a CRC file (no new CRC written).
+// The old CRC is preserved and the LazyCrc is reused from the old snapshot, but since
+// it's at v0 while the snapshot is at v1, it won't be reported as loaded at the
+// snapshot's version.
+#[tokio::test]
+async fn test_incremental_snapshot_old_crc_no_new_crc() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // Create table at v0 and write CRC to disk
+    let committed_v0 = create_table_and_commit(&table_path, engine.as_ref())?;
+    committed_v0
+        .post_commit_snapshot()
+        .unwrap()
+        .write_checksum(engine.as_ref())?;
+
+    // Insert data at v1 -- do NOT write CRC for v1
+    let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+    let committed_v1 = insert_data(
+        committed_v0.post_commit_snapshot().unwrap().clone(),
+        &engine,
+        vec![col],
+    )
+    .await?
+    .unwrap_committed();
+    assert_eq!(committed_v1.commit_version(), 1);
+
+    // Load a fresh snapshot at v0 (this loads 0.crc during P&M reading)
+    let fresh_v0 = Snapshot::builder_for(&table_path)
+        .at_version(0)
+        .build(engine.as_ref())?;
+    assert!(
+        fresh_v0.get_current_crc_if_loaded_for_testing().is_some(),
+        "Fresh v0 snapshot should have CRC loaded from 0.crc"
+    );
+
+    // Incrementally update from v0 -> v1. The new listing (starting at v1) doesn't find
+    // any CRC file, so it falls back to the old segment's 0.crc. Since the old snapshot's
+    // LazyCrc is at the same version, it is reused (may already be loaded in memory).
+    let incremental_v1 = Snapshot::builder_from(fresh_v0).build(engine.as_ref())?;
+    assert_eq!(incremental_v1.version(), 1);
+
+    // The CRC is at v0, not v1, so it won't be reported as loaded at v1
+    assert!(
+        incremental_v1
+            .get_current_crc_if_loaded_for_testing()
+            .is_none(),
+        "CRC at v0 should not be reported as loaded at v1 (version mismatch)"
+    );
 
     Ok(())
 }
@@ -622,7 +733,7 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
 
     // Case 3: Write CRC to disk, then reload fresh snapshot => DM loaded from CRC (fast path)
     //         Use NoJsonReadsEngine to prove no log replay occurs.
-    post_commit_snapshot.write_checksum(engine.as_ref())?;
+    let _ = post_commit_snapshot.write_checksum(engine.as_ref())?;
 
     let fresh_snapshot_with_crc = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(fresh_snapshot_with_crc
@@ -635,7 +746,6 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
 
 // ============================================================================
 // Set transaction CRC tracking
-// TODO(#2141): Add tests for testing set txn expiration
 // ============================================================================
 
 /// Comprehensive test for set transaction CRC tracking: verifies that set transactions are
@@ -751,6 +861,112 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
             .get_app_id_version("other-app", &FailingEngine)
             .unwrap(),
         Some(1)
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Set transaction CRC expiration
+// ============================================================================
+
+/// Tests the CRC fast path for set transaction expiration filtering. Since `lastUpdated` is set
+/// to now, "interval 0 seconds" yields `expiration_timestamp = now`, so `last_updated <= now`
+/// holds and the txn expires. A large retention or no retention should keep the txn visible.
+#[rstest]
+#[case::zero_retention_expires(Some("interval 0 seconds"), None)]
+#[case::large_retention_not_expired(Some("interval 365 days"), Some(1))]
+#[case::no_retention_no_filtering(None, Some(1))]
+#[tokio::test]
+async fn test_set_txn_expiration_via_crc_fast_path(
+    #[case] retention: Option<&str>,
+    #[case] expected: Option<i64>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+
+    // v0: create the table with optional retention property
+    let mut builder = create_table(&table_path, schema, "test_engine");
+    if let Some(r) = retention {
+        builder = builder.with_table_properties([("delta.setTransactionRetentionDuration", r)]);
+    }
+    let committed = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // v1: commit a set transaction for "my-app" (lastUpdated = now)
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
+    let committed = snapshot_v0
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_transaction_id("my-app".to_string(), 1)
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // Write CRC at v1 so the fast path is used on reload
+    let snapshot_v1 = committed.post_commit_snapshot().unwrap();
+    snapshot_v1.write_checksum(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 1);
+
+    // Verify CRC was loaded from disk
+    assert!(snapshot.get_current_crc_if_loaded_for_testing().is_some());
+
+    // FailingEngine proves the CRC fast path is used (no log replay)
+    assert_eq!(
+        snapshot
+            .get_app_id_version("my-app", &FailingEngine)
+            .unwrap(),
+        expected
+    );
+
+    Ok(())
+}
+
+/// Verifies that a set transaction with null `last_updated` never expires, even with the most
+/// aggressive retention ("interval 0 seconds").
+#[tokio::test]
+async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // v0: create table with aggressive retention
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+    create_table(&table_path, schema, "test_engine")
+        .with_table_properties([(
+            "delta.setTransactionRetentionDuration",
+            "interval 0 seconds",
+        )])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // v1: raw commit with txn action that omits lastUpdated
+    let store = Arc::new(LocalFileSystem::new());
+    add_commit(
+        &table_path,
+        store.as_ref(),
+        1,
+        r#"{"txn":{"appId":"null-app","version":42}}"#.to_string(),
+    )
+    .await
+    .unwrap();
+
+    // Reload fresh snapshot at v1 -- no CRC covers v1, so log replay is used
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 1);
+
+    // Despite aggressive retention, null last_updated means the txn never expires
+    assert_eq!(
+        fresh.get_app_id_version("null-app", engine.as_ref())?,
+        Some(42)
     );
 
     Ok(())

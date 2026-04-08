@@ -104,7 +104,7 @@ fn verify_column_names_in_clustering_metadata(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = snapshot.schema();
     let clustering_columns = snapshot
-        .get_clustering_columns_physical(engine)?
+        .get_physical_clustering_columns(engine)?
         .expect("Clustering columns should be present");
 
     assert_eq!(

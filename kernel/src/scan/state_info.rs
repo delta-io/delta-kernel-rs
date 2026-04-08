@@ -34,7 +34,7 @@ pub(crate) struct StateInfo {
     /// Physical stats schema for reading/parsing stats from checkpoint files.
     /// Used to construct checkpoint read schema with stats_parsed.
     pub(crate) physical_stats_schema: Option<SchemaRef>,
-    /// Physical partition schema with native types for checkpoint partition pruning via
+    /// Physical partition schema with native types for partition pruning via
     /// `partitionValues_parsed`. Fields use physical column names (for column mapping).
     /// Only present when the table has partition columns and a predicate is provided.
     pub(crate) physical_partition_schema: Option<SchemaRef>,
@@ -104,32 +104,50 @@ fn validate_metadata_columns<'a>(
     Ok(metadata_info)
 }
 
-/// Build the physical stats schema based on `StatsOutputMode` and `PhysicalPredicate`:
+/// Build data-skipping schemas based on `StatsOutputMode` and `PhysicalPredicate`.
 ///
-/// - `StatsOutputMode::AllColumns` + any predicate: output all stats from expected_stats_schema.
-///   Example: `(StatsOutputMode::AllColumns, _)` -> full expected stats schema.
-/// - `StatsOutputMode::Columns(non-empty)` + any predicate: merge requested + predicate columns
-///   for data skipping.
-///   Example: `(StatsOutputMode::Columns([x, y]), _)` with predicate on `z` -> stats for {x, y, z}.
-/// - `StatsOutputMode::Columns(empty)` + `PhysicalPredicate::Some`: predicate-only internal data
-///   skipping.
-///   Example: `(StatsOutputMode::Columns([]), PhysicalPredicate::Some(..))` -> stats from
-///   predicate ref schema.
-/// - `StatsOutputMode::Skip` + `PhysicalPredicate::None`: no stats at all.
-///   Example: `(StatsOutputMode::Skip, PhysicalPredicate::None)` -> returns `None`.
-fn build_physical_stats_schema(
+/// Returns `(physical_stats_schema, physical_partition_schema)`, where:
+/// - `physical_stats_schema` contains data-column stats for `stats_parsed`.
+/// - `physical_partition_schema` contains typed partition values for `partitionValues_parsed`.
+///
+/// In predicate-only mode, predicate-referenced columns are split into data columns
+/// (stats-based pruning) and partition columns (partition-value pruning).
+fn build_data_skipping_schemas(
     stats_output_mode: &StatsOutputMode,
     physical_predicate: &PhysicalPredicate,
     predicate_column_names_logical: &[ColumnName],
     table_configuration: &TableConfiguration,
-) -> DeltaResult<Option<SchemaRef>> {
+    table_partition_schema: Option<SchemaRef>,
+) -> DeltaResult<(Option<SchemaRef>, Option<SchemaRef>)> {
+    // Filter partition schema to only predicate-referenced columns. The DataSkippingFilter
+    // only needs partition columns that appear in the predicate, and the transform output
+    // should not include unused partition columns.
+    let predicate_partition_schema = match (&table_partition_schema, physical_predicate) {
+        (Some(tps), PhysicalPredicate::Some(_, ref_schema)) => {
+            // Partition values extracted from the string map via MapToStruct are always
+            // nullable (map lookup can return null), so we force all partition fields nullable.
+            ref_schema
+                .with_fields_filtered_nonempty(|f| tps.field(f.name()).is_some())?
+                .map(|partition_schema| {
+                    let nullable_fields = partition_schema
+                        .fields()
+                        .map(|f| StructField::nullable(f.name(), f.data_type().clone()));
+                    Arc::new(StructType::new_unchecked(nullable_fields))
+                })
+        }
+        _ => None,
+    };
+
     match (stats_output_mode, physical_predicate) {
         // Output all table stats columns in stats_parsed. The DataSkippingFilter
         // reads stats_parsed from the transformed batch, which uses this schema.
         (StatsOutputMode::AllColumns, _) => {
             let expected_stats_schemas =
                 table_configuration.build_expected_stats_schemas(None, None)?;
-            Ok(Some(expected_stats_schemas.physical))
+            Ok((
+                Some(expected_stats_schemas.physical),
+                predicate_partition_schema,
+            ))
         }
         // Non-empty requested columns -- include predicate-referenced columns
         // alongside the user-requested stats columns so that the DataSkippingFilter
@@ -148,11 +166,8 @@ fn build_physical_stats_schema(
             let all_needed_physical: Vec<ColumnName> = all_needed_logical
                 .iter()
                 .filter_map(|col| {
-                    // Theoretically this should always resolve -- if it doesn't,
-                    // the column was not found in the logical schema (e.g. a
-                    // requested stats column or predicate column that doesn't
-                    // exist in the table schema),
-                    // which is safe to ignore.
+                    // Columns not found in the logical schema (e.g. predicate references a
+                    // column that doesn't exist in the table) are safe to skip.
                     get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode)
                         .inspect_err(|e| {
                             warn!("Failed to resolve physical name for column {col}: {e}")
@@ -162,13 +177,29 @@ fn build_physical_stats_schema(
                 .collect();
             let expected_stats_schemas = table_configuration
                 .build_expected_stats_schemas(None, Some(&all_needed_physical))?;
-            Ok(Some(expected_stats_schemas.physical))
+            Ok((
+                Some(expected_stats_schemas.physical),
+                predicate_partition_schema,
+            ))
         }
         // Columns(empty) or Skip with a physical predicate -- build stats directly
-        // from the physical predicate's referenced schema for internal data skipping.
-        (_, PhysicalPredicate::Some(_, ref_schema)) => Ok(build_stats_schema(ref_schema)),
+        // from the physical predicate's referenced schema for internal data skipping
+        // only (no logical schema needed for output).
+        // Split referenced columns into data columns and partition columns.
+        // Data columns get min/max/nullCount stats; partition columns get exact values.
+        (_, PhysicalPredicate::Some(_, schema)) => {
+            let data_stats = schema
+                .with_fields_filtered_nonempty(|f| {
+                    predicate_partition_schema
+                        .as_ref()
+                        .is_none_or(|partition_schema| partition_schema.field(f.name()).is_none())
+                })?
+                .as_ref()
+                .and_then(build_stats_schema);
+            Ok((data_stats, predicate_partition_schema))
+        }
         // No stats output and no predicate
-        (_, _) => Ok(None),
+        (_, _) => Ok((None, None)),
     }
 }
 
@@ -292,13 +323,13 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
-        // Build partition schema with physical names for checkpoint partition pruning.
+        // Build partition schema with physical names for partition pruning in data skipping.
         // Only needed when we have a predicate and partition columns.
         // partition_columns stores logical names (per Delta protocol), so we zip the table's
         // logical and physical schemas (same field ordering, guaranteed by `make_physical`)
         // to match logical names and extract the corresponding physical fields without
         // per-field metadata lookups.
-        let physical_partition_schema = if !matches!(
+        let table_partition_schema = if !matches!(
             physical_predicate,
             PhysicalPredicate::None | PhysicalPredicate::StaticSkipAll
         ) && !partition_columns.is_empty()
@@ -319,11 +350,12 @@ impl StateInfo {
             None
         };
 
-        let physical_stats_schema = build_physical_stats_schema(
+        let (physical_stats_schema, physical_partition_schema) = build_data_skipping_schemas(
             &stats_output_mode,
             &physical_predicate,
             &predicate_column_names,
             table_configuration,
+            table_partition_schema,
         )?;
 
         let transform_spec =
@@ -342,6 +374,23 @@ impl StateInfo {
             physical_stats_schema,
             physical_partition_schema,
         })
+    }
+
+    /// Returns a conservative initial capacity for the dedup `HashSet` in
+    /// [`ScanLogReplayProcessor`].
+    ///
+    /// The exact file count is not available at this point, so the hint is
+    /// derived from whether stats are enabled: stats are only computed for
+    /// non-trivial tables, so their presence is a reasonable proxy for table
+    /// size. Using 4096 vs 512 as the two tiers eliminates the first 12-14
+    /// hashbrown doubling events for medium/large tables while staying cheap
+    /// for small ones.
+    pub(crate) fn dedup_capacity_hint(&self) -> usize {
+        if self.physical_stats_schema.is_some() {
+            4096
+        } else {
+            512
+        }
     }
 }
 
