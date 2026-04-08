@@ -22,7 +22,36 @@ enum CommitSource {
     Catalog,
 }
 
-// create test storage given list of log files with custom data content
+fn log_path_for_file_type(version: Version, file_type: &LogPathFileType) -> String {
+    match file_type {
+        LogPathFileType::Commit => {
+            format!("_delta_log/{version:020}.json")
+        }
+        LogPathFileType::StagedCommit => {
+            let uuid = uuid::Uuid::new_v4();
+            format!("_delta_log/_staged_commits/{version:020}.{uuid}.json")
+        }
+        LogPathFileType::SinglePartCheckpoint => {
+            format!("_delta_log/{version:020}.checkpoint.parquet")
+        }
+        LogPathFileType::MultiPartCheckpoint {
+            part_num,
+            num_parts,
+        } => {
+            format!("_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet")
+        }
+        LogPathFileType::Crc => {
+            format!("_delta_log/{version:020}.crc")
+        }
+        LogPathFileType::CompactedCommit { hi } => {
+            format!("_delta_log/{version:020}.{hi:020}.compacted.json")
+        }
+        LogPathFileType::UuidCheckpoint | LogPathFileType::Unknown => {
+            panic!("Unsupported file type in test: {file_type:?}")
+        }
+    }
+}
+
 async fn create_storage(
     log_files: Vec<(Version, LogPathFileType, CommitSource)>,
 ) -> (Box<dyn StorageHandler>, Url) {
@@ -30,35 +59,7 @@ async fn create_storage(
     let log_root = Url::parse("memory:///_delta_log/").unwrap();
 
     for (version, file_type, source) in log_files {
-        let path = match file_type {
-            LogPathFileType::Commit => {
-                format!("_delta_log/{version:020}.json")
-            }
-            LogPathFileType::StagedCommit => {
-                let uuid = uuid::Uuid::new_v4();
-                format!("_delta_log/_staged_commits/{version:020}.{uuid}.json")
-            }
-            LogPathFileType::SinglePartCheckpoint => {
-                format!("_delta_log/{version:020}.checkpoint.parquet")
-            }
-            LogPathFileType::MultiPartCheckpoint {
-                part_num,
-                num_parts,
-            } => {
-                format!(
-                    "_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet"
-                )
-            }
-            LogPathFileType::Crc => {
-                format!("_delta_log/{version:020}.crc")
-            }
-            LogPathFileType::CompactedCommit { hi } => {
-                format!("_delta_log/{version:020}.{hi:020}.compacted.json")
-            }
-            LogPathFileType::UuidCheckpoint | LogPathFileType::Unknown => {
-                panic!("Unsupported file type in test: {file_type:?}")
-            }
-        };
+        let path = log_path_for_file_type(version, &file_type);
         let data = match source {
             CommitSource::Filesystem => bytes::Bytes::from("filesystem"),
             CommitSource::Catalog => bytes::Bytes::from("catalog"),
@@ -864,21 +865,7 @@ async fn create_storage_with_empty_files(
     let log_root = Url::parse("memory:///_delta_log/").unwrap();
 
     for (version, file_type, is_empty) in log_files {
-        let path = match file_type {
-            LogPathFileType::Commit => {
-                format!("_delta_log/{version:020}.json")
-            }
-            LogPathFileType::SinglePartCheckpoint => {
-                format!("_delta_log/{version:020}.checkpoint.parquet")
-            }
-            LogPathFileType::Crc => {
-                format!("_delta_log/{version:020}.crc")
-            }
-            LogPathFileType::CompactedCommit { hi } => {
-                format!("_delta_log/{version:020}.{hi:020}.compacted.json")
-            }
-            _ => panic!("Unsupported file type in test: {file_type:?}"),
-        };
+        let path = log_path_for_file_type(version, &file_type);
         let data = if is_empty {
             bytes::Bytes::new()
         } else {

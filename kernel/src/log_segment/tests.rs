@@ -1998,9 +1998,13 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
     let log_segment =
         LogSegment::for_snapshot_impl(&storage, log_root.clone(), vec![], None, None).unwrap();
 
+    assert_eq!(
+        log_segment.listed.ascending_compaction_files.len(),
+        0,
+        "0-byte compaction should have been filtered at listing time"
+    );
+
     let cover = log_segment.find_commit_cover();
-    // The 0-byte compaction should have been filtered at listing time,
-    // so commit cover should return the 5 individual commits (in descending order)
     assert_eq!(cover.len(), 5);
     for (i, file) in cover.iter().enumerate() {
         let expected_version = 4 - i as u64;
