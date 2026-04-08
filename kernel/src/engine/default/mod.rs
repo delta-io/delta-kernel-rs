@@ -305,6 +305,33 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     }
 }
 
+/// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values
+/// from the provided [`WriteContext`].
+///
+/// This is the public API for building Add action metadata from file write results. Custom
+/// engines that write parquet files themselves (bypassing [`DefaultEngine::write_parquet`])
+/// should call this to produce the Add action metadata for [`Transaction::add_files`].
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Custom engine writes parquet and gets back file metadata
+/// let file_metadata: DataFileMetadata = my_custom_write(data, path).await?;
+///
+/// // Convert to Add action EngineData using kernel-serialized partition values
+/// let add_action = build_add_file_metadata(file_metadata, &write_context)?;
+/// txn.add_files(add_action);
+/// ```
+///
+/// [`DataFileMetadata`]: parquet::DataFileMetadata
+/// [`Transaction::add_files`]: crate::transaction::Transaction::add_files
+pub fn build_add_file_metadata(
+    file_metadata: parquet::DataFileMetadata,
+    write_context: &WriteContext,
+) -> DeltaResult<Box<dyn EngineData>> {
+    file_metadata.as_record_batch(write_context.partition_values())
+}
+
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
         self.evaluation.clone()

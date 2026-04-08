@@ -4,8 +4,6 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use delta_kernel_derive::internal_api;
-
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::datatypes::{DataType, Field, Schema};
@@ -88,7 +86,6 @@ impl DataFileMetadata {
     /// protocol rule that empty strings equal null for all partition types.
     ///
     /// [`Transaction::add_files_schema`]: crate::transaction::Transaction::add_files_schema
-    #[internal_api]
     pub(crate) fn as_record_batch(
         &self,
         partition_values: &HashMap<String, Option<String>>,
