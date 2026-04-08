@@ -995,13 +995,13 @@ async fn partition_pruning_with_column_mapping(
     add_commit(table_root, storage.as_ref(), 0, actions.iter().join("\n")).await?;
     storage
         .put(
-            &Path::from("phys_category=A").child(PARQUET_FILE1),
+            &Path::from("phys_category=A").join(PARQUET_FILE1),
             record_batch_to_bytes(&batch).into(),
         )
         .await?;
     storage
         .put(
-            &Path::from("phys_category=B").child(PARQUET_FILE2),
+            &Path::from("phys_category=B").join(PARQUET_FILE2),
             record_batch_to_bytes(&batch).into(),
         )
         .await?;
@@ -1336,13 +1336,13 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
     add_commit(table_root, storage.as_ref(), 0, actions.iter().join("\n")).await?;
     storage
         .put(
-            &Path::from("id=1").child(PARQUET_FILE1),
+            &Path::from("id=1").join(PARQUET_FILE1),
             record_batch_to_bytes(&batch).into(),
         )
         .await?;
     storage
         .put(
-            &Path::from("id=2").child(PARQUET_FILE2),
+            &Path::from("id=2").join(PARQUET_FILE2),
             record_batch_to_bytes(&batch).into(),
         )
         .await?;

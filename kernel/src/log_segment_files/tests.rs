@@ -7,7 +7,7 @@ use rstest::rstest;
 
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-use crate::object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
+use crate::object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStoreExt as _};
 use crate::FileMeta;
 
 use super::*;
