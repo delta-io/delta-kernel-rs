@@ -1,27 +1,58 @@
-//! Hive-style partition path encoding utilities for Delta table writes.
+//! Hive-style partition path encoding for Delta table writes.
 //!
-//! [`escape_partition_value`] and [`build_partition_path`] produce directory layouts like
-//! `col1=val1/col2=val2/` with special characters percent-encoded using the same rules as:
-//!   - Hive's [`FileUtils.escapePathName`][hive]
-//!   - Spark's [`ExternalCatalogUtils.escapePathName`][spark]
+//! This module percent-encodes partition column names and values for use in **file system
+//! directory paths** (e.g., `region=US%2FEast/year=2024/`). It implements the same encoding
+//! as Hive's [`FileUtils.escapePathName`][hive] and Spark's
+//! [`ExternalCatalogUtils.escapePathName`][spark].
 //!
-//! These utilities handle **file path encoding only**. They are completely independent from
-//! the `partitionValues` map serialization in Add actions (which is handled internally by
-//! [`Transaction::partitioned_write_context`]). The two concerns are separate:
+//! # When to use this module
 //!
-//! - **`partitionValues` map** (Add action metadata): partition value serialization converts
-//!   typed values to protocol-compliant strings (e.g., `Date(20178)` -> `"2025-03-31"`).
-//!   This is the source of truth for partition column values.
-//! - **File paths** (this module): [`escape_partition_value`] and [`build_partition_path`]
-//!   percent-encode already-serialized strings for use in directory names (e.g., `"a/b"` ->
-//!   `"a%2Fb"`). The Delta protocol does not require any particular path format.
+//! This module handles **file path encoding only**. It is completely independent from the
+//! `partitionValues` map serialization in Add actions. The same partition value goes through
+//! two separate transformations, and this module handles only the second one:
 //!
-//! These are **convenience utilities**. Connectors may use flat paths like
-//! `<table_root>/<uuid>.parquet` (which is what [`DefaultEngine::write_parquet`] currently
-//! does) or Hive-style paths. The choice is entirely up to the connector.
+//! ```text
+//! Scalar::String("US/East")
+//!         |
+//!         |  (1) partition_utils: serialize for the Delta log
+//!         v
+//!   Some("US/East")           <- stored in AddFile.partitionValues as-is
+//!         |
+//!         |  (2) THIS MODULE: encode for the file system path
+//!         v
+//!   "US%2FEast"               <- used in directory name: region=US%2FEast/
+//! ```
+//!
+//! Step (1) is handled internally by [`Transaction::partitioned_write_context`]. Step (2)
+//! is what this module provides. The slash in `"US/East"` is a path separator on the file
+//! system and must be encoded, but it appears raw in the Delta log JSON because
+//! `partitionValues` is just a string map.
+//!
+//! # Encoding rules
+//!
+//! Encodes ASCII control characters (0x01-0x1F), DEL (0x7F), and the characters
+//! `"` `#` `%` `'` `*` `/` `:` `=` `?` `\` `{` `[` `]` `^`. Everything else passes
+//! through unchanged, including spaces (0x20) and non-ASCII characters.
+//!
+//! ```text
+//! "hello"      -> "hello"         (no encoding, zero allocation)
+//! "US/East"    -> "US%2FEast"     (slash encoded)
+//! "a=b"        -> "a%3Db"         (equals encoded)
+//! "100%"       -> "100%25"        (percent encoded)
+//! "a b"        -> "a b"           (space NOT encoded)
+//! "Muenchen"   -> "Muenchen"      (non-ASCII NOT encoded)
+//! ```
+//!
+//! # Note
+//!
+//! These are **convenience utilities**. The Delta protocol does not require Hive-style
+//! paths. [`DefaultEngine::write_parquet`] uses [`WriteContext::write_dir`] internally,
+//! which calls these functions when column mapping is off. Custom engines may use them
+//! directly or use flat paths.
 //!
 //! [`Transaction::partitioned_write_context`]: crate::transaction::Transaction::partitioned_write_context
 //! [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
+//! [`WriteContext::write_dir`]: crate::transaction::WriteContext::write_dir
 //!
 //! [hive]: https://github.com/apache/hive/blob/trunk/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
 //! [spark]: https://github.com/apache/spark/blob/master/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/catalog/ExternalCatalogUtils.scala

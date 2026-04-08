@@ -1,11 +1,58 @@
-//! Partition value serialization and validation utilities for the write path.
+//! Partition value serialization and validation for the Delta log.
 //!
-//! These are engine-agnostic helpers used by [`Transaction::partitioned_write_context`] to
-//! validate, serialize, and translate partition values before they are stored in a
-//! [`WriteContext`].
+//! This module converts typed [`Scalar`] partition values into the strings that appear in
+//! `AddFile.partitionValues` in the Delta commit log. It also validates that the connector
+//! provided the correct partition keys and types.
 //!
+//! # When to use this module
+//!
+//! This module handles **Delta log serialization only**. It is completely independent from
+//! the Hive-style file path encoding in the [`partition`] module. The same partition value
+//! goes through two separate transformations:
+//!
+//! ```text
+//! Scalar::String("US/East")
+//!         |
+//!         |  (1) THIS MODULE: serialize for the Delta log
+//!         v
+//!   Some("US/East")           <- stored in AddFile.partitionValues as-is
+//!         |
+//!         |  (2) partition module: encode for the file system path
+//!         v
+//!   "US%2FEast"               <- used in directory name: region=US%2FEast/
+//! ```
+//!
+//! The slash in `"US/East"` is NOT encoded here. This module produces the raw protocol
+//! value. File path encoding is a separate concern handled by [`partition`].
+//!
+//! # Serialization examples
+//!
+//! ```text
+//! Scalar::Integer(42)           -> Some("42")
+//! Scalar::Date(20178)           -> Some("2025-03-31")
+//! Scalar::Timestamp(micros)     -> Some("2025-03-31T15:30:00.000000Z")
+//! Scalar::Float(f32::INFINITY)  -> Some("Infinity")
+//! Scalar::Decimal(-5, scale=2)  -> Some("-0.05")
+//! Scalar::String("US/East")     -> Some("US/East")        no encoding
+//! Scalar::String("")            -> None                    protocol: empty = null
+//! Scalar::Null(any)             -> None
+//! ```
+//!
+//! # Validation
+//!
+//! - [`validate_partition_keys`]: checks that the provided keys match the table's partition
+//!   columns (case-insensitive matching, normalizes to schema case, detects duplicates).
+//! - [`validate_partition_value_types`]: checks that each `Scalar`'s type matches the
+//!   partition column's schema type. Null scalars skip the type check.
+//!
+//! # Callers
+//!
+//! These functions are `pub(crate)` and called internally by
+//! [`Transaction::partitioned_write_context`]. Connectors do not call them directly.
+//!
+//! [`Scalar`]: crate::expressions::Scalar
+//! [`partition`]: crate::partition
 //! [`Transaction::partitioned_write_context`]: super::Transaction::partitioned_write_context
-//! [`WriteContext`]: super::WriteContext
 
 use std::collections::HashMap;
 
