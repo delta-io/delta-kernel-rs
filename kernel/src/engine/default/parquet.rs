@@ -79,10 +79,15 @@ impl DataFileMetadata {
         Self { file_meta, stats }
     }
 
-    /// Convert DataFileMetadata into a record batch which matches the schema returned by
-    /// [`add_files_schema`].
+    /// Converts this file metadata into an [`EngineData`] record batch matching the schema
+    /// returned by [`Transaction::add_files_schema`].
     ///
-    /// [`add_files_schema`]: crate::transaction::Transaction::add_files_schema
+    /// The `partition_values` map uses physical column names as keys and protocol-serialized
+    /// strings as values. `None` values represent null partition values. Both `None` and
+    /// `Some("")` are written as null in the resulting `partitionValues` map, per the Delta
+    /// protocol rule that empty strings equal null for all partition types.
+    ///
+    /// [`Transaction::add_files_schema`]: crate::transaction::Transaction::add_files_schema
     #[internal_api]
     pub(crate) fn as_record_batch(
         &self,
@@ -110,9 +115,12 @@ impl DataFileMetadata {
         let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
         for (k, v) in partition_values {
             builder.keys().append_value(k);
-            match v {
-                Some(val) => builder.values().append_value(val),
-                None => builder.values().append_null(),
+            match v.as_deref() {
+                Some(val) if !val.is_empty() => builder.values().append_value(val),
+                // None and empty string both represent null partition values per the
+                // Delta protocol ("an empty string for any type translates to a null
+                // partition value").
+                _ => builder.values().append_null(),
             }
         }
         builder.append(true)?;

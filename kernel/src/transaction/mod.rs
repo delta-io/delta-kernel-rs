@@ -60,6 +60,9 @@ mod domain_metadata;
 pub(crate) mod partition_utils;
 mod stats_verifier;
 mod update;
+use partition_utils::{
+    serialize_partition_value, validate_partition_keys, validate_partition_value_types,
+};
 use stats_verifier::StatsVerifier;
 
 /// Type alias for an iterator of [`EngineData`] results.
@@ -779,15 +782,12 @@ impl<S> Transaction<S> {
     ///
     /// Returns an empty slice for non-partitioned tables. Connectors use this to discover
     /// partition columns and split data before writing.
-    pub fn partition_columns(&self) -> &[String] {
+    pub fn logical_partition_columns(&self) -> &[String] {
         self.read_snapshot.table_configuration().partition_columns()
     }
 
-    /// Lazily builds and caches the [`SharedWriteState`] for this transaction via `OnceLock`.
-    /// The state is shared via `Arc` so that per-partition `WriteContext` creation is cheap
-    /// (just an Arc refcount bump plus a small HashMap). Valid for the Transaction lifetime
-    /// because metadata mutations are not supported yet. Called internally by
-    /// `partitioned_write_context` and `unpartitioned_write_context`.
+    /// Lazily builds and caches the [`SharedWriteState`] for this transaction. Valid for the
+    /// Transaction lifetime because metadata mutations are not supported yet.
     fn shared_write_state(&self) -> &Arc<SharedWriteState> {
         self.shared_write_state.get_or_init(|| {
             let target_dir = self.read_snapshot.table_root().clone();
@@ -812,13 +812,31 @@ impl<S> Transaction<S> {
 
     /// Creates a write context for writing data to a specific partition.
     ///
-    /// Validates that the provided partition values match the table's partition columns
-    /// (case-insensitive key matching, type checking), serializes the values per the Delta
-    /// protocol, and translates logical column names to physical names.
+    /// Performs the following validations and transformations:
+    ///
+    /// - **Key completeness**: ensures all partition columns are present and no extra keys
+    ///   exist. For example, if the table has partition columns `["year", "region"]` and you
+    ///   pass `{"year": Scalar::Integer(2024)}`, this returns an error for missing "region".
+    ///
+    /// - **Case normalization**: matches keys case-insensitively against the schema and
+    ///   normalizes to schema case. For example, passing `"YEAR"` for a column named `"year"`
+    ///   is accepted and normalized.
+    ///
+    /// - **Type checking**: validates that each `Scalar`'s type matches the partition column's
+    ///   schema type. For example, passing `Scalar::String("2024")` for an `INTEGER` column
+    ///   returns an error. Null scalars skip the type check.
+    ///
+    /// - **Value serialization**: serializes each `Scalar` to a protocol-compliant string per
+    ///   the Delta protocol's "Partition Value Serialization" rules. For example,
+    ///   `Scalar::Date(20178)` becomes `"2025-03-31"`, `Scalar::Null(DataType::INTEGER)`
+    ///   becomes `None`.
+    ///
+    /// - **Key translation**: translates logical column names to physical names using the
+    ///   table's column mapping mode. For example, under `ColumnMappingMode::Name`, logical
+    ///   `"year"` might become physical `"col-abc-123"` in the `partitionValues` map.
     ///
     /// Returns an error if the table is not partitioned (use
-    /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead), if
-    /// partition keys are missing/extra, or if value types don't match the schema.
+    /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead).
     pub fn partitioned_write_context(
         &self,
         partition_values: HashMap<String, Scalar>,
@@ -830,12 +848,10 @@ impl<S> Transaction<S> {
         );
 
         // Validate and normalize keys (case-insensitive, detect duplicates).
-        let normalized = partition_utils::validate_partition_keys(
-            &shared.logical_partition_columns,
-            partition_values,
-        )?;
+        let normalized =
+            validate_partition_keys(&shared.logical_partition_columns, partition_values)?;
         // Validate value types match schema column types.
-        partition_utils::validate_partition_value_types(&shared.logical_schema, &normalized)?;
+        validate_partition_value_types(&shared.logical_schema, &normalized)?;
 
         // Serialize values and translate keys from logical to physical names.
         let mut serialized = HashMap::with_capacity(normalized.len());
@@ -845,7 +861,7 @@ impl<S> Transaction<S> {
                     "partition column '{logical_name}' missing after validation"
                 ))
             })?;
-            let value = partition_utils::serialize_partition_value(scalar)?;
+            let value = serialize_partition_value(scalar)?;
             let physical_name = shared
                 .logical_schema
                 .field(logical_name)
@@ -861,7 +877,7 @@ impl<S> Transaction<S> {
 
         Ok(WriteContext {
             shared: shared.clone(),
-            partition_values: serialized,
+            physical_partition_values: serialized,
         })
     }
 
@@ -877,7 +893,7 @@ impl<S> Transaction<S> {
         );
         Ok(WriteContext {
             shared: shared.clone(),
-            partition_values: HashMap::new(),
+            physical_partition_values: HashMap::new(),
         })
     }
 
@@ -1247,18 +1263,17 @@ struct SharedWriteState {
 /// metadata.
 ///
 /// For custom engines that bypass `DefaultEngine`, use [`partition_values`] to build the
-/// `partitionValues` map in Add actions, and [`unique_target_dir`] for file path
-/// construction. A Hive-style target directory helper is also available as an internal API.
+/// `partitionValues` map in Add actions. A Hive-style target directory helper is also
+/// available as an internal API.
 ///
 /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
 /// [`partition_values`]: WriteContext::partition_values
-/// [`unique_target_dir`]: WriteContext::unique_target_dir
 pub struct WriteContext {
     shared: Arc<SharedWriteState>,
     /// Physical column name -> serialized value (`None` = null partition value).
     /// Empty for unpartitioned tables. Ordering for hive-style paths comes from
     /// `shared.logical_partition_columns`, not from this map.
-    partition_values: HashMap<String, Option<String>>,
+    physical_partition_values: HashMap<String, Option<String>>,
 }
 
 impl WriteContext {
@@ -1300,7 +1315,7 @@ impl WriteContext {
     ///
     /// For unpartitioned tables, this is empty.
     pub fn partition_values(&self) -> &HashMap<String, Option<String>> {
-        &self.partition_values
+        &self.physical_partition_values
     }
 
     /// Returns a Hive-style target directory URL for this partition.
@@ -1314,6 +1329,17 @@ impl WriteContext {
     /// Computed on each call (not cached). This is a convenience utility; the Delta protocol
     /// does not require Hive-style paths.
     ///
+    /// # Example
+    ///
+    /// For a table at `s3://bucket/my_table/` with partition columns `["year", "region"]`
+    /// and partition values `year=2024, region=US`:
+    ///
+    /// ```text
+    /// hive_style_target_dir() -> "s3://bucket/my_table/year=2024/region=US/"
+    /// ```
+    ///
+    /// With a null region: `"s3://bucket/my_table/year=2024/region=__HIVE_DEFAULT_PARTITION__/"`
+    ///
     /// [`escape_partition_value`]: crate::partition::escape_partition_value
     /// [`HIVE_DEFAULT_PARTITION`]: crate::partition::HIVE_DEFAULT_PARTITION
     #[internal_api]
@@ -1321,8 +1347,9 @@ impl WriteContext {
         if self.shared.logical_partition_columns.is_empty() {
             return self.shared.target_dir.clone();
         }
-        // Iterate logical partition columns in metadata-defined order.
-        // Look up the physical key to find the serialized value.
+        // physical_partition_values is keyed by physical name (for AddFile.partitionValues), but
+        // hive-style paths use logical column names. We iterate logical columns for path
+        // ordering and look up values by their physical key.
         let columns: Vec<(&str, Option<&str>)> = self
             .shared
             .logical_partition_columns
@@ -1333,7 +1360,7 @@ impl WriteContext {
                     .map(|f| f.physical_name(self.shared.column_mapping_mode))
                     .unwrap_or(logical_name.as_str());
                 let value = self
-                    .partition_values
+                    .physical_partition_values
                     .get(physical_name)
                     .and_then(|v| v.as_deref());
                 (logical_name.as_str(), value)
@@ -1342,17 +1369,6 @@ impl WriteContext {
         let path_suffix = build_partition_path(&columns);
         let mut url = self.shared.target_dir.clone();
         url.set_path(&format!("{}{}", url.path(), path_suffix));
-        url
-    }
-
-    /// Returns a unique target directory URL using a UUID.
-    ///
-    /// Returns `table_root/<uuid-v4>/`. This is an alternative to hive-style paths for
-    /// connectors that prefer flat file layouts.
-    pub fn unique_target_dir(&self) -> Url {
-        let uuid = uuid::Uuid::new_v4();
-        let mut url = self.shared.target_dir.clone();
-        url.set_path(&format!("{}{}/", url.path(), uuid));
         url
     }
 
@@ -1771,7 +1787,7 @@ mod tests {
         let txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let wc = if txn.partition_columns().is_empty() {
+        let wc = if txn.logical_partition_columns().is_empty() {
             txn.unpartitioned_write_context()?
         } else {
             txn.partitioned_write_context(partition_values)?

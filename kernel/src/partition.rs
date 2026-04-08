@@ -114,7 +114,7 @@ pub fn escape_partition_value(s: &str) -> Cow<'_, str> {
 /// [`HIVE_DEFAULT_PARTITION`] as the value.
 ///
 /// The columns should be provided in the order they should appear in the path. Typically
-/// this is the order from [`Transaction::partition_columns`].
+/// this is the order from [`Transaction::logical_partition_columns`].
 ///
 /// This is a convenience utility. The Delta protocol does not require Hive-style paths.
 ///
@@ -135,7 +135,7 @@ pub fn escape_partition_value(s: &str) -> Cow<'_, str> {
 /// assert_eq!(path_with_null, "country=__HIVE_DEFAULT_PARTITION__/");
 /// ```
 ///
-/// [`Transaction::partition_columns`]: crate::transaction::Transaction::partition_columns
+/// [`Transaction::logical_partition_columns`]: crate::transaction::Transaction::logical_partition_columns
 pub fn build_partition_path(columns: &[(&str, Option<&str>)]) -> String {
     let mut path = String::new();
     for (name, value) in columns {
