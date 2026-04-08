@@ -153,9 +153,9 @@ is the source of truth. Key concepts:
   `allowColumnDefaults`, `changeDataFeed`, `identityColumns`, `rowTracking`,
   `domainMetadata`, `icebergCompatV1`, `icebergCompatV2`, `clustering`,
   `inCommitTimestamp`
-- Reader + writer: `columnMapping`, `deletionVectors`, `timestampNtz`,
-  `v2Checkpoint`, `vacuumProtocolCheck`, `variantType`, `variantType-preview`,
-  `typeWidening`
+- Reader + writer: `catalogManaged`, `catalogOwned-preview`, `columnMapping`,
+  `deletionVectors`, `timestampNtz`, `v2Checkpoint`, `vacuumProtocolCheck`,
+  `variantType`, `variantType-preview`, `typeWidening`
 
 Keep this list updated when new protocol features are added to kernel.
 

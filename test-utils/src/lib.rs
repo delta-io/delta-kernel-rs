@@ -32,7 +32,7 @@ use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, Snapshot};
+use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot};
 
 use itertools::Itertools;
 use serde_json::{json, to_vec, Deserializer};
@@ -238,6 +238,19 @@ pub fn generate_simple_batch() -> Result<RecordBatch, ArrowError> {
 pub fn delta_path_for_version(version: u64, suffix: &str) -> Path {
     let path = format!("_delta_log/{version:020}.{suffix}");
     Path::from(path.as_str())
+}
+
+/// Create a [`LogPath`] from a table root URL string and an object-store commit path. Useful for
+/// building log tails in tests.
+pub fn create_log_path(table_root: impl AsRef<str>, commit_path: Path) -> LogPath {
+    let table_url = try_parse_uri(table_root.as_ref()).expect("Failed to parse table root as URL");
+    let commit_url = table_url.join(commit_path.as_ref()).unwrap();
+    let file_meta = FileMeta {
+        location: commit_url,
+        last_modified: 123,
+        size: 100,
+    };
+    LogPath::try_new(file_meta).expect("Failed to create LogPath")
 }
 
 pub fn staged_commit_path_for_version(version: u64) -> Path {

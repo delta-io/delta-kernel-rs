@@ -7,9 +7,10 @@ use tracing::{info, instrument};
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
+use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
+use crate::utils::require;
 use crate::utils::try_parse_uri;
-use crate::{path::LogPathFileType, utils::require};
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
 /// Builder for creating [`Snapshot`] instances.
@@ -275,27 +276,25 @@ impl SnapshotBuilder {
         }
 
         // Log tail end version validation when max_catalog_version is set
-        if let Some(max_cv) = max_catalog_version {
-            if let Some(last) = log_tail.last() {
-                if let Some(ver) = version {
-                    // With time-travel: last log_tail entry must be >= requested version
-                    require!(
-                        last.version >= ver,
-                        Error::generic(format!(
-                            "Log tail last version {} is less than requested version {ver}",
-                            last.version
-                        ))
-                    );
-                } else {
-                    // Without time-travel: last log_tail entry must == max_catalog_version
-                    require!(
-                        last.version == max_cv,
-                        Error::generic(format!(
-                            "Log tail last version {} does not match max_catalog_version {max_cv}",
-                            last.version
-                        ))
-                    );
-                }
+        if let (Some(max_cv), Some(last)) = (max_catalog_version, log_tail.last()) {
+            if let Some(ver) = version {
+                // With time-travel: last log_tail entry must be >= requested version
+                require!(
+                    last.version >= ver,
+                    Error::generic(format!(
+                        "Log tail last version {} is less than requested version {ver}",
+                        last.version
+                    ))
+                );
+            } else {
+                // Without time-travel: last log_tail entry must == max_catalog_version
+                require!(
+                    last.version == max_cv,
+                    Error::generic(format!(
+                        "Log tail last version {} does not match max_catalog_version {max_cv}",
+                        last.version
+                    ))
+                );
             }
         }
 
@@ -871,75 +870,53 @@ mod tests {
         }
 
         #[test_log::test(tokio::test)]
-        async fn test_log_tail_with_gap_errors() -> Result<(), Box<dyn std::error::Error>> {
-            let (engine, store, table_root) = setup_catalog_managed_test().await;
-            let actions = vec![TestAction::Add("file_1.parquet".to_string())];
-            add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
-            let actions = vec![TestAction::Add("file_2.parquet".to_string())];
-            add_commit(&table_root, store.as_ref(), 3, actions_to_string(actions)).await?;
-
-            // log_tail has versions 1 and 3 (gap at 2)
-            let log_tail = vec![
-                create_log_path(&table_root, test_utils::delta_path_for_version(1, "json")),
-                create_log_path(&table_root, test_utils::delta_path_for_version(3, "json")),
-            ];
-
-            let result = SnapshotBuilder::new_for(table_root)
-                .with_log_tail(log_tail)
-                .with_max_catalog_version(3)
-                .build(engine.as_ref());
-
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("log_tail must be sorted and contiguous"));
-
-            Ok(())
-        }
-
-        #[test_log::test(tokio::test)]
-        async fn test_log_tail_with_duplicate_versions_errors(
+        async fn test_builder_from_catalog_managed_without_mcv_errors(
         ) -> Result<(), Box<dyn std::error::Error>> {
             let (engine, store, table_root) = setup_catalog_managed_test().await;
             let actions = vec![TestAction::Add("file_1.parquet".to_string())];
             add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
 
-            // log_tail has version 1 twice
-            let log_tail = vec![
-                create_log_path(&table_root, test_utils::delta_path_for_version(1, "json")),
-                create_log_path(&table_root, test_utils::delta_path_for_version(1, "json")),
-            ];
-
-            let result = SnapshotBuilder::new_for(table_root)
-                .with_log_tail(log_tail)
+            let initial = SnapshotBuilder::new_for(table_root)
                 .with_max_catalog_version(1)
-                .build(engine.as_ref());
+                .build(engine.as_ref())?;
+
+            // Incremental update without mcv should fail
+            let result = SnapshotBuilder::new_from(initial).build(engine.as_ref());
 
             assert!(result
                 .unwrap_err()
                 .to_string()
-                .contains("log_tail must be sorted and contiguous"));
+                .contains("Catalog-managed table requires max_catalog_version"));
 
             Ok(())
         }
 
+        #[rstest::rstest]
+        #[case::gap(vec![1, 3], vec![1, 3], 3)]
+        #[case::duplicates(vec![1], vec![1, 1], 1)]
+        #[case::unsorted(vec![1, 2], vec![2, 1], 2)]
         #[test_log::test(tokio::test)]
-        async fn test_log_tail_unsorted_errors() -> Result<(), Box<dyn std::error::Error>> {
+        async fn test_non_contiguous_log_tail_errors(
+            #[case] commit_versions: Vec<u64>,
+            #[case] log_tail_versions: Vec<u64>,
+            #[case] mcv: u64,
+        ) -> Result<(), Box<dyn std::error::Error>> {
             let (engine, store, table_root) = setup_catalog_managed_test().await;
-            let actions = vec![TestAction::Add("file_1.parquet".to_string())];
-            add_commit(&table_root, store.as_ref(), 1, actions_to_string(actions)).await?;
-            let actions = vec![TestAction::Add("file_2.parquet".to_string())];
-            add_commit(&table_root, store.as_ref(), 2, actions_to_string(actions)).await?;
+            for v in &commit_versions {
+                let actions = vec![TestAction::Add(format!("file_{v}.parquet"))];
+                add_commit(&table_root, store.as_ref(), *v, actions_to_string(actions)).await?;
+            }
 
-            // log_tail is in descending order
-            let log_tail = vec![
-                create_log_path(&table_root, test_utils::delta_path_for_version(2, "json")),
-                create_log_path(&table_root, test_utils::delta_path_for_version(1, "json")),
-            ];
+            let log_tail: Vec<_> = log_tail_versions
+                .iter()
+                .map(|v| {
+                    create_log_path(&table_root, test_utils::delta_path_for_version(*v, "json"))
+                })
+                .collect();
 
             let result = SnapshotBuilder::new_for(table_root)
                 .with_log_tail(log_tail)
-                .with_max_catalog_version(2)
+                .with_max_catalog_version(mcv)
                 .build(engine.as_ref());
 
             assert!(result

@@ -5,28 +5,12 @@ use url::Url;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::object_store::path::Path;
-use delta_kernel::{FileMeta, LogPath, Snapshot};
+use delta_kernel::Snapshot;
 
 use test_utils::{
     actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
-    delta_path_for_version, TestAction,
+    create_log_path, delta_path_for_version, TestAction,
 };
-
-/// Helper function to create a LogPath for a commit at the given version
-fn create_log_path(table_root: &Url, commit_path: Path) -> LogPath {
-    let file_meta = create_file_meta(table_root, commit_path);
-    LogPath::try_new(file_meta).expect("Failed to create LogPath")
-}
-
-fn create_file_meta(table_root: &Url, commit_path: Path) -> FileMeta {
-    let commit_url = table_root.join(commit_path.as_ref()).unwrap();
-    FileMeta {
-        location: commit_url,
-        last_modified: 123,
-        size: 100, // arbitrary size
-    }
-}
 
 fn setup_test() -> (
     Arc<InMemory>,

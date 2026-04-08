@@ -78,7 +78,7 @@ impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
         // The catalog always returns the latest ratified version. Use it as the
         // max_catalog_version for snapshot building, and as the effective version when no
         // explicit time-travel version is requested.
-        let catalog_version: Version = commits.latest_table_version.try_into()?;
+        let max_catalog_version: Version = commits.latest_table_version.try_into()?;
 
         // consume the UC Commit and hand back a delta_kernel LogPath
         let mut table_url = Url::parse(&table_uri)?;
@@ -110,7 +110,7 @@ impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
         debug!("commits for kernel: {:?}\n", commits);
 
         let mut builder = Snapshot::builder_for(table_url)
-            .with_max_catalog_version(catalog_version)
+            .with_max_catalog_version(max_catalog_version)
             .with_log_tail(commits);
 
         if let Some(v) = version {
@@ -278,6 +278,30 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_snapshot_at_errors_when_version_exceeds_catalog() {
+        let client = InMemoryCommitsClient::new();
+        client.insert_table(
+            "test_table",
+            TableData {
+                max_ratified_version: 3,
+                catalog_commits: vec![],
+            },
+        );
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(store).build();
+        let catalog = UCKernelClient::new(&client);
+
+        // Request version 5 but catalog only reports version 3
+        let result = catalog
+            .load_snapshot_at("test_table", "memory:///", 5, &engine)
+            .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Time-travel version 5 exceeds max_catalog_version 3"));
     }
 
     #[tokio::test]
