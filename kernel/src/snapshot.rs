@@ -71,7 +71,7 @@ pub enum CheckpointWriteResult {
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
 ///
-/// BLAH
+/// BLAH BLAH BLAH
 pub struct Snapshot {
     span: tracing::Span,
     log_segment: LogSegment,
