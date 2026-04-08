@@ -25,7 +25,7 @@ use crate::{DeltaResult, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
 
 use itertools::Itertools;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 #[cfg(test)]
@@ -172,30 +172,57 @@ struct ListingAccumulator {
 }
 
 impl ListingAccumulator {
-    fn process_file(&mut self, file: ParsedLogPath) {
+    fn process_file(&mut self, file: ParsedLogPath) -> DeltaResult<()> {
         use LogPathFileType::*;
         match file.file_type {
-            Commit | StagedCommit => self.output.ascending_commit_files.push(file),
-            CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
-                self.output.ascending_compaction_files.push(file);
+            Commit | StagedCommit => {
+                if file.location.size == 0 {
+                    return Err(Error::generic(format!(
+                        "Commit file is empty (0 bytes): {}",
+                        file.location.location,
+                    )));
+                }
+                self.output.ascending_commit_files.push(file);
             }
-            CompactedCommit { .. } => (), // Failed the bounds check above
+            CompactedCommit { hi } => {
+                if file.location.size == 0 {
+                    warn!(
+                        "Skipping empty (0 byte) compacted log file {}, \
+                         falling back to individual commits",
+                        file.location.location,
+                    );
+                } else if self.end_version.is_none_or(|end| hi <= end) {
+                    self.output.ascending_compaction_files.push(file);
+                }
+            }
             SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
-                self.pending_checkpoint_parts.push(file)
+                if file.location.size == 0 {
+                    warn!(
+                        "Skipping empty (0 byte) checkpoint file: {}",
+                        file.location.location,
+                    );
+                } else {
+                    self.pending_checkpoint_parts.push(file);
+                }
             }
             Crc => {
-                self.output.latest_crc_file.replace(file);
+                if file.location.size > 0 {
+                    self.output.latest_crc_file.replace(file);
+                } else {
+                    warn!(
+                        "Skipping empty (0 byte) CRC file: {}",
+                        file.location.location,
+                    );
+                }
             }
             Unknown => {
-                // It is possible that there are other files being stashed away into
-                // _delta_log/  This is not necessarily forbidden, but something we
-                // want to know about in a debugging scenario
                 debug!(
                     "Found file {} with unknown file type {:?} at version {}",
                     file.filename, file.file_type, file.version
                 );
             }
         }
+        Ok(())
     }
 
     /// Called before processing each new file. If `file_version` differs from the current
@@ -308,7 +335,7 @@ impl LogSegmentFiles {
             }
 
             acc.maybe_flush_and_advance(file.version);
-            acc.process_file(file);
+            acc.process_file(file)?;
         }
 
         // Phase 2: Process log_tail entries. We do this after Phase 1 because log_tail commits
@@ -331,7 +358,7 @@ impl LogSegmentFiles {
             }
 
             acc.maybe_flush_and_advance(file.version);
-            acc.process_file(file);
+            acc.process_file(file)?;
         }
 
         // Flush the final group
