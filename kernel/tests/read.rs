@@ -36,6 +36,19 @@ const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c00
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
 const PARQUET_FILE3: &str = "part-00002-c506e79a-0bf8-4e2b-a42b-9731b2e490ff-c000.snappy.parquet";
 
+#[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+/// Bridge the new `Path::join` method that deprecates `Path::child` in object_store 0.13.
+trait PathExt {
+    fn join(&self, other: &str) -> Self;
+}
+
+#[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+impl PathExt for Path {
+    fn join(&self, other: &str) -> Self {
+        self.child(other)
+    }
+}
+
 /// Convert all top-level fields in a RecordBatch to nullable, matching Delta table schema
 /// conventions where the table metadata declares columns as nullable.
 fn make_top_level_fields_nullable(batch: &RecordBatch) -> RecordBatch {
