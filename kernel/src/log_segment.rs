@@ -811,7 +811,7 @@ impl LogSegment {
         let has_stats_parsed = stats_schema.is_some()
             && file_actions_schema
                 .as_ref()
-                .is_some_and(|file_schema| Self::has_usable_stats_parsed(file_schema));
+                .is_some_and(|file_schema| Self::checkpoint_has_stats_parsed(file_schema));
 
         let has_partition_values_parsed = partition_schema
             .zip(file_actions_schema.as_ref())
@@ -1129,7 +1129,7 @@ impl LogSegment {
         SIDECAR_SCHEMA.clone()
     }
 
-    /// Checks if a checkpoint schema contains a usable `add.stats_parsed` field.
+    /// Checks if a checkpoint schema contains an `add.stats_parsed` struct field.
     ///
     /// Returns `true` if `add.stats_parsed` exists and is a struct. Type mismatches for
     /// individual columns within the stats struct are handled gracefully by the parquet
@@ -1140,16 +1140,26 @@ impl LogSegment {
     /// Note: the null-padding behavior is implemented by the default engine's parquet
     /// reader. Custom `ParquetHandler` implementations should handle type-mismatched
     /// nullable fields similarly for correct stats_parsed degradation.
-    pub(crate) fn has_usable_stats_parsed(checkpoint_schema: &StructType) -> bool {
-        let usable = checkpoint_schema
-            .field("add")
-            .and_then(|f| match f.data_type() {
-                DataType::Struct(s) => s.field("stats_parsed"),
-                _ => None,
-            })
-            .is_some_and(|f| matches!(f.data_type(), DataType::Struct(_)));
-        debug!("Checkpoint stats_parsed usable for data skipping: {usable}");
-        usable
+    pub(crate) fn checkpoint_has_stats_parsed(checkpoint_schema: &StructType) -> bool {
+        let add_field = checkpoint_schema.field("add");
+        let stats_parsed_field = add_field.and_then(|f| match f.data_type() {
+            DataType::Struct(s) => s.field("stats_parsed"),
+            _ => None,
+        });
+        let is_struct =
+            stats_parsed_field.is_some_and(|f| matches!(f.data_type(), DataType::Struct(_)));
+
+        if !is_struct {
+            let reason = if add_field.is_none() {
+                "no 'add' field in checkpoint schema"
+            } else if stats_parsed_field.is_none() {
+                "no 'stats_parsed' field in add"
+            } else {
+                "'stats_parsed' is not a struct"
+            };
+            debug!("Checkpoint lacks stats_parsed for data skipping: {reason}");
+        }
+        is_struct
     }
 
     /// Recursively checks if two struct types have compatible field types.

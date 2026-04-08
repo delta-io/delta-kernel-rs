@@ -30,7 +30,7 @@ use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::debug;
+use tracing::{debug, warn};
 
 macro_rules! prim_array_cmp {
     ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
@@ -470,6 +470,10 @@ pub(crate) fn coerce_batch_nullability(
 * 3b. If a field exists in parquet but has an incompatible type and is nullable, it is treated as
 *     missing -- the missing-field handler inserts a `Missing` transform that null-pads it. This
 *     enables graceful degradation for schema evolution (e.g., stats_parsed type mismatches).
+*     For example, if a checkpoint was written when column "value" had type String, but the
+*     current table schema has "value" as Long, the parquet file's stats_parsed.minValues.value
+*     is String -- incompatible with the requested Long. Rather than rejecting all stats, we
+*     null-pad just that field. Compatible columns (e.g., "id") still provide real stats.
 * 4. If a nested element (struct/map/list) is encountered, recurse into it, pushing indices onto
 *    the same vector, but producing a new reorder level, which is added to the parent with a `Nested`
 *    transform
@@ -656,10 +660,35 @@ fn validate_parquet_variant(field: &ArrowField) -> DeltaResult<()> {
     }
 }
 
-/// helper function, does the same as `get_requested_indices` but at an offset. used to recurse into
-/// structs, lists, and maps. `parquet_offset` is how many parquet fields exist before processing
-/// this potentially nested schema. returns the number of parquet fields in `fields` (regardless of
-/// if they are selected or not) and reordering information for the requested fields.
+/// Returns `true` if `err` is an Arrow error, unwrapping any `Backtraced` wrapper. Used to
+/// distinguish type-incompatibility errors (which produce `Error::Arrow`) from internal errors
+/// (e.g., `Error::InternalError`) when deciding whether to null-pad a mismatched field.
+fn is_arrow_error(err: &Error) -> bool {
+    match err {
+        Error::Arrow(_) => true,
+        Error::Backtraced { source, .. } => is_arrow_error(source),
+        _ => false,
+    }
+}
+
+/// Recursive helper for [`get_requested_indices`], handling nested structs, lists, and maps.
+///
+/// `parquet_offset` is how many parquet leaf fields exist before this schema level.
+/// Returns the number of parquet fields in `fields` (regardless of whether they are selected)
+/// and reordering information for the requested fields.
+///
+/// # Null-padding for type mismatches
+///
+/// When a nullable field exists in parquet but has an incompatible type (e.g., a checkpoint's
+/// `stats_parsed` was written under an older table schema), the field is treated as missing and
+/// null-padded instead of erroring. This is safe because:
+///
+/// - **User data columns:** type mismatches cannot occur -- Delta enforces schema consistency
+///   at write time, and supported widenings (e.g., Int32 -> Int64) are handled via `NeedsCast`.
+/// - **Checkpoint action columns:** kernel controls both the write and read schemas.
+/// - **`stats_parsed`:** the only realistic source of type mismatches. Schema evolution can
+///   cause the checkpoint's stats struct to diverge from the current table schema. Null-padding
+///   the mismatched field loses stats for that column but preserves stats for all others.
 fn get_indices(
     start_parquet_offset: usize,
     requested_schema: &Schema,
@@ -736,7 +765,7 @@ fn get_indices(
                     } else if requested_field.nullable {
                         // Parquet has a struct but we requested a non-struct type.
                         // For nullable fields, treat as missing and null-pad.
-                        debug!(
+                        warn!(
                             "Struct/non-struct mismatch for nullable field '{}'. Null-padding.",
                             requested_field.name(),
                         );
@@ -870,13 +899,16 @@ fn get_indices(
                                 "Comparing nested types in get_indices",
                             ));
                         }
-                        Err(_) if requested_field.nullable => {
+                        Err(ref e) if requested_field.nullable && is_arrow_error(e) => {
                             // Type mismatch on a nullable field: treat as missing and
                             // null-pad. This gracefully handles schema evolution (e.g.,
                             // a column's type changed after a checkpoint was written).
-                            // The field gets all nulls. Note: ensure_data_types only
-                            // errors on type incompatibility for leaf types in this arm.
-                            debug!(
+                            // The field gets all nulls.
+                            //
+                            // We only catch Arrow errors (type incompatibility) here.
+                            // Internal errors (e.g., a kernel bug in type conversion)
+                            // still propagate via the fallthrough arm below.
+                            warn!(
                                 "Type mismatch for nullable field '{}': parquet has {:?}, \
                                  requested {:?}. Null-padding.",
                                 requested_field.name(),
@@ -885,7 +917,6 @@ fn get_indices(
                             );
                             // Don't add to found_fields — the missing-field handler below
                             // will insert a Missing transform.
-                            parquet_offset += count_cols(field).saturating_sub(1);
                             continue;
                         }
                         Err(e) => return Err(e),

@@ -2917,7 +2917,7 @@ async fn test_max_published_version_checkpoint_only() {
 }
 
 // ============================================================================
-// has_usable_stats_parsed tests
+// checkpoint_has_stats_parsed tests
 // ============================================================================
 
 // Helper to create a checkpoint schema with stats_parsed for testing
@@ -2952,17 +2952,17 @@ fn create_checkpoint_schema_without_stats_parsed() -> StructType {
 }
 
 #[test]
-fn test_has_usable_stats_parsed_basic() {
+fn test_checkpoint_has_stats_parsed_basic() {
     let checkpoint_schema =
         create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
             "id",
             DataType::INTEGER,
         )]);
-    assert!(LogSegment::has_usable_stats_parsed(&checkpoint_schema));
+    assert!(LogSegment::checkpoint_has_stats_parsed(&checkpoint_schema));
 }
 
 #[test]
-fn test_has_usable_stats_parsed_type_mismatch_still_usable() {
+fn test_checkpoint_has_stats_parsed_type_mismatch_still_usable() {
     // Type mismatch (checkpoint has string, schema needs integer) is still usable --
     // the parquet reader null-pads incompatible fields instead of erroring.
     let checkpoint_schema =
@@ -2971,30 +2971,30 @@ fn test_has_usable_stats_parsed_type_mismatch_still_usable() {
             DataType::STRING,
         )]);
     assert!(
-        LogSegment::has_usable_stats_parsed(&checkpoint_schema),
+        LogSegment::checkpoint_has_stats_parsed(&checkpoint_schema),
         "Type mismatches are handled by parquet reader null-padding, not rejected here"
     );
 }
 
 #[test]
-fn test_has_usable_stats_parsed_no_stats_parsed() {
+fn test_checkpoint_has_stats_parsed_no_stats_parsed() {
     let checkpoint_schema = create_checkpoint_schema_without_stats_parsed();
-    assert!(!LogSegment::has_usable_stats_parsed(&checkpoint_schema));
+    assert!(!LogSegment::checkpoint_has_stats_parsed(&checkpoint_schema));
 }
 
 #[test]
-fn test_has_usable_stats_parsed_not_a_struct() {
+fn test_checkpoint_has_stats_parsed_not_a_struct() {
     // stats_parsed exists but is not a struct type
     let add_schema = StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
         StructField::nullable("stats_parsed", DataType::STRING),
     ]);
     let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
-    assert!(!LogSegment::has_usable_stats_parsed(&checkpoint_schema));
+    assert!(!LogSegment::checkpoint_has_stats_parsed(&checkpoint_schema));
 }
 
 #[test]
-fn test_has_usable_stats_parsed_empty_struct() {
+fn test_checkpoint_has_stats_parsed_empty_struct() {
     // stats_parsed exists and is a struct but has no fields -- still structurally valid.
     let stats_parsed = StructType::new_unchecked([]);
     let add_schema = StructType::new_unchecked([
@@ -3002,7 +3002,7 @@ fn test_has_usable_stats_parsed_empty_struct() {
         StructField::nullable("stats_parsed", stats_parsed),
     ]);
     let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
-    assert!(LogSegment::has_usable_stats_parsed(&checkpoint_schema));
+    assert!(LogSegment::checkpoint_has_stats_parsed(&checkpoint_schema));
 }
 
 // ============================================================================
