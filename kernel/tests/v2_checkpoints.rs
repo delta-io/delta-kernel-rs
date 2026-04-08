@@ -627,6 +627,32 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     });
     snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&checkpoint_spec))?;
 
+    // Post-checkpoint: insert one more row (id=17) and update existing domain metadata
+    let info_field = Arc::new(ArrowField::new("name", ArrowDataType::Utf8, true));
+    let info_array: ArrayRef = Arc::new(StructArray::from(vec![(
+        info_field,
+        Arc::new(StringArray::from(vec![Some("quinn")])) as ArrayRef,
+    )]));
+    let post_ckpt_snapshot = insert_data(
+        Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![17])) as ArrayRef, info_array],
+    )
+    .await?
+    .unwrap_committed()
+    .post_commit_snapshot()
+    .expect("expected post-commit snapshot")
+    .clone();
+
+    let post_ckpt_snapshot = post_ckpt_snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_domain_metadata("app.settings".to_string(), r#"{"version":3}"#.to_string())
+        .commit(engine.as_ref())?
+        .unwrap_committed()
+        .post_commit_snapshot()
+        .expect("expected post-commit snapshot")
+        .clone();
+
     // === Validate _last_checkpoint ===
     let last_ckpt = read_last_checkpoint(&table_path);
     let ckpt_file = load_checkpoint_path(&table_path, version as _);
@@ -718,13 +744,25 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
 
     // === Scan from fresh snapshot to verify data correctness ===
     let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    assert_eq!(fresh_snapshot.version(), version as u64);
+    assert_eq!(fresh_snapshot.version(), post_ckpt_snapshot.version());
+    // Assert that we are reading from the checkpoint + post-checkpoint commits
+    let log_segment = fresh_snapshot.log_segment();
+    assert!(
+        !log_segment.listed.checkpoint_parts.is_empty(),
+        "fresh snapshot should load from checkpoint"
+    );
+    assert_eq!(log_segment.checkpoint_version, Some(version as u64));
+    assert_eq!(
+        log_segment.listed.ascending_commit_files.len(),
+        2,
+        "expected 2 commit files after checkpoint (insert + domain metadata update)"
+    );
 
-    // Verify all 3 domain metadata are retrievable after checkpoint
+    // Verify domain metadata: app.settings updated post-checkpoint to {"version":3}
     assert_eq!(
         fresh_snapshot.get_domain_metadata("app.settings", engine.as_ref())?,
-        Some(r#"{"version":2}"#.to_string()),
-        "app.settings domain metadata should reflect the latest update after reconciliation"
+        Some(r#"{"version":3}"#.to_string()),
+        "app.settings domain metadata should reflect the post-checkpoint update"
     );
     assert_eq!(
         fresh_snapshot.get_domain_metadata("app.feature_flags", engine.as_ref())?,
@@ -741,18 +779,19 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     let batches = read_scan(&scan, engine.clone() as Arc<dyn delta_kernel::Engine>)?;
     assert_batches_sorted_eq!(
         vec![
-            "+----+--------------+",
-            "| id | info         |",
-            "+----+--------------+",
-            "| 10 | {name: judy} |",
-            "| 11 | {name: karl} |",
-            "| 12 | {name: lena} |",
-            "| 13 | {name: mike} |",
-            "| 14 | {name: nina} |",
-            "| 15 | {name: omar} |",
-            "| 16 | {name: pat}  |",
-            "| 9  | {name: ivan} |",
-            "+----+--------------+",
+            "+----+---------------+",
+            "| id | info          |",
+            "+----+---------------+",
+            "| 10 | {name: judy}  |",
+            "| 11 | {name: karl}  |",
+            "| 12 | {name: lena}  |",
+            "| 13 | {name: mike}  |",
+            "| 14 | {name: nina}  |",
+            "| 15 | {name: omar}  |",
+            "| 16 | {name: pat}   |",
+            "| 17 | {name: quinn} |",
+            "| 9  | {name: ivan}  |",
+            "+----+---------------+",
         ],
         &batches
     );
