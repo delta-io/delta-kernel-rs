@@ -14,7 +14,7 @@
 //! ```text
 //! Scalar::String("US/East")
 //!         |
-//!         |  (1) partition_utils: serialize for the Delta log
+//!         |  (1) partition_values: serialize for the Delta log
 //!         v
 //!   Some("US/East")           <- stored in AddFile.partitionValues as-is
 //!         |
@@ -107,7 +107,7 @@ fn needs_escaping(b: u8) -> bool {
 /// # Example
 ///
 /// ```
-/// use delta_kernel::partition::escape_partition_value;
+/// use delta_kernel::hive_partition::escape_partition_value;
 ///
 /// assert_eq!(escape_partition_value("US"), "US");
 /// assert_eq!(escape_partition_value("Serbia/srb%"), "Serbia%2Fsrb%25");
@@ -152,7 +152,7 @@ pub fn escape_partition_value(s: &str) -> Cow<'_, str> {
 /// # Example
 ///
 /// ```
-/// use delta_kernel::partition::build_partition_path;
+/// use delta_kernel::hive_partition::build_partition_path;
 ///
 /// let path = build_partition_path(&[
 ///     ("country", Some("US")),

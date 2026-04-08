@@ -7,7 +7,7 @@
 //! # When to use this module
 //!
 //! This module handles **Delta log serialization only**. It is completely independent from
-//! the Hive-style file path encoding in the [`partition`] module. The same partition value
+//! the Hive-style file path encoding in the [`hive_partition`] module. The same partition value
 //! goes through two separate transformations:
 //!
 //! ```text
@@ -23,7 +23,7 @@
 //! ```
 //!
 //! The slash in `"US/East"` is NOT encoded here. This module produces the raw protocol
-//! value. File path encoding is a separate concern handled by [`partition`].
+//! value. File path encoding is a separate concern handled by [`hive_partition`].
 //!
 //! # Serialization examples
 //!
@@ -51,7 +51,7 @@
 //! [`Transaction::partitioned_write_context`]. Connectors do not call them directly.
 //!
 //! [`Scalar`]: crate::expressions::Scalar
-//! [`partition`]: crate::partition
+//! [`hive_partition`]: crate::hive_partition
 //! [`Transaction::partitioned_write_context`]: super::Transaction::partitioned_write_context
 
 use std::collections::HashMap;
@@ -92,11 +92,11 @@ use crate::{DeltaResult, Error};
 ///
 /// This function is for producing values in the `partitionValues` JSON map in commit log
 /// entries. It is NOT for Hive-style file path encoding. For path encoding, see the
-/// [`partition`] module's [`escape_partition_value`] and [`build_partition_path`].
+/// [`hive_partition`] module's [`escape_partition_value`] and [`build_partition_path`].
 ///
-/// [`partition`]: crate::partition
-/// [`escape_partition_value`]: crate::partition::escape_partition_value
-/// [`build_partition_path`]: crate::partition::build_partition_path
+/// [`hive_partition`]: crate::hive_partition
+/// [`escape_partition_value`]: crate::hive_partition::escape_partition_value
+/// [`build_partition_path`]: crate::hive_partition::build_partition_path
 pub(crate) fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> {
     match value {
         Scalar::Null(_) => Ok(None),

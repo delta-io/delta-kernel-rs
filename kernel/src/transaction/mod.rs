@@ -21,7 +21,7 @@ use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::expressions::Scalar;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
-use crate::partition::build_partition_path;
+use crate::hive_partition::build_partition_path;
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
@@ -57,10 +57,10 @@ pub(crate) mod data_layout;
 
 mod commit_info;
 mod domain_metadata;
-pub(crate) mod partition_utils;
+pub(crate) mod partition_values;
 mod stats_verifier;
 mod update;
-use partition_utils::{
+use partition_values::{
     serialize_partition_value, validate_partition_keys, validate_partition_value_types,
 };
 use stats_verifier::StatsVerifier;
