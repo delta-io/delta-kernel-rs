@@ -276,7 +276,7 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
 
     // This writes to parquet — will fail if the checkpointMetadata batch has a different
     // schema than the action batches.
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Verify the checkpoint was written and is used by a fresh snapshot
     let snapshot2 = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -625,7 +625,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(2),
     });
-    snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&checkpoint_spec))?;
+    snapshot.checkpoint(engine.as_ref(), Some(&checkpoint_spec))?;
 
     // Post-checkpoint: insert one more row (id=17) and update existing domain metadata
     let info_field = Arc::new(ArrowField::new("name", ArrowDataType::Utf8, true));
@@ -885,7 +885,7 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
     let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(1),
     });
-    snapshot2.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&checkpoint_spec))?;
+    snapshot2.checkpoint(engine.as_ref(), Some(&checkpoint_spec))?;
 
     // === Validate sidecar structure ===
     let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
@@ -1029,7 +1029,7 @@ async fn test_v2_checkpoint_spec_requires_v2checkpoint_feature() -> DeltaResult<
 
     // Attempting V2 checkpoint on a table without the feature should fail
     let spec = CheckpointSpec::V2(V2CheckpointConfig::NoSidecar);
-    let result = snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&spec));
+    let result = snapshot.checkpoint(engine.as_ref(), Some(&spec));
     assert!(
         result.is_err(),
         "V2 spec on table without v2Checkpoint feature should fail"
@@ -1065,8 +1065,7 @@ async fn test_v1_checkpoint_rejected_on_v2_table() -> DeltaResult<()> {
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
-    let result =
-        snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&CheckpointSpec::V1));
+    let result = snapshot.checkpoint(engine.as_ref(), Some(&CheckpointSpec::V1));
     assert!(
         result.is_err(),
         "V1 spec on table with v2Checkpoint feature should fail"
@@ -1101,7 +1100,7 @@ async fn test_sidecar_hint_zero_rejected() -> DeltaResult<()> {
     let spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(0),
     });
-    let result = snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&spec));
+    let result = snapshot.checkpoint(engine.as_ref(), Some(&spec));
     assert!(result.is_err(), "hint=0 should be rejected");
     let err_msg = result.unwrap_err().to_string();
     assert!(
