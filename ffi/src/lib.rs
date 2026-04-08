@@ -917,7 +917,7 @@ fn snapshot_checkpoint_impl(
     snapshot: Arc<Snapshot>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<bool> {
-    let (_result, _updated) = snapshot.checkpoint(extern_engine.engine().as_ref())?;
+    let (_result, _updated) = snapshot.checkpoint(extern_engine.engine().as_ref(), None)?;
     // We ignore the CheckpointWriteResult because both Written and AlreadyExists are non-error
     // outcomes at the FFI layer.
     Ok(true)

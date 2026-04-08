@@ -135,7 +135,7 @@ async fn test_checkpoint_stats_config_with_real_data(
 
     // Checkpoint 1 with (json1, struct1) settings
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Version 2: write more data
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
@@ -160,7 +160,7 @@ async fn test_checkpoint_stats_config_with_real_data(
 
     // Checkpoint 2 with (json2, struct2) settings (reads from checkpoint 1 + commits 2-3)
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Read all data back and verify correctness
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
@@ -277,7 +277,7 @@ async fn test_checkpoint_partitioned_with_real_data(
 
     // Checkpoint 1 with (json1, struct1) settings
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Version 2: write data for partition created_at=2025-03-01 09:15:30.123456, tag=world
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
@@ -321,7 +321,7 @@ async fn test_checkpoint_partitioned_with_real_data(
 
     // Checkpoint 2 with (json2, struct2) settings (reads from checkpoint 1 + commits 2-3)
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Verify partitionValues_parsed content directly in the checkpoint
     if struct2 {
@@ -484,7 +484,7 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
 
     // Create checkpoint with writeStatsAsStruct=true
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Read checkpoint and verify partitionValues_parsed uses physical name
     let checkpoint_path = Path::from("_delta_log/00000000000000000001.checkpoint.parquet");
@@ -579,7 +579,7 @@ async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
 
     // Checkpoint at V1: stats_parsed covers only [id, name]
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Version 2: schema evolution - add `age` column via new metadata action
     write_commit(

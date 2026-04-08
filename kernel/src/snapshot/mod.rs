@@ -2710,7 +2710,7 @@ mod tests {
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
 
-        snapshot_v1.clone().checkpoint(ctx.engine.as_ref())?;
+        snapshot_v1.clone().checkpoint(ctx.engine.as_ref(), None)?;
 
         let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         assert_eq!(fresh.version(), 1);
@@ -2734,7 +2734,7 @@ mod tests {
         Snapshot::builder_for(ctx.url.as_str())
             .at_version(1)
             .build(ctx.engine.as_ref())?
-            .checkpoint(ctx.engine.as_ref())?;
+            .checkpoint(ctx.engine.as_ref(), None)?;
 
         let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(3)
@@ -2744,7 +2744,7 @@ mod tests {
         Snapshot::builder_for(ctx.url.as_str())
             .at_version(2)
             .build(ctx.engine.as_ref())?
-            .checkpoint(ctx.engine.as_ref())?;
+            .checkpoint(ctx.engine.as_ref(), None)?;
 
         let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         assert_eq!(fresh.version(), 3);
@@ -2770,7 +2770,7 @@ mod tests {
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
 
-        snapshot_v1.clone().checkpoint(ctx.engine.as_ref())?;
+        snapshot_v1.clone().checkpoint(ctx.engine.as_ref(), None)?;
 
         let refreshed = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         assert_eq!(refreshed.log_segment.checkpoint_version, Some(1));

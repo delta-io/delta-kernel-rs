@@ -108,7 +108,7 @@ async fn test_clustered_table_write_and_checkpoint(
     assert_eq!(total_rows, 5);
 
     // Checkpoint
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Load fresh snapshot from checkpoint and verify everything survived
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
