@@ -566,6 +566,8 @@ impl Snapshot {
         match write_result {
             Ok(()) => {}
             Err(Error::FileAlreadyExists(_)) => {
+                // NOTE: Per write_parquet_file's documentation, it should silently overwrite existing files,
+                // so we log a warning but still return the correct result.
                 warn!(
                     "ParquetHandler::write_parquet_file unexpectedly failed on \
                     FileAlreadyExists for version {}",
