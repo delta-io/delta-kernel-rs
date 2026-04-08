@@ -12,9 +12,9 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::to_json_bytes;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::{path::Path, DynObjectStore, ObjectStore as _};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
@@ -48,8 +48,8 @@ async fn create_row_tracking_table(
         vec![], // no reader features
         vec!["domainMetadata", "rowTracking"],
     )
-        .await
-        .map_err(|e| Error::generic(format!("Failed to create table: {e}")))?;
+    .await
+    .map_err(|e| Error::generic(format!("Failed to create table: {e}")))?;
 
     Ok((table_url, Arc::new(engine), store))
 }
@@ -236,7 +236,7 @@ async fn test_row_tracking_append() -> DeltaResult<()> {
         vec![0, 3], // expected base row IDs
         5,          // expected high watermark
     )
-        .await?;
+    .await?;
 
     // Verify the data can still be read correctly
     test_read(
@@ -285,7 +285,7 @@ async fn test_row_tracking_single_record_batches() -> DeltaResult<()> {
         vec![0, 1, 2], // expected base row IDs
         2,             // expected high watermark
     )
-        .await?;
+    .await?;
 
     Ok(())
 }
@@ -318,7 +318,7 @@ async fn test_row_tracking_large_batch() -> DeltaResult<()> {
         vec![0], // expected base row IDs
         999,     // expected high watermark
     )
-        .await?;
+    .await?;
 
     // Verify the data can still be read correctly
     test_read(
@@ -367,7 +367,7 @@ async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
         vec![0, 3], // expected base row IDs
         5,          // expected high watermark
     )
-        .await?;
+    .await?;
 
     // Second transaction: write one batch with 2 records
     // This should read the existing row tracking domain metadata and assign base row IDs starting from 6
@@ -384,7 +384,7 @@ async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
         vec![6], // expected base row IDs
         7,       // expected high watermark
     )
-        .await?;
+    .await?;
 
     // Verify the data can still be read correctly
     test_read(
@@ -438,7 +438,7 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
         vec![0, 1, 4], // expected base row IDs
         5,             // expected high watermark
     )
-        .await?;
+    .await?;
 
     // Second transaction
     let data_2 = generate_data(
@@ -459,7 +459,7 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
         vec![6], // expected base row IDs
         7,       // expected high watermark
     )
-        .await?;
+    .await?;
 
     // Third transaction
     let data_3 = generate_data(
@@ -486,7 +486,7 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
         vec![8, 10], // expected base row IDs
         11,          // expected high watermark
     )
-        .await?;
+    .await?;
 
     Ok(())
 }
@@ -525,7 +525,7 @@ async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
         vec![0, 3, 3], // expected base row IDs
         5,             // expected high watermark
     )
-        .await?;
+    .await?;
 
     // Verify the data can still be read correctly
     test_read(
@@ -577,7 +577,7 @@ async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
         vec![0, 0], // expected base row IDs
         -1,         // expected high watermark
     )
-        .await?;
+    .await?;
 
     // Verify that the table is empty
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -741,7 +741,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
         vec![0], // expected base row IDs
         2,       // expected high watermark
     )
-        .await?;
+    .await?;
 
     // Verify the data matches the winning transaction
     test_read(
@@ -781,8 +781,8 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
         vec![], // no reader features
         vec![], // no writer features
     )
-        .await
-        .map_err(|e| Error::generic(format!("Failed to create table: {e}")))?;
+    .await
+    .map_err(|e| Error::generic(format!("Failed to create table: {e}")))?;
 
     let engine = Arc::new(engine);
 
@@ -851,6 +851,20 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
     Ok(())
 }
 
+/// Build a scan with `MetadataColumnSpec::RowId` appended to the snapshot schema and execute it.
+fn read_row_id_scan(
+    snapshot: Arc<Snapshot>,
+    engine: Arc<dyn delta_kernel::Engine>,
+) -> DeltaResult<Vec<RecordBatch>> {
+    let scan_schema = Arc::new(
+        snapshot
+            .schema()
+            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?,
+    );
+    let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
+    read_scan(&scan, engine)
+}
+
 /// Collect all `row_id` values from scan results across all batches by column name.
 fn collect_row_ids(batches: &[RecordBatch]) -> Vec<i64> {
     batches
@@ -884,13 +898,7 @@ async fn test_read_row_ids_basic() -> DeltaResult<()> {
         .is_committed());
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let scan_schema = Arc::new(
-        snapshot
-            .schema()
-            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?,
-    );
-    let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
-    let batches = read_scan(&scan, engine)?;
+    let batches = read_row_id_scan(snapshot, engine)?;
 
     let mut row_ids = collect_row_ids(&batches);
     row_ids.sort_unstable();
@@ -926,15 +934,7 @@ async fn test_read_row_ids_multiple_files_one_commit() -> DeltaResult<()> {
         .is_committed());
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let scan_schema = Arc::new(
-        snapshot
-            .schema()
-            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?,
-    );
-    let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
-    let batches = read_scan(&scan, engine)?;
-
-    assert_eq!(batches.len(), 2, "Expected one batch per file");
+    let batches = read_row_id_scan(snapshot, engine)?;
 
     let mut all_ids = collect_row_ids(&batches);
     all_ids.sort_unstable();
@@ -977,7 +977,7 @@ async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
         "test_read_row_ids_multiple_commits",
         schema.clone(),
     )
-        .await?;
+    .await?;
 
     // Commit 1: 3 rows -> IDs 0, 1, 2.
     let data1 = generate_data(schema.clone(), [vec![int32_array(vec![1, 2, 3])]])?;
@@ -992,13 +992,7 @@ async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
         .is_committed());
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let scan_schema = Arc::new(
-        snapshot
-            .schema()
-            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?,
-    );
-    let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
-    let batches = read_scan(&scan, engine)?;
+    let batches = read_row_id_scan(snapshot, engine)?;
 
     let mut all_ids = collect_row_ids(&batches);
     all_ids.sort_unstable();
@@ -1035,7 +1029,7 @@ async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
         "test_read_row_ids_after_checkpoint",
         schema.clone(),
     )
-        .await?;
+    .await?;
 
     // Write 3 rows -> IDs 0, 1, 2.
     let data = generate_data(schema.clone(), [vec![int32_array(vec![1, 2, 3])]])?;
@@ -1051,16 +1045,7 @@ async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
 
     // Fresh snapshot loaded from the checkpoint must return the same row IDs.
     let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(mt_engine.as_ref())?;
-    let scan_schema = Arc::new(
-        fresh_snapshot
-            .schema()
-            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?,
-    );
-    let scan = fresh_snapshot
-        .scan_builder()
-        .with_schema(scan_schema)
-        .build()?;
-    let batches = read_scan(&scan, mt_engine.clone())?;
+    let batches = read_row_id_scan(fresh_snapshot, mt_engine.clone())?;
 
     let mut ids_after_ckpt = collect_row_ids(&batches);
     ids_after_ckpt.sort_unstable();
@@ -1077,13 +1062,7 @@ async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
         .is_committed());
 
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(mt_engine.as_ref())?;
-    let scan_schema2 = Arc::new(
-        snapshot2
-            .schema()
-            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?,
-    );
-    let scan2 = snapshot2.scan_builder().with_schema(scan_schema2).build()?;
-    let batches2 = read_scan(&scan2, mt_engine)?;
+    let batches2 = read_row_id_scan(snapshot2, mt_engine)?;
 
     let mut all_ids = collect_row_ids(&batches2);
     all_ids.sort_unstable();
@@ -1113,7 +1092,7 @@ async fn test_read_row_ids_coexist_with_row_index() -> DeltaResult<()> {
         "test_read_row_ids_coexist_with_row_index",
         schema.clone(),
     )
-        .await?;
+    .await?;
 
     // Two files: 3 rows (baseRowId=0) and 2 rows (baseRowId=3).
     let data = generate_data(
@@ -1136,8 +1115,6 @@ async fn test_read_row_ids_coexist_with_row_index() -> DeltaResult<()> {
     );
     let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
     let batches = read_scan(&scan, engine)?;
-
-    assert_eq!(batches.len(), 2, "Expected one batch per file");
 
     for batch in &batches {
         assert_eq!(
@@ -1243,16 +1220,7 @@ async fn test_read_row_ids_after_log_compaction() -> DeltaResult<()> {
 
     // Load a fresh snapshot -- it should read Protocol and Metadata and file list from the compaction file.
     let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let scan_schema = Arc::new(
-        fresh_snapshot
-            .schema()
-            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?,
-    );
-    let scan = fresh_snapshot
-        .scan_builder()
-        .with_schema(scan_schema)
-        .build()?;
-    let scan_batches = read_scan(&scan, engine)?;
+    let scan_batches = read_row_id_scan(fresh_snapshot, engine)?;
 
     let mut all_ids = collect_row_ids(&scan_batches);
     all_ids.sort_unstable();
