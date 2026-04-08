@@ -164,7 +164,7 @@ pub enum V2CheckpointConfig {
         /// batches that cannot be split. For example, if the hint is 99 but a single
         /// `EngineData` batch contains 100 file actions, all 100 will be written to one sidecar.
         ///
-        /// Defaults to [`DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT`] when `None`.
+        /// Defaults to `DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT` when `None`.
         file_actions_per_sidecar_hint: Option<usize>,
     },
 }
