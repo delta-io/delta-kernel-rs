@@ -141,7 +141,7 @@ all returned batches -- the engine may split a single file across multiple batch
 Tables whose commits go through a catalog (e.g. Unity Catalog) instead of direct filesystem
 writes. Kernel doesn't know about catalogs -- the catalog client provides a log tail via
 `SnapshotBuilder::with_log_tail()` and a custom `Committer` for staging/ratifying/publishing
-commits. Requires `catalog-managed` feature flag.
+commits.
 
 The `UCCommitter` (in the `delta-kernel-unity-catalog` crate) is the reference implementation of a catalog
 committer for Unity Catalog. It stages commits to `_staged_commits/`, calls the UC commit API to

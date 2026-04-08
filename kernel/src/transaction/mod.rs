@@ -395,8 +395,13 @@ impl<S> Transaction<S> {
             .chain(dv_update_actions);
 
         // Step 7: Commit via the committer
-        let commit_metadata =
-            self.create_commit_metadata(commit_version, protocol, metadata, dm_changes.clone())?;
+        let commit_metadata = self.create_commit_metadata(
+            commit_version,
+            in_commit_timestamp,
+            protocol,
+            metadata,
+            dm_changes.clone(),
+        )?;
         match self
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)
@@ -505,13 +510,7 @@ impl<S> Transaction<S> {
         is_create: bool,
         table_config: &crate::table_configuration::TableConfiguration,
     ) -> CommitType {
-        #[cfg(feature = "catalog-managed")]
         let is_catalog_managed = table_config.is_catalog_managed();
-        #[cfg(not(feature = "catalog-managed"))]
-        let is_catalog_managed = {
-            let _ = table_config;
-            false
-        };
 
         // TODO: Handle UpgradeToCatalogManaged and DowngradeToPathBased when ALTER TABLE
         // SET TBLPROPERTIES is supported.
@@ -549,6 +548,7 @@ impl<S> Transaction<S> {
     fn create_commit_metadata(
         &self,
         commit_version: Version,
+        in_commit_timestamp: Option<i64>,
         new_protocol: Option<Protocol>,
         new_metadata: Option<Metadata>,
         domain_metadata_changes: Vec<crate::actions::DomainMetadata>,
@@ -578,7 +578,7 @@ impl<S> Transaction<S> {
             log_root,
             commit_version,
             commit_type,
-            self.commit_timestamp,
+            in_commit_timestamp.unwrap_or(self.commit_timestamp),
             self.read_snapshot
                 .log_segment()
                 .listed
@@ -1356,6 +1356,7 @@ pub struct RetryableTransaction<S = ExistingTable> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -1384,6 +1385,7 @@ mod tests {
     use crate::Snapshot;
     use rstest::rstest;
     use std::path::PathBuf;
+    use url::Url;
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -1419,10 +1421,8 @@ mod tests {
     }
 
     /// A mock catalog committer, used to test catalog committer validation.
-    #[cfg(feature = "catalog-managed")]
     struct MockCatalogCommitter;
 
-    #[cfg(feature = "catalog-managed")]
     impl Committer for MockCatalogCommitter {
         fn commit(
             &self,
@@ -2287,7 +2287,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "catalog-managed")]
     #[test]
     fn disallow_catalog_committer_for_non_catalog_managed_table() {
         let storage = Arc::new(InMemory::new());
@@ -2321,7 +2320,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "catalog-managed")]
     #[test]
     fn disallow_catalog_committer_for_non_catalog_managed_create_table() {
         let storage = Arc::new(InMemory::new());
@@ -2341,5 +2339,125 @@ mod tests {
             err,
             crate::Error::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
         ));
+    }
+
+    struct CapturingCommitter {
+        captured: Arc<Mutex<Option<i64>>>,
+    }
+
+    impl CapturingCommitter {
+        fn new() -> (Self, Arc<Mutex<Option<i64>>>) {
+            let captured = Arc::new(Mutex::new(None));
+            (
+                Self {
+                    captured: captured.clone(),
+                },
+                captured,
+            )
+        }
+    }
+
+    impl Committer for CapturingCommitter {
+        fn commit(
+            &self,
+            _engine: &dyn Engine,
+            _actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+            commit_metadata: CommitMetadata,
+        ) -> DeltaResult<CommitResponse> {
+            *self.captured.lock().unwrap() = Some(commit_metadata.in_commit_timestamp());
+            Ok(CommitResponse::Conflict {
+                version: commit_metadata.version(),
+            })
+        }
+        fn is_catalog_committer(&self) -> bool {
+            false
+        }
+        fn publish(
+            &self,
+            _engine: &dyn Engine,
+            _publish_metadata: PublishMetadata,
+        ) -> DeltaResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_commit_metadata_receives_ict_not_wall_time() -> DeltaResult<()> {
+        // Set up a table with ICT enabled and a very high previous ICT so that the
+        // monotonicity rule (max(wall_time, prev_ict + 1)) produces a value strictly
+        // greater than the current wall time. This lets us verify the computed ICT is
+        // passed to CommitMetadata (not the wall-clock timestamp).
+        let tempdir = tempfile::tempdir().unwrap();
+        let log_dir = tempdir.path().join("_delta_log");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let future_ict: i64 = 9_999_999_999_999; // far-future timestamp in ms
+        let commit_info = serde_json::json!({
+            "commitInfo": {
+                "timestamp": 1000,
+                "operation": "WRITE",
+                "inCommitTimestamp": future_ict
+            }
+        });
+        let protocol = serde_json::json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": ["inCommitTimestamp"]
+            }
+        });
+        let schema_json = serde_json::json!({
+            "type": "struct",
+            "fields": [{
+                "name": "id",
+                "type": "integer",
+                "nullable": true,
+                "metadata": {}
+            }]
+        });
+        let metadata = serde_json::json!({
+            "metaData": {
+                "id": "test-id",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema_json.to_string(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.enableInCommitTimestamps": "true"
+                }
+            }
+        });
+        let commit0 = format!("{commit_info}\n{protocol}\n{metadata}\n");
+        std::fs::write(log_dir.join("00000000000000000000.json"), commit0).unwrap();
+
+        let table_url = Url::from_directory_path(tempdir.path()).unwrap();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+
+        let prev_ict = snapshot.get_in_commit_timestamp(&engine)?;
+        assert_eq!(prev_ict, Some(future_ict));
+
+        let (committer, captured_ts) = CapturingCommitter::new();
+        let mut txn = snapshot.transaction(Box::new(committer), &engine)?;
+        add_dummy_file(&mut txn);
+
+        let result = txn.commit(&engine)?;
+        assert!(
+            matches!(result, CommitResult::ConflictedTransaction(_)),
+            "Expected ConflictedTransaction from capturing committer"
+        );
+
+        // The ICT in CommitMetadata must be prev_ict + 1 (monotonicity), NOT the wall time.
+        let captured = captured_ts
+            .lock()
+            .unwrap()
+            .expect("should have captured a timestamp");
+        assert_eq!(
+            captured,
+            future_ict + 1,
+            "CommitMetadata.in_commit_timestamp should be the computed ICT (prev_ict + 1), \
+             not the wall-clock time"
+        );
+        Ok(())
     }
 }

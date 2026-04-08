@@ -734,8 +734,8 @@ impl ParquetStatsProvider for MinStatsValue {
         Some(0)
     }
 
-    fn get_parquet_rowcount_stat(&self) -> i64 {
-        1
+    fn get_parquet_rowcount_stat(&self) -> Option<i64> {
+        Some(1)
     }
 }
 
@@ -839,8 +839,8 @@ impl ParquetStatsProvider for OneStatsValue {
         Some(nullcount)
     }
 
-    fn get_parquet_rowcount_stat(&self) -> i64 {
-        1
+    fn get_parquet_rowcount_stat(&self) -> Option<i64> {
+        Some(1)
     }
 }
 

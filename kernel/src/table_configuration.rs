@@ -1707,7 +1707,6 @@ mod test {
         );
     }
 
-    #[cfg(feature = "catalog-managed")]
     #[test]
     fn test_catalog_managed_writes() {
         // CatalogManaged requires ICT to be supported and enabled

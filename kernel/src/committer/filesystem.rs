@@ -99,7 +99,6 @@ mod tests {
     use crate::path::LogRoot;
     use url::Url;
 
-    #[cfg(feature = "catalog-managed")]
     #[tokio::test]
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
         let storage = Arc::new(InMemory::new());
