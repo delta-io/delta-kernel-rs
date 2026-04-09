@@ -82,11 +82,16 @@ impl DataFileMetadata {
     /// Convert DataFileMetadata into a record batch which matches the schema returned by
     /// [`add_files_schema`].
     ///
+    /// The path column is derived as a relative path by stripping the `table_root` prefix from
+    /// the file's absolute URL, matching the convention used by Spark and most Delta
+    /// implementations.
+    ///
     /// [`add_files_schema`]: crate::transaction::Transaction::add_files_schema
     #[internal_api]
     pub(crate) fn as_record_batch(
         &self,
         partition_values: &HashMap<String, String>,
+        table_root: &url::Url,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let DataFileMetadata {
             file_meta:
@@ -96,10 +101,13 @@ impl DataFileMetadata {
                     size,
                 },
             stats,
-            ..
         } = self;
-        // create the record batch of the write metadata
-        let path = Arc::new(StringArray::from(vec![location.to_string()]));
+        // Derive relative path by stripping the table root prefix from the absolute URL.
+        let relative_path = location
+            .path()
+            .strip_prefix(table_root.path())
+            .unwrap_or(location.path());
+        let path = Arc::new(StringArray::from(vec![relative_path]));
         let key_builder = StringBuilder::new();
         let val_builder = StringBuilder::new();
         let names = MapFieldNames {
@@ -256,7 +264,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let parquet_metadata = self
             .write_parquet(path, data, stats_columns.unwrap_or(&[]))
             .await?;
-        parquet_metadata.as_record_batch(&partition_values)
+        parquet_metadata.as_record_batch(&partition_values, path)
     }
 }
 
@@ -767,8 +775,9 @@ mod tests {
             "a".to_string()
         };
         let partition_values = HashMap::from([("partition1".to_string(), partition_value)]);
+        let table_root = Url::parse("file:///").unwrap();
         let actual = data_file_metadata
-            .as_record_batch(&partition_values)
+            .as_record_batch(&partition_values, &table_root)
             .unwrap();
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
@@ -821,7 +830,7 @@ mod tests {
         let expected = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec![location.to_string()])),
+                Arc::new(StringArray::from(vec!["test_url"])),
                 Arc::new(partition_values),
                 Arc::new(Int64Array::from(vec![size as i64])),
                 Arc::new(Int64Array::from(vec![last_modified])),
