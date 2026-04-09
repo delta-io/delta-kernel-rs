@@ -3331,8 +3331,8 @@ async fn test_write_parquet_rejects_partitioned_write_context_on_unpartitioned_t
             "nonexistent".to_string(),
             Scalar::String("val".into()),
         )]));
-        let err = result
-            .expect_err("should fail with partitioned_write_context on unpartitioned table");
+        let err =
+            result.expect_err("should fail with partitioned_write_context on unpartitioned table");
         let err_msg = err.to_string();
         assert!(
             err_msg.contains("table is not partitioned"),

@@ -275,9 +275,6 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// The `write_context` must be created by [`Transaction::partitioned_write_context`] or
     /// [`Transaction::unpartitioned_write_context`], which handle partition value validation,
     /// serialization, and logical-to-physical key translation.
-    ///
-    /// [`Transaction::partitioned_write_context`]: crate::transaction::Transaction::partitioned_write_context
-    /// [`Transaction::unpartitioned_write_context`]: crate::transaction::Transaction::unpartitioned_write_context
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,
@@ -292,12 +289,13 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             output_schema.clone().into(),
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
+        // Random 2-char prefix for CM tables, Hive-style dirs for partitioned, else table root.
         let write_dir = write_context.write_dir();
         self.parquet
             .write_parquet_file(
                 &write_dir,
                 physical_data,
-                write_context.partition_values(),
+                write_context.physical_partition_values(),
                 Some(write_context.stats_columns()),
             )
             .await
@@ -308,7 +306,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 /// from the provided [`WriteContext`].
 ///
 /// This is the public API for building Add action metadata from file write results. Custom
-/// engines that write parquet files themselves (bypassing [`DefaultEngine::write_parquet`])
+/// Arrow-based engines that write parquet files themselves (bypassing [`DefaultEngine::write_parquet`])
 /// should call this to produce the Add action metadata for [`Transaction::add_files`].
 ///
 /// [`DataFileMetadata`]: parquet::DataFileMetadata
@@ -317,7 +315,7 @@ pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
     write_context: &WriteContext,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    file_metadata.as_record_batch(write_context.partition_values())
+    file_metadata.as_record_batch(write_context.physical_partition_values())
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {

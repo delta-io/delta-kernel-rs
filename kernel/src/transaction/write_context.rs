@@ -26,20 +26,21 @@ pub(super) struct SharedWriteState {
     pub(super) logical_partition_columns: Vec<String>,
 }
 
-/// A write context for a specific partition (or an unpartitioned table). Created by
+/// A write context for a specific partition or an unpartitioned table. Created by
 /// [`Transaction::partitioned_write_context`] or [`Transaction::unpartitioned_write_context`].
+///
+/// Note: clustered tables are unpartitioned and use `unpartitioned_write_context`.
 ///
 /// Contains both table-wide state (shared cheaply via `Arc`) and per-partition state
 /// (serialized partition values with physical column names as keys). Pass this to
 /// [`DefaultEngine::write_parquet`] to write data files with correctly formatted partition
 /// metadata.
 ///
-/// For custom engines that bypass `DefaultEngine`, use [`partition_values`] to build the
-/// `partitionValues` map in Add actions. A Hive-style target directory helper is also
-/// available as an internal API.
+/// For custom engines that bypass `DefaultEngine`, use [`physical_partition_values`] to build
+/// the `partitionValues` map in Add actions.
 ///
 /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
-/// [`partition_values`]: WriteContext::partition_values
+/// [`physical_partition_values`]: WriteContext::physical_partition_values
 #[derive(Debug)]
 pub struct WriteContext {
     pub(super) shared: Arc<SharedWriteState>,
@@ -87,11 +88,13 @@ impl WriteContext {
     /// column names; values are protocol-serialized strings (`None` = null).
     ///
     /// For unpartitioned tables, this is empty.
-    pub fn partition_values(&self) -> &HashMap<String, Option<String>> {
+    pub fn physical_partition_values(&self) -> &HashMap<String, Option<String>> {
         &self.physical_partition_values
     }
 
-    /// Returns the target directory where data files for this partition should be written.
+    /// Returns the recommended target directory where data files for this partition should be
+    /// written. Data files can technically live under any path within the table root, but using
+    /// this method produces the conventional directory layout that other engines expect.
     ///
     /// The directory structure depends on the table's column mapping mode:
     ///
@@ -101,8 +104,8 @@ impl WriteContext {
     /// | **CM ON** | `<table_root>/<2char>/` | `<table_root>/<2char>/` |
     ///
     /// With column mapping OFF and partitioned tables, the path uses **logical** column names
-    /// and Hive-style encoding (matching Spark). With column mapping ON, a random 2-character
-    /// alphanumeric prefix is used unconditionally (matching Spark's
+    /// and Hive-style encoding (matching Delta-Spark). With column mapping ON, a random 2-character
+    /// alphanumeric prefix is used unconditionally (matching Delta-Spark's
     /// `getRandomPrefix`). Column mapping forces random prefixes to avoid S3 hotspots and
     /// to prevent leaking physical UUID column names into directory paths.
     ///
@@ -134,7 +137,7 @@ impl WriteContext {
             }
             ColumnMappingMode::Id | ColumnMappingMode::Name => {
                 // Column mapping ON: use a random 2-char alphanumeric prefix (matching
-                // Spark's getRandomPrefix). This avoids S3 hotspots and prevents leaking
+                // Delta-Spark's getRandomPrefix). This avoids S3 hotspots and prevents leaking
                 // physical UUID column names into directory paths.
                 let prefix = random_alphanumeric_prefix();
                 url.set_path(&format!("{}{}/", url.path(), prefix));
@@ -144,7 +147,7 @@ impl WriteContext {
     }
 
     /// Builds the Hive-style partition path suffix (e.g., `year=2024/region=US/`).
-    /// Only valid when column mapping is OFF. Uses logical column names for path segments
+    /// Should only be used when column mapping is OFF. Uses logical column names for path segments
     /// and looks up serialized values by physical key.
     fn hive_partition_path_suffix(&self) -> String {
         let columns: Vec<(&str, Option<&str>)> = self
@@ -192,7 +195,7 @@ impl WriteContext {
 }
 
 /// Generates a random 2-character alphanumeric prefix for partition directory paths, matching
-/// Spark's `Utils.getRandomPrefix` (`Random.alphanumeric.take(2)`). Used when column mapping
+/// Delta-Spark's `Utils.getRandomPrefix` (`Random.alphanumeric.take(2)`). Used when column mapping
 /// is enabled to avoid S3 hotspots and prevent leaking physical UUID column names into paths.
 fn random_alphanumeric_prefix() -> String {
     use rand::Rng;

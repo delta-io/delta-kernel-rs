@@ -784,8 +784,7 @@ impl<S> Transaction<S> {
         self.read_snapshot.table_configuration().partition_columns()
     }
 
-    /// Lazily builds and caches the [`SharedWriteState`] for this transaction. Valid for the
-    /// Transaction lifetime because metadata mutations are not supported yet.
+    /// Lazily builds and caches the [`SharedWriteState`] for this transaction.
     fn shared_write_state(&self) -> &Arc<SharedWriteState> {
         self.shared_write_state.get_or_init(|| {
             let target_dir = self.read_snapshot.table_root().clone();
@@ -825,16 +824,22 @@ impl<S> Transaction<S> {
     ///   returns an error. Null scalars skip the type check.
     ///
     /// - **Value serialization**: serializes each `Scalar` to a protocol-compliant string per
-    ///   the Delta protocol's "Partition Value Serialization" rules. For example,
-    ///   `Scalar::Date(20178)` becomes `"2025-03-31"`, `Scalar::Null(DataType::INTEGER)`
-    ///   becomes `None`.
+    ///   the Delta protocol's "Partition Value Serialization" rules.
+    ///   `Scalar::Null(...)` becomes `None` in `add.partitionValues` (JSON null).
+    ///   `Scalar::String("")` also becomes `None` (empty string equals null for all types).
+    ///   `Scalar::Integer(2024)` becomes `Some("2024")`.
     ///
     /// - **Key translation**: translates logical column names to physical names using the
     ///   table's column mapping mode. For example, under `ColumnMappingMode::Name`, logical
     ///   `"year"` might become physical `"col-abc-123"` in the `partitionValues` map.
     ///
+    /// The returned [`WriteContext`] also provides a [`write_dir`] that returns the correct
+    /// target directory (Hive-style paths when column mapping is off, random prefix when on).
+    ///
     /// Returns an error if the table is not partitioned (use
     /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead).
+    ///
+    /// [`write_dir`]: WriteContext::write_dir
     pub fn partitioned_write_context(
         &self,
         partition_values: HashMap<String, Scalar>,
