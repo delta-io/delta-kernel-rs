@@ -50,10 +50,11 @@ use delta_kernel::FileMeta;
 use test_utils::create_default_engine_mt_executor;
 use test_utils::{
     assert_partition_values, assert_result_error_with_message, assert_schema_has_field,
-    copy_directory, create_add_files_metadata, create_default_engine, create_table,
-    create_table_and_load_snapshot, engine_store_setup, nested_batches, nested_schema,
-    read_actions_from_commit, read_add_infos, remove_all_and_get_remove_actions, resolve_field,
-    setup_test_tables, test_read, test_table_setup, write_batch_to_table,
+    begin_transaction, copy_directory, create_add_files_metadata, create_default_engine,
+    create_table, create_table_and_load_snapshot, engine_store_setup, load_and_begin_transaction,
+    nested_batches, nested_schema, read_actions_from_commit, read_add_infos,
+    remove_all_and_get_remove_actions, resolve_field, setup_test_tables, test_read,
+    test_table_setup, write_batch_to_table,
 };
 
 mod common;
@@ -141,10 +142,7 @@ async fn create_dv_table_with_files(
     .await?;
 
     // Write files
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
         .with_engine_info("test engine")
         .with_operation("WRITE".to_string())
         .with_data_change(true);
@@ -297,10 +295,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // create a transaction
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let committer = Box::new(FileSystemCommitter::new());
-        let txn = snapshot
-            .transaction(committer, &engine)?
+        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine");
 
         // commit!
@@ -383,10 +378,7 @@ async fn write_data_and_check_result_and_stats(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let committer = Box::new(FileSystemCommitter::new());
-    let mut txn = snapshot
-        .transaction(committer, engine.as_ref())?
+    let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
         .with_data_change(true);
 
     // create two new arrow record batches to append
@@ -449,9 +441,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine");
 
         let _ = txn.commit(&engine)?;
@@ -526,9 +516,7 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
             StructField::nullable("operation", DataType::STRING),
         ]));
 
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_operation("WRITE".to_string())
             .with_commit_info(Box::new(ArrowEngineData::new(batch)), engine_schema);
 
@@ -672,9 +660,7 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine");
 
         // Commit without adding any add files
@@ -748,9 +734,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
     {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine")
             .with_data_change(false);
 
@@ -893,9 +877,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(table_schema, &[], None, "test_table").await?
     {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine");
 
         // create two new arrow record batches to append
@@ -952,19 +934,15 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // can't have duplicate app_id in same transaction
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         assert!(matches!(
-            snapshot
-                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            load_and_begin_transaction(table_url.clone(), &engine)?
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
                 .commit(&engine),
             Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
         ));
 
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine")
             .with_transaction_id("app_id1".to_string(), 1)
             .with_transaction_id("app_id2".to_string(), 2);
@@ -1087,9 +1065,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?
         .with_engine_info("default engine");
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
@@ -1210,9 +1186,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?
         .with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
@@ -1422,9 +1396,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?
         .with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
@@ -1540,9 +1512,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn = load_and_begin_transaction(table_url.clone(), &engine)?;
 
     // write context does not conflict with domain metadata
     let _write_context = txn.get_write_context();
@@ -1618,9 +1588,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
 
     // System domain rejection
-    let txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn = begin_transaction(snapshot.clone(), &engine)?;
     let res = txn
         .with_domain_metadata("delta.system".to_string(), "config".to_string())
         .commit(&engine);
@@ -1630,9 +1598,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     );
 
     // Duplicate domain rejection
-    let txn2 = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn2 = begin_transaction(snapshot.clone(), &engine)?;
     let res = txn2
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata("app.config".to_string(), "v2".to_string())
@@ -1667,9 +1633,7 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let res = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    let res = load_and_begin_transaction(table_url.clone(), &engine)?
         .with_domain_metadata("app.config".to_string(), "test_config".to_string())
         .commit(&engine);
 
@@ -1700,9 +1664,7 @@ async fn test_remove_domain_metadata_unsupported_writer_feature(
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let res = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    let res = load_and_begin_transaction(table_url.clone(), &engine)?
         .with_domain_metadata_removed("app.config".to_string())
         .commit(&engine);
 
@@ -1732,8 +1694,7 @@ async fn test_remove_domain_metadata_non_existent_domain() -> Result<(), Box<dyn
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn = load_and_begin_transaction(table_url.clone(), &engine)?;
 
     let domain = "app.deprecated";
 
@@ -1789,9 +1750,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
 
     // set then remove same domain
-    let txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn = begin_transaction(snapshot.clone(), &engine)?;
     let err = txn
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata_removed("app.config".to_string())
@@ -1802,9 +1761,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .contains("already specified in this transaction"));
 
     // remove then set same domain
-    let txn2 = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn2 = begin_transaction(snapshot.clone(), &engine)?;
     let err = txn2
         .with_domain_metadata_removed("test.domain".to_string())
         .with_domain_metadata("test.domain".to_string(), "v1".to_string())
@@ -1815,9 +1772,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .contains("already specified in this transaction"));
 
     // remove same domain twice
-    let txn3 = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn3 = begin_transaction(snapshot.clone(), &engine)?;
     let err = txn3
         .with_domain_metadata_removed("another.domain".to_string())
         .with_domain_metadata_removed("another.domain".to_string())
@@ -1828,9 +1783,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .contains("already specified in this transaction"));
 
     // remove system domain
-    let txn4 = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn4 = begin_transaction(snapshot.clone(), &engine)?;
     let err = txn4
         .with_domain_metadata_removed("delta.system".to_string())
         .commit(&engine)
@@ -1866,16 +1819,12 @@ async fn test_domain_metadata_set_then_remove() -> Result<(), Box<dyn std::error
     let configuration = r#"{"version": 1}"#;
 
     // txn 1: set domain metadata
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-    let _ = txn
+    let _ = load_and_begin_transaction(table_url.clone(), &engine)?
         .with_domain_metadata(domain.to_string(), configuration.to_string())
         .commit(&engine)?;
 
     // txn 2: remove the same domain metadata
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-    let _ = txn
+    let _ = load_and_begin_transaction(table_url.clone(), &engine)?
         .with_domain_metadata_removed(domain.to_string())
         .commit(&engine)?;
 
@@ -2001,8 +1950,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         "Initial snapshot should be version 0"
     );
 
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    let mut txn = begin_transaction(snapshot, &engine)?
         .with_engine_info("ict test");
 
     // Add some data
@@ -2045,8 +1993,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         "Second snapshot should be version 1"
     );
 
-    let mut txn2 = snapshot2
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    let mut txn2 = begin_transaction(snapshot2, &engine)?
         .with_engine_info("ict test 2");
 
     // Add more data
@@ -2111,9 +2058,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
         .with_data_change(true);
 
@@ -2294,9 +2239,7 @@ async fn test_update_deletion_vectors_adds_expected_entries(
         .build(engine.as_ref())?;
 
     // Create transaction with DV update mode enabled
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
         .with_operation("UPDATE".to_string())
         .with_data_change(true);
@@ -2592,9 +2535,7 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
 
     // Create DV update transaction
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
         .with_operation("UPDATE".to_string())
         .with_data_change(true);
@@ -2738,9 +2679,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         assert!(initial_file_count > 0);
 
         // Now create a transaction to remove files
-        let mut txn = snapshot
-            .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+        let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
 
         // Create a new scan to get file metadata for removal
         let scan2 = snapshot.scan_builder().build()?;
@@ -2834,9 +2773,7 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
         );
 
         // Create a transaction to remove files in two batches
-        let mut txn = snapshot
-            .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
             .with_engine_info("selective remove test")
             .with_operation("DELETE".to_string())
             .with_data_change(true);
@@ -2959,9 +2896,7 @@ async fn write_data_to_table(
     schema: SchemaRef,
     values: Vec<i32>,
 ) -> Result<Version, Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
         .with_engine_info("test");
 
     add_files_to_transaction(&mut txn, engine, schema, values).await?;
@@ -3029,9 +2964,7 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
 
     // Now remove the files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("cdf remove test")
         .with_data_change(true);
 
@@ -3069,9 +3002,7 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
 
     // Now create a transaction with both add AND remove files, but dataChange=false
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("cdf mixed test")
         .with_data_change(false); // dataChange=false is key here
 
@@ -3111,9 +3042,7 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
 
     // Now create a transaction with both add AND remove files with dataChange=true
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("cdf mixed fail test")
         .with_data_change(true); // dataChange=true - this should fail
 
@@ -3167,9 +3096,7 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
     for i in 1..11 {
         let base_version = current_snapshot.version();
 
-        let txn = current_snapshot
-            .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        let txn = begin_transaction(current_snapshot.clone(), engine.as_ref())?
             .with_engine_info("test");
 
         match txn.commit(engine.as_ref())? {

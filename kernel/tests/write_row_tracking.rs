@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::Snapshot;
 use url::Url;
 
@@ -21,7 +20,7 @@ use tempfile::tempdir;
 
 use delta_kernel::schema::{DataType, StructField, StructType};
 
-use test_utils::{create_table, engine_store_setup};
+use test_utils::{begin_transaction, create_table, engine_store_setup, load_and_begin_transaction};
 
 /// Test that verifies baseRowId and defaultRowCommitVersion are correctly populated
 /// when row tracking is enabled on the table when a remove action is generated for a
@@ -63,9 +62,7 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
     .await?;
 
     // ===== FIRST COMMIT: Add files with row tracking =====
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?
         .with_engine_info("row tracking test")
         .with_data_change(true);
 
@@ -135,9 +132,7 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
 
     // ===== SECOND COMMIT: Remove the file =====
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine_arc.as_ref())?;
-    let mut txn2 = snapshot2
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine_arc.as_ref())?
+    let mut txn2 = begin_transaction(snapshot2.clone(), engine_arc.as_ref())?
         .with_engine_info("row tracking remove test")
         .with_data_change(true);
 
