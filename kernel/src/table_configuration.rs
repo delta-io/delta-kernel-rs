@@ -271,6 +271,13 @@ impl TableConfiguration {
     }
 
     /// Returns the list of physical column names that should have statistics collected.
+    ///
+    /// Partition columns are excluded because their values are already stored in the Add
+    /// action's `partitionValues` field, making per-file statistics redundant.
+    ///
+    /// If `required_columns` is `Some`, those columns are always included regardless of
+    /// `dataSkippingNumIndexedCols` or `dataSkippingStatsColumns` settings (e.g. clustering
+    /// columns). Required columns that are also partition columns are still excluded.
     pub(crate) fn physical_stats_column_names(
         &self,
         required_columns: Option<&[ColumnName]>,
@@ -280,7 +287,11 @@ impl TableConfiguration {
             data_skipping_stats_columns: physical_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: self.table_properties().data_skipping_num_indexed_cols,
         };
-        stats_column_names(&self.physical_schema(), &config, required_columns)
+        stats_column_names(
+            &self.physical_data_schema_without_partition_columns(),
+            &config,
+            required_columns,
+        )
     }
 
     /// Returns the physical partition schema for `partitionValues_parsed`.
@@ -1915,6 +1926,134 @@ mod test {
             inner.field("part_col").is_none(),
             "Partition column logical name should also be absent"
         );
+    }
+
+    #[test]
+    fn test_physical_stats_column_names_excludes_partition_columns() {
+        let field_a: StructField = serde_json::from_str(
+            r#"{
+                "name": "data_col",
+                "type": "long",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 1,
+                    "delta.columnMapping.physicalName": "phys_data"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let field_b: StructField = serde_json::from_str(
+            r#"{
+                "name": "part_col",
+                "type": "string",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 2,
+                    "delta.columnMapping.physicalName": "phys_part"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let schema = Arc::new(StructType::new_unchecked([field_a, field_b]));
+        let mut props = HashMap::new();
+        props.insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        let metadata =
+            Metadata::try_new(None, None, schema, vec!["part_col".to_string()], 0, props).unwrap();
+        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        let column_names = config.physical_stats_column_names(None);
+
+        assert_eq!(
+            column_names,
+            vec![ColumnName::new(["phys_data"])],
+            "Partition columns should be excluded from stats column names"
+        );
+    }
+
+    #[test]
+    fn test_physical_stats_column_names_excludes_partition_columns_no_column_mapping() {
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("data_col", DataType::LONG),
+            StructField::nullable("part_col", DataType::STRING),
+        ]));
+        let metadata =
+            Metadata::try_new(None, None, schema, vec!["part_col".to_string()], 0, HashMap::new())
+                .unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        let column_names = config.physical_stats_column_names(None);
+        assert_eq!(column_names, vec![ColumnName::new(["data_col"])]);
+    }
+
+    #[test]
+    fn test_physical_stats_column_names_excludes_partition_col_even_when_required() {
+        let field_a: StructField = serde_json::from_str(
+            r#"{
+                "name": "data_col",
+                "type": "long",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 1,
+                    "delta.columnMapping.physicalName": "phys_data"
+                }
+            }"#,
+        )
+        .unwrap();
+        let field_b: StructField = serde_json::from_str(
+            r#"{
+                "name": "part_col",
+                "type": "string",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 2,
+                    "delta.columnMapping.physicalName": "phys_part"
+                }
+            }"#,
+        )
+        .unwrap();
+        let schema = Arc::new(StructType::new_unchecked([field_a, field_b]));
+        let mut props = HashMap::new();
+        props.insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        let metadata =
+            Metadata::try_new(None, None, schema, vec!["part_col".to_string()], 0, props).unwrap();
+        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        // Pass partition column as a required column (e.g. clustering column)
+        let required = [ColumnName::new(["phys_part"])];
+        let column_names = config.physical_stats_column_names(Some(&required));
+
+        assert_eq!(column_names, vec![ColumnName::new(["phys_data"])]);
+    }
+
+    #[test]
+    fn test_physical_stats_column_names_all_partition_columns_returns_empty() {
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "part_col",
+            DataType::STRING,
+        )]));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec!["part_col".to_string()],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        let column_names = config.physical_stats_column_names(None);
+        assert!(column_names.is_empty());
     }
 
     #[test]
