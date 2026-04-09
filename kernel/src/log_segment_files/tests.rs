@@ -882,21 +882,23 @@ async fn create_storage_with_empty_files(
     (storage, log_root)
 }
 
-// v2.json is 0 bytes -> skipped, only v0 and v1 remain in listing
+// v2.json is 0 bytes -> kept in listing (commits are source of truth, not skipped)
 #[tokio::test]
-async fn test_zero_byte_commit_skipped() {
+async fn test_zero_byte_commit_kept_in_listing() {
     let log_files = vec![
         (0, LogPathFileType::Commit, false),
         (1, LogPathFileType::Commit, false),
-        (2, LogPathFileType::Commit, true), // empty
+        (2, LogPathFileType::Commit, true), // empty but still listed
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
         LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
-    assert_eq!(result.ascending_commit_files.len(), 2);
+    assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[0].version, 0);
     assert_eq!(result.ascending_commit_files[1].version, 1);
+    assert_eq!(result.ascending_commit_files[2].version, 2);
+    assert_eq!(result.ascending_commit_files[2].location.size, 0);
 }
 
 // 0.4.compacted.json is 0 bytes -> skipped, individual commits v0-v4 used instead
@@ -976,24 +978,24 @@ async fn test_zero_byte_checkpoint_skipped_older_used(#[case] use_backward_scan:
     assert_eq!(result.ascending_commit_files[4].version, 10);
 }
 
-// v2.crc is 0 bytes -> skipped, valid v1.crc is kept
+// v2.crc is 0 bytes -> kept (CRC is optional, may report size 0 on some platforms)
 #[tokio::test]
-async fn test_zero_byte_crc_skipped() {
+async fn test_zero_byte_crc_kept() {
     let log_files = vec![
         (0, LogPathFileType::Commit, false),
         (1, LogPathFileType::Commit, false),
         (2, LogPathFileType::Commit, false),
         (1, LogPathFileType::Crc, false), // valid CRC
-        (2, LogPathFileType::Crc, true),  // empty CRC
+        (2, LogPathFileType::Crc, true),  // empty CRC, still kept
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
         LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
 
-    // The 0-byte CRC at v2 is skipped; the valid CRC at v1 is kept
+    // The 0-byte CRC at v2 is kept (latest_crc_file tracks the highest version)
     let crc = result.latest_crc_file.unwrap();
-    assert_eq!(crc.version, 1);
+    assert_eq!(crc.version, 2);
 }
 
 // v1005.checkpoint.parquet is 0 bytes in window 1 -> scan continues to window 2,
@@ -1026,21 +1028,21 @@ async fn test_zero_byte_checkpoint_backward_scan_crosses_windows() {
     assert_eq!(result.ascending_commit_files[999].version, 1005);
 }
 
-// 0-byte commit in list_commits -> skipped, only v0 and v1 remain
+// 0-byte commit in list_commits -> kept (commits are source of truth, not skipped)
 #[tokio::test]
-async fn test_list_commits_zero_byte_commit_skipped() {
+async fn test_list_commits_zero_byte_commit_kept() {
     let log_files = vec![
         (0, LogPathFileType::Commit, false),
         (1, LogPathFileType::Commit, false),
-        (2, LogPathFileType::Commit, true), // empty
+        (2, LogPathFileType::Commit, true), // empty but still listed
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result =
         LogSegmentFiles::list_commits(storage.as_ref(), &log_root, Some(0), Some(2)).unwrap();
-    assert_eq!(result.ascending_commit_files.len(), 2);
-    assert_eq!(result.ascending_commit_files[0].version, 0);
-    assert_eq!(result.ascending_commit_files[1].version, 1);
+    assert_eq!(result.ascending_commit_files.len(), 3);
+    assert_eq!(result.ascending_commit_files[2].version, 2);
+    assert_eq!(result.ascending_commit_files[2].location.size, 0);
 }
 
 // ===== find_complete_checkpoint_version direct unit tests (other cases already covered by tests above) =====

@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::path::{LogPathFileType, LogPathFileType::*, ParsedLogPath};
 use crate::{DeltaResult, Error, StorageHandler, Version};
 
 use delta_kernel_derive::internal_api;
@@ -92,7 +92,6 @@ fn list_from_storage(
 fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedLogPath>> {
     let mut checkpoints: HashMap<u32, Vec<ParsedLogPath>> = HashMap::new();
     for part_file in parts {
-        use LogPathFileType::*;
         match &part_file.file_type {
             SinglePartCheckpoint
             | UuidCheckpoint
@@ -152,21 +151,23 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
 /// Validates a log file's size. Returns `true` to keep the file, `false` to skip it
 /// (with a warning already emitted).
 ///
-/// All 0-byte files are skipped with a warning rather than producing a hard error. This
-/// allows readers to still load the table at versions that don't depend on the corrupt file.
-/// Safety is preserved by `LogSegment::try_new`, which validates commit contiguity -- if a
-/// skipped commit creates a gap, segment construction fails with a clear error.
+/// Compaction and checkpoint files are skipped when empty -- they have fallbacks
+/// (individual commits, older checkpoints). Commit and CRC files are kept even
+/// if empty; the warning ensures the corrupt file is identifiable in logs.
 fn should_process_log_file(file: &ParsedLogPath) -> bool {
     if file.location.size > 0 {
         return true;
     }
-    use LogPathFileType::*;
     match file.file_type {
+        // Commit files are kept even if 0 bytes -- the downstream JSON handler might
+        // error, but the warning here ensures the corrupt file is identifiable in logs.
+        // We don't skip commits because they are the source of truth for table state.
         Commit | StagedCommit => {
             warn!(
-                "Skipping empty (0 byte) {:?} file: {}",
+                "{:?} file is empty (0 bytes): {}",
                 file.file_type, file.location.location,
             );
+            return true;
         }
         CompactedCommit { .. } => {
             warn!(
@@ -181,11 +182,11 @@ fn should_process_log_file(file: &ParsedLogPath) -> bool {
                 file.location.location,
             );
         }
+        // CRC files are optional and may report size 0 on some platforms.
+        // Keep them -- the CRC reader handles empty/invalid content.
         Crc => {
-            warn!(
-                "Skipping empty (0 byte) CRC file: {}",
-                file.location.location,
-            );
+            warn!("CRC file is empty (0 bytes): {}", file.location.location,);
+            return true;
         }
         Unknown => return true,
     }
@@ -219,7 +220,6 @@ impl ListingAccumulator {
         if !should_process_log_file(&file) {
             return;
         }
-        use LogPathFileType::*;
         match file.file_type {
             Commit | StagedCommit => self.output.ascending_commit_files.push(file),
             CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
@@ -431,7 +431,8 @@ impl LogSegmentFiles {
 
         for file_result in fs_iter {
             let file = file_result?;
-            if matches!(file.file_type, LogPathFileType::Commit) && should_process_log_file(&file) {
+            if matches!(file.file_type, LogPathFileType::Commit) {
+                should_process_log_file(&file); // warns if 0 bytes
                 max_published_version = max_published_version.max(Some(file.version));
                 listed_commits.push(file);
             }

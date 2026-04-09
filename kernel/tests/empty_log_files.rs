@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStore;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::Snapshot;
 use test_utils::{add_commit, compacted_log_path_for_versions, create_table, engine_store_setup};
@@ -100,8 +100,9 @@ async fn snapshot_loads_with_zero_byte_commit() -> Result<(), Box<dyn std::error
     )
     .await?;
 
-    // Overwrite commit v1 with 0 bytes -- it gets skipped at listing,
-    // so the snapshot falls back to v0 (the create table commit)
+    // Overwrite commit v1 with 0 bytes -- the file stays in the listing
+    // (commits are not skipped). The JSON handler reads it as an empty
+    // commit (no actions).
     let empty_commit_path =
         Path::from("test_zero_byte_commit/_delta_log/00000000000000000001.json");
     store
@@ -109,7 +110,7 @@ async fn snapshot_loads_with_zero_byte_commit() -> Result<(), Box<dyn std::error
         .await?;
 
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
-    assert_eq!(snapshot.version(), 0);
+    assert_eq!(snapshot.version(), 1);
 
     Ok(())
 }
