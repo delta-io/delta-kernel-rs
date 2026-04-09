@@ -882,9 +882,9 @@ async fn create_storage_with_empty_files(
     (storage, log_root)
 }
 
-// v2.json is 0 bytes -> listing fails with a clear error
+// v2.json is 0 bytes -> skipped, only v0 and v1 remain in listing
 #[tokio::test]
-async fn test_zero_byte_commit_errors() {
+async fn test_zero_byte_commit_skipped() {
     let log_files = vec![
         (0, LogPathFileType::Commit, false),
         (1, LogPathFileType::Commit, false),
@@ -892,12 +892,11 @@ async fn test_zero_byte_commit_errors() {
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
-    let result = LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2));
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("empty (0 bytes)"),
-        "Expected 'empty (0 bytes)' in error, got: {err}"
-    );
+    let result =
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+    assert_eq!(result.ascending_commit_files.len(), 2);
+    assert_eq!(result.ascending_commit_files[0].version, 0);
+    assert_eq!(result.ascending_commit_files[1].version, 1);
 }
 
 // 0.4.compacted.json is 0 bytes -> skipped, individual commits v0-v4 used instead
@@ -1027,9 +1026,9 @@ async fn test_zero_byte_checkpoint_backward_scan_crosses_windows() {
     assert_eq!(result.ascending_commit_files[999].version, 1005);
 }
 
-// 0-byte commit in list_commits -> error
+// 0-byte commit in list_commits -> skipped, only v0 and v1 remain
 #[tokio::test]
-async fn test_list_commits_zero_byte_commit_errors() {
+async fn test_list_commits_zero_byte_commit_skipped() {
     let log_files = vec![
         (0, LogPathFileType::Commit, false),
         (1, LogPathFileType::Commit, false),
@@ -1037,12 +1036,11 @@ async fn test_list_commits_zero_byte_commit_errors() {
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
-    let result = LogSegmentFiles::list_commits(storage.as_ref(), &log_root, Some(0), Some(2));
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("empty (0 bytes)"),
-        "Expected 'empty (0 bytes)' in error, got: {err}"
-    );
+    let result =
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, Some(0), Some(2)).unwrap();
+    assert_eq!(result.ascending_commit_files.len(), 2);
+    assert_eq!(result.ascending_commit_files[0].version, 0);
+    assert_eq!(result.ascending_commit_files[1].version, 1);
 }
 
 // ===== find_complete_checkpoint_version direct unit tests (other cases already covered by tests above) =====

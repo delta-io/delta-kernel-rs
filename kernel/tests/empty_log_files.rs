@@ -78,7 +78,7 @@ async fn snapshot_loads_with_zero_byte_compaction() -> Result<(), Box<dyn std::e
 }
 
 #[tokio::test]
-async fn snapshot_fails_with_zero_byte_commit() -> Result<(), Box<dyn std::error::Error>> {
+async fn snapshot_loads_with_zero_byte_commit() -> Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_location) = engine_store_setup("test_zero_byte_commit", None);
 
     let table_url = create_table(
@@ -100,19 +100,16 @@ async fn snapshot_fails_with_zero_byte_commit() -> Result<(), Box<dyn std::error
     )
     .await?;
 
-    // Overwrite commit v1 with 0 bytes
+    // Overwrite commit v1 with 0 bytes -- it gets skipped at listing,
+    // so the snapshot falls back to v0 (the create table commit)
     let empty_commit_path =
         Path::from("test_zero_byte_commit/_delta_log/00000000000000000001.json");
     store
         .put(&empty_commit_path, bytes::Bytes::new().into())
         .await?;
 
-    let result = Snapshot::builder_for(table_url).build(&engine);
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("empty (0 bytes)"),
-        "Expected 'empty (0 bytes)' in error, got: {err}"
-    );
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+    assert_eq!(snapshot.version(), 0);
 
     Ok(())
 }

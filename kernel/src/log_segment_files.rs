@@ -136,7 +136,7 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
 fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option<Version> {
     ascending_files
         .iter()
-        .filter(|f| f.is_checkpoint() && should_process_log_file(f).unwrap_or(false))
+        .filter(|f| f.is_checkpoint() && should_process_log_file(f))
         .chunk_by(|f| f.version)
         .into_iter()
         .filter_map(|(version, parts)| {
@@ -149,47 +149,47 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
         .last()
 }
 
-/// Validates a log file's size. Returns `Ok(true)` to keep the file, `Ok(false)` to skip it
-/// (with a warning already emitted), or `Err` for unrecoverable corruption.
+/// Validates a log file's size. Returns `true` to keep the file, `false` to skip it
+/// (with a warning already emitted).
 ///
-/// - Commit/StagedCommit: error (no fallback exists for a corrupt commit)
-/// - CompactedCommit: warn and skip (individual commits are the fallback)
-/// - Checkpoint: warn and skip (won't count toward a "complete" checkpoint)
-/// - CRC: warn and skip (optional optimization file)
-fn should_process_log_file(file: &ParsedLogPath) -> DeltaResult<bool> {
+/// All 0-byte files are skipped with a warning rather than producing a hard error. This
+/// allows readers to still load the table at versions that don't depend on the corrupt file.
+/// Safety is preserved by `LogSegment::try_new`, which validates commit contiguity -- if a
+/// skipped commit creates a gap, segment construction fails with a clear error.
+fn should_process_log_file(file: &ParsedLogPath) -> bool {
     if file.location.size > 0 {
-        return Ok(true);
+        return true;
     }
     use LogPathFileType::*;
     match file.file_type {
-        Commit | StagedCommit => Err(Error::generic(format!(
-            "{:?} file is empty (0 bytes): {}",
-            file.file_type, file.location.location,
-        ))),
+        Commit | StagedCommit => {
+            warn!(
+                "Skipping empty (0 byte) {:?} file: {}",
+                file.file_type, file.location.location,
+            );
+        }
         CompactedCommit { .. } => {
             warn!(
                 "Skipping empty (0 byte) compacted log file {}, \
                  falling back to individual commits",
                 file.location.location,
             );
-            Ok(false)
         }
         SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
             warn!(
                 "Skipping empty (0 byte) checkpoint file: {}",
                 file.location.location,
             );
-            Ok(false)
         }
         Crc => {
             warn!(
                 "Skipping empty (0 byte) CRC file: {}",
                 file.location.location,
             );
-            Ok(false)
         }
-        Unknown => Ok(true),
+        Unknown => return true,
     }
+    false
 }
 
 /// Accumulates and groups log files during listing. Each "group" consists of all files that
@@ -215,9 +215,9 @@ struct ListingAccumulator {
 }
 
 impl ListingAccumulator {
-    fn process_file(&mut self, file: ParsedLogPath) -> DeltaResult<()> {
-        if !should_process_log_file(&file)? {
-            return Ok(());
+    fn process_file(&mut self, file: ParsedLogPath) {
+        if !should_process_log_file(&file) {
+            return;
         }
         use LogPathFileType::*;
         match file.file_type {
@@ -242,7 +242,6 @@ impl ListingAccumulator {
                 );
             }
         }
-        Ok(())
     }
 
     /// Called before processing each new file. If `file_version` differs from the current
@@ -355,7 +354,7 @@ impl LogSegmentFiles {
             }
 
             acc.maybe_flush_and_advance(file.version);
-            acc.process_file(file)?;
+            acc.process_file(file);
         }
 
         // Phase 2: Process log_tail entries. We do this after Phase 1 because log_tail commits
@@ -378,7 +377,7 @@ impl LogSegmentFiles {
             }
 
             acc.maybe_flush_and_advance(file.version);
-            acc.process_file(file)?;
+            acc.process_file(file);
         }
 
         // Flush the final group
@@ -432,8 +431,7 @@ impl LogSegmentFiles {
 
         for file_result in fs_iter {
             let file = file_result?;
-            if matches!(file.file_type, LogPathFileType::Commit) {
-                should_process_log_file(&file)?;
+            if matches!(file.file_type, LogPathFileType::Commit) && should_process_log_file(&file) {
                 max_published_version = max_published_version.max(Some(file.version));
                 listed_commits.push(file);
             }
