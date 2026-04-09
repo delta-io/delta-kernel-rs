@@ -18,7 +18,10 @@ use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Error, Snapshot};
 
-use test_utils::{begin_transaction, create_table, engine_store_setup, load_and_begin_transaction, read_scan, test_read};
+use test_utils::{
+    begin_transaction, create_table, engine_store_setup, load_and_begin_transaction, read_scan,
+    test_read,
+};
 
 /// Helper function to create a simple table with row tracking enabled.
 async fn create_row_tracking_table(
@@ -56,8 +59,8 @@ async fn write_data_to_table(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     data: Vec<ArrowEngineData>,
 ) -> DeltaResult<CommitResult> {
-    let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
-        .with_data_change(true);
+    let mut txn =
+        load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
 
     // Write data out by spawning async tasks to simulate executors
     let write_context = Arc::new(txn.get_write_context());

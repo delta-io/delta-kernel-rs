@@ -14,8 +14,8 @@ use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
 use tempfile::tempdir;
 use test_utils::{
-    create_add_files_metadata, create_table, engine_store_setup, generate_batch,
-    into_record_batch, load_and_begin_transaction, record_batch_to_bytes, IntoArray,
+    create_add_files_metadata, create_table, engine_store_setup, generate_batch, into_record_batch,
+    load_and_begin_transaction, record_batch_to_bytes, IntoArray,
 };
 
 use itertools::Itertools;

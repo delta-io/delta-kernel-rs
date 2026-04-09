@@ -378,8 +378,8 @@ async fn write_data_and_check_result_and_stats(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
-        .with_data_change(true);
+    let mut txn =
+        load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
 
     // create two new arrow record batches to append
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -1065,8 +1065,8 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?
-        .with_engine_info("default engine");
+    let mut txn =
+        load_and_begin_transaction(table_url.clone(), &engine)?.with_engine_info("default engine");
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
     // These are microseconds since Unix epoch
@@ -1186,8 +1186,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?
-        .with_data_change(true);
+    let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?.with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -1396,8 +1395,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     )
     .await?;
 
-    let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?
-        .with_data_change(true);
+    let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?.with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -1950,8 +1948,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         "Initial snapshot should be version 0"
     );
 
-    let mut txn = begin_transaction(snapshot, &engine)?
-        .with_engine_info("ict test");
+    let mut txn = begin_transaction(snapshot, &engine)?.with_engine_info("ict test");
 
     // Add some data
     generate_and_add_data_file(&mut txn, &engine, schema.clone(), vec![1, 2, 3]).await?;
@@ -1993,8 +1990,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         "Second snapshot should be version 1"
     );
 
-    let mut txn2 = begin_transaction(snapshot2, &engine)?
-        .with_engine_info("ict test 2");
+    let mut txn2 = begin_transaction(snapshot2, &engine)?.with_engine_info("ict test 2");
 
     // Add more data
     generate_and_add_data_file(&mut txn2, &engine, schema, vec![4, 5, 6]).await?;
@@ -2896,8 +2892,8 @@ async fn write_data_to_table(
     schema: SchemaRef,
     values: Vec<i32>,
 ) -> Result<Version, Box<dyn std::error::Error>> {
-    let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
-        .with_engine_info("test");
+    let mut txn =
+        load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_engine_info("test");
 
     add_files_to_transaction(&mut txn, engine, schema, values).await?;
 
@@ -3096,8 +3092,8 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
     for i in 1..11 {
         let base_version = current_snapshot.version();
 
-        let txn = begin_transaction(current_snapshot.clone(), engine.as_ref())?
-            .with_engine_info("test");
+        let txn =
+            begin_transaction(current_snapshot.clone(), engine.as_ref())?.with_engine_info("test");
 
         match txn.commit(engine.as_ref())? {
             CommitResult::CommittedTransaction(committed) => {
