@@ -568,6 +568,8 @@ impl Snapshot {
     ///
     /// # Returns
     /// A [`LogCompactionWriter`] that can be used to generate the compaction file.
+    ///
+    /// NOTE: This method is currently a no-op because log compaction is disabled (#2337)
     pub fn log_compaction_writer(
         self: Arc<Self>,
         start_version: Version,
@@ -1971,6 +1973,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "log compaction disabled (#2337)"]
     fn test_log_compaction_writer() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
@@ -1994,6 +1997,20 @@ mod tests {
         // Test equal version range (also invalid)
         let result = snapshot.log_compaction_writer(1, 1);
         assert_result_error_with_message(result, "Invalid version range");
+    }
+
+    // TODO(#2337): remove this test when log compaction is re-enabled.
+    #[test]
+    fn test_log_compaction_writer_unsupported() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+        let result = snapshot.log_compaction_writer(0, 1);
+        assert_result_error_with_message(result, "not currently supported");
     }
 
     #[tokio::test]
@@ -2728,10 +2745,84 @@ mod tests {
 
         Ok(())
     }
+
+    // TODO(#2337): remove this test when log compaction is re-enabled.
+    #[tokio::test]
+    async fn test_compaction_files_ignored_on_read() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+        // Create commits 0-2 and write compaction files to storage
+        setup_test_table_with_commits(table_root, &store, 3).await?;
+        write_compaction_file(&store, 0, 1).await?;
+        write_compaction_file(&store, 0, 2).await?;
+
+        // Compaction files exist on disk but should be skipped during listing
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        assert!(
+            snapshot
+                .log_segment
+                .listed
+                .ascending_compaction_files
+                .is_empty(),
+            "Compaction files should be ignored when log compaction is disabled"
+        );
+
+        Ok(())
+    }
+
+    // TODO(#2337): remove this test when log compaction is re-enabled.
+    #[tokio::test]
+    async fn test_incremental_snapshot_ignores_compaction_files() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+        // Create commits 0-2 with compaction files in storage
+        setup_test_table_with_commits(table_root, &store, 3).await?;
+        write_compaction_file(&store, 0, 1).await?;
+        write_compaction_file(&store, 0, 2).await?;
+
+        // Build base snapshot at v2
+        let snapshot_v2 = Snapshot::builder_for(table_root)
+            .at_version(2)
+            .build(&engine)?;
+        assert_eq!(snapshot_v2.version(), 2);
+        assert!(snapshot_v2
+            .log_segment
+            .listed
+            .ascending_compaction_files
+            .is_empty());
+
+        // Add commit 3
+        commit(
+            table_root,
+            &store,
+            3,
+            vec![json!({"add": {"path": "file4.parquet", "partitionValues": {}, "size": 400, "modificationTime": 4000, "dataChange": true}})],
+        )
+        .await;
+
+        // Build v3 incrementally -- compaction files should still be skipped
+        let snapshot_v3 = Snapshot::builder_from(snapshot_v2)
+            .at_version(3)
+            .build(&engine)?;
+        assert_eq!(snapshot_v3.version(), 3);
+        assert!(snapshot_v3
+            .log_segment
+            .listed
+            .ascending_compaction_files
+            .is_empty());
+
+        Ok(())
+    }
+
     /// The incremental snapshot path (try_new_from_impl) re-lists files from the checkpoint
     /// version onwards. We must ensure that it deduplicates compaction files, since producing
     /// duplicates violated the sort invariant in LogSegmentFilesBuilder::build().
     #[tokio::test]
+    #[ignore = "log compaction disabled (#2337)"]
     async fn test_incremental_snapshot_with_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
@@ -2787,6 +2878,7 @@ mod tests {
     /// added after building the base snapshot at v2 gets filtered out because its start version
     /// (1) <= old_version (2).
     #[tokio::test]
+    #[ignore = "log compaction disabled (#2337)"]
     async fn test_incremental_snapshot_with_new_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
