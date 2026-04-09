@@ -874,30 +874,41 @@ impl TestTableBuilder {
     ///   feature.
     pub fn all_tables(required: FeatureSet) -> DeltaResult<Vec<TestTable>> {
         let total_versions = 3;
-        let mut tables = Vec::new();
-        for log_state in LogState::all(total_versions) {
-            let needs_v2 = matches!(log_state, LogState::CheckpointV2 { .. });
-            let needs_v1 = matches!(
-                log_state,
-                LogState::CheckpointV1 { .. } | LogState::CheckpointAndCommits { .. }
-            );
-            for base_features in FeatureSet::common() {
-                let features = base_features.merge(&required);
-                if needs_v2 && !features.has_v2_checkpoint() {
-                    continue;
+        // Share a single runtime across all table builds to avoid startup overhead.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+                let mut tables = Vec::new();
+                for log_state in LogState::all(total_versions) {
+                    let needs_v2 = matches!(log_state, LogState::CheckpointV2 { .. });
+                    let needs_v1 = matches!(
+                        log_state,
+                        LogState::CheckpointV1 { .. } | LogState::CheckpointAndCommits { .. }
+                    );
+                    for base_features in FeatureSet::common() {
+                        let features = base_features.merge(&required);
+                        if needs_v2 && !features.has_v2_checkpoint() {
+                            continue;
+                        }
+                        if needs_v1 && features.has_v2_checkpoint() {
+                            continue;
+                        }
+                        tables.push(
+                            Self::new()
+                                .with_log_state(log_state.clone())
+                                .with_features(features)
+                                .build_with_runtime(&rt)?,
+                        );
+                    }
                 }
-                if needs_v1 && features.has_v2_checkpoint() {
-                    continue;
-                }
-                tables.push(
-                    Self::new()
-                        .with_log_state(log_state.clone())
-                        .with_features(features)
-                        .build()?,
-                );
-            }
-        }
-        Ok(tables)
+                Ok(tables)
+            })
+            .join()
+            .expect("builder thread panicked")
+        })
     }
 
     /// Build the table and return a [`TestTable`] handle to the store.
@@ -911,6 +922,24 @@ impl TestTableBuilder {
     ///   feature (kernel's checkpoint writer dispatches on the feature, so pairing V1 log state
     ///   with the V2 feature would silently produce a V2 file).
     pub fn build(self) -> DeltaResult<TestTable> {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // Multi-thread runtime so `Snapshot::checkpoint` (called below for checkpoint
+                // log states) can `block_in_place` without deadlocking. The single-threaded
+                // `TokioBackgroundExecutor` deadlocks when combined with nested `block_on`
+                // calls from kernel's write path.
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+                self.build_with_runtime(&rt)
+            })
+            .join()
+            .expect("builder thread panicked")
+        })
+    }
+
+    fn build_with_runtime(self, rt: &tokio::runtime::Runtime) -> DeltaResult<TestTable> {
         let has_v2 = self.features.has_v2_checkpoint();
         match self.log_state {
             LogState::CheckpointV2 { .. } if !has_v2 => {
@@ -926,32 +955,19 @@ impl TestTableBuilder {
             }
             _ => {}
         }
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                // Use a multi-threaded runtime so `Snapshot::checkpoint` (called below
-                // for checkpoint log states) can `block_in_place` without deadlocking.
-                // `TokioBackgroundExecutor` routes block_on through a single-threaded
-                // background runtime and deadlocks when combined with nested `block_on`
-                // calls from kernel's write path.
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
-                let handle = runtime.handle().clone();
-                runtime.block_on(self.build_async(handle))
-            })
-            .join()
-            .expect("builder thread panicked")
-        })
+        rt.block_on(self.build_async())
     }
 
-    async fn build_async(self, handle: tokio::runtime::Handle) -> DeltaResult<TestTable> {
+    async fn build_async(self) -> DeltaResult<TestTable> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let executor = Arc::new(TokioMultiThreadExecutor::new(handle));
+        // Use TokioMultiThreadExecutor with the current runtime handle so all builds
+        // share the same runtime instead of each creating its own.
         let engine = Arc::new(
             DefaultEngineBuilder::new(store.clone())
-                .with_task_executor(executor)
+                .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                    tokio::runtime::Handle::current(),
+                )))
                 .build(),
         );
         let schema = self.schema;
@@ -989,7 +1005,7 @@ impl TestTableBuilder {
         for v in 1..total {
             let result = write_data_commit(
                 snapshot.clone(),
-                &engine,
+                engine.as_ref(),
                 self.num_data_files,
                 self.rows_per_file,
                 &self.partition_columns,
