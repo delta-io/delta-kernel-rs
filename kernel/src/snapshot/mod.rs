@@ -1160,7 +1160,7 @@ mod tests {
 
     use rstest::rstest;
     use serde_json::json;
-    use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
+    use test_utils::table_builder::*;
     use test_utils::{add_commit, delta_path_for_version};
 
     use super::*;
@@ -1373,7 +1373,7 @@ mod tests {
         )]
         feature_set: FeatureSet,
     ) {
-        let table = test_utils::table_builder::table(log_state, feature_set);
+        let table = test_utils::table_builder::test_table(log_state, feature_set);
         let engine = DefaultEngineBuilder::new(table.store().clone()).build();
         let base = Snapshot::builder_for(table.table_root())
             .at_version(0)
@@ -1607,8 +1607,8 @@ mod tests {
         features: FeatureSet,
     ) -> DeltaResult<()> {
         let table = TestTableBuilder::new()
-            .log_state(LogState::with_crc(0, 2))
-            .features(features)
+            .with_log_state(LogState::with_crc(0, 2))
+            .with_features(features)
             .build()
             .map_err(|e| Error::generic(e.to_string()))?;
         let engine = DefaultEngineBuilder::new(table.store().clone()).build();
@@ -1962,24 +1962,47 @@ mod tests {
         assert_result_error_with_message(result, "not currently supported");
     }
 
-    #[tokio::test]
-    async fn test_timestamp_with_ict_disabled() -> Result<(), Box<dyn std::error::Error>> {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory://test/";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+    #[rstest::rstest]
+    fn test_ict_enabled_across_all_configs(
+        #[values(
+            LogState::with_commits(3),
+            LogState::checkpoint_v1(2, 3),
+            LogState::checkpoint_v2(2, 3),
+            LogState::checkpoint_and_commits(2, 1),
+            LogState::with_crc(0, 3)
+        )]
+        log_state: LogState,
+        #[values(
+            FeatureSet::new().ict(),
+            FeatureSet::new().column_mapping("name").ict()
+        )]
+        feature_set: FeatureSet,
+        #[values(
+            VersionTarget::Latest,
+            VersionTarget::IncrementalToLatest { from: 0 }
+        )]
+        version_target: VersionTarget,
+    ) {
+        let (engine, snap, _table) =
+            test_utils::test_context!(log_state, feature_set, version_target);
+        assert!(snap.get_in_commit_timestamp(&engine).unwrap().is_some());
+    }
 
-        // Create a basic commit without ICT enabled
-        let commit0 = create_basic_commit(false, None);
-        add_commit(table_root, store.as_ref(), 0, commit0).await?;
-
-        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-
-        // When ICT is disabled, get_timestamp should return None
-        let result = snapshot.get_in_commit_timestamp(&engine)?;
-        assert_eq!(result, None);
-
+    #[test]
+    fn test_ict_disabled_returns_none() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_commits(2))
+            .build()
+            .map_err(|e| Error::generic(e.to_string()))?;
+        let engine = DefaultEngineBuilder::new(table.store().clone()).build();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.get_in_commit_timestamp(&engine)?, None);
         Ok(())
     }
+
+    // Tests that ICT works across the enablement timeline: v0 without ICT,
+    // v1 enables ICT, v2 has ICT timestamp. This requires mid-stream feature
+    // enablement which the builder cannot produce.
 
     #[tokio::test]
     async fn test_timestamp_with_ict_enablement_timeline() -> Result<(), Box<dyn std::error::Error>>
