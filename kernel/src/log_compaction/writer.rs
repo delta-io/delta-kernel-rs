@@ -14,7 +14,7 @@ use crate::{DeltaResult, Engine, Error, SnapshotRef, Version};
 
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.
-/// 
+///
 /// Always returns `false` because log compaction is currently disabled.
 pub fn should_compact(_commit_version: Version, _compaction_interval: Version) -> bool {
     // TODO(#2337): re-enable log compaction once testing is sufficient
