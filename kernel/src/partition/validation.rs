@@ -1,31 +1,54 @@
-//! Step 3: Partition key and type validation.
+//! Partition key and type validation.
 //!
 //! Validates that the connector provided the correct partition column names and value types
-//! before serialization. Called internally by [`Transaction::partitioned_write_context`].
+//! before serialization.
 //!
 //! ```text
-//! Step 1 (serialization):  Scalar::Integer(2024)  -->  "2024"   (partitionValues string)
-//! Step 2 (path encoding):  "2024"                 -->  "2024"   (Hive-style directory name)
-//! Step 3 (THIS MODULE):    Scalar::Integer(2024)  -->  Ok(())   (type/key checks)
+//! Step 1 (THIS MODULE):  {"YEAR": Integer(2024)} --> {"Year": Integer(2024)}
+//!                         (case-normalize keys, check types against schema)
+//! Step 2 (serialization): Integer(2024) --> "2024"
+//! Step 3 (path encoding): "Year=2024/"
 //! ```
 //!
 //! See the encoding tables in the [`super`] module for the full set of partition-eligible
 //! types and their expected serializations.
 //!
-//! - [`validate_partition_keys`]: checks key completeness (case-insensitive matching,
-//!   normalizes to schema case, detects post-normalization duplicates).
-//! - [`validate_partition_value_types`]: checks that each `Scalar`'s type matches the
-//!   partition column's schema type. Null scalars skip the type check.
+//! The primary entry point is [`validate_partition_values`], which combines key validation
+//! and type checking. The two phases are also exposed individually for testing:
 //!
-//! [`Transaction::partitioned_write_context`]: crate::transaction::Transaction::partitioned_write_context
+//! - [`validate_keys`]: checks key completeness (case-insensitive matching,
+//!   normalizes to schema case, detects post-normalization duplicates).
+//! - [`validate_types`]: checks that each `Scalar`'s type matches the
+//!   partition column's schema type. Null scalars skip the type check.
 
 #![allow(dead_code)] // callers are in a later PR in the stack
 
 use std::collections::HashMap;
 
 use crate::expressions::Scalar;
-use crate::schema::StructType;
+use crate::schema::{DataType, StructType};
 use crate::{DeltaResult, Error};
+
+/// Validates and normalizes partition keys and value types against the table schema.
+/// Returns the map re-keyed to schema case.
+///
+/// This is the primary entry point for partition validation. It combines [`validate_keys`]
+/// (key completeness and case normalization) with [`validate_types`] (scalar type checking).
+///
+/// # Parameters
+/// - `logical_partition_columns`: logical partition column names from kernel's table metadata.
+/// - `logical_schema`: the table's logical schema.
+/// - `logical_partition_values`: connector-provided map from logical column names (any
+///   case) to typed values.
+pub(crate) fn validate_partition_values(
+    logical_partition_columns: &[String],
+    logical_schema: &StructType,
+    logical_partition_values: HashMap<String, Scalar>,
+) -> DeltaResult<HashMap<String, Scalar>> {
+    let normalized = validate_keys(logical_partition_columns, logical_partition_values)?;
+    validate_types(logical_schema, &normalized)?;
+    Ok(normalized)
+}
 
 /// Validates that a connector-provided partition value map contains exactly the expected
 /// partition columns, with case-insensitive key matching. Returns the map re-keyed to
@@ -44,7 +67,7 @@ use crate::{DeltaResult, Error};
 /// - A partition column is missing from the map
 /// - An extra key is present that is not a partition column
 /// - Two keys collide after case normalization (e.g., "COL" and "col" both provided)
-pub(crate) fn validate_partition_keys(
+fn validate_keys(
     logical_partition_columns: &[String],
     logical_partition_values: HashMap<String, Scalar>,
 ) -> DeltaResult<HashMap<String, Scalar>> {
@@ -57,14 +80,14 @@ pub(crate) fn validate_partition_keys(
     for (key, value) in logical_partition_values {
         let lower_key = key.to_lowercase();
         let schema_name = schema_lookup.get(&lower_key).ok_or_else(|| {
-            Error::generic(format!(
+            Error::invalid_partition_values(format!(
                 "unknown partition column '{key}'. Expected one of: [{}]",
                 logical_partition_columns.join(", ")
             ))
         })?;
         // Detect post-normalization duplicates (e.g., "COL" and "col" both provided).
         if normalized.contains_key(*schema_name) {
-            return Err(Error::generic(format!(
+            return Err(Error::invalid_partition_values(format!(
                 "duplicate partition column '{key}' (normalized to same key as a previously provided entry)"
             )));
         }
@@ -73,7 +96,7 @@ pub(crate) fn validate_partition_keys(
 
     for col in logical_partition_columns {
         if !normalized.contains_key(col.as_str()) {
-            return Err(Error::generic(format!(
+            return Err(Error::invalid_partition_values(format!(
                 "missing partition column '{col}'. Provided: [{}]",
                 normalized.keys().cloned().collect::<Vec<_>>().join(", ")
             )));
@@ -91,24 +114,38 @@ pub(crate) fn validate_partition_keys(
 /// - `logical_schema`: the table's logical schema.
 /// - `logical_partition_values`: map from logical column names (schema case) to typed
 ///   values. Keys must use the exact logical names from the schema, as returned by
-///   [`validate_partition_keys`]. This function uses case-sensitive schema lookup.
-pub(crate) fn validate_partition_value_types(
+///   [`validate_keys`]. This function uses case-sensitive schema lookup.
+///
+/// # Errors
+/// - A partition column is not found in the table schema
+/// - A partition column's schema type is not a primitive (struct, array, map are rejected)
+/// - A non-null value's type does not match the partition column's schema type
+fn validate_types(
     logical_schema: &StructType,
     logical_partition_values: &HashMap<String, Scalar>,
 ) -> DeltaResult<()> {
     for (col_name, value) in logical_partition_values {
-        if value.is_null() {
-            continue;
-        }
         let field = logical_schema.field(col_name).ok_or_else(|| {
-            Error::generic(format!(
+            Error::invalid_partition_values(format!(
                 "partition column '{col_name}' not found in table schema"
             ))
         })?;
         let expected_type = field.data_type();
+        if matches!(
+            expected_type,
+            DataType::Struct(_) | DataType::Array(_) | DataType::Map(_)
+        ) {
+            return Err(Error::invalid_partition_values(format!(
+                "partition column '{col_name}' has non-primitive type {expected_type:?}. \
+                 Partition columns must be primitive types."
+            )));
+        }
+        if value.is_null() {
+            continue;
+        }
         let actual_type = value.data_type();
         if *expected_type != actual_type {
-            return Err(Error::generic(format!(
+            return Err(Error::invalid_partition_values(format!(
                 "partition column '{col_name}' has type {expected_type:?} but got \
                  value of type {actual_type:?}"
             )));
@@ -123,9 +160,23 @@ mod tests {
     use rstest::rstest;
 
     use crate::expressions::Scalar;
-    use crate::schema::{DataType, StructField};
+    use crate::schema::{ArrayType, DataType, MapType, StructField};
 
-    // === validate_partition_keys tests ===
+    fn assert_type_ok(data_type: DataType, value: Scalar) {
+        let schema = StructType::new_unchecked(vec![StructField::not_null("p", data_type)]);
+        let values = HashMap::from([("p".to_string(), value)]);
+        validate_types(&schema, &values).unwrap();
+    }
+
+    fn assert_type_err(data_type: DataType, value: Scalar) -> String {
+        let schema = StructType::new_unchecked(vec![StructField::not_null("p", data_type)]);
+        let values = HashMap::from([("p".to_string(), value)]);
+        validate_types(&schema, &values).unwrap_err().to_string()
+    }
+
+    // ============================================================================
+    // validate_keys
+    // ============================================================================
 
     #[test]
     fn test_validate_partition_keys_matching_keys_returns_ok() {
@@ -134,7 +185,7 @@ mod tests {
             ("year".to_string(), Scalar::Integer(2024)),
             ("region".to_string(), Scalar::String("US".into())),
         ]);
-        let result = validate_partition_keys(&cols, values).unwrap();
+        let result = validate_keys(&cols, values).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result.get("year"), Some(&Scalar::Integer(2024)));
         assert_eq!(result.get("region"), Some(&Scalar::String("US".into())));
@@ -144,7 +195,7 @@ mod tests {
     fn test_validate_partition_keys_empty_columns_and_values_returns_ok() {
         let cols: Vec<String> = vec![];
         let values = HashMap::new();
-        let result = validate_partition_keys(&cols, values).unwrap();
+        let result = validate_keys(&cols, values).unwrap();
         assert!(result.is_empty());
     }
 
@@ -152,7 +203,7 @@ mod tests {
     fn test_validate_partition_keys_missing_key_returns_error() {
         let cols = vec!["year".to_string(), "region".to_string()];
         let values = HashMap::from([("year".to_string(), Scalar::Integer(2024))]);
-        let result = validate_partition_keys(&cols, values);
+        let result = validate_keys(&cols, values);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("missing partition column 'region'"), "{err}");
@@ -165,7 +216,7 @@ mod tests {
             ("year".to_string(), Scalar::Integer(2024)),
             ("region".to_string(), Scalar::String("US".into())),
         ]);
-        let result = validate_partition_keys(&cols, values);
+        let result = validate_keys(&cols, values);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("unknown partition column 'region'"), "{err}");
@@ -175,7 +226,7 @@ mod tests {
     fn test_validate_partition_keys_case_normalizes_to_schema_case() {
         let cols = vec!["Year".to_string()];
         let values = HashMap::from([("YEAR".to_string(), Scalar::Integer(2024))]);
-        let result = validate_partition_keys(&cols, values).unwrap();
+        let result = validate_keys(&cols, values).unwrap();
         assert!(result.contains_key("Year"));
         assert!(!result.contains_key("YEAR"));
     }
@@ -187,13 +238,15 @@ mod tests {
             ("COL".to_string(), Scalar::Integer(1)),
             ("col".to_string(), Scalar::Integer(2)),
         ]);
-        let result = validate_partition_keys(&cols, values);
+        let result = validate_keys(&cols, values);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("duplicate"), "{err}");
     }
 
-    // === validate_partition_value_types tests ===
+    // ============================================================================
+    // validate_types
+    // ============================================================================
     //
     // Covers every partition-eligible type from the encoding tables in `partition/mod.rs`.
     // Each row tests that the correct Scalar variant passes type validation against the
@@ -253,9 +306,7 @@ mod tests {
         #[case] data_type: DataType,
         #[case] value: Scalar,
     ) {
-        let schema = StructType::new_unchecked(vec![StructField::not_null("p", data_type)]);
-        let values = HashMap::from([("p".to_string(), value)]);
-        validate_partition_value_types(&schema, &values).unwrap();
+        assert_type_ok(data_type, value);
     }
 
     /// Every non-null row from the "String and binary encoding" table in
@@ -288,9 +339,7 @@ mod tests {
         #[case] data_type: DataType,
         #[case] value: Scalar,
     ) {
-        let schema = StructType::new_unchecked(vec![StructField::not_null("p", data_type)]);
-        let values = HashMap::from([("p".to_string(), value)]);
-        validate_partition_value_types(&schema, &values).unwrap();
+        assert_type_ok(data_type, value);
     }
 
     /// NULL rows from the encoding table. Null is valid for every partition column type,
@@ -310,9 +359,7 @@ mod tests {
     #[case(DataType::STRING, Scalar::Null(DataType::STRING))] // row 66
     #[case(DataType::BINARY, Scalar::Null(DataType::BINARY))] // (binary NULL)
     fn test_validate_types_null_returns_ok(#[case] data_type: DataType, #[case] value: Scalar) {
-        let schema = StructType::new_unchecked(vec![StructField::not_null("p", data_type)]);
-        let values = HashMap::from([("p".to_string(), value)]);
-        validate_partition_value_types(&schema, &values).unwrap();
+        assert_type_ok(data_type, value);
     }
 
     /// Null skips the type check even when the Scalar::Null inner type does not match
@@ -320,9 +367,7 @@ mod tests {
     /// column regardless of what type the Null carries.
     #[test]
     fn test_validate_types_null_with_mismatched_inner_type_returns_ok() {
-        let schema = StructType::new_unchecked(vec![StructField::not_null("p", DataType::INTEGER)]);
-        let values = HashMap::from([("p".to_string(), Scalar::Null(DataType::STRING))]);
-        validate_partition_value_types(&schema, &values).unwrap();
+        assert_type_ok(DataType::INTEGER, Scalar::Null(DataType::STRING));
     }
 
     /// Type mismatch: every non-null Scalar variant against the wrong schema type.
@@ -342,12 +387,32 @@ mod tests {
         #[case] data_type: DataType,
         #[case] value: Scalar,
     ) {
-        let schema = StructType::new_unchecked(vec![StructField::not_null("p", data_type)]);
-        let values = HashMap::from([("p".to_string(), value)]);
-        let result = validate_partition_value_types(&schema, &values);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = assert_type_err(data_type, value);
         assert!(err.contains("p"), "{err}");
+    }
+
+    /// Complex types (struct, array, map) are rejected as partition column types.
+    #[rstest]
+    #[case(
+        DataType::Struct(Box::new(StructType::new_unchecked(vec![
+            StructField::not_null("x", DataType::INTEGER),
+        ]))),
+        Scalar::Null(DataType::STRING)
+    )]
+    #[case(
+        DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
+        Scalar::Null(DataType::STRING)
+    )]
+    #[case(
+        DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::INTEGER, false))),
+        Scalar::Null(DataType::STRING)
+    )]
+    fn test_validate_types_complex_type_returns_error(
+        #[case] data_type: DataType,
+        #[case] value: Scalar,
+    ) {
+        let err = assert_type_err(data_type, value);
+        assert!(err.contains("non-primitive type"), "{err}");
     }
 
     #[test]
@@ -355,16 +420,15 @@ mod tests {
         let schema =
             StructType::new_unchecked(vec![StructField::not_null("year", DataType::INTEGER)]);
         let values = HashMap::from([("nonexistent".to_string(), Scalar::Integer(42))]);
-        let result = validate_partition_value_types(&schema, &values);
+        let result = validate_types(&schema, &values);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not found in table schema"), "{err}");
     }
 
-    /// Composed usage: validate_partition_keys normalizes keys to schema case, then
-    /// validate_partition_value_types succeeds with the normalized keys.
+    /// validate_partition_values normalizes keys to schema case and type-checks in one call.
     #[test]
-    fn test_validate_keys_then_types_with_case_mismatch_succeeds() {
+    fn test_validate_partition_values_with_case_mismatch_succeeds() {
         let partition_cols = vec!["Year".to_string(), "Region".to_string()];
         let schema = StructType::new_unchecked(vec![
             StructField::not_null("id", DataType::INTEGER),
@@ -375,7 +439,8 @@ mod tests {
             ("YEAR".to_string(), Scalar::Integer(2024)),
             ("region".to_string(), Scalar::String("US".into())),
         ]);
-        let normalized = validate_partition_keys(&partition_cols, values).unwrap();
-        validate_partition_value_types(&schema, &normalized).unwrap();
+        let result = validate_partition_values(&partition_cols, &schema, values).unwrap();
+        assert_eq!(result.get("Year"), Some(&Scalar::Integer(2024)));
+        assert_eq!(result.get("Region"), Some(&Scalar::String("US".into())));
     }
 }
