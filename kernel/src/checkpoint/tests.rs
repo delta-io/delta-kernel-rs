@@ -16,14 +16,15 @@ use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngineBuilder;
 use crate::log_replay::HasSelectionVector;
 use crate::object_store::local::LocalFileSystem;
-use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
+use crate::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
+use crate::transaction::create_table::create_table;
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 use serde_json::{from_slice, json, Value};
 use tempfile::tempdir;
-use test_utils::delta_path_for_version;
+use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
 use url::Url;
 
 #[rstest::rstest]
@@ -185,13 +186,22 @@ fn create_basic_protocol_action() -> Action {
     )
 }
 
+/// Create a Protocol action with catalogManaged feature support. Per the Delta protocol,
+/// catalogManaged depends on inCommitTimestamp.
+fn create_catalog_managed_protocol_action() -> Action {
+    Action::Protocol(
+        Protocol::try_new_modern(["catalogManaged"], ["catalogManaged", "inCommitTimestamp"])
+            .unwrap(),
+    )
+}
+
 /// Create a Protocol action with v2Checkpoint feature support
 fn create_v2_checkpoint_protocol_action() -> Action {
     Action::Protocol(Protocol::try_new_modern(vec!["v2Checkpoint"], vec!["v2Checkpoint"]).unwrap())
 }
 
-/// Create a Metadata action
-fn create_metadata_action() -> Action {
+/// Create a Metadata action with the given table configuration.
+fn create_metadata_action_with_config(configuration: HashMap<String, String>) -> Action {
     Action::Metadata(
         Metadata::try_new(
             Some("test-table".into()),
@@ -202,10 +212,15 @@ fn create_metadata_action() -> Action {
             )])),
             vec![],
             0,
-            HashMap::new(),
+            configuration,
         )
         .unwrap(),
     )
+}
+
+/// Create a Metadata action with no configuration.
+fn create_metadata_action() -> Action {
+    create_metadata_action_with_config(HashMap::new())
 }
 
 /// Create a simple Add action with the specified path (no stats)
@@ -526,10 +541,16 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
-    // normal commit
+    // normal commit with catalog-managed protocol
     write_commit_to_store(
         &store,
-        vec![create_metadata_action(), create_basic_protocol_action()],
+        vec![
+            create_metadata_action_with_config(HashMap::from([(
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            )])),
+            create_catalog_managed_protocol_action(),
+        ],
         0,
     )
     .await?;
@@ -555,6 +576,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
     };
     let snapshot = Snapshot::builder_for(table_root.clone())
         .with_log_tail(vec![LogPath::try_new(staged_commit).unwrap()])
+        .with_max_catalog_version(1)
         .build(&engine)?;
 
     assert!(matches!(
@@ -756,6 +778,70 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
     assert_eq!(domain_value, Some("bar2".to_string()));
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer() -> DeltaResult<()>
+{
+    let (store, _) = new_in_memory_store();
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_task_executor(executor)
+        .build();
+
+    let table_root = Url::parse("memory:///")?;
+    let _ = create_table(
+        table_root.as_str(),
+        Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            KernelDataType::INTEGER,
+        )])),
+        "test",
+    )
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?;
+
+    // Version 1
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        1,
+        actions_to_string(vec![TestAction::Add("file1.parquet".to_string())]),
+    )
+    .await
+    .map_err(|err| crate::Error::generic(err.to_string()))?;
+
+    // Version 2
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        2,
+        actions_to_string(vec![TestAction::Add("file2.parquet".to_string())]),
+    )
+    .await
+    .map_err(|err| crate::Error::generic(err.to_string()))?;
+
+    // Checkpoint at version 2
+    let snapshot_v2 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    assert_eq!(snapshot_v2.version(), 2);
+    snapshot_v2.checkpoint(&engine)?;
+    let last_checkpoint = read_last_checkpoint_file(&store).await?;
+    let size_in_bytes = last_checkpoint
+        .get("sizeInBytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            crate::Error::generic("missing or invalid sizeInBytes in _last_checkpoint")
+        })?;
+    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await?;
+
+    // Time-travel to version 1 and writing a checkpoint should not override _last_checkpoint
+    let snapshot_v1 = Snapshot::builder_for(table_root)
+        .at_version(1)
+        .build(&engine)?;
+    snapshot_v1.checkpoint(&engine)?;
+    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await
 }
 
 // TODO: Add test that checkpoint does not contain tombstoned domain metadata.

@@ -187,7 +187,10 @@ mod tests {
             .commit(&engine)
             .unwrap();
 
-        let snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(table_path)
+            .with_max_catalog_version(0)
+            .build(&engine)
+            .unwrap();
         assert_eq!(snapshot.version(), 0);
         let uc_props = get_final_required_properties_for_uc(&snapshot, &engine).unwrap();
 
@@ -252,7 +255,10 @@ mod tests {
             .commit(&engine)
             .unwrap();
 
-        let snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(table_path)
+            .with_max_catalog_version(0)
+            .build(&engine)
+            .unwrap();
         let uc_props = get_final_required_properties_for_uc(&snapshot, &engine).unwrap();
 
         // Clustering columns serialized as array of path arrays:
@@ -283,7 +289,10 @@ mod tests {
             .unwrap()
             .commit(&engine)
             .unwrap();
-        let v0_snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
+        let v0_snapshot = Snapshot::builder_for(table_path)
+            .with_max_catalog_version(0)
+            .build(&engine)
+            .unwrap();
         let result = v0_snapshot
             .transaction(Box::new(MockCatalogCommitter), &engine)
             .unwrap()
@@ -292,7 +301,10 @@ mod tests {
         assert!(result.is_committed());
 
         // Load snapshot at version 1
-        let snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(table_path)
+            .with_max_catalog_version(1)
+            .build(&engine)
+            .unwrap();
         assert_eq!(snapshot.version(), 1);
 
         // Should fail because version != 0
