@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use url::Url;
 
+use rand::Rng;
+
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::expressions::{ColumnName, ExpressionRef};
 use crate::partition::build_partition_path;
@@ -52,8 +54,65 @@ pub struct WriteContext {
 
 impl WriteContext {
     /// Returns the table root URL.
-    pub fn target_dir(&self) -> &Url {
+    pub fn table_root_dir(&self) -> &Url {
         &self.shared.target_dir
+    }
+
+    /// Returns the recommended target directory where data files for this partition should be
+    /// written. Data files can technically live under any path within the table root, but using
+    /// this method produces the conventional directory layout that other engines expect.
+    ///
+    /// The directory structure depends on the table's column mapping mode:
+    ///
+    /// | | Not Partitioned | Partitioned |
+    /// |---|---|---|
+    /// | **CM OFF** | `<table_root>/` | `<table_root>/col=val/.../` |
+    /// | **CM ON** | `<table_root>/<2char>/` | `<table_root>/<2char>/` |
+    ///
+    /// With column mapping OFF and partitioned tables, the path uses **logical** column names
+    /// and Hive-style encoding (matching Delta-Spark). With column mapping ON, a random 2-character
+    /// alphanumeric prefix is used unconditionally (matching Delta-Spark's
+    /// `getRandomPrefix`). Column mapping forces random prefixes to avoid S3 hotspots and
+    /// to prevent leaking physical UUID column names into directory paths.
+    ///
+    /// Each call generates a fresh random prefix when column mapping is enabled, matching
+    /// Delta-Spark's per-file prefix behavior. The engine appends the filename (e.g.,
+    /// `<uuid>.parquet`) to this directory to form the full file path.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// // CM OFF, partitioned: year=2024, region=US
+    /// write_dir() -> "s3://bucket/table/year=2024/region=US/"
+    ///
+    /// // CM OFF, not partitioned
+    /// write_dir() -> "s3://bucket/table/"
+    ///
+    /// // CM ON (partitioned or not)
+    /// write_dir() -> "s3://bucket/table/3v/"
+    /// ```
+    // TODO(#2357): respect `delta.randomizeFilePrefixes` and `delta.randomPrefixLength`
+    // table properties. Currently random prefixes are only used when column mapping is on.
+    pub fn write_dir(&self) -> Url {
+        let mut url = self.shared.target_dir.clone();
+        match self.shared.column_mapping_mode {
+            ColumnMappingMode::None => {
+                // No column mapping: use Hive-style partition directories for partitioned
+                // tables, or just the table root for unpartitioned tables.
+                if !self.shared.logical_partition_columns.is_empty() {
+                    let path_suffix = self.hive_partition_path_suffix();
+                    url.set_path(&format!("{}{}", url.path(), path_suffix));
+                }
+            }
+            ColumnMappingMode::Id | ColumnMappingMode::Name => {
+                // Column mapping ON: use a random 2-char alphanumeric prefix (matching
+                // Delta-Spark's getRandomPrefix). This avoids S3 hotspots and prevents leaking
+                // physical UUID column names into directory paths.
+                let prefix = random_alphanumeric_prefix();
+                url.set_path(&format!("{}{}/", url.path(), prefix));
+            }
+        }
+        url
     }
 
     /// Returns the logical (user-facing) table schema. Connectors use this to determine
@@ -92,78 +151,25 @@ impl WriteContext {
         &self.physical_partition_values
     }
 
-    /// Returns the recommended target directory where data files for this partition should be
-    /// written. Data files can technically live under any path within the table root, but using
-    /// this method produces the conventional directory layout that other engines expect.
-    ///
-    /// The directory structure depends on the table's column mapping mode:
-    ///
-    /// | | Not Partitioned | Partitioned |
-    /// |---|---|---|
-    /// | **CM OFF** | `<table_root>/` | `<table_root>/col=val/.../` |
-    /// | **CM ON** | `<table_root>/<2char>/` | `<table_root>/<2char>/` |
-    ///
-    /// With column mapping OFF and partitioned tables, the path uses **logical** column names
-    /// and Hive-style encoding (matching Delta-Spark). With column mapping ON, a random 2-character
-    /// alphanumeric prefix is used unconditionally (matching Delta-Spark's
-    /// `getRandomPrefix`). Column mapping forces random prefixes to avoid S3 hotspots and
-    /// to prevent leaking physical UUID column names into directory paths.
-    ///
-    /// The engine appends the filename (e.g., `<uuid>.parquet`) to this directory to form
-    /// the full file path.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// // CM OFF, partitioned: year=2024, region=US
-    /// write_dir() -> "s3://bucket/table/year=2024/region=US/"
-    ///
-    /// // CM OFF, not partitioned
-    /// write_dir() -> "s3://bucket/table/"
-    ///
-    /// // CM ON (partitioned or not)
-    /// write_dir() -> "s3://bucket/table/3v/"
-    /// ```
-    pub fn write_dir(&self) -> Url {
-        let mut url = self.shared.target_dir.clone();
-        match self.shared.column_mapping_mode {
-            ColumnMappingMode::None => {
-                // No column mapping: use Hive-style partition directories for partitioned
-                // tables, or just the table root for unpartitioned tables.
-                if !self.shared.logical_partition_columns.is_empty() {
-                    let path_suffix = self.hive_partition_path_suffix();
-                    url.set_path(&format!("{}{}", url.path(), path_suffix));
-                }
-            }
-            ColumnMappingMode::Id | ColumnMappingMode::Name => {
-                // Column mapping ON: use a random 2-char alphanumeric prefix (matching
-                // Delta-Spark's getRandomPrefix). This avoids S3 hotspots and prevents leaking
-                // physical UUID column names into directory paths.
-                let prefix = random_alphanumeric_prefix();
-                url.set_path(&format!("{}{}/", url.path(), prefix));
-            }
-        }
-        url
-    }
-
     /// Builds the Hive-style partition path suffix (e.g., `year=2024/region=US/`).
-    /// Should only be used when column mapping is OFF. Uses logical column names for path segments
-    /// and looks up serialized values by physical key.
+    /// Only called when column mapping is OFF, where physical name == logical name, so
+    /// the same name is used both as the path segment and the partition values map key.
     fn hive_partition_path_suffix(&self) -> String {
+        debug_assert!(
+            self.shared.column_mapping_mode == ColumnMappingMode::None,
+            "Hive-style paths should only be used when column mapping is OFF"
+        );
         let columns: Vec<(&str, Option<&str>)> = self
             .shared
             .logical_partition_columns
             .iter()
             .map(|logical_name| {
-                // physical_partition_values is keyed by physical name (for
-                // AddFile.partitionValues), but hive-style paths use logical column names.
-                let field = self.shared.logical_schema.field(logical_name);
-                let physical_name = field
-                    .map(|f| f.physical_name(self.shared.column_mapping_mode))
-                    .unwrap_or(logical_name.as_str());
+                // CM is None, so physical == logical. Use the logical name as both the
+                // directory name (e.g. "year" in "year=2024/") and the key into
+                // physical_partition_values.
                 let value = self
                     .physical_partition_values
-                    .get(physical_name)
+                    .get(logical_name.as_str())
                     .and_then(|v| v.as_deref());
                 (logical_name.as_str(), value)
             })
@@ -189,6 +195,9 @@ impl WriteContext {
     /// let write_context = transaction.unpartitioned_write_context()?;
     /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
     /// ```
+    // TODO(#2357): generate the random prefix internally based on table properties
+    // (delta.randomizeFilePrefixes / delta.randomPrefixLength) instead of requiring the
+    // caller to pass it. Connectors that need custom paths can use table_root_dir() directly.
     pub fn new_deletion_vector_path(&self, random_prefix: String) -> DeletionVectorPath {
         DeletionVectorPath::new(self.shared.target_dir.clone(), random_prefix)
     }
@@ -198,7 +207,6 @@ impl WriteContext {
 /// Delta-Spark's `Utils.getRandomPrefix` (`Random.alphanumeric.take(2)`). Used when column mapping
 /// is enabled to avoid S3 hotspots and prevent leaking physical UUID column names into paths.
 fn random_alphanumeric_prefix() -> String {
-    use rand::Rng;
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::rng();
     (0..2)
