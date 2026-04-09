@@ -63,7 +63,7 @@ impl SidecarSplitter {
         checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
         checkpoint_data_schema: SchemaRef,
-    ) -> DeltaResult<Arc<Mutex<Self>>> {
+    ) -> DeltaResult<Self> {
         // Derive sidecar output schema from the checkpoint data schema (add + remove only).
         let add_field = checkpoint_data_schema.field(ADD_NAME).ok_or_else(|| {
             Error::checkpoint_write(format!("Checkpoint data schema missing '{ADD_NAME}' field"))
@@ -89,13 +89,10 @@ impl SidecarSplitter {
         // Sidecar projector: select only add/remove columns.
         let file_action = eval_handler.new_expression_evaluator(
             checkpoint_data_schema.clone(),
-            Arc::new(Expression::Struct(
-                vec![
-                    Arc::new(Expression::column([ADD_NAME])),
-                    Arc::new(Expression::column([REMOVE_NAME])),
-                ],
-                None,
-            )),
+            Arc::new(Expression::struct_from([
+                Expression::column([ADD_NAME]),
+                Expression::column([REMOVE_NAME]),
+            ])),
             sidecar_output_schema.clone().into(),
         )?;
 
@@ -142,7 +139,7 @@ impl SidecarSplitter {
             eval_handler.new_predicate_evaluator(checkpoint_data_schema, Arc::new(predicate))?
         };
 
-        Ok(Arc::new(Mutex::new(Self {
+        Ok(Self {
             checkpoint_data_iter: checkpoint_data_iterator,
             file_actions_picker: ColumnPicker {
                 projector: file_action,
@@ -154,22 +151,37 @@ impl SidecarSplitter {
             },
             non_file_batches: Vec::new(),
             exhausted: false,
-        })))
+        })
+    }
+
+    /// Creates a new `SidecarSplitter` wrapped in `Arc<Mutex<_>>` for
+    /// shared mutable access.
+    pub(super) fn new_mut_shared(
+        checkpoint_data_iterator: ActionReconciliationIterator,
+        eval_handler: &dyn EvaluationHandler,
+        checkpoint_data_schema: SchemaRef,
+    ) -> DeltaResult<Arc<Mutex<Self>>> {
+        Self::new(
+            checkpoint_data_iterator,
+            eval_handler,
+            checkpoint_data_schema,
+        )
+        .map(|s| Arc::new(Mutex::new(s)))
     }
 
     pub(super) fn is_exhausted(&self) -> bool {
         self.exhausted
     }
 
-    /// Drain the buffered non-file-action batches.
-    pub(super) fn take_non_file_batches(&mut self) -> Vec<Box<dyn EngineData>> {
-        std::mem::take(&mut self.non_file_batches)
+    /// Consume the splitter and return the buffered non-file-action batches.
+    pub(super) fn into_non_file_batches(self) -> Vec<Box<dyn EngineData>> {
+        self.non_file_batches
     }
 
-    /// Pull the next batch from the inner iterator, split it into file / non-file parts.
-    /// Buffers the non-file part; returns the next non-empty file batch.
+    /// Pull the next batch from the inner iterator, split it into file-action and non-file-action
+    /// parts. Buffers the non-file-action part; returns the next non-empty file-action batch.
     /// Returns `None` and sets `exhausted` when the inner iterator is exhausted.
-    fn next_batch(&mut self) -> Option<DeltaResult<Box<dyn EngineData>>> {
+    fn next_file_actions_batch(&mut self) -> Option<DeltaResult<Box<dyn EngineData>>> {
         loop {
             let result = self.checkpoint_data_iter.next().or_else(|| {
                 self.exhausted = true;
@@ -179,15 +191,15 @@ impl SidecarSplitter {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),
             };
-            let non_file_batch = match self.non_file_actions_picker.pick(batch.as_ref()) {
+            let non_file_actions_batch = match self.non_file_actions_picker.pick(batch.as_ref()) {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),
             };
-            if !non_file_batch.is_empty() {
-                self.non_file_batches.push(non_file_batch);
+            if !non_file_actions_batch.is_empty() {
+                self.non_file_batches.push(non_file_actions_batch);
             }
             match self.file_actions_picker.pick(batch.as_ref()) {
-                Ok(file_batch) if file_batch.is_empty() => continue,
+                Ok(file_actions_batch) if file_actions_batch.is_empty() => continue,
                 other => return Some(other),
             }
         }
@@ -230,7 +242,7 @@ impl Iterator for SingleSidecarDataIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.yielded_row_count >= self.max_file_actions_hint {
-            return None; // hint reached -- start a new sidecar
+            return None;
         }
         let mut splitter = match self.splitter.lock() {
             Ok(guard) => guard,
@@ -240,7 +252,7 @@ impl Iterator for SingleSidecarDataIterator {
                 ))))
             }
         };
-        match splitter.next_batch() {
+        match splitter.next_file_actions_batch() {
             Some(Ok(file_batch)) => {
                 self.yielded_row_count += file_batch.len();
                 Some(Ok(file_batch))

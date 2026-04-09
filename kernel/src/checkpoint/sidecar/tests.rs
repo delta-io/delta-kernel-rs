@@ -51,7 +51,7 @@ fn generate_checkpoint_parts(
         .cloned()
         .expect("checkpoint_output_schema should be set by checkpoint_data");
 
-    let splitter = SidecarSplitter::new(
+    let splitter = SidecarSplitter::new_mut_shared(
         data_iter,
         engine.evaluation_handler().as_ref(),
         output_schema,
@@ -78,10 +78,11 @@ fn generate_checkpoint_parts(
         }
     }
 
-    let non_file_batches = splitter
-        .lock()
-        .expect("splitter lock")
-        .take_non_file_batches();
+    let non_file_batches = Arc::into_inner(splitter)
+        .expect("splitter Arc should have no other references")
+        .into_inner()
+        .expect("splitter Mutex should not be poisoned")
+        .into_non_file_batches();
 
     Ok(CheckpointParts {
         sidecar_files,
@@ -98,12 +99,6 @@ fn new_multi_thread_engine(store: Arc<InMemory>) -> impl Engine {
     DefaultEngineBuilder::new(store)
         .with_task_executor(executor)
         .build()
-}
-
-struct NonFileActionSummary {
-    protocol: usize,
-    metadata: usize,
-    checkpoint_metadata: usize,
 }
 
 struct ExpectedNonFileContent<'a> {
@@ -201,16 +196,11 @@ fn struct_field_string<'a>(s: &'a StructArray, field: &str, row: usize) -> &'a s
 /// - Metadata has the expected table name
 /// - CheckpointMetadata has the expected version
 /// - add/remove columns are null in every row
-fn assert_non_file_batches(
-    batches: &[Box<dyn EngineData>],
-    expected: &ExpectedNonFileContent<'_>,
-) -> NonFileActionSummary {
+fn assert_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedNonFileContent<'_>) {
     assert!(!batches.is_empty(), "non-file batches should not be empty");
-    let mut summary = NonFileActionSummary {
-        protocol: 0,
-        metadata: 0,
-        checkpoint_metadata: 0,
-    };
+    let mut protocol_count = 0usize;
+    let mut metadata_count = 0usize;
+    let mut checkpoint_metadata_count = 0usize;
     for batch in batches {
         let arrow = batch
             .as_ref()
@@ -223,7 +213,7 @@ fn assert_non_file_batches(
             if let Some(col) = rb.column_by_name("protocol") {
                 if col.is_valid(row) {
                     has_non_file_action = true;
-                    summary.protocol += 1;
+                    protocol_count += 1;
                     let parent_struct = col.as_struct();
                     let reader_v =
                         struct_field_value::<Int32Type>(parent_struct, "minReaderVersion", row);
@@ -243,7 +233,7 @@ fn assert_non_file_batches(
             if let Some(col) = rb.column_by_name("metaData") {
                 if col.is_valid(row) {
                     has_non_file_action = true;
-                    summary.metadata += 1;
+                    metadata_count += 1;
                     let ms = col.as_struct();
                     assert_eq!(
                         struct_field_string(ms, "name", row),
@@ -256,7 +246,7 @@ fn assert_non_file_batches(
             if let Some(col) = rb.column_by_name("checkpointMetadata") {
                 if col.is_valid(row) {
                     has_non_file_action = true;
-                    summary.checkpoint_metadata += 1;
+                    checkpoint_metadata_count += 1;
                     let cs = col.as_struct();
                     let version = struct_field_value::<Int64Type>(cs, "version", row);
                     assert_eq!(
@@ -285,7 +275,12 @@ fn assert_non_file_batches(
             );
         }
     }
-    summary
+    assert_eq!(protocol_count, 1, "expected exactly 1 protocol action");
+    assert_eq!(metadata_count, 1, "expected exactly 1 metadata action");
+    assert_eq!(
+        checkpoint_metadata_count, 1,
+        "expected exactly 1 checkpointMetadata action"
+    );
 }
 
 /// V2 table with 3 adds + 1 remove, single sidecar.
@@ -327,7 +322,7 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
 
     assert_eq!(result.sidecar_files.len(), 1);
 
-    let summary = assert_non_file_batches(
+    assert_non_file_batches(
         &result.non_file_batches,
         &ExpectedNonFileContent {
             reader_version: 3,
@@ -336,9 +331,6 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
             checkpoint_version: 2,
         },
     );
-    assert_eq!(summary.protocol, 1);
-    assert_eq!(summary.metadata, 1);
-    assert_eq!(summary.checkpoint_metadata, 1);
 
     assert!(result.iter_state.is_exhausted());
 
@@ -420,7 +412,7 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
 
     let total_non_file_rows: usize = result.non_file_batches.iter().map(|b| b.len()).sum();
     assert_eq!(total_non_file_rows, 3); // 1 protocol + 1 metadata + 1 checkpointMetadata
-    let summary = assert_non_file_batches(
+    assert_non_file_batches(
         &result.non_file_batches,
         &ExpectedNonFileContent {
             reader_version: 3,
@@ -429,9 +421,6 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
             checkpoint_version: 3,
         },
     );
-    assert_eq!(summary.protocol, 1);
-    assert_eq!(summary.metadata, 1);
-    assert_eq!(summary.checkpoint_metadata, 1);
 
     assert_eq!(
         result.sidecar_files.len(),
@@ -681,7 +670,7 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
         .cloned()
         .expect("checkpoint_output_schema should be set by checkpoint_data");
 
-    let splitter = SidecarSplitter::new(
+    let splitter = SidecarSplitter::new_mut_shared(
         data_iter,
         engine.evaluation_handler().as_ref(),
         output_schema,
@@ -691,11 +680,14 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
     let total_file_rows: usize = iter.map(|batch| batch.unwrap().len()).sum();
     assert_eq!(total_file_rows, 0, "should have no file-action rows");
 
-    let mut guard = splitter.lock().expect("splitter lock");
-    assert!(guard.is_exhausted());
+    assert!(splitter.lock().expect("splitter lock").is_exhausted());
 
-    let non_file_batches = guard.take_non_file_batches();
-    let summary = assert_non_file_batches(
+    let non_file_batches = Arc::into_inner(splitter)
+        .expect("splitter Arc should have no other references")
+        .into_inner()
+        .expect("splitter Mutex should not be poisoned")
+        .into_non_file_batches();
+    assert_non_file_batches(
         &non_file_batches,
         &ExpectedNonFileContent {
             reader_version: 3,
@@ -704,9 +696,6 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
             checkpoint_version: 0,
         },
     );
-    assert_eq!(summary.protocol, 1);
-    assert_eq!(summary.metadata, 1);
-    assert_eq!(summary.checkpoint_metadata, 1);
 
     Ok(())
 }
@@ -758,7 +747,7 @@ fn test_single_sidecar_data_iterator_rejects_zero_max_file_actions_hint() {
     ])
     .into();
     let iter = ActionReconciliationIterator::new(Box::new(std::iter::empty()));
-    let splitter = SidecarSplitter::new(iter, &ArrowEvaluationHandler, schema).unwrap();
+    let splitter = SidecarSplitter::new_mut_shared(iter, &ArrowEvaluationHandler, schema).unwrap();
     let result = SingleSidecarDataIterator::new(splitter, 0);
     assert!(result.is_err());
     let err = result.err().unwrap();
