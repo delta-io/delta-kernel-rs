@@ -20,7 +20,8 @@ pub struct SharedWriteContext;
 /// Gets the write context from a transaction for an unpartitioned table. The write context
 /// provides schema and path information needed for writing data.
 ///
-/// For partitioned tables, use a partitioned write context instead (not yet exposed via FFI).
+/// For partitioned tables, use a partitioned write context instead.
+/// TODO(#2355): expose partitioned_write_context via FFI.
 ///
 /// # Safety
 ///
