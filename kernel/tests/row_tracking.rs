@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -64,15 +63,11 @@ async fn write_data_to_table(
         .with_data_change(true);
 
     // Write data out by spawning async tasks to simulate executors
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context()?);
     let tasks = data.into_iter().map(|data| {
         let engine = engine.clone();
         let write_context = write_context.clone();
-        tokio::task::spawn(async move {
-            engine
-                .write_parquet(&data, write_context.as_ref(), HashMap::new())
-                .await
-        })
+        tokio::task::spawn(async move { engine.write_parquet(&data, write_context.as_ref()).await })
     });
 
     let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
@@ -663,23 +658,15 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     )?;
 
     // Write data for both transactions
-    let write_context1 = Arc::new(txn1.get_write_context());
-    let write_context2 = Arc::new(txn2.get_write_context());
+    let write_context1 = Arc::new(txn1.unpartitioned_write_context()?);
+    let write_context2 = Arc::new(txn2.unpartitioned_write_context()?);
 
     let metadata1 = engine1
-        .write_parquet(
-            &ArrowEngineData::new(data1),
-            write_context1.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(data1), write_context1.as_ref())
         .await?;
 
     let metadata2 = engine2
-        .write_parquet(
-            &ArrowEngineData::new(data2),
-            write_context2.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(data2), write_context2.as_ref())
         .await?;
 
     txn1.add_files(metadata1);
