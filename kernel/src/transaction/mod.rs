@@ -89,7 +89,7 @@ pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
 /// The base schema for add file metadata, referenced by [`Transaction::add_files_schema`].
 ///
 /// The `stats` field represents the minimum structure. The actual stats written by
-/// [`DefaultEngine::write_parquet`] include additional fields computed from the data:
+/// `DefaultEngine::write_parquet` include additional fields computed from the data:
 /// - `nullCount`: nested struct mirroring the data schema (all fields LONG)
 /// - `minValues`: nested struct with min/max eligible column types
 /// - `maxValues`: nested struct with min/max eligible column types
@@ -98,7 +98,6 @@ pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
 /// and which columns have statistics enabled. Use [`Transaction::stats_schema`] to get the
 /// expected stats schema for a specific table.
 ///
-/// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
 pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     let stats = StructField::nullable(
         "stats",
@@ -682,7 +681,7 @@ impl<S> Transaction<S> {
     /// action schema, adding internal fields (e.g., baseRowID) as necessary.
     ///
     /// The `stats` field contains file-level statistics. The schema returned here shows the base
-    /// structure; the actual stats written by [`DefaultEngine::write_parquet`] include dynamically
+    /// structure; the actual stats written by `DefaultEngine::write_parquet` include dynamically
     /// computed fields (numRecords, nullCount, minValues, maxValues, tightBounds) based on the
     /// data schema and table configuration. See [`stats_schema`] for the table-specific expected
     /// stats schema.
@@ -692,7 +691,6 @@ impl<S> Transaction<S> {
     ///
     /// [`add_files`]: crate::transaction::Transaction::add_files
     /// [`ParquetHandler`]: crate::ParquetHandler
-    /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
     /// [`stats_schema`]: Transaction::stats_schema
     pub fn add_files_schema(&self) -> &'static SchemaRef {
         &BASE_ADD_FILES_SCHEMA
