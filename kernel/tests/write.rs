@@ -39,7 +39,7 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
-use delta_kernel::expressions::ColumnName;
+use delta_kernel::expressions::{ColumnName, Scalar};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
@@ -399,18 +399,14 @@ async fn write_data_and_check_result_and_stats(
     });
 
     // write data out by spawning async tasks to simulate executors
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
     let tasks = append_data.into_iter().map(|data| {
         // arc clones
         let engine = engine.clone();
         let write_context = write_context.clone();
         tokio::task::spawn(async move {
             engine
-                .write_parquet(
-                    data.as_ref().unwrap(),
-                    write_context.as_ref(),
-                    HashMap::new(),
-                )
+                .write_parquet(data.as_ref().unwrap(), write_context.as_ref())
                 .await
         })
     });
@@ -766,21 +762,22 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
         let tasks = append_data
             .into_iter()
             .zip(partition_vals)
             .map(|(data, partition_val)| {
+                let write_context = Arc::new(
+                    txn.partitioned_write_context(HashMap::from([(
+                        "partition".to_string(),
+                        Scalar::String(partition_val.into()),
+                    )]))
+                    .unwrap(),
+                );
                 // arc clones
                 let engine = engine.clone();
-                let write_context = write_context.clone();
                 tokio::task::spawn(async move {
                     engine
-                        .write_parquet(
-                            data.as_ref().unwrap(),
-                            write_context.as_ref(),
-                            HashMap::from([(partition_col.to_string(), partition_val.to_string())]),
-                        )
+                        .write_parquet(data.as_ref().unwrap(), write_context.as_ref())
                         .await
                 })
             });
@@ -1006,18 +1003,14 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
+        let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
         let tasks = append_data.into_iter().map(|data| {
             // arc clones
             let engine = engine.clone();
             let write_context = write_context.clone();
             tokio::task::spawn(async move {
                 engine
-                    .write_parquet(
-                        data.as_ref().unwrap(),
-                        write_context.as_ref(),
-                        HashMap::new(),
-                    )
+                    .write_parquet(data.as_ref().unwrap(), write_context.as_ref())
                     .await
             })
         });
@@ -1207,14 +1200,10 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
     let add_files_metadata = engine
-        .write_parquet(
-            &ArrowEngineData::new(data.clone()),
-            write_context.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(data.clone()), write_context.as_ref())
         .await?;
 
     txn.add_files(add_files_metadata);
@@ -1398,7 +1387,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
     let add_files_metadata = (*engine)
         .parquet_handler()
@@ -1408,7 +1397,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         .write_parquet_file(
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
-            HashMap::new(),
+            &HashMap::new(),
             Some(write_context.stats_columns()),
         )
         .await?;
@@ -1572,7 +1561,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     .unwrap();
 
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
     let add_files_metadata = (*engine)
         .parquet_handler()
@@ -1582,7 +1571,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
         .write_parquet_file(
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
-            HashMap::new(),
+            &HashMap::new(),
             Some(write_context.stats_columns()),
         )
         .await?;
@@ -1642,7 +1631,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
 
     // write context does not conflict with domain metadata
-    let _write_context = txn.get_write_context();
+    let _write_context = txn.unpartitioned_write_context().unwrap();
 
     // set multiple domain metadata
     let domain1 = "app.config";
@@ -2053,13 +2042,9 @@ async fn generate_and_add_data_file(
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
     let file_meta = engine
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            write_context.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
         .await?;
     txn.add_files(file_meta);
     Ok(())
@@ -3082,13 +3067,9 @@ async fn add_files_to_transaction(
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
     let add_files_metadata = engine
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            write_context.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
         .await?;
     txn.add_files(add_files_metadata);
     Ok(())
@@ -3321,7 +3302,7 @@ async fn test_write_parquet_succeed_with_logical_partition_names(
             &snapshot,
             &engine,
             batch,
-            HashMap::from([("letter".to_string(), "a".to_string())]),
+            HashMap::from([("letter".to_string(), Scalar::String("a".into()))]),
         )
         .await;
         assert!(
@@ -3333,7 +3314,7 @@ async fn test_write_parquet_succeed_with_logical_partition_names(
 }
 
 #[tokio::test]
-async fn test_write_parquet_rejects_unknown_partition_column(
+async fn test_write_parquet_rejects_partitioned_write_context_on_unpartitioned_table(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_int_schema();
 
@@ -3341,24 +3322,21 @@ async fn test_write_parquet_rejects_unknown_partition_column(
         setup_test_tables(schema.clone(), &[], None, "test_partition_reject").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_engine_info("test");
 
-        let batch = RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
-            vec![Arc::new(Int32Array::from(vec![1, 2]))],
-        )?;
-
-        let result = write_batch_to_table(
-            &snapshot,
-            &engine,
-            batch,
-            HashMap::from([("nonexistent".to_string(), "val".to_string())]),
-        )
-        .await;
-        let err = result.expect_err("write_parquet should fail with unknown partition column");
+        let result = txn.partitioned_write_context(HashMap::from([(
+            "nonexistent".to_string(),
+            Scalar::String("val".into()),
+        )]));
+        let err = result
+            .expect_err("should fail with partitioned_write_context on unpartitioned table");
         let err_msg = err.to_string();
         assert!(
-            err_msg.contains("Partition column 'nonexistent' not found in table schema"),
-            "Error should mention the unknown column name, got: {err_msg}"
+            err_msg.contains("table is not partitioned"),
+            "Error should indicate table is not partitioned, got: {err_msg}"
         );
     }
     Ok(())
@@ -3695,7 +3673,7 @@ async fn test_column_mapping_partitioned_write(
         Arc::new(data_schema.as_ref().try_into_arrow()?),
         vec![Arc::new(Int32Array::from(vec![1, 2]))],
     )?;
-    let partition_values = HashMap::from([("category".to_string(), "A".to_string())]);
+    let partition_values = HashMap::from([("category".to_string(), Scalar::String("A".into()))]);
     write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
 
     // Read commit log and verify add.partitionValues key uses physical name
