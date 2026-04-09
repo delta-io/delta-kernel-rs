@@ -128,16 +128,17 @@ impl Snapshot {
     ///     - **C.1.** `target_version` is set: error (the target is newer than anything in the
     ///       log).
     ///     - **C.2.** `target_version` is unset: return the existing snapshot.
-    ///   - **D.** Listing contains a checkpoint: build a fresh snapshot from that checkpoint (and
-    ///     any commits after it), reusing the existing CRC if its version matches. TODO(#2351):
-    ///     when the new checkpoint is at or below `existing_version`, the existing snapshot already
-    ///     covers its P+M, so a full rebuild is wasted work. PR #2351 splits this into D.1
-    ///     (checkpoint > `existing_version`: rebuild) and D.2 (checkpoint <= `existing_version`:
-    ///     take the incremental path and advance the checkpoint base).
+    ///   - **D.1.** Listing contains a checkpoint *ahead of* the existing snapshot version: commits
+    ///     between existing_snapshot_version+1 and the new checkpoint were not listed, so build a
+    ///     fresh snapshot starting from that checkpoint.
+    ///   - **D.2.** Listing contains a checkpoint *at or below* the existing snapshot version: the
+    ///     existing snapshot's P+M already covers the checkpoint; fall through to case F to replay
+    ///     only the new commits and advance the checkpoint base.
     ///   - **E.** Listing contains commits but no new checkpoint and no version advance: return the
     ///     existing snapshot.
-    ///   - **F.** Listing contains new commits (and no new checkpoint): run lightweight P+M replay
-    ///     on the new commits and merge them into the existing log segment.
+    ///   - **F.** Listing contains new commits (and either no new checkpoint or a checkpoint at or
+    ///     below the existing snapshot version): run lightweight P+M replay on the new commits and
+    ///     merge them into the existing log segment.
     ///
     /// Each case is marked with `// Case X` in `Snapshot::try_new_from`. The engine is passed
     /// to [`SnapshotBuilder::build`].
@@ -267,43 +268,76 @@ impl Snapshot {
                  older than the existing snapshot version {existing_snapshot_version}"
             )));
         }
-        if new_log_segment.checkpoint_version.is_some() {
-            // Case D: listing contains a checkpoint; build a fresh snapshot from it.
-            // TODO(#2218): consider incremental P&M replay instead of full rebuild.
-            // `resolve_crc` reuses the existing `LazyCrc` when the resolved CRC version
-            // matches, avoiding redundant I/O.
-            let (_, lazy_crc) = Self::resolve_crc(
-                &new_log_segment,
-                existing_log_segment,
-                &existing_snapshot.lazy_crc,
-            );
-            let snapshot = Self::try_new_from_log_segment(
-                existing_snapshot.table_root().clone(),
-                new_log_segment,
-                engine,
-                operation_id,
-                Some(lazy_crc),
-            );
-            return Ok(Arc::new(snapshot?));
+        if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version {
+            if new_checkpoint_version > existing_snapshot_version {
+                // Case D.1: checkpoint ahead of existing snapshot. Commits between
+                // existing_snapshot_version+1 and new_checkpoint_version were filtered out
+                // of the listing, so a full rebuild is required.
+                // `resolve_crc` reuses the existing `LazyCrc` when the resolved CRC version
+                // matches, avoiding redundant I/O.
+                let (_, lazy_crc) = Self::resolve_crc(
+                    &new_log_segment,
+                    existing_log_segment,
+                    &existing_snapshot.lazy_crc,
+                );
+                let snapshot = Self::try_new_from_log_segment(
+                    existing_snapshot.table_root().clone(),
+                    new_log_segment,
+                    engine,
+                    operation_id,
+                    Some(lazy_crc),
+                );
+                return Ok(Arc::new(snapshot?));
+            }
+            // Case D.2: checkpoint at or below existing snapshot; fall through to case F to
+            // replay only the new commits and advance the checkpoint base.
         }
 
         // Case E: no new checkpoint, version did not advance; return existing.
-        if new_end_version == existing_snapshot_version {
+        if new_end_version == existing_snapshot_version
+            && new_log_segment.checkpoint_version.is_none()
+        {
             return Ok(existing_snapshot.clone());
         }
 
-        // Case F: new commits, no new checkpoint; lightweight P+M replay + merge.
-        // First we remove the 'overlap' in commits, example:
+        // Case F: lightweight P+M replay on new commits, merge with existing segment.
+        // (Also reached from Case D.2 when a checkpoint at or below the existing snapshot
+        // version was discovered.)
         //
-        //    existing logsegment checkpoint1-commit1-commit2-commit3
-        // 1. new logsegment                  commit1-commit2-commit3
-        // 2. new logsegment                  commit1-commit2-commit3-commit4
-        // 3. new logsegment                          checkpoint2+commit2-commit3-commit4
+        // All examples below start from: old segment = ckpt@v0 + commit@v1, v2, v3
+        //                                existing_snapshot_version = v3, listing_start = v1
         //
-        // retain does
-        // 1. new logsegment             [empty] -> caught above
-        // 2. new logsegment             [commit4]
-        // 3. new logsegment             [checkpoint2-commit3] -> caught above
+        // 1. target=v3, no new commits: listing finds commit@v1, v2, v3. new_end_version(v3) ==
+        //    existing_snapshot_version(v3), no new checkpoint -> return same snapshot
+        //
+        // 2. target=v4, one new commit: listing finds commit@v1, v2, v3, v4. Drop v1-v3 (already in
+        //    existing snapshot), so new_log_segment.ascending_commit_files = [commit@v4]. This is
+        //    replayed for P&M below and merged into the combined log segment.
+        //
+        // 3. target=v6, new ckpt@v5 written since last build: listing finds commit@v1 through v3
+        //    then ckpt@v5+commit@v6; the listing drops v1-v3 on checkpoint flush (ckpt@v5 is a
+        //    complete snapshot through v5, so earlier commits are not needed), so new segment =
+        //    ckpt@v5 + commit@v6. new_checkpoint_version(v5) > existing_snapshot_version(v3) ->
+        //    full rebuild
+        //
+        // 4. target=v4, new ckpt@v2 written since last build: listing finds commit@v1 then
+        //    ckpt@v2+commit@v3, v4; the listing drops v1 on checkpoint flush, so new segment =
+        //    ckpt@v2 + commit@v3, v4. new_checkpoint_version(v2) <= existing_snapshot_version(v3).
+        //    Dedup: drop commit@v3 from new segment (it overlaps with the existing snapshot), so
+        //    new_log_segment.ascending_commit_files = [commit@v4]. Note: commit@v3 is NOT lost: it
+        //    is contributed by the old segment below when building the combined segment (old
+        //    commits above ckpt@v2 = [commit@v3]). Combined segment = ckpt@v2 + commit@v3 (from
+        //    old) + commit@v4 (from new). ckpt@v2 stays in new_log_segment.listed.checkpoint_parts
+        //    to advance the base.
+        //
+        // 5. target=v3, new ckpt@v2 written since last build, no new commits: listing finds
+        //    commit@v1 then ckpt@v2+commit@v3; the listing drops v1 on checkpoint flush, so new
+        //    segment = ckpt@v2 + commit@v3. new_checkpoint_version(v2) <=
+        //    existing_snapshot_version(v3). Dedup: drop commit@v3 from new segment (it overlaps
+        //    with the existing snapshot), so new_log_segment.ascending_commit_files = []. Note:
+        //    commit@v3 is contributed by the old segment below (old commits above ckpt@v2).
+        //    Combined segment = ckpt@v2 + commit@v3 (from old). ckpt@v2 stays in
+        //    new_log_segment.listed.checkpoint_parts to advance the base.
         new_log_segment
             .listed
             .ascending_commit_files
@@ -319,16 +353,17 @@ impl Snapshot {
             .ascending_compaction_files
             .retain(|log_path| existing_snapshot_version < log_path.version);
 
-        // we have new commits and no new checkpoint: we replay new commits for P+M and then
-        // create a new snapshot by combining LogSegments and building a new TableConfiguration
         let (crc_file, lazy_crc) = Self::resolve_crc(
             &new_log_segment,
             existing_log_segment,
             &existing_snapshot.lazy_crc,
         );
 
-        let (new_metadata, new_protocol) =
-            new_log_segment.read_protocol_metadata_opt(engine, &lazy_crc)?;
+        // Replay only the new commits (> existing_snapshot_version) for P&M, excluding the
+        // checkpoint.
+        let (new_metadata, new_protocol) = new_log_segment
+            .segment_after_crc(existing_snapshot_version)
+            .read_protocol_metadata_opt(engine, &lazy_crc)?;
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
             new_metadata,
@@ -336,22 +371,46 @@ impl Snapshot {
             new_log_segment.end_version,
         )?;
 
-        // NB: we must add the new log segment to the existing snapshot's log segment
-        let mut ascending_commit_files = existing_log_segment.listed.ascending_commit_files.clone();
+        // Combine existing and new log segments. When the new listing found a checkpoint at or
+        // below the existing snapshot version, trim existing commits and compaction files
+        // already covered by it; otherwise keep all existing files.
+        let new_checkpoint_version = new_log_segment.checkpoint_version;
+        let new_checkpoint_hint = new_log_segment.last_checkpoint_hint_summary();
+        let mut ascending_commit_files = Self::old_files_above_checkpoint(
+            &existing_log_segment.listed.ascending_commit_files,
+            new_checkpoint_version,
+        );
         ascending_commit_files.extend(new_log_segment.listed.ascending_commit_files);
-        let mut ascending_compaction_files = existing_log_segment
-            .listed
-            .ascending_compaction_files
-            .clone();
+        let mut ascending_compaction_files = Self::old_files_above_checkpoint(
+            &existing_log_segment.listed.ascending_compaction_files,
+            new_checkpoint_version,
+        );
         ascending_compaction_files.extend(new_log_segment.listed.ascending_compaction_files);
 
+        // When the new listing found a checkpoint at or below the existing snapshot version,
+        // advance the base so future listings start from new_checkpoint_version+1; otherwise
+        // preserve the existing base.
+        // Note: the incremental listing never uses a _last_checkpoint hint, so
+        // new_log_segment.last_checkpoint_hint_summary() is always None when a new checkpoint
+        // is found here. The combined segment will read the new checkpoint's parquet footer at
+        // scan time. When no new checkpoint was found, preserve the existing schema hint if
+        // available.
+        let (new_checkpoint_parts, new_checkpoint_schema) = if new_checkpoint_version.is_some() {
+            (
+                new_log_segment.listed.checkpoint_parts.clone(),
+                new_checkpoint_hint,
+            )
+        } else {
+            (
+                existing_log_segment.listed.checkpoint_parts.clone(),
+                existing_log_segment.last_checkpoint_hint_summary(),
+            )
+        };
         let combined_log_segment = LogSegment::try_new(
             LogSegmentFiles {
                 ascending_commit_files,
                 ascending_compaction_files,
-                // We pass in just the existing checkpoint parts since by the time we reach
-                // this line, we know there are no checkpoints in the new log segment.
-                checkpoint_parts: existing_log_segment.listed.checkpoint_parts.clone(),
+                checkpoint_parts: new_checkpoint_parts,
                 latest_crc_file: crc_file,
                 // In Case F there are new commits (new_end_version > existing_snapshot_version
                 // with no new checkpoint), so the new listing's `latest_commit_file` is always
@@ -364,8 +423,7 @@ impl Snapshot {
             },
             log_root,
             requested_version,
-            // Preserve `_last_checkpoint` hint from existing segment
-            existing_log_segment.last_checkpoint_hint_summary(),
+            new_checkpoint_schema,
         )?;
 
         tracing::Span::current().record("version", table_configuration.version());
@@ -1279,6 +1337,22 @@ impl Snapshot {
                         self.version()
                     ))
                 }),
+        }
+    }
+
+    /// Filters `files` to only those with version above `checkpoint_version`, or clones all if
+    /// `checkpoint_version` is `None`.
+    fn old_files_above_checkpoint(
+        files: &[ParsedLogPath],
+        checkpoint_version: Option<Version>,
+    ) -> Vec<ParsedLogPath> {
+        match checkpoint_version {
+            Some(ckpt_v) => files
+                .iter()
+                .filter(|f| f.version > ckpt_v)
+                .cloned()
+                .collect(),
+            None => files.to_vec(),
         }
     }
 }
@@ -3242,6 +3316,134 @@ mod tests {
             .listed
             .ascending_compaction_files
             .is_empty());
+
+        Ok(())
+    }
+
+    /// When a checkpoint at or below the existing snapshot version is discovered and commits
+    /// between that checkpoint and the existing snapshot version contain P&M changes, the
+    /// incremental update must preserve those P&M changes rather than regressing to the
+    /// checkpoint's older P&M.
+    ///
+    /// Setup: initial checkpoint@v0 so listing_start=1. A checkpoint at v1 is written (discoverable
+    /// since v1 >= listing_start). The P&M change at commit 2 lies between the new checkpoint (v1)
+    /// and existing_snapshot_version (v3); the incremental update must preserve it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_at_or_below_snapshot_version_preserves_pm_from_commits_in_between(
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+
+        // Commit 0: initial protocol (1, 2) + metadata.
+        let commit0 = vec![
+            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            json!({
+                "metaData": {
+                    "id": "test-id",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1587968585495i64
+                }
+            }),
+            json!({"add": {"path": "file1.parquet", "partitionValues": {}, "size": 100, "modificationTime": 1000, "dataChange": true}}),
+        ];
+        commit(ctx.url.as_str(), &ctx.store, 0, commit0).await;
+
+        // Commit 1: just an add file (no P&M change).
+        commit(
+            ctx.url.as_str(),
+            &ctx.store,
+            1,
+            vec![json!({"add": {"path": "file2.parquet", "partitionValues": {}, "size": 200, "modificationTime": 2000, "dataChange": true}})],
+        )
+        .await;
+
+        // Commit 2: protocol upgrade to (2, 5).
+        commit(
+            ctx.url.as_str(),
+            &ctx.store,
+            2,
+            vec![json!({"protocol": {"minReaderVersion": 2, "minWriterVersion": 5}})],
+        )
+        .await;
+
+        // Commit 3: just an add file.
+        commit(
+            ctx.url.as_str(),
+            &ctx.store,
+            3,
+            vec![json!({"add": {"path": "file3.parquet", "partitionValues": {}, "size": 300, "modificationTime": 3000, "dataChange": true}})],
+        )
+        .await;
+
+        // Write initial checkpoint at v0 so that listing_start = v0+1 = 1.
+        Snapshot::builder_for(ctx.url.as_str())
+            .at_version(0)
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref())?;
+
+        // Build snapshot at v3: has checkpoint@v0, protocol (2, 5) from commit 2.
+        let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(3)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(snapshot_v3.log_segment.checkpoint_version, Some(0));
+        assert_eq!(
+            snapshot_v3
+                .table_configuration()
+                .protocol()
+                .min_reader_version(),
+            2
+        );
+        assert_eq!(
+            snapshot_v3
+                .table_configuration()
+                .protocol()
+                .min_writer_version(),
+            5
+        );
+
+        // Write a checkpoint at v1 (v1 >= listing_start=1, so it is discoverable).
+        // This checkpoint captures only protocol (1, 2) from commit 0.
+        Snapshot::builder_for(ctx.url.as_str())
+            .at_version(1)
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref())?;
+
+        // Add commit 4 (new state beyond existing_snapshot_version=3).
+        commit(
+            ctx.url.as_str(),
+            &ctx.store,
+            4,
+            vec![json!({"add": {"path": "file4.parquet", "partitionValues": {}, "size": 400, "modificationTime": 4000, "dataChange": true}})],
+        )
+        .await;
+
+        // Incremental update from v3: listing starts from v1, discovers checkpoint@v1.
+        // Must preserve protocol (2, 5) from commit 2, not regress to (1, 2) from checkpoint@v1.
+        let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
+        assert_eq!(updated.version(), 4);
+        assert_eq!(updated.log_segment.checkpoint_version, Some(1));
+
+        // Critical: protocol must still be (2, 5) from commit 2, not (1, 2) from ckpt@v1.
+        assert_eq!(
+            updated
+                .table_configuration()
+                .protocol()
+                .min_reader_version(),
+            2
+        );
+        assert_eq!(
+            updated
+                .table_configuration()
+                .protocol()
+                .min_writer_version(),
+            5
+        );
+
+        // Cross-check against a fresh build.
+        let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        compare_snapshots(&updated, &fresh);
 
         Ok(())
     }
