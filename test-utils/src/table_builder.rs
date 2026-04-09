@@ -7,7 +7,7 @@
 //!
 //! # Quick start
 //!
-//! The [`test_context!`] macro builds a table, engine, and snapshot in one call.
+//! The `test_context!` macro builds a table, engine, and snapshot in one call.
 //! Pair it with rstest `#[values]` for cross-product testing:
 //!
 //! ```ignore
@@ -17,11 +17,11 @@
 //!
 //! #[rstest]
 //! fn test_scan(
-//!     #[values(LogState::commits(3))]
+//!     #[values(LogState::with_commits(3))]
 //!     log_state: LogState,
 //!     #[values(FeatureSet::empty())]
 //!     feature_set: FeatureSet,
-//!     #[values(VersionTarget::Latest, VersionTarget::Incremental { from: 0, to: 2 })]
+//!     #[values(VersionTarget::Latest, VersionTarget::IncrementalToLatest { from: 0 })]
 //!     version_target: VersionTarget,
 //! ) {
 //!     let (engine, snap, _table) =
@@ -63,10 +63,13 @@ impl LogState {
     /// Table with `n` total versions as JSON commit files.
     ///
     /// `n` must be >= 1. Version 0 is a metadata-only create-table commit (not CTAS).
-    /// For example, `commits(3)` produces versions 0, 1, 2 where version 0 has only
+    /// For example, `with_commits(3)` produces versions 0, 1, 2 where version 0 has only
     /// metadata and versions 1-2 contain data.
-    pub fn commits(n: u64) -> Self {
-        assert!(n >= 1, "commits() requires at least 1 version (the create-table commit)");
+    pub fn with_commits(n: u64) -> Self {
+        assert!(
+            n >= 1,
+            "with_commits() requires at least 1 version (the create-table commit)"
+        );
         LogState::CommitsOnly { num_commits: n }
     }
 
@@ -138,16 +141,14 @@ impl fmt::Display for FeatureSet {
 
 /// How the snapshot should be loaded from the built table.
 ///
-/// Designed for use as an rstest `#[values]` parameter. Use the [`build_snapshot!`] macro
-/// or [`test_context!`] macro to load a snapshot according to this target.
+/// Designed for use as an rstest `#[values]` parameter. Use the `build_snapshot!` macro
+/// or `test_context!` macro to load a snapshot according to this target.
 #[derive(Clone, Debug)]
 pub enum VersionTarget {
     /// Load the latest version.
     Latest,
     /// Time travel to a specific version.
     AtVersion(u64),
-    /// Load at `from`, then incrementally update to `to`.
-    Incremental { from: u64, to: u64 },
     /// Load at `from`, then incrementally update to latest.
     IncrementalToLatest { from: u64 },
 }
@@ -157,9 +158,6 @@ impl fmt::Display for VersionTarget {
         match self {
             VersionTarget::Latest => write!(f, "latest"),
             VersionTarget::AtVersion(v) => write!(f, "at_version({v})"),
-            VersionTarget::Incremental { from, to } => {
-                write!(f, "incremental({from}->{to})")
-            }
             VersionTarget::IncrementalToLatest { from } => {
                 write!(f, "incremental({from}->latest)")
             }
@@ -192,7 +190,7 @@ impl TestTableBuilder {
     /// Create a builder with sensible defaults: 1 commit, no features.
     pub fn new() -> Self {
         Self {
-            log_state: LogState::commits(1),
+            log_state: LogState::with_commits(1),
             features: FeatureSet::empty(),
             schema: default_schema(),
         }
@@ -327,7 +325,7 @@ impl fmt::Display for TestTable {
 // ===========================================================================
 
 /// Convenience wrapper: build a [`TestTable`] from a `log_state` and `feature_set`.
-/// Used by the [`test_context!`] macro and available for direct use in tests.
+/// Used by the `test_context!` macro and available for direct use in tests.
 pub fn test_table(log_state: LogState, feature_set: FeatureSet) -> TestTable {
     TestTableBuilder::new()
         .log_state(log_state)
@@ -358,24 +356,12 @@ macro_rules! build_snapshot {
                     .build($engine)
                     .unwrap()
             }
-            $crate::table_builder::VersionTarget::Incremental { from, to } => {
-                let base = Snapshot::builder_for($table_root)
-                    .at_version(*from)
-                    .build($engine)
-                    .unwrap();
-                Snapshot::builder_from(base)
-                    .at_version(*to)
-                    .build($engine)
-                    .unwrap()
-            }
             $crate::table_builder::VersionTarget::IncrementalToLatest { from } => {
                 let base = Snapshot::builder_for($table_root)
                     .at_version(*from)
                     .build($engine)
                     .unwrap();
-                Snapshot::builder_from(base)
-                    .build($engine)
-                    .unwrap()
+                Snapshot::builder_from(base).build($engine).unwrap()
             }
         }
     };
@@ -405,8 +391,8 @@ macro_rules! test_context {
 // Helpers: schema
 // ===========================================================================
 
-/// Default schema with all Delta primitive types (except TimestampNtz which auto-enables
-/// a table feature, and nested types which are a separate concern).
+/// Default schema with all Delta primitive types including TimestampNtz
+/// (nested types are a separate concern).
 pub(crate) fn default_schema() -> SchemaRef {
     Arc::new(StructType::new_unchecked(vec![
         StructField::new("bool_col", DataType::BOOLEAN, true),
@@ -420,6 +406,7 @@ pub(crate) fn default_schema() -> SchemaRef {
         StructField::new("binary_col", DataType::BINARY, true),
         StructField::new("date_col", DataType::DATE, true),
         StructField::new("ts_col", DataType::TIMESTAMP, true),
+        StructField::new("ts_ntz_col", DataType::TIMESTAMP_NTZ, true),
         StructField::new("decimal_col", DataType::decimal(10, 2).unwrap(), true),
     ]))
 }
@@ -441,7 +428,7 @@ mod tests {
     #[test]
     fn test_commits_only() -> DeltaResult<()> {
         let table = TestTableBuilder::new()
-            .log_state(LogState::commits(3))
+            .log_state(LogState::with_commits(3))
             .build()?;
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
@@ -452,21 +439,19 @@ mod tests {
     /// Demonstrates the `test_context!` macro with rstest `#[values]`.
     #[rstest]
     fn test_version_targets(
-        #[values(LogState::commits(5))] log_state: LogState,
+        #[values(LogState::with_commits(5))] log_state: LogState,
         #[values(FeatureSet::empty())] feature_set: FeatureSet,
         #[values(
             VersionTarget::Latest,
             VersionTarget::AtVersion(2),
-            VersionTarget::Incremental { from: 1, to: 3 }
+            VersionTarget::IncrementalToLatest { from: 1 }
         )]
         version_target: VersionTarget,
     ) {
-        let (_engine, snap, _table) =
-            test_context!(log_state, feature_set, version_target);
+        let (_engine, snap, _table) = test_context!(log_state, feature_set, version_target);
         let expected = match &version_target {
             VersionTarget::Latest | VersionTarget::IncrementalToLatest { .. } => 4,
             VersionTarget::AtVersion(v) => *v,
-            VersionTarget::Incremental { to, .. } => *to,
         };
         assert_eq!(snap.version(), expected);
     }
@@ -474,6 +459,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "at least 1 version")]
     fn test_commits_zero_panics() {
-        LogState::commits(0);
+        LogState::with_commits(0);
     }
 }

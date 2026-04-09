@@ -2377,7 +2377,7 @@ mod tests {
     #[test]
     fn test_context_macro_works_in_unit_test() {
         let (_engine, snap, _table) = test_utils::test_context!(
-            LogState::commits(3),
+            LogState::with_commits(3),
             FeatureSet::empty(),
             VersionTarget::Latest
         );
