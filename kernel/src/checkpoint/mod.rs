@@ -678,7 +678,7 @@ impl CheckpointWriter {
         let data_iter = self.checkpoint_data(engine)?;
         let iter_state = data_iter.state();
 
-        let splitter = SidecarSplitter::new(
+        let splitter = SidecarSplitter::new_mut_shared(
             data_iter,
             engine.evaluation_handler().as_ref(),
             output_schema.clone(),
@@ -723,10 +723,13 @@ impl CheckpointWriter {
         }
 
         // Collect non-file batches
-        let non_file_batches = splitter
-            .lock()
+        let non_file_batches = Arc::into_inner(splitter)
+            .ok_or_else(|| {
+                Error::internal_error("sidecar splitter Arc should have no other references")
+            })?
+            .into_inner()
             .map_err(|e| Error::internal_error(format!("sidecar splitter lock poisoned: {e}")))?
-            .take_non_file_batches();
+            .into_non_file_batches();
 
         // Create sidecar action rows for the main checkpoint file
         let sidecar_batches =
