@@ -1298,7 +1298,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
         .unwrap()
         .write_parquet_file(
-            write_context.target_dir(),
+            write_context.table_root_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             &HashMap::new(),
             Some(write_context.stats_columns()),
@@ -1472,7 +1472,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
         .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
         .unwrap()
         .write_parquet_file(
-            write_context.target_dir(),
+            write_context.table_root_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             &HashMap::new(),
             Some(write_context.stats_columns()),

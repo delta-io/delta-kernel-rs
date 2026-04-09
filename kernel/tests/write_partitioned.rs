@@ -86,14 +86,14 @@ async fn test_write_partitioned_normal_values_roundtrip(
 
     // Read before checkpoint
     let sorted = read_sorted(&snapshot, engine.clone())?;
-    assert_normal_values(&sorted, date_days);
+    assert_normal_values(&sorted, date_days, ts_micros);
 
     // Checkpoint, reload from checkpoint, read again
     snapshot.checkpoint(engine.as_ref())?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot_after_cp = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let sorted = read_sorted(&snapshot_after_cp, engine)?;
-    assert_normal_values(&sorted, date_days);
+    assert_normal_values(&sorted, date_days, ts_micros);
 
     Ok(())
 }
@@ -192,9 +192,20 @@ async fn test_write_partitioned_null_values_roundtrip(
 // Helpers
 // =============================================================================
 
-/// Asserts the normal-values row reads back correctly (1 row, spot-check key types).
-fn assert_normal_values(sorted: &RecordBatch, date_days: i32) {
+/// Asserts the normal-values row reads back correctly (1 row, all 13 partition columns).
+fn assert_normal_values(sorted: &RecordBatch, date_days: i32, ts_micros: i64) {
     assert_eq!(sorted.num_rows(), 1);
+    // col 0: value (non-partition)
+    assert_eq!(
+        sorted
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+    // col 1: p_string
     assert_eq!(
         sorted
             .column(1)
@@ -204,6 +215,7 @@ fn assert_normal_values(sorted: &RecordBatch, date_days: i32) {
             .value(0),
         "hello"
     );
+    // col 2: p_int
     assert_eq!(
         sorted
             .column(2)
@@ -213,6 +225,68 @@ fn assert_normal_values(sorted: &RecordBatch, date_days: i32) {
             .value(0),
         42
     );
+    // col 3: p_long
+    assert_eq!(
+        sorted
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        9_876_543_210i64
+    );
+    // col 4: p_short
+    assert_eq!(
+        sorted
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap()
+            .value(0),
+        7i16
+    );
+    // col 5: p_byte
+    assert_eq!(
+        sorted
+            .column(5)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .unwrap()
+            .value(0),
+        3i8
+    );
+    // col 6: p_float
+    assert!(
+        (sorted
+            .column(6)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .value(0)
+            - 1.25f32)
+            .abs()
+            < f32::EPSILON
+    );
+    // col 7: p_double
+    assert!(
+        (sorted
+            .column(7)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0)
+            - 99.99f64)
+            .abs()
+            < f64::EPSILON
+    );
+    // col 8: p_boolean
+    assert!(sorted
+        .column(8)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap()
+        .value(0));
+    // col 9: p_date
     assert_eq!(
         sorted
             .column(9)
@@ -222,6 +296,17 @@ fn assert_normal_values(sorted: &RecordBatch, date_days: i32) {
             .value(0),
         date_days
     );
+    // col 10: p_timestamp
+    assert_eq!(
+        sorted
+            .column(10)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap()
+            .value(0),
+        ts_micros
+    );
+    // col 11: p_decimal
     assert_eq!(
         sorted
             .column(11)
@@ -231,6 +316,7 @@ fn assert_normal_values(sorted: &RecordBatch, date_days: i32) {
             .value(0),
         12345
     );
+    // col 12: p_binary
     assert_eq!(
         sorted
             .column(12)
@@ -240,12 +326,16 @@ fn assert_normal_values(sorted: &RecordBatch, date_days: i32) {
             .value(0),
         b"Hello"
     );
-    assert!(sorted
-        .column(8)
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .unwrap()
-        .value(0));
+    // col 13: p_timestamp_ntz
+    assert_eq!(
+        sorted
+            .column(13)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap()
+            .value(0),
+        ts_micros
+    );
 }
 
 /// Asserts all partition columns (indices 1-13) are null for the single row.
