@@ -59,6 +59,9 @@ use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
+use serde_json::json;
+
+use crate::delta_path_for_version;
 
 // ===========================================================================
 // LogState
@@ -70,6 +73,24 @@ pub enum LogState {
     /// Only JSON commit files: `num_commits` total versions (0 through `num_commits - 1`).
     /// Version 0 is always the create-table commit; versions 1+ contain data.
     CommitsOnly { num_commits: u64 },
+    /// Commits 0..total_versions, with a V1 parquet checkpoint at `checkpoint_at`.
+    CheckpointV1 {
+        checkpoint_at: u64,
+        total_versions: u64,
+    },
+    /// Commits 0..total_versions, with a V2 checkpoint at `checkpoint_at`.
+    /// Requires `FeatureSet::new().v2_checkpoint()`.
+    CheckpointV2 {
+        checkpoint_at: u64,
+        total_versions: u64,
+    },
+    /// A V1 checkpoint followed by additional commits.
+    CheckpointAndCommits {
+        checkpoint_at: u64,
+        commits_after: u64,
+    },
+    /// Commits with a CRC file at `crc_at`.
+    WithCrc { crc_at: u64, total_versions: u64 },
 }
 
 impl LogState {
@@ -86,10 +107,62 @@ impl LogState {
         LogState::CommitsOnly { num_commits: n }
     }
 
+    /// Table with a V1 checkpoint at the given version.
+    pub fn checkpoint_v1(at: u64, total: u64) -> Self {
+        LogState::CheckpointV1 {
+            checkpoint_at: at,
+            total_versions: total,
+        }
+    }
+
+    /// Table with a V2 checkpoint at the given version.
+    pub fn checkpoint_v2(at: u64, total: u64) -> Self {
+        LogState::CheckpointV2 {
+            checkpoint_at: at,
+            total_versions: total,
+        }
+    }
+
+    /// Table with a V1 checkpoint followed by additional commits.
+    pub fn checkpoint_and_commits(checkpoint_at: u64, commits_after: u64) -> Self {
+        LogState::CheckpointAndCommits {
+            checkpoint_at,
+            commits_after,
+        }
+    }
+
+    /// Table with a CRC file at the given version.
+    pub fn with_crc(at: u64, total: u64) -> Self {
+        LogState::WithCrc {
+            crc_at: at,
+            total_versions: total,
+        }
+    }
+
+    /// All standard log states for a table with `n` total versions.
+    /// Useful for cross-product testing across all log configurations.
+    pub fn all(n: u64) -> Vec<Self> {
+        assert!(n >= 2, "need at least 2 versions for meaningful log states");
+        vec![
+            Self::with_commits(n),
+            Self::checkpoint_v1(n - 1, n),
+            Self::checkpoint_v2(n - 1, n),
+            Self::checkpoint_and_commits(1, n - 2),
+            Self::with_crc(0, n),
+        ]
+    }
+
     /// Number of commit files on disk (versions 0 through `num_versions - 1`).
     pub(crate) fn num_versions(&self) -> u64 {
         match self {
             LogState::CommitsOnly { num_commits } => *num_commits,
+            LogState::CheckpointV1 { total_versions, .. } => *total_versions,
+            LogState::CheckpointV2 { total_versions, .. } => *total_versions,
+            LogState::CheckpointAndCommits {
+                checkpoint_at,
+                commits_after,
+            } => checkpoint_at + commits_after + 1,
+            LogState::WithCrc { total_versions, .. } => *total_versions,
         }
     }
 }
@@ -98,6 +171,31 @@ impl fmt::Display for LogState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LogState::CommitsOnly { num_commits } => write!(f, "commits({num_commits})"),
+            LogState::CheckpointV1 {
+                checkpoint_at,
+                total_versions,
+            } => write!(
+                f,
+                "checkpoint_v1(at={checkpoint_at}, total={total_versions})"
+            ),
+            LogState::CheckpointV2 {
+                checkpoint_at,
+                total_versions,
+            } => write!(
+                f,
+                "checkpoint_v2(at={checkpoint_at}, total={total_versions})"
+            ),
+            LogState::CheckpointAndCommits {
+                checkpoint_at,
+                commits_after,
+            } => write!(
+                f,
+                "checkpoint_and_commits(at={checkpoint_at}, after={commits_after})"
+            ),
+            LogState::WithCrc {
+                crc_at,
+                total_versions,
+            } => write!(f, "with_crc(at={crc_at}, total={total_versions})"),
         }
     }
 }
@@ -166,6 +264,17 @@ impl FeatureSet {
             Self::new().v2_checkpoint(),
             Self::new().column_mapping("name").ict(),
         ]
+    }
+
+    /// Merge another feature set's properties into this one.
+    pub fn merge(&self, other: &FeatureSet) -> Self {
+        let mut merged = self.clone();
+        for prop in &other.table_properties {
+            if !merged.table_properties.contains(prop) {
+                merged.table_properties.push(prop.clone());
+            }
+        }
+        merged
     }
 
     /// Whether v2_checkpoint is enabled.
@@ -376,11 +485,51 @@ impl TestTableBuilder {
             .with_partition_columns(cols)
     }
 
+    /// Build all valid (LogState, FeatureSet) combinations with the given required features.
+    ///
+    /// Cross-products all standard log states with all standard feature sets, merging
+    /// `required` into each one. Pass `FeatureSet::empty()` for no required features.
+    /// Incompatible pairings are skipped (e.g. V2 checkpoint log state without v2Checkpoint
+    /// feature, or V1 checkpoint log state with v2Checkpoint feature).
+    pub fn all_tables(required: FeatureSet) -> DeltaResult<Vec<TestTable>> {
+        let total_versions = 3;
+        let mut tables = Vec::new();
+        for log_state in LogState::all(total_versions) {
+            let needs_v2 = matches!(log_state, LogState::CheckpointV2 { .. });
+            let needs_v1 = matches!(
+                log_state,
+                LogState::CheckpointV1 { .. } | LogState::CheckpointAndCommits { .. }
+            );
+            for base_features in FeatureSet::all() {
+                let features = base_features.merge(&required);
+                if needs_v2 && !features.has_v2_checkpoint() {
+                    continue;
+                }
+                if needs_v1 && features.has_v2_checkpoint() {
+                    continue;
+                }
+                tables.push(
+                    Self::new()
+                        .log_state(log_state.clone())
+                        .features(features)
+                        .build()?,
+                );
+            }
+        }
+        Ok(tables)
+    }
+
     /// Build the table and return a [`TestTable`] handle to the store.
     ///
     /// Safe to call from both sync tests and `#[tokio::test]` -- uses a dedicated runtime
     /// on a background thread to avoid panicking on nested runtimes.
-    pub fn build(self) -> DeltaResult<TestTable> {
+    pub fn build(mut self) -> DeltaResult<TestTable> {
+        // Auto-enable v2_checkpoint feature when CheckpointV2 log state is used
+        if matches!(self.log_state, LogState::CheckpointV2 { .. })
+            && !self.features.has_v2_checkpoint()
+        {
+            self.features = self.features.v2_checkpoint();
+        }
         std::thread::scope(|s| {
             s.spawn(|| {
                 tokio::runtime::Runtime::new()
@@ -436,6 +585,24 @@ impl TestTableBuilder {
                 .post_commit_snapshot()
                 .unwrap()
                 .clone();
+        }
+
+        // Checkpoints
+        match &self.log_state {
+            LogState::CheckpointV1 { checkpoint_at, .. }
+            | LogState::CheckpointV2 { checkpoint_at, .. }
+            | LogState::CheckpointAndCommits { checkpoint_at, .. } => {
+                let snap = Snapshot::builder_for(table_root)
+                    .at_version(*checkpoint_at)
+                    .build(engine.as_ref())?;
+                snap.checkpoint(engine.as_ref())?;
+            }
+            _ => {}
+        }
+
+        // CRC files
+        if let LogState::WithCrc { crc_at, .. } = &self.log_state {
+            write_crc(*crc_at, &store, table_root).await?;
         }
 
         Ok(TestTable {
@@ -652,6 +819,69 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
         }
         other => panic!("unsupported Arrow type in test data generation: {other:?}"),
     }
+}
+
+// ===========================================================================
+// CRC file generation
+// ===========================================================================
+
+/// Write a CRC file at the given version. Protocol and metadata are always read from
+/// the version 0 commit (assumes P&M doesn't change after table creation).
+pub async fn write_crc(
+    version: u64,
+    store: &Arc<DynObjectStore>,
+    table_root: &str,
+) -> DeltaResult<()> {
+    let commit_path = delta_path_for_version(0, "json");
+    let resolved = crate::resolve_table_path(table_root, &commit_path)
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let data = store
+        .get(&resolved)
+        .await
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let bytes = data
+        .bytes()
+        .await
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let text = String::from_utf8(bytes.to_vec())
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+
+    let mut protocol_json = json!(null);
+    let mut metadata_json = json!(null);
+    for line in text.lines() {
+        let v: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        if let Some(p) = v.get("protocol") {
+            protocol_json = p.clone();
+        }
+        if let Some(m) = v.get("metaData") {
+            metadata_json = m.clone();
+        }
+    }
+
+    let crc = json!({
+        "tableSizeBytes": 0,
+        "numFiles": 0,
+        "numMetadata": 1,
+        "numProtocol": 1,
+        "metadata": metadata_json,
+        "protocol": protocol_json,
+    });
+
+    let crc_path = delta_path_for_version(version, "crc");
+    let resolved = crate::resolve_table_path(table_root, &crc_path)
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    store
+        .put(
+            &resolved,
+            serde_json::to_string(&crc)
+                .map_err(|e| delta_kernel::Error::generic(e.to_string()))?
+                .into(),
+        )
+        .await
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+
+    Ok(())
 }
 
 // ===========================================================================
@@ -957,6 +1187,65 @@ mod tests {
         // All these features require table features (v3/v7).
         assert_eq!(protocol.min_reader_version(), 3);
         assert_eq!(protocol.min_writer_version(), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_v1() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .log_state(LogState::checkpoint_v1(2, 4))
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_v2() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .log_state(LogState::checkpoint_v2(2, 4))
+            .features(FeatureSet::new().v2_checkpoint())
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_and_commits() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .log_state(LogState::checkpoint_and_commits(2, 2))
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_crc() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .log_state(LogState::with_crc(2, 4))
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_all_tables() -> DeltaResult<()> {
+        let tables = TestTableBuilder::all_tables(FeatureSet::empty())?;
+        // 5 log states x 5 feature sets = 25, minus 4 (v2 log without v2 feature)
+        // and minus 2 (v1 log with v2 feature) = 19
+        assert_eq!(tables.len(), 19);
+        for table in &tables {
+            let engine = table.engine();
+            let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+            assert_eq!(snap.version(), 2);
+        }
         Ok(())
     }
 
