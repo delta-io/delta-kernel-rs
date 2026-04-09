@@ -51,10 +51,12 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowS
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -493,58 +495,79 @@ impl TestTableBuilder {
     /// feature, or V1 checkpoint log state with v2Checkpoint feature).
     pub fn all_tables(required: FeatureSet) -> DeltaResult<Vec<TestTable>> {
         let total_versions = 3;
-        let mut tables = Vec::new();
-        for log_state in LogState::all(total_versions) {
-            let needs_v2 = matches!(log_state, LogState::CheckpointV2 { .. });
-            let needs_v1 = matches!(
-                log_state,
-                LogState::CheckpointV1 { .. } | LogState::CheckpointAndCommits { .. }
-            );
-            for base_features in FeatureSet::all() {
-                let features = base_features.merge(&required);
-                if needs_v2 && !features.has_v2_checkpoint() {
-                    continue;
-                }
-                if needs_v1 && features.has_v2_checkpoint() {
-                    continue;
-                }
-                tables.push(
-                    Self::new()
-                        .log_state(log_state.clone())
-                        .features(features)
-                        .build()?,
-                );
-            }
-        }
-        Ok(tables)
-    }
-
-    /// Build the table and return a [`TestTable`] handle to the store.
-    ///
-    /// Safe to call from both sync tests and `#[tokio::test]` -- uses a dedicated runtime
-    /// on a background thread to avoid panicking on nested runtimes.
-    pub fn build(mut self) -> DeltaResult<TestTable> {
-        // Auto-enable v2_checkpoint feature when CheckpointV2 log state is used
-        if matches!(self.log_state, LogState::CheckpointV2 { .. })
-            && !self.features.has_v2_checkpoint()
-        {
-            self.features = self.features.v2_checkpoint();
-        }
+        // Share a single runtime across all table builds to avoid startup overhead.
         std::thread::scope(|s| {
             s.spawn(|| {
-                tokio::runtime::Runtime::new()
-                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?
-                    .block_on(self.build_async())
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+                let mut tables = Vec::new();
+                for log_state in LogState::all(total_versions) {
+                    let needs_v2 = matches!(log_state, LogState::CheckpointV2 { .. });
+                    let needs_v1 = matches!(
+                        log_state,
+                        LogState::CheckpointV1 { .. } | LogState::CheckpointAndCommits { .. }
+                    );
+                    for base_features in FeatureSet::all() {
+                        let features = base_features.merge(&required);
+                        if needs_v2 && !features.has_v2_checkpoint() {
+                            continue;
+                        }
+                        if needs_v1 && features.has_v2_checkpoint() {
+                            continue;
+                        }
+                        tables.push(
+                            Self::new()
+                                .with_log_state(log_state.clone())
+                                .with_features(features)
+                                .build_with_runtime(&rt)?,
+                        );
+                    }
+                }
+                Ok(tables)
             })
             .join()
             .expect("builder thread panicked")
         })
     }
 
+    /// Build the table and return a [`TestTable`] handle to the store.
+    ///
+    /// Safe to call from both sync tests and `#[tokio::test]` -- uses a dedicated runtime
+    /// on a background thread to avoid panicking on nested runtimes.
+    pub fn build(self) -> DeltaResult<TestTable> {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+                self.build_with_runtime(&rt)
+            })
+            .join()
+            .expect("builder thread panicked")
+        })
+    }
+
+    fn build_with_runtime(mut self, rt: &tokio::runtime::Runtime) -> DeltaResult<TestTable> {
+        // Auto-enable v2_checkpoint feature when CheckpointV2 log state is used
+        if matches!(self.log_state, LogState::CheckpointV2 { .. })
+            && !self.features.has_v2_checkpoint()
+        {
+            self.features = self.features.v2_checkpoint();
+        }
+        rt.block_on(self.build_async())
+    }
+
     async fn build_async(self) -> DeltaResult<TestTable> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+        // Use TokioMultiThreadExecutor with the current runtime handle so all builds
+        // share the same runtime instead of each creating its own.
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(store.clone())
+                .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                    tokio::runtime::Handle::current(),
+                )))
+                .build(),
+        );
         let schema = self.schema;
 
         // Version 0: CreateTable
@@ -573,7 +596,7 @@ impl TestTableBuilder {
         for v in 1..total {
             let result = write_data_commit(
                 snapshot.clone(),
-                &engine,
+                engine.as_ref(),
                 self.num_data_files,
                 self.rows_per_file,
                 &self.partition_columns,
@@ -621,9 +644,9 @@ impl TestTableBuilder {
 /// Produces `num_files` parquet files with `rows_per_file` rows each. For partition
 /// columns, all rows in a file share the same value (matching the declared partition
 /// values); non-partition columns get varying data.
-async fn write_data_commit(
+async fn write_data_commit<E: delta_kernel::engine::default::executor::TaskExecutor>(
     snapshot: Arc<Snapshot>,
-    engine: &DefaultEngine<TokioBackgroundExecutor>,
+    engine: &DefaultEngine<E>,
     num_files: usize,
     rows_per_file: usize,
     partition_columns: &[String],
@@ -1193,7 +1216,7 @@ mod tests {
     #[test]
     fn test_checkpoint_v1() -> DeltaResult<()> {
         let table = TestTableBuilder::new()
-            .log_state(LogState::checkpoint_v1(2, 4))
+            .with_log_state(LogState::checkpoint_v1(2, 4))
             .build()?;
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
@@ -1204,8 +1227,8 @@ mod tests {
     #[test]
     fn test_checkpoint_v2() -> DeltaResult<()> {
         let table = TestTableBuilder::new()
-            .log_state(LogState::checkpoint_v2(2, 4))
-            .features(FeatureSet::new().v2_checkpoint())
+            .with_log_state(LogState::checkpoint_v2(2, 4))
+            .with_features(FeatureSet::new().v2_checkpoint())
             .build()?;
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
@@ -1216,7 +1239,7 @@ mod tests {
     #[test]
     fn test_checkpoint_and_commits() -> DeltaResult<()> {
         let table = TestTableBuilder::new()
-            .log_state(LogState::checkpoint_and_commits(2, 2))
+            .with_log_state(LogState::checkpoint_and_commits(2, 2))
             .build()?;
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
@@ -1227,7 +1250,7 @@ mod tests {
     #[test]
     fn test_with_crc() -> DeltaResult<()> {
         let table = TestTableBuilder::new()
-            .log_state(LogState::with_crc(2, 4))
+            .with_log_state(LogState::with_crc(2, 4))
             .build()?;
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
