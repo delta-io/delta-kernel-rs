@@ -26,7 +26,7 @@
 //!   typed `Scalar` values to protocol-compliant strings for `add.partitionValues`. Null,
 //!   empty string, and empty binary all serialize as JSON `null`.
 //!
-//! - **Step 3: Path encoding** ([`hive`] module): percent-encodes serialized strings for
+//! - **Step 3: Path encoding** (`hive` module): percent-encodes serialized strings for
 //!   Hive-style filesystem directory names. Only a small set of ASCII characters is
 //!   encoded; spaces and non-ASCII pass through raw. Hive-style paths are optional; the
 //!   Delta protocol does not require them. Kernel uses them for partitioned tables without
@@ -156,4 +156,4 @@
 //! becomes unparseable. In kernel, `escape_partition_value` takes `&str`, so Rust's type
 //! system prevents non-UTF-8 bytes from reaching the encoding layer.
 
-pub mod hive;
+pub(crate) mod hive;

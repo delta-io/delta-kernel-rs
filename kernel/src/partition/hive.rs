@@ -24,6 +24,8 @@
 //! [hive]: https://github.com/apache/hive/blob/trunk/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
 //! [spark]: https://github.com/apache/spark/blob/master/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/catalog/ExternalCatalogUtils.scala
 
+#![allow(dead_code)]
+
 use std::borrow::Cow;
 
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
@@ -37,7 +39,7 @@ const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 /// INSERT INTO t VALUES (2, '');     --> p=__HIVE_DEFAULT_PARTITION__/...
 /// INSERT INTO t VALUES (3, 'US');   --> p=US/...
 /// ```
-pub const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
+pub(crate) const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 const HIVE_DEFAULT_PARTITION_LEN: usize = HIVE_DEFAULT_PARTITION.len();
 
 /// Percent-encodes a string for use in a Hive-style partition path segment.
@@ -80,8 +82,8 @@ pub(crate) fn escape_partition_value(s: &str) -> Cow<'_, str> {
 /// Returns `col1=val1/col2=val2/` with both names and values percent-encoded.
 /// Missing values (`None` or empty string) use [`HIVE_DEFAULT_PARTITION`].
 ///
-/// ```
-/// use delta_kernel::partition::hive::build_partition_path;
+/// ```ignore
+/// use crate::partition::hive::build_partition_path;
 ///
 /// let path = build_partition_path(&[("country", Some("US")), ("year", Some("2025"))]);
 /// assert_eq!(path, "country=US/year=2025/");
@@ -91,7 +93,7 @@ pub(crate) fn escape_partition_value(s: &str) -> Cow<'_, str> {
 /// assert_eq!(null_path, empty_path);
 /// assert_eq!(null_path, "col=__HIVE_DEFAULT_PARTITION__/");
 /// ```
-pub fn build_partition_path(columns: &[(&str, Option<&str>)]) -> String {
+pub(crate) fn build_partition_path(columns: &[(&str, Option<&str>)]) -> String {
     // Lower-bound capacity: exact when no escaping needed (the common case for
     // partition names and most values like dates, integers, short strings).
     let cap: usize = columns
@@ -205,17 +207,13 @@ mod tests {
     #[case("/=%", "%2F%3D%25")] // 53
     #[case("a{b", "a%7Bb")] // 54
     #[case("a}b", "a}b")] // 55
-    #[case("hello world", "hello world")] // 56
     #[case("M\u{00FC}nchen", "M\u{00FC}nchen")] // 57
     #[case("\u{65E5}\u{672C}\u{8A9E}", "\u{65E5}\u{672C}\u{8A9E}")] // 58
     #[case("\u{1F3B5}\u{1F3B6}", "\u{1F3B5}\u{1F3B6}")] // 59
-    #[case("a<b>c|d", "a<b>c|d")] // 60
     #[case("a@b!c(d)", "a@b!c(d)")] // 61
     #[case("a&b+c$d;e,f", "a&b+c$d;e,f")] // 62
     #[case("Serbia/srb%", "Serbia%2Fsrb%25")] // 63
     #[case("100%25", "100%2525")] // 64
-    #[case(" ", " ")] // 67
-    #[case("  ", "  ")] // 68
     fn test_escape_table_rows(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(escape_partition_value(input), expected);
     }
@@ -246,15 +244,12 @@ mod tests {
         assert_eq!(escape_partition_value(input), expected);
     }
 
-    /// Chars NOT in the escape set (RFC 3986 reserved, space, non-ASCII, `}`).
+    /// Chars NOT in the escape set on any platform.
     #[rstest]
     #[case("", "")]
     #[case("US", "US")]
     #[case("2024-01-15", "2024-01-15")]
     #[case("}", "}")]
-    #[case("<", "<")]
-    #[case(">", ">")]
-    #[case("|", "|")]
     #[case("~", "~")]
     #[case("@", "@")]
     #[case("!", "!")]
@@ -374,18 +369,57 @@ mod tests {
     }
 
     // ============================================================================
-    // Windows-specific escaping
+    // Platform-sensitive chars (space, <, >, |)
     // ============================================================================
 
+    /// On non-Windows, space/</>/| pass through unescaped (rows 56, 60, 67, 68).
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_escape_platform_sensitive_chars_pass_through() {
+        assert_eq!(escape_partition_value(" "), " ");
+        assert_eq!(escape_partition_value("  "), "  ");
+        assert_eq!(escape_partition_value("hello world"), "hello world");
+        assert_eq!(escape_partition_value("<"), "<");
+        assert_eq!(escape_partition_value(">"), ">");
+        assert_eq!(escape_partition_value("|"), "|");
+        assert_eq!(escape_partition_value("a<b>c|d"), "a<b>c|d");
+    }
+
+    /// On non-Windows, build_partition_path preserves spaces (rows 56, 67, 68).
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_build_path_platform_sensitive_chars_pass_through() {
+        assert_eq!(
+            build_partition_path(&[("p", Some("hello world"))]),
+            "p=hello world/"
+        );
+        assert_eq!(build_partition_path(&[("p", Some(" "))]), "p= /");
+        assert_eq!(build_partition_path(&[("p", Some("  "))]), "p=  /");
+    }
+
+    /// On Windows, space/</>/| are escaped.
     #[cfg(target_os = "windows")]
     #[test]
     fn test_escape_windows_special_chars_are_escaped() {
         assert_eq!(escape_partition_value(" "), "%20");
+        assert_eq!(escape_partition_value("  "), "%20%20");
+        assert_eq!(escape_partition_value("hello world"), "hello%20world");
         assert_eq!(escape_partition_value("<"), "%3C");
         assert_eq!(escape_partition_value(">"), "%3E");
         assert_eq!(escape_partition_value("|"), "%7C");
-        assert_eq!(escape_partition_value("a b"), "a%20b");
         assert_eq!(escape_partition_value("a<b>c|d"), "a%3Cb%3Ec%7Cd");
+    }
+
+    /// On Windows, build_partition_path escapes spaces.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_build_path_windows_escapes_spaces() {
+        assert_eq!(
+            build_partition_path(&[("p", Some("hello world"))]),
+            "p=hello%20world/"
+        );
+        assert_eq!(build_partition_path(&[("p", Some(" "))]), "p=%20/");
+        assert_eq!(build_partition_path(&[("p", Some("  "))]), "p=%20%20/");
     }
 
     // ============================================================================
@@ -479,13 +513,10 @@ mod tests {
     #[case("p", Some("/=%"), "p=%2F%3D%25/")] // 53
     #[case("p", Some("a{b"), "p=a%7Bb/")] // 54
     #[case("p", Some("a}b"), "p=a}b/")] // 55
-    #[case("p", Some("hello world"), "p=hello world/")] // 56
     #[case("p", Some("M\u{00FC}nchen"), "p=M\u{00FC}nchen/")] // 57
     #[case("p", Some("Serbia/srb%"), "p=Serbia%2Fsrb%25/")] // 63
     #[case("p", Some("100%25"), "p=100%2525/")] // 64
     #[case("p", None, "p=__HIVE_DEFAULT_PARTITION__/")] // 66: NULL
-    #[case("p", Some(" "), "p= /")] // 67
-    #[case("p", Some("  "), "p=  /")] // 68
     fn test_build_path_table_rows(
         #[case] name: &str,
         #[case] value: Option<&str>,
