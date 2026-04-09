@@ -73,7 +73,8 @@ pub fn execute_read_workload(
     // Extract and parse the predicate if one is present
     let predicate = if let Some(ref predicate_string) = read_spec.predicate {
         let predicate = parse_predicate(predicate_string, &table_schema).map_err(Error::generic)?;
-        scan_builder = scan_builder.with_predicate(Arc::new(predicate.clone()));
+        let predicate = Arc::new(predicate);
+        scan_builder = scan_builder.with_predicate(predicate.clone());
         Some(predicate)
     } else {
         None
@@ -92,7 +93,7 @@ pub fn execute_read_workload(
         .execute(engine)?
         .map(|data| data?.try_into_record_batch())
         .try_collect()?;
-    let batches = filter_batches_with_predicate(batches, predicate.as_ref())?;
+    let batches = filter_batches_with_predicate(batches, predicate.as_deref())?;
 
     // Compute row count from filtered batches
     let row_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
