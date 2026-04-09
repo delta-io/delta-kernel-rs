@@ -22,7 +22,36 @@ enum CommitSource {
     Catalog,
 }
 
-// create test storage given list of log files with custom data content
+fn log_path_for_file_type(version: Version, file_type: &LogPathFileType) -> String {
+    match file_type {
+        LogPathFileType::Commit => {
+            format!("_delta_log/{version:020}.json")
+        }
+        LogPathFileType::StagedCommit => {
+            let uuid = uuid::Uuid::new_v4();
+            format!("_delta_log/_staged_commits/{version:020}.{uuid}.json")
+        }
+        LogPathFileType::SinglePartCheckpoint => {
+            format!("_delta_log/{version:020}.checkpoint.parquet")
+        }
+        LogPathFileType::MultiPartCheckpoint {
+            part_num,
+            num_parts,
+        } => {
+            format!("_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet")
+        }
+        LogPathFileType::Crc => {
+            format!("_delta_log/{version:020}.crc")
+        }
+        LogPathFileType::CompactedCommit { hi } => {
+            format!("_delta_log/{version:020}.{hi:020}.compacted.json")
+        }
+        LogPathFileType::UuidCheckpoint | LogPathFileType::Unknown => {
+            panic!("Unsupported file type in test: {file_type:?}")
+        }
+    }
+}
+
 async fn create_storage(
     log_files: Vec<(Version, LogPathFileType, CommitSource)>,
 ) -> (Box<dyn StorageHandler>, Url) {
@@ -30,35 +59,7 @@ async fn create_storage(
     let log_root = Url::parse("memory:///_delta_log/").unwrap();
 
     for (version, file_type, source) in log_files {
-        let path = match file_type {
-            LogPathFileType::Commit => {
-                format!("_delta_log/{version:020}.json")
-            }
-            LogPathFileType::StagedCommit => {
-                let uuid = uuid::Uuid::new_v4();
-                format!("_delta_log/_staged_commits/{version:020}.{uuid}.json")
-            }
-            LogPathFileType::SinglePartCheckpoint => {
-                format!("_delta_log/{version:020}.checkpoint.parquet")
-            }
-            LogPathFileType::MultiPartCheckpoint {
-                part_num,
-                num_parts,
-            } => {
-                format!(
-                    "_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet"
-                )
-            }
-            LogPathFileType::Crc => {
-                format!("_delta_log/{version:020}.crc")
-            }
-            LogPathFileType::CompactedCommit { hi } => {
-                format!("_delta_log/{version:020}.{hi:020}.compacted.json")
-            }
-            LogPathFileType::UuidCheckpoint | LogPathFileType::Unknown => {
-                panic!("Unsupported file type in test: {file_type:?}")
-            }
-        };
+        let path = log_path_for_file_type(version, &file_type);
         let data = match source {
             CommitSource::Filesystem => bytes::Bytes::from("filesystem"),
             CommitSource::Catalog => bytes::Bytes::from("catalog"),
@@ -851,6 +852,197 @@ async fn backward_scan_log_tail_defines_latest_version() {
     }
     assert_eq!(result.latest_commit_file.unwrap().version, 4);
     assert_eq!(result.max_published_version, Some(5));
+}
+
+// ===== empty (0-byte) log file detection tests =====
+
+/// Creates storage where some files can be empty (0 bytes). Each entry is
+/// (version, file_type, is_empty). Non-empty files get placeholder content.
+async fn create_storage_with_empty_files(
+    log_files: Vec<(Version, LogPathFileType, bool)>,
+) -> (Box<dyn StorageHandler>, Url) {
+    let store = Arc::new(InMemory::new());
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+
+    for (version, file_type, is_empty) in log_files {
+        let path = log_path_for_file_type(version, &file_type);
+        let data = if is_empty {
+            bytes::Bytes::new()
+        } else {
+            bytes::Bytes::from("placeholder")
+        };
+        store
+            .put(&ObjectPath::from(path.as_str()), data.into())
+            .await
+            .expect("Failed to put test file");
+    }
+
+    let executor = Arc::new(TokioBackgroundExecutor::new());
+    let storage = Box::new(ObjectStoreStorageHandler::new(store, executor, None));
+    (storage, log_root)
+}
+
+// v2.json is 0 bytes -> kept in listing (commits are source of truth, not skipped)
+#[tokio::test]
+async fn test_zero_byte_commit_kept_in_listing() {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, false),
+        (1, LogPathFileType::Commit, false),
+        (2, LogPathFileType::Commit, true), // empty but still listed
+    ];
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+
+    let result =
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+    assert_eq!(result.ascending_commit_files.len(), 3);
+    assert_eq!(result.ascending_commit_files[0].version, 0);
+    assert_eq!(result.ascending_commit_files[1].version, 1);
+    assert_eq!(result.ascending_commit_files[2].version, 2);
+    assert_eq!(result.ascending_commit_files[2].location.size, 0);
+}
+
+// 0.4.compacted.json is 0 bytes -> skipped, individual commits v0-v4 used instead
+#[rstest]
+#[case::forward_list(false)]
+#[case::backward_scan(true)]
+#[tokio::test]
+async fn test_zero_byte_compaction_skipped_commits_used(#[case] use_backward_scan: bool) {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, false),
+        (1, LogPathFileType::Commit, false),
+        (2, LogPathFileType::Commit, false),
+        (3, LogPathFileType::Commit, false),
+        (4, LogPathFileType::Commit, false),
+        (
+            0,
+            LogPathFileType::CompactedCommit { hi: 4 },
+            true, // empty compaction
+        ),
+    ];
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+
+    let result = if use_backward_scan {
+        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 4)
+            .unwrap()
+    } else {
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(4)).unwrap()
+    };
+
+    assert!(
+        result.ascending_compaction_files.is_empty(),
+        "0-byte compaction should have been skipped"
+    );
+    assert_eq!(result.ascending_commit_files.len(), 5);
+    for (i, commit) in result.ascending_commit_files.iter().enumerate() {
+        assert_eq!(commit.version, i as u64);
+    }
+}
+
+// v10.checkpoint.parquet is 0 bytes -> skipped, falls back to valid checkpoint at v5
+#[rstest]
+#[case::forward_list(false)]
+#[case::backward_scan(true)]
+#[tokio::test]
+async fn test_zero_byte_checkpoint_skipped_older_used(#[case] use_backward_scan: bool) {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, false),
+        (1, LogPathFileType::Commit, false),
+        (2, LogPathFileType::Commit, false),
+        (3, LogPathFileType::Commit, false),
+        (4, LogPathFileType::Commit, false),
+        (5, LogPathFileType::Commit, false),
+        (6, LogPathFileType::Commit, false),
+        (7, LogPathFileType::Commit, false),
+        (8, LogPathFileType::Commit, false),
+        (9, LogPathFileType::Commit, false),
+        (10, LogPathFileType::Commit, false),
+        (5, LogPathFileType::SinglePartCheckpoint, false), // valid checkpoint
+        (10, LogPathFileType::SinglePartCheckpoint, true), // empty checkpoint
+    ];
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+
+    let result = if use_backward_scan {
+        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 10)
+            .unwrap()
+    } else {
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(10)).unwrap()
+    };
+
+    // Should fall back to checkpoint at v5 (the empty v10 checkpoint is skipped)
+    assert_eq!(result.checkpoint_parts.len(), 1);
+    assert_eq!(result.checkpoint_parts[0].version, 5);
+
+    // Commits after checkpoint v5: v6 through v10
+    assert_eq!(result.ascending_commit_files.len(), 5);
+    assert_eq!(result.ascending_commit_files[0].version, 6);
+    assert_eq!(result.ascending_commit_files[4].version, 10);
+}
+
+// v2.crc is 0 bytes -> kept (CRC is optional, may report size 0 on some platforms)
+#[tokio::test]
+async fn test_zero_byte_crc_kept() {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, false),
+        (1, LogPathFileType::Commit, false),
+        (2, LogPathFileType::Commit, false),
+        (1, LogPathFileType::Crc, false), // valid CRC
+        (2, LogPathFileType::Crc, true),  // empty CRC, still kept
+    ];
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+
+    let result =
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+
+    // The 0-byte CRC at v2 is kept (latest_crc_file tracks the highest version)
+    let crc = result.latest_crc_file.unwrap();
+    assert_eq!(crc.version, 2);
+}
+
+// v1005.checkpoint.parquet is 0 bytes in window 1 -> scan continues to window 2,
+// finds valid checkpoint at v5. Verifies the fix in find_complete_checkpoint_version.
+#[tokio::test]
+async fn test_zero_byte_checkpoint_backward_scan_crosses_windows() {
+    // Commits v0..=1005, valid checkpoint at v5, 0-byte checkpoint at v1005.
+    // Window 1 [6, 1006): sees 0-byte checkpoint at v1005, must NOT stop.
+    // Window 2 [0, 6): finds valid checkpoint at v5 -> stop.
+    let mut log_files: Vec<(Version, LogPathFileType, bool)> = (0u64..=1005)
+        .map(|v| (v, LogPathFileType::Commit, false))
+        .collect();
+    log_files.push((5, LogPathFileType::SinglePartCheckpoint, false));
+    log_files.push((1005, LogPathFileType::SinglePartCheckpoint, true));
+
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+    let counter = CountingStorageHandler::new(storage);
+
+    let result =
+        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
+            .unwrap();
+
+    // Needed 2 windows because the 0-byte checkpoint at v1005 was skipped
+    assert_eq!(counter.call_count(), 2);
+    assert_eq!(result.checkpoint_parts.len(), 1);
+    assert_eq!(result.checkpoint_parts[0].version, 5);
+    // Commits after checkpoint v5: v6 through v1005
+    assert_eq!(result.ascending_commit_files.len(), 1000);
+    assert_eq!(result.ascending_commit_files[0].version, 6);
+    assert_eq!(result.ascending_commit_files[999].version, 1005);
+}
+
+// 0-byte commit in list_commits -> kept (commits are source of truth, not skipped)
+#[tokio::test]
+async fn test_list_commits_zero_byte_commit_kept() {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, false),
+        (1, LogPathFileType::Commit, false),
+        (2, LogPathFileType::Commit, true), // empty but still listed
+    ];
+    let (storage, log_root) = create_storage_with_empty_files(log_files).await;
+
+    let result =
+        LogSegmentFiles::list_commits(storage.as_ref(), &log_root, Some(0), Some(2)).unwrap();
+    assert_eq!(result.ascending_commit_files.len(), 3);
+    assert_eq!(result.ascending_commit_files[2].version, 2);
+    assert_eq!(result.ascending_commit_files[2].location.size, 0);
 }
 
 // ===== find_complete_checkpoint_version direct unit tests (other cases already covered by tests above) =====

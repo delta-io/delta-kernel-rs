@@ -1573,7 +1573,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
             ParsedLogPath::try_from(FileMeta {
                 location: table_root.join(path.as_ref()).unwrap(),
                 last_modified: 0,
-                size: 0,
+                size: 100,
             })
             .unwrap()
             .unwrap()
@@ -1969,6 +1969,50 @@ async fn test_commit_cover_minimal_overlap() {
         ],
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_commit_cover_zero_byte_compaction_uses_commits() {
+    let store = Arc::new(InMemory::new());
+
+    let commit_data = bytes::Bytes::from("kernel-data");
+    for v in 0..=4u64 {
+        let path = delta_path_for_version(v, "json");
+        store
+            .put(&path, commit_data.clone().into())
+            .await
+            .expect("put commit");
+    }
+    // Write a 0-byte compaction file covering v0-v4
+    let compaction_path = compacted_log_path_for_versions(0, 4, "json");
+    store
+        .put(&compaction_path, bytes::Bytes::new().into())
+        .await
+        .expect("put empty compaction");
+
+    let storage =
+        ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), None);
+    let table_root = Url::parse("memory:///").expect("valid url");
+    let log_root = table_root.join("_delta_log/").unwrap();
+
+    let log_segment =
+        LogSegment::for_snapshot_impl(&storage, log_root.clone(), vec![], None, None).unwrap();
+
+    assert_eq!(
+        log_segment.listed.ascending_compaction_files.len(),
+        0,
+        "0-byte compaction should have been filtered at listing time"
+    );
+
+    let cover = log_segment.find_commit_cover();
+    assert_eq!(cover.len(), 5);
+    for (i, file) in cover.iter().enumerate() {
+        let expected_version = 4 - i as u64;
+        let expected_url = log_root
+            .join(&format!("{expected_version:020}.json"))
+            .unwrap();
+        assert_eq!(file.location, expected_url);
+    }
 }
 
 #[test]
