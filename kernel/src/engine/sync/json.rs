@@ -1,11 +1,11 @@
-use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Cursor, Write};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tempfile::NamedTempFile;
 use url::Url;
 
-use super::read_files;
+use super::{read_files, read_files_from_store};
 use crate::arrow::json::ReaderBuilder;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
@@ -13,28 +13,52 @@ use crate::engine::arrow_utils::{
     to_json_bytes,
 };
 use crate::engine_data::FilteredEngineData;
+use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
 
-pub(crate) struct SyncJsonHandler;
+pub(crate) struct SyncJsonHandler {
+    store: Option<Arc<DynObjectStore>>,
+}
+
+impl SyncJsonHandler {
+    pub(crate) fn new() -> Self {
+        Self { store: None }
+    }
+
+    pub(crate) fn with_store(store: Arc<DynObjectStore>) -> Self {
+        Self { store: Some(store) }
+    }
+}
 
 fn try_create_from_json(
-    file: File,
+    file: std::fs::File,
     schema: SchemaRef,
     _predicate: Option<PredicateRef>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    // Build Arrow schema from only the real JSON columns, omitting any metadata columns
-    // (e.g. FilePath) that the JSON reader cannot populate from the file content.
     let json_schema = Arc::new(json_arrow_schema(&schema)?);
-    // Build the reorder index vec once; apply it to every batch to re-insert synthesized metadata
-    // columns (e.g. file path) at their schema positions.
     let reorder_indices = build_json_reorder_indices(&schema)?;
     let json = ReaderBuilder::new(json_schema)
         .with_coerce_primitive(true)
         .build(BufReader::new(file))?
+        .map(move |data| fixup_json_read(data?, &reorder_indices, &file_location));
+    Ok(json)
+}
+
+fn try_create_from_json_bytes(
+    data: Bytes,
+    schema: SchemaRef,
+    _predicate: Option<PredicateRef>,
+    file_location: String,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
+    let json_schema = Arc::new(json_arrow_schema(&schema)?);
+    let reorder_indices = build_json_reorder_indices(&schema)?;
+    let json = ReaderBuilder::new(json_schema)
+        .with_coerce_primitive(true)
+        .build(BufReader::new(Cursor::new(data)))?
         .map(move |data| fixup_json_read(data?, &reorder_indices, &file_location));
     Ok(json)
 }
@@ -46,6 +70,15 @@ impl JsonHandler for SyncJsonHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        if let Some(store) = &self.store {
+            return read_files_from_store(
+                files,
+                schema,
+                predicate,
+                store.clone(),
+                try_create_from_json_bytes,
+            );
+        }
         read_files(files, schema, predicate, try_create_from_json)
     }
 
@@ -57,15 +90,36 @@ impl JsonHandler for SyncJsonHandler {
         arrow_parse_json(json_strings, output_schema)
     }
 
-    // For sync writer we write data to a tmp file then atomically rename it to the final path.
-    // This is highly OS-dependent and for now relies on the atomicity of tempfile's
-    // `persist_noclobber`.
     fn write_json_file(
         &self,
         path: &Url,
         data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         overwrite: bool,
     ) -> DeltaResult<()> {
+        let buf = to_json_bytes(data)?;
+
+        if let Some(store) = &self.store {
+            let object_path = crate::object_store::path::Path::from(path.path());
+            let opts = if overwrite {
+                crate::object_store::PutOptions::default()
+            } else {
+                crate::object_store::PutOptions {
+                    mode: crate::object_store::PutMode::Create,
+                    ..Default::default()
+                }
+            };
+            super::block_on_async(store.put_opts(&object_path, buf.into(), opts)).map_err(|e| {
+                match e {
+                    crate::object_store::Error::AlreadyExists { .. } => {
+                        Error::FileAlreadyExists(path.to_string())
+                    }
+                    other => Error::generic(other.to_string()),
+                }
+            })?;
+            return Ok(());
+        }
+
+        // Local filesystem path
         let path = path
             .to_file_path()
             .map_err(|_| crate::Error::generic("sync client can only read local files"))?;
@@ -79,20 +133,16 @@ impl JsonHandler for SyncJsonHandler {
             std::fs::create_dir_all(parent)?;
         }
 
-        // write data to tmp file
         let mut tmp_file = NamedTempFile::new_in(parent)?;
-        let buf = to_json_bytes(data)?;
         tmp_file.write_all(&buf)?;
         tmp_file.flush()?;
 
         let persist_result = if overwrite {
             tmp_file.persist(path.clone())
         } else {
-            // use 'persist_noclobber' to atomically rename tmp file to final path
             tmp_file.persist_noclobber(path.clone())
         };
 
-        // Map errors (handling AlreadyExists only in non-overwrite mode).
         persist_result.map_err(|e| {
             if !overwrite && e.error.kind() == std::io::ErrorKind::AlreadyExists {
                 Error::FileAlreadyExists(path.to_string_lossy().to_string())
@@ -152,7 +202,7 @@ mod tests {
     fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
         let test_dir = TempDir::new().unwrap();
         let path = test_dir.path().join("00000000000000000001.json");
-        let handler = SyncJsonHandler;
+        let handler = SyncJsonHandler::new();
         let url = Url::from_file_path(&path).unwrap();
 
         // First write with no existing file
