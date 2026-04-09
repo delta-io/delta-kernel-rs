@@ -114,6 +114,12 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   or inputs. Prefer `#[case]` over duplicating test functions. When parameters are
   independent and form a cartesian product, prefer `#[values]` over enumerating
   every combination with `#[case]`.
+- Actively look for rstest consolidation opportunities: when writing multiple tests
+  that share the same setup/flow and differ only in configuration and expected
+  outcome, write one parameterized rstest instead of separate functions. Also check
+  whether a new test duplicates the flow of an existing nearby test and should be
+  merged into it as a new `#[case]`. A common pattern is toggling a feature (e.g.
+  column mapping on/off) and asserting success vs. error.
 - Reuse helpers from `test_utils` instead of writing custom ones when possible.
 - **`add_commit` and table setup in tests:** `add_commit` takes a `table_root` string and
   resolves it to an absolute object-store path. The `table_root` must be a proper URL string
