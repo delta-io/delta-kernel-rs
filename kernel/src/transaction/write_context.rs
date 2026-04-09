@@ -7,7 +7,7 @@ use rand::Rng;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::expressions::{ColumnName, ExpressionRef};
-use crate::partition::build_partition_path;
+use crate::partition::hive::build_partition_path;
 use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
 
@@ -34,14 +34,22 @@ pub(super) struct SharedWriteState {
 /// Note: clustered tables are unpartitioned and use `unpartitioned_write_context`.
 ///
 /// Contains both table-wide state (shared cheaply via `Arc`) and per-partition state
-/// (serialized partition values with physical column names as keys). Pass this to
-/// [`DefaultEngine::write_parquet`] to write data files with correctly formatted partition
-/// metadata.
+/// (serialized partition values with physical column names as keys). How you use a
+/// `WriteContext` depends on your engine:
 ///
-/// For custom engines that bypass `DefaultEngine`, use [`physical_partition_values`] to build
-/// the `partitionValues` map in Add actions.
+/// - **`DefaultEngine` consumers**: pass this to [`DefaultEngine::write_parquet`], which
+///   handles everything (transform, write, partition metadata).
+/// - **Arrow-based custom engines**: write parquet yourself, then call
+///   [`build_add_file_metadata`] with the resulting `DataFileMetadata` and this
+///   `WriteContext` to produce the Add action `EngineData` for [`Transaction::add_files`].
+/// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
+///   `partitionValues` map in Add actions directly.
 ///
+/// [`Transaction::partitioned_write_context`]: super::Transaction::partitioned_write_context
+/// [`Transaction::unpartitioned_write_context`]: super::Transaction::unpartitioned_write_context
 /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
+/// [`build_add_file_metadata`]: crate::engine::default::build_add_file_metadata
+/// [`Transaction::add_files`]: super::Transaction::add_files
 /// [`physical_partition_values`]: WriteContext::physical_partition_values
 #[derive(Debug)]
 pub struct WriteContext {
@@ -58,39 +66,19 @@ impl WriteContext {
         &self.shared.target_dir
     }
 
-    /// Returns the recommended target directory where data files for this partition should be
-    /// written. Data files can technically live under any path within the table root, but using
-    /// this method produces the conventional directory layout that other engines expect.
-    ///
-    /// The directory structure depends on the table's column mapping mode:
-    ///
-    /// | | Not Partitioned | Partitioned |
-    /// |---|---|---|
-    /// | **CM OFF** | `<table_root>/` | `<table_root>/col=val/.../` |
-    /// | **CM ON** | `<table_root>/<2char>/` | `<table_root>/<2char>/` |
-    ///
-    /// With column mapping OFF and partitioned tables, the path uses **logical** column names
-    /// and Hive-style encoding (matching Delta-Spark). With column mapping ON, a random 2-character
-    /// alphanumeric prefix is used unconditionally (matching Delta-Spark's
-    /// `getRandomPrefix`). Column mapping forces random prefixes to avoid S3 hotspots and
-    /// to prevent leaking physical UUID column names into directory paths.
-    ///
-    /// Each call generates a fresh random prefix when column mapping is enabled, matching
-    /// Delta-Spark's per-file prefix behavior. The engine appends the filename (e.g.,
-    /// `<uuid>.parquet`) to this directory to form the full file path.
-    ///
-    /// # Examples
+    /// Returns the recommended directory for writing data files. Not required (data files
+    /// can live anywhere under the table root), but produces the conventional layout.
     ///
     /// ```text
-    /// // CM OFF, partitioned: year=2024, region=US
-    /// write_dir() -> "s3://bucket/table/year=2024/region=US/"
-    ///
-    /// // CM OFF, not partitioned
-    /// write_dir() -> "s3://bucket/table/"
-    ///
-    /// // CM ON (partitioned or not)
-    /// write_dir() -> "s3://bucket/table/3v/"
+    ///              | CM OFF                        | CM ON
+    /// -------------|-------------------------------|---------------------------
+    /// Unpartitioned| <table_root>/                 | <table_root>/<2char>/
+    /// Partitioned  | <table_root>/col=val/.../     | <table_root>/<2char>/
     /// ```
+    ///
+    /// CM ON uses a random 2-char alphanumeric prefix (matching Delta-Spark's
+    /// `getRandomPrefix`) to avoid S3 hotspots. Each call generates a fresh prefix,
+    /// matching Delta-Spark's per-file behavior.
     // TODO(#2357): respect `delta.randomizeFilePrefixes` and `delta.randomPrefixLength`
     // table properties. Currently random prefixes are only used when column mapping is on.
     pub fn write_dir(&self) -> Url {
@@ -105,9 +93,8 @@ impl WriteContext {
                 }
             }
             ColumnMappingMode::Id | ColumnMappingMode::Name => {
-                // Column mapping ON: use a random 2-char alphanumeric prefix (matching
-                // Delta-Spark's getRandomPrefix). This avoids S3 hotspots and prevents leaking
-                // physical UUID column names into directory paths.
+                // Column mapping ON: random 2-char prefix avoids S3 hotspots and avoids
+                // exposing physical UUID column names in Hive-style directory paths.
                 let prefix = random_alphanumeric_prefix();
                 url.set_path(&format!("{}{}/", url.path(), prefix));
             }
@@ -121,7 +108,8 @@ impl WriteContext {
         &self.shared.logical_schema
     }
 
-    /// Returns the physical schema (partition columns removed, column mapping applied).
+    /// Returns the physical schema (partition columns removed if applicable, column mapping
+    /// applied). Partition columns are kept when `materializePartitionColumns` is enabled.
     pub fn physical_schema(&self) -> &SchemaRef {
         &self.shared.physical_schema
     }
@@ -152,8 +140,8 @@ impl WriteContext {
     }
 
     /// Builds the Hive-style partition path suffix (e.g., `year=2024/region=US/`).
-    /// Only called when column mapping is OFF, where physical name == logical name, so
-    /// the same name is used both as the path segment and the partition values map key.
+    /// Builds the Hive-style partition path suffix (e.g., `year=2024/region=US/`).
+    /// Only called when column mapping is OFF.
     fn hive_partition_path_suffix(&self) -> String {
         debug_assert!(
             self.shared.column_mapping_mode == ColumnMappingMode::None,
@@ -212,4 +200,139 @@ fn random_alphanumeric_prefix() -> String {
     (0..2)
         .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expressions::Expression;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use rstest::rstest;
+
+    use crate::schema::{DataType, StructField, StructType};
+
+    fn make_write_context(
+        cm_mode: ColumnMappingMode,
+        partition_columns: Vec<String>,
+        partition_values: HashMap<String, Option<String>>,
+    ) -> WriteContext {
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
+        let shared = Arc::new(SharedWriteState {
+            target_dir: Url::parse("s3://bucket/table/").unwrap(),
+            logical_schema: schema.clone(),
+            physical_schema: schema.clone(),
+            logical_to_physical: Arc::new(Expression::literal(true)),
+            column_mapping_mode: cm_mode,
+            stats_columns: vec![],
+            logical_partition_columns: partition_columns,
+        });
+        WriteContext {
+            shared,
+            physical_partition_values: partition_values,
+        }
+    }
+
+    /// Tests the cross product of ColumnMappingMode x partitioned/unpartitioned.
+    #[rstest]
+    fn test_write_dir_structure(
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        cm_mode: ColumnMappingMode,
+        #[values(true, false)] is_partitioned: bool,
+    ) {
+        let (cols, pvs) = if is_partitioned {
+            (
+                vec!["year".into(), "month".into()],
+                HashMap::from([
+                    ("year".into(), Some("2024".into())),
+                    ("month".into(), Some("03".into())),
+                ]),
+            )
+        } else {
+            (vec![], HashMap::new())
+        };
+        let wc = make_write_context(cm_mode, cols, pvs);
+        let path = wc.write_dir().path().to_string();
+
+        match cm_mode {
+            ColumnMappingMode::None if !is_partitioned => {
+                assert_eq!(
+                    path, "/table/",
+                    "CM off, unpartitioned: should be table root"
+                );
+            }
+            ColumnMappingMode::None => {
+                assert_eq!(
+                    path, "/table/year=2024/month=03/",
+                    "CM off, partitioned: full Hive-style path"
+                );
+            }
+            ColumnMappingMode::Name | ColumnMappingMode::Id => {
+                assert!(
+                    !path.contains("year="),
+                    "CM on: should NOT contain Hive-style dirs, got: {path}"
+                );
+                // Path should be /table/<2-char-alphanumeric>/ regardless of partitioning.
+                let prefix_dir = path
+                    .strip_prefix("/table/")
+                    .unwrap()
+                    .strip_suffix('/')
+                    .unwrap();
+                assert_eq!(
+                    prefix_dir.len(),
+                    2,
+                    "expected 2-char prefix, got: {prefix_dir}"
+                );
+                assert!(
+                    prefix_dir.chars().all(|c| c.is_ascii_alphanumeric()),
+                    "prefix should be alphanumeric, got: {prefix_dir}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_write_dir_cm_on_generates_different_prefixes_per_call() {
+        let wc = make_write_context(ColumnMappingMode::Name, vec![], HashMap::new());
+        let dirs: Vec<String> = (0..20).map(|_| wc.write_dir().path().to_string()).collect();
+        let unique: HashSet<_> = dirs.iter().collect();
+        assert!(
+            unique.len() > 1,
+            "20 calls should produce at least 2 distinct prefixes"
+        );
+    }
+
+    #[test]
+    fn test_write_dir_cm_off_partitioned_null_value_uses_hive_default() {
+        let wc = make_write_context(
+            ColumnMappingMode::None,
+            vec!["region".into()],
+            HashMap::from([("region".into(), None)]),
+        );
+        let path = wc.write_dir().path().to_string();
+        assert!(
+            path.contains("__HIVE_DEFAULT_PARTITION__"),
+            "null partition value should use HIVE_DEFAULT_PARTITION, got: {path}"
+        );
+    }
+
+    #[test]
+    fn test_random_alphanumeric_prefix_format() {
+        for _ in 0..100 {
+            let prefix = random_alphanumeric_prefix();
+            assert_eq!(prefix.len(), 2, "prefix should be exactly 2 chars");
+            assert!(
+                prefix.chars().all(|c| c.is_ascii_alphanumeric()),
+                "prefix should be alphanumeric, got: {prefix}"
+            );
+        }
+    }
 }
