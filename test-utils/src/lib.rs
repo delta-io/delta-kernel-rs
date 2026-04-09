@@ -34,7 +34,7 @@ use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, Snapshot};
+use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot};
 
 use itertools::Itertools;
 use serde_json::{json, to_vec, Deserializer};
@@ -121,6 +121,13 @@ pub const METADATA_WITH_FEATURES: &str = concat!(
     r#"{"metaData":{"id":"deadbeef-1234-5678-abcd-000000000000","name":"test_table","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.rowTracking.enabled":"true","delta.rowTracking.materializedRowIdColumnName":"_row_id","delta.rowTracking.materializedRowCommitVersionColumnName":"_row_commit_version"},"createdTime":1234567890000}}"#,
 );
 
+/// Like [`METADATA`] but with protocol v3/7 and the `catalogManaged` table feature enabled.
+/// Per the Delta protocol, `catalogManaged` depends on `inCommitTimestamp`, and commitInfo must
+/// include a `txnId`.
+pub const CATALOG_MANAGED_METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true,"txnId":"test-txn-0","inCommitTimestamp":1587968586154}}
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["catalogManaged"],"writerFeatures":["catalogManaged","inCommitTimestamp"]}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true"},"createdTime":1587968585495}}"#;
+
 pub enum TestAction {
     Add(String),
     Remove(String),
@@ -136,6 +143,11 @@ pub enum TestAction {
 /// Convert a vector of actions into a newline delimited json string, with standard metadata
 pub fn actions_to_string(actions: Vec<TestAction>) -> String {
     actions_to_string_with_metadata(actions, METADATA)
+}
+
+/// Convert a vector of actions into a newline delimited json string, with catalog-managed metadata
+pub fn actions_to_string_catalog_managed(actions: Vec<TestAction>) -> String {
+    actions_to_string_with_metadata(actions, CATALOG_MANAGED_METADATA)
 }
 
 /// Convert a vector of actions into a newline delimited json string, with metadata including a partition column
@@ -228,6 +240,19 @@ pub fn generate_simple_batch() -> Result<RecordBatch, ArrowError> {
 pub fn delta_path_for_version(version: u64, suffix: &str) -> Path {
     let path = format!("_delta_log/{version:020}.{suffix}");
     Path::from(path.as_str())
+}
+
+/// Create a [`LogPath`] from a table root URL string and an object-store commit path. Useful for
+/// building log tails in tests.
+pub fn create_log_path(table_root: impl AsRef<str>, commit_path: Path) -> LogPath {
+    let table_url = try_parse_uri(table_root.as_ref()).expect("Failed to parse table root as URL");
+    let commit_url = table_url.join(commit_path.as_ref()).unwrap();
+    let file_meta = FileMeta {
+        location: commit_url,
+        last_modified: 123,
+        size: 100,
+    };
+    LogPath::try_new(file_meta).expect("Failed to create LogPath")
 }
 
 pub fn staged_commit_path_for_version(version: u64) -> Path {

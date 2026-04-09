@@ -172,12 +172,19 @@ int main(int argc, char* argv[])
     if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
       print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
       free_error((Error*)snapshot_builder_res.err);
+      free_engine(engine);
+      free_uc_commit_client(uc_client);
       return -1;
     }
+    // The test table is catalog-managed, so we must set the max catalog version.
+    // Version 0 is the only commit on disk (staged commits are not loaded here).
+    snapshot_builder_set_max_catalog_version(&snapshot_builder_res.ok, 0);
     ExternResultHandleSharedSnapshot snapshot_res = snapshot_builder_build(snapshot_builder_res.ok);
     if (snapshot_res.tag != OkHandleSharedSnapshot) {
       print_error("Failed to create snapshot.", (Error*)snapshot_res.err);
       free_error((Error*)snapshot_res.err);
+      free_engine(engine);
+      free_uc_commit_client(uc_client);
       return -1;
     }
 
