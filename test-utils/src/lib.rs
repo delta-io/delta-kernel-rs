@@ -796,6 +796,21 @@ pub fn multiple_ntz_schema() -> SchemaRef {
     multi_schema_with_type(DataType::TIMESTAMP_NTZ)
 }
 
+#[cfg(feature = "nanosecond-timestamps")]
+pub fn top_level_nanots_schema() -> SchemaRef {
+    schema_with_type(DataType::TIMESTAMP_NANOS)
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+pub fn nested_nanots_schema() -> SchemaRef {
+    nested_schema_with_type(DataType::TIMESTAMP_NANOS)
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+pub fn multiple_nanots_schema() -> SchemaRef {
+    multi_schema_with_type(DataType::TIMESTAMP_NANOS)
+}
+
 pub fn top_level_variant_schema() -> SchemaRef {
     schema_with_type(DataType::unshredded_variant())
 }

@@ -62,3 +62,6 @@ default-engine-base = ["delta_kernel/default-engine-base"]
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []
 test-ffi = []
+
+# Preview feature, not yet part of Delta protocol.
+nanosecond-timestamps = ["delta_kernel/nanosecond-timestamps"]

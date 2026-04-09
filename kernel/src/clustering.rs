@@ -89,7 +89,7 @@ pub(crate) fn validate_clustering_columns(
                 return Err(Error::generic(format!(
                     "Clustering column '{col}' has unsupported type '{dt}'. \
                      Supported types: Byte, Short, Integer, Long, Float, Double, \
-                     Decimal, Date, Timestamp, TimestampNtz, String"
+                     Decimal, Date, Timestamp, TimestampNtz, TimestampNanos, String"
                 )));
             }
         }
