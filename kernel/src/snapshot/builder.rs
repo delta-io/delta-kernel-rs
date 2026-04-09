@@ -205,7 +205,7 @@ mod tests {
     use crate::metrics::MetricEvent;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::{DynObjectStore, ObjectStore as _};
+    use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::utils::test_utils::CapturingReporter;
     use itertools::Itertools;
     use serde_json::json;

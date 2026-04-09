@@ -564,7 +564,7 @@ mod tests {
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::ObjectStore;
+    use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
 
@@ -655,14 +655,8 @@ mod tests {
 
         // writer must be closed to write footer
         let res = writer.close().unwrap();
-
         let file_size_bytes = std::fs::metadata(&full_path)?.len();
-
-        #[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
         let num_rows = res.file_metadata().num_rows();
-        #[cfg(all(feature = "arrow-56", not(feature = "arrow-57")))]
-        let num_rows = res.num_rows;
-
         create_file_metadata(file_path, file_size_bytes, num_rows, metadata_schema)
     }
 
@@ -831,7 +825,7 @@ mod tests {
 
     /// Read the commit log at `version` and return the `domainMetadata` action JSON.
     async fn read_domain_metadata_action(
-        store: &dyn ObjectStore,
+        store: &DynObjectStore,
         table_url: &Url,
         version: u64,
     ) -> serde_json::Value {
@@ -857,7 +851,7 @@ mod tests {
     async fn setup_domain_metadata_table(
         dir_url: &Url,
         name: &str,
-    ) -> Result<(Url, Arc<dyn ObjectStore>, Handle<SharedExternEngine>), Box<dyn std::error::Error>>
+    ) -> Result<(Url, Arc<DynObjectStore>, Handle<SharedExternEngine>), Box<dyn std::error::Error>>
     {
         let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
             "id",
