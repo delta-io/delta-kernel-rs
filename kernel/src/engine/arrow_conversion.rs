@@ -298,6 +298,10 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             {
                 Ok(DataType::TIMESTAMP)
             }
+            // If the user has the nanosecond timestamps feature, they don't
+            // want data loss. In short term this will error out, in medium term
+            // would be good to add nanosecond without timezone primitive type.
+            #[cfg(not(feature = "nanosecond-timestamps"))]
             ArrowDataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(DataType::TIMESTAMP_NTZ),
             #[cfg(feature = "nanosecond-timestamps")]
             ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz))
