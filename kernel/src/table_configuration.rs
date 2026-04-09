@@ -272,12 +272,10 @@ impl TableConfiguration {
 
     /// Returns the list of physical column names that should have statistics collected.
     ///
-    /// Partition columns are excluded because their values are already stored in the Add
-    /// action's `partitionValues` field, making per-file statistics redundant.
-    ///
-    /// If `required_columns` is `Some`, those columns are always included regardless of
-    /// `dataSkippingNumIndexedCols` or `dataSkippingStatsColumns` settings (e.g. clustering
-    /// columns). Required columns that are also partition columns are still excluded.
+    /// Partition columns are excluded first (their values are already in the Add action's
+    /// `partitionValues` field). Among the remaining columns, if `required_columns` is `Some`,
+    /// those columns are always included regardless of `dataSkippingNumIndexedCols` or
+    /// `dataSkippingStatsColumns` settings (e.g. clustering columns).
     pub(crate) fn physical_stats_column_names(
         &self,
         required_columns: Option<&[ColumnName]>,
@@ -1732,6 +1730,20 @@ mod test {
         column_mapping_mode: &str,
         extra_props: impl IntoIterator<Item = (&'static str, &'static str)>,
     ) -> TableConfiguration {
+        create_partitioned_table_config_with_column_mapping(
+            schema,
+            column_mapping_mode,
+            vec![], // partition_columns
+            extra_props,
+        )
+    }
+
+    fn create_partitioned_table_config_with_column_mapping(
+        schema: SchemaRef,
+        column_mapping_mode: &str,
+        partition_columns: Vec<String>,
+        extra_props: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> TableConfiguration {
         let mut props: HashMap<String, String> = extra_props
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1741,7 +1753,7 @@ mod test {
             column_mapping_mode.to_string(),
         );
 
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
+        let metadata = Metadata::try_new(None, None, schema, partition_columns, 0, props).unwrap();
 
         // Use reader version 2 which supports column mapping
         let protocol = Protocol::try_new_legacy(2, 5).unwrap();
@@ -1867,9 +1879,10 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_build_expected_stats_schemas_excludes_partition_columns() {
-        let field_a: StructField = serde_json::from_str(
+    /// Schema with a data column and two partition columns, all with column mapping metadata.
+    /// data_col (long) -> phys_data, part_a (string) -> phys_part_a, part_b (integer) -> phys_part_b
+    fn partitioned_schema_with_column_mapping() -> SchemaRef {
+        let data_col: StructField = serde_json::from_str(
             r#"{
                 "name": "data_col",
                 "type": "long",
@@ -1881,28 +1894,41 @@ mod test {
             }"#,
         )
         .unwrap();
-
-        let field_b: StructField = serde_json::from_str(
+        let part_a: StructField = serde_json::from_str(
             r#"{
-                "name": "part_col",
+                "name": "part_a",
                 "type": "string",
                 "nullable": true,
                 "metadata": {
                     "delta.columnMapping.id": 2,
-                    "delta.columnMapping.physicalName": "phys_part"
+                    "delta.columnMapping.physicalName": "phys_part_a"
                 }
             }"#,
         )
         .unwrap();
+        let part_b: StructField = serde_json::from_str(
+            r#"{
+                "name": "part_b",
+                "type": "integer",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 3,
+                    "delta.columnMapping.physicalName": "phys_part_b"
+                }
+            }"#,
+        )
+        .unwrap();
+        Arc::new(StructType::new_unchecked([data_col, part_a, part_b]))
+    }
 
-        let schema = Arc::new(StructType::new_unchecked([field_a, field_b]));
-        let mut props = HashMap::new();
-        props.insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
-        let metadata =
-            Metadata::try_new(None, None, schema, vec!["part_col".to_string()], 0, props).unwrap();
-        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+    #[test]
+    fn test_build_expected_stats_schemas_excludes_partition_columns() {
+        let config = create_partitioned_table_config_with_column_mapping(
+            partitioned_schema_with_column_mapping(),
+            "name",
+            vec!["part_a".to_string(), "part_b".to_string()],
+            [],
+        );
 
         let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
 
@@ -1919,70 +1945,52 @@ mod test {
             "Data column should be present with physical name"
         );
         assert!(
-            inner.field("phys_part").is_none(),
-            "Partition column should be excluded"
+            inner.field("phys_part_a").is_none(),
+            "Partition column a should be excluded"
         );
         assert!(
-            inner.field("part_col").is_none(),
-            "Partition column logical name should also be absent"
+            inner.field("phys_part_b").is_none(),
+            "Partition column b should be excluded"
         );
     }
 
     #[test]
     fn test_physical_stats_column_names_excludes_partition_columns() {
-        let field_a: StructField = serde_json::from_str(
-            r#"{
-                "name": "data_col",
-                "type": "long",
-                "nullable": true,
-                "metadata": {
-                    "delta.columnMapping.id": 1,
-                    "delta.columnMapping.physicalName": "phys_data"
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let field_b: StructField = serde_json::from_str(
-            r#"{
-                "name": "part_col",
-                "type": "string",
-                "nullable": true,
-                "metadata": {
-                    "delta.columnMapping.id": 2,
-                    "delta.columnMapping.physicalName": "phys_part"
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let schema = Arc::new(StructType::new_unchecked([field_a, field_b]));
-        let mut props = HashMap::new();
-        props.insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
-        let metadata =
-            Metadata::try_new(None, None, schema, vec!["part_col".to_string()], 0, props).unwrap();
-        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let config = create_partitioned_table_config_with_column_mapping(
+            partitioned_schema_with_column_mapping(),
+            "name",
+            vec!["part_a".to_string(), "part_b".to_string()],
+            [],
+        );
 
         let column_names = config.physical_stats_column_names(None);
+        assert_eq!(column_names, vec![ColumnName::new(["phys_data"])]);
 
-        assert_eq!(
-            column_names,
-            vec![ColumnName::new(["phys_data"])],
-            "Partition columns should be excluded from stats column names"
-        );
+        // Also verify partition columns are excluded when passed as required columns
+        let required = [
+            ColumnName::new(["phys_part_a"]),
+            ColumnName::new(["phys_part_b"]),
+        ];
+        let column_names = config.physical_stats_column_names(Some(&required));
+        assert_eq!(column_names, vec![ColumnName::new(["phys_data"])]);
     }
 
     #[test]
     fn test_physical_stats_column_names_excludes_partition_columns_no_column_mapping() {
         let schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("data_col", DataType::LONG),
-            StructField::nullable("part_col", DataType::STRING),
+            StructField::nullable("part_a", DataType::STRING),
+            StructField::nullable("part_b", DataType::INTEGER),
         ]));
-        let metadata =
-            Metadata::try_new(None, None, schema, vec!["part_col".to_string()], 0, HashMap::new())
-                .unwrap();
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec!["part_a".to_string(), "part_b".to_string()],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
         let protocol = Protocol::try_new_legacy(1, 2).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
@@ -1992,58 +2000,16 @@ mod test {
     }
 
     #[test]
-    fn test_physical_stats_column_names_excludes_partition_col_even_when_required() {
-        let field_a: StructField = serde_json::from_str(
-            r#"{
-                "name": "data_col",
-                "type": "long",
-                "nullable": true,
-                "metadata": {
-                    "delta.columnMapping.id": 1,
-                    "delta.columnMapping.physicalName": "phys_data"
-                }
-            }"#,
-        )
-        .unwrap();
-        let field_b: StructField = serde_json::from_str(
-            r#"{
-                "name": "part_col",
-                "type": "string",
-                "nullable": true,
-                "metadata": {
-                    "delta.columnMapping.id": 2,
-                    "delta.columnMapping.physicalName": "phys_part"
-                }
-            }"#,
-        )
-        .unwrap();
-        let schema = Arc::new(StructType::new_unchecked([field_a, field_b]));
-        let mut props = HashMap::new();
-        props.insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
-        let metadata =
-            Metadata::try_new(None, None, schema, vec!["part_col".to_string()], 0, props).unwrap();
-        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-
-        // Pass partition column as a required column (e.g. clustering column)
-        let required = [ColumnName::new(["phys_part"])];
-        let column_names = config.physical_stats_column_names(Some(&required));
-
-        assert_eq!(column_names, vec![ColumnName::new(["phys_data"])]);
-    }
-
-    #[test]
     fn test_physical_stats_column_names_all_partition_columns_returns_empty() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "part_col",
-            DataType::STRING,
-        )]));
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("part_a", DataType::STRING),
+            StructField::nullable("part_b", DataType::INTEGER),
+        ]));
         let metadata = Metadata::try_new(
             None,
             None,
             schema,
-            vec!["part_col".to_string()],
+            vec!["part_a".to_string(), "part_b".to_string()],
             0,
             HashMap::new(),
         )
