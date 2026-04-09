@@ -25,10 +25,11 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::Snapshot;
 use rstest::rstest;
 use test_utils::{read_scan, test_table_setup_mt};
+use url::Url;
 
-// =============================================================================
+// ==============================================================================
 // Tests
-// =============================================================================
+// ==============================================================================
 
 /// Writes one row with a normal everyday value for every partition column type, reads it
 /// back, checkpoints, reloads from checkpoint, and verifies the values survive both paths.
@@ -40,60 +41,96 @@ use test_utils::{read_scan, test_table_setup_mt};
 async fn test_write_partitioned_normal_values_roundtrip(
     #[case] cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // ===== Step 1: Create table and write one row with normal partition values. =====
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = all_types_schema();
     let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
     let snapshot = create_all_types_table(&table_path, engine.as_ref(), cm_mode)?;
     assert_eq!(snapshot.table_configuration().partition_columns().len(), 13);
 
-    let ts_micros = ts_to_micros("2025-03-31 15:30:00.123456");
-    let date_days = date_to_days("2025-03-31");
+    let batch = RecordBatch::try_new(arrow_schema, normal_arrow_columns())?;
+    let snapshot = test_utils::write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        batch,
+        normal_partition_values()?,
+    )
+    .await?;
 
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(Int32Array::from(vec![1])),
-        Arc::new(StringArray::from(vec!["hello"])),
-        Arc::new(Int32Array::from(vec![42])),
-        Arc::new(Int64Array::from(vec![9_876_543_210i64])),
-        Arc::new(Int16Array::from(vec![7i16])),
-        Arc::new(Int8Array::from(vec![3i8])),
-        Arc::new(Float32Array::from(vec![1.25f32])),
-        Arc::new(Float64Array::from(vec![99.99f64])),
-        Arc::new(BooleanArray::from(vec![true])),
-        Arc::new(Date32Array::from(vec![date_days])),
-        ts_array(ts_micros),
-        decimal_array(12345, 10, 2),
-        Arc::new(BinaryArray::from_vec(vec![b"Hello"])),
-        ts_ntz_array(ts_micros),
-    ];
-    let pvs = HashMap::from([
-        ("p_string".into(), Scalar::String("hello".into())),
-        ("p_int".into(), Scalar::Integer(42)),
-        ("p_long".into(), Scalar::Long(9_876_543_210)),
-        ("p_short".into(), Scalar::Short(7)),
-        ("p_byte".into(), Scalar::Byte(3)),
-        ("p_float".into(), Scalar::Float(1.25)),
-        ("p_double".into(), Scalar::Double(99.99)),
-        ("p_boolean".into(), Scalar::Boolean(true)),
-        ("p_date".into(), Scalar::Date(date_days)),
-        ("p_timestamp".into(), Scalar::Timestamp(ts_micros)),
-        ("p_decimal".into(), Scalar::decimal(12345, 10, 2)?),
-        ("p_binary".into(), Scalar::Binary(b"Hello".to_vec())),
-        ("p_timestamp_ntz".into(), Scalar::TimestampNtz(ts_micros)),
-    ]);
+    // ===== Step 2: Validate add.path structure in the commit log JSON. =====
+    let adds = read_add_actions_json(&table_path, 1)?;
+    assert_eq!(adds.len(), 1, "should have exactly one add action");
+    let add = &adds[0];
+    let path = add["path"].as_str().unwrap();
+    let rel_path = strip_table_root(path, &table_path);
 
-    let batch = RecordBatch::try_new(arrow_schema, columns)?;
-    let snapshot = test_utils::write_batch_to_table(&snapshot, engine.as_ref(), batch, pvs).await?;
+    match cm_mode {
+        ColumnMappingMode::None => {
+            // Hive-style path with Hive encoding: colons -> %3A, spaces -> %20.
+            let expected_prefix = "\
+                p_string=hello/p_int=42/p_long=9876543210/p_short=7/\
+                p_byte=3/p_float=1.25/p_double=99.99/p_boolean=true/p_date=2025-03-31/\
+                p_timestamp=2025-03-31T15%3A30%3A00.123456Z/p_decimal=123.45/\
+                p_binary=Hello/p_timestamp_ntz=2025-03-31%2015%3A30%3A00.123456/";
+            assert!(
+                rel_path.starts_with(expected_prefix),
+                "CM off: relative path mismatch.\n  \
+                 expected: {expected_prefix}<uuid>.parquet\n  got: {rel_path}"
+            );
+            assert!(rel_path.ends_with(".parquet"));
+        }
+        ColumnMappingMode::Name | ColumnMappingMode::Id => {
+            // Random 2-char prefix: <2char>/<uuid>.parquet
+            let segments: Vec<&str> = rel_path.split('/').collect();
+            assert_eq!(
+                segments.len(),
+                2,
+                "CM on: path should be <prefix>/<file>, got: {rel_path}"
+            );
+            assert_eq!(segments[0].len(), 2, "prefix should be 2 chars");
+            assert!(segments[0].chars().all(|c| c.is_ascii_alphanumeric()));
+            assert!(segments[1].ends_with(".parquet"));
+        }
+    }
 
-    // Read before checkpoint
+    // ===== Step 3: Validate add.partitionValues content. =====
+    let pv = add["partitionValues"].as_object().unwrap();
+    match cm_mode {
+        ColumnMappingMode::None => {
+            // Keys are logical column names, values are serialized strings.
+            for (key, val) in EXPECTED_NORMAL_PVS {
+                assert_eq!(
+                    pv.get(*key).and_then(|v| v.as_str()),
+                    Some(*val),
+                    "partitionValues[{key}] mismatch"
+                );
+            }
+        }
+        ColumnMappingMode::Name | ColumnMappingMode::Id => {
+            // Keys are physical names. Look up via schema and verify each value.
+            let logical_schema = snapshot.schema();
+            for (logical_key, expected_val) in EXPECTED_NORMAL_PVS {
+                let field = logical_schema.field(logical_key).unwrap();
+                let physical_key = field.physical_name(cm_mode);
+                assert_eq!(
+                    pv.get(physical_key).and_then(|v| v.as_str()),
+                    Some(*expected_val),
+                    "partitionValues[{physical_key}] (logical: {logical_key}) mismatch"
+                );
+            }
+        }
+    }
+
+    // ===== Step 4: Read data back via scan and verify all column values. =====
     let sorted = read_sorted(&snapshot, engine.clone())?;
-    assert_normal_values(&sorted, date_days, ts_micros);
+    assert_normal_values(&sorted);
 
-    // Checkpoint, reload from checkpoint, read again
+    // ===== Step 5: Checkpoint, reload snapshot from checkpoint, read again. =====
     snapshot.checkpoint(engine.as_ref())?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot_after_cp = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let sorted = read_sorted(&snapshot_after_cp, engine)?;
-    assert_normal_values(&sorted, date_days, ts_micros);
+    assert_normal_values(&sorted);
 
     Ok(())
 }
@@ -108,58 +145,65 @@ async fn test_write_partitioned_normal_values_roundtrip(
 async fn test_write_partitioned_null_values_roundtrip(
     #[case] cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // ===== Step 1: Create table and write one row with all-null partition values. =====
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = all_types_schema();
     let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
     let snapshot = create_all_types_table(&table_path, engine.as_ref(), cm_mode)?;
 
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(Int32Array::from(vec![1])),
-        Arc::new(StringArray::from(vec![None::<&str>])),
-        Arc::new(Int32Array::from(vec![None::<i32>])),
-        Arc::new(Int64Array::from(vec![None::<i64>])),
-        Arc::new(Int16Array::from(vec![None::<i16>])),
-        Arc::new(Int8Array::from(vec![None::<i8>])),
-        Arc::new(Float32Array::from(vec![None::<f32>])),
-        Arc::new(Float64Array::from(vec![None::<f64>])),
-        Arc::new(BooleanArray::from(vec![None::<bool>])),
-        Arc::new(Date32Array::from(vec![None::<i32>])),
-        Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>]).with_timezone("UTC")),
-        Arc::new(
-            Decimal128Array::from(vec![None::<i128>])
-                .with_precision_and_scale(10, 2)
-                .unwrap(),
-        ),
-        Arc::new(BinaryArray::from(vec![None::<&[u8]>])),
-        Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>])),
-    ];
-    let pvs = HashMap::from([
-        ("p_string".into(), Scalar::Null(DataType::STRING)),
-        ("p_int".into(), Scalar::Null(DataType::INTEGER)),
-        ("p_long".into(), Scalar::Null(DataType::LONG)),
-        ("p_short".into(), Scalar::Null(DataType::SHORT)),
-        ("p_byte".into(), Scalar::Null(DataType::BYTE)),
-        ("p_float".into(), Scalar::Null(DataType::FLOAT)),
-        ("p_double".into(), Scalar::Null(DataType::DOUBLE)),
-        ("p_boolean".into(), Scalar::Null(DataType::BOOLEAN)),
-        ("p_date".into(), Scalar::Null(DataType::DATE)),
-        ("p_timestamp".into(), Scalar::Null(DataType::TIMESTAMP)),
-        ("p_decimal".into(), Scalar::Null(DataType::decimal(10, 2)?)),
-        ("p_binary".into(), Scalar::Null(DataType::BINARY)),
-        (
-            "p_timestamp_ntz".into(),
-            Scalar::Null(DataType::TIMESTAMP_NTZ),
-        ),
-    ]);
+    let batch = RecordBatch::try_new(arrow_schema, null_arrow_columns())?;
+    let snapshot = test_utils::write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        batch,
+        null_partition_values()?,
+    )
+    .await?;
 
-    let batch = RecordBatch::try_new(arrow_schema, columns)?;
-    let snapshot = test_utils::write_batch_to_table(&snapshot, engine.as_ref(), batch, pvs).await?;
+    // ===== Step 2: Validate add.path structure in the commit log JSON. =====
+    let adds = read_add_actions_json(&table_path, 1)?;
+    assert_eq!(adds.len(), 1, "should have exactly one add action");
+    let add = &adds[0];
+    let rel_path = strip_table_root(add["path"].as_str().unwrap(), &table_path);
 
-    // Read before checkpoint
+    let hdp = "__HIVE_DEFAULT_PARTITION__";
+    match cm_mode {
+        ColumnMappingMode::None => {
+            // Every partition column should use HIVE_DEFAULT_PARTITION in the path.
+            let expected_prefix = hive_prefix(PARTITION_COLS, hdp);
+            assert!(
+                rel_path.starts_with(&expected_prefix),
+                "CM off null: relative path mismatch.\n  \
+                 expected: {expected_prefix}<uuid>.parquet\n  got: {rel_path}"
+            );
+        }
+        ColumnMappingMode::Name | ColumnMappingMode::Id => {
+            let segments: Vec<&str> = rel_path.split('/').collect();
+            assert_eq!(
+                segments.len(),
+                2,
+                "CM on: path should be <prefix>/<file>, got: {rel_path}"
+            );
+            assert_eq!(segments[0].len(), 2);
+            assert!(segments[0].chars().all(|c| c.is_ascii_alphanumeric()));
+        }
+    }
+
+    // ===== Step 3: Validate add.partitionValues content (all values should be JSON null). =====
+    let pv = add["partitionValues"].as_object().unwrap();
+    assert_eq!(pv.len(), PARTITION_COLS.len());
+    for val in pv.values() {
+        assert!(
+            val.is_null(),
+            "all partition values should be null, got: {val}"
+        );
+    }
+
+    // ===== Step 4: Read data back via scan and verify all partition columns are null. =====
     let sorted = read_sorted(&snapshot, engine.clone())?;
     assert_all_partition_columns_null(&sorted);
 
-    // Checkpoint, reload from checkpoint, read again
+    // ===== Step 5: Checkpoint, reload snapshot from checkpoint, read again. =====
     snapshot.checkpoint(engine.as_ref())?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot_after_cp = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -169,219 +213,9 @@ async fn test_write_partitioned_null_values_roundtrip(
     Ok(())
 }
 
-// TODO: Add golden table comparison test.
-// Check in a golden Delta table under tests/data/all-partition-types/ written by delta-spark,
-// write the same data with kernel, and compare the partitionValues strings in the JSON log
-// key-by-key to verify serialization interop.
-
-// TODO: Add test for special float/double values (Infinity, -Infinity, NaN, -0.0).
-
-// TODO: Add test for boundary/extreme values (i32::MAX, i64::MIN, f32::MIN_POSITIVE,
-// decimal negative between 0 and -1, pre-epoch dates, etc.).
-
-// TODO: Add test for binary edge cases (emoji bytes, control characters, mixed ASCII + multi-byte).
-
-// TODO: Add test for special string values (empty string -> null round-trip, strings with
-// special characters like /=:%").
-
-// TODO: Add test for negative timestamps and pre-epoch dates.
-
-// TODO: Add test for multi-column partitioned writes verifying column order in hive paths.
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-/// Asserts the normal-values row reads back correctly (1 row, all 13 partition columns).
-fn assert_normal_values(sorted: &RecordBatch, date_days: i32, ts_micros: i64) {
-    assert_eq!(sorted.num_rows(), 1);
-    // col 0: value (non-partition)
-    assert_eq!(
-        sorted
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .value(0),
-        1
-    );
-    // col 1: p_string
-    assert_eq!(
-        sorted
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()
-            .value(0),
-        "hello"
-    );
-    // col 2: p_int
-    assert_eq!(
-        sorted
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .value(0),
-        42
-    );
-    // col 3: p_long
-    assert_eq!(
-        sorted
-            .column(3)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0),
-        9_876_543_210i64
-    );
-    // col 4: p_short
-    assert_eq!(
-        sorted
-            .column(4)
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .unwrap()
-            .value(0),
-        7i16
-    );
-    // col 5: p_byte
-    assert_eq!(
-        sorted
-            .column(5)
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .unwrap()
-            .value(0),
-        3i8
-    );
-    // col 6: p_float
-    assert!(
-        (sorted
-            .column(6)
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap()
-            .value(0)
-            - 1.25f32)
-            .abs()
-            < f32::EPSILON
-    );
-    // col 7: p_double
-    assert!(
-        (sorted
-            .column(7)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0)
-            - 99.99f64)
-            .abs()
-            < f64::EPSILON
-    );
-    // col 8: p_boolean
-    assert!(sorted
-        .column(8)
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .unwrap()
-        .value(0));
-    // col 9: p_date
-    assert_eq!(
-        sorted
-            .column(9)
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .unwrap()
-            .value(0),
-        date_days
-    );
-    // col 10: p_timestamp
-    assert_eq!(
-        sorted
-            .column(10)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap()
-            .value(0),
-        ts_micros
-    );
-    // col 11: p_decimal
-    assert_eq!(
-        sorted
-            .column(11)
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .unwrap()
-            .value(0),
-        12345
-    );
-    // col 12: p_binary
-    assert_eq!(
-        sorted
-            .column(12)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap()
-            .value(0),
-        b"Hello"
-    );
-    // col 13: p_timestamp_ntz
-    assert_eq!(
-        sorted
-            .column(13)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap()
-            .value(0),
-        ts_micros
-    );
-}
-
-/// Asserts all partition columns (indices 1-13) are null for the single row.
-fn assert_all_partition_columns_null(sorted: &RecordBatch) {
-    assert_eq!(sorted.num_rows(), 1);
-    for col_idx in 1..=13 {
-        assert!(
-            sorted.column(col_idx).is_null(0),
-            "partition column at index {col_idx} ({}) should be null",
-            sorted.schema().field(col_idx).name()
-        );
-    }
-}
-
-fn ts_to_micros(s: &str) -> i64 {
-    use chrono::{NaiveDateTime, TimeZone, Utc};
-    let ndt = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").unwrap();
-    Utc.from_utc_datetime(&ndt)
-        .signed_duration_since(chrono::DateTime::UNIX_EPOCH)
-        .num_microseconds()
-        .unwrap()
-}
-
-fn date_to_days(s: &str) -> i32 {
-    use chrono::{NaiveDate, TimeZone, Utc};
-    let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
-    let dt = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap());
-    dt.signed_duration_since(chrono::DateTime::UNIX_EPOCH)
-        .num_days() as i32
-}
-
-fn ts_array(micros: i64) -> ArrayRef {
-    Arc::new(TimestampMicrosecondArray::from(vec![micros]).with_timezone("UTC"))
-}
-
-fn ts_ntz_array(micros: i64) -> ArrayRef {
-    Arc::new(TimestampMicrosecondArray::from(vec![micros]))
-}
-
-fn decimal_array(value: i128, precision: u8, scale: i8) -> ArrayRef {
-    Arc::new(
-        Decimal128Array::from(vec![value])
-            .with_precision_and_scale(precision, scale)
-            .unwrap(),
-    )
-}
+// ==============================================================================
+// Schema and partition column definitions
+// ==============================================================================
 
 fn all_types_schema() -> Arc<StructType> {
     Arc::new(
@@ -420,6 +254,215 @@ const PARTITION_COLS: &[&str] = &[
     "p_binary",
     "p_timestamp_ntz",
 ];
+
+// ==============================================================================
+// Normal-values test data
+// ==============================================================================
+
+/// Arrow columns for one row with normal everyday values for all 13 partition types.
+fn normal_arrow_columns() -> Vec<ArrayRef> {
+    let ts = ts_to_micros("2025-03-31 15:30:00.123456");
+    vec![
+        Arc::new(Int32Array::from(vec![1])),
+        Arc::new(StringArray::from(vec!["hello"])),
+        Arc::new(Int32Array::from(vec![42])),
+        Arc::new(Int64Array::from(vec![9_876_543_210i64])),
+        Arc::new(Int16Array::from(vec![7i16])),
+        Arc::new(Int8Array::from(vec![3i8])),
+        Arc::new(Float32Array::from(vec![1.25f32])),
+        Arc::new(Float64Array::from(vec![99.99f64])),
+        Arc::new(BooleanArray::from(vec![true])),
+        Arc::new(Date32Array::from(vec![date_to_days("2025-03-31")])),
+        ts_array(ts),
+        decimal_array(12345, 10, 2),
+        Arc::new(BinaryArray::from_vec(vec![b"Hello"])),
+        ts_ntz_array(ts),
+    ]
+}
+
+/// Typed partition values matching `normal_arrow_columns`.
+fn normal_partition_values() -> Result<HashMap<String, Scalar>, Box<dyn std::error::Error>> {
+    let ts = ts_to_micros("2025-03-31 15:30:00.123456");
+    Ok(HashMap::from([
+        ("p_string".into(), Scalar::String("hello".into())),
+        ("p_int".into(), Scalar::Integer(42)),
+        ("p_long".into(), Scalar::Long(9_876_543_210)),
+        ("p_short".into(), Scalar::Short(7)),
+        ("p_byte".into(), Scalar::Byte(3)),
+        ("p_float".into(), Scalar::Float(1.25)),
+        ("p_double".into(), Scalar::Double(99.99)),
+        ("p_boolean".into(), Scalar::Boolean(true)),
+        ("p_date".into(), Scalar::Date(date_to_days("2025-03-31"))),
+        ("p_timestamp".into(), Scalar::Timestamp(ts)),
+        ("p_decimal".into(), Scalar::decimal(12345, 10, 2)?),
+        ("p_binary".into(), Scalar::Binary(b"Hello".to_vec())),
+        ("p_timestamp_ntz".into(), Scalar::TimestampNtz(ts)),
+    ]))
+}
+
+/// Expected serialized partition values (logical key -> serialized string) for normal data.
+const EXPECTED_NORMAL_PVS: &[(&str, &str)] = &[
+    ("p_string", "hello"),
+    ("p_int", "42"),
+    ("p_long", "9876543210"),
+    ("p_short", "7"),
+    ("p_byte", "3"),
+    ("p_float", "1.25"),
+    ("p_double", "99.99"),
+    ("p_boolean", "true"),
+    ("p_date", "2025-03-31"),
+    ("p_timestamp", "2025-03-31T15:30:00.123456Z"),
+    ("p_decimal", "123.45"),
+    ("p_binary", "Hello"),
+    ("p_timestamp_ntz", "2025-03-31 15:30:00.123456"),
+];
+
+// ==============================================================================
+// Null-values test data
+// ==============================================================================
+
+/// Arrow columns for one row with all null partition values.
+fn null_arrow_columns() -> Vec<ArrayRef> {
+    vec![
+        Arc::new(Int32Array::from(vec![1])),
+        Arc::new(StringArray::from(vec![None::<&str>])),
+        Arc::new(Int32Array::from(vec![None::<i32>])),
+        Arc::new(Int64Array::from(vec![None::<i64>])),
+        Arc::new(Int16Array::from(vec![None::<i16>])),
+        Arc::new(Int8Array::from(vec![None::<i8>])),
+        Arc::new(Float32Array::from(vec![None::<f32>])),
+        Arc::new(Float64Array::from(vec![None::<f64>])),
+        Arc::new(BooleanArray::from(vec![None::<bool>])),
+        Arc::new(Date32Array::from(vec![None::<i32>])),
+        Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>]).with_timezone("UTC")),
+        Arc::new(
+            Decimal128Array::from(vec![None::<i128>])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        ),
+        Arc::new(BinaryArray::from(vec![None::<&[u8]>])),
+        Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>])),
+    ]
+}
+
+/// Typed null partition values for all 13 partition columns.
+fn null_partition_values() -> Result<HashMap<String, Scalar>, Box<dyn std::error::Error>> {
+    Ok(HashMap::from([
+        ("p_string".into(), Scalar::Null(DataType::STRING)),
+        ("p_int".into(), Scalar::Null(DataType::INTEGER)),
+        ("p_long".into(), Scalar::Null(DataType::LONG)),
+        ("p_short".into(), Scalar::Null(DataType::SHORT)),
+        ("p_byte".into(), Scalar::Null(DataType::BYTE)),
+        ("p_float".into(), Scalar::Null(DataType::FLOAT)),
+        ("p_double".into(), Scalar::Null(DataType::DOUBLE)),
+        ("p_boolean".into(), Scalar::Null(DataType::BOOLEAN)),
+        ("p_date".into(), Scalar::Null(DataType::DATE)),
+        ("p_timestamp".into(), Scalar::Null(DataType::TIMESTAMP)),
+        ("p_decimal".into(), Scalar::Null(DataType::decimal(10, 2)?)),
+        ("p_binary".into(), Scalar::Null(DataType::BINARY)),
+        (
+            "p_timestamp_ntz".into(),
+            Scalar::Null(DataType::TIMESTAMP_NTZ),
+        ),
+    ]))
+}
+
+// ==============================================================================
+// Assertions
+// ==============================================================================
+
+/// Downcast column `$idx` to `$arr_ty` and assert `value(0)` equals `$expected`.
+macro_rules! assert_col {
+    ($batch:expr, $idx:expr, $arr_ty:ty, $expected:expr) => {
+        assert_eq!(
+            $batch
+                .column($idx)
+                .as_any()
+                .downcast_ref::<$arr_ty>()
+                .unwrap()
+                .value(0),
+            $expected,
+            "column {} ({}) value mismatch",
+            $idx,
+            $batch.schema().field($idx).name()
+        );
+    };
+}
+
+/// Asserts the normal-values row reads back correctly (1 row, all 13 partition columns).
+fn assert_normal_values(sorted: &RecordBatch) {
+    let ts = ts_to_micros("2025-03-31 15:30:00.123456");
+    assert_eq!(sorted.num_rows(), 1);
+    assert_col!(sorted, 0, Int32Array, 1); // value
+    assert_col!(sorted, 1, StringArray, "hello"); // p_string
+    assert_col!(sorted, 2, Int32Array, 42); // p_int
+    assert_col!(sorted, 3, Int64Array, 9_876_543_210i64); // p_long
+    assert_col!(sorted, 4, Int16Array, 7i16); // p_short
+    assert_col!(sorted, 5, Int8Array, 3i8); // p_byte
+    assert!(
+        (sorted
+            .column(6)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .value(0)
+            - 1.25f32)
+            .abs()
+            < f32::EPSILON,
+        "p_float mismatch"
+    );
+    assert!(
+        (sorted
+            .column(7)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0)
+            - 99.99f64)
+            .abs()
+            < f64::EPSILON,
+        "p_double mismatch"
+    );
+    assert!(
+        sorted
+            .column(8)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0),
+        "p_boolean should be true"
+    );
+    assert_col!(sorted, 9, Date32Array, date_to_days("2025-03-31")); // p_date
+    assert_col!(sorted, 10, TimestampMicrosecondArray, ts); // p_timestamp
+    assert_col!(sorted, 11, Decimal128Array, 12345); // p_decimal
+    assert_eq!(
+        // p_binary (slice comparison)
+        sorted
+            .column(12)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .value(0),
+        b"Hello"
+    );
+    assert_col!(sorted, 13, TimestampMicrosecondArray, ts); // p_timestamp_ntz
+}
+
+/// Asserts all partition columns (indices 1-13) are null for the single row.
+fn assert_all_partition_columns_null(sorted: &RecordBatch) {
+    assert_eq!(sorted.num_rows(), 1);
+    for col_idx in 1..=13 {
+        assert!(
+            sorted.column(col_idx).is_null(0),
+            "partition column at index {col_idx} ({}) should be null",
+            sorted.schema().field(col_idx).name()
+        );
+    }
+}
+
+// ==============================================================================
+// Table setup and utility helpers
+// ==============================================================================
 
 fn cm_mode_str(mode: ColumnMappingMode) -> &'static str {
     match mode {
@@ -463,4 +506,77 @@ fn read_sorted(
         .map(|col| delta_kernel::arrow::compute::take(col.as_ref(), &sort_indices, None).unwrap())
         .collect();
     Ok(RecordBatch::try_new(merged.schema(), sorted_columns)?)
+}
+
+fn ts_to_micros(s: &str) -> i64 {
+    use chrono::{NaiveDateTime, TimeZone, Utc};
+    let ndt = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").unwrap();
+    Utc.from_utc_datetime(&ndt)
+        .signed_duration_since(chrono::DateTime::UNIX_EPOCH)
+        .num_microseconds()
+        .unwrap()
+}
+
+fn date_to_days(s: &str) -> i32 {
+    use chrono::{NaiveDate, TimeZone, Utc};
+    let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+    let dt = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap());
+    dt.signed_duration_since(chrono::DateTime::UNIX_EPOCH)
+        .num_days() as i32
+}
+
+fn ts_array(micros: i64) -> ArrayRef {
+    Arc::new(TimestampMicrosecondArray::from(vec![micros]).with_timezone("UTC"))
+}
+
+fn ts_ntz_array(micros: i64) -> ArrayRef {
+    Arc::new(TimestampMicrosecondArray::from(vec![micros]))
+}
+
+fn decimal_array(value: i128, precision: u8, scale: i8) -> ArrayRef {
+    Arc::new(
+        Decimal128Array::from(vec![value])
+            .with_precision_and_scale(precision, scale)
+            .unwrap(),
+    )
+}
+
+// ==============================================================================
+// JSON commit log helpers
+// ==============================================================================
+
+/// Strips the table root URL prefix from an add.path to get the relative path.
+fn strip_table_root(path: &str, table_path: &str) -> String {
+    let prefix = Url::from_directory_path(table_path).unwrap().to_string();
+    path.strip_prefix(&prefix)
+        .unwrap_or_else(|| {
+            panic!("add.path should start with table root.\n  root: {prefix}\n  path: {path}")
+        })
+        .to_string()
+}
+
+/// Builds an unescaped Hive-style path prefix like `col1=val/col2=val/`.
+/// Only correct when `value` contains no Hive-special characters.
+fn hive_prefix(cols: &[&str], value: &str) -> String {
+    cols.iter()
+        .map(|c| format!("{c}={value}"))
+        .collect::<Vec<_>>()
+        .join("/")
+        + "/"
+}
+
+/// Reads the commit JSON at the given version and returns all add actions.
+fn read_add_actions_json(
+    table_path: &str,
+    version: u64,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let commit_path = format!("{table_path}/_delta_log/{version:020}.json");
+    let content = std::fs::read_to_string(commit_path)?;
+    let parsed: Vec<serde_json::Value> = serde_json::Deserializer::from_str(&content)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(parsed
+        .into_iter()
+        .filter_map(|v| v.get("add").cloned())
+        .collect())
 }

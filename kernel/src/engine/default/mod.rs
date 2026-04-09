@@ -275,6 +275,9 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// The `write_context` must be created by [`Transaction::partitioned_write_context`] or
     /// [`Transaction::unpartitioned_write_context`], which handle partition value validation,
     /// serialization, and logical-to-physical key translation.
+    ///
+    /// [`Transaction::partitioned_write_context`]: crate::transaction::Transaction::partitioned_write_context
+    /// [`Transaction::unpartitioned_write_context`]: crate::transaction::Transaction::unpartitioned_write_context
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,
@@ -289,7 +292,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             output_schema.clone().into(),
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
-        // Random 2-char prefix for CM tables, Hive-style dirs for partitioned, else table root.
+        // Random 2-char prefix for CM tables, Hive-style for partitioned, else table root.
         let write_dir = write_context.write_dir();
         self.parquet
             .write_parquet_file(

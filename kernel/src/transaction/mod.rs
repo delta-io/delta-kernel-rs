@@ -20,8 +20,7 @@ use crate::expressions::ColumnName;
 use crate::expressions::Scalar;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::partition::{
-    serialization::serialize_partition_value,
-    validation::{validate_partition_keys, validate_partition_value_types},
+    serialization::serialize_partition_value, validation::validate_partition_values,
 };
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
@@ -787,22 +786,15 @@ impl<S> Transaction<S> {
     /// Lazily builds and caches the [`SharedWriteState`] for this transaction.
     fn shared_write_state(&self) -> &Arc<SharedWriteState> {
         self.shared_write_state.get_or_init(|| {
-            let target_dir = self.read_snapshot.table_root().clone();
-            let logical_schema = self.read_snapshot.schema();
-            let logical_to_physical = self.generate_logical_to_physical();
             let table_config = self.read_snapshot.table_configuration();
-            let column_mapping_mode = table_config.column_mapping_mode();
-            let physical_schema = table_config.physical_write_schema();
-            let stats_columns = self.stats_columns();
-            let logical_partition_columns = table_config.partition_columns().to_vec();
             Arc::new(SharedWriteState {
-                target_dir,
-                logical_schema,
-                physical_schema,
-                logical_to_physical: Arc::new(logical_to_physical),
-                column_mapping_mode,
-                stats_columns,
-                logical_partition_columns,
+                target_dir: self.read_snapshot.table_root().clone(),
+                logical_schema: self.read_snapshot.schema(),
+                physical_schema: table_config.physical_write_schema(),
+                logical_to_physical: Arc::new(self.generate_logical_to_physical()),
+                column_mapping_mode: table_config.column_mapping_mode(),
+                stats_columns: self.stats_columns(),
+                logical_partition_columns: table_config.partition_columns().to_vec(),
             })
         })
     }
@@ -819,15 +811,17 @@ impl<S> Transaction<S> {
     ///   normalizes to schema case. For example, passing `"YEAR"` for a column named `"year"`
     ///   is accepted and normalized.
     ///
-    /// - **Type checking**: validates that each `Scalar`'s type matches the partition column's
+    /// - **Type checking**: rejects non-primitive partition column types (struct, array, map)
+    ///   and validates that each non-null `Scalar`'s type matches the partition column's
     ///   schema type. For example, passing `Scalar::String("2024")` for an `INTEGER` column
-    ///   returns an error. Null scalars skip the type check.
+    ///   returns an error. Null scalars skip the value type check (null is valid for any
+    ///   primitive partition column).
     ///
     /// - **Value serialization**: serializes each `Scalar` to a protocol-compliant string per
     ///   the Delta protocol's "Partition Value Serialization" rules.
     ///   `Scalar::Null(...)` becomes `None` in `add.partitionValues` (JSON null).
     ///   `Scalar::String("")` also becomes `None` (empty string equals null for all types).
-    ///   `Scalar::Integer(2024)` becomes `Some("2024")`.
+    ///   `Scalar::Date(19723)` becomes `Some("2024-01-01")`.
     ///
     /// - **Key translation**: translates logical column names to physical names using the
     ///   table's column mapping mode. For example, under `ColumnMappingMode::Name`, logical
@@ -850,11 +844,13 @@ impl<S> Transaction<S> {
             Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
         );
 
-        // Validate and normalize keys (case-insensitive, detect duplicates).
-        let normalized =
-            validate_partition_keys(&shared.logical_partition_columns, partition_values)?;
-        // Validate value types match schema column types.
-        validate_partition_value_types(&shared.logical_schema, &normalized)?;
+        // Validate keys (completeness, case normalization) and value types, then return
+        // the map re-keyed to schema case.
+        let normalized = validate_partition_values(
+            &shared.logical_partition_columns,
+            &shared.logical_schema,
+            partition_values,
+        )?;
 
         // Serialize values and translate keys from logical to physical names.
         let mut serialized = HashMap::with_capacity(normalized.len());
@@ -1625,7 +1621,7 @@ mod tests {
 
     /// Helper: loads a test table snapshot and returns both the snapshot and its write context.
     /// For partitioned tables, creates a partitioned write context with null values.
-    fn snapshot_and_write_context(
+    fn snapshot_and_partitioned_write_context(
         table_path: &str,
     ) -> Result<(Arc<Snapshot>, WriteContext), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
@@ -1679,7 +1675,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Without materializePartitionColumns, partition column should be dropped
         let (snap_without, wc_without) =
-            snapshot_and_write_context("./tests/data/basic_partitioned/")?;
+            snapshot_and_partitioned_write_context("./tests/data/basic_partitioned/")?;
         let partition_cols = snap_without.table_configuration().partition_columns();
         assert_eq!(partition_cols.len(), 1);
         assert_eq!(partition_cols[0], "letter");
@@ -1697,8 +1693,9 @@ mod tests {
         );
 
         // With materializePartitionColumns, no columns should be dropped (identity transform)
-        let (snap_with, wc_with) =
-            snapshot_and_write_context("./tests/data/partitioned_with_materialize_feature/")?;
+        let (snap_with, wc_with) = snapshot_and_partitioned_write_context(
+            "./tests/data/partitioned_with_materialize_feature/",
+        )?;
         let partition_cols = snap_with.table_configuration().partition_columns();
         assert_eq!(partition_cols.len(), 1);
         assert_eq!(partition_cols[0], "letter");
@@ -1748,42 +1745,33 @@ mod tests {
         Ok(())
     }
 
-    /// Calling partitioned_write_context on an unpartitioned table returns an error.
-    #[test]
-    fn test_partitioned_write_context_on_unpartitioned_table_returns_error(
+    /// Using the wrong write context method for the table's partitioning returns an error.
+    #[rstest]
+    #[case::partitioned_on_unpartitioned(
+        "./tests/data/table-without-dv-small/",
+        true,
+        "not partitioned"
+    )]
+    #[case::unpartitioned_on_partitioned("./tests/data/basic_partitioned/", false, "partitioned")]
+    fn test_wrong_write_context_method_returns_error(
+        #[case] table_path: &str,
+        #[case] call_partitioned: bool,
+        #[case] expected_msg: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
+        let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let result =
-            txn.partitioned_write_context(HashMap::from([("x".to_string(), Scalar::Integer(1))]));
-        assert!(result.is_err());
+        let result = if call_partitioned {
+            txn.partitioned_write_context(HashMap::from([("x".to_string(), Scalar::Integer(1))]))
+        } else {
+            txn.unpartitioned_write_context()
+        };
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("not partitioned"),
-            "expected 'not partitioned' error, got: {err}"
-        );
-        Ok(())
-    }
-
-    /// Calling unpartitioned_write_context on a partitioned table returns an error.
-    #[test]
-    fn test_unpartitioned_write_context_on_partitioned_table_returns_error(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let engine = SyncEngine::new();
-        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url).build(&engine)?;
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let result = txn.unpartitioned_write_context();
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("partitioned"),
-            "expected 'partitioned' error, got: {err}"
+            err.contains(expected_msg),
+            "expected '{expected_msg}' in error, got: {err}"
         );
         Ok(())
     }
@@ -2158,7 +2146,7 @@ mod tests {
         #[case] expected_partition_cols: &[&str],
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::arrow::array::Float64Array;
-        let (_snap, wc) = snapshot_and_write_context(table_path)?;
+        let (_snap, wc) = snapshot_and_partitioned_write_context(table_path)?;
         let batch = RecordBatch::try_new(
             Arc::new(wc.logical_schema().as_ref().try_into_arrow()?),
             vec![
