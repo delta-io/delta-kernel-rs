@@ -19,13 +19,13 @@
 use std::collections::HashMap;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::path::{LogPathFileType, LogPathFileType::*, ParsedLogPath};
 use crate::{DeltaResult, Error, StorageHandler, Version};
 
 use delta_kernel_derive::internal_api;
 
 use itertools::Itertools;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 #[cfg(test)]
@@ -92,7 +92,6 @@ fn list_from_storage(
 fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedLogPath>> {
     let mut checkpoints: HashMap<u32, Vec<ParsedLogPath>> = HashMap::new();
     for part_file in parts {
-        use LogPathFileType::*;
         match &part_file.file_type {
             SinglePartCheckpoint
             | UuidCheckpoint
@@ -132,11 +131,11 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
 }
 
 /// Returns the version of the latest complete checkpoint in `files`, or `None` if no complete
-/// checkpoint exists.
+/// checkpoint exists. Skips 0-byte checkpoint files so they don't count toward completeness.
 fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option<Version> {
     ascending_files
         .iter()
-        .filter(|f| f.is_checkpoint())
+        .filter(|f| f.is_checkpoint() && should_process_log_file(f))
         .chunk_by(|f| f.version)
         .into_iter()
         .filter_map(|(version, parts)| {
@@ -147,6 +146,51 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
                 .then_some(version)
         })
         .last()
+}
+
+/// Validates a log file's size. Returns `true` to keep the file, `false` to skip it
+/// (with a warning already emitted).
+///
+/// Compaction and checkpoint files are skipped when empty -- they have fallbacks
+/// (individual commits, older checkpoints). Commit and CRC files are kept even
+/// if empty; the warning ensures the corrupt file is identifiable in logs.
+fn should_process_log_file(file: &ParsedLogPath) -> bool {
+    if file.location.size > 0 {
+        return true;
+    }
+    match file.file_type {
+        // Commit files are kept even if 0 bytes -- the downstream JSON handler might
+        // error, but the warning here ensures the corrupt file is identifiable in logs.
+        // We don't skip commits because they are the source of truth for table state.
+        Commit | StagedCommit => {
+            warn!(
+                "{:?} file is empty (0 bytes): {}",
+                file.file_type, file.location.location,
+            );
+            return true;
+        }
+        CompactedCommit { .. } => {
+            warn!(
+                "Skipping empty (0 byte) compacted log file {}, \
+                 falling back to individual commits",
+                file.location.location,
+            );
+        }
+        SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
+            warn!(
+                "Skipping empty (0 byte) checkpoint file: {}",
+                file.location.location,
+            );
+        }
+        // CRC files are optional and may report size 0 on some platforms.
+        // Keep them -- the CRC reader handles empty/invalid content.
+        Crc => {
+            warn!("CRC file is empty (0 bytes): {}", file.location.location,);
+            return true;
+        }
+        Unknown => return true,
+    }
+    false
 }
 
 /// Accumulates and groups log files during listing. Each "group" consists of all files that
@@ -173,13 +217,15 @@ struct ListingAccumulator {
 
 impl ListingAccumulator {
     fn process_file(&mut self, file: ParsedLogPath) {
-        use LogPathFileType::*;
+        if !should_process_log_file(&file) {
+            return;
+        }
         match file.file_type {
             Commit | StagedCommit => self.output.ascending_commit_files.push(file),
             CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
                 self.output.ascending_compaction_files.push(file);
             }
-            CompactedCommit { .. } => (), // Failed the bounds check above
+            CompactedCommit { .. } => (), // failed the bounds check above
             SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
                 self.pending_checkpoint_parts.push(file)
             }
@@ -386,6 +432,7 @@ impl LogSegmentFiles {
         for file_result in fs_iter {
             let file = file_result?;
             if matches!(file.file_type, LogPathFileType::Commit) {
+                should_process_log_file(&file); // warns if 0 bytes
                 max_published_version = max_published_version.max(Some(file.version));
                 listed_commits.push(file);
             }

@@ -5,9 +5,7 @@ use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
 use tracing::{info, instrument};
-use url::Url;
 
-use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
     DomainMetadata, Metadata, Protocol, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
@@ -29,12 +27,12 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::FileMeta;
 use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, Version, PRE_COMMIT_VERSION,
+    DataType, DeltaResult, Engine, EngineData, Expression, IntoEngineData, RowVisitor, Version,
+    PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
 
@@ -57,7 +55,10 @@ mod commit_info;
 mod domain_metadata;
 mod stats_verifier;
 mod update;
+mod write_context;
+
 use stats_verifier::StatsVerifier;
+pub use write_context::WriteContext;
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -1142,92 +1143,6 @@ impl<S> Transaction<S> {
     }
 }
 
-/// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
-/// write table data.
-///
-/// [`Transaction`]: struct.Transaction.html
-pub struct WriteContext {
-    target_dir: Url,
-    logical_schema: SchemaRef,
-    physical_schema: SchemaRef,
-    logical_to_physical: ExpressionRef,
-    column_mapping_mode: ColumnMappingMode,
-    /// Column names that should have statistics collected during writes.
-    stats_columns: Vec<ColumnName>,
-}
-
-impl WriteContext {
-    fn new(
-        target_dir: Url,
-        logical_schema: SchemaRef,
-        physical_schema: SchemaRef,
-        logical_to_physical: ExpressionRef,
-        column_mapping_mode: ColumnMappingMode,
-        stats_columns: Vec<ColumnName>,
-    ) -> Self {
-        WriteContext {
-            target_dir,
-            logical_schema,
-            physical_schema,
-            logical_to_physical,
-            column_mapping_mode,
-            stats_columns,
-        }
-    }
-
-    pub fn target_dir(&self) -> &Url {
-        &self.target_dir
-    }
-
-    pub fn logical_schema(&self) -> &SchemaRef {
-        &self.logical_schema
-    }
-
-    pub fn physical_schema(&self) -> &SchemaRef {
-        &self.physical_schema
-    }
-
-    pub fn logical_to_physical(&self) -> ExpressionRef {
-        self.logical_to_physical.clone()
-    }
-
-    /// The [`ColumnMappingMode`] for this table.
-    pub fn column_mapping_mode(&self) -> ColumnMappingMode {
-        self.column_mapping_mode
-    }
-
-    /// Returns the column names that should have statistics collected during writes.
-    ///
-    /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
-    pub fn stats_columns(&self) -> &[ColumnName] {
-        &self.stats_columns
-    }
-
-    /// Generate a new unique absolute URL for a deletion vector file.
-    ///
-    /// This method generates a unique file name in the table directory.
-    /// Each call to this method returns a new unique path.
-    ///
-    /// # Arguments
-    ///
-    /// * `random_prefix` - A random prefix to use for the deletion vector file name.
-    ///   Making this non-empty can help distributed load on object storage when writing/reading
-    ///   to avoid throttling.  Typically a random string fo 2-4 characters is sufficient
-    ///   for this purpose.
-    ///
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// let write_context = transaction.get_write_context();
-    /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
-    /// // dv_url might be: s3://bucket/table/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin
-    /// ```
-    pub fn new_deletion_vector_path(&self, random_prefix: String) -> DeletionVectorPath {
-        DeletionVectorPath::new(self.target_dir.clone(), random_prefix)
-    }
-}
-
 /// Kernel exposes information about the state of the table that engines might want to use to
 /// trigger actions like checkpointing or log compaction. This struct holds that information.
 #[derive(Debug)]
@@ -1373,7 +1288,7 @@ mod tests {
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStore as _;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::schema::MapType;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;

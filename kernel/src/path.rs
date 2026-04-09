@@ -475,7 +475,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::Commit);
@@ -492,7 +492,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::StagedCommit);
@@ -506,7 +506,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::Crc);

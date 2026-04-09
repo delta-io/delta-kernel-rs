@@ -1169,6 +1169,7 @@ mod tests {
 
     use rstest::rstest;
     use serde_json::json;
+    use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
     use test_utils::{add_commit, delta_path_for_version};
 
     use crate::actions::{DomainMetadata, Protocol};
@@ -1188,7 +1189,7 @@ mod tests {
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStore;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::{LogPathFileType, ParsedLogPath};
     use crate::schema::{DataType, StructField, StructType};
@@ -2371,38 +2372,27 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory:///test_table/";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+    // Verifies the test_context! macro works from kernel/src/ unit tests
+    // (crosses the crate type boundary via macro expansion).
+    #[test]
+    fn test_context_macro_works_in_unit_test() {
+        let (_engine, snap, _table) = test_utils::test_context!(
+            LogState::with_commits(3),
+            FeatureSet::empty(),
+            VersionTarget::Latest
+        );
+        assert_eq!(snap.version(), 2);
+    }
 
-        // Create initial commit
-        let commit0 = vec![
-            json!({
-                "protocol": {
-                    "minReaderVersion": 1,
-                    "minWriterVersion": 2
-                }
-            }),
-            json!({
-                "metaData": {
-                    "id": "test-id",
-                    "format": {"provider": "parquet", "options": {}},
-                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
-                    "partitionColumns": [],
-                    "configuration": {},
-                    "createdTime": 1587968585495i64
-                }
-            }),
-        ];
-        commit(table_root, store.as_ref(), 0, commit0).await;
+    #[test]
+    fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
+        let table = TestTableBuilder::new().build().unwrap();
+        let engine = DefaultEngineBuilder::new(table.store().clone()).build();
 
-        let base_snapshot = Snapshot::builder_for(table_root)
+        let base_snapshot = Snapshot::builder_for(table.table_root())
             .at_version(0)
             .build(&engine)?;
 
-        // Test with empty log tail - should return same snapshot
         let result = Snapshot::try_new_from_impl(
             base_snapshot.clone(),
             vec![],
