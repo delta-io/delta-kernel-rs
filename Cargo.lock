@@ -4063,6 +4063,7 @@ version = "0.20.0"
 dependencies = [
  "delta_kernel",
  "itertools 0.14.0",
+ "rstest",
  "serde_json",
  "tar",
  "tempfile",

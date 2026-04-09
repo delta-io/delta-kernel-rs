@@ -1,6 +1,7 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
 pub mod counting_reporter;
+pub mod table_builder;
 pub use counting_reporter::CountingReporter;
 
 use std::collections::HashMap;
