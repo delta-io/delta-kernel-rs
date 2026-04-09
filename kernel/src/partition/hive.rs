@@ -278,7 +278,6 @@ mod tests {
     #[case("%2F", "%252F")]
     #[case("%3D", "%253D")]
     #[case("region=us/east#1", "region%3Dus%2Feast%231")]
-    #[case("2024-01-15 12:30:45", "2024-01-15 12%3A30%3A45")]
     fn test_escape_mixed(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(escape_partition_value(input), expected);
     }
@@ -383,6 +382,10 @@ mod tests {
         assert_eq!(escape_partition_value(">"), ">");
         assert_eq!(escape_partition_value("|"), "|");
         assert_eq!(escape_partition_value("a<b>c|d"), "a<b>c|d");
+        assert_eq!(
+            escape_partition_value("2024-01-15 12:30:45"),
+            "2024-01-15 12%3A30%3A45"
+        );
     }
 
     /// On non-Windows, build_partition_path preserves spaces (rows 56, 67, 68).
@@ -408,6 +411,10 @@ mod tests {
         assert_eq!(escape_partition_value(">"), "%3E");
         assert_eq!(escape_partition_value("|"), "%7C");
         assert_eq!(escape_partition_value("a<b>c|d"), "a%3Cb%3Ec%7Cd");
+        assert_eq!(
+            escape_partition_value("2024-01-15 12:30:45"),
+            "2024-01-15%2012%3A30%3A45"
+        );
     }
 
     /// On Windows, build_partition_path escapes spaces.
