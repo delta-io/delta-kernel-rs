@@ -12,7 +12,7 @@ use crate::actions::{
 };
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
-use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointHintSummary};
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
@@ -91,20 +91,6 @@ pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<Actio
     pub checkpoint_info: CheckpointReadInfo,
 }
 
-/// This struct stores metadata from the `_last_checkpoint` hint file, within the context of
-/// a log segment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[internal_api]
-pub(crate) struct LastCheckpointMetadata {
-    /// Version of the latest known checkpoint, at the time the hint file was read.
-    pub version: Version,
-
-    /// Schema of the checkpoint file(s), as read from the `_last_checkpoint` hint.
-    /// Useful for determining if `stats_parsed` is available for data skipping.
-    /// `None` when the hint file did not include a `checkpointSchema` field.
-    pub schema: Option<SchemaRef>,
-}
-
 /// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
 /// and commit files and guarantees the following:
 ///     1. Commit file versions will not have any gaps between them.
@@ -125,7 +111,7 @@ pub(crate) struct LogSegment {
     pub checkpoint_version: Option<Version>,
     pub log_root: Url,
     /// Metadata from the `_last_checkpoint` hint file.
-    pub last_checkpoint_metadata: Option<LastCheckpointMetadata>,
+    pub last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
     /// The set of log files found during listing.
     pub listed: LogSegmentFiles,
 }
@@ -184,7 +170,7 @@ impl LogSegment {
         mut listed_files: LogSegmentFiles,
         log_root: Url,
         end_version: Option<Version>,
-        last_checkpoint_metadata: Option<LastCheckpointMetadata>,
+        last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
     ) -> DeltaResult<Self> {
         validate_compaction_files(&listed_files.ascending_compaction_files)?;
         validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
@@ -306,14 +292,16 @@ impl LogSegment {
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        // TODO --> This seems like a bug with checkpoint_schema? i.e checkpoint schema is being loaded
-        // from last_checkpoint hint file and stored in log_segment even if the checkpoint version from the
-        // hint file is newer than time_travel_version.
+        // TODO(#2361): This is a bug -> checkpoint schema is being loaded from last_checkpoint
+        // hint file and stored in log_segment even if the checkpoint version from the hint file
+        // is newer than time_travel_version.
         let last_checkpoint_metadata =
-            checkpoint_hint.as_ref().map(|hint| LastCheckpointMetadata {
-                version: hint.version,
-                schema: hint.checkpoint_schema.clone(),
-            });
+            checkpoint_hint
+                .as_ref()
+                .map(|hint| LastCheckpointHintSummary {
+                    version: hint.version,
+                    schema: hint.checkpoint_schema.clone(),
+                });
 
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
@@ -514,7 +502,7 @@ impl LogSegment {
         // so a checkpoint at N covers everything and we can clear them entirely.
         new_log_segment.listed.ascending_commit_files.clear();
         new_log_segment.listed.ascending_compaction_files.clear();
-        // TODO(#839): Once CheckpointWriter exposes the output schema, build a LastCheckpointMetadata
+        // TODO(#839): Once CheckpointWriter exposes the output schema, build a LastCheckpointHintSummary
         // and thread it through here instead of None. Today the schema is computed inside checkpoint_data()
         // but not returned. With None, the next scan will read the checkpoint parquet footer
         // to determine the schema (e.g. whether stats_parsed or sidecar columns exist).

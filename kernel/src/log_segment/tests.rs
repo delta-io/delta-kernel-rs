@@ -19,8 +19,9 @@ use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::last_checkpoint_hint::LastCheckpointHintSummary;
 use crate::log_replay::ActionsBatch;
-use crate::log_segment::{LastCheckpointMetadata, LogSegment};
+use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
 use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
 use crate::parquet::arrow::ArrowWriter;
@@ -2714,7 +2715,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
         },
         log_root,
         None,
-        Some(LastCheckpointMetadata {
+        Some(LastCheckpointHintSummary {
             version: 1,
             schema: Some(hint_schema.clone()),
         }),
@@ -2798,7 +2799,7 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         },
         log_root,
         None,
-        use_hint.then(|| LastCheckpointMetadata {
+        use_hint.then(|| LastCheckpointHintSummary {
             version: 1,
             schema: Some(v1_schema.clone()),
         }),
