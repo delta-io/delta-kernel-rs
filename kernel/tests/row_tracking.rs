@@ -16,7 +16,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 
 use delta_kernel::engine::to_json_bytes;
-use delta_kernel::object_store::{path::Path, DynObjectStore, ObjectStore as _};                                                                                   
+use delta_kernel::object_store::{path::Path, DynObjectStore, ObjectStore as _};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
 
 use delta_kernel::transaction::CommitResult;
