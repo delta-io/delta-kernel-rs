@@ -9,16 +9,16 @@ use crate::{
     DeltaResult, EngineData, Error, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator,
 };
 
-/// Selects a subset of columns from a batch and filters out all-null rows.
+/// Adjusts a batch and filters out all-null rows.
 struct NonNullColumnPicker {
-    projector: Arc<dyn ExpressionEvaluator>,
+    adjuster: Arc<dyn ExpressionEvaluator>,
     null_row_filter: Arc<dyn PredicateEvaluator>,
 }
 
 impl NonNullColumnPicker {
     fn pick(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
-        let projected = self.projector.evaluate(batch)?;
-        filter_by_predicate(self.null_row_filter.as_ref(), projected)
+        let adjusted = self.adjuster.evaluate(batch)?;
+        filter_by_predicate(self.null_row_filter.as_ref(), adjusted)
     }
 }
 
@@ -144,11 +144,11 @@ impl SidecarSplitter {
         Ok(Self {
             checkpoint_data_iter: checkpoint_data_iterator,
             file_actions_picker: NonNullColumnPicker {
-                projector: file_action_projector,
+                adjuster: file_action_projector,
                 null_row_filter: file_actions_null_row_filter,
             },
             non_file_actions_picker: NonNullColumnPicker {
-                projector: non_file_action_nullifier,
+                adjuster: non_file_action_nullifier,
                 null_row_filter: non_file_actions_null_row_filter,
             },
             non_file_action_batches: Vec::new(),
