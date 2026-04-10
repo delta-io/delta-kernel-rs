@@ -70,7 +70,7 @@ mod tests {
 
     use crate::actions::visitors::DomainMetadataVisitor;
     use crate::committer::FileSystemCommitter;
-    use crate::engine::default::DefaultEngineBuilder;
+    use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::{DataType, StructField, StructType};
     use crate::transaction::create_table::create_table as create_table_txn;
@@ -84,7 +84,7 @@ mod tests {
     /// is the second batch.
     fn build_two_commit_log() -> (impl crate::Engine, std::sync::Arc<Snapshot>) {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = SyncEngine::new_with_store(store);
         let url = Url::parse("memory:///").unwrap();
 
         // Commit 0: CREATE TABLE (protocol + metadata) with "domainC" in the same commit.

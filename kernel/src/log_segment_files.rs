@@ -572,3 +572,433 @@ impl LogSegmentFiles {
         Self::build_log_segment_files(fs_iter, log_tail, start, Some(end_version))
     }
 }
+
+#[cfg(test)]
+mod list_log_files_with_log_tail_tests {
+    use std::sync::Arc;
+
+    use url::Url;
+
+    use crate::engine::sync::SyncEngine;
+    use crate::object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStoreExt as _};
+    use crate::Engine as _;
+    use crate::FileMeta;
+
+    use super::*;
+
+    // size markers used to identify commit sources in tests
+    const FILESYSTEM_SIZE_MARKER: u64 = 10;
+    const CATALOG_SIZE_MARKER: u64 = 7;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CommitSource {
+        Filesystem,
+        Catalog,
+    }
+
+    // create test storage given list of log files with custom data content
+    async fn create_storage(
+        log_files: Vec<(Version, LogPathFileType, CommitSource)>,
+    ) -> (Arc<dyn StorageHandler>, Url) {
+        let store = Arc::new(InMemory::new());
+        let log_root = Url::parse("memory:///_delta_log/").unwrap();
+
+        for (version, file_type, source) in log_files {
+            let path = match file_type {
+                LogPathFileType::Commit => {
+                    format!("_delta_log/{version:020}.json")
+                }
+                LogPathFileType::StagedCommit => {
+                    let uuid = uuid::Uuid::new_v4();
+                    format!("_delta_log/_staged_commits/{version:020}.{uuid}.json")
+                }
+                LogPathFileType::SinglePartCheckpoint => {
+                    format!("_delta_log/{version:020}.checkpoint.parquet")
+                }
+                LogPathFileType::MultiPartCheckpoint {
+                    part_num,
+                    num_parts,
+                } => {
+                    format!(
+                        "_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet"
+                    )
+                }
+                LogPathFileType::Crc => {
+                    format!("_delta_log/{version:020}.crc")
+                }
+                LogPathFileType::CompactedCommit { hi } => {
+                    format!("_delta_log/{version:020}.{hi:020}.compacted.json")
+                }
+                LogPathFileType::UuidCheckpoint | LogPathFileType::Unknown => {
+                    panic!("Unsupported file type in test: {file_type:?}")
+                }
+            };
+            let data = match source {
+                CommitSource::Filesystem => bytes::Bytes::from("filesystem"),
+                CommitSource::Catalog => bytes::Bytes::from("catalog"),
+            };
+            store
+                .put(&ObjectPath::from(path.as_str()), data.into())
+                .await
+                .expect("Failed to put test file");
+        }
+
+        let engine = SyncEngine::new_with_store(store);
+        (engine.storage_handler(), log_root)
+    }
+
+    // helper to create a ParsedLogPath with specific source marker
+    fn make_parsed_log_path_with_source(
+        version: Version,
+        file_type: LogPathFileType,
+        source: CommitSource,
+    ) -> ParsedLogPath {
+        let url = Url::parse(&format!("memory:///_delta_log/{version:020}.json")).unwrap();
+        let mut filename_path_segments = url.path_segments().unwrap();
+        let filename = filename_path_segments.next_back().unwrap().to_string();
+        let extension = filename.split('.').next_back().unwrap().to_string();
+
+        let size = match source {
+            CommitSource::Filesystem => FILESYSTEM_SIZE_MARKER,
+            CommitSource::Catalog => CATALOG_SIZE_MARKER,
+        };
+
+        let location = FileMeta {
+            location: url,
+            last_modified: 0,
+            size,
+        };
+
+        ParsedLogPath {
+            location,
+            filename,
+            extension,
+            version,
+            file_type,
+        }
+    }
+
+    fn assert_source(commit: &ParsedLogPath, expected_source: CommitSource) {
+        let expected_size = match expected_source {
+            CommitSource::Filesystem => FILESYSTEM_SIZE_MARKER,
+            CommitSource::Catalog => CATALOG_SIZE_MARKER,
+        };
+        assert_eq!(
+            commit.location.size, expected_size,
+            "Commit version {} should be from {:?}, but size was {}",
+            commit.version, expected_source, commit.location.size
+        );
+    }
+
+    /// Helper to call `LogSegmentFiles::list()` and destructure the result for assertions.
+    /// Returns (ascending_commit_files, ascending_compaction_files, checkpoint_parts,
+    ///          latest_crc_file, latest_commit_file, max_published_version).
+    #[allow(clippy::type_complexity)]
+    fn list_and_destructure(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
+        start_version: Option<Version>,
+        end_version: Option<Version>,
+    ) -> (
+        Vec<ParsedLogPath>,
+        Vec<ParsedLogPath>,
+        Vec<ParsedLogPath>,
+        Option<ParsedLogPath>,
+        Option<ParsedLogPath>,
+        Option<Version>,
+    ) {
+        let r =
+            LogSegmentFiles::list(storage, log_root, log_tail, start_version, end_version).unwrap();
+        (
+            r.ascending_commit_files,
+            r.ascending_compaction_files,
+            r.checkpoint_parts,
+            r.latest_crc_file,
+            r.latest_commit_file,
+            r.max_published_version,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_empty_log_tail() {
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+
+        let (commits, _, _, _, latest_commit, max_pub) =
+            list_and_destructure(storage.as_ref(), &log_root, vec![], Some(1), Some(2));
+
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].version, 1);
+        assert_eq!(commits[1].version, 2);
+        assert_source(&commits[0], CommitSource::Filesystem);
+        assert_source(&commits[1], CommitSource::Filesystem);
+        assert_eq!(latest_commit.unwrap().version, 2);
+        assert_eq!(max_pub, Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_log_tail_has_latest_commit_files() {
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+
+        let log_tail = vec![
+            make_parsed_log_path_with_source(3, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(4, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(5, LogPathFileType::Commit, CommitSource::Catalog),
+        ];
+
+        let (commits, _, _, _, latest_commit, max_pub) =
+            list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(0), Some(5));
+
+        assert_eq!(commits.len(), 6);
+        for (i, commit) in commits.iter().enumerate().take(3) {
+            assert_eq!(commit.version, i as u64);
+            assert_source(commit, CommitSource::Filesystem);
+        }
+        for (i, commit) in commits.iter().enumerate().skip(3) {
+            assert_eq!(commit.version, i as u64);
+            assert_source(commit, CommitSource::Catalog);
+        }
+        assert_eq!(latest_commit.unwrap().version, 5);
+        assert_eq!(max_pub, Some(5));
+    }
+
+    #[tokio::test]
+    async fn test_request_subset_with_log_tail() {
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+
+        let log_tail = vec![
+            make_parsed_log_path_with_source(2, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(3, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(4, LogPathFileType::Commit, CommitSource::Catalog),
+        ];
+
+        let (commits, _, _, _, latest_commit, max_pub) =
+            list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(1), Some(3));
+
+        assert_eq!(commits.len(), 3);
+        assert_eq!(commits[0].version, 1);
+        assert_eq!(commits[1].version, 2);
+        assert_eq!(commits[2].version, 3);
+        assert_source(&commits[0], CommitSource::Filesystem);
+        assert_source(&commits[1], CommitSource::Catalog);
+        assert_source(&commits[2], CommitSource::Catalog);
+        assert_eq!(latest_commit.unwrap().version, 3);
+        assert_eq!(max_pub, Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_log_tail_defines_latest_version() {
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+
+        let log_tail = vec![make_parsed_log_path_with_source(
+            1,
+            LogPathFileType::Commit,
+            CommitSource::Catalog,
+        )];
+
+        let (commits, _, _, _, latest_commit, max_pub) =
+            list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(0), None);
+
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].version, 0);
+        assert_eq!(commits[1].version, 1);
+        assert_source(&commits[0], CommitSource::Filesystem);
+        assert_source(&commits[1], CommitSource::Catalog);
+        assert_eq!(latest_commit.unwrap().version, 1);
+        assert_eq!(max_pub, Some(2));
+    }
+
+    #[test]
+    fn test_log_tail_covers_entire_range_empty_filesystem() {
+        struct EmptyStorageHandler;
+        impl StorageHandler for EmptyStorageHandler {
+            fn list_from(
+                &self,
+                _path: &Url,
+            ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+                Ok(Box::new(std::iter::empty()))
+            }
+            fn read_files(
+                &self,
+                _files: Vec<crate::FileSlice>,
+            ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+                panic!("read_files should not be called during listing");
+            }
+            fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+                panic!("put should not be called during listing");
+            }
+            fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+                panic!("copy_atomic should not be called during listing");
+            }
+            fn head(&self, _path: &Url) -> DeltaResult<crate::FileMeta> {
+                panic!("head should not be called during listing");
+            }
+        }
+
+        let log_tail = vec![
+            make_parsed_log_path_with_source(0, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(1, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(
+                2,
+                LogPathFileType::StagedCommit,
+                CommitSource::Catalog,
+            ),
+        ];
+
+        let storage = EmptyStorageHandler;
+        let url = Url::parse("memory:///anything/_delta_log/").unwrap();
+        let (commits, _, _, _, latest_commit, max_pub) =
+            list_and_destructure(&storage, &url, log_tail, Some(0), Some(2));
+
+        assert_eq!(commits.len(), 3);
+        assert_eq!(commits[0].version, 0);
+        assert_eq!(commits[1].version, 1);
+        assert_eq!(commits[2].version, 2);
+        assert_source(&commits[0], CommitSource::Catalog);
+        assert_source(&commits[1], CommitSource::Catalog);
+        assert_source(&commits[2], CommitSource::Catalog);
+        assert_eq!(latest_commit.unwrap().version, 2);
+        assert_eq!(max_pub, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_log_tail_covers_entire_range_with_crc() {
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::Crc, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+
+        let log_tail = vec![
+            make_parsed_log_path_with_source(0, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(1, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(
+                2,
+                LogPathFileType::StagedCommit,
+                CommitSource::Catalog,
+            ),
+        ];
+
+        let (commits, _, _, latest_crc, latest_commit, max_pub) =
+            list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(0), Some(2));
+
+        assert_eq!(commits.len(), 3);
+        assert_source(&commits[0], CommitSource::Catalog);
+        assert_source(&commits[1], CommitSource::Catalog);
+        assert_source(&commits[2], CommitSource::Catalog);
+
+        let crc = latest_crc.unwrap();
+        assert_eq!(crc.version, 2);
+        assert!(matches!(crc.file_type, LogPathFileType::Crc));
+
+        assert_eq!(latest_commit.unwrap().version, 2);
+        assert_eq!(max_pub, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_listing_omits_staged_commits() {
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::StagedCommit, CommitSource::Filesystem),
+            (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
+        ];
+
+        let (storage, log_root) = create_storage(log_files).await;
+        let (commits, _, _, _, latest_commit, max_pub) =
+            list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].version, 0);
+        assert_eq!(commits[1].version, 1);
+        assert_source(&commits[0], CommitSource::Filesystem);
+        assert_source(&commits[1], CommitSource::Filesystem);
+        assert_eq!(latest_commit.unwrap().version, 1);
+        assert_eq!(max_pub, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_listing_with_large_end_version() {
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
+        ];
+
+        let (storage, log_root) = create_storage(log_files).await;
+        let (commits, _, _, _, latest_commit, max_pub) =
+            list_and_destructure(storage.as_ref(), &log_root, vec![], None, Some(3));
+
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].version, 0);
+        assert_eq!(commits[1].version, 1);
+        assert_eq!(latest_commit.unwrap().version, 1);
+        assert_eq!(max_pub, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_non_commit_files_at_log_tail_versions_are_preserved() {
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::Commit, CommitSource::Filesystem),
+            (3, LogPathFileType::Commit, CommitSource::Filesystem),
+            (4, LogPathFileType::Commit, CommitSource::Filesystem),
+            (5, LogPathFileType::Commit, CommitSource::Filesystem),
+            (
+                7,
+                LogPathFileType::SinglePartCheckpoint,
+                CommitSource::Filesystem,
+            ),
+            (8, LogPathFileType::Crc, CommitSource::Filesystem),
+        ];
+        let (storage, log_root) = create_storage(log_files).await;
+
+        let log_tail = vec![
+            make_parsed_log_path_with_source(6, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(7, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(8, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(9, LogPathFileType::Commit, CommitSource::Catalog),
+            make_parsed_log_path_with_source(10, LogPathFileType::Commit, CommitSource::Catalog),
+        ];
+
+        let (commits, _, checkpoint_parts, latest_crc, latest_commit, max_pub) =
+            list_and_destructure(storage.as_ref(), &log_root, log_tail, Some(0), Some(10));
+
+        assert_eq!(checkpoint_parts.len(), 1);
+        assert_eq!(checkpoint_parts[0].version, 7);
+        assert!(checkpoint_parts[0].is_checkpoint());
+
+        let crc = latest_crc.unwrap();
+        assert_eq!(crc.version, 8);
+        assert!(matches!(crc.file_type, LogPathFileType::Crc));
+
+        assert_eq!(commits.len(), 5);
+        for (i, commit) in commits.iter().enumerate() {
+            assert_eq!(commit.version, (i + 6) as u64);
+            assert_source(commit, CommitSource::Catalog);
+        }
+        assert_eq!(latest_commit.unwrap().version, 10);
+        assert_eq!(max_pub, Some(10));
+    }
+}
