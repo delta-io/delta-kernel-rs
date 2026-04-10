@@ -203,8 +203,8 @@ fn format_binary(bytes: &[u8]) -> DeltaResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::Scalar;
-    use crate::schema::{DataType, PrimitiveType};
+    use crate::expressions::{ArrayData, MapData, Scalar, StructData};
+    use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField};
     use rstest::rstest;
 
     // ============================================================================
@@ -652,8 +652,6 @@ mod tests {
     /// Non-null Struct, Array, and Map values return an error.
     #[test]
     fn test_serialize_partition_value_non_null_struct_returns_error() {
-        use crate::expressions::StructData;
-        use crate::schema::StructField;
         let data = StructData::try_new(
             vec![StructField::new("x", DataType::INTEGER, true)],
             vec![Scalar::Integer(1)],
@@ -664,16 +662,12 @@ mod tests {
 
     #[test]
     fn test_serialize_partition_value_non_null_array_returns_error() {
-        use crate::expressions::ArrayData;
-        use crate::schema::ArrayType;
         let data = ArrayData::try_new(ArrayType::new(DataType::INTEGER, false), [1i32]).unwrap();
         assert!(serialize_partition_value(&Scalar::Array(data)).is_err());
     }
 
     #[test]
     fn test_serialize_partition_value_non_null_map_returns_error() {
-        use crate::expressions::MapData;
-        use crate::schema::MapType;
         let data = MapData::try_new(
             MapType::new(DataType::STRING, DataType::INTEGER, false),
             [("k".to_string(), 1i32)],
