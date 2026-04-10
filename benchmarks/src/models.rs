@@ -538,7 +538,7 @@ mod tests {
         let tt = TimeTravel::Version { version: -1 };
         assert_eq!(
             tt.as_version(),
-            Err("Snapshot version must be non-negative")
+            Err("Only non-negative snapshot versions are supported")
         );
     }
 
