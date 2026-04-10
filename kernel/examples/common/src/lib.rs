@@ -4,11 +4,11 @@ use std::{collections::HashMap, sync::Arc};
 
 use clap::{Args, CommandFactory, FromArgMatches};
 use delta_kernel::{
-    arrow::array::RecordBatch, engine::default::executor::tokio::TokioBackgroundExecutor,
-    engine::default::storage::store_from_url_opts, engine::default::DefaultEngine,
-    engine::default::DefaultEngineBuilder, scan::Scan, schema::MetadataColumnSpec, DeltaResult,
-    SnapshotRef,
+    arrow::array::RecordBatch, scan::Scan, schema::MetadataColumnSpec, DeltaResult, SnapshotRef,
 };
+use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_default_engine::storage::store_from_url_opts;
+use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 
 use delta_kernel::object_store::{
     aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,

@@ -13,9 +13,9 @@ use crate::{
 };
 use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 #[cfg(test)]
-use delta_kernel::engine::default::DefaultEngineBuilder;
-#[cfg(test)]
 use delta_kernel::object_store::memory::InMemory;
+#[cfg(test)]
+use delta_kernel_default_engine::DefaultEngineBuilder;
 #[cfg(test)]
 use test_utils::add_commit;
 

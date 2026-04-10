@@ -19,7 +19,7 @@ arrow-57 = ["delta_kernel/arrow-57"]
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 delta_kernel = { path = "../../../kernel", features = [
-  "default-engine-rustls",
   "internal-api",
 ] }
+delta_kernel_default_engine = { path = "../../../default-engine", features = ["rustls", "arrow"] }
 url = "2"
