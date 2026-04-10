@@ -542,3 +542,122 @@ fn read_add_actions_json(
         .filter_map(|v| v.get("add").cloned())
         .collect())
 }
+
+// ==============================================================================
+// write_partitioned_parquet e2e tests
+// ==============================================================================
+
+/// Writes 6 rows spanning 3 partitions (non-adjacent in the input) using
+/// write_partitioned_parquet, then verifies 3 add actions with correct
+/// partitionValues and reads back all 6 rows with correct values.
+#[rstest]
+#[case::cm_none(ColumnMappingMode::None)]
+#[case::cm_name(ColumnMappingMode::Name)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_partitioned_parquet_multi_partition_roundtrip(
+    #[case] cm_mode: ColumnMappingMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+
+    // === Step 1: Create a partitioned table ===
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let schema = Arc::new(
+        StructType::try_new(vec![
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("region", DataType::STRING),
+        ])
+        .unwrap(),
+    );
+
+    let mut builder = create_table(&table_path, schema.clone(), "test/1.0")
+        .with_data_layout(DataLayout::partitioned(vec!["region"]));
+    if cm_mode != ColumnMappingMode::None {
+        builder =
+            builder.with_table_properties([("delta.columnMapping.mode", cm_mode_str(cm_mode))]);
+    }
+    let _ = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+
+    // === Step 2: Build a batch with 6 rows, 3 partitions, non-adjacent ===
+    let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
+            Arc::new(StringArray::from(vec!["US", "EU", "US", "AP", "EU", "AP"])),
+        ],
+    )?;
+
+    // === Step 3: Write using write_partitioned_parquet ===
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("test")
+        .with_data_change(true);
+
+    let meta = engine
+        .write_partitioned_parquet(&ArrowEngineData::new(batch), &txn)
+        .await?;
+    txn.add_files(meta);
+    let commit_result = txn.commit(engine.as_ref())?;
+    assert!(commit_result.is_committed(), "commit should succeed");
+
+    // === Step 4: Verify commit log has 3 add actions ===
+    let adds = read_add_actions_json(&table_path, 1)?;
+    assert_eq!(
+        adds.len(),
+        3,
+        "should have 3 add actions (one per partition)"
+    );
+
+    // Collect partitionValues from all add actions.
+    let mut partition_values: Vec<String> = adds
+        .iter()
+        .map(|add| {
+            let pv = add["partitionValues"].as_object().unwrap();
+            assert_eq!(pv.len(), 1, "each add should have 1 partition column");
+            // Get the value (could be under logical or physical key depending on CM mode).
+            pv.values().next().unwrap().as_str().unwrap().to_string()
+        })
+        .collect();
+    partition_values.sort();
+    assert_eq!(
+        partition_values,
+        vec!["AP", "EU", "US"],
+        "should have one add per distinct region value"
+    );
+
+    // === Step 5: Read back and verify all 6 rows ===
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let snapshot = Arc::new(snapshot);
+    let sorted = read_sorted(&snapshot, engine.clone())?;
+    assert_eq!(sorted.num_rows(), 6, "should read back all 6 rows");
+
+    // Verify id values (sorted by id since read_sorted sorts by column 0).
+    let ids: Vec<i32> = sorted
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+
+    // Verify region values match (after sorting by id).
+    let regions: Vec<&str> = (0..6)
+        .map(|i| {
+            sorted
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(i)
+        })
+        .collect();
+    assert_eq!(regions, vec!["US", "EU", "US", "AP", "EU", "AP"]);
+
+    Ok(())
+}

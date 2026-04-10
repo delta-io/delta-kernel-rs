@@ -6,32 +6,44 @@
 //! a separate thread pool, provided by the [`TaskExecutor`] trait. Read more in
 //! the [executor] module.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use futures::stream::{BoxStream, StreamExt as _};
+use futures::stream::{self, BoxStream, StreamExt as _, TryStreamExt as _};
 use url::Url;
 
 use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
+use self::scalar_from_arrow::extract_scalar;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
+use crate::arrow::array::{ArrayRef, RecordBatch};
+use crate::arrow::compute::{concat_batches, partition};
+use crate::expressions::Scalar;
 use crate::metrics::MetricsReporter;
 use crate::object_store::DynObjectStore;
+use crate::partition::serialization::serialize_partition_value;
 use crate::schema::Schema;
-use crate::transaction::WriteContext;
+use crate::transaction::{Transaction, WriteContext};
 use crate::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+    DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler, ParquetHandler,
+    StorageHandler,
 };
+
+/// Hashable key for grouping adjacent partition slices that share the same partition values.
+/// Each element is the serialized partition value (`None` = null) for one partition column.
+type PartitionGroupKey = Vec<Option<String>>;
 
 pub mod executor;
 pub mod file_stream;
 pub mod filesystem;
 pub mod json;
 pub mod parquet;
+pub mod scalar_from_arrow;
 pub mod stats;
 pub mod storage;
 
@@ -303,6 +315,117 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             )
             .await
     }
+
+    /// Partitions a [`RecordBatch`] by partition column values and writes each partition to a
+    /// separate parquet file, returning all add-file metadata as a single [`EngineData`] batch.
+    ///
+    /// The input `data` must contain ALL columns (data + partition) matching the table's logical
+    /// schema. Partition columns are discovered from the transaction. For unpartitioned tables,
+    /// writes the entire batch as a single file.
+    ///
+    /// Uses the partition-then-rejoin strategy: scans the batch once to find runs of adjacent
+    /// identical partition values (zero-copy slices), groups them by partition key, merges
+    /// non-adjacent runs via [`concat_batches`], then writes each distinct partition concurrently
+    /// (up to 50 in-flight writes) using buffered streams.
+    ///
+    /// Returns a single [`EngineData`] batch containing all add-file metadata (one row per
+    /// written file). Pass this directly to [`Transaction::add_files`].
+    ///
+    /// [`Transaction::add_files`]: crate::transaction::Transaction::add_files
+    pub async fn write_partitioned_parquet<S>(
+        &self,
+        data: &ArrowEngineData,
+        txn: &Transaction<S>,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let batch = data.record_batch();
+        let partition_cols = txn.logical_partition_columns();
+
+        // Unpartitioned fast path: write the whole batch as a single file.
+        if partition_cols.is_empty() {
+            let wc = txn.unpartitioned_write_context()?;
+            return self.write_parquet(data, &wc).await;
+        }
+
+        // Resolve partition column indices in the input batch schema.
+        let col_indices: Vec<usize> = partition_cols
+            .iter()
+            .map(|name| {
+                batch.schema().index_of(name).map_err(|_| {
+                    Error::generic(format!(
+                        "partition column '{}' not found in input batch schema",
+                        name
+                    ))
+                })
+            })
+            .collect::<DeltaResult<_>>()?;
+
+        // Find adjacent groups of identical partition values (O(n) scan, no sort).
+        let partition_arrays: Vec<ArrayRef> = col_indices
+            .iter()
+            .map(|&idx| batch.column(idx).clone())
+            .collect();
+        let ranges = partition(&partition_arrays)
+            .map_err(|e| Error::generic(format!("arrow partition failed: {e}")))?
+            .ranges();
+
+        // Slice each adjacent group and group by partition key. Slices are zero-copy
+        // (offset+length views over the original batch buffers).
+        let mut groups: HashMap<PartitionGroupKey, (HashMap<String, Scalar>, Vec<RecordBatch>)> =
+            HashMap::new();
+
+        for range in &ranges {
+            let slice = batch.slice(range.start, range.end - range.start);
+
+            let mut values = HashMap::with_capacity(col_indices.len());
+            let mut group_key = Vec::with_capacity(col_indices.len());
+            for (name, &idx) in partition_cols.iter().zip(&col_indices) {
+                let scalar = extract_scalar(slice.column(idx).as_ref(), 0)?;
+                group_key.push(serialize_partition_value(&scalar)?);
+                values.insert(name.clone(), scalar);
+            }
+
+            groups
+                .entry(group_key)
+                .or_insert_with(|| (values, Vec::new()))
+                .1
+                .push(slice);
+        }
+
+        // Rejoin non-adjacent groups: concat slices that share the same partition key.
+        // If a partition has only one contiguous run, the original zero-copy slice is
+        // used directly (no data copied).
+        let partitions: Vec<(HashMap<String, Scalar>, RecordBatch)> = groups
+            .into_values()
+            .map(
+                |(values, slices): (HashMap<String, Scalar>, Vec<RecordBatch>)| {
+                    if slices.len() == 1 {
+                        let batch = slices.into_iter().next().ok_or_else(|| {
+                            Error::generic("expected at least one slice in partition group")
+                        })?;
+                        Ok((values, batch))
+                    } else {
+                        let merged = concat_batches(&slices[0].schema(), &slices)
+                            .map_err(|e| Error::generic(format!("concat_batches failed: {e}")))?;
+                        Ok((values, merged))
+                    }
+                },
+            )
+            .collect::<DeltaResult<_>>()?;
+
+        // Write each partition concurrently (buffered stream, up to 50 in-flight).
+        let results: Vec<Box<dyn EngineData>> = stream::iter(partitions)
+            .map(|(values, group_batch)| async move {
+                let wc = txn.partitioned_write_context(values)?;
+                self.write_parquet(&ArrowEngineData::new(group_batch), &wc)
+                    .await
+            })
+            .buffered(MAX_CONCURRENT_PARTITION_WRITES)
+            .try_collect()
+            .await?;
+
+        // Merge all per-partition metadata into a single EngineData batch.
+        merge_add_file_metadata(results)
+    }
 }
 
 /// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values
@@ -319,6 +442,32 @@ pub fn build_add_file_metadata(
     write_context: &WriteContext,
 ) -> DeltaResult<Box<dyn EngineData>> {
     file_metadata.as_record_batch(write_context.physical_partition_values())
+}
+
+/// Maximum number of concurrent partition writes in [`DefaultEngine::write_partitioned_parquet`].
+const MAX_CONCURRENT_PARTITION_WRITES: usize = 50;
+
+/// Merges multiple add-file metadata batches into a single [`EngineData`] batch.
+fn merge_add_file_metadata(batches: Vec<Box<dyn EngineData>>) -> DeltaResult<Box<dyn EngineData>> {
+    if batches.len() == 1 {
+        return batches
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::generic("expected at least one metadata batch"));
+    }
+    let arrow_batches: Vec<Box<ArrowEngineData>> = batches
+        .into_iter()
+        .map(|b| {
+            ArrowEngineData::try_from_engine_data(b)
+                .map_err(|_| Error::generic("expected ArrowEngineData from write_parquet"))
+        })
+        .collect::<DeltaResult<_>>()?;
+    let record_batches: Vec<&RecordBatch> =
+        arrow_batches.iter().map(|d| d.record_batch()).collect();
+    let schema = record_batches[0].schema();
+    let merged = concat_batches(&schema, record_batches)
+        .map_err(|e| Error::generic(format!("failed to merge add-file metadata: {e}")))?;
+    Ok(Box::new(ArrowEngineData::new(merged)))
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
