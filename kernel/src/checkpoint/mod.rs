@@ -117,12 +117,8 @@ use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, 
 use url::Url;
 
 mod checkpoint_transform;
-#[allow(unused)]
-// Used once sidecar checkpoint writing is enabled
 mod sidecar;
 
-#[allow(unused_imports)]
-//SIDECAR_TODO: Will be removed in the PR officially provides sidecar support.
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator};
 
 use checkpoint_transform::{
@@ -590,7 +586,6 @@ impl CheckpointWriter {
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `checkpoint_data_schema`: The output checkpoint schema (must contain a `sidecar` struct field)
     /// - `sidecar_metas`: Pairs of (relative sidecar filename, FileMeta) for each sidecar file
-    #[allow(dead_code)] //SIDECAR_TODO: Will be removed in the PR officially provides sidecar support.
     fn create_sidecar_action_batches(
         &self,
         engine: &dyn Engine,
@@ -660,7 +655,6 @@ impl CheckpointWriter {
     /// # Parameters
     /// - `engine`: Engine for data processing and I/O
     /// - `file_actions_per_sidecar_hint`: Approximate number of file actions per sidecar
-    #[allow(dead_code)] // SIDECAR_TODO: Will be removed in the PR officially provides sidecar support.
     pub(crate) fn write_checkpoint_with_sidecars(
         self,
         engine: &dyn Engine,
@@ -748,7 +742,6 @@ impl CheckpointWriter {
     }
 
     /// Writes a checkpoint (V1 or V2 without sidecars).
-    #[allow(dead_code)] // SIDECAR_TODO: Will be removed in the PR officially provides sidecar support.
     pub(crate) fn write_checkpoint_without_sidecars(self, engine: &dyn Engine) -> DeltaResult<()> {
         let checkpoint_path = self.checkpoint_path()?;
         let data_iter = self.checkpoint_data(engine)?;

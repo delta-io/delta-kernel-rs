@@ -575,11 +575,8 @@ impl Snapshot {
     /// - If `file_actions_per_sidecar_hint` is `Some(0)`.
     ///
     /// [`CheckpointSpec`]: crate::checkpoint::CheckpointSpec
-    #[internal_api]
     #[instrument(parent = &self.span, name = "snap.checkpoint_placeholder", skip_all, err)]
-    #[allow(unused)]
-    // Next PR will replace snapshot.checkpoint with snapshot.checkpoint_placeholder.
-    pub(crate) fn snapshot_checkpoint_placeholder(
+    pub fn snapshot_checkpoint_placeholder(
         self: Arc<Self>,
         engine: &dyn Engine,
         spec: Option<&CheckpointSpec>,
