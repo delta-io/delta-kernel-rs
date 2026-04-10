@@ -7,9 +7,9 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::Snapshot;
+use delta_kernel_default_engine::DefaultEngineBuilder;
 use serde_json::json;
 use tempfile::tempdir;
 use tracing::info;
