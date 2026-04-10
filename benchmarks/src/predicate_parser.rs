@@ -40,6 +40,9 @@
 
 use std::borrow::Cow;
 
+// Imports use a naming convention to distinguish kernel types from sqlparser types:
+// - K-prefix: Kernel types (KExpr, KPred, KBinOp, KPredOp)
+// - P-prefix: Parser/sqlparser types (PExpr, PBinOp, PUnaryOp, PVal)
 use delta_kernel::expressions::{
     ArrayData, BinaryExpressionOp as KBinOp, BinaryPredicateOp as KPredOp, ColumnName,
     Expression as KExpr, Predicate as KPred, Scalar,
@@ -215,6 +218,7 @@ fn check_literal(
     value: &PVal,
     is_negative: bool,
 ) -> Result<KExpr, Box<dyn std::error::Error>> {
+    // Local import to avoid conflict with Scalar::* variants (Long, Integer, etc.) used in tests
     use PrimitiveType::*;
     match (expected_ty, value) {
         // Numeric literals - only for numeric primitive types
@@ -840,6 +844,37 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Cannot determine type"));
+    }
+
+    #[test]
+    fn literal_only_comparison_fails() {
+        // When both sides are literals (no column context), types cannot be determined
+        let schema = test_schema();
+        let result = parse_predicate("5 > 3", &schema);
+        assert!(result.is_err(), "Literal-only comparisons should fail");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot determine types"));
+    }
+
+    // IN list with NULL values (tests ArrayType nullability)
+    #[test]
+    fn in_list_with_null_values() {
+        let schema = test_schema();
+        let pred = parse_predicate("a IN (1, 2, NULL)", &schema).unwrap();
+        // The array should be nullable since it contains NULL
+        let expected_array = ArrayData::try_new(
+            ArrayType::new(DataType::LONG, true), // nullable = true
+            vec![Long(1), Long(2), Null(DataType::LONG)],
+        )
+        .unwrap();
+        let expected = KPred::binary(
+            KPredOp::In,
+            column_name!("a"),
+            KExpr::literal(Scalar::Array(expected_array)),
+        );
+        assert_eq!(pred, expected);
     }
 
     // Arithmetic expressions (now supported)
