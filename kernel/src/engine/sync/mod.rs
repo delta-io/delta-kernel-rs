@@ -2,6 +2,7 @@
 
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
+use crate::metrics::MetricsReporter;
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
     JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
@@ -24,6 +25,7 @@ pub(crate) struct SyncEngine {
     json_handler: Arc<json::SyncJsonHandler>,
     parquet_handler: Arc<parquet::SyncParquetHandler>,
     evaluation_handler: Arc<ArrowEvaluationHandler>,
+    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl SyncEngine {
@@ -33,6 +35,15 @@ impl SyncEngine {
             json_handler: Arc::new(json::SyncJsonHandler {}),
             parquet_handler: Arc::new(parquet::SyncParquetHandler {}),
             evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
+            metrics_reporter: None,
+        }
+    }
+
+    /// Create a new `SyncEngine` with the given metrics reporter.
+    pub(crate) fn new_with_reporter(reporter: Arc<dyn MetricsReporter>) -> Self {
+        SyncEngine {
+            metrics_reporter: Some(reporter),
+            ..Self::new()
         }
     }
 }
@@ -53,6 +64,10 @@ impl Engine for SyncEngine {
 
     fn json_handler(&self) -> Arc<dyn JsonHandler> {
         self.json_handler.clone()
+    }
+
+    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
+        self.metrics_reporter.clone()
     }
 }
 
