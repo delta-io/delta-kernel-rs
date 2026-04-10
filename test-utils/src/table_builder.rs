@@ -51,13 +51,19 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowS
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
+use serde_json::json;
+
+use crate::delta_path_for_version;
 
 // ===========================================================================
 // LogState
@@ -69,6 +75,24 @@ pub enum LogState {
     /// Only JSON commit files: `num_commits` total versions (0 through `num_commits - 1`).
     /// Version 0 is always the create-table commit; versions 1+ contain data.
     CommitsOnly { num_commits: u64 },
+    /// Commits 0..total_versions, with a V1 parquet checkpoint at `checkpoint_at`.
+    CheckpointV1 {
+        checkpoint_at: u64,
+        total_versions: u64,
+    },
+    /// Commits 0..total_versions, with a V2 checkpoint at `checkpoint_at`.
+    /// Requires `FeatureSet::new().v2_checkpoint()`.
+    CheckpointV2 {
+        checkpoint_at: u64,
+        total_versions: u64,
+    },
+    /// A V1 checkpoint followed by additional commits.
+    CheckpointAndCommits {
+        checkpoint_at: u64,
+        commits_after: u64,
+    },
+    /// Commits with a CRC file at `crc_at`.
+    WithCrc { crc_at: u64, total_versions: u64 },
 }
 
 impl LogState {
@@ -85,10 +109,62 @@ impl LogState {
         LogState::CommitsOnly { num_commits: n }
     }
 
+    /// Table with a V1 checkpoint at the given version.
+    pub fn checkpoint_v1(at: u64, total: u64) -> Self {
+        LogState::CheckpointV1 {
+            checkpoint_at: at,
+            total_versions: total,
+        }
+    }
+
+    /// Table with a V2 checkpoint at the given version.
+    pub fn checkpoint_v2(at: u64, total: u64) -> Self {
+        LogState::CheckpointV2 {
+            checkpoint_at: at,
+            total_versions: total,
+        }
+    }
+
+    /// Table with a V1 checkpoint followed by additional commits.
+    pub fn checkpoint_and_commits(checkpoint_at: u64, commits_after: u64) -> Self {
+        LogState::CheckpointAndCommits {
+            checkpoint_at,
+            commits_after,
+        }
+    }
+
+    /// Table with a CRC file at the given version.
+    pub fn with_crc(at: u64, total: u64) -> Self {
+        LogState::WithCrc {
+            crc_at: at,
+            total_versions: total,
+        }
+    }
+
+    /// All standard log states for a table with `n` total versions.
+    /// Useful for cross-product testing across all log configurations.
+    pub fn all(n: u64) -> Vec<Self> {
+        assert!(n >= 2, "need at least 2 versions for meaningful log states");
+        vec![
+            Self::with_commits(n),
+            Self::checkpoint_v1(n - 1, n),
+            Self::checkpoint_v2(n - 1, n),
+            Self::checkpoint_and_commits(1, n - 2),
+            Self::with_crc(0, n),
+        ]
+    }
+
     /// Number of commit files on disk (versions 0 through `num_versions - 1`).
     pub(crate) fn num_versions(&self) -> u64 {
         match self {
             LogState::CommitsOnly { num_commits } => *num_commits,
+            LogState::CheckpointV1 { total_versions, .. } => *total_versions,
+            LogState::CheckpointV2 { total_versions, .. } => *total_versions,
+            LogState::CheckpointAndCommits {
+                checkpoint_at,
+                commits_after,
+            } => checkpoint_at + commits_after + 1,
+            LogState::WithCrc { total_versions, .. } => *total_versions,
         }
     }
 }
@@ -97,6 +173,31 @@ impl fmt::Display for LogState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LogState::CommitsOnly { num_commits } => write!(f, "commits({num_commits})"),
+            LogState::CheckpointV1 {
+                checkpoint_at,
+                total_versions,
+            } => write!(
+                f,
+                "checkpoint_v1(at={checkpoint_at}, total={total_versions})"
+            ),
+            LogState::CheckpointV2 {
+                checkpoint_at,
+                total_versions,
+            } => write!(
+                f,
+                "checkpoint_v2(at={checkpoint_at}, total={total_versions})"
+            ),
+            LogState::CheckpointAndCommits {
+                checkpoint_at,
+                commits_after,
+            } => write!(
+                f,
+                "checkpoint_and_commits(at={checkpoint_at}, after={commits_after})"
+            ),
+            LogState::WithCrc {
+                crc_at,
+                total_versions,
+            } => write!(f, "with_crc(at={crc_at}, total={total_versions})"),
         }
     }
 }
@@ -124,6 +225,66 @@ impl FeatureSet {
     pub fn empty() -> Self {
         Self::new()
     }
+
+    /// Enable column mapping with the given mode ("none", "name", or "id").
+    pub fn column_mapping(mut self, mode: &str) -> Self {
+        if mode != "none" {
+            self.table_properties
+                .push(("delta.columnMapping.mode".into(), mode.into()));
+        }
+        self
+    }
+
+    /// Enable V2 checkpoints.
+    pub fn v2_checkpoint(mut self) -> Self {
+        self.table_properties
+            .push(("delta.feature.v2Checkpoint".into(), "supported".into()));
+        self
+    }
+
+    /// Enable in-commit timestamps.
+    pub fn ict(mut self) -> Self {
+        self.table_properties
+            .push(("delta.enableInCommitTimestamps".into(), "true".into()));
+        self
+    }
+
+    /// Set an arbitrary table property. Useful for properties that don't have a
+    /// dedicated method (e.g. `delta.checkpoint.writeStatsAsJson`).
+    pub fn with_property(mut self, key: &str, value: &str) -> Self {
+        self.table_properties.push((key.into(), value.into()));
+        self
+    }
+
+    /// Common feature sets for cross-product testing: empty, one per feature, and one
+    /// combined set. Not the full power set -- add specific combos as needed.
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::empty(),
+            Self::new().column_mapping("name"),
+            Self::new().ict(),
+            Self::new().v2_checkpoint(),
+            Self::new().column_mapping("name").ict(),
+        ]
+    }
+
+    /// Merge another feature set's properties into this one.
+    pub fn merge(&self, other: &FeatureSet) -> Self {
+        let mut merged = self.clone();
+        for prop in &other.table_properties {
+            if !merged.table_properties.contains(prop) {
+                merged.table_properties.push(prop.clone());
+            }
+        }
+        merged
+    }
+
+    /// Whether v2_checkpoint is enabled.
+    pub fn has_v2_checkpoint(&self) -> bool {
+        self.table_properties
+            .iter()
+            .any(|(k, v)| k == "delta.feature.v2Checkpoint" && v == "supported")
+    }
 }
 
 impl fmt::Display for FeatureSet {
@@ -145,6 +306,70 @@ impl fmt::Display for FeatureSet {
             .collect();
         write!(f, "{}", props.join(", "))
     }
+}
+
+// ===========================================================================
+// DataLayoutConfig
+// ===========================================================================
+
+/// Data layout configuration for cross-product testing (partitioning, clustering, etc.).
+///
+/// Designed for rstest `#[values]` parameterization alongside [`LogState`] and
+/// [`FeatureSet`].
+#[derive(Clone, Debug)]
+pub enum DataLayoutConfig {
+    /// No partition columns (default schema).
+    Unpartitioned,
+    /// Partition by every valid primitive type: ts_ntz, bool, string, date, int, long,
+    /// decimal, timestamp. Uses [`partitioned_schema`] with all columns as partition columns.
+    AllTypes,
+}
+
+impl DataLayoutConfig {
+    /// The partition column names for this config, referencing [`partitioned_schema`] columns.
+    pub fn columns(&self) -> Vec<&'static str> {
+        match self {
+            DataLayoutConfig::Unpartitioned => vec![],
+            DataLayoutConfig::AllTypes => vec![
+                "part_ts_ntz",
+                "part_bool",
+                "part_string",
+                "part_date",
+                "part_int",
+                "part_long",
+                "part_decimal",
+                "part_ts",
+            ],
+        }
+    }
+}
+
+impl fmt::Display for DataLayoutConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DataLayoutConfig::Unpartitioned => write!(f, "unpartitioned"),
+            DataLayoutConfig::AllTypes => write!(f, "partitioned(all_types)"),
+        }
+    }
+}
+
+/// Schema with all partition-valid primitive types. Use with [`DataLayoutConfig`] to select
+/// which columns are partition columns. Includes `TimestampNtz` which auto-enables the
+/// `timestampNtz` table feature.
+pub fn partitioned_schema() -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        // Partition-candidate columns (all valid partition types)
+        StructField::new("part_bool", DataType::BOOLEAN, true),
+        StructField::new("part_int", DataType::INTEGER, true),
+        StructField::new("part_long", DataType::LONG, true),
+        StructField::new("part_string", DataType::STRING, true),
+        StructField::new("part_date", DataType::DATE, true),
+        StructField::new("part_ts", DataType::TIMESTAMP, true),
+        StructField::new("part_ts_ntz", DataType::TIMESTAMP_NTZ, true),
+        StructField::new("part_decimal", DataType::decimal(10, 2).unwrap(), true),
+        // Non-partition data column (required: at least one non-partition column)
+        StructField::new("value", DataType::INTEGER, true),
+    ]))
 }
 
 // ===========================================================================
@@ -190,6 +415,7 @@ pub struct TestTableBuilder {
     log_state: LogState,
     features: FeatureSet,
     schema: SchemaRef,
+    partition_columns: Vec<String>,
     num_data_files: usize,
     rows_per_file: usize,
 }
@@ -208,6 +434,7 @@ impl TestTableBuilder {
             log_state: LogState::with_commits(1),
             features: FeatureSet::empty(),
             schema: default_schema(),
+            partition_columns: Vec::new(),
             num_data_files: 1,
             rows_per_file: 10,
         }
@@ -233,13 +460,74 @@ impl TestTableBuilder {
 
     /// Override the number of parquet data files per commit and rows per file. Defaults
     /// are 1 file with 10 rows -- most tests don't need to call this.
-    ///
-    /// Note: for partitioned tables the file count is determined by the number of distinct
-    /// partition values, so `files_per_commit` is ignored in that case.
     pub fn with_data(mut self, files_per_commit: usize, rows_per_file: usize) -> Self {
         self.num_data_files = files_per_commit;
         self.rows_per_file = rows_per_file;
         self
+    }
+
+    /// Set partition columns by logical name. The columns must exist in the schema.
+    /// Each data file gets deterministic partition values derived from version and file index.
+    pub fn with_partition_columns(
+        mut self,
+        cols: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.partition_columns = cols.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Apply a [`DataLayoutConfig`], setting the schema and partition columns accordingly.
+    /// For [`DataLayoutConfig::Unpartitioned`], leaves the schema and columns unchanged.
+    pub fn with_data_layout(self, config: DataLayoutConfig) -> Self {
+        let cols = config.columns();
+        if cols.is_empty() {
+            return self;
+        }
+        self.with_schema(partitioned_schema())
+            .with_partition_columns(cols)
+    }
+
+    /// Build all valid (LogState, FeatureSet) combinations with the given required features.
+    ///
+    /// Cross-products all standard log states with all standard feature sets, merging
+    /// `required` into each one. Pass `FeatureSet::empty()` for no required features.
+    /// Incompatible pairings are skipped (e.g. V2 checkpoint log state without v2Checkpoint
+    /// feature, or V1 checkpoint log state with v2Checkpoint feature).
+    pub fn all_tables(required: FeatureSet) -> DeltaResult<Vec<TestTable>> {
+        let total_versions = 3;
+        // Share a single runtime across all table builds to avoid startup overhead.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+                let mut tables = Vec::new();
+                for log_state in LogState::all(total_versions) {
+                    let needs_v2 = matches!(log_state, LogState::CheckpointV2 { .. });
+                    let needs_v1 = matches!(
+                        log_state,
+                        LogState::CheckpointV1 { .. } | LogState::CheckpointAndCommits { .. }
+                    );
+                    for base_features in FeatureSet::all() {
+                        let features = base_features.merge(&required);
+                        if needs_v2 && !features.has_v2_checkpoint() {
+                            continue;
+                        }
+                        if needs_v1 && features.has_v2_checkpoint() {
+                            continue;
+                        }
+                        tables.push(
+                            Self::new()
+                                .with_log_state(log_state.clone())
+                                .with_features(features)
+                                .build_with_runtime(&rt)?,
+                        );
+                    }
+                }
+                Ok(tables)
+            })
+            .join()
+            .expect("builder thread panicked")
+        })
     }
 
     /// Build the table and return a [`TestTable`] handle to the store.
@@ -249,19 +537,37 @@ impl TestTableBuilder {
     pub fn build(self) -> DeltaResult<TestTable> {
         std::thread::scope(|s| {
             s.spawn(|| {
-                tokio::runtime::Runtime::new()
-                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?
-                    .block_on(self.build_async())
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+                self.build_with_runtime(&rt)
             })
             .join()
             .expect("builder thread panicked")
         })
     }
 
+    fn build_with_runtime(mut self, rt: &tokio::runtime::Runtime) -> DeltaResult<TestTable> {
+        // Auto-enable v2_checkpoint feature when CheckpointV2 log state is used
+        if matches!(self.log_state, LogState::CheckpointV2 { .. })
+            && !self.features.has_v2_checkpoint()
+        {
+            self.features = self.features.v2_checkpoint();
+        }
+        rt.block_on(self.build_async())
+    }
+
     async fn build_async(self) -> DeltaResult<TestTable> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+        // Use TokioMultiThreadExecutor with the current runtime handle so all builds
+        // share the same runtime instead of each creating its own.
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(store.clone())
+                .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                    tokio::runtime::Handle::current(),
+                )))
+                .build(),
+        );
         let schema = self.schema;
 
         // Version 0: CreateTable
@@ -274,6 +580,11 @@ impl TestTableBuilder {
                     .map(|(k, v)| (k.as_str(), v.as_str())),
             );
         }
+        if !self.partition_columns.is_empty() {
+            builder = builder.with_data_layout(DataLayout::partitioned(
+                self.partition_columns.iter().map(|s| s.as_str()),
+            ));
+        }
         let committed = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?
@@ -285,9 +596,10 @@ impl TestTableBuilder {
         for v in 1..total {
             let result = write_data_commit(
                 snapshot.clone(),
-                &engine,
+                engine.as_ref(),
                 self.num_data_files,
                 self.rows_per_file,
+                &self.partition_columns,
                 v,
             )
             .await?;
@@ -296,6 +608,24 @@ impl TestTableBuilder {
                 .post_commit_snapshot()
                 .unwrap()
                 .clone();
+        }
+
+        // Checkpoints
+        match &self.log_state {
+            LogState::CheckpointV1 { checkpoint_at, .. }
+            | LogState::CheckpointV2 { checkpoint_at, .. }
+            | LogState::CheckpointAndCommits { checkpoint_at, .. } => {
+                let snap = Snapshot::builder_for(table_root)
+                    .at_version(*checkpoint_at)
+                    .build(engine.as_ref())?;
+                snap.checkpoint(engine.as_ref())?;
+            }
+            _ => {}
+        }
+
+        // CRC files
+        if let LogState::WithCrc { crc_at, .. } = &self.log_state {
+            write_crc(*crc_at, &store, table_root).await?;
         }
 
         Ok(TestTable {
@@ -311,13 +641,15 @@ impl TestTableBuilder {
 // ===========================================================================
 
 /// Write a data commit using kernel's transaction + write_parquet path.
-/// Produces `num_files` parquet files with `rows_per_file` rows each. For partitioned
-/// tables, each partition value produces a separate file regardless of `num_files`.
-async fn write_data_commit(
+/// Produces `num_files` parquet files with `rows_per_file` rows each. For partition
+/// columns, all rows in a file share the same value (matching the declared partition
+/// values); non-partition columns get varying data.
+async fn write_data_commit<E: delta_kernel::engine::default::executor::TaskExecutor>(
     snapshot: Arc<Snapshot>,
-    engine: &DefaultEngine<TokioBackgroundExecutor>,
+    engine: &DefaultEngine<E>,
     num_files: usize,
     rows_per_file: usize,
+    partition_columns: &[String],
     version: u64,
 ) -> DeltaResult<delta_kernel::transaction::CommitResult> {
     let logical_schema = snapshot.schema().clone();
@@ -333,21 +665,105 @@ async fn write_data_commit(
 
     for file_idx in 0..num_files {
         let base = (version as i32 * 1000) + (file_idx as i32 * 100);
+        let partition_seed = (version as usize) * 1000 + file_idx * 100;
         let columns: Vec<ArrayRef> = arrow_schema
             .fields()
             .iter()
-            .map(|f| generate_column(f.data_type(), rows_per_file, base))
+            .zip(logical_schema.fields())
+            .map(|(arrow_field, kernel_field)| {
+                if partition_columns.contains(&kernel_field.name().to_string()) {
+                    generate_constant_column(arrow_field.data_type(), rows_per_file, partition_seed)
+                } else {
+                    generate_column(arrow_field.data_type(), rows_per_file, base)
+                }
+            })
             .collect();
         let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns)
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
+        let partition_values = generate_partition_values(
+            logical_schema.as_ref(),
+            partition_columns,
+            version,
+            file_idx,
+        );
+
         let add_files = engine
-            .write_parquet(&ArrowEngineData::new(batch), &write_context, HashMap::new())
+            .write_parquet(
+                &ArrowEngineData::new(batch),
+                &write_context,
+                partition_values,
+            )
             .await?;
         txn.add_files(add_files);
     }
 
     txn.commit(engine)
+}
+
+/// Generate a constant column where all rows have the same value derived from `seed`.
+/// Used for partition columns so the data matches the declared partition values.
+fn generate_constant_column(arrow_type: &ArrowDataType, rows: usize, seed: usize) -> ArrayRef {
+    match arrow_type {
+        ArrowDataType::Boolean => {
+            let v = seed.is_multiple_of(2);
+            Arc::new(BooleanArray::from(vec![v; rows]))
+        }
+        ArrowDataType::Int8 => {
+            let v = (seed % 100) as i8;
+            Arc::new(Int8Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Int16 => {
+            let v = (seed % 100) as i16;
+            Arc::new(Int16Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Int32 => {
+            let v = (seed % 100) as i32;
+            Arc::new(Int32Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Int64 => {
+            let v = (seed * 1000) as i64;
+            Arc::new(Int64Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Float32 => {
+            let v = seed as f32 * 0.5;
+            Arc::new(Float32Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Float64 => {
+            let v = seed as f64 * 0.25;
+            Arc::new(Float64Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Utf8 => {
+            let v = format!("part_{seed}");
+            Arc::new(StringArray::from(vec![v.as_str(); rows]))
+        }
+        ArrowDataType::Binary => {
+            let v = format!("bin_{seed}").into_bytes();
+            Arc::new(BinaryArray::from(vec![v.as_slice(); rows]))
+        }
+        ArrowDataType::Date32 => {
+            let v = 18000 + seed as i32;
+            Arc::new(Date32Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            let v = (18000 + seed as i64) * 86_400_000_000;
+            let array = TimestampMicrosecondArray::from(vec![v; rows]);
+            match tz {
+                Some(tz) => Arc::new(array.with_timezone(tz.as_ref())),
+                None => Arc::new(array),
+            }
+        }
+        ArrowDataType::Decimal128(precision, scale) => {
+            let scale_factor = 10i128.pow(*scale as u32);
+            let v = seed as i128 * scale_factor;
+            Arc::new(
+                Decimal128Array::from(vec![v; rows])
+                    .with_precision_and_scale(*precision, *scale)
+                    .expect("valid decimal"),
+            )
+        }
+        other => panic!("unsupported Arrow type for partition column: {other:?}"),
+    }
 }
 
 /// Generate a single column of data based on its Arrow type.
@@ -426,6 +842,69 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
         }
         other => panic!("unsupported Arrow type in test data generation: {other:?}"),
     }
+}
+
+// ===========================================================================
+// CRC file generation
+// ===========================================================================
+
+/// Write a CRC file at the given version. Protocol and metadata are always read from
+/// the version 0 commit (assumes P&M doesn't change after table creation).
+pub async fn write_crc(
+    version: u64,
+    store: &Arc<DynObjectStore>,
+    table_root: &str,
+) -> DeltaResult<()> {
+    let commit_path = delta_path_for_version(0, "json");
+    let resolved = crate::resolve_table_path(table_root, &commit_path)
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let data = store
+        .get(&resolved)
+        .await
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let bytes = data
+        .bytes()
+        .await
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let text = String::from_utf8(bytes.to_vec())
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+
+    let mut protocol_json = json!(null);
+    let mut metadata_json = json!(null);
+    for line in text.lines() {
+        let v: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        if let Some(p) = v.get("protocol") {
+            protocol_json = p.clone();
+        }
+        if let Some(m) = v.get("metaData") {
+            metadata_json = m.clone();
+        }
+    }
+
+    let crc = json!({
+        "tableSizeBytes": 0,
+        "numFiles": 0,
+        "numMetadata": 1,
+        "numProtocol": 1,
+        "metadata": metadata_json,
+        "protocol": protocol_json,
+    });
+
+    let crc_path = delta_path_for_version(version, "crc");
+    let resolved = crate::resolve_table_path(table_root, &crc_path)
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    store
+        .put(
+            &resolved,
+            serde_json::to_string(&crc)
+                .map_err(|e| delta_kernel::Error::generic(e.to_string()))?
+                .into(),
+        )
+        .await
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+
+    Ok(())
 }
 
 // ===========================================================================
@@ -545,6 +1024,107 @@ macro_rules! test_context {
 }
 
 // ===========================================================================
+// Partition value generation
+// ===========================================================================
+
+/// Generate deterministic partition values for a given version and file index.
+/// Follows the Delta protocol partition value serialization format.
+fn generate_partition_values(
+    schema: &StructType,
+    partition_columns: &[String],
+    version: u64,
+    file_idx: usize,
+) -> HashMap<String, String> {
+    let seed = (version as usize) * 1000 + file_idx * 100;
+    partition_columns
+        .iter()
+        .map(|col_name| {
+            let field = schema
+                .field(col_name)
+                .unwrap_or_else(|| panic!("partition column '{col_name}' not in schema"));
+            let value = partition_value_for_type(field.data_type(), seed);
+            (col_name.clone(), value)
+        })
+        .collect()
+}
+
+/// Generate a deterministic partition value string for the given data type, following
+/// the Delta protocol's partition value serialization format.
+fn partition_value_for_type(data_type: &DataType, seed: usize) -> String {
+    use delta_kernel::schema::PrimitiveType;
+    match data_type {
+        DataType::Primitive(p) => match p {
+            PrimitiveType::Boolean => {
+                let even = seed.is_multiple_of(2);
+                format!("{even}")
+            }
+            PrimitiveType::Byte | PrimitiveType::Short | PrimitiveType::Integer => {
+                format!("{}", seed % 100)
+            }
+            PrimitiveType::Long => {
+                format!("{}", seed * 1000)
+            }
+            PrimitiveType::Float => {
+                format!("{:.1}", seed as f32 * 0.5)
+            }
+            PrimitiveType::Double => {
+                format!("{:.2}", seed as f64 * 0.25)
+            }
+            PrimitiveType::String => {
+                format!("part_{seed}")
+            }
+            PrimitiveType::Binary => {
+                format!("bin_{seed}")
+            }
+            PrimitiveType::Date => {
+                // Days since epoch -> YYYY-MM-DD
+                let days = 18000 + seed as i32;
+                let date = chrono::NaiveDate::from_num_days_from_ce_opt(
+                    days + 719_163, // epoch offset
+                )
+                .unwrap_or(chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap());
+                date.format("%Y-%m-%d").to_string()
+            }
+            PrimitiveType::Timestamp => {
+                // Microseconds since epoch -> yyyy-MM-dd HH:mm:ss.SSSSSS
+                let micros = (18000 + seed as i64) * 86_400_000_000;
+                let secs = micros / 1_000_000;
+                let sub_micros = (micros % 1_000_000) as u32;
+                let dt =
+                    chrono::DateTime::from_timestamp(secs, sub_micros * 1000).unwrap_or_default();
+                dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+            }
+            PrimitiveType::TimestampNtz => {
+                let micros = (18000 + seed as i64) * 86_400_000_000;
+                let secs = micros / 1_000_000;
+                let sub_micros = (micros % 1_000_000) as u32;
+                let dt = chrono::DateTime::from_timestamp(secs, sub_micros * 1000)
+                    .unwrap_or_default()
+                    .naive_utc();
+                dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+            }
+            PrimitiveType::Decimal(dt) => {
+                let scale_factor = 10i128.pow(dt.scale() as u32);
+                let value = seed as i128 * scale_factor;
+                format_decimal(value, dt.precision(), dt.scale())
+            }
+        },
+        other => panic!("partition columns must be primitive types, got: {other:?}"),
+    }
+}
+
+/// Format a decimal value as a string with the correct scale.
+fn format_decimal(value: i128, _precision: u8, scale: u8) -> String {
+    if scale == 0 {
+        return value.to_string();
+    }
+    let scale_factor = 10i128.pow(scale as u32);
+    let whole = value / scale_factor;
+    let frac = (value % scale_factor).unsigned_abs();
+    format!("{whole}.{frac:0>width$}", width = scale as usize)
+}
+
+// ===========================================================================
 // Helpers: schema
 // ===========================================================================
 
@@ -613,6 +1193,102 @@ mod tests {
         assert_eq!(snap.version(), expected);
     }
 
+    #[rstest]
+    fn test_feature_sets_enable_table_features(
+        #[values(
+            FeatureSet::new().column_mapping("name"),
+            FeatureSet::new().ict(),
+            FeatureSet::new().v2_checkpoint(),
+            FeatureSet::new().column_mapping("name").ict().v2_checkpoint()
+        )]
+        feature_set: FeatureSet,
+    ) -> DeltaResult<()> {
+        let table = TestTableBuilder::new().with_features(feature_set).build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        let protocol = snap.table_configuration().protocol();
+        // All these features require table features (v3/v7).
+        assert_eq!(protocol.min_reader_version(), 3);
+        assert_eq!(protocol.min_writer_version(), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_v1() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::checkpoint_v1(2, 4))
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_v2() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::checkpoint_v2(2, 4))
+            .with_features(FeatureSet::new().v2_checkpoint())
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_and_commits() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::checkpoint_and_commits(2, 2))
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_crc() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_crc(2, 4))
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_all_tables() -> DeltaResult<()> {
+        let tables = TestTableBuilder::all_tables(FeatureSet::empty())?;
+        // 5 log states x 5 feature sets = 25, minus 4 (v2 log without v2 feature)
+        // and minus 2 (v1 log with v2 feature) = 19
+        assert_eq!(tables.len(), 19);
+        for table in &tables {
+            let engine = table.engine();
+            let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+            assert_eq!(snap.version(), 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_with_column_mapping() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_commits(2))
+            .with_features(FeatureSet::new().column_mapping("name"))
+            .with_data(1, 5)
+            .build()?;
+        let engine: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+        let scan = snap.scan_builder().build()?;
+        let batches = crate::read_scan(&scan, engine)?;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 5);
+        Ok(())
+    }
+
     #[test]
     fn test_scan_with_data() -> DeltaResult<()> {
         let table = TestTableBuilder::new()
@@ -624,6 +1300,25 @@ mod tests {
         let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
         let scan = snap.scan_builder().build()?;
         let batches = crate::read_scan(&scan, engine)?;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn test_partitioned_table() -> DeltaResult<()> {
+        let data_layout_config = DataLayoutConfig::AllTypes;
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_commits(2))
+            .with_data_layout(data_layout_config)
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 1);
+        let scan = snap.scan_builder().build()?;
+        let engine_arc: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let batches = crate::read_scan(&scan, engine_arc)?;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 10);
         Ok(())
