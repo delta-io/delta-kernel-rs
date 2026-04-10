@@ -891,29 +891,34 @@ impl<S> Transaction<S> {
             })
         }
 
+        // Note: this does not require delta.enableRowTracking=true. "supported" is sufficient
+        // for writers to assign row IDs.
+        let row_tracking_supported = self
+            .read_snapshot
+            .table_configuration()
+            .should_write_row_tracking();
+
         if self.add_files_metadata.is_empty() {
-            return Ok((Box::new(iter::empty()), None));
+            // No files to add. For an empty CREATE TABLE with row tracking, emit the initial
+            // high water mark domain metadata (rowIdHighWaterMark = -1) so subsequent writes
+            // have a valid starting point. For all other empty commits (metadata-only, etc.),
+            // nothing row-tracking-related needs to be written.
+            let row_tracking_dm = (row_tracking_supported && self.is_create_table())
+                .then(RowTrackingDomainMetadata::initial);
+            return Ok((Box::new(iter::empty()), row_tracking_dm));
         }
 
         let commit_version = i64::try_from(commit_version)
             .map_err(|_| Error::generic("Commit version too large to fit in i64"))?;
 
-        let needs_row_tracking = self
-            .read_snapshot
-            .table_configuration()
-            .should_write_row_tracking();
-
-        // Row tracking is not yet supported for create-table with data
-        if needs_row_tracking && self.is_create_table() {
-            return Err(Error::unsupported(
-                "Row tracking is not yet supported for create table with data",
-            ));
-        }
-
-        if needs_row_tracking {
-            // Read the current rowIdHighWaterMark from the snapshot's row tracking domain metadata
-            let row_id_high_water_mark =
-                RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
+        if row_tracking_supported {
+            // For create-table (CTAS), there is no prior log to read the high water mark from,
+            // so start from the default (-1). For existing tables, read from the snapshot.
+            let row_id_high_water_mark = if self.is_create_table() {
+                None
+            } else {
+                RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?
+            };
 
             // Create a row tracking visitor and visit all files to collect row tracking information
             let mut row_tracking_visitor = RowTrackingVisitor::new(
@@ -921,8 +926,8 @@ impl<S> Transaction<S> {
                 Some(self.add_files_metadata.len()),
             );
 
-            // We visit all files with the row visitor before creating the add action iterator
-            // because we need to know the final row ID high water mark to create the domain metadata action
+            // We visit all files with the row visitor before creating the add action iterator because
+            // we need to know the final row ID high water mark to create the domain metadata action.
             for add_files_batch in &self.add_files_metadata {
                 row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
             }
