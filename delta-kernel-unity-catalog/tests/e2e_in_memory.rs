@@ -275,7 +275,7 @@ async fn test_sidecar_checkpoint_uc_managed_v2_table() -> Result<(), TestError> 
     let spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(10),
     });
-    snapshot.snapshot_checkpoint_placeholder(&engine, Some(&spec))?;
+    snapshot.checkpoint(&engine, Some(&spec))?;
 
     let ckpt_path = Path::from("_delta_log/00000000000000000000.checkpoint.parquet");
     assert!(
