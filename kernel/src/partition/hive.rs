@@ -1,4 +1,4 @@
-//! Step 3: Hive-style partition path encoding.
+//! Hive-style partition path encoding.
 //!
 //! Percent-encodes partition column names and values for filesystem directory paths
 //! (e.g., `region=US%2FEast/year=2024/`). Matches Hive's [`FileUtils.escapePathName`][hive]

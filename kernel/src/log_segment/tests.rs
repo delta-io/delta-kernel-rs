@@ -2740,24 +2740,25 @@ async fn test_checkpoint_schema_propagation_from_hint() {
     )
     .unwrap();
 
-    // Verify last_checkpoint_metadata is propagated with version and schema
-    let metadata = log_segment
-        .last_checkpoint_metadata
-        .expect("last_checkpoint_metadata should be Some");
-    assert_eq!(metadata.version, 5);
-    assert_eq!(metadata.schema.unwrap(), sample_schema);
+    assert_eq!(log_segment.last_checkpoint_version(), Some(5));
+    assert_eq!(log_segment.checkpoint_schema().unwrap(), sample_schema);
 }
 
-/// Test get_file_actions_schema_and_sidecars with V1 parquet checkpoint using hint schema
-/// This verifies the optimization path where hint schema is used directly (avoiding footer read)
+/// Checkpoint schema resolution uses the `_last_checkpoint` schema only when the hint's version
+/// matches [`LogSegment::checkpoint_version`]. Otherwise the parquet footer is read.
+#[rstest]
+#[case::hint_matches_checkpoint(1, true)]
+#[case::hint_newer_than_checkpoint(99, false)]
+#[case::hint_older_than_checkpoint(0, false)]
 #[tokio::test]
-async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> {
-    use crate::schema::{StructField, StructType};
-
+async fn test_get_file_actions_schema_v1_parquet_with_hint(
+    #[case] hint_version: u64,
+    #[case] expect_hint_schema_used: bool,
+) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
-    // Create a V1 checkpoint (without sidecar column)
+    // Build a checkpoint with an initial v1 schema
     let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
     add_checkpoint_to_store(
         &store,
@@ -2766,38 +2767,56 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     )
     .await?;
 
-    let checkpoint_file = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
-        .to_string();
+    let checkpoint_rel = "00000000000000000001.checkpoint.parquet";
+    let checkpoint_file = log_root.join(checkpoint_rel)?.to_string();
+    let cp_size = get_file_size(&store, &format!("_delta_log/{checkpoint_rel}")).await;
 
-    // Create a hint schema without sidecar field (indicates V1)
-    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable("add", StructType::new_unchecked([])),
-        StructField::nullable("remove", StructType::new_unchecked([])),
-    ]));
+    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "metadata",
+        StructType::new_unchecked([]),
+    )]));
 
+    // Build a commit that uses v1 checkpoint and a hint that describes a different schema
+    let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
+    let commit_v2 = create_log_path(&commit_v2_path);
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
-            checkpoint_parts: vec![create_log_path(&checkpoint_file)],
-            latest_commit_file: Some(create_log_path("file:///00000000000000000002.json")),
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, cp_size)],
+            ascending_commit_files: vec![commit_v2.clone()],
+            latest_commit_file: Some(commit_v2),
             ..Default::default()
         },
         log_root,
         None,
         Some(LastCheckpointHintSummary {
-            version: 1,
+            version: hint_version,
             schema: Some(hint_schema.clone()),
         }),
     )?;
 
-    // With V1 hint, should use hint schema and avoid footer read
+    // Verify that checkpoint_schema only returns schema if it is valid
+    assert_eq!(log_segment.checkpoint_version, Some(1));
+    assert_eq!(log_segment.end_version, 2);
+    if expect_hint_schema_used {
+        assert_eq!(log_segment.checkpoint_schema().as_ref(), Some(&hint_schema));
+    } else {
+        assert!(
+            log_segment.checkpoint_schema().is_none(),
+            "hint should not have been returned since version does not match checkpoint_version"
+        );
+    }
+
+    // Verify that get_file_actions_schema_and_sidecars returns appropriate schema based on hint version
     let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
-    assert!(schema.is_some(), "Should return hint schema for V1");
-    assert_eq!(
-        schema.unwrap(),
-        hint_schema,
-        "Should use hint schema directly"
-    );
+    let schema = schema.expect("V1 checkpoint should yield a file actions schema");
+    if expect_hint_schema_used {
+        assert_eq!(schema, hint_schema, "should use hint when versions match");
+    } else {
+        assert_eq!(
+            schema, v1_schema,
+            "should read schema from parquet footer when versions mismatch"
+        );
+    }
     assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
 
     Ok(())
@@ -4012,7 +4031,7 @@ async fn test_try_new_with_checkpoint_sets_checkpoint_and_clears_commits(#[case]
     assert_eq!(result.listed.checkpoint_parts[0].version, 2);
     assert!(result.listed.ascending_commit_files.is_empty());
     assert!(result.listed.ascending_compaction_files.is_empty());
-    assert!(result.last_checkpoint_metadata.is_none());
+    assert!(result.last_checkpoint_hint_summary().is_none());
 
     // latest_commit_file is preserved for ICT access even though commits are cleared
     assert_eq!(
