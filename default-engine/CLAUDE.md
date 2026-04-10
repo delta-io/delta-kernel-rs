@@ -28,8 +28,8 @@ This crate depends on `delta_kernel` with the `internal-api` feature, which expo
 ## Feature Flags
 
 - `rustls` / `native-tls` -- TLS backend for `reqwest` (pick one)
-- `arrow` -- defaults to latest Arrow version (`arrow-57`)
-- `arrow-56`, `arrow-57` -- explicit Arrow version selection
+- `arrow` -- defaults to latest Arrow version (`arrow-58`)
+- `arrow-57`, `arrow-58` -- explicit Arrow version selection
 
 ## Build & Test
 

@@ -1,6 +1,6 @@
-//! Provides an engine implementation that implements the required traits. The engine can optionally
-//! be built into the kernel by setting the `default-engine` feature flag. See the related module
-//! for more information.
+//! Arrow-based engine utilities and handler implementations.
+//!
+//! The default engine implementation lives in the `delta_kernel_default_engine` crate.
 
 #[cfg(feature = "arrow-expression")]
 use crate::parquet::arrow::arrow_reader::ArrowReaderOptions;
