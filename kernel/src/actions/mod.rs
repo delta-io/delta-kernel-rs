@@ -234,6 +234,11 @@ pub(crate) struct Metadata {
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
     created_time: Option<i64>,
     /// Configuration options for the metadata action. These are parsed into [`TableProperties`].
+    /// This map can contain null values in log files written by Spark. We drop null values due to
+    /// the `allow_null_container_values` annotation and because [`materialize`] drops them.
+    ///
+    /// [`materialize`]: crate::engine_data::MapItem::materialize
+    #[allow_null_container_values]
     configuration: HashMap<String, String>,
 }
 
@@ -379,7 +384,13 @@ impl IntoEngineData for Metadata {
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        // For format, we need to provide individual scalars for provider and options
+        // For format, we need to provide individual scalars for provider and options.
+        // Use value_contains_null=true because Spark can write null map values.
+        let configuration = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, true),
+            self.configuration,
+        )
+        .map(Scalar::Map)?;
         let values = [
             self.id.into(),
             self.name.into(),
@@ -389,7 +400,7 @@ impl IntoEngineData for Metadata {
             self.schema_string.into(),
             self.partition_columns.try_into()?,
             self.created_time.into(),
-            self.configuration.try_into()?,
+            configuration,
         ];
 
         engine.evaluation_handler().create_one(schema, &values)
@@ -639,7 +650,7 @@ impl Protocol {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
@@ -657,6 +668,11 @@ pub(crate) struct CommitInfo {
     pub(crate) operation: Option<String>,
     /// Map of arbitrary string key-value pairs that provide additional information about the
     /// operation. This is specified by the engine. For now this is always empty on write.
+    /// This map can contain null values in log files written by Spark. We drop null values due to
+    /// the `allow_null_container_values` annotation and because [`materialize`] drops them.
+    ///
+    /// [`materialize`]: crate::engine_data::MapItem::materialize
+    #[allow_null_container_values]
     pub(crate) operation_parameters: Option<HashMap<String, String>>,
     /// The version of the delta_kernel crate used to write this commit. The kernel will always
     /// write this field, but it is optional since many tables will not have this field (i.e. any
@@ -688,6 +704,33 @@ impl CommitInfo {
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
         }
+    }
+}
+
+impl IntoEngineData for CommitInfo {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        // Use value_contains_null=true because Spark can write null map values.
+        let map_type = MapType::new(DataType::STRING, DataType::STRING, true);
+        let operation_parameters = match self.operation_parameters {
+            Some(map) => Scalar::Map(MapData::try_new(map_type, map)?),
+            None => Scalar::Null(map_type.into()),
+        };
+        let values = [
+            self.timestamp.into(),
+            self.in_commit_timestamp.into(),
+            self.operation.into(),
+            operation_parameters,
+            self.kernel_version.into(),
+            self.is_blind_append.into(),
+            self.engine_info.into(),
+            self.txn_id.into(),
+        ];
+
+        engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
@@ -1128,7 +1171,7 @@ mod tests {
                 StructField::nullable("createdTime", DataType::LONG),
                 StructField::not_null(
                     "configuration",
-                    MapType::new(DataType::STRING, DataType::STRING, false),
+                    MapType::new(DataType::STRING, DataType::STRING, true),
                 ),
             ]),
         )]));
@@ -1296,7 +1339,7 @@ mod tests {
                 StructField::nullable("operation", DataType::STRING),
                 StructField::nullable(
                     "operationParameters",
-                    MapType::new(DataType::STRING, DataType::STRING, false),
+                    MapType::new(DataType::STRING, DataType::STRING, true),
                 ),
                 StructField::nullable("kernelVersion", DataType::STRING),
                 StructField::nullable("isBlindAppend", DataType::BOOLEAN),
@@ -1610,7 +1653,8 @@ mod tests {
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
         let record_batch = engine_data.try_into_record_batch().unwrap();
 
-        let mut map_builder = create_string_map_builder(false);
+        // Use nullable_values=true to match schema (Spark can write nulls)
+        let mut map_builder = create_string_map_builder(true);
         map_builder.append(true).unwrap();
         let operation_parameters = Arc::new(map_builder.finish());
 
