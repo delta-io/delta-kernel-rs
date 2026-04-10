@@ -3345,7 +3345,7 @@ async fn test_column_mapping_write(
 
     // Step 3: Checkpoint and verify add.stats uses correct column names
     let snapshot_for_checkpoint = latest_snapshot.clone();
-    snapshot_for_checkpoint.checkpoint(engine.as_ref())?;
+    snapshot_for_checkpoint.checkpoint(engine.as_ref(), None)?;
     let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let add_actions = read_add_infos(&ckpt_snapshot, engine.as_ref())?;
     let mut all_stats: Vec<_> = add_actions
@@ -3655,7 +3655,7 @@ async fn test_checkpoint_non_kernel_written_table() {
     let batches_before = test_utils::read_scan(&scan_before, engine.clone()).unwrap();
 
     // Create checkpoint via snapshot.checkpoint()
-    snapshot.checkpoint(engine.as_ref()).unwrap();
+    snapshot.checkpoint(engine.as_ref(), None).unwrap();
 
     // Read data after checkpoint
     let snapshot_after = Snapshot::builder_for(url.clone())
@@ -3884,7 +3884,7 @@ async fn test_clustered_table_write_has_stats_parsed(
     )?
     .into_inner();
 
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Read checkpoint parquet directly to verify stats_parsed contains only clustering columns.
     // ScanBuilder::include_all_stats_columns() doesn't support stats_parsed when

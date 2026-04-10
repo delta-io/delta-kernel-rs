@@ -5,9 +5,11 @@ use std::ops::Range;
 
 use tracing::debug;
 
+use crate::actions::visitors::SelectionVectorVisitor;
 use crate::expressions::ArrayData;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{ColumnName, DataType, SchemaRef};
+use crate::utils::require;
 use crate::{AsAny, DeltaResult, Error};
 
 /// Engine data paired with a selection vector indicating which rows are logically selected.
@@ -548,6 +550,26 @@ pub trait EngineData: AsAny {
         self: Box<Self>,
         selection_vector: Vec<bool>,
     ) -> DeltaResult<Box<dyn EngineData>>;
+}
+
+/// Evaluates a predicate on the batch, extracts the resulting selection vector, and applies
+/// it to filter out rows that don't satisfy the predicate.
+pub(crate) fn filter_by_predicate(
+    filter: &dyn crate::PredicateEvaluator,
+    batch: Box<dyn EngineData>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    let predicate_result = filter.evaluate(batch.as_ref())?;
+    let mut visitor = SelectionVectorVisitor::default();
+    visitor.visit_rows_of(predicate_result.as_ref())?;
+    require!(
+        visitor.selection_vector.len() == batch.len(),
+        Error::internal_error(format!(
+            "predicate output length {} != batch length {}",
+            visitor.selection_vector.len(),
+            batch.len()
+        ))
+    );
+    batch.apply_selection_vector(visitor.selection_vector)
 }
 
 #[cfg(test)]
