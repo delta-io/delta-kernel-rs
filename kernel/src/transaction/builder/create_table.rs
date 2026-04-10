@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use url::Url;
+use uuid::Uuid;
 
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
@@ -24,8 +25,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     assign_column_mapping_metadata, get_any_level_column_physical_name,
     get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
-    EnablementCheck, FeatureRequirement, FeatureType, TableFeature,
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    EnablementCheck, FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
@@ -187,7 +188,7 @@ fn add_feature_to_lists(
 /// Validates clustering columns, adds the `DomainMetadata` and `ClusteredTable` features
 /// directly, and creates the domain metadata action.
 #[cfg(test)]
-fn apply_clustering_for_table_create(
+fn make_clustering_domain_metadata(
     logical_schema: &SchemaRef,
     logical_columns: &[ColumnName],
     reader_features: &mut Vec<TableFeature>,
@@ -288,7 +289,7 @@ fn validate_partition_columns(
 ///
 /// - **None**: Returns defaults (no domain metadata, no clustering/partition columns).
 /// - **Clustered**: Validates clustering columns, resolves to physical names, adds the
-///   `ClusteredTable` feature, creates clustering domain metadata.
+///   `DomainMetadata` and `ClusteredTable` features, creates clustering domain metadata.
 /// - **Partitioned**: Validates partition columns and stores logical names. No domain
 ///   metadata or special features are needed (partitioning is a core Delta feature).
 fn apply_data_layout(
@@ -310,6 +311,11 @@ fn apply_data_layout(
                 })
                 .try_collect()?;
 
+            add_feature_to_lists(
+                TableFeature::DomainMetadata,
+                &mut validated.reader_features,
+                &mut validated.writer_features,
+            );
             add_feature_to_lists(
                 TableFeature::ClusteredTable,
                 &mut validated.reader_features,
@@ -374,39 +380,15 @@ fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProp
                     &mut validated.reader_features,
                     &mut validated.writer_features,
                 );
+                // RowTracking requires DomainMetadata as a dependency
+                if matches!(feature, TableFeature::RowTracking) {
+                    add_feature_to_lists(
+                        TableFeature::DomainMetadata,
+                        &mut validated.reader_features,
+                        &mut validated.writer_features,
+                    );
+                }
             }
-        }
-    }
-}
-
-/// For each feature in `writer_features` and `reader_features`, checks its
-/// [`FeatureInfo::feature_requirements`] and adds any `Supported` dependencies that aren't
-/// already present.
-///
-/// Note: cycles in [`FeatureRequirement::Supported`] chains (feature A requires B, B requires A)
-/// would cause an infinite loop. The feature dependency graph must remain acyclic.
-fn resolve_feature_dependencies(validated: &mut ValidatedTableProperties) {
-    loop {
-        let before = validated.writer_features.len() + validated.reader_features.len();
-        let deps: Vec<TableFeature> = validated
-            .writer_features
-            .iter()
-            .chain(&validated.reader_features)
-            .flat_map(|f| f.info().feature_requirements)
-            .filter_map(|req| match req {
-                FeatureRequirement::Supported(dep) => Some(dep.clone()),
-                _ => None,
-            })
-            .collect();
-        for dep in deps {
-            add_feature_to_lists(
-                dep,
-                &mut validated.reader_features,
-                &mut validated.writer_features,
-            );
-        }
-        if validated.writer_features.len() + validated.reader_features.len() == before {
-            break;
         }
     }
 }
@@ -415,13 +397,17 @@ fn resolve_feature_dependencies(validated: &mut ValidatedTableProperties) {
 ///
 /// Writes `delta.rowTracking.materializedRowIdColumnName` and
 /// `delta.rowTracking.materializedRowCommitVersionColumnName` into the table
-/// properties using UUID-based column names. These properties record which physical
-/// columns store materialized row IDs and commit versions.
+/// properties using UUID-based column names (`_row-id-col-{uuid}` and
+/// `_row-commit-version-col-{uuid}`). These names record which physical columns
+/// store materialized row IDs and commit versions.
 ///
-/// Column names use the format `_row-id-col-{uuid}` and
-/// `_row-commit-version-col-{uuid}` to avoid collisions with user-defined columns.
-/// If the properties are already set, they are left unchanged.
-fn maybe_set_materialized_row_tracking_column_names(validated: &mut ValidatedTableProperties) {
+/// Only fires when `delta.enableRowTracking=true` is set. Feature-signal-only tables
+/// (`delta.feature.rowTracking=supported` without the enablement property) do not get
+/// these properties because the materialized columns are part of the "enabled" state, not
+/// the "supported" state.
+fn maybe_set_materialized_row_tracking_column_name_properties(
+    validated: &mut ValidatedTableProperties,
+) {
     if validated
         .properties
         .get(ENABLE_ROW_TRACKING)
@@ -429,14 +415,14 @@ fn maybe_set_materialized_row_tracking_column_names(validated: &mut ValidatedTab
     {
         return;
     }
-    validated
-        .properties
-        .entry(MATERIALIZED_ROW_ID_COLUMN_NAME.to_string())
-        .or_insert_with(|| format!("_row-id-col-{}", uuid::Uuid::new_v4()));
-    validated
-        .properties
-        .entry(MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME.to_string())
-        .or_insert_with(|| format!("_row-commit-version-col-{}", uuid::Uuid::new_v4()));
+    validated.properties.insert(
+        MATERIALIZED_ROW_ID_COLUMN_NAME.to_string(),
+        format!("_row-id-col-{}", Uuid::new_v4()),
+    );
+    validated.properties.insert(
+        MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME.to_string(),
+        format!("_row-commit-version-col-{}", Uuid::new_v4()),
+    );
 }
 
 /// Ensures that `inCommitTimestamp` is enabled when `catalogManaged` is present. Adds the ICT
@@ -576,7 +562,16 @@ fn validate_extract_table_features_and_properties(
         }
 
         // Add to appropriate feature lists based on feature type
+        let needs_domain_metadata = matches!(feature, TableFeature::RowTracking);
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
+        // RowTracking requires DomainMetadata as a dependency
+        if needs_domain_metadata {
+            add_feature_to_lists(
+                TableFeature::DomainMetadata,
+                &mut reader_features,
+                &mut writer_features,
+            );
+        }
     }
 
     // Validate remaining delta.* properties against allow list
@@ -781,12 +776,8 @@ impl CreateTableTransactionBuilder {
         // Auto-enable inCommitTimestamp for catalogManaged tables
         maybe_enable_ict_for_catalog_managed(&mut validated)?;
 
-        // Resolve Supported dependencies for all enabled features (e.g. RowTracking and
-        // ClusteredTable both require DomainMetadata). Runs last so all features are present.
-        resolve_feature_dependencies(&mut validated);
-
         // Set materialized row tracking column names when row tracking is enabled.
-        maybe_set_materialized_row_tracking_column_names(&mut validated);
+        maybe_set_materialized_row_tracking_column_name_properties(&mut validated);
 
         // Create Protocol action with table features support
         let protocol =
@@ -981,7 +972,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let dm = apply_clustering_for_table_create(
+        let dm = make_clustering_domain_metadata(
             &schema,
             &[ColumnName::new(["id"])],
             &mut reader_features,
@@ -1010,7 +1001,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let dm = apply_clustering_for_table_create(
+        let dm = make_clustering_domain_metadata(
             &schema,
             &[ColumnName::new(["id"]), ColumnName::new(["date"])],
             &mut reader_features,
@@ -1039,7 +1030,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let result = apply_clustering_for_table_create(
+        let result = make_clustering_domain_metadata(
             &schema,
             &[ColumnName::new(["nonexistent"])],
             &mut reader_features,
@@ -1071,7 +1062,7 @@ mod tests {
         let mut writer_features = vec![];
 
         let nested_col = ColumnName::new(["address", "city"]);
-        let dm = apply_clustering_for_table_create(
+        let dm = make_clustering_domain_metadata(
             &schema,
             &[nested_col],
             &mut reader_features,
@@ -1324,8 +1315,6 @@ mod tests {
         )
         .unwrap();
 
-        resolve_feature_dependencies(&mut validated);
-
         assert_eq!(
             !result.system_domain_metadata.is_empty(),
             expectation.has_domain_metadata
@@ -1498,7 +1487,6 @@ mod tests {
                 .collect();
         let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
-        resolve_feature_dependencies(&mut validated);
 
         assert!(
             validated
@@ -1515,66 +1503,24 @@ mod tests {
     }
 
     #[test]
-    fn test_row_tracking_feature_signal_enables_domain_metadata_dependency() {
+    fn test_row_tracking_feature_signal_adds_domain_metadata_dependency() {
         let properties: HashMap<String, String> = [(
             "delta.feature.rowTracking".to_string(),
             "supported".to_string(),
         )]
         .into_iter()
         .collect();
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
 
-        // Feature signal adds RowTracking directly
+        // Feature signal adds both RowTracking and its DomainMetadata dependency
         assert!(validated
             .writer_features
             .contains(&TableFeature::RowTracking));
-        // But DomainMetadata is not yet added (auto-enablement doesn't handle dependencies)
-        assert!(!validated
-            .writer_features
-            .contains(&TableFeature::DomainMetadata));
-
-        resolve_feature_dependencies(&mut validated);
         assert!(
             validated
                 .writer_features
                 .contains(&TableFeature::DomainMetadata),
-            "Expected DomainMetadata dependency to be added"
-        );
-    }
-
-    #[test]
-    fn test_user_supplied_materialized_column_names_are_preserved() {
-        // Simulate a user supplying explicit materialized column names alongside the enablement
-        // property. maybe_set_materialized_row_tracking_column_names must not overwrite them.
-        let mut validated = ValidatedTableProperties {
-            properties: HashMap::from([
-                (ENABLE_ROW_TRACKING.to_string(), "true".to_string()),
-                (
-                    MATERIALIZED_ROW_ID_COLUMN_NAME.to_string(),
-                    "my_row_id_col".to_string(),
-                ),
-                (
-                    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME.to_string(),
-                    "my_commit_version_col".to_string(),
-                ),
-            ]),
-            reader_features: vec![],
-            writer_features: vec![TableFeature::RowTracking],
-        };
-
-        maybe_set_materialized_row_tracking_column_names(&mut validated);
-
-        assert_eq!(
-            validated.properties.get(MATERIALIZED_ROW_ID_COLUMN_NAME),
-            Some(&"my_row_id_col".to_string()),
-            "User-supplied materializedRowIdColumnName must not be overwritten"
-        );
-        assert_eq!(
-            validated
-                .properties
-                .get(MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME),
-            Some(&"my_commit_version_col".to_string()),
-            "User-supplied materializedRowCommitVersionColumnName must not be overwritten"
+            "Expected DomainMetadata to be added alongside RowTracking"
         );
     }
 

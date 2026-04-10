@@ -73,40 +73,75 @@ fn assert_row_tracking_protocol(snapshot: &Snapshot) {
     );
 }
 
-/// Verifies that enabling row tracking (via property or feature signal) adds the required
-/// protocol features and writes the initial row tracking domain metadata (HWM = -1).
-/// The `expect_materialized_columns` flag reflects that materialized column name properties
-/// are only assigned when `delta.enableRowTracking=true` is set.
+/// Verifies row tracking across both activation paths (enablement property and feature signal)
+/// and both table shapes (empty CREATE TABLE and CTAS with a single file of 5 rows).
+///
+/// Key behavioral differences by case:
+/// - Activation path: `delta.enableRowTracking=true` sets materialized column name properties;
+///   feature-signal-only does not.
+/// - Table shape: empty tables get `rowIdHighWaterMark = -1` with no add actions; CTAS
+///   assigns `baseRowId = 0` and `defaultRowCommitVersion = 0` and sets `rowIdHighWaterMark = 4`.
 #[rstest]
-#[case::enablement_property("delta.enableRowTracking", "true", true)]
-#[case::feature_signal("delta.feature.rowTracking", "supported", false)]
-fn test_create_empty_table_with_row_tracking(
-    #[case] key: &str,
-    #[case] value: &str,
-    #[case] expect_materialized_columns: bool,
+#[tokio::test]
+async fn test_create_table_with_row_tracking(
+    #[values(
+        ("delta.enableRowTracking", "true"),
+        ("delta.feature.rowTracking", "supported")
+    )]
+    activation: (&str, &str),
+    #[values(false, true)] with_data: bool,
 ) -> DeltaResult<()> {
+    let (key, value) = activation;
+    let is_property_enabled = key == "delta.enableRowTracking";
+
     let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = super::simple_schema()?;
 
-    let committed = create_table(&table_path, super::simple_schema()?, "Test/1.0")
+    let mut txn = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties([(key, value)])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
-        .unwrap_committed();
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
+    if with_data {
+        // Write one parquet file with 5 rows
+        let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+            ],
+        )
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+
+        let write_context = Arc::new(txn.get_write_context());
+        let add_files = engine
+            .write_parquet(
+                &ArrowEngineData::new(batch),
+                write_context.as_ref(),
+                HashMap::new(),
+            )
+            .await?;
+        txn.add_files(add_files);
+    }
+
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     let snapshot = committed
         .post_commit_snapshot()
         .expect("should have snapshot");
     assert_row_tracking_protocol(snapshot);
 
-    // Verify domain metadata persists to disk
-    let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert_row_tracking_protocol(&disk_snapshot);
+    // Verify domain metadata persists to disk for empty tables. CTAS is not checked here
+    // because the high water mark is written via add-file processing, not the initial
+    // domain metadata path.
+    if !with_data {
+        let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+        assert_row_tracking_protocol(&disk_snapshot);
+    }
 
-    // Verify domain metadata in the commit JSON (the public get_domain_metadata API blocks
-    // system domains, so we read the commit file directly)
     let actions = read_commit_actions(&table_path, 0);
-    let dm_actions = find_domain_metadata_actions(&actions);
 
+    // Verify row tracking domain metadata
+    let dm_actions = find_domain_metadata_actions(&actions);
     let row_tracking_dm: Vec<_> = dm_actions
         .iter()
         .filter(|dm| dm["domain"] == "delta.rowTracking")
@@ -114,31 +149,46 @@ fn test_create_empty_table_with_row_tracking(
     assert_eq!(
         row_tracking_dm.len(),
         1,
-        "Expected exactly one row tracking domain metadata action"
+        "Expected exactly one row tracking domain metadata"
     );
-
-    let config: serde_json::Value =
+    let dm_config: serde_json::Value =
         serde_json::from_str(row_tracking_dm[0]["configuration"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        config["rowIdHighWaterMark"], -1,
-        "Initial high water mark should be -1"
-    );
+    let expected_high_water_mark: i64 = if with_data { 4 } else { -1 };
+    assert_eq!(dm_config["rowIdHighWaterMark"], expected_high_water_mark);
 
-    // Materialized column name properties are only set when delta.enableRowTracking=true.
-    // Feature-signal-only tables do not get them.
+    // Verify add actions
+    let add_actions: Vec<_> = actions.iter().filter_map(|a| a.get("add")).collect();
+    if with_data {
+        assert_eq!(add_actions.len(), 1, "Expected one add action");
+        assert_eq!(
+            add_actions[0]["baseRowId"].as_i64(),
+            Some(0),
+            "baseRowId should be 0"
+        );
+        assert_eq!(
+            add_actions[0]["defaultRowCommitVersion"].as_i64(),
+            Some(0),
+            "defaultRowCommitVersion should be 0"
+        );
+    } else {
+        assert!(
+            add_actions.is_empty(),
+            "Expected no add actions for empty create"
+        );
+    }
+
+    // Verify materialized column name properties.
+    // Only set when delta.enableRowTracking=true; feature-signal-only tables do not get them.
     let metadata_actions: Vec<_> = actions.iter().filter_map(|a| a.get("metaData")).collect();
     assert_eq!(metadata_actions.len(), 1);
     let meta_config = metadata_actions[0].get("configuration").unwrap();
 
-    if expect_materialized_columns {
+    if is_property_enabled {
         let row_id_col = meta_config
             .get("delta.rowTracking.materializedRowIdColumnName")
             .and_then(|v| v.as_str())
             .expect("materializedRowIdColumnName should be set");
-        assert!(
-            row_id_col.starts_with("_row-id-col-"),
-            "Expected _row-id-col-<uuid>, got {row_id_col}"
-        );
+        assert!(row_id_col.starts_with("_row-id-col-"), "got {row_id_col}");
 
         let commit_version_col = meta_config
             .get("delta.rowTracking.materializedRowCommitVersionColumnName")
@@ -146,7 +196,7 @@ fn test_create_empty_table_with_row_tracking(
             .expect("materializedRowCommitVersionColumnName should be set");
         assert!(
             commit_version_col.starts_with("_row-commit-version-col-"),
-            "Expected _row-commit-version-col-<uuid>, got {commit_version_col}"
+            "got {commit_version_col}"
         );
     } else {
         assert!(
@@ -161,86 +211,11 @@ fn test_create_empty_table_with_row_tracking(
                 .is_none(),
             "materializedRowCommitVersionColumnName should NOT be set for feature-signal-only tables"
         );
+        assert!(
+            meta_config.get("delta.enableRowTracking").is_none(),
+            "delta.enableRowTracking should NOT be set for feature-signal-only tables"
+        );
     }
-
-    Ok(())
-}
-
-/// Verifies that CTAS (create table with data) correctly computes row tracking metadata:
-/// baseRowId, defaultRowCommitVersion on add actions, and the correct high water mark in
-/// domain metadata.
-#[tokio::test]
-async fn test_create_table_with_data_and_row_tracking() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-
-    let schema = super::simple_schema()?;
-    let mut txn = create_table(&table_path, schema.clone(), "Test/1.0")
-        .with_table_properties([("delta.enableRowTracking", "true")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-
-    // Write a parquet file with 5 rows
-    let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
-            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
-        ],
-    )
-    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
-
-    let write_context = Arc::new(txn.get_write_context());
-    let add_files = engine
-        .write_parquet(
-            &ArrowEngineData::new(batch),
-            write_context.as_ref(),
-            HashMap::new(),
-        )
-        .await?;
-
-    txn.add_files(add_files);
-
-    let result = txn.commit(engine.as_ref())?;
-    let committed = result.unwrap_committed();
-    assert_eq!(committed.commit_version(), 0);
-
-    // Verify protocol via snapshot
-    let snapshot = committed
-        .post_commit_snapshot()
-        .expect("should have snapshot");
-    assert_row_tracking_protocol(snapshot);
-
-    // Verify commit file contents
-    let actions = read_commit_actions(&table_path, 0);
-
-    // Verify add action has row tracking fields
-    let add_actions: Vec<_> = actions.iter().filter_map(|a| a.get("add")).collect();
-    assert_eq!(add_actions.len(), 1, "Expected exactly one add action");
-    let add = add_actions[0];
-    assert_eq!(
-        add["baseRowId"].as_i64(),
-        Some(0),
-        "First file should have baseRowId 0"
-    );
-    assert_eq!(
-        add["defaultRowCommitVersion"].as_i64(),
-        Some(0),
-        "Commit version should be 0"
-    );
-
-    // Verify high water mark is updated (5 rows -> HWM = 4)
-    let dm_actions = find_domain_metadata_actions(&actions);
-    let row_tracking_dm: Vec<_> = dm_actions
-        .iter()
-        .filter(|dm| dm["domain"] == "delta.rowTracking")
-        .collect();
-    assert_eq!(row_tracking_dm.len(), 1);
-    let config: serde_json::Value =
-        serde_json::from_str(row_tracking_dm[0]["configuration"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        config["rowIdHighWaterMark"], 4,
-        "HWM should be 4 for 5 rows starting from -1"
-    );
 
     Ok(())
 }

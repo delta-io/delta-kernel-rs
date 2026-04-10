@@ -884,15 +884,19 @@ impl<S> Transaction<S> {
             })
         }
 
-        let needs_row_tracking = self
+        // Note: this does not require delta.enableRowTracking=true. "supported" is sufficient
+        // for writers to assign row IDs.
+        let row_tracking_supported = self
             .read_snapshot
             .table_configuration()
             .should_write_row_tracking();
 
         if self.add_files_metadata.is_empty() {
-            // For empty create-table with row tracking, return the initial HWM = -1 domain
-            // metadata so it gets written to the commit.
-            let row_tracking_dm = (needs_row_tracking && self.is_create_table())
+            // No files to add. For an empty CREATE TABLE with row tracking, emit the initial
+            // high water mark domain metadata (rowIdHighWaterMark = -1) so subsequent writes
+            // have a valid starting point. For all other empty commits (metadata-only, etc.),
+            // nothing row-tracking-related needs to be written.
+            let row_tracking_dm = (row_tracking_supported && self.is_create_table())
                 .then(RowTrackingDomainMetadata::initial);
             return Ok((Box::new(iter::empty()), row_tracking_dm));
         }
@@ -900,9 +904,9 @@ impl<S> Transaction<S> {
         let commit_version = i64::try_from(commit_version)
             .map_err(|_| Error::generic("Commit version too large to fit in i64"))?;
 
-        if needs_row_tracking {
-            // For create-table, there is no prior log to read the high water mark from, so
-            // start from the default (-1). For existing tables, read from the snapshot.
+        if row_tracking_supported {
+            // For create-table (CTAS), there is no prior log to read the high water mark from,
+            // so start from the default (-1). For existing tables, read from the snapshot.
             let row_id_high_water_mark = if self.is_create_table() {
                 None
             } else {
