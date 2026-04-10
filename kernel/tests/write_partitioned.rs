@@ -1,10 +1,4 @@
 //! Integration tests for writing to partitioned Delta tables.
-//!
-//! Verifies that the full write pipeline works end-to-end for every supported partition
-//! column type: create table with partition columns, write data with typed `Scalar` partition
-//! values via `partitioned_write_context`, and read it back via scan.
-//!
-//! Tests are parameterized over column mapping modes (None, Name, Id) via rstest.
 
 use std::collections::HashMap;
 use std::sync::Arc;
