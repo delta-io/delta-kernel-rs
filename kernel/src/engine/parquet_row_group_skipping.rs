@@ -36,7 +36,6 @@ pub(crate) trait ParquetRowGroupSkipping {
     /// Statistics for data columns are null-guarded: if a stat column contains any null values
     /// in the row group (indicating some files lack that statistic), the stat is treated as
     /// unavailable to prevent false pruning.
-    #[allow(dead_code)]
     fn with_checkpoint_row_group_filter(
         self,
         predicate: &Predicate,
@@ -273,7 +272,6 @@ fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
 
 /// Checks whether a parquet column has any null values in a row group, based on its footer stats.
 /// Returns `true` if the column has nulls, or if nullcount stats are unavailable (conservative).
-#[allow(dead_code)]
 fn column_has_nulls(row_group: &RowGroupMetaData, col_index: usize) -> bool {
     row_group
         .column(col_index)
@@ -285,7 +283,6 @@ fn column_has_nulls(row_group: &RowGroupMetaData, col_index: usize) -> bool {
 /// Parquet field indices for a single column's Delta statistics within a checkpoint file.
 /// Each index points to a leaf column in the checkpoint parquet schema.
 #[derive(Default)]
-#[allow(dead_code)]
 struct StatsColumnIndices {
     /// Index of `add.stats_parsed.minValues.<col>` in the parquet schema.
     min_index: Option<usize>,
@@ -312,7 +309,6 @@ struct StatsColumnIndices {
 /// Partition columns are handled separately: their footer min/max of
 /// `add.partitionValues_parsed.<col>` can be used directly without null guarding, because parquet
 /// footer stats ignore null values (which may appear for non-add action rows).
-#[allow(dead_code)]
 pub(crate) struct CheckpointRowGroupFilter<'a> {
     row_group: &'a RowGroupMetaData,
     /// Maps each predicate data column to its stats column indices in the checkpoint parquet file.
@@ -323,7 +319,6 @@ pub(crate) struct CheckpointRowGroupFilter<'a> {
     partition_columns: &'a HashSet<String>,
 }
 
-#[allow(dead_code)]
 impl<'a> CheckpointRowGroupFilter<'a> {
     /// Creates a new checkpoint row group filter. The `predicate` uses physical column names
     /// (e.g. `x > 10`, or `col-abc-123 > 10` under column mapping), and `partition_columns`
@@ -442,7 +437,6 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
 /// `stored_max <= actual_max <= stored_max + 999us`. Adding 999us ensures we never falsely
 /// prune files whose actual max exceeds the truncated value. Non-timestamp values pass through
 /// unchanged.
-#[allow(dead_code)]
 fn adjust_stats_for_truncation(val: Scalar) -> Scalar {
     match val {
         Scalar::Timestamp(us) => Scalar::Timestamp(us.saturating_add(999)),
@@ -453,7 +447,6 @@ fn adjust_stats_for_truncation(val: Scalar) -> Scalar {
 
 /// Extracts the maximum value as i64 from parquet statistics. Used for reading checkpoint
 /// nullCount stats where the footer max represents the largest per-file null count.
-#[allow(dead_code)]
 fn extract_max_i64(stats: &Statistics) -> Option<i64> {
     match stats {
         Statistics::Int64(s) => Some(*s.max_opt()?),
@@ -489,7 +482,6 @@ pub(crate) fn compute_field_indices(
 /// Builds column index mappings for checkpoint row group skipping. Maps each predicate column to
 /// its corresponding stats column indices (`add.stats_parsed.{minValues,maxValues,nullCount}.<col>`)
 /// or partition column index (`add.partitionValues_parsed.<col>`).
-#[allow(dead_code)]
 fn compute_checkpoint_field_indices(
     fields: &[ColumnDescPtr],
     predicate: &Predicate,
