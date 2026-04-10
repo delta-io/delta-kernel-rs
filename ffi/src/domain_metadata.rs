@@ -93,9 +93,9 @@ mod tests {
         ok_or_panic, recover_string,
     };
     use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice};
-    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::DeltaResult;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
     use serde_json::json;
     use std::collections::HashMap;
     use std::ptr::NonNull;
