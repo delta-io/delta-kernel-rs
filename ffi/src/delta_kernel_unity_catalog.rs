@@ -6,11 +6,11 @@ use crate::{ExclusiveRustString, NullableCvoid};
 use std::sync::Arc;
 
 use delta_kernel::committer::Committer;
-use delta_kernel::engine::default::executor::tokio::{
+use delta_kernel::DeltaResult;
+use delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
-use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::DeltaResult;
+use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_ffi::{
     handle::Handle, kernel_string_slice, KernelStringSlice, OptionalValue, TryFromStringSlice,
 };

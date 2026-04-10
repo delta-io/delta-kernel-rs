@@ -276,9 +276,9 @@ mod tests {
     use std::fs;
 
     use delta_kernel::committer::{CatalogCommit, CommitMetadata};
-    use delta_kernel::engine::default::DefaultEngine;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::Version;
+    use delta_kernel_default_engine::DefaultEngine;
     use unity_catalog_delta_client_api::error::Result;
 
     struct MockCommitsClient;
