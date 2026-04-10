@@ -263,18 +263,11 @@ mod tests {
 
     use std::sync::Arc;
 
-    use rstest::rstest;
-
-    use crate::arrow::array::{
-        Array, ArrayRef, Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray,
-        StructArray,
-    };
+    use crate::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, StructArray};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::stats::collect_stats;
-    use crate::expressions::column_name;
     use crate::EngineData;
 
     /// Creates test add file data with stats.numRecords, stats.nullCount.col,
@@ -582,123 +575,7 @@ mod tests {
         assert!(!err_msg.contains("col_a"));
     }
 
-    /// Verifies that stats collected from non-standard Arrow string representations
-    /// (LargeUtf8/LargeStringArray, Utf8View/StringViewArray) can be validated by
-    /// StatsVerifier, which expects Delta's logical STRING type. Engines may use any of
-    /// these representations, and the stats pipeline must handle them without type errors.
-    #[rstest]
-    #[case::large_utf8(Arc::new(LargeStringArray::from(vec!["Austin", "Boston", "Chicago"])) as ArrayRef)]
-    #[case::utf8_view(Arc::new(StringViewArray::from(vec!["Austin", "Boston", "Chicago"])) as ArrayRef)]
-    fn test_verify_string_stats(#[case] values: ArrayRef) {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "city",
-            values.data_type().clone(),
-            false,
-        )]));
-        let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
-
-        let stats = collect_stats(&batch, &[column_name!("city")]).unwrap();
-
-        let path_array = StringArray::from(vec!["file1.parquet"]);
-        let add_file_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("path", ArrowDataType::Utf8, false),
-            ArrowField::new("stats", stats.data_type().clone(), true),
-        ]));
-        let add_file_batch = RecordBatch::try_new(
-            add_file_schema,
-            vec![
-                Arc::new(path_array) as ArrayRef,
-                Arc::new(stats) as ArrayRef,
-            ],
-        )
-        .unwrap();
-
-        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(add_file_batch));
-
-        let verifier = StatsVerifier::new(vec![(ColumnName::new(["city"]), DataType::STRING)]);
-        verifier.verify(&[engine_data]).unwrap();
-    }
-
-    /// Round-trip test: collect_stats produces stats that pass verification for all null
-    /// patterns. The all-null and empty cases are regression tests -- collect_stats must keep
-    /// the field present (with null value) so the verifier's all_null check can run.
-    #[rstest]
-    #[case::non_null(vec![Some(1i64), Some(2), Some(3)])]
-    #[case::all_null(vec![None, None, None])]
-    #[case::empty(vec![])]
-    fn test_collected_stats_pass_verification(#[case] values: Vec<Option<i64>>) {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "col",
-            ArrowDataType::Int64,
-            true,
-        )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef])
-                .unwrap();
-
-        let stats = collect_stats(&batch, &[column_name!("col")]).unwrap();
-
-        let path_array = StringArray::from(vec!["file1.parquet"]);
-        let add_file_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("path", ArrowDataType::Utf8, false),
-            ArrowField::new("stats", stats.data_type().clone(), true),
-        ]));
-        let add_file_batch = RecordBatch::try_new(
-            add_file_schema,
-            vec![
-                Arc::new(path_array) as ArrayRef,
-                Arc::new(stats) as ArrayRef,
-            ],
-        )
-        .unwrap();
-
-        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(add_file_batch));
-
-        let verifier = StatsVerifier::new(vec![(ColumnName::new(["col"]), DataType::LONG)]);
-        verifier.verify(&[engine_data]).unwrap();
-    }
-
-    /// Verify collect_stats produces correct stats shape for all-null and empty batches.
-    /// These cases keep the column in minValues/maxValues with null values (so that
-    /// StatsVerifier can find the field via visit_rows and check nullCount == numRecords).
-    #[rstest]
-    #[case::all_null_values(Arc::new(Int64Array::from(vec![None::<i64>, None, None])) as ArrayRef)]
-    #[case::empty_batch(Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef)]
-    fn test_collected_stats_shape_for_all_null_and_empty(#[case] values: ArrayRef) {
-        let num_rows = values.len();
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "col",
-            values.data_type().clone(),
-            true,
-        )]));
-        let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
-
-        let stats = collect_stats(&batch, &[column_name!("col")]).unwrap();
-
-        // numRecords should match row count
-        let num_records = stats
-            .column_by_name("numRecords")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(num_records.value(0), num_rows as i64);
-
-        // All-null/empty columns are present in minValues/maxValues with null values
-        let min_values = stats
-            .column_by_name("minValues")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        assert!(min_values.column_by_name("col").unwrap().is_null(0));
-
-        let max_values = stats
-            .column_by_name("maxValues")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        assert!(max_values.column_by_name("col").unwrap().is_null(0));
-    }
+    // NOTE: Tests for collect_stats round-tripping (test_verify_string_stats,
+    // test_collected_stats_pass_verification, test_collected_stats_shape_for_all_null_and_empty)
+    // live in the delta_kernel_default_engine crate where collect_stats is defined.
 }

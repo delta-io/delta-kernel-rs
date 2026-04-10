@@ -1,79 +1,43 @@
-//! Cross-engine tests: verifies that both the default (Arrow/Tokio) and sync engines exhibit
-//! consistent behavior for [`JsonHandler`] and [`ParquetHandler`].
+//! Cross-engine contract tests: verifies that handler implementations exhibit consistent behavior
+//! for [`JsonHandler`] and [`ParquetHandler`].
 //!
-//! Contract tests (things any [`ParquetHandler`] implementation must satisfy) call into
-//! [`super::tests`]. Internal implementation tests (Arrow-specific behavior that both kernel
-//! engines share) are defined as local helpers here.
+//! Contract tests (things any handler implementation must satisfy) call into [`super::tests`].
+//! Internal implementation tests (Arrow-specific behavior) are defined as local helpers here.
 
 use std::fs::File;
 use std::sync::Arc;
 
-use rstest::rstest;
 use tempfile::tempdir;
 use url::Url;
 
 use crate::arrow::array::{Array, Int64Array, RecordBatch};
 use crate::engine::arrow_conversion::TryIntoKernel as _;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-use crate::engine::default::json::DefaultJsonHandler;
-use crate::engine::default::parquet::DefaultParquetHandler;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncParquetHandler;
-use crate::object_store::local::LocalFileSystem;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::ARROW_SCHEMA_META_KEY;
-use crate::{EngineData, JsonHandler, ParquetHandler};
+use crate::{EngineData, ParquetHandler};
 
-fn default_parquet_handler() -> Box<dyn ParquetHandler> {
-    Box::new(DefaultParquetHandler::new(
-        Arc::new(LocalFileSystem::new()),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ))
+#[test]
+fn test_reads_footer() {
+    super::tests::test_parquet_handler_reads_footer(&SyncParquetHandler::new());
 }
 
-fn sync_parquet_handler() -> Box<dyn ParquetHandler> {
-    Box::new(SyncParquetHandler)
+#[test]
+fn test_footer_errors_on_missing_file() {
+    super::tests::test_parquet_handler_footer_errors_on_missing_file(&SyncParquetHandler::new());
 }
 
-fn default_json_handler() -> Box<dyn JsonHandler> {
-    Box::new(DefaultJsonHandler::new(
-        Arc::new(LocalFileSystem::new()),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ))
+#[test]
+fn test_footer_preserves_field_ids() {
+    super::tests::test_parquet_handler_footer_preserves_field_ids(&SyncParquetHandler::new());
 }
 
-fn sync_json_handler() -> Box<dyn JsonHandler> {
-    Box::new(SyncJsonHandler)
-}
-
-#[rstest]
-#[case::default_engine(default_parquet_handler())]
-#[case::sync_engine(sync_parquet_handler())]
-fn test_reads_footer(#[case] handler: Box<dyn ParquetHandler>) {
-    super::tests::test_parquet_handler_reads_footer(handler.as_ref());
-}
-
-#[rstest]
-#[case::default_engine(default_parquet_handler())]
-#[case::sync_engine(sync_parquet_handler())]
-fn test_footer_errors_on_missing_file(#[case] handler: Box<dyn ParquetHandler>) {
-    super::tests::test_parquet_handler_footer_errors_on_missing_file(handler.as_ref());
-}
-
-#[rstest]
-#[case::default_engine(default_parquet_handler())]
-#[case::sync_engine(sync_parquet_handler())]
-fn test_footer_preserves_field_ids(#[case] handler: Box<dyn ParquetHandler>) {
-    super::tests::test_parquet_handler_footer_preserves_field_ids(handler.as_ref());
-}
-
-#[rstest]
-#[case::default_engine(default_parquet_handler())]
-#[case::sync_engine(sync_parquet_handler())]
-fn test_write_always_overwrites(#[case] handler: Box<dyn ParquetHandler>) {
-    super::tests::test_parquet_handler_write_always_overwrites(handler.as_ref());
+#[test]
+fn test_write_always_overwrites() {
+    super::tests::test_parquet_handler_write_always_overwrites(&SyncParquetHandler::new());
 }
 
 // Both kernel engines configure their parquet readers and writers to skip the Arrow IPC schema
@@ -146,23 +110,17 @@ fn assert_reads_file_with_arrow_schema_metadata(handler: &dyn ParquetHandler) {
     );
 }
 
-#[rstest]
-#[case::default_engine(default_parquet_handler())]
-#[case::sync_engine(sync_parquet_handler())]
-fn test_write_file_omits_arrow_schema(#[case] handler: Box<dyn ParquetHandler>) {
-    assert_no_arrow_schema(handler.as_ref());
+#[test]
+fn test_write_file_omits_arrow_schema() {
+    assert_no_arrow_schema(&SyncParquetHandler::new());
 }
 
-#[rstest]
-#[case::default_engine(default_parquet_handler())]
-#[case::sync_engine(sync_parquet_handler())]
-fn test_reads_file_with_arrow_schema_metadata(#[case] handler: Box<dyn ParquetHandler>) {
-    assert_reads_file_with_arrow_schema_metadata(handler.as_ref());
+#[test]
+fn test_reads_file_with_arrow_schema_metadata() {
+    assert_reads_file_with_arrow_schema_metadata(&SyncParquetHandler::new());
 }
 
-#[rstest]
-#[case::default_engine(default_json_handler())]
-#[case::sync_engine(sync_json_handler())]
-fn test_json_file_path_contract(#[case] handler: Box<dyn JsonHandler>) {
-    super::tests::test_json_handler_file_path_contract(handler.as_ref());
+#[test]
+fn test_json_file_path_contract() {
+    super::tests::test_json_handler_file_path_contract(&SyncJsonHandler::new());
 }
