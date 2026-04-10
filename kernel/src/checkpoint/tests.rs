@@ -781,6 +781,91 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()> {
+    // ===== Setup =====
+    let tmp_dir = tempdir().unwrap();
+    let table_path = tmp_dir.path();
+    let table_url = Url::from_directory_path(table_path).unwrap();
+    std::fs::create_dir_all(table_path.join("_delta_log")).unwrap();
+
+    // ===== Create Table with domainMetadata feature =====
+    let commit0 = [
+        json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": ["domainMetadata"]
+            }
+        }),
+        json!({
+            "metaData": {
+                "id": "test-table-id",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        }),
+    ]
+    .map(|j| j.to_string())
+    .join("\n");
+    std::fs::write(
+        table_path.join("_delta_log/00000000000000000000.json"),
+        commit0,
+    )
+    .unwrap();
+
+    // ===== Create Engine =====
+    let store = Arc::new(LocalFileSystem::new());
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_task_executor(executor)
+        .build();
+
+    // ===== Commit domain metadata for "foo" =====
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let result = txn
+        .with_domain_metadata("foo".to_string(), "bar".to_string())
+        .commit(&engine)?;
+    assert!(result.is_committed());
+
+    // Verify domain exists before removal
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    assert_eq!(
+        snapshot.get_domain_metadata("foo", &engine)?,
+        Some("bar".to_string())
+    );
+
+    // ===== Remove domain metadata for "foo" (tombstone) =====
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let result = txn
+        .with_domain_metadata_removed("foo".to_string())
+        .commit(&engine)?;
+    assert!(result.is_committed());
+
+    // Verify domain is gone before checkpoint
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    assert_eq!(snapshot.get_domain_metadata("foo", &engine)?, None);
+
+    // ===== Write checkpoint =====
+    snapshot.checkpoint(&engine)?;
+
+    // ===== Verify tombstoned domain is NOT present after loading from checkpoint =====
+    let snapshot = Snapshot::builder_for(table_url)
+        .at_version(snapshot.version())
+        .build(&engine)?;
+    assert_eq!(snapshot.get_domain_metadata("foo", &engine)?, None);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer() -> DeltaResult<()>
 {
     let (store, _) = new_in_memory_store();
@@ -843,8 +928,6 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     snapshot_v1.checkpoint(&engine)?;
     assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await
 }
-
-// TODO: Add test that checkpoint does not contain tombstoned domain metadata.
 
 /// Helper to create metadata action with specific stats settings
 fn create_metadata_with_stats_config(
