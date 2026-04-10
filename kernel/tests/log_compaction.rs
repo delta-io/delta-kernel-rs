@@ -22,6 +22,7 @@ fn url_to_object_store_path(url: &Url) -> Result<Path, Box<dyn std::error::Error
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -195,6 +196,7 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
 
 /// Test log compaction behavior with expired tombstones.
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 

@@ -210,6 +210,8 @@ struct ListingAccumulator {
     /// Staging area for checkpoint parts at the current version group; always empty when iteration ends
     pending_checkpoint_parts: Vec<ParsedLogPath>,
     /// End-version bound used in process_file() to filter CompactedCommit files
+    // TODO(#2337): remove allow(dead_code) when log compaction is re-enabled
+    #[allow(dead_code)]
     end_version: Option<Version>,
     /// The version of the current group being accumulated
     group_version: Option<Version>,
@@ -222,10 +224,17 @@ impl ListingAccumulator {
         }
         match file.file_type {
             Commit | StagedCommit => self.output.ascending_commit_files.push(file),
-            CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
-                self.output.ascending_compaction_files.push(file);
+            // TODO(#2337): re-enable log compaction once testing is sufficient
+            // CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
+            //     self.output.ascending_compaction_files.push(file);
+            // }
+            // CompactedCommit { .. } => (), // Failed the bounds check above
+            CompactedCommit { .. } => {
+                debug!(
+                    "Skipping unsupported log compaction file: {:?}",
+                    file.location
+                );
             }
-            CompactedCommit { .. } => (), // failed the bounds check above
             SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
                 self.pending_checkpoint_parts.push(file)
             }

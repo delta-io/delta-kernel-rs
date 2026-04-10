@@ -1084,6 +1084,9 @@ mod tests {
             CommitRequest,
         };
         use crate::{Handle, NullableCvoid, OptionalValue};
+        use delta_kernel_ffi::{
+            get_snapshot_builder, snapshot_builder_build, snapshot_builder_set_max_catalog_version,
+        };
 
         #[no_mangle]
         extern "C" fn test_uc_commit(
@@ -1135,7 +1138,12 @@ mod tests {
             let engine = get_default_engine(table_path_str);
 
             let snapshot = unsafe {
-                build_snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy())
+                let mut ptr = ok_or_panic(get_snapshot_builder(
+                    kernel_string_slice!(table_path_str),
+                    engine.shallow_copy(),
+                ));
+                snapshot_builder_set_max_catalog_version(&mut ptr, 0);
+                ok_or_panic(snapshot_builder_build(ptr))
             };
 
             let context = get_test_context(false);

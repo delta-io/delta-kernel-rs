@@ -19,6 +19,7 @@ use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::last_checkpoint_hint::LastCheckpointHintSummary;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
@@ -1685,6 +1686,7 @@ async fn test_compaction_listing(
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_compaction_simple() {
     test_compaction_listing(
         &[0, 1, 2],
@@ -1696,6 +1698,7 @@ async fn test_compaction_simple() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_compaction_in_version_range() {
     test_compaction_listing(
         &[0, 1, 2, 3],
@@ -1707,6 +1710,7 @@ async fn test_compaction_in_version_range() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_compaction_out_of_version_range() {
     test_compaction_listing(
         &[0, 1, 2, 3, 4],
@@ -1718,6 +1722,7 @@ async fn test_compaction_out_of_version_range() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_multi_compaction() {
     test_compaction_listing(
         &[0, 1, 2, 3, 4, 5],
@@ -1729,6 +1734,7 @@ async fn test_multi_compaction() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_multi_compaction_one_out_of_range() {
     test_compaction_listing(
         &[0, 1, 2, 3, 4, 5],
@@ -1740,6 +1746,7 @@ async fn test_multi_compaction_one_out_of_range() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_compaction_with_checkpoint() {
     test_compaction_listing(
         &[0, 1, 2, 4, 5],
@@ -1751,6 +1758,7 @@ async fn test_compaction_with_checkpoint() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_compaction_to_early_with_checkpoint() {
     test_compaction_listing(
         &[0, 1, 2, 4, 5],
@@ -1762,6 +1770,7 @@ async fn test_compaction_to_early_with_checkpoint() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_compaction_starts_at_checkpoint() {
     test_compaction_listing(
         &[0, 1, 2, 4, 5],
@@ -1812,6 +1821,7 @@ async fn test_commit_cover(
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_one_compaction() {
     test_commit_cover(
         &[0, 1, 2],
@@ -1824,6 +1834,7 @@ async fn test_commit_cover_one_compaction() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_in_version_range() {
     test_commit_cover(
         &[0, 1, 2, 3],
@@ -1852,6 +1863,7 @@ async fn test_commit_cover_out_of_version_range() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_multi_compaction() {
     test_commit_cover(
         &[0, 1, 2, 3, 4, 5],
@@ -1868,6 +1880,7 @@ async fn test_commit_cover_multi_compaction() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_multi_compaction_one_out_of_range() {
     test_commit_cover(
         &[0, 1, 2, 3, 4, 5],
@@ -1885,6 +1898,7 @@ async fn test_commit_cover_multi_compaction_one_out_of_range() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_compaction_with_checkpoint() {
     test_commit_cover(
         &[0, 1, 2, 4, 5],
@@ -1897,6 +1911,7 @@ async fn test_commit_cover_compaction_with_checkpoint() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_too_early_with_checkpoint() {
     test_commit_cover(
         &[0, 1, 2, 4, 5],
@@ -1909,6 +1924,7 @@ async fn test_commit_cover_too_early_with_checkpoint() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_starts_at_checkpoint() {
     test_commit_cover(
         &[0, 1, 2, 4, 5],
@@ -1921,6 +1937,7 @@ async fn test_commit_cover_starts_at_checkpoint() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_wider_range() {
     test_commit_cover(
         &Vec::from_iter(0..20),
@@ -1955,6 +1972,7 @@ async fn test_commit_cover_no_compactions() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_minimal_overlap() {
     test_commit_cover(
         &Vec::from_iter(0..6),
@@ -2016,6 +2034,7 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_validate_listed_log_file_in_order_compaction_files() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
@@ -2041,6 +2060,7 @@ fn test_validate_listed_log_file_in_order_compaction_files() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_validate_listed_log_file_out_of_order_compaction_files() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
@@ -2200,6 +2220,7 @@ fn test_validate_listed_log_file_commit_files_contains_non_commit() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_validate_listed_log_file_compaction_files_contains_non_compaction() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
@@ -2220,6 +2241,7 @@ fn test_validate_listed_log_file_compaction_files_contains_non_compaction() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_validate_listed_log_file_compaction_start_exceeds_end() {
     // A compaction file where the start version is greater than the end version
     let log_root = Url::parse("file:///_delta_log/").unwrap();
@@ -2251,6 +2273,10 @@ async fn commits_since() {
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 4);
 
+    // TODO(#2337): restore original expected values when log compaction is re-enabled.
+    // Compaction files are currently skipped during listing, so
+    // commits_since_log_compaction_or_checkpoint() equals commits_since_checkpoint().
+
     // with compaction, no checkpoint
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &Vec::from_iter(0..=4),
@@ -2259,7 +2285,7 @@ async fn commits_since() {
     })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
-    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 4);
 
     // checkpoint, no compaction
     let log_segment = create_segment_for(LogSegmentConfig {
@@ -2291,7 +2317,7 @@ async fn commits_since() {
     })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
-    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 4);
 
     // multiple compactions
     let log_segment = create_segment_for(LogSegmentConfig {
@@ -2301,7 +2327,7 @@ async fn commits_since() {
     })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 6);
-    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 6);
 
     // multiple compactions, out of order
     let log_segment = create_segment_for(LogSegmentConfig {
@@ -2311,7 +2337,7 @@ async fn commits_since() {
     })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 10);
-    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 1);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 10);
 }
 
 #[tokio::test]
@@ -2672,7 +2698,7 @@ fn test_log_segment_contiguous_commit_files() {
     );
 }
 
-/// Test that checkpoint_schema from _last_checkpoint hint is properly propagated to LogSegment
+/// Test that last_checkpoint_metadata from _last_checkpoint hint is properly propagated to LogSegment
 #[tokio::test]
 async fn test_checkpoint_schema_propagation_from_hint() {
     use crate::schema::{StructField, StructType};
@@ -2714,9 +2740,12 @@ async fn test_checkpoint_schema_propagation_from_hint() {
     )
     .unwrap();
 
-    // Verify checkpoint_schema is propagated
-    assert!(log_segment.checkpoint_schema.is_some());
-    assert_eq!(log_segment.checkpoint_schema.unwrap(), sample_schema);
+    // Verify last_checkpoint_metadata is propagated with version and schema
+    let metadata = log_segment
+        .last_checkpoint_metadata
+        .expect("last_checkpoint_metadata should be Some");
+    assert_eq!(metadata.version, 5);
+    assert_eq!(metadata.schema.unwrap(), sample_schema);
 }
 
 /// Test get_file_actions_schema_and_sidecars with V1 parquet checkpoint using hint schema
@@ -2755,7 +2784,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
         },
         log_root,
         None,
-        Some(hint_schema.clone()), // V1 hint schema (no sidecar field)
+        Some(LastCheckpointHintSummary {
+            version: 1,
+            schema: Some(hint_schema.clone()),
+        }),
     )?;
 
     // With V1 hint, should use hint schema and avoid footer read
@@ -2836,7 +2868,10 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         },
         log_root,
         None,
-        use_hint.then(|| v1_schema.clone() as SchemaRef),
+        use_hint.then(|| LastCheckpointHintSummary {
+            version: 1,
+            schema: Some(v1_schema.clone()),
+        }),
     )?;
 
     let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
@@ -3966,7 +4001,8 @@ async fn test_try_new_with_checkpoint_sets_checkpoint_and_clears_commits(#[case]
     })
     .await;
     assert!(!log_segment.listed.ascending_commit_files.is_empty());
-    assert!(!log_segment.listed.ascending_compaction_files.is_empty());
+    // TODO(#2337): restore to assert !is_empty() when log compaction is re-enabled
+    assert!(log_segment.listed.ascending_compaction_files.is_empty());
 
     let ckpt_path = create_log_path(path);
     let result = log_segment.try_new_with_checkpoint(ckpt_path).unwrap();
@@ -3976,7 +4012,7 @@ async fn test_try_new_with_checkpoint_sets_checkpoint_and_clears_commits(#[case]
     assert_eq!(result.listed.checkpoint_parts[0].version, 2);
     assert!(result.listed.ascending_commit_files.is_empty());
     assert!(result.listed.ascending_compaction_files.is_empty());
-    assert!(result.checkpoint_schema.is_none());
+    assert!(result.last_checkpoint_metadata.is_none());
 
     // latest_commit_file is preserved for ICT access even though commits are cleared
     assert_eq!(
@@ -4149,7 +4185,7 @@ struct CrcPruningCase {
     checkpoint: None,
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
-    after_compactions: &[(5, 7)],
+    after_compactions: &[], // TODO(#2337): restore to &[(5, 7)] when re-enabled
     through_commits: &[0, 1, 2, 3, 4],
     through_compactions: &[],
 })]
@@ -4185,7 +4221,7 @@ struct CrcPruningCase {
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
     through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[(0, 2)],
+    through_compactions: &[], // TODO(#2337): restore to &[(0, 2)] when re-enabled
 })]
 #[tokio::test]
 async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {

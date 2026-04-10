@@ -75,26 +75,10 @@ impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
             commits.sort_by_key(|c| c.version)
         }
 
-        // if commits are present, we ensure they are sorted+contiguous
-        if let Some(commits) = &commits.commits {
-            if !commits.windows(2).all(|w| w[1].version == w[0].version + 1) {
-                return Err("Received non-contiguous commit versions".into());
-            }
-        }
-
-        // we always get back the latest version from commits response, and pass that in to
-        // kernel's Snapshot builder. basically, load_table for the latest version always looks
-        // like a time travel query since we know the latest version ahead of time.
-        //
-        // note there is a weird edge case: if the table was just created it will return
-        // latest_table_version = -1, but the 0.json will exist in the _delta_log.
-        let version: Version = match version {
-            Some(v) => v,
-            None => match commits.latest_table_version {
-                -1 => 0,
-                i => i.try_into()?,
-            },
-        };
+        // The catalog always returns the latest ratified version. Use it as the
+        // max_catalog_version for snapshot building, and as the effective version when no
+        // explicit time-travel version is requested.
+        let max_catalog_version: Version = commits.latest_table_version.try_into()?;
 
         // consume the UC Commit and hand back a delta_kernel LogPath
         let mut table_url = Url::parse(&table_uri)?;
@@ -125,11 +109,15 @@ impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
 
         debug!("commits for kernel: {:?}\n", commits);
 
-        Snapshot::builder_for(table_url)
-            .at_version(version)
-            .with_log_tail(commits)
-            .build(engine)
-            .map_err(|e| e.into())
+        let mut builder = Snapshot::builder_for(table_url)
+            .with_max_catalog_version(max_catalog_version)
+            .with_log_tail(commits);
+
+        if let Some(v) = version {
+            builder = builder.at_version(v);
+        }
+
+        builder.build(engine).map_err(Into::into)
     }
 }
 
@@ -293,6 +281,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_snapshot_at_errors_when_version_exceeds_catalog() {
+        let client = InMemoryCommitsClient::new();
+        client.insert_table(
+            "test_table",
+            TableData {
+                max_ratified_version: 3,
+                catalog_commits: vec![],
+            },
+        );
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngineBuilder::new(store).build();
+        let catalog = UCKernelClient::new(&client);
+
+        // Request version 5 but catalog only reports version 3
+        let result = catalog
+            .load_snapshot_at("test_table", "memory:///", 5, &engine)
+            .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Time-travel version 5 exceeds max_catalog_version 3"));
+    }
+
+    #[tokio::test]
     async fn load_snapshot_errors_on_non_contiguous_commits() {
         let client = InMemoryCommitsClient::new();
         client.insert_table(
@@ -300,8 +312,20 @@ mod tests {
             TableData {
                 max_ratified_version: 3,
                 catalog_commits: vec![
-                    Commit::new(1, 0, "1.json", 100, 0),
-                    Commit::new(3, 0, "3.json", 100, 0), // gap: version 2 missing
+                    Commit::new(
+                        1,
+                        0,
+                        "00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+                        100,
+                        0,
+                    ),
+                    Commit::new(
+                        3,
+                        0,
+                        "00000000000000000003.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+                        100,
+                        0,
+                    ), // gap: version 2 missing
                 ],
             },
         );
@@ -312,7 +336,9 @@ mod tests {
         let result = catalog
             .load_snapshot("test_table", "memory:///", &engine)
             .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("non-contiguous"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("log_tail must be sorted and contiguous"));
     }
 }
