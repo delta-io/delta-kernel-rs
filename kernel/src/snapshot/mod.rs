@@ -2811,7 +2811,7 @@ mod tests {
 
         // Verify structural correctness: same result as a fresh snapshot build.
         let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
-        assert_eq!(updated, fresh);
+        compare_snapshots(&updated, &fresh);
         assert_eq!(updated.version(), 3);
         assert_eq!(updated.log_segment.checkpoint_version, Some(1));
 
@@ -2868,7 +2868,7 @@ mod tests {
 
         // Verify structural correctness: same result as a fresh snapshot build.
         let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
-        assert_eq!(updated, fresh);
+        compare_snapshots(&updated, &fresh);
         assert_eq!(updated.version(), 3);
         assert_eq!(updated.log_segment.checkpoint_version, Some(1));
 
