@@ -4,6 +4,7 @@ use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::expressions::{ColumnName, ExpressionRef};
 use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
+use crate::transaction::PathMode;
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
 /// write table data.
@@ -17,6 +18,8 @@ pub struct WriteContext {
     column_mapping_mode: ColumnMappingMode,
     /// Column names that should have statistics collected during writes.
     stats_columns: Vec<ColumnName>,
+    /// How file paths should be stored in the Delta log.
+    path_mode: PathMode,
 }
 
 impl WriteContext {
@@ -27,6 +30,7 @@ impl WriteContext {
         logical_to_physical: ExpressionRef,
         column_mapping_mode: ColumnMappingMode,
         stats_columns: Vec<ColumnName>,
+        path_mode: PathMode,
     ) -> Self {
         WriteContext {
             target_dir,
@@ -35,6 +39,7 @@ impl WriteContext {
             logical_to_physical,
             column_mapping_mode,
             stats_columns,
+            path_mode,
         }
     }
 
@@ -64,6 +69,16 @@ impl WriteContext {
     /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
     pub fn stats_columns(&self) -> &[ColumnName] {
         &self.stats_columns
+    }
+
+    /// Returns the [`PathMode`] that controls how file paths should be stored in the Delta log.
+    ///
+    /// Connectors should use this to determine whether to store relative or absolute paths in the
+    /// add file metadata passed to [`Transaction::add_files`].
+    ///
+    /// [`Transaction::add_files`]: super::Transaction::add_files
+    pub fn path_mode(&self) -> PathMode {
+        self.path_mode
     }
 
     /// Generate a new unique absolute URL for a deletion vector file.

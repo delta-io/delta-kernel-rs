@@ -34,6 +34,7 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::expressions::ColumnName;
 use crate::metrics::{MetricEvent, MetricsReporter};
 use crate::schema::{SchemaRef, StructType};
+use crate::transaction::PathMode;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
     ParquetHandler, PredicateRef,
@@ -56,34 +57,37 @@ pub struct DataFileMetadata {
     file_meta: FileMeta,
     /// Collected statistics for this file (includes numRecords, tightBounds, etc.).
     stats: StructArray,
+    /// The path relative to the table root (e.g. `{uuid}.parquet`).
+    relative_path: String,
 }
 
 impl DataFileMetadata {
-    pub fn new(file_meta: FileMeta, stats: StructArray) -> Self {
-        Self { file_meta, stats }
+    pub fn new(file_meta: FileMeta, stats: StructArray, relative_path: String) -> Self {
+        Self {
+            file_meta,
+            stats,
+            relative_path,
+        }
     }
 
     /// Convert DataFileMetadata into a record batch which matches the schema returned by
     /// [`add_files_schema`].
+    ///
+    /// The `path_mode` controls whether the path column contains the relative path
+    /// (e.g. `abc.parquet`) or the absolute URL (e.g. `s3://bucket/table/abc.parquet`).
     ///
     /// [`add_files_schema`]: crate::transaction::Transaction::add_files_schema
     #[internal_api]
     pub(crate) fn as_record_batch(
         &self,
         partition_values: &HashMap<String, String>,
+        path_mode: PathMode,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let DataFileMetadata {
-            file_meta:
-                FileMeta {
-                    location,
-                    last_modified,
-                    size,
-                },
-            stats,
-            ..
-        } = self;
-        // create the record batch of the write metadata
-        let path = Arc::new(StringArray::from(vec![location.to_string()]));
+        let log_path = match path_mode {
+            PathMode::Relative => self.relative_path.as_str(),
+            PathMode::Absolute => self.file_meta.location.as_str(),
+        };
+        let path = Arc::new(StringArray::from(vec![log_path]));
         let key_builder = StringBuilder::new();
         let val_builder = StringBuilder::new();
         let names = MapFieldNames {
@@ -104,13 +108,15 @@ impl DataFileMetadata {
         builder.append(true)?;
         let partitions = Arc::new(builder.finish());
         // this means max size we can write is i64::MAX (~8EB)
-        let size: i64 = (*size)
+        let size: i64 = self
+            .file_meta
+            .size
             .try_into()
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to i64"))?;
         let size = Arc::new(Int64Array::from(vec![size]));
-        let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
+        let modification_time = Arc::new(Int64Array::from(vec![self.file_meta.last_modified]));
 
-        let stats_array = Arc::new(stats.clone());
+        let stats_array = Arc::new(self.stats.clone());
 
         // Build schema dynamically based on stats (stats schema varies based on collected statistics)
         let key_value_struct = DataType::Struct(
@@ -219,12 +225,15 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         }
 
         let file_meta = FileMeta::new(path, modification_time, size);
-        Ok(DataFileMetadata::new(file_meta, stats))
+        Ok(DataFileMetadata::new(file_meta, stats, name))
     }
 
     /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
     /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
     /// is a generated UUIDv4).
+    ///
+    /// The `path_mode` controls whether the returned metadata uses relative paths (from the table
+    /// root) or absolute URLs. See [`PathMode`] for details.
     ///
     /// Note that the schema does not contain the dataChange column. In order to set `data_change` flag,
     /// use [`crate::transaction::Transaction::with_data_change`].
@@ -236,11 +245,12 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         data: Box<dyn EngineData>,
         partition_values: HashMap<String, String>,
         stats_columns: Option<&[ColumnName]>,
+        path_mode: PathMode,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let parquet_metadata = self
             .write_parquet(path, data, stats_columns.unwrap_or(&[]))
             .await?;
-        parquet_metadata.as_record_batch(&partition_values)
+        parquet_metadata.as_record_batch(&partition_values, path_mode)
     }
 }
 
@@ -744,7 +754,8 @@ mod tests {
             None,
         )
         .unwrap();
-        let data_file_metadata = DataFileMetadata::new(file_metadata, stats.clone());
+        let data_file_metadata =
+            DataFileMetadata::new(file_metadata, stats.clone(), "test_url".to_string());
         let partition_value = if test_empty_str {
             "".to_string()
         } else {
@@ -752,7 +763,7 @@ mod tests {
         };
         let partition_values = HashMap::from([("partition1".to_string(), partition_value)]);
         let actual = data_file_metadata
-            .as_record_batch(&partition_values)
+            .as_record_batch(&partition_values, PathMode::Relative)
             .unwrap();
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
@@ -805,7 +816,7 @@ mod tests {
         let expected = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec![location.to_string()])),
+                Arc::new(StringArray::from(vec!["test_url"])),
                 Arc::new(partition_values),
                 Arc::new(Int64Array::from(vec![size as i64])),
                 Arc::new(Int64Array::from(vec![last_modified])),
@@ -844,6 +855,7 @@ mod tests {
                     size,
                 },
             ref stats,
+            ref relative_path,
         } = write_metadata;
         let expected_location = Url::parse("memory:///data/").unwrap();
 
@@ -859,6 +871,7 @@ mod tests {
 
         let filename = location.path().split('/').next_back().unwrap();
         assert_eq!(&expected_location.join(filename).unwrap(), location);
+        assert_eq!(relative_path, filename);
         assert_eq!(expected_size, size);
         assert!(now - last_modified < 10_000);
 

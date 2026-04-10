@@ -38,7 +38,7 @@ use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::SchemaRef;
 use crate::snapshot::SnapshotRef;
-use crate::transaction::{CreateTable, Transaction};
+use crate::transaction::{CreateTable, PathMode, Transaction};
 use crate::utils::current_time_ms;
 use crate::DeltaResult;
 
@@ -173,6 +173,7 @@ impl CreateTableTransaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
+            path_mode: PathMode::default(),
             _state: PhantomData,
         })
     }
