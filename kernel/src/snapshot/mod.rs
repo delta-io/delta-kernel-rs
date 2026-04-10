@@ -246,15 +246,20 @@ impl Snapshot {
         if new_log_segment.checkpoint_version.is_some() {
             // We found a checkpoint in the new log segment, so build a fresh snapshot from it.
             // TODO(#2218): consider incremental P&M replay instead of full rebuild.
-            // Only lazy_crc is needed: the new_log_segment carries its own latest_crc_file. The
-            // lazy_crc may reference the old segment's CRC as a fallback, which is safe:
-            // read_protocol_metadata always validates CRC version against end_version before
-            // trusting its P&M, so log replay runs when the versions differ.
-            let (_, lazy_crc) = Self::resolve_crc(
+            // Pass the resolved lazy_crc so the full rebuild can reuse a loaded CRC if the
+            // version matches. If the new segment has no CRC file, resolve_crc falls back to
+            // the old segment's CRC, which is safe: read_protocol_metadata validates the CRC
+            // version against end_version and falls back to log replay when they differ.
+            let (crc_file, lazy_crc) = Self::resolve_crc(
                 &new_log_segment,
                 old_log_segment,
                 &existing_snapshot.lazy_crc,
             );
+            // Inject the resolved CRC file path so the rebuilt snapshot remembers it.
+            // Without this, if the CRC is below the new listing start (and thus not found
+            // by the listing), the rebuilt snapshot's log_segment.latest_crc_file would be
+            // None, causing future incremental updates to lose the CRC reference.
+            new_log_segment.listed.latest_crc_file = crc_file;
             let snapshot = Self::try_new_from_log_segment(
                 existing_snapshot.table_root().clone(),
                 new_log_segment,
@@ -366,7 +371,6 @@ impl Snapshot {
         let old_crc_file = old_log_segment.listed.latest_crc_file.clone();
         let crc_file = new_crc_file.or(old_crc_file);
         let crc_version = crc_file.as_ref().map(|f| f.version);
-        // Version equality is sufficient: Delta allows at most one CRC file per version.
         let lazy_crc = if crc_version == existing_lazy_crc.crc_version() {
             existing_lazy_crc.clone()
         } else {
