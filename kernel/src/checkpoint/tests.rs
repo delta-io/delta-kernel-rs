@@ -838,7 +838,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     // Checkpoint at version 2
     let snapshot_v2 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
     assert_eq!(snapshot_v2.version(), 2);
-    snapshot_v2.checkpoint(&engine)?;
+    snapshot_v2.checkpoint(&engine, None)?;
     let last_checkpoint = read_last_checkpoint_file(&store).await?;
     let size_in_bytes = last_checkpoint
         .get("sizeInBytes")
@@ -852,7 +852,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     let snapshot_v1 = Snapshot::builder_for(table_root)
         .at_version(1)
         .build(&engine)?;
-    snapshot_v1.checkpoint(&engine)?;
+    snapshot_v1.checkpoint(&engine, None)?;
     assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await
 }
 
