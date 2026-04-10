@@ -575,6 +575,8 @@ impl Snapshot {
     /// - If `file_actions_per_sidecar_hint` is `Some(0)`.
     ///
     /// [`CheckpointSpec`]: crate::checkpoint::CheckpointSpec
+    /// This method is for review only, and will be merged into snapshot::checkpoint() in the next PR:
+    /// https://github.com/delta-io/delta-kernel-rs/pull/2333
     #[instrument(parent = &self.span, name = "snap.checkpoint_placeholder", skip_all, err)]
     pub fn snapshot_checkpoint_placeholder(
         self: Arc<Self>,
