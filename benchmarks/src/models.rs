@@ -170,17 +170,31 @@ pub enum DataLayout {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum TimeTravel {
-    Version { version: u64 },
-    Timestamp { timestamp: String },
+    /// Snapshot/read version from the workload JSON. It is i64 so that negative values from
+    /// the test spec can be deserialized correctly; We rely on [`TimeTravel::as_version`] to reject
+    /// values below zero.
+    Version {
+        version: i64,
+    },
+    Timestamp {
+        timestamp: String,
+    },
 }
 
 impl TimeTravel {
-    /// Returns the version if this is version-based time travel.
+    /// Returns the version if this is version-based time travel and the version is non-negative.
     ///
-    /// Returns an error message for timestamp-based time travel, which is not yet supported.
+    /// Returns an error for negative versions or for timestamp-based time travel( which is not
+    /// yet supported).
     pub fn as_version(&self) -> Result<u64, &'static str> {
         match self {
-            TimeTravel::Version { version } => Ok(*version),
+            TimeTravel::Version { version } => {
+                if *version < 0 {
+                    Err("Only non-negative snapshot versions are supported")
+                } else {
+                    Ok(*version as u64)
+                }
+            }
             TimeTravel::Timestamp { .. } => Err("Timestamp-based time travel is not yet supported"),
         }
     }
@@ -490,10 +504,16 @@ mod tests {
         "snapshotConstruction",
         Some(7)
     )]
+    #[case(
+        r#"{"type": "snapshotConstruction", "version": -1}"#,
+        "snapshotConstruction",
+        Some(-1)
+    )]
+    #[case(r#"{"type": "read", "version": -1}"#, "read", Some(-1))]
     fn test_deserialize_spec(
         #[case] json: &str,
         #[case] expected_type: &str,
-        #[case] expected_version: Option<u64>,
+        #[case] expected_version: Option<i64>,
     ) {
         let spec: Spec = serde_json::from_str(json).expect("Failed to deserialize spec");
         assert_eq!(spec.as_str(), expected_type);
@@ -511,6 +531,15 @@ mod tests {
         };
 
         assert_eq!(version, expected_version);
+    }
+
+    #[test]
+    fn test_time_travel_as_version_rejects_negative() {
+        let tt = TimeTravel::Version { version: -1 };
+        assert_eq!(
+            tt.as_version(),
+            Err("Only non-negative snapshot versions are supported")
+        );
     }
 
     #[rstest]
