@@ -12,7 +12,7 @@ use crate::actions::{
 };
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
-use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointHintSummary};
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
@@ -110,9 +110,8 @@ pub(crate) struct LogSegment {
     pub end_version: Version,
     pub checkpoint_version: Option<Version>,
     pub log_root: Url,
-    /// Schema of the checkpoint file(s), if known from `_last_checkpoint` hint.
-    /// Used to determine if `stats_parsed` is available for data skipping.
-    pub checkpoint_schema: Option<SchemaRef>,
+    /// Metadata from the `_last_checkpoint` hint file.
+    pub last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
     /// The set of log files found during listing.
     pub listed: LogSegmentFiles,
 }
@@ -161,7 +160,7 @@ impl LogSegment {
             end_version: PRE_COMMIT_VERSION,
             checkpoint_version: None,
             log_root,
-            checkpoint_schema: None,
+            last_checkpoint_metadata: None,
             listed: LogSegmentFiles::default(),
         }
     }
@@ -171,7 +170,7 @@ impl LogSegment {
         mut listed_files: LogSegmentFiles,
         log_root: Url,
         end_version: Option<Version>,
-        checkpoint_schema: Option<SchemaRef>,
+        last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
     ) -> DeltaResult<Self> {
         validate_compaction_files(&listed_files.ascending_compaction_files)?;
         validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
@@ -201,7 +200,7 @@ impl LogSegment {
             end_version: effective_version,
             checkpoint_version,
             log_root,
-            checkpoint_schema,
+            last_checkpoint_metadata,
             listed: listed_files,
         };
 
@@ -293,10 +292,16 @@ impl LogSegment {
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        // Extract checkpoint schema from hint (already an Arc, no clone needed)
-        let checkpoint_schema = checkpoint_hint
-            .as_ref()
-            .and_then(|hint| hint.checkpoint_schema.clone());
+        // TODO(#2361): This is a bug -> checkpoint schema is being loaded from last_checkpoint
+        // hint file and stored in log_segment even if the checkpoint version from the hint file
+        // is newer than time_travel_version.
+        let last_checkpoint_metadata =
+            checkpoint_hint
+                .as_ref()
+                .map(|hint| LastCheckpointHintSummary {
+                    version: hint.version,
+                    schema: hint.checkpoint_schema.clone(),
+                });
 
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
@@ -336,7 +341,7 @@ impl LogSegment {
             listed_files,
             log_root,
             time_travel_version,
-            checkpoint_schema,
+            last_checkpoint_metadata,
         )
     }
 
@@ -497,11 +502,11 @@ impl LogSegment {
         // so a checkpoint at N covers everything and we can clear them entirely.
         new_log_segment.listed.ascending_commit_files.clear();
         new_log_segment.listed.ascending_compaction_files.clear();
-        // TODO(#839): Once CheckpointWriter exposes the output schema, thread it through
-        // here instead of None. Today the schema is computed inside checkpoint_data() but
-        // not returned. With None, the next scan will read the checkpoint parquet footer
+        // TODO(#839): Once CheckpointWriter exposes the output schema, build a LastCheckpointHintSummary
+        // and thread it through here instead of None. Today the schema is computed inside checkpoint_data()
+        // but not returned. With None, the next scan will read the checkpoint parquet footer
         // to determine the schema (e.g. whether stats_parsed or sidecar columns exist).
-        new_log_segment.checkpoint_schema = None;
+        new_log_segment.last_checkpoint_metadata = None;
         Ok(new_log_segment)
     }
 
@@ -712,7 +717,10 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
-        let hint_schema = self.checkpoint_schema.as_ref();
+        let hint_schema = self
+            .last_checkpoint_metadata
+            .as_ref()
+            .and_then(|m| m.schema.as_ref());
 
         // All parts of a multi-part checkpoint belong to the same table version and follow
         // the same V1 spec, so reading any one part's schema is sufficient.
@@ -986,7 +994,7 @@ impl LogSegment {
     /// Creates a pruned LogSegment for replay *after* a CRC at `start_v_exclusive`.
     ///
     /// The CRC covers protocol, metadata, and checkpoint state, so this segment drops
-    /// checkpoint files, CRC files, and checkpoint schema. Only commits and compactions
+    /// checkpoint files, CRC files, and last checkpoint metadata. Only commits and compactions
     /// in `(start_v_exclusive, end_version]` are retained.
     pub(crate) fn segment_after_crc(&self, start_v_exclusive: Version) -> Self {
         let (commits, compactions) =
@@ -995,7 +1003,7 @@ impl LogSegment {
             end_version: self.end_version,
             checkpoint_version: None,
             log_root: self.log_root.clone(),
-            checkpoint_schema: None,
+            last_checkpoint_metadata: None,
             listed: LogSegmentFiles {
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,
@@ -1010,7 +1018,7 @@ impl LogSegment {
     /// Creates a pruned LogSegment for replay *before* a CRC at `end_v_inclusive`.
     ///
     /// Used as fallback when the CRC at `end_v_inclusive` fails to load. Falls back to
-    /// checkpoint-based replay, so checkpoint files and schema are preserved. Only commits
+    /// checkpoint-based replay, so checkpoint files and metadata are preserved. Only commits
     /// and compactions in `(checkpoint_version, end_v_inclusive]` are retained. Fields not
     /// needed for this replay path (CRC file, latest commit file) are dropped.
     pub(crate) fn segment_through_crc(&self, end_v_inclusive: Version) -> Self {
@@ -1020,7 +1028,7 @@ impl LogSegment {
             end_version: self.end_version,
             checkpoint_version: self.checkpoint_version,
             log_root: self.log_root.clone(),
-            checkpoint_schema: self.checkpoint_schema.clone(),
+            last_checkpoint_metadata: self.last_checkpoint_metadata.clone(),
             listed: LogSegmentFiles {
                 ascending_commit_files: commits,
                 ascending_compaction_files: compactions,

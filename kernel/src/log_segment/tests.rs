@@ -19,6 +19,7 @@ use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::last_checkpoint_hint::LastCheckpointHintSummary;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
@@ -2697,7 +2698,7 @@ fn test_log_segment_contiguous_commit_files() {
     );
 }
 
-/// Test that checkpoint_schema from _last_checkpoint hint is properly propagated to LogSegment
+/// Test that last_checkpoint_metadata from _last_checkpoint hint is properly propagated to LogSegment
 #[tokio::test]
 async fn test_checkpoint_schema_propagation_from_hint() {
     use crate::schema::{StructField, StructType};
@@ -2739,9 +2740,12 @@ async fn test_checkpoint_schema_propagation_from_hint() {
     )
     .unwrap();
 
-    // Verify checkpoint_schema is propagated
-    assert!(log_segment.checkpoint_schema.is_some());
-    assert_eq!(log_segment.checkpoint_schema.unwrap(), sample_schema);
+    // Verify last_checkpoint_metadata is propagated with version and schema
+    let metadata = log_segment
+        .last_checkpoint_metadata
+        .expect("last_checkpoint_metadata should be Some");
+    assert_eq!(metadata.version, 5);
+    assert_eq!(metadata.schema.unwrap(), sample_schema);
 }
 
 /// Test get_file_actions_schema_and_sidecars with V1 parquet checkpoint using hint schema
@@ -2780,7 +2784,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
         },
         log_root,
         None,
-        Some(hint_schema.clone()), // V1 hint schema (no sidecar field)
+        Some(LastCheckpointHintSummary {
+            version: 1,
+            schema: Some(hint_schema.clone()),
+        }),
     )?;
 
     // With V1 hint, should use hint schema and avoid footer read
@@ -2861,7 +2868,10 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         },
         log_root,
         None,
-        use_hint.then(|| v1_schema.clone() as SchemaRef),
+        use_hint.then(|| LastCheckpointHintSummary {
+            version: 1,
+            schema: Some(v1_schema.clone()),
+        }),
     )?;
 
     let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
@@ -4002,7 +4012,7 @@ async fn test_try_new_with_checkpoint_sets_checkpoint_and_clears_commits(#[case]
     assert_eq!(result.listed.checkpoint_parts[0].version, 2);
     assert!(result.listed.ascending_commit_files.is_empty());
     assert!(result.listed.ascending_compaction_files.is_empty());
-    assert!(result.checkpoint_schema.is_none());
+    assert!(result.last_checkpoint_metadata.is_none());
 
     // latest_commit_file is preserved for ICT access even though commits are cleared
     assert_eq!(

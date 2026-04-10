@@ -16,6 +16,24 @@ use url::Url;
 /// the latest checkpoint without a full directory listing.
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
+/// A more minimal version of LastCheckpointHint, storing only the version and schema.
+///
+/// This is primarily used by LogSegment to store necessary information about the latest
+/// checkpoint without retaining all of the metadata fields. If this struct grows
+/// to be similar in size to LastCheckpointHint, we should just switch to using LastCheckpointHint
+/// directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[internal_api]
+pub(crate) struct LastCheckpointHintSummary {
+    /// Version of the latest known checkpoint, at the time the hint file was read.
+    pub version: Version,
+
+    /// Schema of the checkpoint file(s), as read from the `_last_checkpoint` hint.
+    /// Useful for determining if `stats_parsed` is available for data skipping.
+    /// `None` when the hint file did not include a `checkpointSchema` field.
+    pub schema: Option<SchemaRef>,
+}
+
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

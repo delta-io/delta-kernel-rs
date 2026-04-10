@@ -19,11 +19,12 @@ use crate::object_store::local::LocalFileSystem;
 use crate::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
+use crate::transaction::create_table::create_table;
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 use serde_json::{from_slice, json, Value};
 use tempfile::tempdir;
-use test_utils::delta_path_for_version;
+use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
 use url::Url;
 
 #[rstest::rstest]
@@ -777,6 +778,70 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
     assert_eq!(domain_value, Some("bar2".to_string()));
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer() -> DeltaResult<()>
+{
+    let (store, _) = new_in_memory_store();
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_task_executor(executor)
+        .build();
+
+    let table_root = Url::parse("memory:///")?;
+    let _ = create_table(
+        table_root.as_str(),
+        Arc::new(StructType::new_unchecked([StructField::nullable(
+            "value",
+            KernelDataType::INTEGER,
+        )])),
+        "test",
+    )
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?;
+
+    // Version 1
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        1,
+        actions_to_string(vec![TestAction::Add("file1.parquet".to_string())]),
+    )
+    .await
+    .map_err(|err| crate::Error::generic(err.to_string()))?;
+
+    // Version 2
+    add_commit(
+        table_root.as_str(),
+        store.as_ref(),
+        2,
+        actions_to_string(vec![TestAction::Add("file2.parquet".to_string())]),
+    )
+    .await
+    .map_err(|err| crate::Error::generic(err.to_string()))?;
+
+    // Checkpoint at version 2
+    let snapshot_v2 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    assert_eq!(snapshot_v2.version(), 2);
+    snapshot_v2.checkpoint(&engine)?;
+    let last_checkpoint = read_last_checkpoint_file(&store).await?;
+    let size_in_bytes = last_checkpoint
+        .get("sizeInBytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            crate::Error::generic("missing or invalid sizeInBytes in _last_checkpoint")
+        })?;
+    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await?;
+
+    // Time-travel to version 1 and writing a checkpoint should not override _last_checkpoint
+    let snapshot_v1 = Snapshot::builder_for(table_root)
+        .at_version(1)
+        .build(&engine)?;
+    snapshot_v1.checkpoint(&engine)?;
+    assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await
 }
 
 // TODO: Add test that checkpoint does not contain tombstoned domain metadata.
