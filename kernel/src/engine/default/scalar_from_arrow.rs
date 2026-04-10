@@ -524,4 +524,101 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unsupported Arrow type"), "got: {msg}");
     }
+
+    // ============================================================================
+    // Roundtrip: Arrow -> extract_scalar -> serialize -> parse_scalar -> compare
+    // ============================================================================
+    //
+    // Validates the full connector pipeline: Arrow array value is extracted as a Scalar,
+    // serialized to a partition value string, then parsed back. The result must match
+    // the originally extracted Scalar.
+
+    use crate::partition::serialization::serialize_partition_value;
+    use crate::schema::PrimitiveType;
+
+    /// Maps an Arrow data type to the corresponding kernel PrimitiveType for parse_scalar.
+    fn arrow_to_primitive_type(arrow_type: &ArrowDataType) -> PrimitiveType {
+        match arrow_type {
+            ArrowDataType::Int8 => PrimitiveType::Byte,
+            ArrowDataType::Int16 => PrimitiveType::Short,
+            ArrowDataType::Int32 => PrimitiveType::Integer,
+            ArrowDataType::Int64 => PrimitiveType::Long,
+            ArrowDataType::Float32 => PrimitiveType::Float,
+            ArrowDataType::Float64 => PrimitiveType::Double,
+            ArrowDataType::Boolean => PrimitiveType::Boolean,
+            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => PrimitiveType::String,
+            ArrowDataType::Date32 => PrimitiveType::Date,
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)) => PrimitiveType::Timestamp,
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => PrimitiveType::TimestampNtz,
+            ArrowDataType::Decimal128(p, s) => {
+                PrimitiveType::decimal(*p, *s as u8).expect("valid decimal")
+            }
+            ArrowDataType::Binary | ArrowDataType::LargeBinary => PrimitiveType::Binary,
+            other => panic!("unsupported Arrow type in test helper: {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::byte(Arc::new(Int8Array::from(vec![42i8])) as ArrayRef)]
+    #[case::byte_min(Arc::new(Int8Array::from(vec![i8::MIN])) as ArrayRef)]
+    #[case::short(Arc::new(Int16Array::from(vec![1234i16])) as ArrayRef)]
+    #[case::integer(Arc::new(Int32Array::from(vec![42])) as ArrayRef)]
+    #[case::integer_min(Arc::new(Int32Array::from(vec![i32::MIN])) as ArrayRef)]
+    #[case::long(Arc::new(Int64Array::from(vec![9_876_543_210i64])) as ArrayRef)]
+    #[case::long_max(Arc::new(Int64Array::from(vec![i64::MAX])) as ArrayRef)]
+    #[case::boolean_true(Arc::new(BooleanArray::from(vec![true])) as ArrayRef)]
+    #[case::boolean_false(Arc::new(BooleanArray::from(vec![false])) as ArrayRef)]
+    #[case::string(Arc::new(StringArray::from(vec!["hello world"])) as ArrayRef)]
+    #[case::string_special_chars(Arc::new(StringArray::from(vec!["US/East"])) as ArrayRef)]
+    #[case::date(Arc::new(Date32Array::from(vec![20178])) as ArrayRef)]
+    #[case::date_epoch(Arc::new(Date32Array::from(vec![0])) as ArrayRef)]
+    #[case::date_pre_epoch(Arc::new(Date32Array::from(vec![-1])) as ArrayRef)]
+    #[case::timestamp_tz(
+        Arc::new(TimestampMicrosecondArray::from(vec![1_743_436_200_000_000i64]).with_timezone("UTC")) as ArrayRef
+    )]
+    #[case::timestamp_ntz(Arc::new(TimestampMicrosecondArray::from(vec![1_743_436_200_123_456i64])) as ArrayRef)]
+    #[case::decimal(
+        Arc::new(Decimal128Array::from(vec![12345i128]).with_precision_and_scale(10, 2).unwrap()) as ArrayRef
+    )]
+    #[case::decimal_negative(
+        Arc::new(Decimal128Array::from(vec![-5i128]).with_precision_and_scale(3, 2).unwrap()) as ArrayRef
+    )]
+    #[case::binary_utf8(Arc::new(BinaryArray::from_vec(vec![b"Hello"])) as ArrayRef)]
+    #[case::large_utf8(Arc::new(LargeStringArray::from(vec!["large"])) as ArrayRef)]
+    #[case::float_normal(Arc::new(Float32Array::from(vec![1.25f32])) as ArrayRef)]
+    #[case::float_inf(Arc::new(Float32Array::from(vec![f32::INFINITY])) as ArrayRef)]
+    #[case::float_neg_inf(Arc::new(Float32Array::from(vec![f32::NEG_INFINITY])) as ArrayRef)]
+    #[case::double_normal(Arc::new(Float64Array::from(vec![99.99f64])) as ArrayRef)]
+    #[case::double_inf(Arc::new(Float64Array::from(vec![f64::INFINITY])) as ArrayRef)]
+    #[case::double_neg_inf(Arc::new(Float64Array::from(vec![f64::NEG_INFINITY])) as ArrayRef)]
+    fn test_roundtrip_extract_serialize_parse_returns_original_scalar(#[case] array: ArrayRef) {
+        let scalar = extract_scalar(array.as_ref(), 0).unwrap();
+        let serialized = serialize_partition_value(&scalar)
+            .unwrap()
+            .expect("non-null value should serialize to Some");
+        let ptype = arrow_to_primitive_type(array.data_type());
+        let parsed = ptype.parse_scalar(&serialized).unwrap();
+        assert_eq!(
+            scalar, parsed,
+            "roundtrip failed: serialized as '{serialized}'"
+        );
+    }
+
+    // NaN does not equal itself, so we verify the roundtrip preserves NaN-ness separately.
+    #[rstest]
+    #[case::float_nan(Arc::new(Float32Array::from(vec![f32::NAN])) as ArrayRef)]
+    #[case::double_nan(Arc::new(Float64Array::from(vec![f64::NAN])) as ArrayRef)]
+    fn test_roundtrip_nan_serialize_parse_returns_nan(#[case] array: ArrayRef) {
+        let scalar = extract_scalar(array.as_ref(), 0).unwrap();
+        let serialized = serialize_partition_value(&scalar)
+            .unwrap()
+            .expect("NaN should serialize to Some");
+        let ptype = arrow_to_primitive_type(array.data_type());
+        let parsed = ptype.parse_scalar(&serialized).unwrap();
+        match parsed {
+            Scalar::Float(v) => assert!(v.is_nan(), "expected NaN float"),
+            Scalar::Double(v) => assert!(v.is_nan(), "expected NaN double"),
+            other => panic!("expected float/double NaN, got {other:?}"),
+        }
+    }
 }
