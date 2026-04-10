@@ -361,15 +361,22 @@ impl Snapshot {
         );
 
         // Replay only the new commits (> existing_snapshot_version) for P&M, excluding the
-        // checkpoint. We do not pass the CRC here: the CRC may be older than
-        // existing_snapshot_version, and read_protocol_metadata_opt's CRC fallback assumes
-        // "no P&M in commits after the CRC means the CRC's P&M is current." That assumption
-        // breaks on this partial segment, which intentionally omits commits between the new
-        // checkpoint and existing_snapshot_version. A stale CRC fallback would overwrite
-        // P&M changes already captured in the existing snapshot.
-        let (new_metadata, new_protocol) = new_log_segment
-            .segment_after_crc(existing_snapshot_version)
-            .read_protocol_metadata_opt(engine, &LazyCrc::new(None))?;
+        // checkpoint. Skip a stale CRC (at or below existing_snapshot_version): its Case 2(b)
+        // fallback could return P&M that predates changes already in the existing snapshot.
+        let (new_metadata, new_protocol) = {
+            let no_crc = LazyCrc::new(None);
+            let crc: &LazyCrc = if lazy_crc
+                .crc_version()
+                .is_some_and(|v| v <= existing_snapshot_version)
+            {
+                &no_crc
+            } else {
+                &lazy_crc
+            };
+            new_log_segment
+                .segment_after_crc(existing_snapshot_version)
+                .read_protocol_metadata_opt(engine, crc)?
+        };
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
             new_metadata,
