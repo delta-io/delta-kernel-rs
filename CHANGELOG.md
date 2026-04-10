@@ -10,7 +10,7 @@
 1. Add partitioned variant to DataLayout enum ([#2145])
    - Adds `Partitioned` variant to `DataLayout` enum. Update match statements to handle the new variant.
 2. Add create many API to engine ([#2070])
-   - Adds `create_many` method to `ParquetHandler` trait. Implementors must add this method.
+   - Adds `create_many` method to `ParquetHandler` trait. Implementors must add this method. See the trait rustdocs for details.
 3. Rename uc-catalog and uc-client crates ([#2136])
    - `delta-kernel-uc-catalog` renamed to `delta-kernel-unity-catalog`. `delta-kernel-uc-client` renamed to `unity-catalog-delta-rest-client`. Update `Cargo.toml` dependencies accordingly.
 4. Checksum and checkpoint APIs return updated Snapshot ([#2182])
