@@ -116,9 +116,9 @@ pub(crate) struct LogSegment {
     /// Metadata from the `_last_checkpoint` hint file.
     ///
     /// Note: This is only populated if the hint file was read during creation of this
-    /// log segment. It may also point to a checkpoint version that is newer than the
-    /// end_version. Hence, callers should use explicit getters (such as `checkpoint_schema()`)
-    /// to avoid incorrect behavior.
+    /// log segment. The hint may describe a different checkpoint version than the one in this
+    /// segment. Callers should use explicit getters (such as [`Self::checkpoint_schema`]) rather
+    /// than reading this field directly.
     last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
 }
 
@@ -221,13 +221,14 @@ impl LogSegment {
     }
 
     /// Returns the checkpoint schema from the `_last_checkpoint` hint when it is safe to use for
-    /// this segment's checkpoint.
+    /// this segment's checkpoint parquet.
     ///
-    /// Returns `None` if there is no hint, if the hint omitted `checkpointSchema`, or if the
-    /// hint's checkpoint version is greater than [`Self::end_version`].
+    /// Returns `None` if there is no hint, if the hint omitted `checkpointSchema`, if this segment
+    /// has no checkpoint on disk, or if the hint's checkpoint version does not match this segment's
+    /// checkpoint version.
     pub(crate) fn checkpoint_schema(&self) -> Option<SchemaRef> {
         let m = self.last_checkpoint_metadata.as_ref()?;
-        if m.version > self.end_version {
+        if Some(m.version) != self.checkpoint_version {
             return None;
         }
         m.schema.clone()

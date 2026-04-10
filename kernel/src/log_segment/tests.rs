@@ -2744,71 +2744,21 @@ async fn test_checkpoint_schema_propagation_from_hint() {
     assert_eq!(log_segment.checkpoint_schema().unwrap(), sample_schema);
 }
 
-/// Test get_file_actions_schema_and_sidecars with V1 parquet checkpoint using hint schema
-/// This verifies the optimization path where hint schema is used directly (avoiding footer read)
+/// Checkpoint schema resolution uses the `_last_checkpoint` schema only when the hint's version
+/// matches [`LogSegment::checkpoint_version`]. Otherwise the parquet footer is read.
+#[rstest]
+#[case::hint_matches_checkpoint(1, true)]
+#[case::hint_newer_than_checkpoint(99, false)]
+#[case::hint_older_than_checkpoint(0, false)]
 #[tokio::test]
-async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> {
-    use crate::schema::{StructField, StructType};
-
+async fn test_get_file_actions_schema_v1_parquet_with_hint(
+    #[case] hint_version: u64,
+    #[case] expect_hint_schema_used: bool,
+) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
-    // Create a V1 checkpoint (without sidecar column)
-    let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
-    add_checkpoint_to_store(
-        &store,
-        add_batch_simple(v1_schema.clone()),
-        "00000000000000000001.checkpoint.parquet",
-    )
-    .await?;
-
-    let checkpoint_file = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
-        .to_string();
-
-    // Create a hint schema without sidecar field (indicates V1)
-    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable("add", StructType::new_unchecked([])),
-        StructField::nullable("remove", StructType::new_unchecked([])),
-    ]));
-
-    let log_segment = LogSegment::try_new(
-        LogSegmentFiles {
-            checkpoint_parts: vec![create_log_path(&checkpoint_file)],
-            latest_commit_file: Some(create_log_path("file:///00000000000000000002.json")),
-            ..Default::default()
-        },
-        log_root,
-        None,
-        Some(LastCheckpointHintSummary {
-            version: 1,
-            schema: Some(hint_schema.clone()),
-        }),
-    )?;
-
-    // With V1 hint, should use hint schema and avoid footer read
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
-    assert!(schema.is_some(), "Should return hint schema for V1");
-    assert_eq!(
-        schema.unwrap(),
-        hint_schema,
-        "Should use hint schema directly"
-    );
-    assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
-
-    Ok(())
-}
-
-/// Test get_file_actions_schema_and_sidecars where the `_last_checkpoint` hint
-/// claims a newer table version than [`LogSegment::end_version`] and carries a different schema.
-/// `get_file_actions_schema_and_sidecars` must not trust that schema and should read the real
-/// schema from the checkpoint parquet footer instead.
-#[tokio::test]
-async fn test_get_file_actions_schema_v1_parquet_stale_hint_uses_footer() -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
-
-    // Create a V1 checkpoint (without sidecar column)
+    // Build a checkpoint with an initial v1 schema
     let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
     add_checkpoint_to_store(
         &store,
@@ -2821,14 +2771,12 @@ async fn test_get_file_actions_schema_v1_parquet_stale_hint_uses_footer() -> Del
     let checkpoint_file = log_root.join(checkpoint_rel)?.to_string();
     let cp_size = get_file_size(&store, &format!("_delta_log/{checkpoint_rel}")).await;
 
-    // Hint is present but claims a future checkpoint version and a schema that does not match the
-    // parquet file. `end_version` must include the post-checkpoint commit so the segment matches
-    // a real snapshot layout (see `test_get_file_actions_schema_v1_parquet_with_hint`).
-    let newer_hint_schema: SchemaRef =
-        Arc::new(StructType::new_unchecked([StructField::nullable(
-            "metadata",
-            StructType::new_unchecked([]),
-        )]));
+    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "metadata",
+        StructType::new_unchecked([]),
+    )]));
+
+    // Build a commit that uses v1 checkpoint and a hint that describes a different schema
     let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
     let commit_v2 = create_log_path(&commit_v2_path);
     let log_segment = LogSegment::try_new(
@@ -2841,20 +2789,36 @@ async fn test_get_file_actions_schema_v1_parquet_stale_hint_uses_footer() -> Del
         log_root,
         None,
         Some(LastCheckpointHintSummary {
-            version: 99,
-            schema: Some(newer_hint_schema.clone()),
+            version: hint_version,
+            schema: Some(hint_schema.clone()),
         }),
     )?;
-    assert_eq!(log_segment.end_version, 2);
 
-    // Verify that the original v1_schema is returned
+    // Verify that checkpoint_schema only returns schema if it is valid
+    assert_eq!(log_segment.checkpoint_version, Some(1));
+    assert_eq!(log_segment.end_version, 2);
+    if expect_hint_schema_used {
+        assert_eq!(log_segment.checkpoint_schema().as_ref(), Some(&hint_schema));
+    } else {
+        assert!(
+            log_segment.checkpoint_schema().is_none(),
+            "hint should not have been returned since version does not match checkpoint_version"
+        );
+    }
+
+    // Verify that get_file_actions_schema_and_sidecars returns appropriate schema based on hint version
     let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
-    assert_eq!(
-        schema.unwrap(),
-        v1_schema,
-        "footer schema must match the checkpoint file, not the stale hint"
-    );
+    let schema = schema.expect("V1 checkpoint should yield a file actions schema");
+    if expect_hint_schema_used {
+        assert_eq!(schema, hint_schema, "should use hint when versions match");
+    } else {
+        assert_eq!(
+            schema, v1_schema,
+            "should read schema from parquet footer when versions mismatch"
+        );
+    }
     assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
+
     Ok(())
 }
 
