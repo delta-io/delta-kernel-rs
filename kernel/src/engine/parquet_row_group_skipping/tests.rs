@@ -1,9 +1,27 @@
 use super::*;
-use crate::expressions::{column_name, column_pred};
-use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
+use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
+use crate::expressions::{
+    column_expr, column_name, column_pred, Expression, OpaquePredicateOp, ScalarExpressionEvaluator,
+};
+use crate::kernel_predicates::{
+    DataSkippingPredicateEvaluator as _, DirectDataSkippingPredicateEvaluator,
+    DirectPredicateEvaluator, IndirectDataSkippingPredicateEvaluator,
+    KernelPredicateEvaluator as _,
+};
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
-use crate::Predicate;
+use crate::parquet::arrow::ArrowWriter;
+use crate::parquet::file::properties::WriterProperties;
+use crate::parquet::file::reader::FileReader;
+use crate::parquet::file::serialized_reader::SerializedFileReader;
+use crate::{DeltaResult, Predicate};
+use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fs::File;
+use std::sync::{Arc, LazyLock};
+
+/// Empty partition column set for tests that don't need partition columns.
+static NO_PARTITIONS: LazyLock<HashSet<String>> = LazyLock::new(HashSet::new);
 
 /// Performs an exhaustive set of reads against a specially crafted parquet file.
 ///
@@ -436,4 +454,766 @@ fn test_get_stat_values() {
                 .unwrap()
         )
     );
+}
+
+/// Writes a checkpoint-like parquet file with the given per-file statistics.
+///
+/// Schema: `add.stats_parsed.{minValues,maxValues,nullCount}.<col_name>` (INT64)
+///         + optionally `add.partitionValues_parsed.part_col` (STRING)
+///
+/// Each array index represents one data file row. Use `None` to simulate missing statistics.
+/// When `part_values` is `Some`, a `partitionValues_parsed.part_col` column is included.
+fn write_checkpoint_parquet(
+    min_values: &[Option<i64>],
+    max_values: &[Option<i64>],
+    null_counts: &[Option<i64>],
+    col_name: &str,
+    part_values: Option<&[Option<&str>]>,
+) -> tempfile::NamedTempFile {
+    let col_field = Arc::new(Field::new(col_name, ArrowDataType::Int64, true));
+    let min_values_field = Arc::new(Field::new(
+        "minValues",
+        ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
+        true,
+    ));
+    let max_values_field = Arc::new(Field::new(
+        "maxValues",
+        ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
+        true,
+    ));
+    let null_count_field = Arc::new(Field::new(
+        "nullCount",
+        ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
+        true,
+    ));
+    let stats_parsed_field = Arc::new(Field::new(
+        "stats_parsed",
+        ArrowDataType::Struct(Fields::from(vec![
+            min_values_field.clone(),
+            max_values_field.clone(),
+            null_count_field.clone(),
+        ])),
+        true,
+    ));
+
+    // Build the add struct fields: always include stats_parsed, optionally partitionValues_parsed.
+    let mut add_children: Vec<(Arc<Field>, Arc<dyn crate::arrow::array::Array>)> = vec![];
+
+    let min_x = Arc::new(Int64Array::from(min_values.to_vec()));
+    let max_x = Arc::new(Int64Array::from(max_values.to_vec()));
+    let null_count_x = Arc::new(Int64Array::from(null_counts.to_vec()));
+
+    let min_struct = StructArray::from(vec![(col_field.clone(), min_x as _)]);
+    let max_struct = StructArray::from(vec![(col_field.clone(), max_x as _)]);
+    let nc_struct = StructArray::from(vec![(col_field.clone(), null_count_x as _)]);
+    let stats_struct = StructArray::from(vec![
+        (min_values_field.clone(), Arc::new(min_struct) as _),
+        (max_values_field.clone(), Arc::new(max_struct) as _),
+        (null_count_field.clone(), Arc::new(nc_struct) as _),
+    ]);
+    add_children.push((stats_parsed_field.clone(), Arc::new(stats_struct) as _));
+
+    if let Some(part_values) = part_values {
+        let part_col_field = Arc::new(Field::new("part_col", ArrowDataType::Utf8, true));
+        let pv_parsed_field = Arc::new(Field::new(
+            "partitionValues_parsed",
+            ArrowDataType::Struct(Fields::from(vec![part_col_field.clone()])),
+            true,
+        ));
+        let part_col = Arc::new(StringArray::from(part_values.to_vec()));
+        let pv_struct = StructArray::from(vec![(part_col_field.clone(), part_col as _)]);
+        add_children.push((pv_parsed_field.clone(), Arc::new(pv_struct) as _));
+    }
+
+    let add_struct = StructArray::from(add_children.clone());
+    let add_fields: Fields = add_children.iter().map(|(f, _)| f.clone()).collect();
+    let add_field = Arc::new(Field::new("add", ArrowDataType::Struct(add_fields), true));
+    let schema = Arc::new(ArrowSchema::new(vec![add_field]));
+
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(add_struct)]).unwrap();
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let file = tmp.as_file().try_clone().unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    tmp
+}
+
+fn checkpoint_row_group_metadata(
+    tmp: &tempfile::NamedTempFile,
+) -> crate::parquet::file::metadata::ParquetMetaData {
+    let file = File::open(tmp.path()).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    reader.metadata().clone()
+}
+
+#[test]
+fn checkpoint_filter_returns_stats_when_no_nulls_in_stat_columns() {
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), Some(20)],
+        &[Some(100), Some(200)],
+        &[Some(2), Some(0)],
+        "x",
+        Some(&[Some("a"), Some("b")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    let predicate = Predicate::gt(column_name!("x"), Scalar::from(50i64));
+    let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
+
+    // All stat columns are non-null, so stats should be available.
+    // min(minValues.x) across rows = 10, max(maxValues.x) = 200
+    assert_eq!(
+        filter.get_min_stat(&column_name!("x"), &DataType::LONG),
+        Some(10i64.into())
+    );
+    assert_eq!(
+        filter.get_max_stat(&column_name!("x"), &DataType::LONG),
+        Some(200i64.into())
+    );
+    // max(nullCount.x) = 2 (conservative: at least one file has nulls)
+    assert_eq!(
+        filter.get_nullcount_stat(&column_name!("x")),
+        Some(2i64.into())
+    );
+    // Row count is None for checkpoint files (footer rowcount is not meaningful)
+    assert_eq!(filter.get_rowcount_stat(), None);
+}
+
+#[test]
+fn checkpoint_filter_returns_none_when_stat_column_has_nulls() {
+    // Row 1 has null stats (file missing statistics)
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), None, Some(20)],
+        &[Some(100), None, Some(200)],
+        &[Some(2), None, Some(0)],
+        "x",
+        Some(&[Some("a"), Some("b"), Some("b")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    let predicate = Predicate::gt(column_name!("x"), Scalar::from(50i64));
+    let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
+
+    // Stat columns have nulls (row 1), so footer aggregates are unreliable.
+    assert_eq!(
+        filter.get_min_stat(&column_name!("x"), &DataType::LONG),
+        None
+    );
+    assert_eq!(
+        filter.get_max_stat(&column_name!("x"), &DataType::LONG),
+        None
+    );
+    assert_eq!(filter.get_nullcount_stat(&column_name!("x")), None);
+}
+
+#[test]
+fn checkpoint_filter_partition_columns_always_available() {
+    // Row 1 has null stats, but partition values are always present.
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), None],
+        &[Some(100), None],
+        &[Some(2), None],
+        "x",
+        Some(&[Some("a"), Some("b")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    let partition_columns: HashSet<String> = ["part_col".to_string()].into();
+    let predicate = Predicate::and(
+        Predicate::gt(column_name!("x"), Scalar::from(50i64)),
+        Predicate::eq(column_name!("part_col"), Scalar::from("a")),
+    );
+    let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &partition_columns);
+
+    // Partition column stats should always be available (not null-guarded).
+    assert_eq!(
+        filter.get_min_stat(&column_name!("part_col"), &DataType::STRING),
+        Some("a".into())
+    );
+    assert_eq!(
+        filter.get_max_stat(&column_name!("part_col"), &DataType::STRING),
+        Some("b".into())
+    );
+
+    // Data column stats should still be None (stat columns have nulls).
+    assert_eq!(
+        filter.get_min_stat(&column_name!("x"), &DataType::LONG),
+        None
+    );
+}
+
+#[test]
+fn checkpoint_filter_apply_keeps_row_group_with_missing_stats() {
+    // Row 1 has null stats -- row group must NOT be pruned even though
+    // the non-null footer max is 100 < 500.
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), None],
+        &[Some(100), None],
+        &[Some(0), None],
+        "x",
+        Some(&[Some("a"), Some("b")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    let predicate = Predicate::gt(column_name!("x"), Scalar::from(500i64));
+    // Without null guarding, footer max=100 < 500 would falsely prune this row group.
+    assert!(CheckpointRowGroupFilter::apply(
+        row_group,
+        &predicate,
+        &NO_PARTITIONS
+    ));
+}
+
+#[test]
+fn checkpoint_filter_apply_prunes_row_group_with_all_stats_present() {
+    // All stats present, max=200 < 500, so row group can be pruned.
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), Some(20)],
+        &[Some(100), Some(200)],
+        &[Some(0), Some(0)],
+        "x",
+        Some(&[Some("a"), Some("b")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    let predicate = Predicate::gt(column_name!("x"), Scalar::from(500i64));
+    assert!(!CheckpointRowGroupFilter::apply(
+        row_group,
+        &predicate,
+        &NO_PARTITIONS
+    ));
+}
+
+#[test]
+fn checkpoint_filter_is_null_with_all_stats_present() {
+    // All nullCount values present. max(nullCount.x) = 5 > 0, so IS NULL should keep.
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), Some(20)],
+        &[Some(100), Some(200)],
+        &[Some(5), Some(0)],
+        "x",
+        Some(&[Some("a"), Some("b")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    // IS NULL(x): at least one file has nullCount > 0, so keep the row group.
+    let predicate = Predicate::is_null(column_name!("x"));
+    assert!(CheckpointRowGroupFilter::apply(
+        row_group,
+        &predicate,
+        &NO_PARTITIONS
+    ));
+}
+
+#[test]
+fn checkpoint_filter_is_null_all_zero_nullcounts() {
+    // All nullCount values are 0, so max(nullCount) = 0. The data skipping evaluator checks
+    // nullcount != 0 for IS NULL. Since nullcount == 0, no files have nulls and IS NULL prunes.
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), Some(20)],
+        &[Some(100), Some(200)],
+        &[Some(0), Some(0)],
+        "x",
+        Some(&[Some("a"), Some("b")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    let predicate = Predicate::is_null(column_name!("x"));
+    let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
+
+    // All nullCount entries are present (no nulls in the stat column), so the null guard
+    // passes. max(nullCount.x) = 0, meaning no files have nulls for x.
+    // The data skipping evaluator checks nullcount != 0 for IS NULL. Since nullcount == 0,
+    // it means no files have nulls, so IS NULL can prune.
+    let result = filter.eval_sql_where(&predicate);
+    // eval_sql_where returns Some(false) -> can skip. Semantics: no file has null values for x.
+    assert_eq!(result, Some(false));
+}
+
+#[test]
+fn checkpoint_filter_is_not_null_never_prunes() {
+    // IS NOT NULL can never prune checkpoint row groups because get_rowcount_stat() returns None.
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), Some(20)],
+        &[Some(100), Some(200)],
+        &[Some(5), Some(3)],
+        "x",
+        Some(&[Some("a"), Some("b")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    let predicate = Predicate::is_not_null(column_name!("x"));
+    let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
+
+    // IS NOT NULL checks nullcount != rowcount. Since rowcount is None, the evaluator
+    // short-circuits and returns None (can't decide), which always keeps the row group.
+    let result = filter.eval_sql_where(&predicate);
+    assert_eq!(result, None);
+}
+
+#[test]
+fn checkpoint_filter_timestamp_max_widened() {
+    // Timestamp max stats are widened by 999us to account for millisecond truncation
+    // in JSON-serialized stats (which stats_parsed inherits).
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), Some(20)],
+        &[Some(100), Some(200)],
+        &[Some(0), Some(0)],
+        "x",
+        Some(&[Some("a"), Some("b")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    let predicate = column_pred!("x");
+    let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
+
+    // max(maxValues.x) = 200, widened to 200 + 999 = 1199
+    assert_eq!(
+        filter.get_max_stat(&column_name!("x"), &DataType::TIMESTAMP),
+        Some(Scalar::Timestamp(1199))
+    );
+    assert_eq!(
+        filter.get_max_stat(&column_name!("x"), &DataType::TIMESTAMP_NTZ),
+        Some(Scalar::TimestampNtz(1199))
+    );
+
+    // Non-timestamp types are not widened.
+    assert_eq!(
+        filter.get_max_stat(&column_name!("x"), &DataType::LONG),
+        Some(200i64.into())
+    );
+}
+
+#[test]
+fn checkpoint_filter_unknown_column_returns_none() {
+    let tmp = write_checkpoint_parquet(
+        &[Some(10)],
+        &[Some(100)],
+        &[Some(0)],
+        "x",
+        Some(&[Some("a")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    // Predicate references column "y" which doesn't exist in the checkpoint.
+    let predicate = Predicate::gt(column_name!("y"), Scalar::from(50i64));
+    let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
+
+    assert_eq!(
+        filter.get_min_stat(&column_name!("y"), &DataType::LONG),
+        None
+    );
+    assert_eq!(
+        filter.get_max_stat(&column_name!("y"), &DataType::LONG),
+        None
+    );
+    assert_eq!(filter.get_nullcount_stat(&column_name!("y")), None);
+}
+
+#[test]
+fn checkpoint_filter_mixed_partition_and_data_predicate() {
+    // Row 1 has null data stats but valid partition values.
+    // Predicate: part_col = "a" AND x > 500
+    // The partition predicate should still work, but the data predicate can't prune.
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), None],
+        &[Some(100), None],
+        &[Some(0), None],
+        "x",
+        Some(&[Some("a"), Some("b")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    let partition_columns: HashSet<String> = ["part_col".to_string()].into();
+
+    // x > 500: data stats have nulls, can't prune. Overall AND can't prune.
+    let predicate = Predicate::and(
+        Predicate::eq(column_name!("part_col"), Scalar::from("a")),
+        Predicate::gt(column_name!("x"), Scalar::from(500i64)),
+    );
+    assert!(CheckpointRowGroupFilter::apply(
+        row_group,
+        &predicate,
+        &partition_columns
+    ));
+
+    // part_col = "c": partition stats show min="a", max="b", so "c" is out of range.
+    // But x stats are unreliable. AND("c" not in [a,b], x unknown) -- the partition arm
+    // is false, so the AND is false -> can prune!
+    let predicate = Predicate::and(
+        Predicate::eq(column_name!("part_col"), Scalar::from("c")),
+        Predicate::gt(column_name!("x"), Scalar::from(5i64)),
+    );
+    assert!(!CheckpointRowGroupFilter::apply(
+        row_group,
+        &predicate,
+        &partition_columns,
+    ));
+}
+
+/// An opaque "less than" predicate op that supports data skipping. Used to verify that
+/// `CheckpointRowGroupFilter` correctly delegates opaque predicates through the
+/// `ParquetStatsProvider` trait, where null guarding is applied by the provider.
+#[derive(Debug, PartialEq)]
+struct OpaqueLessThanOp;
+
+impl OpaquePredicateOp for OpaqueLessThanOp {
+    fn name(&self) -> &str {
+        "less_than"
+    }
+
+    fn eval_pred_scalar(
+        &self,
+        _eval_expr: &ScalarExpressionEvaluator<'_>,
+        _evaluator: &DirectPredicateEvaluator<'_>,
+        _exprs: &[Expression],
+        _inverted: bool,
+    ) -> DeltaResult<Option<bool>> {
+        unimplemented!("not needed for data skipping tests")
+    }
+
+    fn eval_as_data_skipping_predicate(
+        &self,
+        evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+        exprs: &[Expression],
+        inverted: bool,
+    ) -> Option<bool> {
+        let (col, val, ord) = match exprs {
+            [Expression::Column(col), Expression::Literal(val)] => (col, val, Ordering::Less),
+            [Expression::Literal(val), Expression::Column(col)] => (col, val, Ordering::Greater),
+            _ => return None,
+        };
+        evaluator.partial_cmp_min_stat(col, val, ord, inverted)
+    }
+
+    fn as_data_skipping_predicate(
+        &self,
+        _evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+        _exprs: &[Expression],
+        _inverted: bool,
+    ) -> Option<Predicate> {
+        unimplemented!("not needed for data skipping tests")
+    }
+}
+
+#[test]
+fn checkpoint_filter_opaque_predicate_with_null_guarded_stats() {
+    // All stats present: opaque predicate should participate in skipping.
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), Some(20)],
+        &[Some(100), Some(200)],
+        &[Some(0), Some(0)],
+        "x",
+        Some(&[Some("a"), Some("b")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    // OpaqueLessThanOp(x, 5) -> "x < 5". Data skipping checks min(x) < 5.
+    // min(x) = 10, so 10 < 5 is false -> can skip the row group.
+    let predicate = Predicate::opaque(
+        OpaqueLessThanOp,
+        vec![column_expr!("x"), Expression::literal(5i64)],
+    );
+    assert!(!CheckpointRowGroupFilter::apply(
+        row_group,
+        &predicate,
+        &NO_PARTITIONS
+    ));
+
+    // OpaqueLessThanOp(x, 50) -> "x < 50". min(x) = 10, so 10 < 50 is true -> keep.
+    let predicate = Predicate::opaque(
+        OpaqueLessThanOp,
+        vec![column_expr!("x"), Expression::literal(50i64)],
+    );
+    assert!(CheckpointRowGroupFilter::apply(
+        row_group,
+        &predicate,
+        &NO_PARTITIONS
+    ));
+}
+
+#[test]
+fn checkpoint_filter_opaque_predicate_with_missing_stats() {
+    // Row 1 has null stats: opaque predicate must not cause false pruning.
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), None],
+        &[Some(100), None],
+        &[Some(0), None],
+        "x",
+        Some(&[Some("a"), Some("b")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    // OpaqueLessThanOp(x, 5) -> "x < 5". The stat column has nulls, so the null-guarded
+    // provider returns None for min(x). The opaque op gets None and returns None,
+    // which means the row group cannot be pruned. This is the safe behavior.
+    let predicate = Predicate::opaque(
+        OpaqueLessThanOp,
+        vec![column_expr!("x"), Expression::literal(5i64)],
+    );
+    assert!(CheckpointRowGroupFilter::apply(
+        row_group,
+        &predicate,
+        &NO_PARTITIONS
+    ));
+}
+
+#[test]
+fn checkpoint_filter_physical_column_names_for_column_mapping() {
+    // Simulate column mapping: the physical column name in the checkpoint parquet file is
+    // "col-abc-123" (a UUID-style name), not the logical "x". The predicate is already in
+    // physical form by the time it reaches CheckpointRowGroupFilter.
+    let physical_name = "col-abc-123";
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), Some(20)],
+        &[Some(100), Some(200)],
+        &[Some(0), Some(0)],
+        physical_name,
+        None,
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    let col = ColumnName::new([physical_name]);
+
+    // Predicate uses the physical column name, matching the checkpoint parquet schema.
+    // physical_col > 500: max = 200 < 500 -> can prune.
+    let predicate = Predicate::gt(col.clone(), Scalar::from(500i64));
+    assert!(!CheckpointRowGroupFilter::apply(
+        row_group,
+        &predicate,
+        &NO_PARTITIONS
+    ));
+
+    // physical_col > 50: max = 200 > 50 -> keep.
+    let predicate = Predicate::gt(col.clone(), Scalar::from(50i64));
+    assert!(CheckpointRowGroupFilter::apply(
+        row_group,
+        &predicate,
+        &NO_PARTITIONS
+    ));
+
+    // Verify stats are accessible via the physical name.
+    let predicate = Predicate::gt(col.clone(), Scalar::from(0i64));
+    let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
+    assert_eq!(
+        filter.get_min_stat(&col, &DataType::LONG),
+        Some(10i64.into())
+    );
+    assert_eq!(
+        filter.get_max_stat(&col, &DataType::LONG),
+        Some(200i64.into())
+    );
+}
+
+#[test]
+fn checkpoint_filter_partition_nullcount_is_null() {
+    // All partition values are non-null, so footer nullcount for partitionValues_parsed.part_col
+    // is 0. extract_nullcount suppresses Some(0) due to the arrow-rs#9451 workaround, so
+    // get_nullcount_stat returns None. IS NULL on the partition column can't prune.
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), Some(20)],
+        &[Some(100), Some(200)],
+        &[Some(0), Some(0)],
+        "x",
+        Some(&[Some("a"), Some("b")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    let partition_columns: HashSet<String> = ["part_col".to_string()].into();
+    let predicate = Predicate::is_null(column_name!("part_col"));
+    let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &partition_columns);
+
+    // extract_nullcount never returns Some(0), so nullcount stat is None (can't decide).
+    assert_eq!(filter.get_nullcount_stat(&column_name!("part_col")), None);
+    // IS NULL evaluates to None (can't decide) -> row group is kept.
+    assert_eq!(filter.eval_sql_where(&predicate), None);
+}
+
+#[test]
+fn checkpoint_filter_multi_row_group_skipping() {
+    // Build schema: add.stats_parsed.{minValues,maxValues,nullCount}.x (INT64)
+    let col_field = Arc::new(Field::new("x", ArrowDataType::Int64, true));
+    let min_field = Arc::new(Field::new(
+        "minValues",
+        ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
+        true,
+    ));
+    let max_field = Arc::new(Field::new(
+        "maxValues",
+        ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
+        true,
+    ));
+    let nc_field = Arc::new(Field::new(
+        "nullCount",
+        ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
+        true,
+    ));
+    let stats_field = Arc::new(Field::new(
+        "stats_parsed",
+        ArrowDataType::Struct(Fields::from(vec![
+            min_field.clone(),
+            max_field.clone(),
+            nc_field.clone(),
+        ])),
+        true,
+    ));
+    let add_field = Arc::new(Field::new(
+        "add",
+        ArrowDataType::Struct(Fields::from(vec![stats_field.clone()])),
+        true,
+    ));
+    let schema = Arc::new(ArrowSchema::new(vec![add_field]));
+
+    let make_batch = |mins: &[i64], maxs: &[i64], ncs: &[i64]| {
+        let min_arr = Arc::new(Int64Array::from(mins.to_vec()));
+        let max_arr = Arc::new(Int64Array::from(maxs.to_vec()));
+        let nc_arr = Arc::new(Int64Array::from(ncs.to_vec()));
+        let min_s = StructArray::from(vec![(col_field.clone(), min_arr as _)]);
+        let max_s = StructArray::from(vec![(col_field.clone(), max_arr as _)]);
+        let nc_s = StructArray::from(vec![(col_field.clone(), nc_arr as _)]);
+        let stats_s = StructArray::from(vec![
+            (min_field.clone(), Arc::new(min_s) as _),
+            (max_field.clone(), Arc::new(max_s) as _),
+            (nc_field.clone(), Arc::new(nc_s) as _),
+        ]);
+        let add_s = StructArray::from(vec![(stats_field.clone(), Arc::new(stats_s) as _)]);
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(add_s)]).unwrap()
+    };
+
+    // RG0: x in [10, 100] -> pruned by "x > 500"
+    // RG1: x in [400, 600] -> kept by "x > 500"
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let file = tmp.as_file().try_clone().unwrap();
+    #[allow(deprecated)] // renamed to set_max_row_group_row_count in newer parquet versions
+    let props = WriterProperties::builder()
+        .set_max_row_group_size(2)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+    writer
+        .write(&make_batch(&[10, 20], &[50, 100], &[0, 0]))
+        .unwrap();
+    writer
+        .write(&make_batch(&[400, 450], &[500, 600], &[0, 0]))
+        .unwrap();
+    writer.close().unwrap();
+
+    let file = File::open(tmp.path()).unwrap();
+    let builder =
+        crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap();
+    assert_eq!(builder.metadata().num_row_groups(), 2);
+
+    let predicate = Predicate::gt(column_name!("x"), Scalar::from(500i64));
+    let builder = builder.with_checkpoint_row_group_filter(&predicate, &NO_PARTITIONS, None);
+
+    // Only RG1 (x in [400, 600]) survives: max(x) = 600 > 500.
+    let reader = builder.build().unwrap();
+    let batches: Vec<_> = reader.into_iter().collect::<Result<_, _>>().unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+}
+
+#[test]
+fn checkpoint_filter_nested_struct_column_stats() {
+    // Build schema: add.stats_parsed.{minValues,maxValues,nullCount}.a.b (INT64)
+    // This simulates a nested struct column `a` with field `b`.
+    let b_field = Arc::new(Field::new("b", ArrowDataType::Int64, true));
+    let a_field = Arc::new(Field::new(
+        "a",
+        ArrowDataType::Struct(Fields::from(vec![b_field.clone()])),
+        true,
+    ));
+    let min_field = Arc::new(Field::new(
+        "minValues",
+        ArrowDataType::Struct(Fields::from(vec![a_field.clone()])),
+        true,
+    ));
+    let max_field = Arc::new(Field::new(
+        "maxValues",
+        ArrowDataType::Struct(Fields::from(vec![a_field.clone()])),
+        true,
+    ));
+    let nc_field = Arc::new(Field::new(
+        "nullCount",
+        ArrowDataType::Struct(Fields::from(vec![a_field.clone()])),
+        true,
+    ));
+    let stats_field = Arc::new(Field::new(
+        "stats_parsed",
+        ArrowDataType::Struct(Fields::from(vec![
+            min_field.clone(),
+            max_field.clone(),
+            nc_field.clone(),
+        ])),
+        true,
+    ));
+    let add_field = Arc::new(Field::new(
+        "add",
+        ArrowDataType::Struct(Fields::from(vec![stats_field.clone()])),
+        true,
+    ));
+    let schema = Arc::new(ArrowSchema::new(vec![add_field]));
+
+    let min_b = Arc::new(Int64Array::from(vec![Some(10), Some(20)]));
+    let max_b = Arc::new(Int64Array::from(vec![Some(100), Some(200)]));
+    let nc_b = Arc::new(Int64Array::from(vec![Some(0), Some(0)]));
+
+    let min_a = StructArray::from(vec![(b_field.clone(), min_b as _)]);
+    let max_a = StructArray::from(vec![(b_field.clone(), max_b as _)]);
+    let nc_a = StructArray::from(vec![(b_field.clone(), nc_b as _)]);
+    let min_s = StructArray::from(vec![(a_field.clone(), Arc::new(min_a) as _)]);
+    let max_s = StructArray::from(vec![(a_field.clone(), Arc::new(max_a) as _)]);
+    let nc_s = StructArray::from(vec![(a_field.clone(), Arc::new(nc_a) as _)]);
+    let stats_s = StructArray::from(vec![
+        (min_field.clone(), Arc::new(min_s) as _),
+        (max_field.clone(), Arc::new(max_s) as _),
+        (nc_field.clone(), Arc::new(nc_s) as _),
+    ]);
+    let add_s = StructArray::from(vec![(stats_field.clone(), Arc::new(stats_s) as _)]);
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(add_s)]).unwrap();
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let file = tmp.as_file().try_clone().unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+
+    let col = ColumnName::new(["a", "b"]);
+    let predicate = Predicate::gt(col.clone(), Scalar::from(500i64));
+    let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
+
+    assert_eq!(
+        filter.get_min_stat(&col, &DataType::LONG),
+        Some(10i64.into())
+    );
+    assert_eq!(
+        filter.get_max_stat(&col, &DataType::LONG),
+        Some(200i64.into())
+    );
+    // max(x) = 200 < 500 -> can prune.
+    assert!(!CheckpointRowGroupFilter::apply(
+        row_group,
+        &predicate,
+        &NO_PARTITIONS
+    ));
 }
