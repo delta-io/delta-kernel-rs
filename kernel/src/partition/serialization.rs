@@ -12,8 +12,6 @@
 //!
 //! [`Scalar`]: crate::expressions::Scalar
 
-#![allow(dead_code)] // callers are in a later PR in the stack
-
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::expressions::{DecimalData, Scalar};
