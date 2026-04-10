@@ -87,6 +87,7 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
             props.materialized_row_commit_version_column_name = Some(v.to_string())
         }
         ROW_TRACKING_SUSPENDED => props.row_tracking_suspended = Some(parse_bool(v)?),
+        PARQUET_FORMAT_VERSION => props.parquet_format_version = Some(v.to_string()),
         ENABLE_IN_COMMIT_TIMESTAMPS => props.enable_in_commit_timestamps = Some(parse_bool(v)?),
         IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION => {
             props.in_commit_timestamp_enablement_version = Some(parse_non_negative(v)?)
