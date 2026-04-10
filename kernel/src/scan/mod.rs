@@ -10,11 +10,6 @@ use itertools::Itertools;
 use tracing::{debug, info};
 use url::Url;
 
-use crate::metrics::MetricId;
-use crate::scan::metrics::ScanMetrics;
-use crate::utils::IteratorExt;
-
-use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -28,12 +23,13 @@ use crate::kernel_predicates::{
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::ScanType;
+use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
 use crate::scan::log_replay::ScanLogReplayProcessor;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
 };
+use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
@@ -41,6 +37,7 @@ use crate::schema::{
 };
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{ExpressionTransform, SchemaTransform};
+use crate::utils::IteratorExt;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 use self::log_replay::scan_action_iter;
@@ -404,19 +401,6 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     }
 }
 
-/// Prefixes all column references in a predicate with a fixed path.
-/// Transforms data-skipping predicates (e.g., `minValues.x > 100`) into
-/// checkpoint/sidecar-compatible predicates (e.g., `add.stats_parsed.minValues.x > 100`).
-struct PrefixColumns {
-    prefix: ColumnName,
-}
-
-impl<'a> ExpressionTransform<'a> for PrefixColumns {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        Some(Cow::Owned(self.prefix.join(name)))
-    }
-}
-
 struct ApplyColumnMappings {
     column_mappings: HashMap<ColumnName, ColumnName>,
 }
@@ -577,12 +561,6 @@ impl Scan {
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
-    ///
-    /// Reports metrics: [`MetricEvent::ScanMetadataCompleted`] when the returned iterator is
-    /// fully exhausted.
-    ///
-    /// [`MetricEvent::ScanMetadataCompleted`]: crate::metrics::MetricEvent::ScanMetadataCompleted
-    ///
     /// Each item in the returned iterator is a struct of:
     /// - `Box<dyn EngineData>`: Data in engine format, where each row represents a file to be
     ///   scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
@@ -734,11 +712,18 @@ impl Scan {
                 self.build_actions_meta_predicate(),
             )
         };
+        let partition_columns = self
+            .snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns()
+            .to_vec();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
             meta_predicate,
+            partition_columns,
             self.state_info
                 .physical_stats_schema
                 .as_ref()
@@ -811,6 +796,12 @@ impl Scan {
                 self.build_actions_meta_predicate(),
             )
         };
+        let partition_columns = self
+            .snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns()
+            .to_vec();
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
@@ -818,6 +809,7 @@ impl Scan {
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
                 meta_predicate,
+                partition_columns,
                 self.state_info
                     .physical_stats_schema
                     .as_ref()
@@ -829,40 +821,17 @@ impl Scan {
             )
     }
 
-    /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
+    /// Builds a predicate for checkpoint row group skipping. Returns the original physical
+    /// predicate (with bare column names), which the [`CheckpointRowGroupFilter`] will evaluate
+    /// directly against checkpoint footer statistics.
     ///
-    /// The scan predicate is first transformed into a data-skipping form with IS NULL guards
-    /// (e.g., `x > 100` becomes `OR(maxValues.x IS NULL, maxValues.x > 100)`), then column
-    /// references are prefixed with `add.stats_parsed` to match the physical column layout
-    /// of checkpoint/sidecar files. The parquet reader's row group filter can then use
-    /// parquet-level statistics on these nested columns to skip entire row groups that cannot
-    /// contain matching files.
-    ///
-    /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
-    /// values. Without them, row groups containing files with missing stats (null stat columns)
-    /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
-    ///
-    /// Returns `None` if the scan has no predicate, no stats schema, or if the predicate is a
-    /// bare unsupported expression (e.g. column-column comparison). Junctions with unsupported
-    /// arms replace them with TRUE to conservatively prevent pruning.
+    /// Returns `None` if the scan has no predicate or no stats schema.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
         };
         self.state_info.physical_stats_schema.as_ref()?;
-
-        let partition_columns = self
-            .snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns();
-        let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
-
-        let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add", "stats_parsed"]),
-        };
-        let prefixed = prefixer.transform_pred(&skipping_pred)?;
-        Some(Arc::new(prefixed.into_owned()))
+        Some(predicate.clone())
     }
 
     /// Start a parallel scan metadata processing for the table.

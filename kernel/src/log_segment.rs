@@ -1,5 +1,6 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
+use std::collections::HashSet;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
@@ -598,12 +599,14 @@ impl LogSegment {
     /// IS NOT NULL predicates are automatically derived from `checkpoint_read_schema` and combined
     /// (AND) with `meta_predicate`, so callers only need to supply query-based skipping predicates.
     #[internal_api]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
+        partition_columns: Vec<String>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
     ) -> DeltaResult<
@@ -625,6 +628,7 @@ impl LogSegment {
             engine,
             checkpoint_read_schema,
             effective_predicate,
+            partition_columns,
             stats_schema,
             partition_schema,
         )?;
@@ -649,6 +653,7 @@ impl LogSegment {
             action_schema.clone(),
             action_schema,
             None,
+            vec![],
             None,
             None,
         )?;
@@ -800,6 +805,7 @@ impl LogSegment {
         engine: &dyn Engine,
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
+        partition_columns: Vec<String>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
     ) -> DeltaResult<
@@ -898,6 +904,7 @@ impl LogSegment {
         // but it was removed to avoid unnecessary coupling. This is a concrete case
         // where it *could* have been useful, but for now, we're keeping them separate.
         // If similar patterns start appearing elsewhere, we should reconsider that decision.
+        let partition_columns: HashSet<String> = partition_columns.into_iter().collect();
         let actions = match self.listed.checkpoint_parts.first() {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
                 engine.json_handler().read_json_files(
@@ -907,10 +914,11 @@ impl LogSegment {
                 )?
             }
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
-                .read_parquet_files(
+                .read_checkpoint_parquet_files(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
+                    partition_columns.clone(),
                 )?,
             Some(parsed_log_path) => {
                 return Err(Error::generic(format!(
@@ -928,10 +936,11 @@ impl LogSegment {
         // Both checkpoint and sidecar parquet files share the same `add.stats_parsed.*` column
         // layout, so we reuse the same predicate for row group skipping.
         let sidecar_batches = if !sidecar_files.is_empty() {
-            parquet_handler.read_parquet_files(
+            parquet_handler.read_checkpoint_parquet_files(
                 &sidecar_files,
                 augmented_checkpoint_read_schema.clone(),
                 meta_predicate,
+                partition_columns,
             )?
         } else {
             Box::new(std::iter::empty())
