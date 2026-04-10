@@ -32,6 +32,7 @@ use crate::arrow::array::types::{
 };
 use crate::arrow::array::Array;
 use crate::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
+use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::expressions::Scalar;
 use crate::schema::DataType;
 use crate::{DeltaResult, Error};
@@ -40,12 +41,12 @@ use crate::{DeltaResult, Error};
 ///
 /// Returns `Scalar::Null(data_type)` if the value at `row_idx` is null. Returns an error
 /// for unsupported Arrow data types (e.g., nested types that cannot be partition columns).
-///
-/// This is useful for connectors that partition data using Arrow arrays and need typed
-/// partition values for the write path (e.g., partitioned writes).
 pub fn extract_scalar(array: &dyn Array, row_idx: usize) -> DeltaResult<Scalar> {
     if array.is_null(row_idx) {
-        return Ok(Scalar::Null(arrow_type_to_kernel_type(array.data_type())?));
+        let kernel_type = DataType::try_from_arrow(array.data_type()).map_err(|e| {
+            Error::generic(format!("unsupported Arrow type for partition column: {e}"))
+        })?;
+        return Ok(Scalar::Null(kernel_type));
     }
     match array.data_type() {
         ArrowDataType::Int8 => Ok(Scalar::Byte(
@@ -102,29 +103,6 @@ pub fn extract_scalar(array: &dyn Array, row_idx: usize) -> DeltaResult<Scalar> 
     }
 }
 
-/// Converts an Arrow [`ArrowDataType`] to a kernel [`DataType`] for null value construction.
-/// Only supports primitive types valid for partition columns.
-fn arrow_type_to_kernel_type(arrow_type: &ArrowDataType) -> DeltaResult<DataType> {
-    match arrow_type {
-        ArrowDataType::Int8 => Ok(DataType::BYTE),
-        ArrowDataType::Int16 => Ok(DataType::SHORT),
-        ArrowDataType::Int32 => Ok(DataType::INTEGER),
-        ArrowDataType::Int64 => Ok(DataType::LONG),
-        ArrowDataType::Float32 => Ok(DataType::FLOAT),
-        ArrowDataType::Float64 => Ok(DataType::DOUBLE),
-        ArrowDataType::Boolean => Ok(DataType::BOOLEAN),
-        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Ok(DataType::STRING),
-        ArrowDataType::Date32 => Ok(DataType::DATE),
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)) => Ok(DataType::TIMESTAMP),
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => Ok(DataType::TIMESTAMP_NTZ),
-        ArrowDataType::Decimal128(p, s) => DataType::decimal(*p, *s as u8),
-        ArrowDataType::Binary | ArrowDataType::LargeBinary => Ok(DataType::BINARY),
-        other => Err(Error::generic(format!(
-            "unsupported Arrow type for partition column: {other:?}"
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +112,8 @@ mod tests {
         LargeBinaryArray, LargeStringArray, StringArray, StructArray, TimestampMicrosecondArray,
     };
     use crate::arrow::datatypes::{Field, Fields};
+
+    use crate::schema::PrimitiveType;
 
     use rstest::rstest;
     use std::sync::Arc;
@@ -447,79 +427,52 @@ mod tests {
     // extract_scalar: unsupported types return error
     // ============================================================================
 
+    // Null values in complex-type arrays return Scalar::Null with the mapped kernel type
+    // (TryFromArrow succeeds for struct/list/map). The unsupported-type error only triggers
+    // for non-null values that the match statement cannot extract.
+
     #[test]
-    fn test_extract_scalar_struct_type_returns_error() {
+    fn test_extract_scalar_null_struct_returns_typed_null() {
         let fields = Fields::from(vec![Field::new("a", ArrowDataType::Int32, false)]);
         let array = StructArray::new_null(fields, 1);
-        let result = extract_scalar(&array, 0);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("unsupported Arrow type"), "got: {msg}");
+        let result = extract_scalar(&array, 0).unwrap();
+        assert!(result.is_null());
     }
 
     #[test]
-    fn test_extract_scalar_list_type_returns_error() {
+    fn test_extract_scalar_null_list_returns_typed_null() {
         let list_type =
             ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Int32, true)));
         let array = new_null_array(&list_type, 1);
-        let result = extract_scalar(array.as_ref(), 0);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("unsupported Arrow type"), "got: {msg}");
-    }
-
-    // ============================================================================
-    // arrow_type_to_kernel_type: verify mapping for all supported types
-    // ============================================================================
-
-    #[rstest]
-    #[case::int8(ArrowDataType::Int8, DataType::BYTE)]
-    #[case::int16(ArrowDataType::Int16, DataType::SHORT)]
-    #[case::int32(ArrowDataType::Int32, DataType::INTEGER)]
-    #[case::int64(ArrowDataType::Int64, DataType::LONG)]
-    #[case::float32(ArrowDataType::Float32, DataType::FLOAT)]
-    #[case::float64(ArrowDataType::Float64, DataType::DOUBLE)]
-    #[case::boolean(ArrowDataType::Boolean, DataType::BOOLEAN)]
-    #[case::utf8(ArrowDataType::Utf8, DataType::STRING)]
-    #[case::large_utf8(ArrowDataType::LargeUtf8, DataType::STRING)]
-    #[case::date32(ArrowDataType::Date32, DataType::DATE)]
-    #[case::timestamp_tz(
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        DataType::TIMESTAMP
-    )]
-    #[case::timestamp_ntz(
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
-        DataType::TIMESTAMP_NTZ
-    )]
-    #[case::binary(ArrowDataType::Binary, DataType::BINARY)]
-    #[case::large_binary(ArrowDataType::LargeBinary, DataType::BINARY)]
-    fn test_arrow_type_to_kernel_type_returns_correct_mapping(
-        #[case] arrow_type: ArrowDataType,
-        #[case] expected: DataType,
-    ) {
-        assert_eq!(arrow_type_to_kernel_type(&arrow_type).unwrap(), expected);
+        let result = extract_scalar(array.as_ref(), 0).unwrap();
+        assert!(result.is_null());
     }
 
     #[test]
-    fn test_arrow_type_to_kernel_type_decimal_preserves_precision_and_scale() {
-        assert_eq!(
-            arrow_type_to_kernel_type(&ArrowDataType::Decimal128(18, 5)).unwrap(),
-            DataType::decimal(18, 5).unwrap()
+    fn test_extract_scalar_null_map_returns_typed_null() {
+        let map_type = ArrowDataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                ArrowDataType::Struct(Fields::from(vec![
+                    Field::new("key", ArrowDataType::Utf8, false),
+                    Field::new("value", ArrowDataType::Int32, true),
+                ])),
+                false,
+            )),
+            false,
         );
+        let array = new_null_array(&map_type, 1);
+        let result = extract_scalar(array.as_ref(), 0).unwrap();
+        assert!(result.is_null());
     }
 
-    #[rstest]
-    #[case::struct_type(ArrowDataType::Struct(Fields::empty()))]
-    #[case::list_type(ArrowDataType::List(Arc::new(Field::new(
-        "item",
-        ArrowDataType::Int32,
-        true
-    ))))]
-    #[case::timestamp_seconds(ArrowDataType::Timestamp(TimeUnit::Second, None))]
-    #[case::timestamp_millis(ArrowDataType::Timestamp(TimeUnit::Millisecond, None))]
-    #[case::timestamp_nanos(ArrowDataType::Timestamp(TimeUnit::Nanosecond, None))]
-    fn test_arrow_type_to_kernel_type_unsupported_returns_error(#[case] arrow_type: ArrowDataType) {
-        let result = arrow_type_to_kernel_type(&arrow_type);
+    #[test]
+    fn test_extract_scalar_non_null_struct_returns_error() {
+        use crate::arrow::array::Int32Array;
+        let int_array = Arc::new(Int32Array::from(vec![42]));
+        let fields = Fields::from(vec![Field::new("a", ArrowDataType::Int32, false)]);
+        let array = StructArray::try_new(fields, vec![int_array], None).unwrap();
+        let result = extract_scalar(&array, 0);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unsupported Arrow type"), "got: {msg}");
@@ -534,28 +487,14 @@ mod tests {
     // the originally extracted Scalar.
 
     use crate::partition::serialization::serialize_partition_value;
-    use crate::schema::PrimitiveType;
 
-    /// Maps an Arrow data type to the corresponding kernel PrimitiveType for parse_scalar.
+    /// Converts an Arrow data type to its kernel PrimitiveType for roundtrip testing.
     fn arrow_to_primitive_type(arrow_type: &ArrowDataType) -> PrimitiveType {
-        match arrow_type {
-            ArrowDataType::Int8 => PrimitiveType::Byte,
-            ArrowDataType::Int16 => PrimitiveType::Short,
-            ArrowDataType::Int32 => PrimitiveType::Integer,
-            ArrowDataType::Int64 => PrimitiveType::Long,
-            ArrowDataType::Float32 => PrimitiveType::Float,
-            ArrowDataType::Float64 => PrimitiveType::Double,
-            ArrowDataType::Boolean => PrimitiveType::Boolean,
-            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => PrimitiveType::String,
-            ArrowDataType::Date32 => PrimitiveType::Date,
-            ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)) => PrimitiveType::Timestamp,
-            ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => PrimitiveType::TimestampNtz,
-            ArrowDataType::Decimal128(p, s) => {
-                PrimitiveType::decimal(*p, *s as u8).expect("valid decimal")
-            }
-            ArrowDataType::Binary | ArrowDataType::LargeBinary => PrimitiveType::Binary,
-            other => panic!("unsupported Arrow type in test helper: {other:?}"),
-        }
+        DataType::try_from_arrow(arrow_type)
+            .expect("supported Arrow type")
+            .as_primitive_opt()
+            .expect("expected primitive type")
+            .clone()
     }
 
     #[rstest]
