@@ -1523,7 +1523,7 @@ mod scan_metadata_completed_tests {
 
     use rstest::rstest;
 
-    use crate::engine::default::DefaultEngineBuilder;
+    use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
     use crate::metrics::MetricEvent;
     use crate::object_store::local::LocalFileSystem;
@@ -1535,9 +1535,8 @@ mod scan_metadata_completed_tests {
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
         let engine = Arc::new(
-            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
-                .with_metrics_reporter(reporter.clone())
-                .build(),
+            SyncEngine::new_with_store(Arc::new(LocalFileSystem::new()))
+                .with_metrics_reporter(reporter.clone()),
         );
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let mut builder = snapshot.scan_builder();
@@ -1611,9 +1610,8 @@ mod scan_metadata_completed_tests {
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
         let engine = Arc::new(
-            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
-                .with_metrics_reporter(reporter.clone())
-                .build(),
+            SyncEngine::new_with_store(Arc::new(LocalFileSystem::new()))
+                .with_metrics_reporter(reporter.clone()),
         );
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let scan = snapshot.scan_builder().build().unwrap();

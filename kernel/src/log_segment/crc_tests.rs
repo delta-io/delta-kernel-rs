@@ -10,8 +10,7 @@ use serde_json::json;
 use url::Url;
 
 use crate::actions::{CommitInfo, Format, Metadata, Protocol};
-use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
 use crate::Snapshot;
@@ -249,7 +248,7 @@ impl CrcReadTest {
     async fn build(self) -> BuiltCrcTest {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///").unwrap();
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         for op in self.ops {
             match op {
@@ -317,7 +316,7 @@ impl CrcReadTest {
 }
 
 struct BuiltCrcTest {
-    engine: DefaultEngine<TokioBackgroundExecutor>,
+    engine: SyncEngine,
     url: Url,
 }
 
