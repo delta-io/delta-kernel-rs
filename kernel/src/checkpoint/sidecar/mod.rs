@@ -10,12 +10,12 @@ use crate::{
 };
 
 /// Selects a subset of columns from a batch and filters out all-null rows.
-struct ColumnPicker {
+struct NonNullColumnPicker {
     projector: Arc<dyn ExpressionEvaluator>,
     null_row_filter: Arc<dyn PredicateEvaluator>,
 }
 
-impl ColumnPicker {
+impl NonNullColumnPicker {
     fn pick(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         let projected = self.projector.evaluate(batch)?;
         filter_by_predicate(self.null_row_filter.as_ref(), projected)
@@ -40,20 +40,23 @@ impl ColumnPicker {
 /// | add    | remove | protocol | metadata | txn  |
 /// |--------|--------|----------|----------|------|
 /// | <add1> | null   | null     | null     | null |   // file action row
-/// | null   | null   | <proto>  | <meta>   | null |   // non-file action row
+/// | null   | null   | <proto>  | null     | null |   // non-file action row
+/// | null   | null   | null     | <meta>   | null |   // non-file action row
 /// ```
 ///
 /// is split into:
-/// - file batch:     `[add: <add1>, remove: null]`
-/// - non-file batch: `[add: null, remove: null, protocol: <proto>, metadata: <meta>, txn: null]`
+/// - file batch: `[add: <add1>, remove: null]`
+/// - non-file batches:
+///   - `[add: null, remove: null, protocol: <prot>, metadata: null, txn: null]`
+///   - `[add: null, remove: null, protocol: null, metadata: <meta>, txn: null]`
 pub(super) struct SidecarSplitter {
     checkpoint_data_iter: ActionReconciliationIterator,
     /// Projects to add/remove columns and filters out rows where both are null.
-    file_actions_picker: ColumnPicker,
+    file_actions_picker: NonNullColumnPicker,
     /// Nulls out add/remove columns and filters out rows where all remaining columns are null.
-    non_file_actions_picker: ColumnPicker,
+    non_file_actions_picker: NonNullColumnPicker,
     /// Accumulated non-file-action batches (protocol, metadata, txn, etc.).
-    non_file_batches: Vec<Box<dyn EngineData>>,
+    non_file_action_batches: Vec<Box<dyn EngineData>>,
     /// Set to `true` when the inner `checkpoint_data_iter` is exhausted.
     exhausted: bool,
 }
@@ -87,7 +90,7 @@ impl SidecarSplitter {
             StructType::try_new([add_field.clone(), remove_field.clone()])?.into();
 
         // Sidecar projector: select only add/remove columns.
-        let file_action = eval_handler.new_expression_evaluator(
+        let file_action_projector = eval_handler.new_expression_evaluator(
             checkpoint_data_schema.clone(),
             Arc::new(Expression::struct_from([
                 Expression::column([ADD_NAME]),
@@ -105,10 +108,9 @@ impl SidecarSplitter {
             )),
         )?;
 
-        // Main checkpoint projector: null out add/remove so file actions only appear in
-        // the sidecar. Output schema is the same as the input since add/remove are
-        // already nullable.
-        let non_file_action = eval_handler.new_expression_evaluator(
+        // Nulls out add/remove instead of dropping them so the data schema stays the
+        // same as checkpoint_data_schema (add/remove columns are already nullable).
+        let non_file_action_nullifier = eval_handler.new_expression_evaluator(
             checkpoint_data_schema.clone(),
             Arc::new(Expression::transform(
                 Transform::new_top_level()
@@ -141,21 +143,22 @@ impl SidecarSplitter {
 
         Ok(Self {
             checkpoint_data_iter: checkpoint_data_iterator,
-            file_actions_picker: ColumnPicker {
-                projector: file_action,
+            file_actions_picker: NonNullColumnPicker {
+                projector: file_action_projector,
                 null_row_filter: file_actions_null_row_filter,
             },
-            non_file_actions_picker: ColumnPicker {
-                projector: non_file_action,
+            non_file_actions_picker: NonNullColumnPicker {
+                projector: non_file_action_nullifier,
                 null_row_filter: non_file_actions_null_row_filter,
             },
-            non_file_batches: Vec::new(),
+            non_file_action_batches: Vec::new(),
             exhausted: false,
         })
     }
 
     /// Creates a new `SidecarSplitter` wrapped in `Arc<Mutex<_>>` for
-    /// shared mutable access.
+    /// shared mutable access. This is useful for passing [`SingleSidecarDataIterator`] to
+    /// [`ParquetHandler::write_parquet_file`], which requires `Box<dyn Iterator + Send>`.
     pub(super) fn new_mut_shared(
         checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
@@ -175,7 +178,7 @@ impl SidecarSplitter {
 
     /// Consume the splitter and return the buffered non-file-action batches.
     pub(super) fn into_non_file_batches(self) -> Vec<Box<dyn EngineData>> {
-        self.non_file_batches
+        self.non_file_action_batches
     }
 
     /// Pull the next batch from the inner iterator, split it into file-action and non-file-action
@@ -196,7 +199,7 @@ impl SidecarSplitter {
                 Err(e) => return Some(Err(e)),
             };
             if !non_file_actions_batch.is_empty() {
-                self.non_file_batches.push(non_file_actions_batch);
+                self.non_file_action_batches.push(non_file_actions_batch);
             }
             match self.file_actions_picker.pick(batch.as_ref()) {
                 Ok(file_actions_batch) if file_actions_batch.is_empty() => continue,
@@ -207,10 +210,6 @@ impl SidecarSplitter {
 }
 
 /// Iterator that yields file-action batches for **one** sidecar file.
-///
-/// Returns `None` when either:
-/// - The row count for this chunk reaches `max_file_actions_hint`, or
-/// - The underlying data stream is exhausted.
 pub(super) struct SingleSidecarDataIterator {
     splitter: Arc<Mutex<SidecarSplitter>>,
     /// Soft cap on the number of file-action rows per sidecar. The actual count may exceed this
@@ -240,6 +239,11 @@ impl SingleSidecarDataIterator {
 impl Iterator for SingleSidecarDataIterator {
     type Item = DeltaResult<Box<dyn EngineData>>;
 
+    /// Yields the next file-action batch for current sidecar.
+    ///
+    /// Returns `None` when either:
+    /// - The row count for this chunk reaches `max_file_actions_hint`, or
+    /// - The underlying data stream is exhausted.
     fn next(&mut self) -> Option<Self::Item> {
         if self.yielded_row_count >= self.max_file_actions_hint {
             return None;

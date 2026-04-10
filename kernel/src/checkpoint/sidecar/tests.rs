@@ -196,7 +196,7 @@ fn struct_field_string<'a>(s: &'a StructArray, field: &str, row: usize) -> &'a s
 /// - Metadata has the expected table name
 /// - CheckpointMetadata has the expected version
 /// - add/remove columns are null in every row
-fn assert_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedNonFileContent<'_>) {
+fn verify_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedNonFileContent<'_>) {
     assert!(!batches.is_empty(), "non-file batches should not be empty");
     let mut protocol_count = 0usize;
     let mut metadata_count = 0usize;
@@ -322,7 +322,7 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
 
     assert_eq!(result.sidecar_files.len(), 1);
 
-    assert_non_file_batches(
+    verify_non_file_batches(
         &result.non_file_batches,
         &ExpectedNonFileContent {
             reader_version: 3,
@@ -345,7 +345,7 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
     Ok(())
 }
 
-/// V2 table with adds and removes across multiple commits, hint=3.
+/// V2 table with adds and removes across multiple commits, `max_file_actions_hint` = 3.
 /// Verifies: multiple sidecar files produced with adds/removes distributed across sidecars,
 /// batches with both file and non-file actions correctly split.
 /// And the row count of the file and non-file batches is correct.
@@ -412,7 +412,7 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
 
     let total_non_file_rows: usize = result.non_file_batches.iter().map(|b| b.len()).sum();
     assert_eq!(total_non_file_rows, 3); // 1 protocol + 1 metadata + 1 checkpointMetadata
-    assert_non_file_batches(
+    verify_non_file_batches(
         &result.non_file_batches,
         &ExpectedNonFileContent {
             reader_version: 3,
@@ -524,8 +524,12 @@ async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
     Ok(())
 }
 
-/// V2 partitioned table with writeStatsAsStruct=true.
-/// Verifies the output schema of the sidecar files is correctly including stats_parsed and partitionValues_parsed in the add struct.
+/// V2 partitioned table with `writeStatsAsStruct` = true. This test will:
+/// 1. Set up a V2 table with a partition column and `writeStatsAsStruct` enabled.
+/// 2. Insert an add action with partition values and JSON stats.
+/// 3. Generate checkpoint data.
+/// 4. Validate the output schema includes `stats_parsed` and `partitionValues_parsed`.
+/// 5. Validate the actual values in `stats_parsed` and `partitionValues_parsed` match the input.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
@@ -601,7 +605,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
         panic!("add should be a struct");
     }
 
-    // Validate the actually values.
+    // Validate the actual values.
     let mut found_add = false;
     for rb in &all_batches {
         let add_col = rb.column_by_name("add").unwrap();
@@ -687,7 +691,7 @@ async fn test_splitter_no_file_actions() -> DeltaResult<()> {
         .into_inner()
         .expect("splitter Mutex should not be poisoned")
         .into_non_file_batches();
-    assert_non_file_batches(
+    verify_non_file_batches(
         &non_file_batches,
         &ExpectedNonFileContent {
             reader_version: 3,
