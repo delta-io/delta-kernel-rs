@@ -132,7 +132,7 @@ mod tests {
     use super::*;
     use crate::actions::get_log_add_schema;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::DefaultEngine;
+    use crate::engine::sync::SyncEngine;
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricEvent, ScanType, WithMetricsReporterLayer};
@@ -227,7 +227,7 @@ mod tests {
     ) -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::builder(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create sidecar with add actions
         let json_adds = add_paths
@@ -314,7 +314,7 @@ mod tests {
         // This test uses multiple sidecar files, so we need custom logic
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::builder(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create two sidecars
         let sidecar1_data = parse_json_batch(vec![

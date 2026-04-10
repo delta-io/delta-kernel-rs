@@ -1522,7 +1522,7 @@ mod scan_metadata_completed_tests {
     use rstest::rstest;
     use tracing_subscriber::util::SubscriberInitExt as _;
 
-    use crate::engine::default::DefaultEngineBuilder;
+    use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
     use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
     use crate::object_store::local::LocalFileSystem;
@@ -1540,7 +1540,7 @@ mod scan_metadata_completed_tests {
         let path = std::fs::canonicalize(PathBuf::from(table)).unwrap();
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
-        let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(LocalFileSystem::new())));
         let guard = tracing_subscriber::registry()
             .with_metrics_reporter_layer(reporter.clone())
             .set_default();
@@ -1615,7 +1615,7 @@ mod scan_metadata_completed_tests {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
-        let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(LocalFileSystem::new())));
         let _guard = tracing_subscriber::registry()
             .with_metrics_reporter_layer(reporter.clone())
             .set_default();

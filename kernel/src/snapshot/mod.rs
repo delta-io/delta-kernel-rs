@@ -1240,7 +1240,7 @@ mod tests {
 
     use rstest::rstest;
     use serde_json::json;
-    use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
+    use test_utils::table_builder::TestTableBuilder;
     use test_utils::{add_commit, delta_path_for_version};
 
     use super::*;
@@ -1249,11 +1249,6 @@ mod tests {
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::executor::tokio::{
-        TokioBackgroundExecutor, TokioMultiThreadExecutor,
-    };
-    use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::log_segment::LogSegment;
@@ -1488,7 +1483,7 @@ mod tests {
         // in each test we will modify versions 1 and 2 to test different scenarios
         fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
             let table_root = "memory:///";
-            let engine = DefaultEngineBuilder::new(store).build();
+            let engine = SyncEngine::new_with_store(store);
             let base_snapshot = Snapshot::builder_for(table_root)
                 .at_version(0)
                 .build(&engine)?;
@@ -1538,7 +1533,7 @@ mod tests {
         commit(table_root, store.as_ref(), 0, commit0.clone()).await;
         // 3. new version > existing version
         // a. no new log segment
-        let engine = DefaultEngineBuilder::new(Arc::new(store.fork())).build();
+        let engine = SyncEngine::new_with_store(Arc::new(store.fork()));
         let base_snapshot = Snapshot::builder_for(table_root)
             .at_version(0)
             .build(&engine)?;
@@ -1610,7 +1605,7 @@ mod tests {
         test_new_from(store_3c_i.clone())?;
 
         // new commits AND request version > end of log
-        let engine = DefaultEngineBuilder::new(store_3c_i).build();
+        let engine = SyncEngine::new_with_store(store_3c_i);
         let base_snapshot = Snapshot::builder_for(table_root)
             .at_version(0)
             .build(&engine)?;
@@ -1654,7 +1649,7 @@ mod tests {
     async fn test_snapshot_new_from_crc() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
         let protocol = |reader_version, writer_version| {
             json!({
                 "protocol": {
@@ -1783,9 +1778,9 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
-        let cp = LastCheckpointHint::try_read(&storage, &url).unwrap();
+        let engine = SyncEngine::new_with_store(store);
+        let storage = engine.storage_handler();
+        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url).unwrap();
         assert!(cp.is_none());
     }
 
@@ -1840,10 +1835,11 @@ mod tests {
             .await
             .expect("put _last_checkpoint");
 
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let engine = SyncEngine::new_with_store(store);
+        let storage = engine.storage_handler();
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
+        let invalid =
+            LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -1870,15 +1866,15 @@ mod tests {
                 .expect("put _last_checkpoint");
         }
 
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let engine = SyncEngine::new_with_store(store);
+        let storage = engine.storage_handler();
 
         // Test reading all checkpoints from the in memory file system for cases where the data is
         // valid, invalid and valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
             let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
             let result =
-                LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
+                LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
             assert_eq!(result, expected_result);
         }
     }
@@ -1923,7 +1919,7 @@ mod tests {
     async fn test_domain_metadata() -> DeltaResult<()> {
         let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // commit0
         // - domain1: not removed
@@ -2091,7 +2087,7 @@ mod tests {
     async fn test_timestamp_with_ict_disabled() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory://test/";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create a basic commit without ICT enabled
         let commit0 = create_basic_commit(false, None);
@@ -2111,7 +2107,7 @@ mod tests {
     {
         let store = Arc::new(InMemory::new());
         let table_root = "memory://test/";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create initial commit without ICT
         let commit0 = create_basic_commit(false, None);
@@ -2153,7 +2149,7 @@ mod tests {
         // Test invalid state where snapshot has enablement version in the future - should error
         let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         let commit_data = [
             json!({
@@ -2204,7 +2200,7 @@ mod tests {
         // Test missing ICT when it should be present - should error
         let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         let commit_data = [
             create_protocol(true, Some(TABLE_FEATURES_MIN_READER_VERSION as u32)),
@@ -2238,7 +2234,7 @@ mod tests {
 
         let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create initial commit with ICT enabled
         let commit_data = [
@@ -2276,7 +2272,7 @@ mod tests {
         // enabled.
         let table_root = "memory:///test_table/";
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create 00000000000000000000.json with ICT enabled
         let commit0_data = [
@@ -2353,7 +2349,7 @@ mod tests {
             .unwrap()
             .to_string();
         let store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = SyncEngine::new_with_store(store);
 
         let schema = Arc::new(StructType::try_new(vec![StructField::new(
             "id",
@@ -2396,7 +2392,7 @@ mod tests {
     ) -> DeltaResult<()> {
         let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // TODO: refactor `ict_config` from a raw tuple to a dedicated ICTConfig struct so the
         // enablement version and enablement timestamp fields are named and self-documenting.
@@ -2444,7 +2440,7 @@ mod tests {
         // action does not carry an inCommitTimestamp value (corrupt/incomplete commit).
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         let commit0_data = vec![
             create_commit_info(1677811175819, None), // commitInfo without inCommitTimestamp
@@ -2466,22 +2462,10 @@ mod tests {
         Ok(())
     }
 
-    // Verifies the test_context! macro works from kernel/src/ unit tests
-    // (crosses the crate type boundary via macro expansion).
-    #[test]
-    fn test_context_macro_works_in_unit_test() {
-        let (_engine, snap, _table) = test_utils::test_context!(
-            LogState::with_commits(3),
-            FeatureSet::empty(),
-            VersionTarget::Latest
-        );
-        assert_eq!(snap.version(), 2);
-    }
-
     #[test]
     fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
         let table = TestTableBuilder::new().build().unwrap();
-        let engine = DefaultEngineBuilder::new(table.store().clone()).build();
+        let engine = SyncEngine::new_with_store(table.store().clone());
 
         let base_snapshot = Snapshot::builder_for(table.table_root())
             .at_version(0)
@@ -2503,7 +2487,7 @@ mod tests {
     async fn test_try_new_from_latest_commit_preservation() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create commits 0-2
         let base_commit = vec![
@@ -2589,7 +2573,7 @@ mod tests {
     async fn test_try_new_from_version_boundary_cases() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///test_table/";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create commits
         let base_commit = vec![
@@ -2738,20 +2722,13 @@ mod tests {
     struct IncrementalSnapshotTestContext {
         store: Arc<InMemory>,
         url: Url,
-        engine: Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+        engine: Arc<SyncEngine>,
     }
 
     fn setup_incremental_snapshot_test() -> DeltaResult<IncrementalSnapshotTestContext> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let executor = Arc::new(TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ));
-        let engine = Arc::new(
-            DefaultEngineBuilder::new(store.clone())
-                .with_task_executor(executor)
-                .build(),
-        );
+        let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
 
         Ok(IncrementalSnapshotTestContext { store, url, engine })
     }
@@ -3129,7 +3106,7 @@ mod tests {
     async fn test_compaction_files_ignored_on_read() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create commits 0-2 and write compaction files to storage
         setup_test_table_with_commits(table_root, &store, 3).await?;
@@ -3155,7 +3132,7 @@ mod tests {
     async fn test_incremental_snapshot_ignores_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create commits 0-2 with compaction files in storage
         setup_test_table_with_commits(table_root, &store, 3).await?;
@@ -3204,7 +3181,7 @@ mod tests {
     async fn test_incremental_snapshot_with_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create commits 0-3 and compaction files (1,1) and (1,2)
         setup_test_table_with_commits(table_root, &store, 3).await?;
@@ -3260,7 +3237,7 @@ mod tests {
     async fn test_incremental_snapshot_with_new_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
 
         // Create commits 0-3 and compaction files (1,2) and (2,2)
         setup_test_table_with_commits(table_root, &store, 4).await?;
@@ -3343,7 +3320,7 @@ mod tests {
     async fn test_metadata_configuration() {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = SyncEngine::new_with_store(storage.clone());
 
         // Create a commit with custom configuration
         let actions = vec![
@@ -3398,7 +3375,7 @@ mod tests {
         use crate::transaction::data_layout::DataLayout;
 
         let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = SyncEngine::new_with_store(storage);
         let schema = Arc::new(
             crate::schema::StructType::try_new(vec![
                 crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, true),
