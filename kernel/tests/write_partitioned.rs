@@ -56,8 +56,7 @@ async fn test_write_partitioned_normal_values_roundtrip(
     let adds = read_add_actions_json(&table_path, 1)?;
     assert_eq!(adds.len(), 1, "should have exactly one add action");
     let add = &adds[0];
-    let path = add["path"].as_str().unwrap();
-    let rel_path = strip_table_root(path, &table_path);
+    let rel_path = strip_table_root(add["path"].as_str().unwrap(), snapshot.table_root());
 
     match cm_mode {
         ColumnMappingMode::None => {
@@ -159,7 +158,7 @@ async fn test_write_partitioned_null_values_roundtrip(
     let adds = read_add_actions_json(&table_path, 1)?;
     assert_eq!(adds.len(), 1, "should have exactly one add action");
     let add = &adds[0];
-    let rel_path = strip_table_root(add["path"].as_str().unwrap(), &table_path);
+    let rel_path = strip_table_root(add["path"].as_str().unwrap(), snapshot.table_root());
 
     let hdp = "__HIVE_DEFAULT_PARTITION__";
     match cm_mode {
@@ -509,9 +508,9 @@ fn decimal_array(value: i128, precision: u8, scale: i8) -> ArrayRef {
 // ==============================================================================
 
 /// Strips the table root URL prefix from an add.path to get the relative path.
-fn strip_table_root(path: &str, table_path: &str) -> String {
-    let prefix = Url::from_directory_path(table_path).unwrap().to_string();
-    path.strip_prefix(&prefix)
+fn strip_table_root(path: &str, table_root: &Url) -> String {
+    let prefix = table_root.as_str();
+    path.strip_prefix(prefix)
         .unwrap_or_else(|| {
             panic!("add.path should start with table root.\n  root: {prefix}\n  path: {path}")
         })
