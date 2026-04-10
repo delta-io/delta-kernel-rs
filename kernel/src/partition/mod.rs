@@ -18,7 +18,7 @@
 //!   AddFile { partitionValues: {"region": "US/East"}, path: "region=US%252FEast/..." }
 //! ```
 //!
-//! - **Step 1: Validation** (FUTURE: `partition/validation.rs`): checks partition column
+//! - **Step 1: Validation** (`validation` module): checks partition column
 //!   key completeness and value types against the table schema. Runs first to reject bad
 //!   input before doing any serialization work.
 //!
@@ -157,3 +157,4 @@
 //! system prevents non-UTF-8 bytes from reaching the encoding layer.
 
 pub(crate) mod hive;
+pub(crate) mod validation;

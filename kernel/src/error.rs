@@ -97,6 +97,11 @@ pub enum Error {
     #[error("{0}")]
     MissingColumn(String),
 
+    /// The connector-provided partition values are invalid (missing/extra/duplicate keys,
+    /// or a value type does not match the schema column type).
+    #[error("Invalid partition values: {0}")]
+    InvalidPartitionValues(String),
+
     /// A column was specified with a specific type, but it is not of that type
     #[error("Expected column type: {0}")]
     UnexpectedColumnType(String),
@@ -247,6 +252,9 @@ impl Error {
     }
     pub fn unexpected_column_type(name: impl ToString) -> Self {
         Self::UnexpectedColumnType(name.to_string())
+    }
+    pub fn invalid_partition_values(msg: impl ToString) -> Self {
+        Self::InvalidPartitionValues(msg.to_string())
     }
     pub fn missing_data(name: impl ToString) -> Self {
         Self::MissingData(name.to_string())
