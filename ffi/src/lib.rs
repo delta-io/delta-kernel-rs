@@ -978,6 +978,31 @@ pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
     schema.drop_handle();
 }
 
+/// Parse a Delta schema JSON string and return a `Handle<SharedSchema>`.
+///
+/// This allows constructing a schema handle from a JSON representation (following the
+/// [Delta Protocol schema serialization format](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#schema-serialization-format))
+/// without needing an existing snapshot. Useful for creating new tables with a caller-defined schema.
+///
+/// The returned handle must be freed with [`free_schema`] when no longer needed.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid `allocate_error` function.
+#[no_mangle]
+pub unsafe extern "C" fn schema_from_json(
+    json: KernelStringSlice,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<Handle<SharedSchema>> {
+    schema_from_json_impl(json).into_extern_result(&allocate_error)
+}
+
+fn schema_from_json_impl(json: KernelStringSlice) -> DeltaResult<Handle<SharedSchema>> {
+    let json_str = unsafe { String::try_from_slice(&json) }?;
+    let schema: Schema = serde_json::from_str(&json_str)?;
+    Ok(Arc::new(schema).into())
+}
+
 /// Get the resolved root of the table. This should be used in any future calls that require
 /// constructing a path
 ///
@@ -2431,5 +2456,36 @@ mod tests {
         unsafe { free_snapshot(snap) };
         unsafe { free_engine(engine) };
         Ok(())
+    }
+
+    #[test]
+    fn test_schema_from_json_valid() {
+        let json = r#"{"type":"struct","fields":[{"name":"id","type":"integer","nullable":false,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#;
+        let result = unsafe { schema_from_json(kernel_string_slice!(json), allocate_err) };
+        let handle = ok_or_panic(result);
+        let schema = unsafe { handle.as_ref() };
+        assert_eq!(schema.fields().count(), 2);
+        unsafe { free_schema(handle) };
+    }
+
+    #[test]
+    fn test_schema_from_json_invalid() {
+        let json = r#"{"not_valid_schema": true}"#;
+        let result = unsafe { schema_from_json(kernel_string_slice!(json), allocate_err) };
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::MalformedJsonError,
+            Some("missing field `type` at line 1 column 26"),
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_empty_struct() {
+        let json = r#"{"type":"struct","fields":[]}"#;
+        let result = unsafe { schema_from_json(kernel_string_slice!(json), allocate_err) };
+        let handle = ok_or_panic(result);
+        let schema = unsafe { handle.as_ref() };
+        assert_eq!(schema.fields().count(), 0);
+        unsafe { free_schema(handle) };
     }
 }
