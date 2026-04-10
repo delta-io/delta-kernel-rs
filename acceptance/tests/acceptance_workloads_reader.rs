@@ -148,10 +148,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Kernel allows negative version, Spark rejects with DELTA_TABLE_RESTORE_VERSION_INVALID",
-        &["dsReadVersionNegative/specs/dsReadVersionNegative_error"],
-    ),
-    (
         "void/NullType not supported in schema deserialization",
         &[
             "void_001_void_top_level/",
