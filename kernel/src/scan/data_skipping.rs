@@ -20,6 +20,8 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::utils::require;
 use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
 
+#[cfg(test)]
+mod fuzz_tests;
 pub(crate) mod stats_schema;
 #[cfg(test)]
 mod tests;
