@@ -9,15 +9,15 @@ use crate::{
     DeltaResult, EngineData, Error, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator,
 };
 
-/// Adjusts a batch and filters out all-null rows.
-struct NonNullColumnPicker {
-    adjuster: Arc<dyn ExpressionEvaluator>,
+/// Transforms a batch and filters out all-null rows.
+struct NonNullRowPicker {
+    batch_transform: Arc<dyn ExpressionEvaluator>,
     null_row_filter: Arc<dyn PredicateEvaluator>,
 }
 
-impl NonNullColumnPicker {
+impl NonNullRowPicker {
     fn pick(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
-        let adjusted = self.adjuster.evaluate(batch)?;
+        let adjusted = self.batch_transform.evaluate(batch)?;
         filter_by_predicate(self.null_row_filter.as_ref(), adjusted)
     }
 }
@@ -52,9 +52,9 @@ impl NonNullColumnPicker {
 pub(super) struct SidecarSplitter {
     checkpoint_data_iter: ActionReconciliationIterator,
     /// Projects to add/remove columns and filters out rows where both are null.
-    file_actions_picker: NonNullColumnPicker,
+    file_actions_picker: NonNullRowPicker,
     /// Nulls out add/remove columns and filters out rows where all remaining columns are null.
-    non_file_actions_picker: NonNullColumnPicker,
+    non_file_actions_picker: NonNullRowPicker,
     /// Accumulated non-file-action batches (protocol, metadata, txn, etc.).
     non_file_action_batches: Vec<Box<dyn EngineData>>,
     /// Set to `true` when the inner `checkpoint_data_iter` is exhausted.
@@ -143,12 +143,12 @@ impl SidecarSplitter {
 
         Ok(Self {
             checkpoint_data_iter: checkpoint_data_iterator,
-            file_actions_picker: NonNullColumnPicker {
-                adjuster: file_action_projector,
+            file_actions_picker: NonNullRowPicker {
+                batch_transform: file_action_projector,
                 null_row_filter: file_actions_null_row_filter,
             },
-            non_file_actions_picker: NonNullColumnPicker {
-                adjuster: non_file_action_nullifier,
+            non_file_actions_picker: NonNullRowPicker {
+                batch_transform: non_file_action_nullifier,
                 null_row_filter: non_file_actions_null_row_filter,
             },
             non_file_action_batches: Vec::new(),
