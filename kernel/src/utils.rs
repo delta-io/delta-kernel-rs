@@ -96,6 +96,7 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
 }
 
 /// Returns the current time as a Duration since Unix epoch.
+#[internal_api]
 pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -103,6 +104,7 @@ pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
 }
 
 /// Returns the current time in milliseconds since Unix epoch.
+#[internal_api]
 pub(crate) fn current_time_ms() -> DeltaResult<i64> {
     let duration = current_time_duration()?;
     i64::try_from(duration.as_millis())

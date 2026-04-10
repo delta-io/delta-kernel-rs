@@ -9,7 +9,6 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred, Scalar,
 };
@@ -21,6 +20,7 @@ use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
 use delta_kernel::{Engine, FileMeta, Snapshot};
+use delta_kernel_default_engine::DefaultEngineBuilder;
 
 use itertools::Itertools;
 use test_utils::{
