@@ -223,10 +223,10 @@ async fn test_cannot_checkpoint_unpublished_snapshot() -> Result<(), TestError> 
     Ok(())
 }
 
-/// Catalog-managed V2 table: write commits to InMemory store, load snapshot,
+/// uc-managed V2 table: write commits to InMemory store, load snapshot,
 /// write a sidecar checkpoint, and verify checkpoint + sidecars exist.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_sidecar_checkpoint_catalog_managed_v2_table() -> Result<(), TestError> {
+async fn test_sidecar_checkpoint_uc_managed_v2_table() -> Result<(), TestError> {
     // Create v0 metadata with catalogManaged + v2Checkpoint features
     let v0_metadata = test_utils::CATALOG_MANAGED_METADATA.replace(
         r#""readerFeatures":["catalogManaged"],"writerFeatures":["catalogManaged","inCommitTimestamp"]"#,
