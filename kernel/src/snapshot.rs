@@ -282,6 +282,9 @@ impl Snapshot {
             && new_log_segment.checkpoint_version.is_none()
         {
             // No new commits and no newly discovered checkpoint, just return the same snapshot.
+            // We must check checkpoint_version here: if a checkpoint at or below the existing
+            // snapshot version was discovered, we still need to fall through to advance the
+            // checkpoint base even though the version did not change (see example 5 below).
             return Ok(existing_snapshot.clone());
         }
         // Incrementally update the snapshot with the new log segment. The listing starts from
@@ -289,44 +292,49 @@ impl Snapshot {
         // discards all commits before it. The new log segment's commits start from the latest
         // checkpoint found.
         //
-        // All examples below start from: old segment = ckpt@v0 + commit@v1, v2, v3
-        //                                existing_snapshot_version = v3, listing_start = v1
+        // All examples start from: old segment = checkpoint@v0 + commit@v1, v2, v3
+        //                          existing_snapshot_version = v3, listing_start = v1
         //
         // 1. target=v3, no new commits:
-        //    listing finds commit@v1, v2, v3. new_end_version(v3) == existing_snapshot_version(v3),
-        //    no new checkpoint -> return same snapshot
+        //    listing:          commit@v1, v2, v3
+        //    new_end_version(v3) == existing_snapshot_version(v3), no new checkpoint
+        //    -> return same snapshot (caught above)
         //
         // 2. target=v4, one new commit:
-        //    listing finds commit@v1, v2, v3, v4. Drop v1-v3 (already in existing snapshot),
-        //    so new_log_segment.ascending_commit_files = [commit@v4]. This is replayed for P&M
-        //    below and merged into the combined log segment.
+        //    listing:          commit@v1, v2, v3, v4
+        //    after dedup:      drop v1-v3 (already in existing snapshot)
+        //                      -> ascending_commit_files = [commit@v4]
+        //    commit@v4 is replayed for P&M below and merged into the combined log segment.
         //
-        // 3. target=v6, new ckpt@v5 written since last build:
-        //    listing finds commit@v1 through v3 then ckpt@v5+commit@v6; the listing drops v1-v3 on
-        //    checkpoint flush (ckpt@v5 is a complete snapshot through v5, so earlier commits are
-        //    not needed), so new segment = ckpt@v5 + commit@v6.
+        // 3. target=v6, new checkpoint@v5 written since last build:
+        //    listing:          commit@v1-v4, then checkpoint@v5 + commit@v6
+        //                      (checkpoint flush drops v1-v4; checkpoint@v5 is a complete
+        //                       snapshot through v5, so all earlier commits are not needed)
+        //    new segment:      checkpoint@v5 + commit@v6
         //    new_checkpoint_version(v5) > existing_snapshot_version(v3) -> full rebuild
+        //    (caught above)
         //
-        // 4. target=v4, new ckpt@v2 written since last build:
-        //    listing finds commit@v1 then ckpt@v2+commit@v3, v4; the listing drops v1 on
-        //    checkpoint flush, so new segment = ckpt@v2 + commit@v3, v4.
-        //    new_checkpoint_version(v2) <= existing_snapshot_version(v3). Dedup: drop commit@v3
-        //    from new segment (it overlaps with the existing snapshot), so
-        //    new_log_segment.ascending_commit_files = [commit@v4].
-        //    Note: commit@v3 is NOT lost: it is contributed by the old segment below when
-        //    building the combined segment (old commits above ckpt@v2 = [commit@v3]).
-        //    Combined segment = ckpt@v2 + commit@v3 (from old) + commit@v4 (from new).
-        //    ckpt@v2 stays in new_log_segment.listed.checkpoint_parts to advance the base.
+        // 4. target=v4, new checkpoint@v2 written since last build:
+        //    listing:          commit@v1, then checkpoint@v2 + commit@v3, v4
+        //                      (checkpoint flush drops v1)
+        //    new segment:      checkpoint@v2 + commit@v3, v4
+        //    after dedup:      drop commit@v3 (already in existing snapshot)
+        //                      -> ascending_commit_files = [commit@v4]
+        //    commit@v3 is not lost: the old segment contributes it below
+        //    (old commits above checkpoint@v2 = [commit@v3])
+        //    combined segment: checkpoint@v2 + commit@v3 (from old) + commit@v4 (from new)
+        //    checkpoint@v2 is kept in checkpoint_parts to advance the listing base.
         //
-        // 5. target=v3, new ckpt@v2 written since last build, no new commits:
-        //    listing finds commit@v1 then ckpt@v2+commit@v3; the listing drops v1 on
-        //    checkpoint flush, so new segment = ckpt@v2 + commit@v3.
-        //    new_checkpoint_version(v2) <= existing_snapshot_version(v3). Dedup: drop commit@v3
-        //    from new segment (it overlaps with the existing snapshot), so
-        //    new_log_segment.ascending_commit_files = [].
-        //    Note: commit@v3 is contributed by the old segment below (old commits above ckpt@v2).
-        //    Combined segment = ckpt@v2 + commit@v3 (from old).
-        //    ckpt@v2 stays in new_log_segment.listed.checkpoint_parts to advance the base.
+        // 5. target=v3, new checkpoint@v2 written since last build, no new commits:
+        //    listing:          commit@v1, then checkpoint@v2 + commit@v3
+        //                      (checkpoint flush drops v1)
+        //    new segment:      checkpoint@v2 + commit@v3
+        //    after dedup:      drop commit@v3 (already in existing snapshot)
+        //                      -> ascending_commit_files = []
+        //    commit@v3 is not lost: the old segment contributes it below
+        //    (old commits above checkpoint@v2 = [commit@v3])
+        //    combined segment: checkpoint@v2 + commit@v3 (from old)
+        //    checkpoint@v2 is kept in checkpoint_parts to advance the listing base.
         new_log_segment
             .listed
             .ascending_commit_files
@@ -349,10 +357,15 @@ impl Snapshot {
         );
 
         // Replay only the new commits (> existing_snapshot_version) for P&M, excluding the
-        // checkpoint.
+        // checkpoint. We do not pass the CRC here: the CRC may be older than
+        // existing_snapshot_version, and read_protocol_metadata_opt's CRC fallback assumes
+        // "no P&M in commits after the CRC means the CRC's P&M is current." That assumption
+        // breaks on this partial segment, which intentionally omits commits between the new
+        // checkpoint and existing_snapshot_version. A stale CRC fallback would overwrite
+        // P&M changes already captured in the existing snapshot.
         let (new_metadata, new_protocol) = new_log_segment
             .segment_after_crc(existing_snapshot_version)
-            .read_protocol_metadata_opt(engine, &lazy_crc)?;
+            .read_protocol_metadata_opt(engine, &LazyCrc::new(None))?;
         let table_configuration = TableConfiguration::try_new_from(
             existing_snapshot.table_configuration(),
             new_metadata,
