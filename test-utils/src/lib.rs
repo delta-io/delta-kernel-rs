@@ -1013,7 +1013,7 @@ pub async fn write_batch_to_table(
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
     let write_context = if txn.logical_partition_columns().is_empty() {
-        debug_assert!(
+        assert!(
             partition_values.is_empty(),
             "partition_values should be empty for unpartitioned tables"
         );

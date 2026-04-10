@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use url::Url;
-
 use rand::Rng;
+use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::expressions::{ColumnName, ExpressionRef};
@@ -18,7 +17,7 @@ use crate::table_features::ColumnMappingMode;
 /// [`Transaction`]: super::Transaction
 #[derive(Debug)]
 pub(super) struct SharedWriteState {
-    pub(super) target_dir: Url,
+    pub(super) table_root: Url,
     pub(super) logical_schema: SchemaRef,
     pub(super) physical_schema: SchemaRef,
     pub(super) logical_to_physical: ExpressionRef,
@@ -63,17 +62,18 @@ pub struct WriteContext {
 impl WriteContext {
     /// Returns the table root URL.
     pub fn table_root_dir(&self) -> &Url {
-        &self.shared.target_dir
+        &self.shared.table_root
     }
 
-    /// Returns the recommended directory for writing data files. Not required (data files
-    /// can live anywhere under the table root), but produces the conventional layout.
+    /// Returns the recommended directory for writing Parquet data files. Connectors should
+    /// write files as `<write_dir>/<uuid>.parquet`. Not strictly required (data files can
+    /// live anywhere under the table root), but produces the conventional layout.
     ///
     /// ```text
-    ///              | CM OFF                        | CM ON
-    /// -------------|-------------------------------|---------------------------
-    /// Unpartitioned| <table_root>/                 | <table_root>/<2char>/
-    /// Partitioned  | <table_root>/col=val/.../     | <table_root>/<2char>/
+    ///              | CM OFF                              | CM ON
+    /// -------------|-------------------------------------|-------------------------------
+    /// Unpartitioned| <table_root>/<uuid>.parquet         | <table_root>/<2char>/<uuid>.parquet
+    /// Partitioned  | <table_root>/col=val/.../<uuid>.pq  | <table_root>/<2char>/<uuid>.parquet
     /// ```
     ///
     /// CM ON uses a random 2-char alphanumeric prefix (matching Delta-Spark's
@@ -82,7 +82,7 @@ impl WriteContext {
     // TODO(#2357): respect `delta.randomizeFilePrefixes` and `delta.randomPrefixLength`
     // table properties. Currently random prefixes are only used when column mapping is on.
     pub fn write_dir(&self) -> Url {
-        let mut url = self.shared.target_dir.clone();
+        let mut url = self.shared.table_root.clone();
         match self.shared.column_mapping_mode {
             ColumnMappingMode::None => {
                 // No column mapping: use Hive-style partition directories for partitioned
@@ -140,7 +140,6 @@ impl WriteContext {
     }
 
     /// Builds the Hive-style partition path suffix (e.g., `year=2024/region=US/`).
-    /// Builds the Hive-style partition path suffix (e.g., `year=2024/region=US/`).
     /// Only called when column mapping is OFF.
     fn hive_partition_path_suffix(&self) -> String {
         debug_assert!(
@@ -187,7 +186,7 @@ impl WriteContext {
     // (delta.randomizeFilePrefixes / delta.randomPrefixLength) instead of requiring the
     // caller to pass it. Connectors that need custom paths can use table_root_dir() directly.
     pub fn new_deletion_vector_path(&self, random_prefix: String) -> DeletionVectorPath {
-        DeletionVectorPath::new(self.shared.target_dir.clone(), random_prefix)
+        DeletionVectorPath::new(self.shared.table_root.clone(), random_prefix)
     }
 }
 
@@ -223,7 +222,7 @@ mod tests {
             DataType::INTEGER,
         )]));
         let shared = Arc::new(SharedWriteState {
-            target_dir: Url::parse("s3://bucket/table/").unwrap(),
+            table_root: Url::parse("s3://bucket/table/").unwrap(),
             logical_schema: schema.clone(),
             physical_schema: schema.clone(),
             logical_to_physical: Arc::new(Expression::literal(true)),
