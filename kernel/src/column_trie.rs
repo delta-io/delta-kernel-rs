@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use delta_kernel_derive::internal_api;
+
 use crate::expressions::ColumnName;
 
 /// A trie (prefix tree) for efficient column path matching.
@@ -17,6 +19,7 @@ use crate::expressions::ColumnName;
 /// `is_terminal = false`. This is used both for creating a new root trie and for
 /// creating intermediate nodes during insertion (via `or_default()`).
 #[derive(Debug, Default)]
+#[internal_api]
 pub(crate) struct ColumnTrie<'col> {
     children: HashMap<&'col str, ColumnTrie<'col>>,
     /// True if this node represents the end of a specified column path.
@@ -27,6 +30,7 @@ pub(crate) struct ColumnTrie<'col> {
 
 impl<'col> ColumnTrie<'col> {
     /// Creates an empty trie.
+    #[internal_api]
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -40,6 +44,7 @@ impl<'col> ColumnTrie<'col> {
     ///     ├── "b" (is_terminal=true)
     ///     └── "c" (is_terminal=true)
     /// ```
+    #[internal_api]
     pub(crate) fn from_columns(columns: &'col [ColumnName]) -> Self {
         let mut trie = Self::new();
         for column in columns {
@@ -61,6 +66,7 @@ impl<'col> ColumnTrie<'col> {
     ///     └── "b" (is_terminal=false)
     ///         └── "c" (is_terminal=true)
     /// ```
+    #[internal_api]
     pub(crate) fn insert(&mut self, column: &'col ColumnName) {
         let mut node = self;
         for part in column.iter() {
@@ -76,6 +82,7 @@ impl<'col> ColumnTrie<'col> {
     /// - `["a", "b", "c"]` → true (descendant)
     /// - `["a"]` → false (ancestor, not descendant)
     /// - `["a", "x"]` → false (divergent path)
+    #[internal_api]
     pub(crate) fn contains_prefix_of(&self, path: &[String]) -> bool {
         let mut node = self;
         for part in path {
