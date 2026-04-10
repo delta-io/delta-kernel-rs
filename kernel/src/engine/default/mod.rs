@@ -35,6 +35,7 @@ pub mod file_stream;
 pub mod filesystem;
 pub mod json;
 pub mod parquet;
+pub mod scalar_from_arrow;
 pub mod stats;
 pub mod storage;
 
