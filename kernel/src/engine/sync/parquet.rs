@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use crate::engine::default::parquet::{reader_options, writer_options};
+use crate::engine::{reader_options, writer_options};
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 
 use super::read_files;
