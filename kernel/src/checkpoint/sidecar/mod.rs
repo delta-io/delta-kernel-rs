@@ -251,7 +251,7 @@ impl Iterator for SingleSidecarDataIterator {
         let mut splitter = match self.splitter.lock() {
             Ok(guard) => guard,
             Err(e) => {
-                return Some(Err(Error::generic(format!(
+                return Some(Err(Error::internal_error(format!(
                     "sidecar splitter lock poisoned: {e}"
                 ))))
             }
