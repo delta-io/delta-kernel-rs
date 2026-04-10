@@ -1,13 +1,13 @@
-//! Step 1: Partition value serialization for the Delta log.
+//! Partition value serialization for the Delta log.
 //!
 //! A partition value goes through several transformation steps before reaching the
 //! Delta log (see the [`super`] module for the full pipeline and encoding tables).
-//! This module implements Step 1: converting typed [`Scalar`] values into the strings
-//! that appear in `AddFile.partitionValues`.
+//! This module converts typed [`Scalar`] values into the strings that appear in
+//! `AddFile.partitionValues`.
 //!
 //! ```text
-//! Step 1 (THIS MODULE):  Scalar::String("US/East")  ->Some("US/East")  (partitionValues)
-//! Step 2 (hive module):  "US/East"                  ->"US%2FEast"      (directory name)
+//! Step 2 (THIS MODULE):  Scalar::String("US/East")  ->  Some("US/East")  (partitionValues)
+//! Step 3 (hive module):  "US/East"                  ->  "US%2FEast"      (directory name)
 //! ```
 //!
 //! [`Scalar`]: crate::expressions::Scalar
