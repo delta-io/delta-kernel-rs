@@ -75,6 +75,7 @@ extern crate self as delta_kernel;
 
 use std::any::Any;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fs::DirEntry;
 use std::ops::Range;
 use std::sync::Arc;
@@ -842,6 +843,31 @@ pub trait ParquetHandler: AsAny {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
+
+    /// Reads checkpoint or sidecar parquet files with checkpoint-aware row group skipping.
+    ///
+    /// Checkpoint files store per-file statistics as nested parquet columns (e.g.
+    /// `add.stats_parsed.minValues.x`). The parquet footer aggregates these across all files
+    /// in a row group. Unlike data file statistics, these aggregates can be misleading when
+    /// some files are missing statistics (null stat values are invisible to footer min/max).
+    ///
+    /// The `predicate` uses the original column names from the table schema (e.g. `x > 10`),
+    /// not checkpoint-internal column paths. The `partition_columns` identifies which predicate
+    /// columns are partition columns (their statistics are always reliable in checkpoint files).
+    ///
+    /// The default implementation falls back to [`read_parquet_files`](Self::read_parquet_files)
+    /// which uses standard row group skipping without checkpoint-specific null guarding. Engines
+    /// that want correct checkpoint row group skipping should override this method.
+    fn read_checkpoint_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        partition_columns: HashSet<String>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        let _ = partition_columns; // unused in default impl
+        self.read_parquet_files(files, physical_schema, predicate)
+    }
 
     /// Write data to a Parquet file at the specified URL.
     ///
