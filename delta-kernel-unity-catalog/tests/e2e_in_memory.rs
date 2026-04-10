@@ -270,6 +270,7 @@ async fn test_sidecar_checkpoint_catalog_managed_v2_table() -> Result<(), TestEr
         .load_snapshot_at(table_id, table_root, 0, &engine)
         .await?;
     assert_eq!(snapshot.version(), 0);
+    assert!(snapshot.table_configuration().is_catalog_managed());
 
     let spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(10),
