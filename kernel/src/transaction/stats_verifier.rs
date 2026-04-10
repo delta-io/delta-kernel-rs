@@ -348,8 +348,6 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::stats::collect_stats;
-    use crate::expressions::column_name;
     use crate::EngineData;
 
     /// Creates test add file data with stats.numRecords, stats.nullCount.col,
