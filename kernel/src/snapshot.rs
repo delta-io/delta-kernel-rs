@@ -247,13 +247,27 @@ impl Snapshot {
         }
         if new_log_segment.checkpoint_version.is_some() {
             // We found a checkpoint in the new log segment, so build a fresh snapshot from it.
-            // TODO(#2217): reuse old LazyCrc when CRC file matches.
             // TODO(#2218): consider incremental P&M replay instead of full rebuild.
+            // Pass the resolved lazy_crc so the full rebuild can reuse a loaded CRC if the
+            // version matches. If the new segment has no CRC file, resolve_crc falls back to
+            // the old segment's CRC, which is safe: read_protocol_metadata validates the CRC
+            // version against end_version and falls back to log replay when they differ.
+            let (crc_file, lazy_crc) = Self::resolve_crc(
+                &new_log_segment,
+                old_log_segment,
+                &existing_snapshot.lazy_crc,
+            );
+            // Inject the resolved CRC file path so the rebuilt snapshot remembers it.
+            // Without this, if the CRC is below the new listing start (and thus not found
+            // by the listing), the rebuilt snapshot's log_segment.latest_crc_file would be
+            // None, causing future incremental updates to lose the CRC reference.
+            new_log_segment.listed.latest_crc_file = crc_file;
             let snapshot = Self::try_new_from_log_segment_impl(
                 existing_snapshot.table_root().clone(),
                 new_log_segment,
                 engine,
                 operation_id,
+                Some(lazy_crc),
             );
             return Ok(Arc::new(snapshot?));
         }
@@ -366,19 +380,24 @@ impl Snapshot {
         (crc_file, lazy_crc)
     }
 
-    /// Implementation of snapshot creation from log segment.
+    /// Creates a snapshot from a log segment and reports `ProtocolMetadataLoaded` metrics.
     ///
-    /// Reports metrics: `ProtocolMetadataLoaded`.
+    /// When `inherited_lazy_crc` is `Some`, reuses it (e.g. carried forward from a previous
+    /// snapshot whose CRC version matches); otherwise creates a fresh [`LazyCrc`] from the log
+    /// segment's CRC file.
     fn try_new_from_log_segment_impl(
         location: Url,
         log_segment: LogSegment,
         engine: &dyn Engine,
         operation_id: MetricId,
+        inherited_lazy_crc: Option<Arc<LazyCrc>>,
     ) -> DeltaResult<Self> {
         let reporter = engine.get_metrics_reporter();
 
-        // Create lazy CRC loader for P&M optimization
-        let lazy_crc = Arc::new(LazyCrc::new(log_segment.listed.latest_crc_file.clone()));
+        // Reuse the inherited LazyCrc when provided (avoids redundant disk I/O if the CRC
+        // file is the same one the previous snapshot already loaded).
+        let lazy_crc = inherited_lazy_crc
+            .unwrap_or_else(|| Arc::new(LazyCrc::new(log_segment.listed.latest_crc_file.clone())));
 
         // Read protocol and metadata (may use CRC if available)
         let start = Instant::now();
@@ -2731,6 +2750,127 @@ mod tests {
         assert_eq!(updated.version(), 3);
         assert_eq!(updated.log_segment.checkpoint_version, Some(2));
         compare_snapshots(&updated, &fresh);
+
+        Ok(())
+    }
+
+    /// CRC JSON for the standard test table (see [`setup_test_table_with_commits`]).
+    fn make_test_crc_json(table_size_bytes: i64, num_files: i64) -> serde_json::Value {
+        json!({
+            "table_size_bytes": table_size_bytes,
+            "num_files": num_files,
+            "num_metadata": 1,
+            "num_protocol": 1,
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "metadata": {
+                "id": "test-id",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_early_return_reuses_lazy_crc() -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+
+        // Create commits 0-3
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
+
+        // Write a well-formed CRC at v2 with P&M matching the table's schema.
+        let crc_path = delta_path_for_version(2, "crc");
+        ctx.store
+            .put(&crc_path, make_test_crc_json(300, 3).to_string().into())
+            .await?;
+
+        // Build snapshot at v3 -- its log segment will reference CRC at v2.
+        let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(3)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(snapshot_v3.lazy_crc.crc_version(), Some(2));
+
+        // Force-load the CRC so it's cached in the OnceLock.
+        let _ = snapshot_v3.lazy_crc.get_or_load(ctx.engine.as_ref());
+        assert!(snapshot_v3.lazy_crc.is_loaded());
+
+        // Write a checkpoint at v1 so that the incremental update hits the checkpoint
+        // early-return. The CRC file (v2) is unchanged.
+        Snapshot::builder_for(ctx.url.as_str())
+            .at_version(1)
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref())?;
+
+        // Incremental update from v3: discovers the new checkpoint, takes the early-return.
+        let updated = Snapshot::builder_from(snapshot_v3.clone()).build(ctx.engine.as_ref())?;
+
+        // Verify structural correctness: same result as a fresh snapshot build.
+        let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        compare_snapshots(&updated, &fresh);
+        assert_eq!(updated.version(), 3);
+        assert_eq!(updated.log_segment.checkpoint_version, Some(1));
+
+        // The LazyCrc should be reused (already loaded) rather than a fresh unloaded one.
+        assert_eq!(updated.lazy_crc.crc_version(), Some(2));
+        assert!(
+            updated.lazy_crc.is_loaded(),
+            "LazyCrc should be reused from old snapshot, not freshly created"
+        );
+
+        Ok(())
+    }
+
+    // When the checkpoint early-return discovers a newer CRC alongside the new checkpoint,
+    // resolve_crc should create a fresh (unloaded) LazyCrc rather than reusing the old one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_early_return_creates_fresh_lazy_crc_when_version_changes(
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+
+        // Create commits 0-3
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
+
+        // Write a CRC at v2 -- this is what snapshot_v3 will reference.
+        let crc_v2_path = delta_path_for_version(2, "crc");
+        ctx.store
+            .put(&crc_v2_path, make_test_crc_json(300, 3).to_string().into())
+            .await?;
+
+        // Build snapshot at v3 -- references CRC at v2.
+        let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(3)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(snapshot_v3.lazy_crc.crc_version(), Some(2));
+
+        // Force-load the v2 CRC into the OnceLock.
+        let _ = snapshot_v3.lazy_crc.get_or_load(ctx.engine.as_ref());
+        assert!(snapshot_v3.lazy_crc.is_loaded());
+
+        // Write a checkpoint at v1 AND a newer CRC at v3, so the incremental update
+        // sees a different CRC version than the old snapshot's (v2 -> v3).
+        Snapshot::builder_for(ctx.url.as_str())
+            .at_version(1)
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref())?;
+
+        let crc_v3_path = delta_path_for_version(3, "crc");
+        ctx.store
+            .put(&crc_v3_path, make_test_crc_json(400, 4).to_string().into())
+            .await?;
+
+        // Incremental update: discovers both the new checkpoint and the newer CRC at v3.
+        let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
+
+        // Verify structural correctness: same result as a fresh snapshot build.
+        let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        compare_snapshots(&updated, &fresh);
+        assert_eq!(updated.version(), 3);
+        assert_eq!(updated.log_segment.checkpoint_version, Some(1));
+
+        // A fresh LazyCrc at v3 should have been created rather than reusing the old v2 one.
+        assert_eq!(updated.lazy_crc.crc_version(), Some(3));
 
         Ok(())
     }
