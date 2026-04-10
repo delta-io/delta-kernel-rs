@@ -29,9 +29,10 @@ use crate::{DeltaResult, Error};
 /// This is useful for connectors that partition data using Arrow arrays and need typed
 /// partition values for the write path.
 ///
-/// Returns `Scalar::Null(data_type)` if the value at `row_idx` is null. Any timezone
-/// annotation on a microsecond `Timestamp` is treated as UTC-adjusted per the Delta
-/// protocol; the raw microsecond value is extracted without conversion.
+/// Returns `Scalar::Null(data_type)` if the value at `row_idx` is null. Per the Arrow
+/// spec, any `Timestamp` with a non-empty timezone stores its raw int64 as UTC
+/// microseconds regardless of which timezone string is attached. The timezone is purely
+/// a display hint, so the raw value is extracted without conversion.
 ///
 /// # Errors
 ///
@@ -81,10 +82,14 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> DeltaResul
         ArrowDataType::Date32 => Ok(Scalar::Date(
             array.as_primitive::<Date32Type>().value(row_idx),
         )),
-        // The Delta protocol defines Timestamp as microseconds since epoch in UTC. Arrow
-        // arrays may carry any timezone label, but the raw microsecond value is always the
-        // same physical representation. We treat any timezone annotation as "this data is
-        // UTC-adjusted" and extract the raw value without conversion.
+        // Per the Arrow spec (arrow-schema datatype.rs), any Timestamp with a non-empty
+        // timezone stores its raw int64 as UTC microseconds since epoch, regardless of which
+        // timezone string is attached. The timezone is purely a display hint. So
+        // Timestamp(us, Some("America/New_York")) with value 0 means midnight UTC, not
+        // midnight New York. We extract the raw value directly with no conversion.
+        //
+        // Timestamp(us, None) means wall-clock time in an unknown timezone, which maps to
+        // Delta's TimestampNtz type.
         ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_tz)) => Ok(Scalar::Timestamp(
             array
                 .as_primitive::<TimestampMicrosecondType>()
@@ -137,7 +142,8 @@ fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> DeltaResult<Dat
         ArrowDataType::Boolean => Ok(DataType::BOOLEAN),
         ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Ok(DataType::STRING),
         ArrowDataType::Date32 => Ok(DataType::DATE),
-        // Any timezone annotation means "UTC-adjusted". See comment in extract_primitive_scalar.
+        // Any timezone annotation means the raw value is UTC. See the Arrow spec comment
+        // in extract_primitive_scalar for details.
         ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)) => Ok(DataType::TIMESTAMP),
         ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => Ok(DataType::TIMESTAMP_NTZ),
         ArrowDataType::Decimal128(p, s) => {
@@ -291,9 +297,9 @@ mod tests {
         );
     }
 
-    // The Delta protocol defines Timestamp as microseconds since epoch in UTC. Arrow
-    // arrays may carry any timezone label, but the raw microsecond value is the same.
-    // We accept any timezone and extract the raw value without conversion.
+    // Per the Arrow spec, Timestamp with any non-empty timezone stores its raw int64 as
+    // UTC microseconds. The timezone string is a display hint, not a conversion signal.
+    // We extract the raw value directly for all timezone annotations.
     #[rstest]
     #[case::utc("UTC")]
     #[case::utc_lowercase("utc")]
