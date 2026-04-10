@@ -12,7 +12,9 @@ use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::Snapshot;
 use delta_kernel_unity_catalog::{UCCommitter, UCKernelClient};
-use test_utils::collect_file_action_paths;
+use test_utils::{
+    actions_to_string_with_metadata, add_commit, collect_file_action_paths, TestAction,
+};
 use unity_catalog_delta_client_api::{Commit, InMemoryCommitsClient, TableData};
 
 // ============================================================================
@@ -225,9 +227,7 @@ async fn test_cannot_checkpoint_unpublished_snapshot() -> Result<(), TestError> 
 /// write a sidecar checkpoint, and verify checkpoint + sidecars exist.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_sidecar_checkpoint_catalog_managed_v2_table() -> Result<(), TestError> {
-    use test_utils::{actions_to_string_with_metadata, add_commit, TestAction};
-
-    // Start from CATALOG_MANAGED_METADATA and add v2Checkpoint to the protocol features
+    // Create v0 metadata with catalogManaged + v2Checkpoint features
     let v0_metadata = test_utils::CATALOG_MANAGED_METADATA.replace(
         r#""readerFeatures":["catalogManaged"],"writerFeatures":["catalogManaged","inCommitTimestamp"]"#,
         r#""readerFeatures":["v2Checkpoint","catalogManaged"],"writerFeatures":["v2Checkpoint","catalogManaged","inCommitTimestamp"]"#,
