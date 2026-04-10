@@ -788,7 +788,7 @@ impl<S> Transaction<S> {
         self.shared_write_state.get_or_init(|| {
             let table_config = self.read_snapshot.table_configuration();
             Arc::new(SharedWriteState {
-                target_dir: self.read_snapshot.table_root().clone(),
+                table_root: self.read_snapshot.table_root().clone(),
                 logical_schema: self.read_snapshot.schema(),
                 physical_schema: table_config.physical_write_schema(),
                 logical_to_physical: Arc::new(self.generate_logical_to_physical()),
@@ -1752,7 +1752,11 @@ mod tests {
         true,
         "not partitioned"
     )]
-    #[case::unpartitioned_on_partitioned("./tests/data/basic_partitioned/", false, "partitioned")]
+    #[case::unpartitioned_on_partitioned(
+        "./tests/data/basic_partitioned/",
+        false,
+        "table is partitioned"
+    )]
     fn test_wrong_write_context_method_returns_error(
         #[case] table_path: &str,
         #[case] call_partitioned: bool,

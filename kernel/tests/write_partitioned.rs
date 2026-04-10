@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
@@ -365,7 +366,7 @@ fn null_partition_values() -> Result<HashMap<String, Scalar>, Box<dyn std::error
 // Assertions
 // ==============================================================================
 
-/// Downcast column `$idx` to `$arr_ty` and assert `value(0)` equals `$expected`.
+/// Downcast column `$idx` to `$arr_ty` and assert row 0's value equals `$expected`.
 macro_rules! assert_col {
     ($batch:expr, $idx:expr, $arr_ty:ty, $expected:expr) => {
         assert_eq!(
@@ -393,39 +394,9 @@ fn assert_normal_values(sorted: &RecordBatch) {
     assert_col!(sorted, 3, Int64Array, 9_876_543_210i64); // p_long
     assert_col!(sorted, 4, Int16Array, 7i16); // p_short
     assert_col!(sorted, 5, Int8Array, 3i8); // p_byte
-    assert!(
-        (sorted
-            .column(6)
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap()
-            .value(0)
-            - 1.25f32)
-            .abs()
-            < f32::EPSILON,
-        "p_float mismatch"
-    );
-    assert!(
-        (sorted
-            .column(7)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0)
-            - 99.99f64)
-            .abs()
-            < f64::EPSILON,
-        "p_double mismatch"
-    );
-    assert!(
-        sorted
-            .column(8)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap()
-            .value(0),
-        "p_boolean should be true"
-    );
+    assert_col!(sorted, 6, Float32Array, 1.25f32); // p_float
+    assert_col!(sorted, 7, Float64Array, 99.99f64); // p_double
+    assert_col!(sorted, 8, BooleanArray, true); // p_boolean
     assert_col!(sorted, 9, Date32Array, date_to_days("2025-03-31")); // p_date
     assert_col!(sorted, 10, TimestampMicrosecondArray, ts); // p_timestamp
     assert_col!(sorted, 11, Decimal128Array, 12345); // p_decimal
@@ -503,7 +474,6 @@ fn read_sorted(
 }
 
 fn ts_to_micros(s: &str) -> i64 {
-    use chrono::{NaiveDateTime, TimeZone, Utc};
     let ndt = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").unwrap();
     Utc.from_utc_datetime(&ndt)
         .signed_duration_since(chrono::DateTime::UNIX_EPOCH)
@@ -512,7 +482,6 @@ fn ts_to_micros(s: &str) -> i64 {
 }
 
 fn date_to_days(s: &str) -> i32 {
-    use chrono::{NaiveDate, TimeZone, Utc};
     let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
     let dt = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap());
     dt.signed_duration_since(chrono::DateTime::UNIX_EPOCH)
