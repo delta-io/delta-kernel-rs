@@ -89,6 +89,7 @@
 //   multi-file support, but the current implementation only supports single-file checkpoints.
 use std::sync::{Arc, LazyLock, OnceLock};
 
+use itertools::Itertools;
 use tracing::info;
 
 use crate::action_reconciliation::log_replay::{
@@ -116,14 +117,53 @@ use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, 
 use url::Url;
 
 mod checkpoint_transform;
+mod sidecar;
+
+use sidecar::{SidecarSplitter, SingleSidecarDataIterator};
 
 use checkpoint_transform::{
     build_checkpoint_output_schema, build_checkpoint_read_schema, build_checkpoint_transform,
     StatsTransformConfig,
 };
-
 #[cfg(test)]
 mod tests;
+
+/// Schemas needed for checkpoint.
+struct CheckpointSchemaContext {
+    config: StatsTransformConfig,
+    base_schema: &'static StructType,
+    stats_schema: SchemaRef,
+    partition_schema: Option<SchemaRef>,
+    is_v2: bool,
+}
+
+pub(crate) const DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT: usize = 50_000;
+
+/// Specifies the checkpoint format and behavior.
+pub enum CheckpointSpec {
+    /// Write a V1 checkpoint.
+    V1,
+    /// Write a V2 checkpoint with the given configuration.
+    V2(V2CheckpointConfig),
+}
+
+/// Configuration for V2 checkpoints.
+pub enum V2CheckpointConfig {
+    /// Write a V2 checkpoint without sidecar files.
+    NoSidecar,
+    /// Write a V2 checkpoint with file actions split into sidecar parquet files.
+    WithSidecar {
+        /// Suggested number of file actions per sidecar file. When there are X file actions,
+        /// the number of sidecars will roughly be `X / file_actions_per_sidecar_hint`.
+        ///
+        /// This is a hint, not a strict limit, because file actions are stored in `EngineData`
+        /// batches that cannot be split. For example, if the hint is 99 but a single
+        /// `EngineData` batch contains 100 file actions, all 100 will be written to one sidecar.
+        ///
+        /// Defaults to `DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT` when `None`.
+        file_actions_per_sidecar_hint: Option<usize>,
+    },
+}
 
 /// Schema of the `_last_checkpoint` file
 /// We cannot use `LastCheckpointInfo::to_schema()` as it would include the 'checkpoint_schema'
@@ -262,6 +302,42 @@ impl CheckpointWriter {
         )
         .map(|parsed| parsed.location)
     }
+    /// Computes the checkpoint schema context from the snapshot and engine.
+    fn checkpoint_schema_context(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<CheckpointSchemaContext> {
+        let tc = self.snapshot.table_configuration();
+        let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
+
+        // Select schema based on V2 checkpoint support
+        let is_v2 = tc.is_feature_supported(&TableFeature::V2Checkpoint);
+        let base_schema = if is_v2 {
+            &CHECKPOINT_ACTIONS_SCHEMA_V2
+        } else {
+            &CHECKPOINT_ACTIONS_SCHEMA_V1
+        };
+
+        // Get clustering columns so they are always included in stats per the Delta protocol.
+        let physical_clustering_columns = self.snapshot.get_physical_clustering_columns(engine)?;
+
+        // Get stats schema from table configuration.
+        // This already excludes partition columns and applies column mapping.
+        let stats_schema = tc
+            .build_expected_stats_schemas(physical_clustering_columns.as_deref(), None)?
+            .physical;
+
+        // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
+        let partition_schema = tc.build_partition_values_parsed_schema();
+        Ok(CheckpointSchemaContext {
+            config,
+            base_schema,
+            stats_schema,
+            partition_schema,
+            is_v2,
+        })
+    }
+
     /// Returns the checkpoint data to be written to the checkpoint file.
     ///
     /// This method reads actions from the log segment, processes them for checkpoint creation,
@@ -294,35 +370,7 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
-        let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
-
-        // Get clustering columns so they are always included in stats per the Delta protocol.
-        let tc = self.snapshot.table_configuration();
-        let physical_clustering_columns = self.snapshot.get_physical_clustering_columns(engine)?;
-
-        // Get stats schema from table configuration.
-        // This already excludes partition columns and applies column mapping.
-        let stats_schema = tc
-            .build_expected_stats_schemas(physical_clustering_columns.as_deref(), None)?
-            .physical;
-
-        // Select schema based on V2 checkpoint support
-        let is_v2_checkpoints_supported = self
-            .snapshot
-            .table_configuration()
-            .is_feature_supported(&TableFeature::V2Checkpoint);
-
-        let base_schema = if is_v2_checkpoints_supported {
-            &CHECKPOINT_ACTIONS_SCHEMA_V2
-        } else {
-            &CHECKPOINT_ACTIONS_SCHEMA_V1
-        };
-
-        // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
-        let partition_schema = self
-            .snapshot
-            .table_configuration()
-            .build_partition_values_parsed_schema();
+        let schema_context = self.checkpoint_schema_context(engine)?;
 
         // The read schema and output schema differ because the transform needs access to
         // both stats formats as input, but may only write one format as output.
@@ -334,8 +382,11 @@ impl CheckpointWriter {
         //
         // output_schema: Only includes the stats fields that the table config requests
         // (e.g., only `stats` if writeStatsAsJson=true and writeStatsAsStruct=false).
-        let read_schema =
-            build_checkpoint_read_schema(base_schema, &stats_schema, partition_schema.as_deref())?;
+        let read_schema = build_checkpoint_read_schema(
+            schema_context.base_schema,
+            &schema_context.stats_schema,
+            schema_context.partition_schema.as_deref(),
+        )?;
 
         // Read actions from log segment
         let actions = self
@@ -352,17 +403,20 @@ impl CheckpointWriter {
 
         let output_schema = self.get_or_init_output_schema(|| {
             build_checkpoint_output_schema(
-                &config,
-                base_schema,
-                &stats_schema,
-                partition_schema.as_deref(),
+                &schema_context.config,
+                schema_context.base_schema,
+                &schema_context.stats_schema,
+                schema_context.partition_schema.as_deref(),
             )
         })?;
 
         // Build transform expression and create expression evaluator.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
-        let transform_expr =
-            build_checkpoint_transform(&config, &stats_schema, partition_schema.as_ref());
+        let transform_expr = build_checkpoint_transform(
+            &schema_context.config,
+            &schema_context.stats_schema,
+            schema_context.partition_schema.as_ref(),
+        );
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             read_schema,
             transform_expr,
@@ -384,7 +438,8 @@ impl CheckpointWriter {
         // For V2 checkpoints, chain the checkpoint metadata batch after the transformed
         // action stream. The metadata batch is created with the output schema directly,
         // bypassing the stats transform (it has no add actions to transform).
-        let checkpoint_metadata = is_v2_checkpoints_supported
+        let checkpoint_metadata = schema_context
+            .is_v2
             .then(|| self.create_checkpoint_metadata_batch(engine, &output_schema));
 
         Ok(ActionReconciliationIterator::new(Box::new(
@@ -519,6 +574,185 @@ impl CheckpointWriter {
             actions_count: 1,
             add_actions_count: 0,
         })
+    }
+
+    /// Creates a [`EngineData`] batch for each sidecar file that was written.
+    ///
+    /// Each returned batch contains a single row with the `sidecar` field populated and all
+    /// other action fields set to null. The sidecar struct schema is derived from the
+    /// checkpoint schema's sidecar field rather than hardcoded.
+    ///
+    /// # Parameters
+    /// - `engine`: Implementation of [`Engine`] apis.
+    /// - `checkpoint_data_schema`: The output checkpoint schema (must contain a `sidecar` struct field)
+    /// - `sidecar_metas`: Pairs of (relative sidecar filename, FileMeta) for each sidecar file
+    fn create_sidecar_action_batches(
+        &self,
+        engine: &dyn Engine,
+        checkpoint_data_schema: &SchemaRef,
+        sidecar_metas: &[(String, FileMeta)],
+    ) -> DeltaResult<Vec<Box<dyn EngineData>>> {
+        // Derive the sidecar struct schema from the checkpoint data schema
+        let sidecar_field = checkpoint_data_schema
+            .field(SIDECAR_NAME)
+            .ok_or_else(|| Error::internal_error("checkpoint schema missing sidecar field"))?;
+        let sidecar_struct = match sidecar_field.data_type() {
+            DataType::Struct(s) => s,
+            other => {
+                return Err(Error::internal_error(format!(
+                    "expected sidecar field to be struct, got {other:?}"
+                )));
+            }
+        };
+        let sidecar_fields: Vec<StructField> = sidecar_struct.fields().cloned().collect();
+
+        let null_row = engine
+            .evaluation_handler()
+            .null_row(checkpoint_data_schema.clone())?;
+
+        let mut batches = Vec::with_capacity(sidecar_metas.len());
+        // Construct [`EngineData`] batches for sidecar files.
+        for (filename, meta) in sidecar_metas {
+            let size_in_bytes = i64::try_from(meta.size).map_err(|e| {
+                Error::CheckpointWrite(format!(
+                    "Failed to convert sidecar size {} to i64: {e}",
+                    meta.size
+                ))
+            })?;
+
+            // Build scalar values matching the sidecar schema field order
+            let values: Vec<Scalar> = sidecar_fields
+                .iter()
+                .map(|field| match field.name().as_str() {
+                    "path" => Ok(Scalar::from(filename.clone())),
+                    "sizeInBytes" => Ok(Scalar::from(size_in_bytes)),
+                    "modificationTime" => Ok(Scalar::from(meta.last_modified)),
+                    // Sidecar tags are protocol details, can expose them if there is a need in the future.
+                    "tags" => Ok(Scalar::Null(field.data_type().clone())),
+                    other => Err(Error::CheckpointWrite(format!(
+                        "Unexpected sidecar field: {other}"
+                    ))),
+                })
+                .try_collect()?;
+
+            let sidecar_value =
+                Scalar::Struct(StructData::try_new(sidecar_fields.clone(), values)?);
+
+            let transform = Transform::new_top_level()
+                .with_replaced_field(SIDECAR_NAME, Arc::new(Expression::literal(sidecar_value)));
+            let evaluator = engine.evaluation_handler().new_expression_evaluator(
+                checkpoint_data_schema.clone(),
+                Arc::new(Expression::transform(transform)),
+                checkpoint_data_schema.clone().into(),
+            )?;
+            batches.push(evaluator.evaluate(null_row.as_ref())?);
+        }
+        Ok(batches)
+    }
+
+    /// Writes a V2 checkpoint with sidecar files.
+    ///
+    /// # Parameters
+    /// - `engine`: Engine for data processing and I/O
+    /// - `file_actions_per_sidecar_hint`: Approximate number of file actions per sidecar
+    pub(crate) fn write_checkpoint_with_sidecars(
+        self,
+        engine: &dyn Engine,
+        file_actions_per_sidecar_hint: usize,
+    ) -> DeltaResult<()> {
+        let output_schema = self.get_or_init_output_schema(|| {
+            let ctx = self.checkpoint_schema_context(engine)?;
+            build_checkpoint_output_schema(
+                &ctx.config,
+                ctx.base_schema,
+                &ctx.stats_schema,
+                ctx.partition_schema.as_deref(),
+            )
+        })?;
+        let data_iter = self.checkpoint_data(engine)?;
+        let iter_state = data_iter.state();
+
+        let splitter = SidecarSplitter::new_mut_shared(
+            data_iter,
+            engine.evaluation_handler().as_ref(),
+            output_schema.clone(),
+        )?;
+
+        // Write sidecar files
+        let sidecars_base = self.snapshot.log_segment().log_root.join("_sidecars/")?;
+
+        let mut sidecar_metas: Vec<(String, FileMeta)> = Vec::new();
+        loop {
+            let mut single_sidecar_iter =
+                SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?
+                    .peekable();
+            if single_sidecar_iter.peek().is_some() {
+                // Per the protocol, a checkpoint sidecar is a uniquely-named parquet
+                // file: `{unique}.parquet` where `unique` is some unique string such
+                // as a UUID.
+                // We use `<version>.checkpoint.<uuid>.parquet` here.
+                let filename = format!(
+                    "{:020}.checkpoint.{}.parquet",
+                    self.version,
+                    uuid::Uuid::new_v4()
+                );
+                // Per the protocol, sidecar path should be URI-encoded.
+                // All characters in the filename here are Unreserved Characters, so we can just retain them.
+                // Ref: https://www.ietf.org/rfc/rfc2396.txt
+                let sidecar_url = sidecars_base.join(&filename)?;
+                engine
+                    .parquet_handler()
+                    .write_parquet_file(sidecar_url.clone(), Box::new(single_sidecar_iter))?;
+                let meta = engine.storage_handler().head(&sidecar_url)?;
+                sidecar_metas.push((filename, meta));
+            }
+
+            let is_exhausted = splitter
+                .lock()
+                .map_err(|e| Error::internal_error(format!("sidecar splitter lock poisoned: {e}")))?
+                .is_exhausted();
+            if is_exhausted {
+                break;
+            }
+        }
+
+        // Collect non-file batches
+        let non_file_batches = Arc::into_inner(splitter)
+            .ok_or_else(|| {
+                Error::internal_error("sidecar splitter Arc should have no other references")
+            })?
+            .into_inner()
+            .map_err(|e| Error::internal_error(format!("sidecar splitter lock poisoned: {e}")))?
+            .into_non_file_batches();
+
+        // Create sidecar action rows for the main checkpoint file
+        let sidecar_batches =
+            self.create_sidecar_action_batches(engine, &output_schema, &sidecar_metas)?;
+
+        // Write main checkpoint file: non-file actions + sidecar references
+        let checkpoint_path = self.checkpoint_path()?;
+        let main_data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(non_file_batches.into_iter().chain(sidecar_batches).map(Ok));
+        engine
+            .parquet_handler()
+            .write_parquet_file(checkpoint_path.clone(), main_data)?;
+
+        let file_meta = engine.storage_handler().head(&checkpoint_path)?;
+        self.finalize(engine, &file_meta, &iter_state)
+    }
+
+    /// Writes a checkpoint (V1 or V2 without sidecars).
+    pub(crate) fn write_checkpoint_without_sidecars(self, engine: &dyn Engine) -> DeltaResult<()> {
+        let checkpoint_path = self.checkpoint_path()?;
+        let data_iter = self.checkpoint_data(engine)?;
+        let state = data_iter.state();
+        let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
+        engine
+            .parquet_handler()
+            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
+
+        let file_meta = engine.storage_handler().head(&checkpoint_path)?;
+        self.finalize(engine, &file_meta, &state)
     }
 }
 
