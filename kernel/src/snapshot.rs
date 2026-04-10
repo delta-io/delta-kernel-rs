@@ -333,8 +333,8 @@ impl Snapshot {
             },
             log_root,
             requested_version,
-            // Preserve last checkpoint metadata from old segment
-            old_log_segment.last_checkpoint_metadata.clone(),
+            // Preserve `_last_checkpoint` hint from old segment
+            old_log_segment.last_checkpoint_hint_summary(),
         )?;
 
         Ok(Arc::new(Snapshot::new_with_crc(
