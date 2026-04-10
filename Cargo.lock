@@ -1327,6 +1327,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "delta_kernel_default_engine"
+version = "0.20.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "delta_kernel",
+ "futures",
+ "hdfs-native-object-store",
+ "itertools 0.14.0",
+ "reqwest 0.13.2",
+ "rstest",
+ "serde_json",
+ "tempfile",
+ "test_utils",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "delta_kernel_derive"
 version = "0.20.0"
 dependencies = [
