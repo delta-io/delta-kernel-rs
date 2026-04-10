@@ -100,6 +100,7 @@ mod log_compaction;
 mod log_path;
 mod log_reader;
 pub mod metrics;
+pub mod partition;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -117,7 +118,7 @@ mod row_tracking;
 pub(crate) mod clustering;
 
 mod arrow_compat;
-#[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
+#[cfg(any(feature = "arrow-57", feature = "arrow-58"))]
 pub use arrow_compat::*;
 
 pub(crate) mod column_trie;

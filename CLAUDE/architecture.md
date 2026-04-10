@@ -28,7 +28,8 @@ properties, and version number.
 
 Built via `Snapshot::builder_for(url).build(engine)` (latest version) or
 `.at_version(v).build(engine)` (specific version). For catalog-managed tables,
-`.with_log_tail(commits)` supplies recent unpublished commits from the catalog.
+`.with_log_tail(commits)` supplies recent unpublished commits from the catalog and
+`.with_max_catalog_version(v)` caps the snapshot at the latest catalog-ratified version.
 
 **Snapshot loading internals:**
 1. **LogSegment** (`kernel/src/log_segment/`) -- discovers commits + checkpoints for the
@@ -140,8 +141,8 @@ all returned batches -- the engine may split a single file across multiple batch
 
 Tables whose commits go through a catalog (e.g. Unity Catalog) instead of direct filesystem
 writes. Kernel doesn't know about catalogs -- the catalog client provides a log tail via
-`SnapshotBuilder::with_log_tail()` and a custom `Committer` for staging/ratifying/publishing
-commits.
+`SnapshotBuilder::with_log_tail()`, caps the version via `with_max_catalog_version()`, and
+uses a custom `Committer` for staging/ratifying/publishing commits.
 
 The `UCCommitter` (in the `delta-kernel-unity-catalog` crate) is the reference implementation of a catalog
 committer for Unity Catalog. It stages commits to `_staged_commits/`, calls the UC commit API to

@@ -8,7 +8,7 @@ internals. Kernel never does I/O directly -- it defines _what_ to do via its API
 (`Snapshot`, `Scan`, `Transaction`) and delegates _how_ to the `Engine` trait.
 
 Current capabilities: table reads with predicates, data skipping, deletion vectors, change
-data feed, checkpoints (V1 & V2), log compaction, blind append writes, table creation
+data feed, checkpoints (V1 & V2), log compaction (disabled, #2337), blind append writes, table creation
 (including clustered tables), and catalog-managed table support.
 
 ## Build & Test Commands
@@ -153,9 +153,9 @@ is the source of truth. Key concepts:
   `allowColumnDefaults`, `changeDataFeed`, `identityColumns`, `rowTracking`,
   `domainMetadata`, `icebergCompatV1`, `icebergCompatV2`, `clustering`,
   `inCommitTimestamp`
-- Reader + writer: `columnMapping`, `deletionVectors`, `timestampNtz`,
-  `v2Checkpoint`, `vacuumProtocolCheck`, `variantType`, `variantType-preview`,
-  `typeWidening`
+- Reader + writer: `catalogManaged`, `catalogOwned-preview`, `columnMapping`,
+  `deletionVectors`, `timestampNtz`, `v2Checkpoint`, `vacuumProtocolCheck`,
+  `variantType`, `variantType-preview`, `typeWidening`
 
 Keep this list updated when new protocol features are added to kernel.
 

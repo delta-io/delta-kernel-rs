@@ -383,6 +383,8 @@ impl ParsedLogPath<Url> {
     }
 
     /// Create a new ParsedLogPath<Url> for a log compaction file
+    // TODO(#2337): remove allow(dead_code) when log compaction is re-enabled
+    #[allow(dead_code)]
     pub(crate) fn new_log_compaction(
         table_root: &Url,
         start_version: Version,
@@ -475,7 +477,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::Commit);
@@ -492,7 +494,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::StagedCommit);
@@ -506,7 +508,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::Crc);
