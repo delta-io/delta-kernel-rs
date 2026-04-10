@@ -357,8 +357,9 @@ impl Snapshot {
         );
 
         // Replay only the new commits (> existing_snapshot_version) for P&M, excluding the
-        // checkpoint. Skip a stale CRC (at or below existing_snapshot_version): its Case 2(b)
-        // fallback could return P&M that predates changes already in the existing snapshot.
+        // checkpoint. Skip a stale CRC (at or below existing_snapshot_version): if no P&M is
+        // found in the pruned replay, read_protocol_metadata_opt falls back to the CRC's P&M,
+        // which could predate changes already in the existing snapshot.
         let (new_metadata, new_protocol) = {
             let no_crc = LazyCrc::new(None);
             let crc: &LazyCrc = if lazy_crc
