@@ -29,7 +29,7 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, PathMode};
 use tempfile::TempDir;
 
 use test_utils::set_json_value;
@@ -1313,6 +1313,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
             Some(write_context.stats_columns()),
+            PathMode::Relative,
         )
         .await?;
 
@@ -1487,6 +1488,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
             Some(write_context.stats_columns()),
+            PathMode::Relative,
         )
         .await?;
 
@@ -3948,6 +3950,219 @@ async fn test_clustered_table_write_has_stats_parsed(
     assert_eq!(stats_rows.len(), 2, "should have stats_parsed for 2 files");
     assert_eq!(stats_rows[0], (1, 3, "st1".to_string(), "st3".to_string()));
     assert_eq!(stats_rows[1], (4, 6, "st4".to_string(), "st6".to_string()));
+
+    Ok(())
+}
+
+// -- PathMode tests --
+
+fn get_simple_schema() -> SchemaRef {
+    Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap())
+}
+
+fn simple_id_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow().unwrap()),
+        vec![Arc::new(Int32Array::from(values))],
+    )
+    .unwrap()
+}
+
+/// Helper to write a batch with a specific PathMode and return the post-commit snapshot.
+async fn write_with_path_mode(
+    snapshot: &Arc<Snapshot>,
+    engine: &DefaultEngine<TokioBackgroundExecutor>,
+    data: RecordBatch,
+    path_mode: PathMode,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .with_engine_info("test")
+        .with_path_mode(path_mode);
+    let write_context = txn.get_write_context();
+    let add_meta = engine
+        .write_parquet(&ArrowEngineData::new(data), &write_context, HashMap::new())
+        .await?;
+    txn.add_files(add_meta);
+    match txn.commit(engine)? {
+        CommitResult::CommittedTransaction(c) => Ok(c.post_commit_snapshot().unwrap().clone()),
+        _ => panic!("commit should succeed"),
+    }
+}
+
+#[rstest::rstest]
+#[case::relative(PathMode::Relative)]
+#[case::absolute(PathMode::Absolute)]
+#[tokio::test]
+async fn test_path_mode_write_format_and_readback(
+    #[case] path_mode: PathMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    let snapshot = write_with_path_mode(
+        &snapshot,
+        engine.as_ref(),
+        simple_id_batch(&schema, vec![1, 2, 3]),
+        path_mode,
+    )
+    .await?;
+
+    // Verify path format in the log
+    let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
+    assert_eq!(add_infos.len(), 1);
+    let path = &add_infos[0].path;
+    match path_mode {
+        PathMode::Relative => assert!(
+            !path.contains("://"),
+            "Relative mode should write relative paths, got: {path}"
+        ),
+        PathMode::Absolute => assert!(
+            path.contains("://"),
+            "Absolute mode should write absolute URLs, got: {path}"
+        ),
+    }
+
+    // Verify data is readable via scan
+    let scan = snapshot.scan_builder().build()?;
+    let engine_ref: Arc<dyn Engine> = engine;
+    let batches = test_utils::read_scan(&scan, engine_ref)?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 3);
+
+    Ok(())
+}
+
+#[test]
+fn test_write_context_propagates_path_mode() -> DeltaResult<()> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    // Default should be Relative
+    let txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    assert_eq!(txn.get_write_context().path_mode(), PathMode::Relative);
+
+    // Explicit Absolute should propagate
+    let txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_path_mode(PathMode::Absolute);
+    assert_eq!(txn.get_write_context().path_mode(), PathMode::Absolute);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_multiple_files_in_commit_all_use_relative_paths(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("test");
+    let write_context = txn.get_write_context();
+    for values in [vec![1, 2], vec![3, 4]] {
+        let add_meta = engine
+            .write_parquet(
+                &ArrowEngineData::new(simple_id_batch(&schema, values)),
+                &write_context,
+                HashMap::new(),
+            )
+            .await?;
+        txn.add_files(add_meta);
+    }
+    let snapshot = match txn.commit(engine.as_ref())? {
+        CommitResult::CommittedTransaction(c) => c.post_commit_snapshot().unwrap().clone(),
+        _ => panic!("commit should succeed"),
+    };
+
+    let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
+    assert_eq!(add_infos.len(), 2);
+    for info in &add_infos {
+        assert!(
+            !info.path.contains("://"),
+            "Expected relative path, got: {}",
+            info.path
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_multiple_commits_with_relative_paths_all_readable(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let mut snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    for values in [vec![1, 2], vec![3, 4], vec![5, 6]] {
+        snapshot = write_batch_to_table(
+            &snapshot,
+            engine.as_ref(),
+            simple_id_batch(&schema, values),
+            HashMap::new(),
+        )
+        .await?;
+    }
+
+    let scan = snapshot.scan_builder().build()?;
+    let engine_ref: Arc<dyn Engine> = engine;
+    let batches = test_utils::read_scan(&scan, engine_ref)?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 6);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_table_with_data_writes_relative_paths(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+
+    let mut txn = create_table_txn(table_url.as_str(), schema.clone(), "test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let write_context = txn.get_write_context();
+    let add_meta = engine
+        .write_parquet(
+            &ArrowEngineData::new(simple_id_batch(&schema, vec![10, 20])),
+            &write_context,
+            HashMap::new(),
+        )
+        .await?;
+    txn.add_files(add_meta);
+    let snapshot = match txn.commit(engine.as_ref())? {
+        CommitResult::CommittedTransaction(c) => c.post_commit_snapshot().unwrap().clone(),
+        _ => panic!("commit should succeed"),
+    };
+
+    let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
+    assert_eq!(add_infos.len(), 1);
+    assert!(
+        !add_infos[0].path.contains("://"),
+        "Expected relative path, got: {}",
+        add_infos[0].path
+    );
+
+    // Verify data is readable
+    let scan = snapshot.scan_builder().build()?;
+    let engine_ref: Arc<dyn Engine> = engine;
+    let batches = test_utils::read_scan(&scan, engine_ref)?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
 
     Ok(())
 }

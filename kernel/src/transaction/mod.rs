@@ -60,6 +60,28 @@ mod write_context;
 use stats_verifier::StatsVerifier;
 pub use write_context::WriteContext;
 
+/// Controls how file paths are stored in the Delta log for add/remove actions.
+///
+/// The Delta protocol allows both relative and absolute paths in file actions. This setting
+/// determines which form kernel writes when committing a transaction.
+///
+/// The path mode should be consistent within a table's lifetime. Mixing relative and absolute
+/// paths across commits can cause incorrect log replay, since file action deduplication uses
+/// raw path string comparison.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PathMode {
+    /// Store paths relative to the table root (e.g. `abc.parquet`).
+    ///
+    /// This is the default and matches the convention used by Spark and most Delta
+    /// implementations. Relative paths are resolved against [`Scan::table_root()`] at read time.
+    ///
+    /// [`Scan::table_root()`]: crate::scan::Scan::table_root
+    #[default]
+    Relative,
+    /// Store absolute URLs (e.g. `s3://bucket/table/abc.parquet`).
+    Absolute,
+}
+
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
@@ -232,6 +254,8 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
+    // Controls whether file paths in the Delta log are stored as relative or absolute.
+    path_mode: PathMode,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -432,6 +456,23 @@ impl<S> Transaction<S> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Set how file paths are stored in the Delta log for add and remove actions.
+    ///
+    /// Defaults to [`PathMode::Relative`], which stores paths relative to the table root.
+    /// Use [`PathMode::Absolute`] to store full URLs in the log.
+    pub fn with_path_mode(mut self, path_mode: PathMode) -> Self {
+        self.path_mode = path_mode;
+        self
+    }
+
+    /// Same as [`Transaction::with_path_mode`] but set the value directly instead of
+    /// using a fluent API.
+    #[internal_api]
+    #[allow(dead_code)] // used in FFI
+    pub(crate) fn set_path_mode(&mut self, path_mode: PathMode) {
+        self.path_mode = path_mode;
     }
 
     /// Set the data change flag.
@@ -797,6 +838,7 @@ impl<S> Transaction<S> {
             Arc::new(logical_to_physical),
             column_mapping_mode,
             stats_columns,
+            self.path_mode,
         )
     }
 
