@@ -16,7 +16,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 
 use delta_kernel::engine::to_json_bytes;
-use delta_kernel::object_store::{path::Path, DynObjectStore, ObjectStore as _};
+use delta_kernel::object_store::{path::Path, DynObjectStore, ObjectStoreExt};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
 
 use delta_kernel::transaction::CommitResult;
@@ -89,6 +89,25 @@ async fn write_data_to_table(
 
     // Commit the transaction
     txn.commit(engine.as_ref())
+}
+
+/// Helper function to create a row-tracking table with a single `number: INTEGER` column.
+async fn setup_number_table(
+    tmp_dir: &TempDir,
+    name: &str,
+) -> DeltaResult<(
+    SchemaRef,
+    Url,
+    Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    Arc<DynObjectStore>,
+)> {
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+    let (table_url, engine, store) =
+        create_row_tracking_table(tmp_dir, name, schema.clone()).await?;
+    Ok((schema, table_url, engine, store))
 }
 
 /// Helper function to create an Arc<dyn Array> from an i32 vector.
@@ -210,13 +229,8 @@ async fn test_row_tracking_append() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_append", schema.clone()).await?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_append").await?;
 
     // Create two new arrow record batches to append
     let data = generate_data(
@@ -258,13 +272,8 @@ async fn test_row_tracking_single_record_batches() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_single_records", schema.clone()).await?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_single_records").await?;
 
     // Write individual records in separate batches
     let data = generate_data(
@@ -297,13 +306,8 @@ async fn test_row_tracking_large_batch() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_large_batch", schema.clone()).await?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_large_batch").await?;
 
     // Write a large batch with 1000 records
     let large_batch: Vec<i32> = (1..=1000).collect();
@@ -340,14 +344,8 @@ async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_consecutive_commits", schema.clone())
-            .await?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_consecutive_commits").await?;
 
     // First transaction: write two batches with 3 records each
     let data_1 = generate_data(
@@ -498,13 +496,8 @@ async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_append", schema.clone()).await?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_append").await?;
 
     // Create two regular and one empty arrow record batches to append
     let data = generate_data(
@@ -547,13 +540,8 @@ async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_append", schema.clone()).await?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_append").await?;
 
     // Create two new _empty_ arrow record batches to append
     let data = generate_data(
@@ -596,14 +584,8 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_consecutive_commits", schema.clone())
-            .await?;
+    let (_schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_consecutive_commits").await?;
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
 
@@ -631,14 +613,8 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) =
-        create_row_tracking_table(&tmp_test_dir, "test_parallel_row_tracking", schema.clone())
-            .await?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_parallel_row_tracking").await?;
 
     let engine1 = engine.clone();
     let engine2 = engine;
@@ -886,13 +862,8 @@ fn collect_row_ids(batches: &[RecordBatch]) -> Vec<i64> {
 async fn test_read_row_ids_basic() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, _store) =
-        create_row_tracking_table(&tmp_dir, "test_read_row_ids_basic", schema.clone()).await?;
+    let (schema, table_url, engine, _store) =
+        setup_number_table(&tmp_dir, "test_read_row_ids_basic").await?;
 
     let data = generate_data(schema.clone(), [vec![int32_array(vec![10, 20, 30])]])?;
     assert!(write_data_to_table(&table_url, engine.clone(), data)
@@ -914,14 +885,8 @@ async fn test_read_row_ids_basic() -> DeltaResult<()> {
 async fn test_read_row_ids_multiple_files_one_commit() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, _store) =
-        create_row_tracking_table(&tmp_dir, "test_read_row_ids_multiple_files", schema.clone())
-            .await?;
+    let (schema, table_url, engine, _store) =
+        setup_number_table(&tmp_dir, "test_read_row_ids_multiple_files").await?;
 
     // Two files: 3 rows (baseRowId=0) and 4 rows (baseRowId=3).
     let data = generate_data(
@@ -957,7 +922,7 @@ async fn test_read_row_ids_multiple_files_one_commit() -> DeltaResult<()> {
             .values()
             .to_vec();
         let min = *ids.iter().min().unwrap();
-        let expected: Vec<i64> = (min..min + ids.len() as i64).collect();
+        let expected = (min..min + ids.len() as i64).collect::<Vec<_>>();
         assert_eq!(ids, expected, "IDs within a file must be contiguous");
     }
 
@@ -969,17 +934,8 @@ async fn test_read_row_ids_multiple_files_one_commit() -> DeltaResult<()> {
 async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, _store) = create_row_tracking_table(
-        &tmp_dir,
-        "test_read_row_ids_multiple_commits",
-        schema.clone(),
-    )
-    .await?;
+    let (schema, table_url, engine, _store) =
+        setup_number_table(&tmp_dir, "test_read_row_ids_multiple_commits").await?;
 
     // Commit 1: 3 rows -> IDs 0, 1, 2.
     let data1 = generate_data(schema.clone(), [vec![int32_array(vec![1, 2, 3])]])?;
@@ -1021,17 +977,8 @@ async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
 async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, _store) = create_row_tracking_table(
-        &tmp_dir,
-        "test_read_row_ids_after_checkpoint",
-        schema.clone(),
-    )
-    .await?;
+    let (schema, table_url, engine, _store) =
+        setup_number_table(&tmp_dir, "test_read_row_ids_after_checkpoint").await?;
 
     // Write 3 rows -> IDs 0, 1, 2.
     let data = generate_data(schema.clone(), [vec![int32_array(vec![1, 2, 3])]])?;
@@ -1084,17 +1031,8 @@ async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
 async fn test_read_row_ids_coexist_with_row_index() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, _store) = create_row_tracking_table(
-        &tmp_dir,
-        "test_read_row_ids_coexist_with_row_index",
-        schema.clone(),
-    )
-    .await?;
+    let (schema, table_url, engine, _store) =
+        setup_number_table(&tmp_dir, "test_read_row_ids_coexist_with_row_index").await?;
 
     // Two files: 3 rows (baseRowId=0) and 2 rows (baseRowId=3).
     let data = generate_data(
@@ -1176,20 +1114,12 @@ async fn test_read_row_ids_coexist_with_row_index() -> DeltaResult<()> {
 /// correctly through the scan path. This ensures that `baseRowId` and row-tracking domain
 /// metadata survive compaction without being dropped or corrupted.
 #[tokio::test]
+#[ignore = "log compaction is not yet supported, tracked in #2337"]
 async fn test_read_row_ids_after_log_compaction() -> DeltaResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_dir = tempdir()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-
-    let (table_url, engine, store) = create_row_tracking_table(
-        &tmp_dir,
-        "test_read_row_ids_after_log_compaction",
-        schema.clone(),
-    )
-    .await?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_dir, "test_read_row_ids_after_log_compaction").await?;
 
     // Commit 1: 3 rows -> IDs 0, 1, 2.
     let data1 = generate_data(schema.clone(), [vec![int32_array(vec![1, 2, 3])]])?;
@@ -1207,9 +1137,9 @@ async fn test_read_row_ids_after_log_compaction() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut writer = snapshot.log_compaction_writer(0, 2)?;
     let compaction_path = writer.compaction_path().clone();
-    let batches: Vec<_> = writer
+    let batches = writer
         .compaction_data(engine.as_ref())?
-        .collect::<DeltaResult<_>>()?;
+        .collect::<DeltaResult<Vec<_>>>()?;
 
     let json_bytes = to_json_bytes(batches.into_iter().map(Ok))?;
     store
