@@ -734,8 +734,8 @@ impl ParquetStatsProvider for MinStatsValue {
         Some(0)
     }
 
-    fn get_parquet_rowcount_stat(&self) -> i64 {
-        1
+    fn get_parquet_rowcount_stat(&self) -> Option<i64> {
+        Some(1)
     }
 }
 
@@ -839,8 +839,8 @@ impl ParquetStatsProvider for OneStatsValue {
         Some(nullcount)
     }
 
-    fn get_parquet_rowcount_stat(&self) -> i64 {
-        1
+    fn get_parquet_rowcount_stat(&self) -> Option<i64> {
+        Some(1)
     }
 }
 
@@ -1007,11 +1007,13 @@ fn test_sql_where() {
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    // NULL allows static skipping under SQL semantics
+    // NULL literal is treated as unknown (not false) under eval_sql_where, so it does not
+    // force static skipping. This prevents incorrect pruning when indirect data skipping
+    // rewriters use NULL as a sentinel for unsupported predicate arms.
     let pred = &Pred::and(NULL, Pred::lt(col.clone(), VAL));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
-    expect_eq!(empty_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Contrast normal vs. SQL WHERE semantics - comparison inside AND inside AND
     let pred = &Pred::and(TRUE, Pred::and(TRUE, Pred::lt(col.clone(), VAL)));

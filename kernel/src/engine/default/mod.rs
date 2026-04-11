@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt as _};
 use itertools::Itertools as _;
-use object_store::DynObjectStore;
 use url::Url;
 
 use self::executor::TaskExecutor;
@@ -22,6 +21,7 @@ use self::parquet::DefaultParquetHandler;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
+use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
@@ -86,6 +86,64 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
 
+// TODO: reimplement using tracing spans instead of reporter
+// /// Wraps a [`FileDataReadResultIterator`] to emit a [`MetricEvent`] exactly once when the
+// /// iterator is either exhausted or dropped. Used by JSON and Parquet handlers to report
+// /// the number of files and bytes requested per `read_*_files` call.
+// pub(super) struct ReadMetricsIterator {
+//     inner: crate::FileDataReadResultIterator,
+//     reporter: Arc<dyn crate::metrics::MetricsReporter>,
+//     num_files: u64,
+//     bytes_read: u64,
+//     emitted: bool,
+//     make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
+// }
+//
+// impl ReadMetricsIterator {
+//     pub(super) fn new(
+//         inner: crate::FileDataReadResultIterator,
+//         reporter: Arc<dyn crate::metrics::MetricsReporter>,
+//         num_files: u64,
+//         bytes_read: u64,
+//         make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
+//     ) -> Self {
+//         Self {
+//             inner,
+//             reporter,
+//             num_files,
+//             bytes_read,
+//             emitted: false,
+//             make_event,
+//         }
+//     }
+//
+//     fn emit_once(&mut self) {
+//         if !self.emitted {
+//             self.emitted = true;
+//             self.reporter
+//                 .report((self.make_event)(self.num_files, self.bytes_read));
+//         }
+//     }
+// }
+//
+// impl Iterator for ReadMetricsIterator {
+//     type Item = crate::DeltaResult<Box<dyn crate::EngineData>>;
+//
+//     fn next(&mut self) -> Option<Self::Item> {
+//         let item = self.inner.next();
+//         if item.is_none() {
+//             self.emit_once();
+//         }
+//         item
+//     }
+// }
+//
+// impl Drop for ReadMetricsIterator {
+//     fn drop(&mut self) {
+//         self.emit_once();
+//     }
+// }
+
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
@@ -104,7 +162,7 @@ pub struct DefaultEngine<E: TaskExecutor> {
 /// # use std::sync::Arc;
 /// # use delta_kernel::engine::default::DefaultEngineBuilder;
 /// # use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-/// # use object_store::local::LocalFileSystem;
+/// # use delta_kernel::object_store::local::LocalFileSystem;
 /// // Build a DefaultEngine with default executor
 /// let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
 ///     .build();
@@ -173,10 +231,14 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             json: Arc::new(DefaultJsonHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
+            // TODO: reimplement using tracing spans instead of reporter
+            // .with_reporter(metrics_reporter.clone()),
             )),
             parquet: Arc::new(DefaultParquetHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
+            // TODO: reimplement using tracing spans instead of reporter
+            // .with_reporter(metrics_reporter.clone()),
             )),
             object_store,
             task_executor,
@@ -300,7 +362,7 @@ impl UrlExt for Url {
 mod tests {
     use super::*;
     use crate::engine::tests::test_arrow_engine;
-    use object_store::local::LocalFileSystem;
+    use crate::object_store::local::LocalFileSystem;
 
     #[test]
     fn test_default_engine() {

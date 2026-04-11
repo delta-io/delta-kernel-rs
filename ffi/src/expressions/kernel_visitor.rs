@@ -1,14 +1,20 @@
 //! Defines [`KernelExpressionVisitorState`]. This is a visitor that can be used to convert an
 //! engine's native expressions into kernel's [`Expression`] and [`Predicate`] types.
-use crate::{
-    AllocateErrorFn, EngineIterator, ExternResult, IntoExternResult, KernelStringSlice,
-    ReferenceSet, TryFromStringSlice,
-};
+use std::sync::Arc;
+
 use delta_kernel::expressions::{
     BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, Predicate, Scalar,
     UnaryPredicateOp,
 };
 use delta_kernel::DeltaResult;
+
+use crate::expressions::{SharedExpression, SharedPredicate};
+use crate::handle::Handle;
+use crate::scan::{EngineExpression, EnginePredicate};
+use crate::{
+    AllocateErrorFn, EngineIterator, ExternResult, IntoExternResult, KernelStringSlice,
+    ReferenceSet, TryFromStringSlice,
+};
 
 pub(crate) enum ExpressionOrPredicate {
     Expression(Expression),
@@ -452,10 +458,16 @@ pub extern "C" fn visit_expression_struct(
     wrap_expression(state, Expression::struct_from(exprs))
 }
 
-use crate::expressions::{SharedExpression, SharedPredicate};
-use crate::handle::Handle;
-use crate::scan::{EngineExpression, EnginePredicate};
-use std::sync::Arc;
+/// Visit a MapToStruct expression. The `child_expr` is the map expression.
+#[no_mangle]
+pub extern "C" fn visit_expression_map_to_struct(
+    state: &mut KernelExpressionVisitorState,
+    child_expr: usize,
+) -> usize {
+    unwrap_kernel_expression(state, child_expr).map_or(0, |expr| {
+        wrap_expression(state, Expression::map_to_struct(expr))
+    })
+}
 
 /// Convert an engine expression to a kernel expression using the visitor
 /// pattern.
@@ -480,8 +492,7 @@ fn visit_engine_expression_impl(
 
     let expr = unwrap_kernel_expression(&mut visitor_state, expr_id).ok_or_else(|| {
         delta_kernel::Error::generic(format!(
-            "Invalid expression ID {} returned from engine visitor",
-            expr_id
+            "Invalid expression ID {expr_id} returned from engine visitor"
         ))
     })?;
 
@@ -511,8 +522,7 @@ fn visit_engine_predicate_impl(
 
     let pred = unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
         delta_kernel::Error::generic(format!(
-            "Invalid predicate ID {} returned from engine visitor",
-            pred_id
+            "Invalid predicate ID {pred_id} returned from engine visitor"
         ))
     })?;
 

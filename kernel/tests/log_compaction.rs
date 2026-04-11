@@ -2,19 +2,19 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use delta_kernel::engine::to_json_bytes;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::Snapshot;
 use test_utils::{create_table, engine_store_setup};
 
-use object_store::path::Path;
-use object_store::ObjectStore;
 use url::Url;
 
-/// Convert a URL to an object_store::Path
+/// Convert a URL to a `delta_kernel::object_store::Path`
 fn url_to_object_store_path(url: &Url) -> Result<Path, Box<dyn std::error::Error>> {
     let path_segments = url
         .path_segments()
-        .ok_or_else(|| format!("URL has no path segments: {}", url))?;
+        .ok_or_else(|| format!("URL has no path segments: {url}"))?;
 
     let path_string = path_segments.skip(1).collect::<Vec<_>>().join("/");
 
@@ -22,6 +22,7 @@ fn url_to_object_store_path(url: &Url) -> Result<Path, Box<dyn std::error::Error
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -64,10 +65,9 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
         .unwrap()
         .as_millis() as i64;
     let commit2_content = format!(
-        r#"{{"commitInfo":{{"timestamp":{},"operation":"DELETE","operationParameters":{{"predicate":"id <= 10"}},"isBlindAppend":false}}}}
-{{"remove":{{"path":"part-00000-file1.parquet","partitionValues":{{}},"size":1024,"modificationTime":1587968586000,"dataChange":true,"deletionTimestamp":{}}}}}
-"#,
-        current_timestamp_millis, current_timestamp_millis
+        r#"{{"commitInfo":{{"timestamp":{current_timestamp_millis},"operation":"DELETE","operationParameters":{{"predicate":"id <= 10"}},"isBlindAppend":false}}}}
+{{"remove":{{"path":"part-00000-file1.parquet","partitionValues":{{}},"size":1024,"modificationTime":1587968586000,"dataChange":true,"deletionTimestamp":{current_timestamp_millis}}}}}
+"#
     );
     store
         .put(
@@ -187,10 +187,7 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     let actual_deletion_timestamp = parsed_remove["remove"]["deletionTimestamp"]
         .as_i64()
         .ok_or_else(|| {
-            format!(
-                "deletionTimestamp should be present in remove action: {}",
-                remove_line
-            )
+            format!("deletionTimestamp should be present in remove action: {remove_line}")
         })?;
     assert_eq!(actual_deletion_timestamp, current_timestamp_millis);
 
@@ -199,6 +196,7 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
 
 /// Test log compaction behavior with expired tombstones.
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -390,8 +388,7 @@ async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>>
         .as_i64()
         .ok_or_else(|| {
             format!(
-                "deletionTimestamp should be present in recent remove action: {}",
-                recent_remove_line
+                "deletionTimestamp should be present in recent remove action: {recent_remove_line}"
             )
         })?;
     assert_eq!(actual_deletion_timestamp, recent_timestamp);
@@ -402,8 +399,7 @@ async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>>
         .count();
     assert!(
         total_actions >= 4,
-        "Should have at least 4 actions: protocol, metadata, 1 add, 1 remove (recent). Found {}",
-        total_actions
+        "Should have at least 4 actions: protocol, metadata, 1 add, 1 remove (recent). Found {total_actions}"
     );
     Ok(())
 }

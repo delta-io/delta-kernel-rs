@@ -241,12 +241,11 @@ pub struct ArrowEvaluationHandler;
 impl EvaluationHandler for ArrowEvaluationHandler {
     fn new_expression_evaluator(
         &self,
-        schema: SchemaRef,
+        _schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
     ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
         Ok(Arc::new(DefaultExpressionEvaluator {
-            input_schema: schema,
             expression,
             output_type,
         }))
@@ -254,13 +253,10 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 
     fn new_predicate_evaluator(
         &self,
-        schema: SchemaRef,
+        _schema: SchemaRef,
         predicate: PredicateRef,
     ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
-        Ok(Arc::new(DefaultPredicateEvaluator {
-            input_schema: schema,
-            predicate,
-        }))
+        Ok(Arc::new(DefaultPredicateEvaluator { predicate }))
     }
 
     /// Create a single-row array with all-null leaf values. Note that if a nested struct is
@@ -275,11 +271,64 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into_arrow()?), arrays)?;
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
+
+    fn create_many(
+        &self,
+        schema: SchemaRef,
+        rows: &[&[Scalar]],
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
+        if rows.is_empty() {
+            return Ok(Box::new(ArrowEngineData::new(RecordBatch::new_empty(
+                arrow_schema,
+            ))));
+        }
+
+        let num_rows = rows.len();
+        let num_fields = schema.fields().len();
+        for (row_idx, row) in rows.iter().enumerate() {
+            if row.len() != num_fields {
+                return Err(Error::generic(format!(
+                    "Row {} has {} scalars but schema has {} fields",
+                    row_idx,
+                    row.len(),
+                    num_fields
+                )));
+            }
+        }
+
+        let mut builders: Vec<Box<dyn ArrayBuilder>> = arrow_schema
+            .fields()
+            .iter()
+            .map(|field| array::make_builder(field.data_type(), num_rows))
+            .collect();
+
+        let fields: Vec<_> = schema.fields().collect();
+        for (col_idx, builder) in builders.iter_mut().enumerate() {
+            let field_name = fields[col_idx].name();
+            for (row_idx, row) in rows.iter().enumerate() {
+                row[col_idx].append_to(builder.as_mut(), 1).map_err(|e| {
+                    Error::generic(format!(
+                        "Row {row_idx}, field '{field_name}' \
+                            (expected type {}, got {}): {e}",
+                        fields[col_idx].data_type(),
+                        row[col_idx].data_type()
+                    ))
+                })?;
+            }
+        }
+
+        let arrays: Vec<ArrayRef> = builders.into_iter().map(|mut b| b.finish()).collect();
+
+        Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
+            arrow_schema,
+            arrays,
+        )?)))
+    }
 }
 
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
-    input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
 }
@@ -288,16 +337,6 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
         let batch = extract_record_batch(batch)?;
-        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
-        // TODO: make sure we have matching schemas for validation
-        // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
-        //         "input schema does not match batch schema: {:?} != {:?}",
-        //         input_schema,
-        //         batch.schema()
-        //     )));
-        // };
-
         let batch = match (self.expression.as_ref(), &self.output_type) {
             (Expression::Transform(transform), DataType::Struct(_)) if transform.is_identity() => {
                 // Empty transform optimization: Skip expression evaluation and directly apply the
@@ -328,7 +367,6 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 
 #[derive(Debug)]
 pub struct DefaultPredicateEvaluator {
-    input_schema: SchemaRef,
     predicate: PredicateRef,
 }
 
@@ -336,15 +374,6 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
         let batch = extract_record_batch(batch)?;
-        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
-        // TODO: make sure we have matching schemas for validation
-        // if batch.schema().as_ref() != &input_schema {
-        //     return Err(Error::Generic(format!(
-        //         "input schema does not match batch schema: {:?} != {:?}",
-        //         input_schema,
-        //         batch.schema()
-        //     )));
-        // };
         let array = evaluate_predicate(&self.predicate, batch, false)?;
         let schema = ArrowSchema::new(vec![ArrowField::new(
             "output",

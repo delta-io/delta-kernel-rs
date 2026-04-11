@@ -5,7 +5,7 @@ use delta_kernel_ffi_macros::handle_descriptor;
 
 use std::sync::Arc;
 
-use super::ExclusiveTransaction;
+use super::{ExclusiveCreateTransaction, ExclusiveTransaction};
 
 /// A [`WriteContext`] that provides schema and path information needed for writing data.
 /// This is a shared reference that can be cloned and used across multiple consumers.
@@ -14,8 +14,8 @@ use super::ExclusiveTransaction;
 #[handle_descriptor(target=WriteContext, mutable=false, sized=true)]
 pub struct SharedWriteContext;
 
-/// Gets the write context from a transaction. The write context provides schema and path information
-/// needed for writing data.
+/// Gets the write context from a transaction. The write context provides schema and path
+/// information needed for writing data.
 ///
 /// # Safety
 ///
@@ -23,6 +23,20 @@ pub struct SharedWriteContext;
 #[no_mangle]
 pub unsafe extern "C" fn get_write_context(
     txn: Handle<ExclusiveTransaction>,
+) -> Handle<SharedWriteContext> {
+    let txn = unsafe { txn.as_ref() };
+    Arc::new(txn.get_write_context()).into()
+}
+
+/// Gets the write context from a create-table transaction. The write context provides schema
+/// and path information needed for writing data.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a [valid][Handle#Validity] transaction handle.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_get_write_context(
+    txn: Handle<ExclusiveCreateTransaction>,
 ) -> Handle<SharedWriteContext> {
     let txn = unsafe { txn.as_ref() };
     Arc::new(txn.get_write_context()).into()

@@ -1,5 +1,9 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
+pub mod counting_reporter;
+pub mod table_builder;
+pub use counting_reporter::CountingReporter;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,17 +25,18 @@ use delta_kernel::engine::default::executor::tokio::{
 use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::object_store::{path::Path, DynObjectStore};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
+use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot};
 
 use itertools::Itertools;
-use object_store::local::LocalFileSystem;
-use object_store::memory::InMemory;
-use object_store::{path::Path, ObjectStore};
 use serde_json::{json, to_vec, Deserializer};
 use std::sync::Mutex;
 use tracing::subscriber::DefaultGuard;
@@ -100,10 +105,37 @@ pub const METADATA_WITH_PARTITION_COLS: &str = r#"{"commitInfo":{"timestamp":158
 {"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
 {"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["val"],"configuration":{},"createdTime":1587968585495}}"#;
 
+/// Like [`METADATA`] but with non-empty table properties including `delta.appendOnly` and `custom.key`.
+pub const METADATA_WITH_TABLE_PROPERTIES: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
+{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.appendOnly":"true","custom.key":"custom_value"},"createdTime":1587968585495}}"#;
+
+/// Like [`METADATA`] but with table-features protocol (v3/v7) including columnMapping (reader)
+/// and columnMapping + rowTracking (writer). Metadata includes a table name and column mapping
+/// configuration.
+pub const METADATA_WITH_FEATURES: &str = concat!(
+    r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
+    "\n",
+    r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping","domainMetadata","rowTracking"]}}"#,
+    "\n",
+    r#"{"metaData":{"id":"deadbeef-1234-5678-abcd-000000000000","name":"test_table","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.rowTracking.enabled":"true","delta.rowTracking.materializedRowIdColumnName":"_row_id","delta.rowTracking.materializedRowCommitVersionColumnName":"_row_commit_version"},"createdTime":1234567890000}}"#,
+);
+
+/// Like [`METADATA`] but with protocol v3/7 and the `catalogManaged` table feature enabled.
+/// Per the Delta protocol, `catalogManaged` depends on `inCommitTimestamp`, and commitInfo must
+/// include a `txnId`.
+pub const CATALOG_MANAGED_METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true,"txnId":"test-txn-0","inCommitTimestamp":1587968586154}}
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["catalogManaged"],"writerFeatures":["catalogManaged","inCommitTimestamp"]}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true"},"createdTime":1587968585495}}"#;
+
 pub enum TestAction {
     Add(String),
     Remove(String),
     Metadata,
+    // TODO: This is a temporary fix to make the test compatible with the file size requirement.
+    // In the future, we can create an AddCommit/RemoveCommit struct type with DefaultAddCommit/DefaultRemoveCommit value to store the commit info in the enum for Add/Remove.
+    AddWithSize(String, u64),
+    RemoveWithSize(String, u64),
 }
 
 // TODO: We need a better way to mock tables :)
@@ -111,6 +143,11 @@ pub enum TestAction {
 /// Convert a vector of actions into a newline delimited json string, with standard metadata
 pub fn actions_to_string(actions: Vec<TestAction>) -> String {
     actions_to_string_with_metadata(actions, METADATA)
+}
+
+/// Convert a vector of actions into a newline delimited json string, with catalog-managed metadata
+pub fn actions_to_string_catalog_managed(actions: Vec<TestAction>) -> String {
+    actions_to_string_with_metadata(actions, CATALOG_MANAGED_METADATA)
 }
 
 /// Convert a vector of actions into a newline delimited json string, with metadata including a partition column
@@ -125,6 +162,8 @@ pub fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str)
             TestAction::Add(path) => format!(r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#),
             TestAction::Remove(path) => format!(r#"{{"remove":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#),
             TestAction::Metadata => metadata.into(),
+            TestAction::AddWithSize(path, file_size) => format!(r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{file_size},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#),
+            TestAction::RemoveWithSize(path, file_size) => format!(r#"{{"remove":{{"path":"{path}","partitionValues":{{}},"size":{file_size},"modificationTime":1587968586000,"dataChange":true}}}}"#),
         })
         .join("\n")
 }
@@ -203,6 +242,19 @@ pub fn delta_path_for_version(version: u64, suffix: &str) -> Path {
     Path::from(path.as_str())
 }
 
+/// Create a [`LogPath`] from a table root URL string and an object-store commit path. Useful for
+/// building log tails in tests.
+pub fn create_log_path(table_root: impl AsRef<str>, commit_path: Path) -> LogPath {
+    let table_url = try_parse_uri(table_root.as_ref()).expect("Failed to parse table root as URL");
+    let commit_url = table_url.join(commit_path.as_ref()).unwrap();
+    let file_meta = FileMeta {
+        location: commit_url,
+        last_modified: 123,
+        size: 100,
+    };
+    LogPath::try_new(file_meta).expect("Failed to create LogPath")
+}
+
 pub fn staged_commit_path_for_version(version: u64) -> Path {
     let uuid = uuid::Uuid::new_v4();
     let path = format!("_delta_log/_staged_commits/{version:020}.{uuid}.json");
@@ -215,25 +267,59 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
     Path::from(path.as_str())
 }
 
-/// put a commit file into the specified object store.
+// Resolve a table from a root and relative path
+fn resolve_table_path(table_root: impl AsRef<str>, relative: &Path) -> DeltaResult<Path> {
+    let url = try_parse_uri(table_root)?;
+    Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
+}
+
+/// Write a Delta commit JSON file at the given version into `store`.
+///
+/// The commit is written to `_delta_log/{version:020}.json` under `table_root`. The caller is
+/// responsible for ensuring that `data` contains valid Delta actions (e.g. built via
+/// [`actions_to_string`]) and that no commit already exists at `version`.
+///
+/// # Parameters
+/// - `table_root` - Root URL of the Delta table (e.g. `"memory:///"` or `"file:///tmp/table"`).
+/// - `store` - Object store that backs the table.
+/// - `version` - Commit version number (determines the log file name).
+/// - `data` - JSON-serialized Delta actions to write as the commit body.
 pub async fn add_commit(
-    store: &dyn ObjectStore,
+    table_root: impl AsRef<str>,
+    store: &DynObjectStore,
     version: u64,
     data: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = delta_path_for_version(version, "json");
-    store.put(&path, data.into()).await?;
+    let relative_path = delta_path_for_version(version, "json");
+    let table_path = resolve_table_path(table_root, &relative_path)?;
+    store.put(&table_path, data.into()).await?;
     Ok(())
 }
 
+/// Write a staged (uncommitted) Delta commit JSON file at the given version into `store`.
+///
+/// The file is written to `_delta_log/_staged_commits/{version}.{uuid}.json` under
+/// `table_root`. Multiple staged commits may exist for the same version (each gets a unique
+/// UUID). The caller is responsible for ensuring that `data` contains valid Delta actions.
+///
+/// Returns the object-store [`Path`] of the written file so callers can reference it in a
+/// log tail or assertions.
+///
+/// # Parameters
+/// - `table_root` - Root URL of the Delta table (e.g. `"memory:///"` or `"file:///tmp/table"`).
+/// - `store` - Object store that backs the table.
+/// - `version` - Target commit version number (determines the staged file name prefix).
+/// - `data` - JSON-serialized Delta actions to write as the staged commit body.
 pub async fn add_staged_commit(
-    store: &dyn ObjectStore,
+    table_root: impl AsRef<str>,
+    store: &DynObjectStore,
     version: u64,
     data: String,
 ) -> Result<Path, Box<dyn std::error::Error>> {
-    let path = staged_commit_path_for_version(version);
-    store.put(&path, data.into()).await?;
-    Ok(path)
+    let relative_path = staged_commit_path_for_version(version);
+    let table_path = resolve_table_path(table_root, &relative_path)?;
+    store.put(&table_path, data.into()).await?;
+    Ok(table_path)
 }
 
 /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
@@ -326,11 +412,11 @@ pub fn engine_store_setup(
     table_name: &str,
     local_directory: Option<&Url>,
 ) -> (
-    Arc<dyn ObjectStore>,
+    Arc<DynObjectStore>,
     DefaultEngine<TokioBackgroundExecutor>,
     Url,
 ) {
-    let (storage, url): (Arc<dyn ObjectStore>, Url) = match local_directory {
+    let (storage, url): (Arc<DynObjectStore>, Url) = match local_directory {
         None => (
             Arc::new(InMemory::new()),
             Url::parse(format!("memory:///{table_name}/").as_str()).expect("valid url"),
@@ -349,7 +435,7 @@ pub fn engine_store_setup(
 // this will just create an empty table with the given schema. (just protocol + metadata actions)
 #[allow(clippy::too_many_arguments)]
 pub async fn create_table(
-    store: Arc<dyn ObjectStore>,
+    store: Arc<DynObjectStore>,
     table_path: Url,
     schema: SchemaRef,
     partition_columns: &[&str],
@@ -407,6 +493,9 @@ pub async fn create_table(
         }
         if writer_features.contains(&"changeDataFeed") {
             config.insert("delta.enableChangeDataFeed".to_string(), json!("true"));
+        }
+        if reader_features.contains(&"catalogManaged") {
+            config.insert("io.unitycatalog.tableId".to_string(), json!(table_id));
         }
 
         config
@@ -482,7 +571,7 @@ pub async fn setup_test_tables(
     Vec<(
         Url,
         DefaultEngine<TokioBackgroundExecutor>,
-        Arc<dyn ObjectStore>,
+        Arc<DynObjectStore>,
         &'static str,
     )>,
     Box<dyn std::error::Error>,
@@ -577,6 +666,7 @@ pub async fn insert_data<E: TaskExecutor>(
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
     let mut txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("WRITE".to_string())
         .with_data_change(true);
 
     let write_context = txn.get_write_context();
@@ -685,9 +775,101 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
     ])
 }
 
-/// Asserts that a field exists at the given dot-separated path in a [`StructType`] schema,
-/// traversing into nested structs as needed. Panics if any segment of the path is missing
-/// or if a non-terminal segment is not a struct type.
+// ---------------------------------------------------------------------------
+// Schema helpers for feature auto-enablement tests (TimestampNTZ, Variant)
+// ---------------------------------------------------------------------------
+
+/// Schema with one column of the given type: `(id INT, col <dtype>)`.
+pub fn schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("col", dtype, true),
+    ]))
+}
+
+/// Schema with the given type nested inside a struct:
+/// `(id INT, nested STRUCT<inner <dtype>>)`.
+pub fn nested_schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new(
+            "nested",
+            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                "inner", dtype, true,
+            )]))),
+            true,
+        ),
+    ]))
+}
+
+/// Schema with two columns of the given type: `(id INT, col1 <dtype>, col2 <dtype>)`.
+pub fn multi_schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("col1", dtype.clone(), true),
+        StructField::new("col2", dtype, true),
+    ]))
+}
+
+pub fn top_level_ntz_schema() -> SchemaRef {
+    schema_with_type(DataType::TIMESTAMP_NTZ)
+}
+
+pub fn nested_ntz_schema() -> SchemaRef {
+    nested_schema_with_type(DataType::TIMESTAMP_NTZ)
+}
+
+pub fn multiple_ntz_schema() -> SchemaRef {
+    multi_schema_with_type(DataType::TIMESTAMP_NTZ)
+}
+
+pub fn top_level_variant_schema() -> SchemaRef {
+    schema_with_type(DataType::unshredded_variant())
+}
+
+pub fn nested_variant_schema() -> SchemaRef {
+    nested_schema_with_type(DataType::unshredded_variant())
+}
+
+pub fn multiple_variant_schema() -> SchemaRef {
+    multi_schema_with_type(DataType::unshredded_variant())
+}
+
+/// Returns column mapping table properties for the given mode, or empty for `"none"`.
+pub fn cm_properties(mode: &str) -> Vec<(&str, &str)> {
+    if mode == "none" {
+        vec![]
+    } else {
+        vec![("delta.columnMapping.mode", mode)]
+    }
+}
+
+/// Resolves a nested field in a [`StructType`] schema by path. Returns an error if any
+/// segment is missing or a non-terminal segment is not a struct type.
+pub fn resolve_field<'a>(
+    schema: &'a delta_kernel::schema::StructType,
+    path: &[impl AsRef<str>],
+) -> Result<&'a delta_kernel::schema::StructField, String> {
+    let path_str: Vec<&str> = path.iter().map(|s| s.as_ref()).collect();
+    let display = path_str.join(".");
+    let (last, rest) = path.split_last().ok_or_else(|| "empty path".to_string())?;
+    let mut current = schema;
+    for name in rest {
+        let field = current
+            .field(name.as_ref())
+            .ok_or_else(|| format!("schema missing field '{display}'"))?;
+        current = match field.data_type() {
+            delta_kernel::schema::DataType::Struct(s) => s,
+            _ => return Err(format!("expected struct at '{display}'")),
+        };
+    }
+    current
+        .field(last.as_ref())
+        .ok_or_else(|| format!("schema missing field '{display}'"))
+}
+
+/// Asserts that a field exists at the given path in a [`StructType`] schema,
+/// traversing into nested structs as needed.
 ///
 /// # Example
 ///
@@ -696,19 +878,7 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
 /// assert_schema_has_field(&schema, &["address".into(), "street".into()]);
 /// ```
 pub fn assert_schema_has_field(schema: &delta_kernel::schema::StructType, path: &[String]) {
-    let path_str = path.join(".");
-    let mut current = schema;
-    for (i, name) in path.iter().enumerate() {
-        let field = current
-            .field(name)
-            .unwrap_or_else(|| panic!("schema missing field '{path_str}'"));
-        if i + 1 < path.len() {
-            current = match field.data_type() {
-                delta_kernel::schema::DataType::Struct(s) => s,
-                _ => panic!("expected struct at '{path_str}'"),
-            };
-        }
-    }
+    resolve_field(schema, path).unwrap();
 }
 
 pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
@@ -882,7 +1052,7 @@ pub fn read_add_infos(
     engine: &impl Engine,
 ) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
     let schema = get_log_add_schema().clone();
-    let batches = snapshot.log_segment().read_actions(engine, schema, None)?;
+    let batches = snapshot.log_segment().read_actions(engine, schema)?;
     let mut actions = Vec::new();
     for batch_result in batches {
         let actions_batch = batch_result?;
@@ -990,7 +1160,7 @@ pub fn read_actions_from_commit(
     action_type: &str,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let table_path = table_url.to_file_path().expect("should be a file URL");
-    let commit_path = table_path.join(format!("_delta_log/{:020}.json", version));
+    let commit_path = table_path.join(format!("_delta_log/{version:020}.json"));
     let content = std::fs::read_to_string(commit_path)?;
     let parsed: Vec<serde_json::Value> = Deserializer::from_str(&content)
         .into_iter::<serde_json::Value>()

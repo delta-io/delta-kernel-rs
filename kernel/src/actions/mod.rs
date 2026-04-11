@@ -8,8 +8,8 @@ use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
-    FeatureType, IntoTableFeature, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, IntoTableFeature, TableFeature, MIN_VALID_RW_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -30,8 +30,6 @@ const UNKNOWN_OPERATION: &str = "UNKNOWN";
 pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
-
-pub(crate) mod domain_metadata;
 
 // see comment in ../lib.rs for the path module for why we include this way
 #[cfg(feature = "internal-api")]
@@ -179,12 +177,9 @@ pub(crate) fn as_log_add_schema(schema: SchemaRef) -> SchemaRef {
     )]))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    any(test, feature = "internal-api"),
-    derive(Serialize, Deserialize),
-    serde(rename_all = "camelCase")
-)]
+// Serde derives are needed for CRC file deserialization (see `crc::reader`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Format {
     /// Name of the encoding for files in this table
@@ -219,12 +214,9 @@ impl TryFrom<Format> for Scalar {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    any(test, feature = "internal-api"),
-    derive(Serialize, Deserialize),
-    serde(rename_all = "camelCase")
-)]
+// Serde derives are needed for CRC file deserialization (see `crc::reader`).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Metadata {
     /// Unique identifier for this table
@@ -321,9 +313,14 @@ impl Metadata {
     }
 
     #[internal_api]
-    #[allow(dead_code)]
     pub(crate) fn configuration(&self) -> &HashMap<String, String> {
         &self.configuration
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn format_provider(&self) -> &str {
+        &self.format.provider
     }
 
     #[internal_api]
@@ -467,6 +464,19 @@ impl Protocol {
         reader_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
         writer_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
     ) -> DeltaResult<Self> {
+        require!(
+            min_reader_version >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {min_reader_version}"
+            ))
+        );
+        require!(
+            min_writer_version >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {min_writer_version}"
+            ))
+        );
+
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
 
@@ -702,7 +712,7 @@ pub(crate) struct Add {
     /// null values. This means an engine can assume that if a partition is found in
     /// [`Metadata::partition_columns`] but not in this map, its value is null.
     ///
-    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    /// [`materialize`]: crate::engine_data::MapItem::materialize
     #[allow_null_container_values]
     pub(crate) partition_values: HashMap<String, String>,
 
@@ -724,10 +734,10 @@ pub(crate) struct Add {
 
     /// Map containing metadata about this logical file.
     /// Note: map values can be null.
-    /// We don't use `#[allow_null_container_values]` here because [`EngineMap::materialize`]
+    /// We don't use `#[allow_null_container_values]` here because [`MapItem::materialize`]
     /// drops null values when that attribute is present.
     ///
-    /// [`EngineMap::materialize`]: crate::engine_data::EngineMap::materialize
+    /// [`MapItem::materialize`]: crate::engine_data::MapItem::materialize
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub tags: Option<HashMap<String, Option<String>>>,
 
@@ -781,7 +791,14 @@ pub(crate) struct Remove {
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) extended_file_metadata: Option<bool>,
 
-    /// A map from partition column to value for this logical file.
+    /// A map from partition column to value for this logical file. This map can contain null in
+    /// the values meaning a partition is null. We drop those values from this map, due to the
+    /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
+    /// null values. This means an engine can assume that if a partition is found in
+    /// [`Metadata::partition_columns`] but not in this map, its value is null.
+    ///
+    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    #[allow_null_container_values]
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) partition_values: Option<HashMap<String, String>>,
 
@@ -795,7 +812,8 @@ pub(crate) struct Remove {
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub stats: Option<String>,
 
-    /// Map containing metadata about this logical file.
+    /// Map containing metadata about this logical file. Values can be null.
+    #[allow_null_container_values]
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) tags: Option<HashMap<String, String>>,
 
@@ -831,7 +849,7 @@ pub(crate) struct Cdc {
     /// null values. This means an engine can assume that if a partition is found in
     /// [`Metadata::partition_columns`] but not in this map, its value is null.
     ///
-    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    /// [`materialize`]: crate::engine_data::MapItem::materialize
     #[allow_null_container_values]
     pub partition_values: HashMap<String, String>,
 
@@ -845,11 +863,13 @@ pub(crate) struct Cdc {
     /// data of the table
     pub data_change: bool,
 
-    /// Map containing metadata about this logical file.
+    /// Map containing metadata about this logical file. Values can be null.
+    #[allow_null_container_values]
     pub tags: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoEngineData)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
@@ -894,7 +914,8 @@ pub(crate) struct Sidecar {
     /// The time this logical file was created, as milliseconds since the epoch.
     pub modification_time: i64,
 
-    /// A map containing any additional metadata about the logicial file.
+    /// A map containing any additional metadata about the logical file. Values can be null.
+    #[allow_null_container_values]
     pub tags: Option<HashMap<String, String>>,
 }
 
@@ -931,7 +952,8 @@ pub(crate) struct CheckpointMetadata {
     /// See issue #786 for tracking progress.
     pub(crate) version: i64,
 
-    /// Map containing any additional metadata about the V2 spec checkpoint.
+    /// Map containing any additional metadata about the V2 spec checkpoint. Values can be null.
+    #[allow_null_container_values]
     pub(crate) tags: Option<HashMap<String, String>>,
 }
 
@@ -942,7 +964,7 @@ pub(crate) struct CheckpointMetadata {
 /// Note that the `delta.*` domain is reserved for internal use.
 ///
 /// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoEngineData)]
 #[internal_api]
 pub(crate) struct DomainMetadata {
     domain: String,
@@ -986,10 +1008,18 @@ impl DomainMetadata {
     pub(crate) fn configuration(&self) -> &str {
         &self.configuration
     }
+
+    /// Returns `true` if this action is a tombstone (marking domain removal).
+    pub(crate) fn is_removed(&self) -> bool {
+        self.removed
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
+    use super::set_transaction::is_set_txn_expired;
     use super::*;
     use crate::{
         arrow::{
@@ -1002,6 +1032,7 @@ mod tests {
         },
         engine::{arrow_data::EngineDataArrowExt as _, arrow_expression::ArrowEvaluationHandler},
         schema::{ArrayType, DataType, MapType, StructField},
+        utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
     use serde_json::json;
@@ -1050,6 +1081,24 @@ mod tests {
             ArrowDataType::Utf8,
             nullable_values,
         ))
+    }
+
+    #[rstest]
+    #[case::no_expiration_configured(None, Some(1000), false)]
+    #[case::null_last_updated_never_expires(Some(5000), None, false)]
+    #[case::both_none(None, None, false)]
+    #[case::last_updated_before_expiration(Some(2000), Some(1000), true)]
+    #[case::last_updated_at_expiration(Some(1000), Some(1000), true)]
+    #[case::last_updated_after_expiration(Some(2000), Some(3000), false)]
+    fn test_is_set_txn_expired(
+        #[case] expiration_timestamp: Option<i64>,
+        #[case] last_updated: Option<i64>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            is_set_txn_expired(expiration_timestamp, last_updated),
+            expected
+        );
     }
 
     #[test]
@@ -1120,14 +1169,14 @@ mod tests {
     fn tags_field() -> StructField {
         StructField::nullable(
             "tags",
-            MapType::new(DataType::STRING, DataType::STRING, false),
+            MapType::new(DataType::STRING, DataType::STRING, true),
         )
     }
 
     fn partition_values_field() -> StructField {
         StructField::nullable(
             "partitionValues",
-            MapType::new(DataType::STRING, DataType::STRING, false),
+            MapType::new(DataType::STRING, DataType::STRING, true),
         )
     }
 
@@ -1313,6 +1362,30 @@ mod tests {
                 Err(Error::InvalidProtocol(_)),
             ));
         }
+    }
+
+    #[rstest]
+    #[case(0, 1)]
+    #[case(1, 0)]
+    #[case(-1, 2)]
+    #[case(1, -1)]
+    fn reject_protocol_version_below_minimum(#[case] rv: i32, #[case] wv: i32) {
+        let expected = if rv < 1 {
+            format!("Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}")
+        } else {
+            format!("Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}")
+        };
+        assert_result_error_with_message(
+            Protocol::try_new(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST),
+            &expected,
+        );
+    }
+
+    #[test]
+    fn accept_min_versions() {
+        let p = Protocol::try_new_legacy(1, 1).unwrap();
+        assert_eq!(p.min_reader_version(), 1);
+        assert_eq!(p.min_writer_version(), 1);
     }
 
     #[test]

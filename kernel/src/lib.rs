@@ -88,6 +88,10 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
+// Public under test-utils so integration tests can inspect CRC state via Snapshot::get_current_crc_if_loaded_for_testing.
+#[cfg(feature = "test-utils")]
+pub mod crc;
+#[cfg(not(feature = "test-utils"))]
 pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
@@ -96,6 +100,7 @@ mod log_compaction;
 mod log_path;
 mod log_reader;
 pub mod metrics;
+pub mod partition;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -104,7 +109,7 @@ pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
-pub(crate) mod transforms;
+pub mod transforms;
 
 pub use log_path::LogPath;
 
@@ -113,9 +118,12 @@ mod row_tracking;
 pub(crate) mod clustering;
 
 mod arrow_compat;
-#[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
+#[cfg(any(feature = "arrow-57", feature = "arrow-58"))]
 pub use arrow_compat::*;
 
+#[cfg(feature = "internal-api")]
+pub mod column_trie;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod column_trie;
 pub mod kernel_predicates;
 pub(crate) mod utils;
@@ -147,16 +155,12 @@ pub mod last_checkpoint_hint;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod last_checkpoint_hint;
 
-pub(crate) mod listed_log_files;
+pub(crate) mod log_segment_files;
 
 #[cfg(feature = "internal-api")]
 pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
-
-// Benchmarking infrastructure (only public for benchmarks and tests)
-#[cfg(any(test, feature = "internal-api"))]
-pub mod benchmarks;
 
 #[cfg(feature = "internal-api")]
 pub mod parallel;
@@ -166,16 +170,18 @@ pub(crate) mod parallel;
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;
-pub use engine_data::{EngineData, FilteredEngineData, RowVisitor};
+pub use engine_data::{
+    EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
+};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
 pub use snapshot::Snapshot;
 pub use snapshot::SnapshotRef;
 
-use expressions::literal_expression_transform::LiteralExpressionTransform;
+use expressions::literal_expression_transform;
 use expressions::Scalar;
-use schema::{SchemaTransform, StructField, StructType};
+use schema::{StructField, StructType};
 
 #[cfg(any(
     feature = "default-engine-native-tls",
@@ -471,6 +477,37 @@ pub trait EvaluationHandler: AsAny {
     // NOTE: we should probably allow DataType instead of SchemaRef, but can expand that in the
     // future.
     fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>>;
+
+    /// Create a multi-row [`EngineData`] by applying the given schema to multiple rows of values.
+    ///
+    /// Each element in `rows` represents one row of data, where each row is a slice of structured
+    /// scalar values (one scalar per top-level field in the schema).
+    ///
+    /// # Parameters
+    ///
+    /// - `schema`: Schema describing the structure of each row.
+    /// - `rows`: Slice of rows, where each row contains one structured scalar per top-level schema
+    ///   field.
+    ///
+    /// # Returns
+    ///
+    /// A multi-row `EngineData` containing all rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any row has a number of scalars that does not match the number of
+    /// top-level fields in `schema`, or if any scalar value cannot be appended to its corresponding
+    /// field's builder (e.g. due to a type mismatch).
+    ///
+    /// # Example
+    ///
+    /// For a schema with fields `[add: Struct, remove: Struct]`, each row should contain exactly 2
+    /// scalars: one for the `add` field and one for the `remove` field.
+    fn create_many(
+        &self,
+        schema: SchemaRef,
+        rows: &[&[Scalar]],
+    ) -> DeltaResult<Box<dyn EngineData>>;
 }
 
 /// Internal trait to allow us to have a private `create_one` API that's implemented for all
@@ -492,9 +529,7 @@ trait EvaluationHandlerExtension: EvaluationHandler {
         let null_row = self.null_row(null_row_schema.clone())?;
 
         // Convert schema and leaf values to an expression
-        let mut schema_transform = LiteralExpressionTransform::new(values);
-        schema_transform.transform_struct(schema.as_ref());
-        let row_expr = schema_transform.try_into_expr()?;
+        let row_expr = literal_expression_transform(schema.as_ref(), values)?;
 
         let eval =
             self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into())?;
@@ -563,6 +598,12 @@ pub trait StorageHandler: AsAny {
     /// it must return Err(Error::FileAlreadyExists).
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
 
+    /// Write data to the specified path.
+    ///
+    /// If `overwrite` is false and the file already exists, this must return
+    /// `Err(Error::FileAlreadyExists)`.
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()>;
+
     /// Perform a HEAD request for the given file at a Url, returning the file metadata.
     ///
     /// If the file does not exist, this must return an `Err` with [`Error::FileNotFound`].
@@ -597,6 +638,8 @@ pub trait JsonHandler: AsAny {
     ///    iter: [EngineData(3), EngineData(1, 2)]
     ///    iter: [EngineData(1), EngineData(3, 2)]
     ///    iter: [EngineData(2, 1, 3)]
+    ///
+    /// Additionally, engines may not merge engine data across file boundaries.
     ///
     /// # Parameters
     ///
@@ -787,6 +830,8 @@ pub trait ParquetHandler: AsAny {
     ///    iter: [EngineData(3), EngineData(1, 2)]
     ///    iter: [EngineData(1), EngineData(3, 2)]
     ///    iter: [EngineData(2, 1, 3)]
+    ///
+    /// Additionally, engines must not merge engine data across file boundaries.
     ///
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey
     fn read_parquet_files(

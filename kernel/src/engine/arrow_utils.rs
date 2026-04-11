@@ -16,14 +16,15 @@ use std::sync::{Arc, OnceLock};
 
 use crate::arrow::array::{
     cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
-    OffsetSizeTrait, PrimitiveArray, RecordBatch, RunArray, StringArray, StructArray,
+    OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
+use crate::arrow::json::writer::{make_encoder, LineDelimited, NullableEncoder};
+use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder, WriterBuilder};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
@@ -89,9 +90,8 @@ struct MatchedParquetField<'p, 'k> {
     kernel_field_info: Option<KernelFieldInfo<'k>>,
 }
 
-/// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This
-/// returns a tuples of (mask_indices: Vec<parquet_schema_index>, reorder_indices:
-/// Vec<requested_index>). `mask_indices` is used for generating the mask for reading from the
+/// Create an [`Error::Arrow`] with a backtrace from the given message.
+#[internal_api]
 pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
     Error::Arrow(crate::arrow::error::ArrowError::InvalidArgumentError(
         s.into(),
@@ -100,12 +100,14 @@ pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
 }
 
 /// Prepares to enumerate row indexes of rows in a parquet file, accounting for row group skipping.
+#[internal_api]
 pub(crate) struct RowIndexBuilder {
     row_group_row_index_ranges: Vec<Range<i64>>,
     row_group_ordinals: Option<Vec<usize>>,
 }
 
 impl RowIndexBuilder {
+    #[internal_api]
     pub(crate) fn new(row_groups: &[RowGroupMetaData]) -> Self {
         let mut row_group_row_index_ranges = Vec::with_capacity(row_groups.len());
         let mut offset = 0;
@@ -122,6 +124,7 @@ impl RowIndexBuilder {
 
     /// Only produce row indexes for the row groups specified by the ordinals that survived row
     /// group skipping. The ordinals must be in 0..num_row_groups.
+    #[internal_api]
     pub(crate) fn select_row_groups(&mut self, ordinals: &[usize]) {
         // NOTE: Don't apply the filtering until we actually build the iterator, because the
         // filtering is not idempotent and `with_row_groups` could be called more than once.
@@ -133,6 +136,7 @@ impl RowIndexBuilder {
     /// # Errors
     ///
     /// Returns an error if there are duplicate or out of bounds row group ordinals.
+    #[internal_api]
     pub(crate) fn build(self) -> DeltaResult<FlattenedRangeIterator<i64>> {
         let starting_offsets = match self.row_group_ordinals {
             Some(ordinals) => {
@@ -165,18 +169,270 @@ impl RowIndexBuilder {
 /// accurate null masks that row visitors rely on for correctness.
 /// `row_indexes` are passed through to `reorder_struct_array`.
 /// `file_location` is used to populate file metadata columns if requested.
-pub(crate) fn fixup_parquet_read<T>(
+/// If `target_schema` is provided, coerces the batch's field nullability to match it.
+#[internal_api]
+pub(crate) fn fixup_parquet_read(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
     row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
     file_location: Option<&str>,
-) -> DeltaResult<T>
-where
-    StructArray: Into<T>,
-{
+    target_schema: Option<&ArrowSchemaRef>,
+) -> DeltaResult<ArrowEngineData> {
     let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
     let data = fix_nested_null_masks(data);
+    let data = if let Some(schema) = target_schema {
+        let batch = RecordBatch::from(data);
+        // Type mismatches are already handled by `reorder_struct_array` above,
+        // we don't do anything more strict here.
+        let allow_all = |_: &ArrowFieldRef, _: &ArrowFieldRef| Ok(());
+        coerce_batch_nullability(batch, schema, Some(&allow_all))?.into()
+    } else {
+        data
+    };
     Ok(data.into())
+}
+
+/// Coerces a [`RecordBatch`]'s field nullability to match a target Arrow schema.
+///
+/// For example, given a source batch whose schema is:
+///
+/// ```text
+/// x: Int64 (nullable)
+/// a: Struct (non-null)
+///   ├── b: Utf8 (nullable)
+///   └── c: Struct (nullable)
+///         └── d: Int32 (non-null)
+/// ```
+///
+/// and a target schema:
+///
+/// ```text
+/// x: Int64 (non-null)          ← was nullable
+/// a: Struct (nullable)          ← was non-null
+///   ├── b: Utf8 (non-null)     ← was nullable
+///   └── c: Struct (non-null)   ← was nullable
+///         └── d: Int32 (nullable) ← was non-null
+/// ```
+///
+/// this function returns a new `RecordBatch` whose schema matches the target exactly — every
+/// field's nullability flag (including deeply nested ones like `a.c.d`) is updated to match,
+/// recursing into structs and maps. The underlying array data is unchanged; only the nullability flag is adjusted.
+///
+/// **Complexity:** O(F) time and space where F is the total number of fields (including nested)
+/// in the schema. The actual row data (Arrow buffers) is shared via `Arc` and never copied.
+/// When the source schema already matches the target, the original batch is returned immediately.
+///
+/// If `type_mismatch_validator` is provided, it is called when a source field's data type differs
+/// from the target field's data type. It should return `Ok(())` to allow the mismatch or an error
+/// to reject it. When `None`, any type mismatch is rejected with an internal error.
+type TypeMismatchValidator<'a> =
+    Option<&'a dyn Fn(&ArrowFieldRef, &ArrowFieldRef) -> DeltaResult<()>>;
+
+pub(crate) fn coerce_batch_nullability(
+    batch: RecordBatch,
+    target_schema: &ArrowSchemaRef,
+    type_mismatch_validator: TypeMismatchValidator<'_>,
+) -> DeltaResult<RecordBatch> {
+    if *batch.schema() == **target_schema {
+        return Ok(batch);
+    }
+
+    fn coerce_struct(
+        src_column: &Arc<dyn ArrowArray>,
+        src_children: &ArrowFields,
+        target_children: &ArrowFields,
+        type_mismatch_validator: TypeMismatchValidator<'_>,
+    ) -> DeltaResult<Arc<dyn ArrowArray>> {
+        let src_struct = src_column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| Error::generic("expected Struct array during nullability coercion"))?;
+        let (coerced_columns, coerced_fields): (Vec<Arc<dyn ArrowArray>>, Vec<ArrowFieldRef>) =
+            src_struct
+                .columns()
+                .iter()
+                .zip(src_children.iter())
+                .zip(target_children.iter())
+                .map(|((src_child_col, src_child), target_child)| {
+                    coerce(
+                        src_child_col.clone(),
+                        src_child,
+                        target_child,
+                        type_mismatch_validator,
+                    )
+                })
+                .collect::<DeltaResult<Vec<_>>>()?
+                .into_iter()
+                .unzip();
+        Ok(Arc::new(StructArray::try_new(
+            coerced_fields.into(),
+            coerced_columns,
+            src_struct.nulls().cloned(),
+        )?))
+    }
+
+    // Map type: recurse into entries struct to fix nested nullability
+    fn coerce_map(
+        src_column: &Arc<dyn ArrowArray>,
+        src_entries_field: &ArrowFieldRef,
+        target_entries_field: &ArrowFieldRef,
+        type_mismatch_validator: TypeMismatchValidator<'_>,
+    ) -> DeltaResult<Arc<dyn ArrowArray>> {
+        let src_map = src_column
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| Error::generic("expected Map array during nullability coercion"))?;
+        // Discard the source entries field; the recursive `coerce` call below
+        // produces `coerced_entries_field` with the target's nullability applied.
+        let (_, src_offsets, src_entries, src_nulls, src_ordered) = src_map.clone().into_parts();
+        let (coerced_entries_col, coerced_entries_field) = coerce(
+            Arc::new(src_entries),
+            src_entries_field,
+            target_entries_field,
+            type_mismatch_validator,
+        )?;
+        let coerced_entries = coerced_entries_col
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::generic("expected Struct array for Map entries during nullability coercion")
+            })?
+            .clone();
+        Ok(Arc::new(MapArray::try_new(
+            coerced_entries_field,
+            src_offsets,
+            coerced_entries,
+            src_nulls,
+            src_ordered,
+        )?))
+    }
+
+    // List type: recurse into element to fix nested nullability
+    fn coerce_list(
+        src_column: &Arc<dyn ArrowArray>,
+        src_element: &ArrowFieldRef,
+        target_element: &ArrowFieldRef,
+        type_mismatch_validator: TypeMismatchValidator<'_>,
+    ) -> DeltaResult<Arc<dyn ArrowArray>> {
+        let src_list = src_column
+            .as_any()
+            .downcast_ref::<GenericListArray<i32>>()
+            .ok_or_else(|| Error::generic("expected List array during nullability coercion"))?;
+        // Discard the source element field; the recursive `coerce` call below
+        // produces `coerced_element_field` with the target's nullability applied.
+        let (_, src_offsets, src_values, src_nulls) = src_list.clone().into_parts();
+        let (coerced_values, coerced_element_field) = coerce(
+            src_values,
+            src_element,
+            target_element,
+            type_mismatch_validator,
+        )?;
+        Ok(Arc::new(GenericListArray::<i32>::try_new(
+            coerced_element_field,
+            src_offsets,
+            coerced_values,
+            src_nulls,
+        )?))
+    }
+
+    // Recursively coerces nullability for a column+field pair. For struct columns, recurses
+    // into children; for leaf columns, just adjusts the field's nullability flag.
+    fn coerce(
+        src_column: Arc<dyn ArrowArray>,
+        src_field: &ArrowFieldRef,
+        target_field: &ArrowFieldRef,
+        type_mismatch_validator: TypeMismatchValidator<'_>,
+    ) -> DeltaResult<(Arc<dyn ArrowArray>, ArrowFieldRef)> {
+        let coerced_array: Arc<dyn ArrowArray> =
+            match (src_column.data_type(), target_field.data_type()) {
+                (ArrowDataType::Struct(src_children), ArrowDataType::Struct(target_children))
+                    if src_children != target_children =>
+                {
+                    coerce_struct(
+                        &src_column,
+                        src_children,
+                        target_children,
+                        type_mismatch_validator,
+                    )?
+                }
+                (
+                    ArrowDataType::Map(src_entries_field, _),
+                    ArrowDataType::Map(target_entries_field, _),
+                ) if src_entries_field != target_entries_field => coerce_map(
+                    &src_column,
+                    src_entries_field,
+                    target_entries_field,
+                    type_mismatch_validator,
+                )?,
+                (ArrowDataType::List(src_element), ArrowDataType::List(target_element))
+                    if src_element != target_element =>
+                {
+                    coerce_list(
+                        &src_column,
+                        src_element,
+                        target_element,
+                        type_mismatch_validator,
+                    )?
+                }
+
+                (src_type, target_type) => {
+                    if src_type != target_type {
+                        // Delegate to the caller-provided validator if present
+                        // (some callers tolerate certain mismatches), otherwise reject.
+                        if let Some(validator) = type_mismatch_validator {
+                            validator(src_field, target_field)?;
+                        } else {
+                            return Err(Error::internal_error(format!(
+                                "data type mismatch for field '{}': \
+                                 source has {src_type:?} but target has {target_type:?}",
+                                src_field.name(),
+                            )));
+                        }
+                    }
+                    let coerced_field = if src_field.is_nullable() == target_field.is_nullable() {
+                        src_field.clone()
+                    } else {
+                        Arc::new(
+                            src_field
+                                .as_ref()
+                                .clone()
+                                .with_nullable(target_field.is_nullable()),
+                        )
+                    };
+                    return Ok((src_column, coerced_field));
+                }
+            };
+        let coerced_field = Arc::new(
+            src_field
+                .as_ref()
+                .clone()
+                .with_data_type(coerced_array.data_type().clone())
+                .with_nullable(target_field.is_nullable()),
+        );
+        Ok((coerced_array, coerced_field))
+    }
+
+    let batch_schema = batch.schema();
+    let batch_struct_array = StructArray::from(batch);
+    let (src_fields, src_columns, _) = batch_struct_array.into_parts();
+
+    let (coerced_columns, coerced_fields): (Vec<Arc<dyn ArrowArray>>, Vec<ArrowFieldRef>) =
+        src_columns
+            .into_iter()
+            .zip(src_fields.iter())
+            .zip(target_schema.fields().iter())
+            .map(|((src_column, src_field), target_field)| {
+                coerce(src_column, src_field, target_field, type_mismatch_validator)
+            })
+            .collect::<DeltaResult<Vec<_>>>()?
+            .into_iter()
+            .unzip();
+
+    let coerced_schema = Arc::new(ArrowSchema::new_with_metadata(
+        coerced_fields,
+        batch_schema.metadata().clone(),
+    ));
+    Ok(RecordBatch::try_new(coerced_schema, coerced_columns)?)
 }
 
 /*
@@ -287,12 +543,14 @@ where
 /// output. The `transform` indicates what, if any, transforms are needed. See the docs for
 /// [`ReorderIndexTransform`] for the meaning.
 #[derive(Debug, PartialEq)]
+#[internal_api]
 pub(crate) struct ReorderIndex {
-    pub(crate) index: usize,
+    pub index: usize,
     transform: ReorderIndexTransform,
 }
 
 #[derive(Debug, PartialEq)]
+#[internal_api]
 pub(crate) enum ReorderIndexTransform {
     /// For a non-nested type, indicates that we need to cast to the contained type
     Cast(ArrowDataType),
@@ -413,6 +671,10 @@ fn get_indices(
 ) -> DeltaResult<(usize, Vec<ReorderIndex>)> {
     let mut found_fields = HashSet::with_capacity(requested_schema.num_fields());
     let mut reorder_indices = Vec::with_capacity(requested_schema.num_fields());
+    // Missing entries for structs found in parquet but with no selected leaves. These must
+    // be appended after all input-consuming entries (Identity/Nested/Cast) because
+    // `reorder_struct_array` uses vec position as the index into the parquet reader output.
+    let mut deferred_missing = Vec::new();
     let mut parquet_offset = start_parquet_offset;
     // for each field, get its position in the parquet (via enumerate), a reference to the arrow
     // field, and info about where it appears in the requested_schema, or None if the field is not
@@ -444,6 +706,7 @@ fn get_indices(
                     if let DataType::Struct(ref requested_schema)
                     | DataType::Variant(ref requested_schema) = requested_field.data_type
                     {
+                        let mask_before = mask_indices.len();
                         let (parquet_advance, children) = get_indices(
                             parquet_index + parquet_offset,
                             requested_schema.as_ref(),
@@ -452,12 +715,27 @@ fn get_indices(
                         )?;
                         // advance the number of parquet fields, but subtract 1 because the
                         // struct will be counted by the `enumerate` call but doesn't count as
-                        // an actual index.
-                        parquet_offset += parquet_advance - 1;
-                        // note that we found this field
+                        // an actual index. Use saturating_sub to handle empty structs (0 fields).
+                        parquet_offset += parquet_advance.saturating_sub(1);
+                        // If no leaf columns were selected (mask unchanged), the parquet
+                        // reader will omit this struct entirely. We cannot create a Nested
+                        // entry because it would index into a column that doesn't exist.
+                        // The recursive call is still needed for the correct
+                        // `parquet_advance` value.
                         found_fields.insert(requested_field.name());
-                        // push the child reorder on
-                        reorder_indices.push(ReorderIndex::nested(index, children));
+                        if mask_indices.len() > mask_before {
+                            reorder_indices.push(ReorderIndex::nested(index, children));
+                        } else {
+                            // The recursive call resolved all children (as nullable/missing
+                            // or the struct is empty), but no parquet leaves were selected.
+                            // Defer the Missing entry so it appears after all entries that
+                            // consume parquet input columns.
+                            debug_assert_eq!(children.len(), requested_schema.num_fields());
+                            deferred_missing.push(ReorderIndex::missing(
+                                index,
+                                Arc::new(requested_field.try_into_arrow()?),
+                            ));
+                        }
                     } else {
                         return Err(Error::unexpected_column_type(field.name()));
                     }
@@ -473,6 +751,7 @@ fn get_indices(
                             array_type.element_type.clone(),
                             array_type.contains_null,
                         )]);
+                        let mask_before = mask_indices.len();
                         let (parquet_advance, mut children) = get_indices(
                             parquet_index + parquet_offset,
                             &requested_schema,
@@ -482,17 +761,24 @@ fn get_indices(
                         // see comment above in struct match arm
                         parquet_offset += parquet_advance - 1;
                         found_fields.insert(requested_field.name());
-                        if children.len() != 1 {
+                        if mask_indices.len() <= mask_before {
+                            // No leaves selected inside this list. Defer a Missing entry.
+                            deferred_missing.push(ReorderIndex::missing(
+                                index,
+                                Arc::new(requested_field.try_into_arrow()?),
+                            ));
+                        } else if children.len() != 1 {
                             return Err(Error::generic(
                                 "List call should not have generated more than one reorder index",
                             ));
+                        } else {
+                            // safety, checked that we have 1 element
+                            let mut children = children.swap_remove(0);
+                            // the index is wrong, as it's the index from the inner schema.
+                            // Adjust it to be our index
+                            children.index = index;
+                            reorder_indices.push(children);
                         }
-                        // safety, checked that we have 1 element
-                        let mut children = children.swap_remove(0);
-                        // the index is wrong, as it's the index from the inner schema. Adjust
-                        // it to be our index
-                        children.index = index;
-                        reorder_indices.push(children);
                     } else {
                         return Err(Error::unexpected_column_type(list_field.name()));
                     }
@@ -512,6 +798,7 @@ fn get_indices(
                                 return Err(Error::generic("map fields had more than 2 members"));
                             }
                             let inner_schema = map_type.as_struct_schema(key_name, val_name);
+                            let mask_before = mask_indices.len();
                             let (parquet_advance, mut children) = get_indices(
                                 parquet_index + parquet_offset,
                                 &inner_schema,
@@ -523,29 +810,34 @@ fn get_indices(
                             // map will be counted by the `enumerate` call but doesn't count as
                             // an actual index.
                             parquet_offset += parquet_advance - 1;
-                            // note that we found this field
                             found_fields.insert(requested_field.name());
-
-                            if children.len() != 2 {
+                            if mask_indices.len() <= mask_before {
+                                // No leaves selected inside this map. Defer a Missing entry.
+                                deferred_missing.push(ReorderIndex::missing(
+                                    index,
+                                    Arc::new(requested_field.try_into_arrow()?),
+                                ));
+                            } else if children.len() != 2 {
                                 return Err(Error::generic(
                                     "Map call should have generated exactly two reorder indices",
                                 ));
+                            } else {
+                                // vec indexing is safe, we checked len above
+                                let mut num_identity_transforms = 0;
+                                if !children[0].needs_transform() {
+                                    children[0] = ReorderIndex::identity(0);
+                                    num_identity_transforms += 1;
+                                }
+                                if !children[1].needs_transform() {
+                                    children[1] = ReorderIndex::identity(1);
+                                    num_identity_transforms += 1;
+                                }
+                                let transform = match num_identity_transforms {
+                                    2 => ReorderIndex::identity(index),
+                                    _ => ReorderIndex::nested(index, children),
+                                };
+                                reorder_indices.push(transform);
                             }
-                            // vec indexing is safe, we checked len above
-                            let mut num_identity_transforms = 0;
-                            if !children[0].needs_transform() {
-                                children[0] = ReorderIndex::identity(0);
-                                num_identity_transforms += 1;
-                            }
-                            if !children[1].needs_transform() {
-                                children[1] = ReorderIndex::identity(1);
-                                num_identity_transforms += 1;
-                            }
-                            let transform = match num_identity_transforms {
-                                2 => ReorderIndex::identity(index),
-                                _ => ReorderIndex::nested(index, children),
-                            };
-                            reorder_indices.push(transform);
                         }
                         _ => {
                             return Err(Error::unexpected_column_type(field.name()));
@@ -553,14 +845,13 @@ fn get_indices(
                     }
                 }
                 _ => {
-                    // we don't care about matching on nullability or metadata here so pass `false`
-                    // as the final argument. These can differ between the delta schema and the
-                    // parquet schema without causing issues in reading the data. We fix them up in
-                    // expression evaluation later.
+                    // We don't care about matching on nullability or metadata here. These can
+                    // differ between the delta schema and the parquet schema without causing
+                    // issues in reading the data. We fix them up in expression evaluation later.
                     match super::ensure_data_types::ensure_data_types(
                         &requested_field.data_type,
                         field.data_type(),
-                        false,
+                        super::ensure_data_types::ValidationMode::TypesAndNames,
                     )? {
                         DataTypeCompat::Identical => {
                             reorder_indices.push(ReorderIndex::identity(index))
@@ -584,9 +875,12 @@ fn get_indices(
             debug!("Skipping over un-selected field: {}", field.name());
             // offset by number of inner fields. subtract one, because the enumerate still
             // counts this logical "parent" field
-            parquet_offset += count_cols(field) - 1;
+            parquet_offset += count_cols(field).saturating_sub(1);
         }
     }
+
+    // Append deferred Missing entries after all input-consuming entries from the main loop.
+    reorder_indices.extend(deferred_missing);
 
     if found_fields.len() != requested_schema.num_fields() {
         // some fields are missing, but they might be nullable or metadata columns, need to insert them into the reorder_indices
@@ -708,6 +1002,7 @@ fn match_parquet_fields<'k, 'p>(
 /// file set to the index of the requested column in the parquet. `reorder_indices` is used for
 /// re-ordering. See the documentation for [`ReorderIndex`] to understand what each element in the
 /// returned array means.
+#[internal_api]
 pub(crate) fn get_requested_indices(
     requested_schema: &SchemaRef,
     parquet_schema: &ArrowSchemaRef,
@@ -724,6 +1019,7 @@ pub(crate) fn get_requested_indices(
 
 /// Create a mask that will only select the specified indices from the parquet. `indices` can be
 /// computed from a [`Schema`] using [`get_requested_indices`]
+#[internal_api]
 pub(crate) fn generate_mask(
     _requested_schema: &SchemaRef,
     _parquet_schema: &ArrowSchemaRef,
@@ -762,6 +1058,7 @@ fn ordering_needs_transform(requested_ordering: &[ReorderIndex]) -> bool {
 ///
 /// The function only checks if a RowIndex transform is present at the top-level, since metadata
 /// columns are not allowed to be nested.
+#[internal_api]
 pub(crate) fn ordering_needs_row_indexes(requested_ordering: &[ReorderIndex]) -> bool {
     requested_ordering
         .iter()
@@ -771,6 +1068,22 @@ pub(crate) fn ordering_needs_row_indexes(requested_ordering: &[ReorderIndex]) ->
 // we use this as a placeholder for an array and its associated field. We can fill in a Vec of None
 // of this type and then set elements of the Vec to Some(FieldArrayOpt) for each column
 type FieldArrayOpt = Option<(Arc<ArrowField>, Arc<dyn ArrowArray>)>;
+
+/// Creates an array for a missing field. For non-nullable structs, produces a non-null struct
+/// (no null buffer) with recursively missing children, preserving the non-null constraint at
+/// every level. For all other types (or nullable structs), produces an all-null array.
+fn new_missing_array(field: &ArrowField, num_rows: usize) -> Arc<dyn ArrowArray> {
+    match (field.is_nullable(), field.data_type()) {
+        (false, ArrowDataType::Struct(child_fields)) => {
+            let child_arrays: Vec<Arc<dyn ArrowArray>> = child_fields
+                .iter()
+                .map(|f| new_missing_array(f, num_rows))
+                .collect();
+            Arc::new(StructArray::new(child_fields.clone(), child_arrays, None))
+        }
+        _ => new_null_array(field.data_type(), num_rows),
+    }
+}
 
 /// Reorder a RecordBatch to match `requested_ordering`. For each non-zero value in
 /// `requested_ordering`, the column at that index will be added in order to the returned batch.
@@ -861,9 +1174,8 @@ pub(crate) fn reorder_struct_array(
                     ));
                 }
                 ReorderIndexTransform::Missing(field) => {
-                    let null_array = Arc::new(new_null_array(field.data_type(), num_rows));
-                    let field = field.clone(); // cheap Arc clone
-                    final_fields_cols[reorder_index.index] = Some((field, null_array));
+                    let array = new_missing_array(field, num_rows);
+                    final_fields_cols[reorder_index.index] = Some((field.clone(), array));
                 }
                 ReorderIndexTransform::RowIndex(field) => {
                     let Some(ref mut row_index_iter) = row_indexes else {
@@ -888,20 +1200,9 @@ pub(crate) fn reorder_struct_array(
                             "File path column requested but file location not provided",
                         ));
                     };
-                    // Use run-end encoding for efficiency since the file path is constant for all rows
-                    // Run-end encoding stores: [run_ends: [num_rows], values: [file_path]]
-                    let run_ends = PrimitiveArray::<Int64Type>::from_iter_values([num_rows as i64]);
-                    let values = StringArray::from_iter_values([file_path]);
-                    let file_path_array = RunArray::try_new(&run_ends, &values)?;
-
-                    // Create a field with the RunEndEncoded data type to match the array
-                    let ree_field = Arc::new(ArrowField::new(
-                        field.name(),
-                        file_path_array.data_type().clone(),
-                        field.is_nullable(),
-                    ));
+                    let file_path_array = StringArray::from(vec![file_path; num_rows]);
                     final_fields_cols[reorder_index.index] =
-                        Some((ree_field, Arc::new(file_path_array)));
+                        Some((Arc::clone(field), Arc::new(file_path_array)));
                 }
             }
         }
@@ -1120,13 +1421,66 @@ pub(crate) fn filter_to_record_batch(
     Ok((*arrow_data).into())
 }
 
+// we want to keep nulls in our partition map, so we end up with data in the log like:
+// {partitionValues:{"foo": null}}, which is what is generally expected. Without this we would
+// get: {partitionValues:{}}
+struct NullValueMapEncoder<'a> {
+    field: &'a ArrowFieldRef,
+    array: &'a MapArray,
+}
+
+impl<'a> Encoder for NullValueMapEncoder<'a> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let options = EncoderOptions::default().with_explicit_nulls(true);
+        // this unwrap is technically unsafe, but we _know_ that the array is a MapArray, and that
+        // `make_encoder` won't return an error for that. It would still be nice if we could return
+        // a `Result`, but we cannot
+        #[allow(clippy::unwrap_used)]
+        let mut encoder = make_encoder(self.field, self.array, &options).unwrap();
+        encoder.encode(idx, out);
+    }
+}
+
+/// This is a special encoder factory that will use the default encoder for all array types except
+/// MapArrays. For MapArrays, it will make a `NullValueMapEncoder` which encodes the map preserving
+/// keys that have null values.
+#[derive(Debug)]
+struct NullValueMapEncoderFactory;
+
+impl EncoderFactory for NullValueMapEncoderFactory {
+    fn make_default_encoder<'a>(
+        &self,
+        field: &'a ArrowFieldRef,
+        array: &'a dyn ArrowArray,
+        _options: &'a EncoderOptions,
+    ) -> Result<Option<NullableEncoder<'a>>, crate::arrow::error::ArrowError> {
+        // It would be tempting to use `make_encoder` below, but we can't because we have to create
+        // a new `EncoderOptions` in order to set `with_explicit_nulls`. Then the lifetime of the
+        // created encoder becomes tied to the lifetime of the `EncoderOptions`, and we cannot
+        // return it from this method as the options would be freed here.  We _also_ can't put the
+        // options inside the NullValueMapEncoderFactory, because this method takes `&self` not
+        // `&'a self`, and we can't change that as it's part of the trait definition.
+        match array.data_type() {
+            ArrowDataType::Map(_, _) => {
+                let array = array.as_map();
+                let encoder = NullValueMapEncoder { field, array };
+                let array_encoder = Box::new(encoder) as Box<dyn Encoder + 'a>;
+                let nulls = array.nulls().cloned();
+                Ok(Some(NullableEncoder::new(array_encoder, nulls)))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 /// serialize an arrow RecordBatch to a JSON string by appending to a buffer.
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
 #[internal_api]
 pub(crate) fn to_json_bytes(
     data: impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send,
 ) -> DeltaResult<Vec<u8>> {
-    let mut writer = LineDelimitedWriter::new(Vec::new());
+    let builder = WriterBuilder::new().with_encoder_factory(Arc::new(NullValueMapEncoderFactory));
+    let mut writer = builder.build::<_, LineDelimited>(Vec::new());
     for chunk in data {
         let batch = filter_to_record_batch(chunk?)?;
         writer.write(&batch)?;
@@ -1135,13 +1489,84 @@ pub(crate) fn to_json_bytes(
     Ok(writer.into_inner())
 }
 
+/// Applies post-processing to data read from a JSON file. Inserts synthesized metadata columns
+/// (e.g. [`MetadataColumnSpec::FilePath`]) at the positions specified by `reorder_indices`.
+///
+/// `reorder_indices` should be built once per schema via [`build_json_reorder_indices`] and
+/// reused for every batch from the same file.
+#[internal_api]
+pub(crate) fn fixup_json_read(
+    batch: RecordBatch,
+    reorder_indices: &[ReorderIndex],
+    file_location: &str,
+) -> DeltaResult<ArrowEngineData> {
+    let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))?;
+    Ok(data.into())
+}
+
+/// Builds the [`ReorderIndex`] vec for post-processing JSON read batches.
+///
+/// The JSON reader is given a schema with metadata columns stripped (see [`json_arrow_schema`]).
+/// Its output therefore has non-metadata columns at contiguous indices 0..N in schema order.
+/// This function maps those source indices -- and any metadata column specs -- into a
+/// `Vec<ReorderIndex>` that `reorder_struct_array` can use to produce the final batch with
+/// every column at its correct position.
+///
+/// Build the index vec once per schema (e.g. once per file); apply it to every batch produced
+/// by the reader via `reorder_struct_array`.
+///
+/// # Companion function
+/// - Use [`json_arrow_schema`] to strip metadata columns before passing the schema to the JSON
+///   reader.
+#[internal_api]
+pub(crate) fn build_json_reorder_indices(schema: &StructType) -> DeltaResult<Vec<ReorderIndex>> {
+    // Real columns: position in reorder_indices IS the source column index (0..N in schema
+    // order), and reorder_index.index carries the output position.
+    let mut reorder_indices = Vec::with_capacity(schema.num_fields());
+    // Metadata columns are appended after all real columns. reorder_struct_array never reads
+    // source data for metadata transforms, so their vec position doesn't correspond to a source
+    // column. Unsupported specs use Missing (null fill); non-nullable violations surface
+    // naturally via StructArray::try_new.
+    let mut metadata_entries = Vec::new();
+
+    for (output_pos, field) in schema.fields().enumerate() {
+        match field.get_metadata_column_spec() {
+            None => reorder_indices.push(ReorderIndex::identity(output_pos)),
+            Some(spec) => metadata_entries.push((output_pos, field, spec)),
+        }
+    }
+
+    for (output_pos, field, spec) in metadata_entries {
+        let field = Arc::new(field.try_into_arrow()?);
+        let rindex = match spec {
+            MetadataColumnSpec::FilePath => ReorderIndex::file_path(output_pos, field),
+            _ => ReorderIndex::missing(output_pos, field),
+        };
+        reorder_indices.push(rindex);
+    }
+
+    Ok(reorder_indices)
+}
+
+/// Builds an Arrow [`ArrowSchema`] from `schema` containing only the "real" JSON columns,
+/// omitting any fields annotated with [`MetadataColumnSpec`].
+///
+/// Pass the returned schema to Arrow's JSON reader; then call [`build_json_reorder_indices`]
+/// once on the same schema and apply `reorder_struct_array` to each resulting batch to
+/// insert the synthesized metadata columns at their correct positions.
+#[internal_api]
+pub(crate) fn json_arrow_schema(schema: &StructType) -> DeltaResult<ArrowSchema> {
+    let json_fields = schema.with_fields_filtered(|f| f.get_metadata_column_spec().is_none())?;
+    Ok(ArrowSchema::try_from_kernel(&json_fields)?)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use crate::arrow::array::{
         Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, Int32Builder,
-        MapArray, MapBuilder, StructArray, StructBuilder,
+        Int64Array, MapArray, MapBuilder, StringArray, StringBuilder, StructArray, StructBuilder,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
@@ -1153,7 +1578,8 @@ mod tests {
     };
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+        StructField, StructType,
     };
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -1190,8 +1616,15 @@ mod tests {
     }
 
     /// Generates the column mapping metadata for a logical struct field given the field id.
-    fn column_mapping_metadata(field_id: i64) -> HashMap<String, MetadataValue> {
-        kernel_fid_and_name(field_id, physical_name(field_id))
+    /// Returns empty metadata for `None` mode, since no annotations should be present.
+    fn column_mapping_metadata(
+        field_id: i64,
+        mode: ColumnMappingMode,
+    ) -> HashMap<String, MetadataValue> {
+        match mode {
+            ColumnMappingMode::None => HashMap::new(),
+            _ => kernel_fid_and_name(field_id, physical_name(field_id)),
+        }
     }
 
     /// Generates metadata for a parquet field with id `field_id`.
@@ -1323,17 +1756,42 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_json_impl_propagates_type_errors() {
+        // Verify that parse_json_impl surfaces errors for values that don't match the schema,
+        // so the expression-level caller can catch them and return nulls.
+
+        // Value overflow: 99999 doesn't fit in decimal(4,2) (max 99.99)
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Decimal128(4, 2),
+            true,
+        )]));
+        let input: Vec<Option<&str>> = vec![Some(r#"{"a": 99999}"#)];
+        assert!(parse_json_impl(&input.into(), schema).is_err());
+
+        // Type mismatch: string where integer expected
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Int64,
+            true,
+        )]));
+        let input: Vec<Option<&str>> = vec![Some(r#"{"a": "not_a_number"}"#)];
+        assert!(parse_json_impl(&input.into(), schema).is_err());
+    }
+
+    #[test]
     fn simple_mask_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0, mode)),
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
@@ -1504,11 +1962,12 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0, mode)),
                 StructField::nullable(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
@@ -1524,11 +1983,12 @@ mod tests {
 
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0, mode)),
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false),
@@ -1549,8 +2009,9 @@ mod tests {
                 logical_name(0),
                 MapType::new(DataType::INTEGER, DataType::STRING, false),
             )
-            .with_metadata(column_mapping_metadata(0))])
+            .with_metadata(column_mapping_metadata(0, mode))])
             .make_physical(mode)
+            .unwrap()
             .into();
 
             // The key and value may have field ids not present in the delta schema
@@ -1577,13 +2038,14 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0, mode)),
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, true)
@@ -1611,13 +2073,14 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0, mode)),
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
@@ -1654,6 +2117,7 @@ mod tests {
                 .with_metadata(kernel_fid_and_name(3, "i2_physical")),
         ])
         .make_physical(ColumnMappingMode::Id)
+        .unwrap()
         .into();
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("not-i", ArrowDataType::Int32, false).with_metadata(arrow_fid(1)),
@@ -1687,6 +2151,7 @@ mod tests {
                 .with_metadata(kernel_fid_and_name(3, "i2_physical")),
         ])
         .make_physical(ColumnMappingMode::Id)
+        .unwrap()
         .into();
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i_logical", ArrowDataType::Int32, false).with_metadata(arrow_fid(1)),
@@ -1734,8 +2199,6 @@ mod tests {
 
     #[test]
     fn test_match_parquet_fields_filters_metadata_columns() {
-        use crate::schema::MetadataColumnSpec;
-
         let kernel_schema = StructType::new_unchecked([
             StructField::not_null("regular_field", DataType::INTEGER),
             StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
@@ -1910,27 +2373,14 @@ mod tests {
         let ordered = reorder_struct_array(arry, &reorder, None, Some(file_location)).unwrap();
         assert_eq!(ordered.column_names(), vec!["b", "_file"]);
 
-        // Verify the file path column is run-end encoded and contains the expected value
+        // Verify the file path column is a plain StringArray with the path repeated for each row.
         let file_path_col = ordered.column(1);
-
-        // Check it's a RunArray<Int64Type, StringArray>
-        let run_array = file_path_col
+        let string_array = file_path_col
             .as_any()
-            .downcast_ref::<RunArray<Int64Type>>()
-            .expect("Expected RunArray");
-
-        // Verify it has 4 logical rows (same as input)
-        assert_eq!(run_array.len(), 4);
-
-        // Verify the physical representation is efficient: 1 run with value at end position 4
-        let run_ends = run_array.run_ends().values();
-        assert_eq!(run_ends.len(), 1, "Should have only 1 run");
-        assert_eq!(run_ends[0], 4, "Run should end at position 4");
-
-        // Verify the value
-        let values = run_array.values().as_string::<i32>();
-        assert_eq!(values.len(), 1, "Should have only 1 unique value");
-        assert_eq!(values.value(0), file_location);
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray");
+        assert_eq!(string_array.len(), 4);
+        assert!(string_array.iter().all(|v| v == Some(file_location)));
     }
 
     #[test]
@@ -2054,21 +2504,22 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(
                     logical_name(3),
                     StructType::new_unchecked([
                         StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_mapping_metadata(4)),
+                            .with_metadata(column_mapping_metadata(4, mode)),
                         StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_mapping_metadata(5)),
+                            .with_metadata(column_mapping_metadata(5, mode)),
                     ]),
                 )
-                .with_metadata(column_mapping_metadata(3)),
+                .with_metadata(column_mapping_metadata(3, mode)),
                 StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = nested_parquet_schema(mode);
             let (mask_indices, reorder_indices) =
@@ -2094,18 +2545,19 @@ mod tests {
                     logical_name(3),
                     StructType::new_unchecked([
                         StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_mapping_metadata(5)),
+                            .with_metadata(column_mapping_metadata(5, mode)),
                         StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_mapping_metadata(4)),
+                            .with_metadata(column_mapping_metadata(4, mode)),
                     ]),
                 )
-                .with_metadata(column_mapping_metadata(3)),
+                .with_metadata(column_mapping_metadata(3, mode)),
                 StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = nested_parquet_schema(mode);
             let (mask_indices, reorder_indices) =
@@ -2129,20 +2581,21 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(
                     logical_name(3),
                     StructType::new_unchecked([StructField::not_null(
                         logical_name(4),
                         DataType::INTEGER,
                     )
-                    .with_metadata(column_mapping_metadata(4))]),
+                    .with_metadata(column_mapping_metadata(4, mode))]),
                 )
-                .with_metadata(column_mapping_metadata(3)),
+                .with_metadata(column_mapping_metadata(3, mode)),
                 StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = nested_parquet_schema(mode);
             let (mask_indices, reorder_indices) =
@@ -2159,17 +2612,62 @@ mod tests {
     }
 
     #[test]
+    fn unmatched_struct_before_selected_leaf_ordering() {
+        // Regression: when a struct with no matching children appears BEFORE a selected
+        // leaf in parquet order, the Missing entry must be deferred so the leaf's
+        // Identity entry gets the correct parquet_position in reorder_struct_array.
+        let requested_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable(
+                "stats",
+                StructType::new_unchecked([StructField::nullable("age", DataType::LONG)]),
+            ),
+        ]));
+        // Parquet has stats BEFORE a
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "stats",
+                ArrowDataType::Struct(
+                    vec![ArrowField::new("id", ArrowDataType::Int64, true)].into(),
+                ),
+                true,
+            ),
+            ArrowField::new("a", ArrowDataType::Int64, true),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        // Only "a" should be in the mask (leaf index 1, after stats.id at index 0)
+        assert_eq!(mask_indices, vec![1]);
+        let expected_stats_field = Arc::new(
+            requested_schema
+                .field("stats")
+                .unwrap()
+                .try_into_arrow()
+                .unwrap(),
+        );
+        // Identity for "a" must come FIRST (parquet_position 0), then Missing for stats
+        assert_eq!(
+            reorder_indices,
+            vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::missing(1, expected_stats_field),
+            ]
+        );
+    }
+
+    #[test]
     fn simple_list_mask() {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(logical_name(2), ArrayType::new(DataType::INTEGER, false))
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
@@ -2207,8 +2705,9 @@ mod tests {
                 logical_name(1),
                 ArrayType::new(DataType::INTEGER, false),
             )
-            .with_metadata(column_mapping_metadata(1))])
+            .with_metadata(column_mapping_metadata(1, mode))])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
@@ -2237,25 +2736,26 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0, mode)),
                 StructField::not_null(
                     logical_name(1),
                     ArrayType::new(
                         StructType::new_unchecked([
                             StructField::not_null(logical_name(3), DataType::INTEGER)
-                                .with_metadata(column_mapping_metadata(3)),
+                                .with_metadata(column_mapping_metadata(3, mode)),
                             StructField::not_null(logical_name(4), DataType::STRING)
-                                .with_metadata(column_mapping_metadata(4)),
+                                .with_metadata(column_mapping_metadata(4, mode)),
                         ])
                         .into(),
                         false,
                     ),
                 )
-                .with_metadata(column_mapping_metadata(1)),
+                .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
@@ -2302,11 +2802,12 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
@@ -2346,7 +2847,7 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
@@ -2354,16 +2855,17 @@ mod tests {
                             logical_name(4),
                             DataType::INTEGER,
                         )
-                        .with_metadata(column_mapping_metadata(4))])
+                        .with_metadata(column_mapping_metadata(4, mode))])
                         .into(),
                         false,
                     ),
                 )
-                .with_metadata(column_mapping_metadata(2)),
+                .with_metadata(column_mapping_metadata(2, mode)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
@@ -2407,25 +2909,26 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
                         StructType::new_unchecked([
                             StructField::not_null(logical_name(6), DataType::STRING)
-                                .with_metadata(column_mapping_metadata(6)),
+                                .with_metadata(column_mapping_metadata(6, mode)),
                             StructField::not_null(logical_name(5), DataType::INTEGER)
-                                .with_metadata(column_mapping_metadata(5)),
+                                .with_metadata(column_mapping_metadata(5, mode)),
                         ])
                         .into(),
                         false,
                     ),
                 )
-                .with_metadata(column_mapping_metadata(2)),
+                .with_metadata(column_mapping_metadata(2, mode)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
@@ -2474,21 +2977,22 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::not_null(
                     logical_name(2),
                     StructType::new_unchecked([
                         StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_mapping_metadata(4)),
+                            .with_metadata(column_mapping_metadata(4, mode)),
                         StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_mapping_metadata(5)),
+                            .with_metadata(column_mapping_metadata(5, mode)),
                     ]),
                 )
-                .with_metadata(column_mapping_metadata(2)),
+                .with_metadata(column_mapping_metadata(2, mode)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(
@@ -2818,11 +3322,12 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_mapping_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1, mode)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_mapping_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2, mode)),
             ])
             .make_physical(mode)
+            .unwrap()
             .into();
             let nots_field =
                 ArrowField::new("NOTs", ArrowDataType::Utf8, true).with_metadata(arrow_fid(3));
@@ -3055,5 +3560,896 @@ mod tests {
         assert_eq!(non_null_leaf_non_null_2, non_null_leaf_non_null_1);
         let non_null_leaf_nullable_2 = inner_non_null_2.column(1);
         assert_eq!(non_null_leaf_nullable_2, non_null_leaf_nullable_1);
+    }
+
+    /// (src_field, target_field, column) where src and target differ only in nullability.
+    type CoerceTestCase = (Arc<ArrowField>, Arc<ArrowField>, Arc<dyn ArrowArray>);
+
+    /// Builds a (to_nullable, to_non_null) coerce test case pair from field/col constructors.
+    /// The `leaf_nullable` parameter controls the nullability of the innermost toggled field.
+    fn make_coerce_pair(
+        make_field: impl Fn(bool) -> Arc<ArrowField>,
+        make_col: impl Fn(bool) -> Arc<dyn ArrowArray>,
+    ) -> (CoerceTestCase, CoerceTestCase) {
+        (
+            (make_field(false), make_field(true), make_col(false)),
+            (make_field(true), make_field(false), make_col(true)),
+        )
+    }
+
+    /// Builds a Map entries field: `entries: Struct { key: Utf8, value: <value_field> }`.
+    fn make_map_entries_field(value_field: ArrowField) -> Arc<ArrowField> {
+        Arc::new(ArrowField::new(
+            "entries",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("key", ArrowDataType::Utf8, false),
+                value_field,
+            ])),
+            false,
+        ))
+    }
+
+    /// Builds a 2-row MapArray from an entries field, with keys ["a","b"] and given values.
+    fn make_map_array(
+        entries_field: Arc<ArrowField>,
+        values: Arc<dyn ArrowArray>,
+    ) -> Arc<dyn ArrowArray> {
+        let entry_fields = match entries_field.data_type() {
+            ArrowDataType::Struct(f) => f.clone(),
+            _ => unreachable!(),
+        };
+        let keys: Arc<dyn ArrowArray> = Arc::new(StringArray::from(vec!["a", "b"]));
+        let entries = StructArray::try_new(entry_fields, vec![keys, values], None).unwrap();
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2]));
+        Arc::new(MapArray::try_new(entries_field, offsets, entries, None, false).unwrap())
+    }
+
+    fn create_data_int() -> (CoerceTestCase, CoerceTestCase) {
+        let col: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
+        make_coerce_pair(
+            |leaf_nullable| Arc::new(ArrowField::new("col", ArrowDataType::Int32, leaf_nullable)),
+            |_leaf_nullable| col.clone(),
+        )
+    }
+
+    fn create_data_string() -> (CoerceTestCase, CoerceTestCase) {
+        let col: Arc<dyn ArrowArray> = Arc::new(StringArray::from(vec!["a", "b"]));
+        make_coerce_pair(
+            |leaf_nullable| Arc::new(ArrowField::new("col", ArrowDataType::Utf8, leaf_nullable)),
+            |_leaf_nullable| col.clone(),
+        )
+    }
+
+    fn create_data_struct() -> (CoerceTestCase, CoerceTestCase) {
+        let inner_col: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
+        make_coerce_pair(
+            |leaf_nullable| {
+                Arc::new(ArrowField::new(
+                    "c",
+                    ArrowDataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                        "val",
+                        ArrowDataType::Int32,
+                        leaf_nullable,
+                    )])),
+                    false,
+                ))
+            },
+            |leaf_nullable| {
+                let inner = ArrowField::new("val", ArrowDataType::Int32, leaf_nullable);
+                Arc::new(
+                    StructArray::try_new(
+                        ArrowFields::from(vec![inner]),
+                        vec![inner_col.clone()],
+                        None,
+                    )
+                    .unwrap(),
+                )
+            },
+        )
+    }
+
+    fn create_data_list() -> (CoerceTestCase, CoerceTestCase) {
+        let values: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        make_coerce_pair(
+            |leaf_nullable| {
+                let elem = Arc::new(ArrowField::new("item", ArrowDataType::Int32, leaf_nullable));
+                Arc::new(ArrowField::new("col", ArrowDataType::List(elem), false))
+            },
+            |leaf_nullable| {
+                let elem = Arc::new(ArrowField::new("item", ArrowDataType::Int32, leaf_nullable));
+                let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3]));
+                Arc::new(
+                    GenericListArray::<i32>::try_new(elem, offsets, values.clone(), None).unwrap(),
+                )
+            },
+        )
+    }
+
+    fn create_data_map() -> (CoerceTestCase, CoerceTestCase) {
+        make_coerce_pair(
+            |leaf_nullable| {
+                let entries_field = make_map_entries_field(ArrowField::new(
+                    "value",
+                    ArrowDataType::Int32,
+                    leaf_nullable,
+                ));
+                Arc::new(ArrowField::new(
+                    "c",
+                    ArrowDataType::Map(entries_field, false),
+                    false,
+                ))
+            },
+            |leaf_nullable| {
+                let entries_field = make_map_entries_field(ArrowField::new(
+                    "value",
+                    ArrowDataType::Int32,
+                    leaf_nullable,
+                ));
+                make_map_array(entries_field, Arc::new(Int32Array::from(vec![1, 2])))
+            },
+        )
+    }
+
+    /// List<Struct<Int32>> — toggle nullability of the Int32 leaf inside the struct element.
+    fn create_data_struct_in_list() -> (CoerceTestCase, CoerceTestCase) {
+        make_coerce_pair(
+            |leaf_nullable| {
+                let leaf = ArrowField::new("val", ArrowDataType::Int32, leaf_nullable);
+                let elem = Arc::new(ArrowField::new(
+                    "item",
+                    ArrowDataType::Struct(ArrowFields::from(vec![leaf])),
+                    false,
+                ));
+                Arc::new(ArrowField::new("col", ArrowDataType::List(elem), false))
+            },
+            |leaf_nullable| {
+                let leaf = ArrowField::new("val", ArrowDataType::Int32, leaf_nullable);
+                let inner_col: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2, 3]));
+                let elem_field = Arc::new(ArrowField::new(
+                    "item",
+                    ArrowDataType::Struct(ArrowFields::from(vec![leaf.clone()])),
+                    false,
+                ));
+                let structs =
+                    StructArray::try_new(ArrowFields::from(vec![leaf]), vec![inner_col], None)
+                        .unwrap();
+                let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3]));
+                Arc::new(
+                    GenericListArray::<i32>::try_new(elem_field, offsets, Arc::new(structs), None)
+                        .unwrap(),
+                )
+            },
+        )
+    }
+
+    /// Struct<List<Int32>> — toggle nullability of the Int32 element inside the list child.
+    fn create_data_list_in_struct() -> (CoerceTestCase, CoerceTestCase) {
+        make_coerce_pair(
+            |leaf_nullable| {
+                let elem = Arc::new(ArrowField::new("item", ArrowDataType::Int32, leaf_nullable));
+                let list_field = ArrowField::new("vals", ArrowDataType::List(elem), false);
+                Arc::new(ArrowField::new(
+                    "c",
+                    ArrowDataType::Struct(ArrowFields::from(vec![list_field])),
+                    false,
+                ))
+            },
+            |leaf_nullable| {
+                let elem = Arc::new(ArrowField::new("item", ArrowDataType::Int32, leaf_nullable));
+                let values: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2, 3]));
+                let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3]));
+                let list_col: Arc<dyn ArrowArray> = Arc::new(
+                    GenericListArray::<i32>::try_new(elem, offsets, values, None).unwrap(),
+                );
+                let list_field = ArrowField::new("vals", list_col.data_type().clone(), false);
+                Arc::new(
+                    StructArray::try_new(ArrowFields::from(vec![list_field]), vec![list_col], None)
+                        .unwrap(),
+                )
+            },
+        )
+    }
+
+    /// Map<String, List<Int32>> — toggle nullability of the Int32 element inside the list value.
+    fn create_data_list_in_map() -> (CoerceTestCase, CoerceTestCase) {
+        make_coerce_pair(
+            |leaf_nullable| {
+                let elem = Arc::new(ArrowField::new("item", ArrowDataType::Int32, leaf_nullable));
+                let entries_field = make_map_entries_field(ArrowField::new(
+                    "value",
+                    ArrowDataType::List(elem),
+                    true,
+                ));
+                Arc::new(ArrowField::new(
+                    "c",
+                    ArrowDataType::Map(entries_field, false),
+                    false,
+                ))
+            },
+            |leaf_nullable| {
+                let elem = Arc::new(ArrowField::new("item", ArrowDataType::Int32, leaf_nullable));
+                let list_values: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
+                let list_offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2]));
+                let list_col: Arc<dyn ArrowArray> = Arc::new(
+                    GenericListArray::<i32>::try_new(elem, list_offsets, list_values, None)
+                        .unwrap(),
+                );
+                let entries_field = make_map_entries_field(ArrowField::new(
+                    "value",
+                    ArrowDataType::List(Arc::new(ArrowField::new(
+                        "item",
+                        ArrowDataType::Int32,
+                        leaf_nullable,
+                    ))),
+                    true,
+                ));
+                make_map_array(entries_field, list_col)
+            },
+        )
+    }
+
+    /// Map<String, Struct<Int32>> — toggle nullability of the Int32 leaf inside the struct value.
+    fn create_data_struct_in_map() -> (CoerceTestCase, CoerceTestCase) {
+        make_coerce_pair(
+            |leaf_nullable| {
+                let leaf = ArrowField::new("val", ArrowDataType::Int32, leaf_nullable);
+                let value_field = ArrowField::new(
+                    "value",
+                    ArrowDataType::Struct(ArrowFields::from(vec![leaf])),
+                    true,
+                );
+                let entries_field = make_map_entries_field(value_field);
+                Arc::new(ArrowField::new(
+                    "c",
+                    ArrowDataType::Map(entries_field, false),
+                    false,
+                ))
+            },
+            |leaf_nullable| {
+                let leaf = ArrowField::new("val", ArrowDataType::Int32, leaf_nullable);
+                let inner: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
+                let struct_col: Arc<dyn ArrowArray> = Arc::new(
+                    StructArray::try_new(ArrowFields::from(vec![leaf.clone()]), vec![inner], None)
+                        .unwrap(),
+                );
+                let value_field = ArrowField::new(
+                    "value",
+                    ArrowDataType::Struct(ArrowFields::from(vec![leaf])),
+                    true,
+                );
+                let entries_field = make_map_entries_field(value_field);
+                make_map_array(entries_field, struct_col)
+            },
+        )
+    }
+
+    /// Struct<Map<String, Int32>> — toggle nullability of the Int32 value inside the map child.
+    fn create_data_map_in_struct() -> (CoerceTestCase, CoerceTestCase) {
+        make_coerce_pair(
+            |leaf_nullable| {
+                let entries_field = make_map_entries_field(ArrowField::new(
+                    "value",
+                    ArrowDataType::Int32,
+                    leaf_nullable,
+                ));
+                let map_field =
+                    ArrowField::new("map_child", ArrowDataType::Map(entries_field, false), false);
+                Arc::new(ArrowField::new(
+                    "c",
+                    ArrowDataType::Struct(ArrowFields::from(vec![map_field])),
+                    false,
+                ))
+            },
+            |leaf_nullable| {
+                let entries_field = make_map_entries_field(ArrowField::new(
+                    "value",
+                    ArrowDataType::Int32,
+                    leaf_nullable,
+                ));
+                let map_col = make_map_array(entries_field, Arc::new(Int32Array::from(vec![1, 2])));
+                let map_child_field =
+                    ArrowField::new("map_child", map_col.data_type().clone(), false);
+                Arc::new(
+                    StructArray::try_new(
+                        ArrowFields::from(vec![map_child_field]),
+                        vec![map_col],
+                        None,
+                    )
+                    .unwrap(),
+                )
+            },
+        )
+    }
+
+    /// List<Map<String, Int32>> — toggle nullability of the Int32 value inside the map element.
+    fn create_data_map_in_list() -> (CoerceTestCase, CoerceTestCase) {
+        make_coerce_pair(
+            |leaf_nullable| {
+                let entries_field = make_map_entries_field(ArrowField::new(
+                    "value",
+                    ArrowDataType::Int32,
+                    leaf_nullable,
+                ));
+                let map_elem = Arc::new(ArrowField::new(
+                    "item",
+                    ArrowDataType::Map(entries_field, false),
+                    false,
+                ));
+                Arc::new(ArrowField::new("col", ArrowDataType::List(map_elem), false))
+            },
+            |leaf_nullable| {
+                let entries_field = make_map_entries_field(ArrowField::new(
+                    "value",
+                    ArrowDataType::Int32,
+                    leaf_nullable,
+                ));
+                let map_col = make_map_array(entries_field, Arc::new(Int32Array::from(vec![1, 2])));
+                let map_elem =
+                    Arc::new(ArrowField::new("item", map_col.data_type().clone(), false));
+                let list_offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2]));
+                Arc::new(
+                    GenericListArray::<i32>::try_new(map_elem, list_offsets, map_col, None)
+                        .unwrap(),
+                )
+            },
+        )
+    }
+
+    use rstest::rstest;
+
+    /// Rename fields in each case tuple to `c{idx}` so multi-column batches have unique names.
+    fn allocate_name_to_field(idx: usize, (src, tgt, col): CoerceTestCase) -> CoerceTestCase {
+        let name = format!("c{idx}");
+        let src = Arc::new(ArrowField::new(
+            &name,
+            src.data_type().clone(),
+            src.is_nullable(),
+        ));
+        let tgt = Arc::new(ArrowField::new(
+            &name,
+            tgt.data_type().clone(),
+            tgt.is_nullable(),
+        ));
+        (src, tgt, col)
+    }
+
+    #[rstest]
+    // Each basic type with a nested type: covers all leaf/container recursion paths
+    #[case::int_and_struct_in_list(vec![
+        create_data_int(), create_data_struct_in_list(),
+    ], true)]
+    #[case::string_and_list_in_struct(vec![
+        create_data_string(), create_data_list_in_struct(),
+    ], false)]
+    // All simple types together
+    #[case::all_simple_types(vec![
+        create_data_int(), create_data_string(), create_data_struct(),
+        create_data_list(), create_data_map(),
+    ], true)]
+    // All nested types together
+    #[case::all_nested_types(vec![
+        create_data_struct_in_list(), create_data_list_in_struct(),
+        create_data_list_in_map(), create_data_struct_in_map(),
+        create_data_map_in_struct(), create_data_map_in_list(),
+    ], false)]
+    // Mix of simple and nested, to_nullable
+    #[case::mixed_to_nullable(vec![
+        create_data_int(), create_data_struct(), create_data_map_in_list(),
+        create_data_struct_in_map(),
+    ], true)]
+    // Mix of simple and nested, to_non_null
+    #[case::mixed_to_non_null(vec![
+        create_data_list(), create_data_map(), create_data_list_in_map(),
+        create_data_map_in_struct(),
+    ], false)]
+    fn test_coerce_batch_nullability(
+        #[case] data: Vec<(CoerceTestCase, CoerceTestCase)>,
+        #[case] to_nullable: bool,
+    ) {
+        let (src_fields, tgt_fields, cols): (Vec<_>, Vec<_>, Vec<_>) = data
+            .into_iter()
+            .enumerate()
+            .map(|(i, (to_nullable_case, to_non_null_case))| {
+                let case = if to_nullable {
+                    to_nullable_case
+                } else {
+                    to_non_null_case
+                };
+                allocate_name_to_field(i, case)
+            })
+            .multiunzip();
+        let src_schema = Arc::new(ArrowSchema::new(src_fields));
+        let target_schema = Arc::new(ArrowSchema::new(tgt_fields));
+        assert_ne!(src_schema, target_schema);
+        let batch = RecordBatch::try_new(src_schema, cols).unwrap();
+        let result = coerce_batch_nullability(batch, &target_schema, None).unwrap();
+        assert_eq!(*result.schema(), *target_schema);
+    }
+
+    #[test]
+    fn test_coerce_batch_nullability_schema_already_matches() {
+        let field = ArrowField::new("a", ArrowDataType::Int32, false);
+        let col: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![1, 2]));
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
+        let result = coerce_batch_nullability(batch.clone(), &schema, None).unwrap();
+        assert_eq!(result, batch);
+    }
+
+    #[test]
+    fn test_coerce_batch_nullability_type_mismatch_rejected_without_validator() {
+        let ((int_src_field, _, int_col), _) = create_data_int();
+        let (_, (_, string_tgt_field, _)) = create_data_string();
+        let src_schema = Arc::new(ArrowSchema::new(vec![int_src_field.as_ref().clone()]));
+        let target_schema = Arc::new(ArrowSchema::new(vec![string_tgt_field.as_ref().clone()]));
+        let batch = RecordBatch::try_new(src_schema, vec![int_col]).unwrap();
+        let result = coerce_batch_nullability(batch, &target_schema, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("data type mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_coerce_batch_nullability_type_mismatch_allowed_with_validator() {
+        let ((int_src_field, _, int_col), _) = create_data_int();
+        let ((_, string_tgt_field, _), _) = create_data_string();
+        let src_schema = Arc::new(ArrowSchema::new(vec![int_src_field.as_ref().clone()]));
+        let target_schema = Arc::new(ArrowSchema::new(vec![string_tgt_field.as_ref().clone()]));
+        let batch = RecordBatch::try_new(src_schema, vec![int_col]).unwrap();
+        let allow_all = |_: &ArrowFieldRef, _: &ArrowFieldRef| Ok(());
+        let result = coerce_batch_nullability(batch, &target_schema, Some(&allow_all)).unwrap();
+        assert_eq!(result.schema().field(0).data_type(), &ArrowDataType::Int32);
+        assert!(result.schema().field(0).is_nullable());
+    }
+
+    /// Verifies metadata is preserved at every nesting level (struct, list, map) after coercion.
+    /// Schema: s: Struct { lst: List[Int32], mp: Map<Utf8, Int32> }, all non-null → nullable.
+    #[test]
+    fn test_coerce_batch_nullability_preserves_field_metadata() {
+        use std::collections::HashMap;
+
+        let meta = |key: &str| HashMap::from([(key.to_string(), "val".to_string())]);
+        let offsets_1 = || OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1]));
+
+        /// Recursively sets all fields to nullable, except map entries and map keys
+        /// which Arrow requires to be non-null.
+        fn make_all_nullable(field: &ArrowField) -> ArrowField {
+            let dt = match field.data_type() {
+                ArrowDataType::Struct(children) => ArrowDataType::Struct(
+                    children
+                        .iter()
+                        .map(|f| Arc::new(make_all_nullable(f)))
+                        .collect(),
+                ),
+                ArrowDataType::List(elem) => ArrowDataType::List(Arc::new(make_all_nullable(elem))),
+                ArrowDataType::Map(entries, ordered) => {
+                    // Recurse into entries struct but keep entries itself non-null
+                    let inner = make_all_nullable(entries).with_nullable(false);
+                    ArrowDataType::Map(Arc::new(inner), *ordered)
+                }
+                other => other.clone(),
+            };
+            field.clone().with_data_type(dt).with_nullable(true)
+        }
+
+        // Source schema (all non-null, each field carries metadata):
+        //   s: Struct {
+        //     lst: List [ item: Int32 ],
+        //     mp:  Map  { key: Utf8, value: Int32 }
+        //   }
+        let src_item = Arc::new(
+            ArrowField::new("item", ArrowDataType::Int32, false).with_metadata(meta("item")),
+        );
+        let src_entries = Arc::new(ArrowField::new(
+            "entries",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("key", ArrowDataType::Utf8, false),
+                ArrowField::new("value", ArrowDataType::Int32, false).with_metadata(meta("value")),
+            ])),
+            false,
+        ));
+        let src_list = ArrowField::new("lst", ArrowDataType::List(src_item.clone()), false)
+            .with_metadata(meta("list"));
+        let src_map = ArrowField::new("mp", ArrowDataType::Map(src_entries.clone(), false), false)
+            .with_metadata(meta("map"));
+        let src_struct = ArrowField::new(
+            "s",
+            ArrowDataType::Struct(ArrowFields::from(vec![src_list.clone(), src_map.clone()])),
+            false,
+        )
+        .with_metadata(meta("struct"));
+
+        // Target: same structure but all fields nullable
+        let tgt_struct = make_all_nullable(&src_struct);
+
+        // Build 1-row arrays
+        let entry_fields = match src_entries.data_type() {
+            ArrowDataType::Struct(f) => f.clone(),
+            _ => unreachable!(),
+        };
+        let list_col: Arc<dyn ArrowArray> = Arc::new(
+            GenericListArray::<i32>::try_new(
+                src_item,
+                offsets_1(),
+                Arc::new(Int32Array::from(vec![1])),
+                None,
+            )
+            .unwrap(),
+        );
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int32Array::from(vec![10])) as _,
+            ],
+            None,
+        )
+        .unwrap();
+        let map_col: Arc<dyn ArrowArray> =
+            Arc::new(MapArray::try_new(src_entries, offsets_1(), entries, None, false).unwrap());
+        let struct_col: Arc<dyn ArrowArray> = Arc::new(
+            StructArray::try_new(
+                ArrowFields::from(vec![src_list, src_map]),
+                vec![list_col, map_col],
+                None,
+            )
+            .unwrap(),
+        );
+
+        let src_schema = Arc::new(ArrowSchema::new(vec![src_struct]));
+        let target_schema = Arc::new(ArrowSchema::new(vec![tgt_struct]));
+        let batch = RecordBatch::try_new(src_schema, vec![struct_col]).unwrap();
+        let result = coerce_batch_nullability(batch, &target_schema, None).unwrap();
+
+        // Walk the result schema and assert metadata + nullability at every level
+        let schema = result.schema();
+        let s = schema.field(0);
+        assert_eq!(s.metadata(), &meta("struct"));
+        assert!(s.is_nullable());
+
+        let fields = match s.data_type() {
+            ArrowDataType::Struct(f) => f,
+            other => panic!("expected Struct, got {other:?}"),
+        };
+        assert_eq!(fields[0].metadata(), &meta("list"));
+        assert!(fields[0].is_nullable());
+
+        let list_item = match fields[0].data_type() {
+            ArrowDataType::List(e) => e,
+            other => panic!("expected List, got {other:?}"),
+        };
+        assert_eq!(list_item.metadata(), &meta("item"));
+        assert!(list_item.is_nullable());
+
+        assert_eq!(fields[1].metadata(), &meta("map"));
+        assert!(fields[1].is_nullable());
+
+        let map_val = match fields[1].data_type() {
+            ArrowDataType::Map(e, _) => match e.data_type() {
+                ArrowDataType::Struct(f) => &f[1],
+                other => panic!("expected Struct entries, got {other:?}"),
+            },
+            other => panic!("expected Map, got {other:?}"),
+        };
+        assert_eq!(map_val.metadata(), &meta("value"));
+        assert!(map_val.is_nullable());
+    }
+
+    // --- Tests for build_json_reorder_indices and json_arrow_schema ---
+
+    const FILE_PATH: &str = "s3://bucket/test.json";
+
+    struct JsonInsertCase {
+        /// Full schema; may include a `FilePath` metadata column at any position.
+        schema: StructType,
+        /// Field names that [`json_arrow_schema`] should expose (metadata columns stripped).
+        expected_json_names: &'static [&'static str],
+        /// Column names in the final output after [`reorder_struct_array`].
+        expected_output_names: &'static [&'static str],
+        /// Index of the `_file` column in the output, or `None` when the schema has no FilePath.
+        file_path_col: Option<usize>,
+    }
+
+    /// Verifies that `json_arrow_schema` + `build_json_reorder_indices` + `reorder_struct_array`
+    /// correctly insert (or omit) the `_file` column at the position declared in the schema.
+    #[rstest]
+    #[case::no_file_path(JsonInsertCase {
+        schema: StructType::new_unchecked([
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::INTEGER),
+        ]),
+        expected_json_names: &["a", "b"],
+        expected_output_names: &["a", "b"],
+        file_path_col: None,
+    })]
+    #[case::file_path_at_start(JsonInsertCase {
+        schema: StructType::new_unchecked([
+            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::INTEGER),
+        ]),
+        expected_json_names: &["a", "b"],
+        expected_output_names: &["_file", "a", "b"],
+        file_path_col: Some(0),
+    })]
+    #[case::file_path_in_middle(JsonInsertCase {
+        schema: StructType::new_unchecked([
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+            StructField::nullable("b", DataType::INTEGER),
+        ]),
+        expected_json_names: &["a", "b"],
+        expected_output_names: &["a", "_file", "b"],
+        file_path_col: Some(1),
+    })]
+    #[case::file_path_at_end(JsonInsertCase {
+        schema: StructType::new_unchecked([
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::INTEGER),
+            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+        ]),
+        expected_json_names: &["a", "b"],
+        expected_output_names: &["a", "b", "_file"],
+        file_path_col: Some(2),
+    })]
+    fn test_json_file_path_insertion(#[case] case: JsonInsertCase) {
+        // json_arrow_schema exposes only the non-metadata fields.
+        let json_schema = json_arrow_schema(&case.schema).unwrap();
+        let json_names: Vec<_> = json_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(json_names, case.expected_json_names);
+
+        // Build an input batch with the JSON schema (real columns only, each an Int32Array).
+        let arrow_schema = Arc::new(json_schema);
+        let cols: Vec<ArrowArrayRef> = (0..arrow_schema.fields().len())
+            .map(|_| Arc::new(Int32Array::from(vec![1i32, 2, 3])) as _)
+            .collect();
+        let batch = RecordBatch::try_new(arrow_schema, cols).unwrap();
+
+        // build_json_reorder_indices + reorder_struct_array inserts the _file column.
+        let indices = build_json_reorder_indices(&case.schema).unwrap();
+        let result = RecordBatch::from(
+            reorder_struct_array(batch.into(), &indices, None, Some(FILE_PATH)).unwrap(),
+        );
+
+        // Verify output column order and row count.
+        let schema = result.schema();
+        let output_names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(output_names, case.expected_output_names);
+        assert_eq!(result.num_rows(), 3);
+
+        // When FilePath is in the schema, verify a plain StringArray with the path for every row.
+        // When absent, verify no _file column leaked into the output.
+        if let Some(idx) = case.file_path_col {
+            let arr = result
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("_file column should be a StringArray");
+            assert!(arr.iter().all(|v| v == Some(FILE_PATH)));
+        } else {
+            assert!(
+                result.schema().fields().iter().all(|f| f.name() != "_file"),
+                "_file should not appear when not declared in the schema"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_json_reorder_indices_unsupported_metadata_column_errors() {
+        // RowIndex is not supported for JSON reads. All metadata column specs are non-nullable,
+        // so the Missing transform inserts a null array — reorder_struct_array errors because
+        // the field is declared non-nullable.
+        let schema = StructType::new_unchecked([
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
+        ]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let indices = build_json_reorder_indices(&schema).unwrap();
+        assert!(reorder_struct_array(batch.into(), &indices, None, None).is_err());
+    }
+
+    #[test]
+    fn ensure_we_encode_maps_with_null_values() {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("str_col", ArrowDataType::Utf8, false),
+            ArrowField::new(
+                "map_col",
+                ArrowDataType::Map(
+                    Arc::new(ArrowField::new(
+                        "entries",
+                        ArrowDataType::Struct(
+                            vec![
+                                ArrowField::new("keys", ArrowDataType::Utf8, false),
+                                ArrowField::new("values", ArrowDataType::Utf8, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false, // sorted
+                ),
+                false,
+            ),
+        ]);
+        let s_array = StringArray::from(vec!["foo"]);
+
+        let string_builder = StringBuilder::new();
+        let string_builder2 = StringBuilder::new();
+        let mut map_builder = MapBuilder::new(None, string_builder, string_builder2);
+
+        // Append one entry: "bar" -> null
+        map_builder.keys().append_value("bar");
+        map_builder.values().append_null();
+        map_builder.append(true).unwrap(); // finish the map row
+
+        let map_array: MapArray = map_builder.finish();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(s_array), Arc::new(map_array)],
+        )
+        .unwrap();
+
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(batch));
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+        let json = to_json_bytes(Box::new(std::iter::once(Ok(filtered_data)))).unwrap();
+        assert_eq!(
+            json,
+            "{\"str_col\":\"foo\",\"map_col\":{\"bar\":null}}\n".as_bytes()
+        );
+    }
+
+    #[rstest]
+    fn struct_with_all_nullable_children_unmatched_is_missing(
+        #[values(true, false)] struct_nullable: bool,
+    ) {
+        // When a struct exists in parquet but none of its children match the requested
+        // schema, the struct should be treated as missing regardless of its nullability.
+        let info_field = if struct_nullable {
+            StructField::nullable(
+                "info",
+                StructType::new_unchecked([StructField::nullable("z", DataType::LONG)]),
+            )
+        } else {
+            StructField::not_null(
+                "info",
+                StructType::new_unchecked([StructField::nullable("z", DataType::LONG)]),
+            )
+        };
+        let requested_schema = Arc::new(StructType::new_unchecked([
+            StructField::not_null("a", DataType::LONG),
+            info_field,
+        ]));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int64, true),
+            ArrowField::new(
+                "info",
+                ArrowDataType::Struct(
+                    vec![
+                        ArrowField::new("x", ArrowDataType::Int64, true),
+                        ArrowField::new("y", ArrowDataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                !struct_nullable,
+            ),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        assert_eq!(mask_indices, vec![0]);
+        let expected_info_field = Arc::new(
+            requested_schema
+                .field("info")
+                .unwrap()
+                .try_into_arrow()
+                .unwrap(),
+        );
+        assert_eq!(
+            reorder_indices,
+            vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::missing(1, expected_info_field),
+            ]
+        );
+    }
+
+    #[test]
+    fn reorder_non_nullable_missing_struct_produces_non_null_struct() {
+        // The Missing transform for a non-nullable struct should produce a struct with
+        // null_count == 0 and all-null children.
+        let a_array: Arc<dyn ArrowArray> = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let input = StructArray::from(vec![(
+            Arc::new(ArrowField::new("a", ArrowDataType::Int64, false)),
+            a_array,
+        )]);
+        let missing_field = Arc::new(ArrowField::new(
+            "info",
+            ArrowDataType::Struct(vec![ArrowField::new("z", ArrowDataType::Int64, true)].into()),
+            false,
+        ));
+        let reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::missing(1, missing_field),
+        ];
+        let ordered = reorder_struct_array(input, &reorder, None, None).unwrap();
+        assert_eq!(ordered.column_names(), vec!["a", "info"]);
+        let info = ordered.column(1).as_struct();
+        assert_eq!(info.null_count(), 0);
+        assert_eq!(info.column(0).null_count(), 3);
+    }
+
+    #[test]
+    fn reorder_nested_non_nullable_missing_struct_recurses() {
+        // Non-nullable struct containing a non-nullable struct child: both levels should
+        // have null_count == 0, with the leaf nullable child being all-null.
+        let a_array: Arc<dyn ArrowArray> = Arc::new(Int64Array::from(vec![1, 2]));
+        let input = StructArray::from(vec![(
+            Arc::new(ArrowField::new("a", ArrowDataType::Int64, false)),
+            a_array,
+        )]);
+        let inner_struct =
+            ArrowDataType::Struct(vec![ArrowField::new("leaf", ArrowDataType::Int64, true)].into());
+        let missing_field = Arc::new(ArrowField::new(
+            "outer",
+            ArrowDataType::Struct(vec![ArrowField::new("inner", inner_struct, false)].into()),
+            false,
+        ));
+        let reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::missing(1, missing_field),
+        ];
+        let ordered = reorder_struct_array(input, &reorder, None, None).unwrap();
+        let outer = ordered.column(1).as_struct();
+        assert_eq!(outer.null_count(), 0);
+        let inner = outer.column(0).as_struct();
+        assert_eq!(inner.null_count(), 0);
+        assert_eq!(inner.column(0).null_count(), 2);
+    }
+
+    #[test]
+    fn empty_struct_is_matched() {
+        // Delta protocol allows empty structs. An empty struct has no children, so no
+        // leaf columns are selected, but the struct itself should still be matched.
+        let requested_schema = Arc::new(StructType::new_unchecked([
+            StructField::not_null("a", DataType::LONG),
+            StructField::not_null("empty", StructType::new_unchecked([])),
+        ]));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int64, true),
+            ArrowField::new("empty", ArrowDataType::Struct(ArrowFields::empty()), false),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        assert_eq!(mask_indices, vec![0]);
+        let expected_empty_field = Arc::new(
+            requested_schema
+                .field("empty")
+                .unwrap()
+                .try_into_arrow()
+                .unwrap(),
+        );
+        assert_eq!(
+            reorder_indices,
+            vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::missing(1, expected_empty_field),
+            ]
+        );
     }
 }

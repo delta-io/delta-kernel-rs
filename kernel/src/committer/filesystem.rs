@@ -87,16 +87,18 @@ impl Committer for FileSystemCommitter {
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::actions::{Metadata, Protocol};
+    use crate::committer::{CommitProtocolMetadata, CommitType};
     use crate::engine::default::DefaultEngineBuilder;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
-
-    use object_store::memory::InMemory;
-    use object_store::ObjectStore as _;
     use url::Url;
 
-    #[cfg(feature = "catalog-managed")]
     #[tokio::test]
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
         let storage = Arc::new(InMemory::new());
@@ -106,13 +108,14 @@ mod tests {
         let actions = [
             r#"{"commitInfo":{"timestamp":12345678900,"inCommitTimestamp":12345678900}}"#,
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["catalogManaged"],"writerFeatures":["catalogManaged","inCommitTimestamp"]}}"#,
-            r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1234567890}}"#,
+            r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true"},"createdTime":1234567890}}"#,
         ].join("\n");
 
-        let commit_path = object_store::path::Path::from("_delta_log/00000000000000000000.json");
+        let commit_path = Path::from("_delta_log/00000000000000000000.json");
         storage.put(&commit_path, actions.into()).await.unwrap();
 
         let snapshot = crate::snapshot::SnapshotBuilder::new_for(table_root)
+            .with_max_catalog_version(0)
             .build(&engine)
             .unwrap();
         // Try to commit a transaction with FileSystemCommitter
@@ -124,7 +127,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Generic(e) if e.contains("A catalog committer must be used to commit to catalog-managed tables. Please provide a catalog committer via Snapshot::transaction().")
+            crate::Error::Generic(e) if e.contains("This table is catalog-managed and requires a catalog committer.")
         ));
     }
 
@@ -136,7 +139,18 @@ mod tests {
 
         let committer = FileSystemCommitter::new();
         let log_root = LogRoot::new(table_root).unwrap();
-        let commit_metadata = CommitMetadata::new(log_root, 1, 12345, Some(0));
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
+        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let commit_metadata = CommitMetadata::new(
+            log_root,
+            1,
+            CommitType::PathBasedWrite,
+            12345,
+            Some(0),
+            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None).unwrap(),
+            vec![],
+        );
         let actions = Box::new(std::iter::empty());
 
         let result = committer.commit(&engine, actions, commit_metadata).unwrap();
@@ -161,10 +175,30 @@ mod tests {
         let engine = DefaultEngineBuilder::new(storage).build();
 
         let committer = FileSystemCommitter::new();
-        let first_metadata =
-            CommitMetadata::new(LogRoot::new(table_root.clone()).unwrap(), 1, 12345, Some(0));
-        let second_metadata =
-            CommitMetadata::new(LogRoot::new(table_root).unwrap(), 1, 12346, Some(0));
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
+        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let metadata1 =
+            Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
+        let metadata2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let first_metadata = CommitMetadata::new(
+            LogRoot::new(table_root.clone()).unwrap(),
+            1,
+            CommitType::PathBasedWrite,
+            12345,
+            Some(0),
+            CommitProtocolMetadata::try_new(Some(protocol.clone()), Some(metadata1), None, None)
+                .unwrap(),
+            vec![],
+        );
+        let second_metadata = CommitMetadata::new(
+            LogRoot::new(table_root).unwrap(),
+            1,
+            CommitType::PathBasedWrite,
+            12346,
+            Some(0),
+            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata2), None, None).unwrap(),
+            vec![],
+        );
 
         let first = committer
             .commit(&engine, Box::new(std::iter::empty()), first_metadata)

@@ -1,5 +1,8 @@
 //! # Log Compaction
 //!
+//! **NOTE:** Log compaction is currently disabled on both reads and writes due to
+//! insufficient integration test coverage. See issue #2337 for re-enablement tracking.
+//!
 //! This module provides an API for writing log compaction files that aggregate
 //! multiple commit JSON files into single compacted files. This improves performance
 //! by reducing the number of individual log files that need to be processed during

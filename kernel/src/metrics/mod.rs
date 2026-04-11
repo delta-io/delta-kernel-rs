@@ -72,7 +72,7 @@ pub(crate) mod reporter;
 
 use std::sync::Arc;
 
-pub use events::{MetricEvent, MetricId};
+pub use events::{MetricEvent, MetricId, ScanType};
 pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
 use tracing::Subscriber;
 use tracing_subscriber::{

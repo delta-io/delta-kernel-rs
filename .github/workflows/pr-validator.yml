@@ -1,0 +1,53 @@
+name: Validate PR Title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled]
+  workflow_run:
+    workflows: ["semver-label"] # we need this since auto-labels from jobs don't trigger a workflow
+    types: [completed]
+
+jobs:
+  validate-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR metadata
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Captured as env vars to prevent expression injection into the shell command.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            pr_json=$(gh api --paginate repos/${{ github.repository }}/pulls \
+              --jq ".[] | select(.head.sha == \"${{ github.event.workflow_run.head_sha }}\")")
+            echo "number=$(echo "$pr_json" | jq -r '.number')" >> "$GITHUB_OUTPUT"
+            # Use multiline delimiter syntax so a title containing newlines cannot inject
+            # additional key=value pairs into GITHUB_OUTPUT.
+            {
+              echo 'title<<PR_TITLE_EOF'
+              echo "$pr_json" | jq -r '.title'
+              echo 'PR_TITLE_EOF'
+            } >> "$GITHUB_OUTPUT"
+            echo "labels=$(echo "$pr_json" | jq -c '[.labels[].name]')" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            # Use multiline delimiter syntax so a title containing newlines cannot inject
+            # additional key=value pairs into GITHUB_OUTPUT.
+            {
+              echo 'title<<PR_TITLE_EOF'
+              echo "$PR_TITLE"
+              echo 'PR_TITLE_EOF'
+            } >> "$GITHUB_OUTPUT"
+            echo "labels=$(echo "$PR_LABELS_JSON" | jq -c '.')" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: ./.github/actions/pr-title-validator
+        with:
+          regex: '^(feat|fix|chore|docs|perf|refactor|test|ci)!?(\(.+\))?: .{1,72}$'
+          breaking-change-regex: '^(feat|fix|chore|docs|perf|refactor|test|ci)!(\(.+\))?: .{1,72}$'
+          labels: ${{ steps.pr.outputs.labels }}
+          title: ${{ steps.pr.outputs.title }}

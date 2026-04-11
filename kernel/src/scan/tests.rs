@@ -20,6 +20,10 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
+use crate::{
+    Engine, EvaluationHandler, FileDataReadResultIterator, FileMeta, JsonHandler, ParquetFooter,
+    ParquetHandler, PredicateRef, StorageHandler,
+};
 use crate::{EngineData, Snapshot};
 
 use super::*;
@@ -36,6 +40,10 @@ macro_rules! get_column {
     };
 }
 
+fn field_names(s: &StructArray) -> Vec<String> {
+    s.fields().iter().map(|f| f.name().clone()).collect()
+}
+
 #[test]
 fn test_static_skipping() {
     const NULL: Pred = Pred::null_literal();
@@ -43,14 +51,14 @@ fn test_static_skipping() {
         (false, column_pred!("a")),
         (true, Pred::literal(false)),
         (false, Pred::literal(true)),
-        (true, NULL),
+        (false, NULL), // NULL is unknown, not false -- conservative (no skip)
         (true, Pred::and(column_pred!("a"), Pred::literal(false))),
         (false, Pred::or(column_pred!("a"), Pred::literal(true))),
         (false, Pred::or(column_pred!("a"), Pred::literal(false))),
         (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
         (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
         (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
-        (true, Pred::and(NULL, column_pred!("a"))),
+        (false, Pred::and(NULL, column_pred!("a"))), // NULL is unknown, not false
     ];
     for (should_skip, predicate) in test_cases {
         assert_eq!(
@@ -209,6 +217,127 @@ fn test_physical_predicate() {
             "Failed for predicate: {predicate:#?}, expected {expected:#?}, got {result:#?}"
         );
     }
+}
+
+/// Delta column names are case-insensitive, so predicates with differently-cased column names
+/// must still resolve against the schema. The predicate is rewritten to use the schema's casing
+/// (or physical names when column mapping is enabled).
+#[rstest]
+#[case::without_column_mapping(
+    // predicate: createdat > 500 AND value < 100, schema: createdAt, Value
+    StructType::new_unchecked(vec![
+        StructField::nullable("createdAt", DataType::LONG),
+        StructField::nullable("Value", DataType::LONG),
+    ]),
+    Pred::and(
+        Pred::gt(column_expr!("createdat"), Expr::literal(500i64)),
+        Pred::lt(column_expr!("value"), Expr::literal(100i64)),
+    ),
+    ColumnMappingMode::None,
+    PhysicalPredicate::Some(
+        Arc::new(Pred::and(
+            Pred::gt(column_expr!("createdAt"), Expr::literal(500i64)),
+            Pred::lt(column_expr!("Value"), Expr::literal(100i64)),
+        )),
+        StructType::new_unchecked(vec![
+            StructField::nullable("createdAt", DataType::LONG),
+            StructField::nullable("Value", DataType::LONG),
+        ]).into(),
+    ),
+)]
+#[case::with_column_mapping(
+    // predicate: createdat > 500 AND value < 100, schema has physical name metadata
+    StructType::new_unchecked(vec![
+        StructField::nullable("createdAt", DataType::LONG).with_metadata([(
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+            "phys_created",
+        )]),
+        StructField::nullable("Value", DataType::LONG).with_metadata([(
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+            "phys_value",
+        )]),
+    ]),
+    Pred::and(
+        Pred::gt(column_expr!("createdat"), Expr::literal(500i64)),
+        Pred::lt(column_expr!("value"), Expr::literal(100i64)),
+    ),
+    ColumnMappingMode::Name,
+    PhysicalPredicate::Some(
+        Arc::new(Pred::and(
+            Pred::gt(column_expr!("phys_created"), Expr::literal(500i64)),
+            Pred::lt(column_expr!("phys_value"), Expr::literal(100i64)),
+        )),
+        StructType::new_unchecked(vec![
+            StructField::nullable("phys_created", DataType::LONG).with_metadata([(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                "phys_created",
+            )]),
+            StructField::nullable("phys_value", DataType::LONG).with_metadata([(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                "phys_value",
+            )]),
+        ]).into(),
+    ),
+)]
+#[case::duplicate_column_different_casing(
+    // predicate references same column with different casings: value > 5 AND VALUE < 10
+    StructType::new_unchecked(vec![
+        StructField::nullable("Value", DataType::LONG),
+    ]),
+    Pred::and(
+        Pred::gt(column_expr!("value"), Expr::literal(5i64)),
+        Pred::lt(column_expr!("VALUE"), Expr::literal(10i64)),
+    ),
+    ColumnMappingMode::None,
+    PhysicalPredicate::Some(
+        Arc::new(Pred::and(
+            Pred::gt(column_expr!("Value"), Expr::literal(5i64)),
+            Pred::lt(column_expr!("Value"), Expr::literal(10i64)),
+        )),
+        StructType::new_unchecked(vec![StructField::nullable("Value", DataType::LONG)])
+            .into(),
+    ),
+)]
+#[case::nested_fields(
+    // predicate references nested.fieldname but schema has Nested.FieldName
+    StructType::new_unchecked(vec![StructField::nullable(
+        "Nested",
+        StructType::new_unchecked(vec![StructField::nullable("FieldName", DataType::LONG)]),
+    )]),
+    column_pred!("nested.fieldname"),
+    ColumnMappingMode::None,
+    PhysicalPredicate::Some(
+        column_pred!("Nested.FieldName").into(),
+        StructType::new_unchecked(vec![StructField::nullable(
+            "Nested",
+            StructType::new_unchecked(vec![
+                StructField::nullable("FieldName", DataType::LONG)
+            ]),
+        )]).into(),
+    ),
+)]
+fn test_physical_predicate_case_insensitive(
+    #[case] logical_schema: StructType,
+    #[case] predicate: Predicate,
+    #[case] column_mapping_mode: ColumnMappingMode,
+    #[case] expected: PhysicalPredicate,
+) {
+    let result =
+        PhysicalPredicate::try_new(&predicate, &logical_schema, column_mapping_mode).unwrap();
+    assert_eq!(result, expected);
+}
+
+/// Unknown column still fails even with case-insensitive matching.
+#[test]
+fn test_physical_predicate_case_insensitive_unknown_column() {
+    let logical_schema =
+        StructType::new_unchecked(vec![StructField::nullable("createdAt", DataType::LONG)]);
+    let result = PhysicalPredicate::try_new(
+        &column_pred!("nonexistent"),
+        &logical_schema,
+        ColumnMappingMode::None,
+    );
+    assert!(result.is_err());
 }
 
 fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
@@ -380,7 +509,7 @@ fn test_get_partition_value() {
     ];
 
     for (raw, data_type, expected) in &cases {
-        let value = crate::transforms::parse_partition_value_raw(
+        let value = crate::scan::transform_spec::parse_partition_value_raw(
             Some(&raw.to_string()),
             &DataType::Primitive(data_type.clone()),
         )
@@ -528,10 +657,7 @@ fn assert_stats_struct_matches_json(
             assert_eq!(
                 json_val.as_i64().unwrap(),
                 int_col.value(row_idx),
-                "{}.{} mismatch at row {}",
-                field_name,
-                col_name,
-                row_idx
+                "{field_name}.{col_name} mismatch at row {row_idx}"
             );
         }
     }
@@ -550,7 +676,7 @@ fn test_scan_metadata_with_stats_columns() {
 
     let scan = snapshot
         .scan_builder()
-        .include_stats_columns()
+        .include_all_stats_columns()
         .build()
         .unwrap();
 
@@ -638,53 +764,7 @@ fn test_scan_metadata_with_stats_columns() {
     );
 }
 
-/// Test that data skipping works correctly with pre-parsed stats from a checkpoint.
-///
-/// The parsed-stats test table has a checkpoint at version 3 (containing stats_parsed) and
-/// JSON commits at versions 4-5. This test exercises both code paths:
-/// - Checkpoint batches: stats_parsed is read directly from the transformed batch
-/// - JSON log batches: stats are parsed from JSON via the transform expression
-///
-/// Table layout (6 files, each 100 records):
-///   File 1: id [1-100],   File 2: id [101-200], File 3: id [201-300]
-///   File 4: id [301-400], File 5: id [401-500], File 6: id [501-600]
-#[test]
-fn test_data_skipping_with_parsed_stats() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-
-    // Predicate: id > 400 should skip files 1-4 (max id: 100, 200, 300, 400) and keep files 5-6
-    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
-    let scan = snapshot
-        .scan_builder()
-        .with_predicate(predicate)
-        .build()
-        .unwrap();
-
-    let scan_metadata_results: Vec<_> = scan
-        .scan_metadata(engine.as_ref())
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-
-    let mut selected_file_count = 0;
-    for scan_metadata in &scan_metadata_results {
-        let selection_vector = scan_metadata.scan_files.selection_vector();
-        selected_file_count += selection_vector
-            .iter()
-            .filter(|&&selected| selected)
-            .count();
-    }
-
-    assert_eq!(
-        selected_file_count, 2,
-        "Data skipping with parsed stats should keep only 2 files (id [401-500] and [501-600])"
-    );
-}
-
-/// Test that `include_stats_columns` and `with_predicate` can be used together.
+/// Test that `include_all_stats_columns` and `with_predicate` can be used together.
 /// The scan should output stats_parsed AND perform data skipping via the predicate.
 #[test]
 fn test_scan_metadata_stats_columns_with_predicate() {
@@ -701,7 +781,7 @@ fn test_scan_metadata_stats_columns_with_predicate() {
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .include_stats_columns()
+        .include_all_stats_columns()
         .build()
         .expect("Should succeed when using both predicate and stats_columns");
 
@@ -1098,22 +1178,453 @@ fn test_skip_stats_disables_data_skipping() {
 }
 
 #[test]
-fn test_skip_stats_and_include_stats_columns_errors() {
+fn test_skip_stats_after_include_all_stats_columns_wins() {
+    // With StatsOutputMode enum, last call wins. Calling with_skip_stats(true) after
+    // include_all_stats_columns() should result in stats being skipped.
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    let result = snapshot
+    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    let scan = snapshot
         .scan_builder()
+        .include_all_stats_columns()
         .with_skip_stats(true)
-        .include_stats_columns()
-        .build();
+        .with_predicate(predicate)
+        .build()
+        .unwrap();
 
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    // Stats are skipped, so all files should be returned (no data skipping)
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut selected_file_count = 0;
+    for scan_metadata in &scan_metadata_results {
+        let selection_vector = scan_metadata.scan_files.selection_vector();
+        selected_file_count += selection_vector
+            .iter()
+            .filter(|&&selected| selected)
+            .count();
+    }
+
+    assert_eq!(selected_file_count, 6);
+}
+
+#[test]
+fn test_with_stats_columns_empty_no_stats_output() {
+    // with_stats_columns(vec![]) should produce no stats output
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![])
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
     assert!(
-        err.contains("Cannot set both skip_stats and include_stats_columns"),
-        "unexpected error: {err}"
+        !scan_metadata_results.is_empty(),
+        "Should have scan metadata"
+    );
+
+    for scan_metadata in scan_metadata_results {
+        let (underlying_data, _selection_vector) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+
+        // stats_parsed should not be present since empty Columns means no stats output
+        assert!(
+            batch.column_by_name("stats_parsed").is_none(),
+            "stats_parsed should not be present with empty stats columns"
+        );
+    }
+}
+
+/// Test that `with_stats_columns` with specific columns only returns stats for those columns.
+/// Verifies that requesting `vec![col!("id")]` only includes `id` in minValues/maxValues/nullCount.
+#[test]
+fn test_scan_metadata_with_specific_stats_columns() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    // Request only "id" column stats
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![column_name!("id")])
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert!(
+        !scan_metadata_results.is_empty(),
+        "Should have scan metadata"
+    );
+
+    for scan_metadata in scan_metadata_results {
+        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        let filtered_batch =
+            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+
+        let stats_parsed = get_column!(filtered_batch, "stats_parsed", StructArray);
+        let min_values = get_column!(stats_parsed, "minValues", StructArray);
+        let max_values = get_column!(stats_parsed, "maxValues", StructArray);
+        let null_count = get_column!(stats_parsed, "nullCount", StructArray);
+
+        // Check minValues/maxValues/nullCount only have "id"
+        assert_eq!(
+            field_names(min_values),
+            vec!["id"],
+            "minValues should only contain 'id'"
+        );
+        assert_eq!(
+            field_names(max_values),
+            vec!["id"],
+            "maxValues should only contain 'id'"
+        );
+        assert_eq!(
+            field_names(null_count),
+            vec!["id"],
+            "nullCount should only contain 'id'"
+        );
+    }
+}
+
+/// Test that `with_stats_columns` with multiple specific columns returns stats for all of them.
+#[test]
+fn test_scan_metadata_with_multiple_stats_columns() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    // Request "id" and "name" column stats (not "age" or "salary")
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![column_name!("id"), column_name!("name")])
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert!(
+        !scan_metadata_results.is_empty(),
+        "Should have scan metadata"
+    );
+
+    for scan_metadata in scan_metadata_results {
+        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        let filtered_batch =
+            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+
+        let stats_parsed = get_column!(filtered_batch, "stats_parsed", StructArray);
+        let min_values = get_column!(stats_parsed, "minValues", StructArray);
+        let max_values = get_column!(stats_parsed, "maxValues", StructArray);
+        let null_count = get_column!(stats_parsed, "nullCount", StructArray);
+
+        // Check minValues/maxValues/nullCount have "id" and "name"
+        let expected = vec!["id", "name"];
+        assert_eq!(
+            field_names(min_values),
+            expected,
+            "minValues should contain 'id' and 'name'"
+        );
+        assert_eq!(
+            field_names(max_values),
+            expected,
+            "maxValues should contain 'id' and 'name'"
+        );
+        assert_eq!(
+            field_names(null_count),
+            expected,
+            "nullCount should contain 'id' and 'name'"
+        );
+
+        // Verify "age" and "salary" are NOT present
+        assert!(
+            min_values.column_by_name("age").is_none(),
+            "minValues should NOT contain 'age'"
+        );
+        assert!(
+            min_values.column_by_name("salary").is_none(),
+            "minValues should NOT contain 'salary'"
+        );
+    }
+}
+
+/// Test that `with_stats_columns` with a nonexistent column name produces empty stats for that column.
+#[test]
+fn test_scan_metadata_with_nonexistent_stats_columns() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    let scan = snapshot
+        .scan_builder()
+        .with_stats_columns(vec![column_name!("nonexistent_column")])
+        .build()
+        .unwrap();
+
+    let scan_metadata_results: Vec<_> = scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert!(
+        !scan_metadata_results.is_empty(),
+        "Should have scan metadata"
+    );
+
+    for scan_metadata in scan_metadata_results {
+        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        let filtered_batch =
+            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+
+        let stats_parsed = get_column!(filtered_batch, "stats_parsed", StructArray);
+
+        // Should have numRecords but no minValues/maxValues/nullCount
+        // (or they exist but are empty structs)
+        assert!(
+            stats_parsed.column_by_name("numRecords").is_some(),
+            "Should still have numRecords"
+        );
+    }
+}
+
+/// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.
+/// Used to simulate a buggy connector that drops all data for a file.
+struct EmptyParquetHandler;
+
+impl ParquetHandler for EmptyParquetHandler {
+    fn read_parquet_files(
+        &self,
+        _files: &[FileMeta],
+        _schema: crate::schema::SchemaRef,
+        _predicate: Option<PredicateRef>,
+    ) -> crate::DeltaResult<FileDataReadResultIterator> {
+        Ok(Box::new(std::iter::empty()))
+    }
+
+    fn read_parquet_footer(&self, _file: &FileMeta) -> crate::DeltaResult<ParquetFooter> {
+        unimplemented!()
+    }
+
+    fn write_parquet_file(
+        &self,
+        _location: url::Url,
+        _data: Box<dyn Iterator<Item = crate::DeltaResult<Box<dyn EngineData>>> + Send>,
+    ) -> crate::DeltaResult<()> {
+        unimplemented!()
+    }
+}
+
+/// An [`Engine`] that delegates everything to a [`SyncEngine`] except `parquet_handler`, which
+/// returns [`EmptyParquetHandler`].
+struct EmptyParquetEngine(Arc<SyncEngine>);
+
+impl Engine for EmptyParquetEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        self.0.evaluation_handler()
+    }
+
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.0.json_handler()
+    }
+
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        Arc::new(EmptyParquetHandler)
+    }
+
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.0.storage_handler()
+    }
+}
+
+/// When a file's Add action stats report `numRecords > 0` and the parquet handler returns an empty
+/// iterator, `execute` must surface an error rather than silently producing no rows.
+#[test]
+fn execute_errors_when_parquet_returns_empty_for_file_with_positive_stats() {
+    let path =
+        std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(EmptyParquetEngine(Arc::new(SyncEngine::new())));
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let scan = snapshot.scan_builder().build().unwrap();
+
+    let results: Vec<_> = scan.execute(engine).unwrap().collect();
+    assert_eq!(results.len(), 1, "should emit exactly one error item");
+    assert!(results[0].is_err(), "the result should be an error, got Ok");
+    let err = results[0].as_ref().err().unwrap().to_string();
+    assert!(
+        err.contains("ParquetHandler returned no data"),
+        "unexpected error message: {err}"
     );
 }
+
+/// When a file's Add action has no stats, an empty iterator from the parquet handler is allowed
+/// -- we conservatively treat the file as possibly legitimately empty.
+#[test]
+fn execute_does_not_error_when_parquet_returns_empty_and_stats_absent() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-cdf/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(EmptyParquetEngine(Arc::new(SyncEngine::new())));
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let scan = snapshot.scan_builder().build().unwrap();
+
+    // All Add files in this table have no stats -- empty iterators should be silently ignored.
+    let results: Vec<_> = scan.execute(engine).unwrap().collect();
+    assert!(
+        results.iter().all(|r| r.is_ok()),
+        "expected no errors for stats-absent files"
+    );
+}
+
+// TODO: reimplement using tracing spans instead of reporter
+// /// Tests for ScanMetadataCompleted event emission
+// mod scan_metadata_completed_tests {
+//     use std::path::PathBuf;
+//     use std::sync::Arc;
+//     use std::time::Duration;
+//
+//     use rstest::rstest;
+//
+//     use crate::engine::default::DefaultEngineBuilder;
+//     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
+//     use crate::metrics::MetricEvent;
+//     use crate::object_store::local::LocalFileSystem;
+//     use crate::utils::test_utils::CapturingReporter;
+//     use crate::Snapshot;
+//
+//     fn run_scan(table: &str, predicate: Option<Arc<Pred>>) -> (Arc<CapturingReporter>, usize) {
+//         let path = std::fs::canonicalize(PathBuf::from(table)).unwrap();
+//         let url = url::Url::from_directory_path(&path).unwrap();
+//         let reporter = Arc::new(CapturingReporter::default());
+//         let engine = Arc::new(
+//             DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+//                 .with_metrics_reporter(reporter.clone())
+//                 .build(),
+//         );
+//         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+//         let mut builder = snapshot.scan_builder();
+//         if let Some(pred) = predicate {
+//             builder = builder.with_predicate(pred);
+//         }
+//         let scan = builder.build().unwrap();
+//         let results: Vec<_> = scan
+//             .scan_metadata(engine.as_ref())
+//             .unwrap()
+//             .collect::<Result<Vec<_>, _>>()
+//             .unwrap();
+//         (reporter, results.len())
+//     }
+//
+//     fn get_scan_event(reporter: &CapturingReporter) -> MetricEvent {
+//         reporter
+//             .events()
+//             .into_iter()
+//             .find(|e| matches!(e, MetricEvent::ScanMetadataCompleted { .. }))
+//             .expect("expected ScanMetadataCompleted event")
+//     }
+//
+//     #[rstest]
+//     #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 0, 0)]
+//     #[case::static_skip_all(
+//         "./tests/data/parsed-stats/",
+//         Some(Arc::new(Pred::literal(false))),
+//         0,
+//         0,
+//         0,
+//         0
+//     )]
+//     #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 2, 0)]
+//     #[case::with_removes("./tests/data/with_checkpoint_no_last_checkpoint/", None, 2, 1, 1, 0)]
+//     #[case::partition_filter(
+//         "./tests/data/basic_partitioned/",
+//         Some(Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))),
+//         2, 2, 0, 4
+//     )]
+//     fn test_scan_metrics(
+//         #[case] table: &str,
+//         #[case] predicate: Option<Arc<Pred>>,
+//         #[case] expected_add_seen: u64,
+//         #[case] expected_active: u64,
+//         #[case] expected_removes: u64,
+//         #[case] expected_filtered: u64,
+//     ) {
+//         let (reporter, _) = run_scan(table, predicate);
+//         let MetricEvent::ScanMetadataCompleted {
+//             total_duration,
+//             num_add_files_seen,
+//             num_active_add_files,
+//             num_remove_files_seen,
+//             num_predicate_filtered,
+//             ..
+//         } = get_scan_event(&reporter)
+//         else {
+//             panic!("expected ScanMetadataCompleted");
+//         };
+//         assert!(total_duration > Duration::ZERO);
+//         assert_eq!(num_add_files_seen, expected_add_seen);
+//         assert_eq!(num_active_add_files, expected_active);
+//         assert_eq!(num_remove_files_seen, expected_removes);
+//         assert_eq!(num_predicate_filtered, expected_filtered);
+//     }
+//
+//     #[test]
+//     fn test_no_metrics_on_early_drop() {
+//         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+//         let url = url::Url::from_directory_path(&path).unwrap();
+//         let reporter = Arc::new(CapturingReporter::default());
+//         let engine = Arc::new(
+//             DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+//                 .with_metrics_reporter(reporter.clone())
+//                 .build(),
+//         );
+//         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+//         let scan = snapshot.scan_builder().build().unwrap();
+//         {
+//             let mut iter = scan.scan_metadata(engine.as_ref()).unwrap();
+//             let _ = iter.next();
+//         }
+//         assert!(reporter
+//             .events()
+//             .iter()
+//             .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted { .. })));
+//     }
+// }

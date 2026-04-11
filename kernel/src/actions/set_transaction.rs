@@ -1,13 +1,26 @@
-use std::sync::{Arc, LazyLock};
-
 use crate::actions::get_log_txn_schema;
 use crate::actions::visitors::SetTransactionVisitor;
-use crate::actions::{SetTransaction, SET_TRANSACTION_NAME};
+use crate::actions::SetTransaction;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _};
+use crate::{DeltaResult, Engine, RowVisitor as _};
 
 pub(crate) use crate::actions::visitors::SetTransactionMap;
+
+/// Returns `true` if a set transaction is expired according to the given expiration and
+/// last-updated timestamps. A transaction is expired when both values are present and
+/// `last_updated <= expiration_timestamp`. Transactions without `last_updated` never
+/// expire. A `None` expiration timestamp (no retention duration configured) means
+/// nothing expires.
+pub(crate) fn is_set_txn_expired(
+    expiration_timestamp: Option<i64>,
+    last_updated: Option<i64>,
+) -> bool {
+    matches!(
+        (expiration_timestamp, last_updated),
+        (Some(exp_ts), Some(lu)) if lu <= exp_ts
+    )
+}
 
 pub(crate) struct SetTransactionScanner {}
 
@@ -76,20 +89,7 @@ fn replay_for_app_ids(
     engine: &dyn Engine,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
     let txn_schema = get_log_txn_schema();
-    // This meta-predicate should be effective because all the app ids end up in a single
-    // checkpoint part when patitioned by `add.path` like the Delta spec requires. There's no
-    // point filtering by a particular app id, even if we have one, because app ids are all in
-    // the a single checkpoint part having large min/max range (because they're usually uuids).
-    static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-        Some(Arc::new(
-            Expr::column([SET_TRANSACTION_NAME, "appId"]).is_not_null(),
-        ))
-    });
-    log_segment.read_actions(
-        engine,
-        txn_schema.clone(), // Arc clone
-        META_PREDICATE.clone(),
-    )
+    log_segment.read_actions(engine, txn_schema.clone())
 }
 
 #[cfg(test)]

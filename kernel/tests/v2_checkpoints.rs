@@ -264,14 +264,14 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
 
     // This writes to parquet — will fail if the checkpointMetadata batch has a different
     // schema than the action batches.
-    snapshot.clone().checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref())?;
 
     // Verify the checkpoint was written and is used by a fresh snapshot
     let snapshot2 = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     assert_eq!(snapshot2.version(), 1);
     let log_segment = snapshot2.log_segment();
     assert!(
-        !log_segment.checkpoint_parts.is_empty(),
+        !log_segment.listed.checkpoint_parts.is_empty(),
         "expected snapshot to use the written checkpoint, but checkpoint_parts is empty"
     );
     assert_eq!(
@@ -280,9 +280,9 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
         "expected checkpoint at version 1"
     );
     assert!(
-        log_segment.ascending_commit_files.is_empty(),
+        log_segment.listed.ascending_commit_files.is_empty(),
         "expected no commit files after checkpoint, but found: {:?}",
-        log_segment.ascending_commit_files
+        log_segment.listed.ascending_commit_files
     );
 
     // Verify reading data from the checkpointed snapshot returns the expected rows
