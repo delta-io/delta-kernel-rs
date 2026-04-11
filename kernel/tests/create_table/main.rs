@@ -479,3 +479,55 @@ fn test_create_table_with_enablement_property(
 
     Ok(())
 }
+
+#[test]
+fn test_create_table_invalid_column_name_without_cm() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("valid_col", DataType::INTEGER, false),
+        StructField::new("bad column", DataType::STRING, true),
+    ])?);
+
+    let result = create_table(&table_path, schema, "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("invalid character"),
+        "Expected invalid character error, got: {err}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_create_table_invalid_column_name_allowed_with_cm() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("valid_col", DataType::INTEGER, false),
+        StructField::new("bad column", DataType::STRING, true),
+    ])?);
+
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.columnMapping.mode", "name")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 0);
+
+    let field_names: Vec<_> = snapshot
+        .schema()
+        .fields()
+        .map(|f| f.name().clone())
+        .collect();
+    assert!(
+        field_names.contains(&"bad column".to_string()),
+        "Schema should contain field 'bad column', got: {field_names:?}"
+    );
+
+    Ok(())
+}
