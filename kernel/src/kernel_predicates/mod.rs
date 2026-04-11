@@ -434,10 +434,23 @@ pub trait KernelPredicateEvaluator {
         use Pred::*;
         match pred {
             Junction(JunctionPredicate { op, preds }) => {
-                // Recursively invoke `eval_pred_sql_where` instead of the usual `eval_pred` for AND/OR.
-                let mut preds = preds
-                    .iter()
-                    .map(|pred| self.eval_pred_sql_where(pred, inverted));
+                // Only push null-safety wrapping into AND children. OR children must use
+                // normal eval_pred so that NULL (= unknown) propagates instead of being
+                // converted to FALSE. Inside OR, FALSE is fatal: OR(FALSE, FALSE) = FALSE
+                // would incorrectly prune files whose stats are merely missing.
+                let is_and = match (op, inverted) {
+                    (JunctionPredicateOp::And, false) | (JunctionPredicateOp::Or, true) => true,
+                    (JunctionPredicateOp::Or, false) | (JunctionPredicateOp::And, true) => false,
+                };
+                let mut preds: Box<dyn Iterator<Item = Option<Self::Output>>> = if is_and {
+                    Box::new(
+                        preds
+                            .iter()
+                            .map(|pred| self.eval_pred_sql_where(pred, inverted)),
+                    )
+                } else {
+                    Box::new(preds.iter().map(|pred| self.eval_pred(pred, inverted)))
+                };
                 self.finish_eval_pred_junction(*op, &mut preds, inverted)
             }
             Binary(BinaryPredicate { op, left, right }) if op.is_null_intolerant() => {

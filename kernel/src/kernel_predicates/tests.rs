@@ -1021,9 +1021,66 @@ fn test_sql_where() {
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    // Ditto for comparison inside OR inside AND
+    // Comparison inside AND inside OR: OR children use normal eval, so the AND inside OR
+    // does not get null-safety wrapping. NULL propagates through the OR conservatively.
     let pred = &Pred::or(FALSE, Pred::and(TRUE, Pred::lt(col.clone(), VAL)));
     expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), None, "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
+
+    // Null-safety wrapping must NOT be pushed into OR children. Inside AND, wrapping a
+    // null-intolerant comparison as AND(col IS NOT NULL, lit IS NOT NULL, cmp) correctly
+    // converts NULL to FALSE because AND(FALSE, ...) is still FALSE. But inside OR, converting
+    // NULL to FALSE is fatal: OR(FALSE, FALSE) = FALSE causes incorrect file pruning when
+    // stats are merely missing (NULL) rather than indicating all-null data.
+    //
+    // OR children should be evaluated with normal (non-sql-where) semantics so that NULL
+    // (= unknown) propagates through the OR, producing a conservative "can't skip" result.
+
+    // Comparison directly inside OR: should preserve NULL, not convert to FALSE
+    let pred = &Pred::or(Pred::lt(col.clone(), VAL), FALSE);
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), None, "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
+
+    // Symmetric: FALSE on left, comparison on right
+    let pred = &Pred::or(FALSE, Pred::lt(col.clone(), VAL));
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), None, "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
+
+    // Multiple null-intolerant comparisons in OR: all should preserve NULL
+    let pred = &Pred::or(Pred::lt(col.clone(), VAL), Pred::gt(col.clone(), VAL));
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), None, "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
+
+    // OR inside AND: the AND applies sql_where to its children, but the nested OR should
+    // still evaluate its own children with normal semantics
+    let pred = &Pred::and(TRUE, Pred::or(Pred::lt(col.clone(), VAL), FALSE));
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), None, "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
+
+    // Comparison inside AND inside OR: AND should still null-wrap its children, but the
+    // outer OR should not cause additional wrapping
+    let pred = &Pred::or(Pred::and(TRUE, Pred::lt(col.clone(), VAL)), FALSE);
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), None, "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
+
+    // NOT(OR(...)) has AND semantics (De Morgan's), so null-wrapping IS applied to children.
+    // NOT(OR(lt(x, 1), TRUE)) = AND(NOT(lt(x, 1)), FALSE) = FALSE regardless.
+    let pred = &Pred::not(Pred::or(Pred::lt(col.clone(), VAL), TRUE));
+    expect_eq!(null_filter.eval(pred), Some(false), "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), Some(false), "{pred}");
+
+    // NOT(AND(...)) has OR semantics, so null-wrapping is NOT applied to children.
+    // NOT(AND(lt(x, 1), TRUE)) = OR(NOT(lt(x, 1)), FALSE). The comparison inside the
+    // (inverted) OR should preserve NULL.
+    let pred = &Pred::not(Pred::and(Pred::lt(col.clone(), VAL), TRUE));
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), None, "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 }
