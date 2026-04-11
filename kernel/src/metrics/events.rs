@@ -1,6 +1,7 @@
 //! Metric event types and utilities.
 
 use std::fmt;
+use std::str::FromStr;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -15,10 +16,17 @@ pub struct MetricId(Uuid);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanType {
     /// Sequential phase of [`crate::scan::Scan::parallel_scan_metadata`].
+    ///
+    /// This emits once per scan operation when `SequentialScanMetadata::finish()` is called.
     SequentialPhase,
     /// Parallel phase of [`crate::scan::Scan::parallel_scan_metadata`].
+    ///
+    /// This may emit multiple events for a single operation when phase-2 work is sharded across
+    /// workers. Group by `operation_id` to aggregate.
     ParallelPhase,
     /// Scan metadata from [`crate::scan::Scan::scan_metadata`].
+    ///
+    /// This emits once when the returned iterator is fully exhausted.
     Full,
 }
 
@@ -43,6 +51,14 @@ impl MetricId {
 impl Default for MetricId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl FromStr for MetricId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(s)?))
     }
 }
 
@@ -122,6 +138,13 @@ pub enum MetricEvent {
     ///
     /// Emitted when the scan metadata iterator is exhausted. This event captures metrics about the
     /// log replay process, including file counts and timing information.
+    ///
+    /// Aggregation guidance:
+    /// - Use `operation_id` to correlate all events from the same scan operation.
+    /// - Use `scan_type` to separate full-scan, sequential phase, and parallel
+    ///   phase events.
+    /// - Parallel phase events are per worker/shard and can emit multiple times
+    ///   for the same operation.
     ScanMetadataCompleted {
         /// Unique ID to correlate this scan with other events.
         operation_id: MetricId,
