@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acceptance"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "datatest-stable",
  "delta_kernel",
@@ -1004,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "clap",
  "delta_kernel",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "delta-kernel-unity-catalog"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "delta_kernel",
  "itertools 0.14.0",
@@ -1237,7 +1237,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "arrow 57.3.0",
  "arrow 58.1.0",
@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_benchmarks"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "criterion",
  "delta-kernel-unity-catalog",
@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1312,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_ffi"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "cbindgen",
  "delta-kernel-unity-catalog",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_ffi_macros"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1489,7 +1489,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "feature_tests"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "delta_kernel",
  "reqwest 0.13.2",
@@ -2528,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "mem-test"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "delta_kernel",
  "dhat",
@@ -4039,7 +4039,7 @@ dependencies = [
 
 [[package]]
 name = "test_utils"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "delta_kernel",
  "itertools 0.14.0",
@@ -4480,7 +4480,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "unity-catalog-delta-client-api"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "chrono",
  "serde",
@@ -4491,7 +4491,7 @@ dependencies = [
 
 [[package]]
 name = "unity-catalog-delta-rest-client"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "chrono",
  "clap",
