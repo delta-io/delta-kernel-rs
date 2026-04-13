@@ -17,7 +17,7 @@ use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::crc::Crc;
-use crate::crc::{try_write_crc_file, CrcDelta, LazyCrc};
+use crate::crc::{try_write_crc_file, CrcDelta, FileStats, LazyCrc};
 use crate::expressions::ColumnName;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
@@ -38,13 +38,6 @@ pub use builder::SnapshotBuilder;
 
 /// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
-
-/// File-level statistics for a table version.
-///
-/// NOTE: This is an unstable API expected to change in future releases.
-#[allow(unused)]
-#[internal_api]
-pub(crate) type FileStats = crate::crc::FileStats;
 
 /// Result of attempting to write a version checksum (CRC) file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

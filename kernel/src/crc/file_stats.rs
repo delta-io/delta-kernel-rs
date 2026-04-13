@@ -24,12 +24,31 @@ use crate::{DeltaResult, EngineData, Error, RowVisitor};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStats {
     /// Number of active [`Add`](crate::actions::Add) file actions in this table version.
-    pub num_files: i64,
+    pub(crate) num_files: i64,
     /// Total size of the table in bytes (sum of all active
     /// [`Add`](crate::actions::Add) file sizes).
-    pub table_size_bytes: i64,
+    pub(crate) table_size_bytes: i64,
     /// Size distribution of active files, if available.
-    pub file_size_histogram: Option<FileSizeHistogram>,
+    pub(crate) file_size_histogram: Option<FileSizeHistogram>,
+}
+
+impl FileStats {
+    /// Returns the number of active [`Add`](crate::actions::Add) file actions in this table
+    /// version.
+    pub fn num_files(&self) -> i64 {
+        self.num_files
+    }
+
+    /// Returns the total size of the table in bytes (sum of all active
+    /// [`Add`](crate::actions::Add) file sizes).
+    pub fn table_size_bytes(&self) -> i64 {
+        self.table_size_bytes
+    }
+
+    /// Returns the size distribution of active files, if available.
+    pub fn file_size_histogram(&self) -> Option<&FileSizeHistogram> {
+        self.file_size_histogram.as_ref()
+    }
 }
 
 /// Net file count and size changes from a single commit, with an optional net histogram.

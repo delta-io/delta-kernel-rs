@@ -248,6 +248,21 @@ impl FileSizeHistogram {
         }
         Ok(self)
     }
+
+    /// Returns the sorted bin boundaries.
+    pub fn sorted_bin_boundaries(&self) -> &[i64] {
+        &self.sorted_bin_boundaries
+    }
+
+    /// Returns the file count for each bin.
+    pub fn file_counts(&self) -> &[i64] {
+        &self.file_counts
+    }
+
+    /// Returns the total bytes for each bin.
+    pub fn total_bytes(&self) -> &[i64] {
+        &self.total_bytes
+    }
 }
 
 #[cfg(test)]
