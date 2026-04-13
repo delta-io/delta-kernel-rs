@@ -29,10 +29,7 @@ use crate::{DeltaResult, Error};
 /// This is useful for connectors that partition data using Arrow arrays and need typed
 /// partition values for the write path.
 ///
-/// Returns `Scalar::Null(data_type)` if the value at `row_idx` is null. Per the Arrow
-/// spec, any `Timestamp` with a non-empty timezone stores its raw int64 as UTC
-/// microseconds regardless of which timezone string is attached. The timezone is purely
-/// a display hint, so the raw value is extracted without conversion.
+/// Returns `Scalar::Null(data_type)` if the value at `row_idx` is null.
 ///
 /// # Errors
 ///
@@ -128,9 +125,9 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> DeltaResul
 /// accept exactly the same set of Arrow types.
 ///
 /// This intentionally does not delegate to `TryFromArrow<&ArrowDataType>` from
-/// `arrow_conversion` because it has different semantics: it accepts any timezone
-/// annotation (not just UTC) and rejects types like UInt*, Utf8View, Date64 that are
-/// not valid for direct scalar extraction.
+/// `arrow_conversion` because this function has different requirements: we accept any
+/// timezone annotation (not just UTC) and reject types like UInt*, Utf8View, Date64
+/// that `TryFromArrow` supports but are not valid for direct scalar extraction.
 fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> DeltaResult<DataType> {
     match arrow_type {
         ArrowDataType::Int8 => Ok(DataType::BYTE),
@@ -547,8 +544,8 @@ mod tests {
         let serialized = serialize_partition_value(&scalar)
             .unwrap()
             .expect("non-null value should serialize to Some");
-        let ptype = arrow_to_primitive_type(array.data_type());
-        let parsed = ptype.parse_scalar(&serialized).unwrap();
+        let primitive_type = arrow_to_primitive_type(array.data_type());
+        let parsed = primitive_type.parse_scalar(&serialized).unwrap();
         assert_eq!(
             scalar, parsed,
             "roundtrip failed: serialized as '{serialized}'"
@@ -564,8 +561,8 @@ mod tests {
         let serialized = serialize_partition_value(&scalar)
             .unwrap()
             .expect("NaN should serialize to Some");
-        let ptype = arrow_to_primitive_type(array.data_type());
-        let parsed = ptype.parse_scalar(&serialized).unwrap();
+        let primitive_type = arrow_to_primitive_type(array.data_type());
+        let parsed = primitive_type.parse_scalar(&serialized).unwrap();
         match parsed {
             Scalar::Float(v) => assert!(v.is_nan(), "expected NaN float"),
             Scalar::Double(v) => assert!(v.is_nan(), "expected NaN double"),
