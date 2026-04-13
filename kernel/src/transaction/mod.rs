@@ -178,6 +178,15 @@ pub struct ExistingTable;
 #[derive(Debug)]
 pub struct CreateTable;
 
+/// Marker trait for transaction states that support data file operations.
+///
+/// Only transaction types that implement this trait can access methods for adding, removing, or
+/// updating data files. This prevents compile-time misuse by states like `AlterTable` that
+/// only perform metadata-only commits.
+pub trait SupportsDataFiles {}
+impl SupportsDataFiles for ExistingTable {}
+impl SupportsDataFiles for CreateTable {}
+
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
 /// changes to the table.
@@ -756,7 +765,12 @@ impl<S> Transaction<S> {
     pub fn add_files_schema(&self) -> &'static SchemaRef {
         &BASE_ADD_FILES_SCHEMA
     }
+}
 
+// =============================================================================
+// Data file methods -- only available on transaction types that support data files
+// =============================================================================
+impl<S: SupportsDataFiles> Transaction<S> {
     /// Returns the expected schema for file statistics.
     ///
     /// The schema structure is derived from table configuration:
@@ -948,7 +962,12 @@ impl<S> Transaction<S> {
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
     }
+}
 
+// =============================================================================
+// Internal methods available on ALL transaction types (used by commit path)
+// =============================================================================
+impl<S> Transaction<S> {
     /// Validate that add files have required statistics for clustering columns.
     ///
     /// Per the Delta protocol, writers MUST collect per-file statistics for clustering columns
@@ -1946,7 +1965,7 @@ mod tests {
     // ============================================================================
     // validate_blind_append tests
     // ============================================================================
-    fn add_dummy_file<S>(txn: &mut Transaction<S>) {
+    fn add_dummy_file<S: SupportsDataFiles>(txn: &mut Transaction<S>) {
         let data = string_array_to_engine_data(StringArray::from(vec!["dummy"]));
         txn.add_files(data);
     }
