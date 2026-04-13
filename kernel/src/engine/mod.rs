@@ -27,8 +27,6 @@ pub(crate) fn writer_options() -> ArrowWriterOptions {
 
 #[cfg(feature = "arrow-conversion")]
 pub mod arrow_conversion;
-#[cfg(feature = "arrow-conversion")]
-pub mod scalar_from_arrow;
 
 #[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
 pub mod arrow_expression;

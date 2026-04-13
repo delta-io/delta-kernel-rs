@@ -85,14 +85,17 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> DeltaResul
         // Timestamp(us, Some("America/New_York")) with value 0 means midnight UTC, not
         // midnight New York. We extract the raw value directly with no conversion.
         //
-        // Timestamp(us, None) means wall-clock time in an unknown timezone, which maps to
-        // Delta's TimestampNtz type.
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_tz)) => Ok(Scalar::Timestamp(
-            array
-                .as_primitive::<TimestampMicrosecondType>()
-                .value(row_idx),
-        )),
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => Ok(Scalar::TimestampNtz(
+        // Timestamp(us, None) and Timestamp(us, Some("")) both mean wall-clock time in an
+        // unknown timezone, which maps to Delta's TimestampNtz type. Per the Arrow spec, an
+        // empty timezone string is semantically equivalent to None.
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(tz)) if !tz.is_empty() => {
+            Ok(Scalar::Timestamp(
+                array
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .value(row_idx),
+            ))
+        }
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => Ok(Scalar::TimestampNtz(
             array
                 .as_primitive::<TimestampMicrosecondType>()
                 .value(row_idx),
@@ -139,10 +142,12 @@ fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> DeltaResult<Dat
         ArrowDataType::Boolean => Ok(DataType::BOOLEAN),
         ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Ok(DataType::STRING),
         ArrowDataType::Date32 => Ok(DataType::DATE),
-        // Any timezone annotation means the raw value is UTC. See the Arrow spec comment
-        // in extract_primitive_scalar for details.
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)) => Ok(DataType::TIMESTAMP),
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => Ok(DataType::TIMESTAMP_NTZ),
+        // Any non-empty timezone annotation means the raw value is UTC. An empty timezone
+        // string is equivalent to None per the Arrow spec. See extract_primitive_scalar.
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(tz)) if !tz.is_empty() => {
+            Ok(DataType::TIMESTAMP)
+        }
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => Ok(DataType::TIMESTAMP_NTZ),
         ArrowDataType::Decimal128(p, s) => {
             if *s < 0 {
                 return Err(Error::generic(format!(
@@ -285,9 +290,19 @@ mod tests {
     // extract_primitive_scalar: timestamp variants
     // ============================================================================
 
-    #[test]
-    fn test_extract_primitive_scalar_timestamp_without_tz_returns_timestamp_ntz() {
+    // Per the Arrow spec, Timestamp(us, None) and Timestamp(us, Some("")) both mean
+    // wall-clock time with no timezone, mapping to Delta's TimestampNtz.
+    #[rstest]
+    #[case::no_tz(None)]
+    #[case::empty_tz(Some(""))]
+    fn test_extract_primitive_scalar_timestamp_without_tz_returns_timestamp_ntz(
+        #[case] tz: Option<&str>,
+    ) {
         let array = TimestampMicrosecondArray::from(vec![1_000_000i64]);
+        let array = match tz {
+            Some(tz) => array.with_timezone(tz),
+            None => array,
+        };
         assert_eq!(
             extract_primitive_scalar(&array, 0).unwrap(),
             Scalar::TimestampNtz(1_000_000)
@@ -320,6 +335,16 @@ mod tests {
         assert_eq!(
             extract_primitive_scalar(&array, 0).unwrap(),
             Scalar::Null(DataType::TIMESTAMP)
+        );
+    }
+
+    // Per the Arrow spec, an empty timezone string is equivalent to None.
+    #[test]
+    fn test_extract_primitive_scalar_null_timestamp_empty_tz_returns_timestamp_ntz_null() {
+        let array = TimestampMicrosecondArray::from(vec![None::<i64>]).with_timezone("");
+        assert_eq!(
+            extract_primitive_scalar(&array, 0).unwrap(),
+            Scalar::Null(DataType::TIMESTAMP_NTZ)
         );
     }
 
@@ -415,10 +440,14 @@ mod tests {
     // extract_primitive_scalar: bounds checking
     // ============================================================================
 
-    #[test]
-    fn test_extract_primitive_scalar_out_of_bounds_returns_error() {
-        let array = Int32Array::from(vec![42]);
-        let result = extract_primitive_scalar(&array, 1);
+    #[rstest]
+    #[case::past_end(Int32Array::from(vec![42]), 1)]
+    #[case::empty_array(Int32Array::from(Vec::<i32>::new()), 0)]
+    fn test_extract_primitive_scalar_out_of_bounds_returns_error(
+        #[case] array: Int32Array,
+        #[case] idx: usize,
+    ) {
+        let result = extract_primitive_scalar(&array, idx);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("out of bounds"), "got: {msg}");
