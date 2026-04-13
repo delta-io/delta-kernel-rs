@@ -1454,6 +1454,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_parquet_file_creates_parent_directories() {
+        // GIVEN a file path whose parent directories do not exist
         let temp_dir = tempfile::tempdir().unwrap();
         let nested_path = temp_dir.path().join("a/b/c/output.parquet");
         assert!(!nested_path.parent().unwrap().exists());
@@ -1474,11 +1475,13 @@ mod tests {
         let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
             Box::new(std::iter::once(Ok(engine_data)));
 
+        // WHEN we write a parquet file to that path
         let file_url = Url::from_file_path(&nested_path).unwrap();
         parquet_handler
             .write_parquet_file(file_url.clone(), data_iter)
             .unwrap();
 
+        // THEN the file is created and contains the expected data
         assert!(nested_path.exists());
 
         let path = Path::from_url_path(file_url.path()).unwrap();

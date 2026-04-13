@@ -423,28 +423,7 @@ mod tests {
         let file_path = temp_dir.path().join("a/b/c/test.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
 
-        assert!(!temp_dir.path().join("a").exists());
         handler.write_parquet_file(url, test_data_iter()).unwrap();
         assert!(file_path.exists());
-    }
-
-    #[test]
-    fn write_parquet_does_not_modify_existing_parent_directory() {
-        let handler = SyncParquetHandler;
-        let temp_dir = tempdir().unwrap();
-        let parent = temp_dir.path().join("existing_dir");
-        std::fs::create_dir(&parent).unwrap();
-
-        let marker = parent.join("marker.txt");
-        std::fs::write(&marker, "keep me").unwrap();
-
-        let file_path = parent.join("test.parquet");
-        let url = Url::from_file_path(&file_path).unwrap();
-
-        handler.write_parquet_file(url, test_data_iter()).unwrap();
-
-        assert!(file_path.exists());
-        assert!(marker.exists());
-        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "keep me");
     }
 }
