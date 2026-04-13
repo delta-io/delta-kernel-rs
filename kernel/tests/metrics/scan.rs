@@ -4,7 +4,7 @@
 //! through `DefaultParquetHandler::read_parquet_files` and the JSON log replay that
 //! `scan.execute()` performs internally to collect Add/Remove scan metadata.
 
-use super::{measuring_engine, setup_in_memory_table};
+use super::{measuring_engine, LogState, TestTableBuilder};
 use std::sync::Arc;
 
 use delta_kernel::{DeltaResult, Engine, Snapshot};
@@ -21,12 +21,15 @@ use delta_kernel::{DeltaResult, Engine, Snapshot};
 /// Note: `scan.execute()` also does its own log replay (to collect Add/Remove
 /// actions for scan metadata), so `json_read_calls` is non-zero even after the
 /// reporter reset.
-#[tokio::test]
-async fn scan_execute_contributes_parquet_data_file_reads() -> DeltaResult<()> {
-    let (table_url, _setup_engine, store) = setup_in_memory_table(2).await?;
+#[test]
+fn scan_execute_contributes_parquet_data_file_reads() -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_commits(3))
+        .with_data(1, 1)
+        .build()?;
 
-    let (engine, reporter) = measuring_engine(store);
-    let snap = Snapshot::builder_for(table_url).build(&engine)?;
+    let (engine, reporter) = measuring_engine(table.store().clone());
+    let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
     // Reset after snapshot build to isolate scan I/O
     reporter.reset();

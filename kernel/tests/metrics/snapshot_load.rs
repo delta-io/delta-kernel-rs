@@ -5,18 +5,19 @@
 //! (`get_domain_metadata`) that incur additional I/O after a snapshot is already built.
 
 use super::{
-    insert_rows, measuring_engine, setup_in_memory_table, setup_table_with_v1_checkpoint,
-    simple_schema,
+    insert_rows, measuring_engine, setup_table_with_v1_checkpoint, simple_schema, LogState,
+    TestTableBuilder,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStore as _;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
 use test_utils::{insert_data, test_table_setup_mt};
@@ -29,12 +30,15 @@ use url::Url;
 /// A snapshot built from two JSON commits -- no checkpoint, no CRC, no compaction --
 /// reports exactly the commit file count and triggers one JSON read call covering all
 /// commit files.
-#[tokio::test]
-async fn delta_only_snapshot_emits_expected_metrics() -> DeltaResult<()> {
-    let (table_url, _setup_engine, store) = setup_in_memory_table(1).await?;
+#[test]
+fn delta_only_snapshot_emits_expected_metrics() -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_commits(2))
+        .with_data(1, 1)
+        .build()?;
 
-    let (engine, reporter) = measuring_engine(store);
-    let _snap = Snapshot::builder_for(table_url).build(&engine)?;
+    let (engine, reporter) = measuring_engine(table.store().clone());
+    let _snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
     assert_eq!(reporter.log_segment_loads.get(), 1);
@@ -57,6 +61,7 @@ async fn delta_only_snapshot_emits_expected_metrics() -> DeltaResult<()> {
 // ============================================================================
 // Scenario 2: v1 parquet checkpoint + one tail commit
 // ============================================================================
+// TODO: migrate to TestTableBuilder when checkpoint LogState variants land (#2284)
 
 /// After a v1 parquet checkpoint is written at version 1 and a further commit is added,
 /// a fresh snapshot sees one checkpoint file, one tail commit, and performs a single
@@ -103,6 +108,7 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
 // ============================================================================
 // Scenario 3: v1 parquet checkpoint at latest version (no tail commits)
 // ============================================================================
+// TODO: migrate to TestTableBuilder when checkpoint LogState variants land (#2284)
 
 /// When the latest version has a checkpoint and no subsequent commits exist, the snapshot
 /// has zero commit files and the JSON handler is called with an empty file list.
@@ -133,15 +139,26 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> DeltaResult<()> 
 // Scenario 4: log compaction covering early commits + one tail commit
 // ============================================================================
 
+// TODO: migrate to TestTableBuilder when compaction LogState variants land (#2284)
+
 /// When early commits are covered by a compacted log file, the snapshot reports both
 /// the individual commit count and the compaction count. The JSON handler reads the
 /// compaction file and the tail commit in a single call (the minimal cover).
+// TODO(#2337): re-enable when log compaction is re-enabled
+#[ignore = "log compaction is temporarily disabled (#2337)"]
 #[tokio::test]
 async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()> {
-    let (table_url, setup_engine, store) = setup_in_memory_table(2).await?;
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_commits(3))
+        .with_schema(simple_schema())
+        .with_data(1, 1)
+        .build()?;
+    let store = table.store().clone();
+    let table_url = Url::parse(table.table_root()).unwrap();
+    let setup_engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
 
     // Write a compacted log file covering versions 0-2 using the public API
-    let snap2 = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
+    let snap2 = Snapshot::builder_for(table.table_root()).build(setup_engine.as_ref())?;
     let mut writer = snap2.log_compaction_writer(0, 2)?;
     let compaction_url = writer.compaction_path().clone();
     let batches: Vec<_> = writer
@@ -159,7 +176,7 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()
     insert_rows(&table_url, &setup_engine, 3, 1).await?;
 
     let (engine, reporter) = measuring_engine(store);
-    let _snap = Snapshot::builder_for(table_url).build(&engine)?;
+    let _snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
     assert_eq!(reporter.log_segment_loads.get(), 1);
@@ -179,6 +196,7 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()
 // ============================================================================
 // Scenario 5: CRC fast-path bypasses JSON replay
 // ============================================================================
+// TODO: migrate to TestTableBuilder when CRC LogState variants land (#2284)
 
 /// When a CRC file exists at the target snapshot version, Protocol+Metadata are loaded
 /// directly from it, skipping all JSON log replay. The JSON handler is never called.
@@ -214,6 +232,7 @@ async fn snapshot_with_crc_at_target_version_skips_json_replay() -> DeltaResult<
 // ============================================================================
 // Scenario 6: CRC at a prior version (CRC exists but is older than latest)
 // ============================================================================
+// TODO: migrate to TestTableBuilder when CRC LogState variants land (#2284)
 
 /// When a CRC file exists at an older version than the snapshot, the kernel takes the
 /// partial-replay path: it replays only the tail commits (those after the CRC version)
@@ -282,6 +301,7 @@ async fn crc_at_prior_version_triggers_tail_replay_then_falls_back_to_crc() -> D
 // ============================================================================
 // Scenario 7: checkpoint behind latest version (with multiple tail commits)
 // ============================================================================
+// TODO: migrate to TestTableBuilder when checkpoint LogState variants land (#2284)
 
 /// A checkpoint that is multiple versions behind the latest forces a longer tail replay.
 /// Checkpoint at v1 plus 3 additional commits (v2, v3, v4) verifies that all tail commits
@@ -339,12 +359,15 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Delta
 ///
 /// The specific count (`json_read_calls = 1`) reflects this test's table: 2 commits, no
 /// checkpoint, no CRC. Tables with different log structures will produce different counts.
-#[tokio::test]
-async fn get_domain_metadata_incurs_additional_log_replay() -> DeltaResult<()> {
-    let (table_url, _setup_engine, store) = setup_in_memory_table(1).await?;
+#[test]
+fn get_domain_metadata_when_no_latest_crc_incurs_additional_log_replay() -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_commits(2))
+        .with_data(1, 1)
+        .build()?;
 
-    let (engine, reporter) = measuring_engine(store);
-    let snap = Snapshot::builder_for(table_url).build(&engine)?;
+    let (engine, reporter) = measuring_engine(table.store().clone());
+    let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
     // Snapshot build reads both commit files in one JSON call
     assert_eq!(reporter.json_read_calls.get(), 1);
@@ -362,13 +385,3 @@ async fn get_domain_metadata_incurs_additional_log_replay() -> DeltaResult<()> {
 
     Ok(())
 }
-
-// ============================================================================
-// Scenario 9: snapshot.transaction() on a clustered table
-// ============================================================================
-// NOTE: This scenario is verified via clustering_e2e.rs tests because the
-// `clustered-table` Rust feature is not exposed to the integration test binary.
-// The mechanism: `transaction()` unconditionally calls `get_clustering_columns_physical()`,
-// which for ClusteredTable-enabled tables does a full domain-metadata log replay for
-// `delta.clustering`. Reset the reporter after snapshot build and call `transaction()`
-// to isolate that I/O cost.
