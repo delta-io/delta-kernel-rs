@@ -916,14 +916,11 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     )?;
     let data = Box::new(ArrowEngineData::new(batch));
 
-    let write_context = txn.get_write_context();
-    let result = engine
-        .write_parquet(
-            &data,
-            &write_context,
-            HashMap::from([(partition_col.to_string(), "a".to_string())]),
-        )
-        .await?;
+    let write_context = txn.partitioned_write_context(HashMap::from([(
+        partition_col.to_string(),
+        Scalar::String("a".into()),
+    )]))?;
+    let result = engine.write_parquet(&data, &write_context).await?;
     txn.add_files(result);
     assert!(txn.commit(engine.as_ref())?.is_committed());
 
