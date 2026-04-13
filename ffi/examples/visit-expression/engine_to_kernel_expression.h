@@ -72,7 +72,10 @@ uintptr_t convert_engine_to_kernel_literal(
       return result.ok;
     }
     case Null: {
-      ExternResultusize result = visit_expression_literal_null(state, allocate_error);
+      // Pass type_tag=3 (Integer), precision=0, scale=0 as a default typed null.
+      // A real engine would track the null's data type and pass the correct tag.
+      ExternResultusize result =
+          visit_expression_literal_null(state, 3, 0, 0, allocate_error);
       if (result.tag == Errusize) {
         print_error("visit_expression_literal_null failed", (Error*)result.err);
         free_error((Error*)result.err);

@@ -13,6 +13,7 @@ use delta_kernel::expressions::{
     UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
     VariadicExpressionOp,
 };
+use delta_kernel::schema::{DataType, PrimitiveType};
 
 use std::ffi::c_void;
 
@@ -128,8 +129,18 @@ pub struct EngineExpressionVisitor {
         key_list_id: usize,
         value_list_id: usize,
     ),
-    /// Visits a null value belonging to the list identified by `sibling_list_id.
-    pub visit_literal_null: extern "C" fn(data: *mut c_void, sibling_list_id: usize),
+    /// Visits a typed null value belonging to the list identified by `sibling_list_id`.
+    ///
+    /// The `type_tag` identifies the data type (see [`NullTypeTag`] in `kernel_visitor`). For
+    /// decimal nulls (`type_tag == 12`), `precision` and `scale` carry the decimal type; they
+    /// are zero for all other types.
+    pub visit_literal_null: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        type_tag: u8,
+        precision: u8,
+        scale: u8,
+    ),
     /// Visits an `and` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expressions of the array are in a list identified by `child_list_id`
     pub visit_and: VisitJunctionFn,
@@ -534,6 +545,32 @@ fn visit_predicate_opaque(
     );
 }
 
+/// Convert a [`DataType`] to the `(type_tag, precision, scale)` triple used by
+/// [`EngineExpressionVisitor::visit_literal_null`]. Non-primitive types (struct, array, map,
+/// variant) map to `type_tag == 255` — the engine must handle or reject them.
+fn data_type_to_null_tag(data_type: &DataType) -> (u8, u8, u8) {
+    match data_type {
+        DataType::Primitive(p) => match p {
+            PrimitiveType::Boolean => (0, 0, 0),
+            PrimitiveType::Byte => (1, 0, 0),
+            PrimitiveType::Short => (2, 0, 0),
+            PrimitiveType::Integer => (3, 0, 0),
+            PrimitiveType::Long => (4, 0, 0),
+            PrimitiveType::Float => (5, 0, 0),
+            PrimitiveType::Double => (6, 0, 0),
+            PrimitiveType::String => (7, 0, 0),
+            PrimitiveType::Binary => (8, 0, 0),
+            PrimitiveType::Date => (9, 0, 0),
+            PrimitiveType::Timestamp => (10, 0, 0),
+            PrimitiveType::TimestampNtz => (11, 0, 0),
+            PrimitiveType::Decimal(dt) => (12, dt.precision(), dt.scale()),
+        },
+        // Non-primitive nulls use a sentinel tag. Engines that need type details for complex
+        // null types should use opaque expressions or a schema visitor instead.
+        _ => (255, 0, 0),
+    }
+}
+
 fn visit_unknown(visitor: &mut EngineExpressionVisitor, sibling_list_id: usize, name: &str) {
     call!(
         visitor,
@@ -587,7 +624,17 @@ fn visit_expression_scalar(
                 v.scale()
             )
         }
-        Scalar::Null(_) => call!(visitor, visit_literal_null, sibling_list_id),
+        Scalar::Null(data_type) => {
+            let (type_tag, precision, scale) = data_type_to_null_tag(data_type);
+            call!(
+                visitor,
+                visit_literal_null,
+                sibling_list_id,
+                type_tag,
+                precision,
+                scale
+            )
+        }
         Scalar::Struct(struct_data) => {
             visit_expression_struct_literal(visitor, struct_data, sibling_list_id)
         }

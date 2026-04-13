@@ -6,6 +6,7 @@ use delta_kernel::expressions::{
     BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, Predicate, Scalar,
     UnaryPredicateOp,
 };
+use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::DeltaResult;
 
 use crate::expressions::{SharedExpression, SharedPredicate};
@@ -401,19 +402,81 @@ fn visit_expression_literal_decimal_impl(
     Ok(wrap_expression(state, Expression::literal(decimal)))
 }
 
-/// Visit a null literal expression.
+/// Type tag for null literal construction via FFI. Identifies the data type of a typed null.
 ///
-/// Returns an error because NULL literal reconstruction is not supported - type information
-/// is lost when converting from kernel to engine format, so we cannot faithfully reconstruct
-/// the original NULL literal.
+/// Primitive types use fixed discriminants 0-11. Decimal uses 12 and requires additional
+/// precision/scale parameters.
+///
+/// NOTE: These values are part of the FFI contract. Changing existing values is a breaking change.
+#[repr(u8)]
+pub enum NullTypeTag {
+    Boolean = 0,
+    Byte = 1,
+    Short = 2,
+    Integer = 3,
+    Long = 4,
+    Float = 5,
+    Double = 6,
+    String = 7,
+    Binary = 8,
+    Date = 9,
+    Timestamp = 10,
+    TimestampNtz = 11,
+    Decimal = 12,
+}
+
+/// Visit a typed null literal expression.
+///
+/// The `type_tag` identifies the data type (see [`NullTypeTag`]). For decimal nulls
+/// (`type_tag == 12`), `precision` and `scale` specify the decimal type parameters; they are
+/// ignored for all other types.
+///
+/// Returns an error if the type tag is unrecognized or if the decimal precision/scale is invalid.
 #[no_mangle]
 pub extern "C" fn visit_expression_literal_null(
-    _state: &mut KernelExpressionVisitorState,
+    state: &mut KernelExpressionVisitorState,
+    type_tag: u8,
+    precision: u8,
+    scale: u8,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let err = delta_kernel::Error::generic("NULL literal reconstruction is not supported");
     // SAFETY: The allocate_error function pointer is provided by the engine and assumed valid.
-    unsafe { Err(err).into_extern_result(&allocate_error) }
+    unsafe {
+        visit_expression_literal_null_impl(state, type_tag, precision, scale)
+            .into_extern_result(&allocate_error)
+    }
+}
+
+fn visit_expression_literal_null_impl(
+    state: &mut KernelExpressionVisitorState,
+    type_tag: u8,
+    precision: u8,
+    scale: u8,
+) -> DeltaResult<usize> {
+    let data_type = match type_tag {
+        0 => DataType::BOOLEAN,
+        1 => DataType::BYTE,
+        2 => DataType::SHORT,
+        3 => DataType::INTEGER,
+        4 => DataType::LONG,
+        5 => DataType::FLOAT,
+        6 => DataType::DOUBLE,
+        7 => DataType::STRING,
+        8 => DataType::BINARY,
+        9 => DataType::DATE,
+        10 => DataType::TIMESTAMP,
+        11 => DataType::TIMESTAMP_NTZ,
+        12 => DataType::Primitive(PrimitiveType::decimal(precision, scale)?),
+        other => {
+            return Err(delta_kernel::Error::generic(format!(
+                "Unrecognized null type tag: {other}"
+            )));
+        }
+    };
+    Ok(wrap_expression(
+        state,
+        Expression::literal(Scalar::Null(data_type)),
+    ))
 }
 
 #[no_mangle]

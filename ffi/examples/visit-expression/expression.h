@@ -269,7 +269,15 @@ void visit_expr_struct_literal(void* data,
   struct_data->values = get_expr_list(data, child_value_list_id);
   put_expr_item(data, sibling_list_id, literal, Literal);
 }
-void visit_expr_null_literal(void* data, uintptr_t sibling_id_list) {
+void visit_expr_null_literal(
+    void* data,
+    uintptr_t sibling_id_list,
+    uint8_t type_tag,
+    uint8_t precision,
+    uint8_t scale) {
+  (void)type_tag;
+  (void)precision;
+  (void)scale;
   struct Literal* literal = malloc(sizeof(struct Literal));
   literal->type = Null;
   put_expr_item(data, sibling_id_list, literal, Literal);
