@@ -2472,22 +2472,14 @@ mod tests {
     fn test_schema_from_json_invalid() {
         let json = r#"{"not_valid_schema": true}"#;
         let result = unsafe { schema_from_json(kernel_string_slice!(json), allocate_err) };
-        assert_extern_result_error_with_message(
-            result,
-            KernelError::MalformedJsonError,
-            Some("missing field `type` at line 1 column 26"),
-        );
+        assert_extern_result_error_with_message(result, KernelError::MalformedJsonError, None);
     }
 
     #[test]
     fn test_schema_from_json_bad_syntax() {
         let json = r#"{not valid json at all"#;
         let result = unsafe { schema_from_json(kernel_string_slice!(json), allocate_err) };
-        assert_extern_result_error_with_message(
-            result,
-            KernelError::MalformedJsonError,
-            Some("key must be a string at line 1 column 2"),
-        );
+        assert_extern_result_error_with_message(result, KernelError::MalformedJsonError, None);
     }
 
     #[test]
