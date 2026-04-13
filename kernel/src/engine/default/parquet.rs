@@ -4,8 +4,6 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use delta_kernel_derive::internal_api;
-
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::datatypes::{DataType, Field, Schema};
@@ -63,14 +61,18 @@ impl DataFileMetadata {
         Self { file_meta, stats }
     }
 
-    /// Convert DataFileMetadata into a record batch which matches the schema returned by
-    /// [`add_files_schema`].
+    /// Converts this `DataFileMetadata` into an [`EngineData`] record batch matching the schema
+    /// returned by [`Transaction::add_files_schema`].
     ///
-    /// [`add_files_schema`]: crate::transaction::Transaction::add_files_schema
-    #[internal_api]
+    /// The `partition_values` map uses physical column names as keys and protocol-serialized
+    /// strings as values. `None` represents a null partition value. The serialization layer
+    /// converts nulls and empty strings to `None` before reaching this method, so `Some("")`
+    /// is not expected in normal usage.
+    ///
+    /// [`Transaction::add_files_schema`]: crate::transaction::Transaction::add_files_schema
     pub(crate) fn as_record_batch(
         &self,
-        partition_values: &HashMap<String, String>,
+        partition_values: &HashMap<String, Option<String>>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let DataFileMetadata {
             file_meta:
@@ -94,11 +96,11 @@ impl DataFileMetadata {
         let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
         for (k, v) in partition_values {
             builder.keys().append_value(k);
-            if v.is_empty() {
-                // convert empty string to null as per the Delta Spec
-                builder.values().append_null();
-            } else {
-                builder.values().append_value(v);
+            match v.as_deref() {
+                // The serialization layer already converts empty strings to None, so
+                // Some("") should not occur. The empty check is purely defensive.
+                Some(val) if !val.is_empty() => builder.values().append_value(val),
+                _ => builder.values().append_null(),
             }
         }
         builder.append(true)?;
@@ -234,13 +236,13 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         &self,
         path: &url::Url,
         data: Box<dyn EngineData>,
-        partition_values: HashMap<String, String>,
+        partition_values: &HashMap<String, Option<String>>,
         stats_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let parquet_metadata = self
             .write_parquet(path, data, stats_columns.unwrap_or(&[]))
             .await?;
-        parquet_metadata.as_record_batch(&partition_values)
+        parquet_metadata.as_record_batch(partition_values)
     }
 }
 
@@ -725,7 +727,9 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn test_as_record_batch(#[values(true, false)] test_empty_str: bool) {
+    fn test_as_record_batch(
+        #[values(None, Some("a".to_string()))] partition_value: Option<String>,
+    ) {
         let location = Url::parse("file:///test_url").unwrap();
         let size = 1_000_000;
         let last_modified = 10000000000;
@@ -745,12 +749,7 @@ mod tests {
         )
         .unwrap();
         let data_file_metadata = DataFileMetadata::new(file_metadata, stats.clone());
-        let partition_value = if test_empty_str {
-            "".to_string()
-        } else {
-            "a".to_string()
-        };
-        let partition_values = HashMap::from([("partition1".to_string(), partition_value)]);
+        let partition_values = HashMap::from([("partition1".to_string(), partition_value.clone())]);
         let actual = data_file_metadata
             .as_record_batch(&partition_values)
             .unwrap();
@@ -767,10 +766,9 @@ mod tests {
         );
 
         partition_values_builder.keys().append_value("partition1");
-        if test_empty_str {
-            partition_values_builder.values().append_null(); // empty string should go to null
-        } else {
-            partition_values_builder.values().append_value("a");
+        match &partition_value {
+            None => partition_values_builder.values().append_null(),
+            Some(v) => partition_values_builder.values().append_value(v),
         }
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();

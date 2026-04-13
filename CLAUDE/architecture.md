@@ -64,14 +64,14 @@ set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and
 
 `Snapshot` -> `Transaction` -> commit
 
-The kernel coordinates the write transaction: it provides the write context (target directory,
-physical schema, stats columns), assembles commit actions (CommitInfo, Add files), enforces
-protocol compliance (table features, schema validation), and delegates the atomic commit to a
-`Committer`.
+The kernel coordinates the write transaction: it provides the write context (validated partition
+values, recommended write directory, physical schema, stats columns), assembles commit actions
+(CommitInfo, Add files), enforces protocol compliance (table features, schema validation), and
+delegates the atomic commit to a `Committer`.
 
 **Steps:**
 1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)
-2. Get `WriteContext` for target dir, physical schema, and stats columns
+2. Get `WriteContext` via `partitioned_write_context(values)` or `unpartitioned_write_context()`
 3. Write Parquet files (via engine), collect file metadata
 4. Register files via `txn.add_files(metadata)`
 5. Commit: returns `CommittedTransaction`, `ConflictedTransaction`, or `RetryableTransaction`
@@ -119,6 +119,7 @@ all returned batches -- the engine may split a single file across multiple batch
 - `kernel/src/snapshot/` -- `Snapshot`, `SnapshotBuilder`, entry point for reads/writes
 - `kernel/src/scan/` -- `Scan`, `ScanBuilder`, log replay, data skipping
 - `kernel/src/transaction/` -- `Transaction`, `WriteContext`, `create_table` builder
+- `kernel/src/partition/` -- partition value validation, serialization, Hive-style path encoding
 - `kernel/src/committer/` -- `Committer` trait, `FileSystemCommitter`
 - `kernel/src/log_segment/` -- log file discovery, Protocol/Metadata replay
 - `kernel/src/log_replay.rs` -- file-action deduplication, `LogReplayProcessor` trait
