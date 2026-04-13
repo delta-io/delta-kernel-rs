@@ -408,15 +408,12 @@ impl Snapshot {
     /// producing a post-commit snapshot without a full log replay from storage.
     ///
     /// The `crc_delta` captures the CRC-relevant changes from the committed transaction
-    /// (file stats, domain metadata, ICT, etc.). If the pre-commit snapshot had a loaded CRC
-    /// at its version, the delta is applied to produce a precomputed in-memory CRC for the new
-    /// version -- this CRC contains all important table metadata (protocol, metadata, domain
-    /// metadata, set transactions, ICT) and avoids re-reading them from storage. CREATE TABLE
-    /// always produces a CRC at v0. If no CRC was available on the pre-commit snapshot, the
-    /// existing lazy CRC is carried forward unchanged.
+    /// (file stats, domain metadata, ICT, etc.). If this snapshot had a loaded CRC at its
+    /// version, the delta is applied to produce a precomputed in-memory CRC for the new
+    /// version -- this avoids re-reading metadata from storage. If no CRC was available, the
+    /// existing lazy CRC is carried forward unchanged. CREATE TABLE handles CRC construction
+    /// separately in `Transaction::into_committed`.
     ///
-    /// TODO: Handle Protocol changes in CrcDelta (when Kernel-RS supports protocol changes)
-    /// TODO: Handle Metadata changes in CrcDelta (when Kernel-RS supports metadata changes)
     pub(crate) fn new_post_commit(
         &self,
         commit: ParsedLogPath,
@@ -440,8 +437,12 @@ impl Snapshot {
             ))
         );
 
-        let new_table_configuration =
-            TableConfiguration::new_post_commit(self.table_configuration(), new_version);
+        let new_table_configuration = TableConfiguration::new_post_commit(
+            self.table_configuration(),
+            new_version,
+            crc_delta.metadata.clone(),
+            crc_delta.protocol.clone(),
+        )?;
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
@@ -459,17 +460,14 @@ impl Snapshot {
     /// For CREATE TABLE, builds a fresh CRC from the `crc_delta`. For existing tables, applies
     /// the `crc_delta` to the current CRC if loaded, otherwise carries forward the existing lazy CRC.
     fn compute_post_commit_crc(&self, new_version: Version, crc_delta: CrcDelta) -> Arc<LazyCrc> {
-        let crc = if self.version() == crate::PRE_COMMIT_VERSION {
-            crc_delta.into_crc_for_version_zero()
-        } else {
-            self.lazy_crc
-                .get_if_loaded_at_version(self.version())
-                .map(|base| {
-                    let mut crc = base.as_ref().clone();
-                    crc.apply(crc_delta);
-                    crc
-                })
-        };
+        let crc = self
+            .lazy_crc
+            .get_if_loaded_at_version(self.version())
+            .map(|base| {
+                let mut crc = base.as_ref().clone();
+                crc.apply(crc_delta);
+                crc
+            });
 
         match crc {
             Some(c) => Arc::new(LazyCrc::new_precomputed(c, new_version)),
