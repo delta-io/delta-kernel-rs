@@ -347,8 +347,8 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
 
 /// V2 table with adds and removes across multiple commits, `max_file_actions_hint` = 3.
 /// Verifies: multiple sidecar files produced with adds/removes distributed across sidecars,
-/// batches with both file and non-file actions correctly split.
-/// And the row count of the file and non-file batches is correct.
+/// batches with both file and non-file actions correctly split, and the row count of the
+/// file and non-file batches is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
@@ -368,9 +368,8 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
     )
     .await?;
 
-    // Spread adds and removes across commits
-    // so the hint=3 causes chunking at batch boundaries, with removes landing in
-    // multiple sidecars.
+    // Spread adds and removes across commits so the hint=3 causes chunking at batch
+    // boundaries, with removes landing in multiple sidecars.
     write_commit_to_store(
         &store,
         vec![
