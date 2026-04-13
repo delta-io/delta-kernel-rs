@@ -249,6 +249,7 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
         Scalar::Date(19000).into(),
         Scalar::Timestamp(1234567890).into(),
         Scalar::TimestampNtz(9876543210).into(),
+        Expr::null_literal(DataType::INTEGER),
         Expr::binary(
             BinaryExpressionOp::Plus,
             Expr::literal(10),

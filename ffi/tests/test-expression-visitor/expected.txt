@@ -25,7 +25,7 @@ StructExpression
   Date(32)
   Binary(0000deadbeefcafe)
   Decimal(1,1,20,3)
-  Null
+  Null(Short)
   Struct
     Field: top
       Struct
@@ -153,6 +153,7 @@ StructExpression
   Date(19000)
   Timestamp(1234567890)
   TimestampNtz(9876543210)
+  Null(Integer)
   Add
     Integer(10)
     Integer(20)
