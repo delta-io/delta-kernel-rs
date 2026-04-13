@@ -340,16 +340,36 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         let batch = data.record_batch();
         let partition_cols = txn.logical_partition_columns();
 
+        println!(
+            "[write_partitioned_parquet] input: {} rows, {} cols, partition_cols={:?}",
+            batch.num_rows(),
+            batch.num_columns(),
+            partition_cols
+        );
+
         // Unpartitioned fast path: write the whole batch as a single file.
         if partition_cols.is_empty() {
+            println!("[write_partitioned_parquet] unpartitioned table, writing single file");
             let wc = txn.unpartitioned_write_context()?;
             return self.write_parquet(data, &wc).await;
         }
 
-        // Resolve partition column indices in the input batch schema.
+        // === PHASE 1: Find partition column positions in the batch ===
+        //
+        // The input batch has columns in the table's logical schema order, e.g.:
+        //
+        //   batch schema: [id: INT, region: STRING, category: STRING, value: DOUBLE]
+        //   partition_cols (from table metadata): ["region", "category"]
+        //
+        // We need the *index* of each partition column so we can pull out its Arrow
+        // array later. `schema.index_of("region")` returns 1, `index_of("category")`
+        // returns 2, so col_indices = [1, 2].
         let col_indices: Vec<usize> = partition_cols
             .iter()
             .map(|name| {
+                // batch.schema() returns the Arrow Schema for this RecordBatch.
+                // index_of(name) does a linear scan of its fields and returns the
+                // 0-based position, or Err if the column doesn't exist.
                 batch.schema().index_of(name).map_err(|_| {
                     Error::generic(format!(
                         "partition column '{}' not found in input batch schema",
@@ -357,25 +377,104 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                     ))
                 })
             })
+            // collect::<DeltaResult<Vec<usize>>>() short-circuits on the first Err,
+            // so if any partition column is missing from the batch we fail immediately.
             .collect::<DeltaResult<_>>()?;
 
-        // Find adjacent groups of identical partition values (O(n) scan, no sort).
+        // === PHASE 2: Find runs of identical partition values (the "partition" step) ===
+        //
+        // Goal: split the batch into groups where each group has the same partition
+        // column values, so we can write one parquet file per distinct partition.
+        //
+        // Example input (6 rows, 2 partition columns):
+        //
+        //   row | id | region | category
+        //   ----+----+--------+---------
+        //    0  |  1 | "US"   | "A"
+        //    1  |  2 | "US"   | "A"       <-- same as row 0
+        //    2  |  3 | "EU"   | "B"       <-- different, new run starts
+        //    3  |  4 | "US"   | "A"       <-- same as rows 0-1, but non-adjacent
+        //    4  |  5 | "EU"   | "B"       <-- same as row 2, but non-adjacent
+        //    5  |  6 | "EU"   | "B"       <-- same as row 4, continues run
+        //
+        // First, extract just the partition column arrays from the batch. Using
+        // col_indices = [1, 2], we get:
+        //   partition_arrays = [region_array, category_array]
         let partition_arrays: Vec<ArrayRef> = col_indices
             .iter()
-            .map(|&idx| batch.column(idx).clone())
+            .map(|&idx| batch.column(idx).clone()) // clone() is cheap: Arc clone, not data copy
             .collect();
+
+        // Arrow's `partition()` scans the arrays and finds ranges of *adjacent* rows
+        // that have identical values across ALL partition columns. It does NOT sort or
+        // reorder the data. It returns a `Partitions` struct whose `.ranges()` method
+        // gives a Vec<Range<usize>>.
+        //
+        // For the example above:
+        //   ranges = [0..2, 2..3, 3..4, 4..6]
+        //
+        //   0..2 = rows 0-1: ("US", "A")   <-- 2 adjacent rows with same values
+        //   2..3 = row 2:    ("EU", "B")   <-- different from previous
+        //   3..4 = row 3:    ("US", "A")   <-- same VALUES as 0..2, but non-adjacent
+        //   4..6 = rows 4-5: ("EU", "B")   <-- same VALUES as 2..3, but non-adjacent
+        //
+        // Note: runs 0..2 and 3..4 have the same partition values ("US","A") but are
+        // separate ranges because they are not adjacent in the input. We will merge
+        // them in phase 3.
         let ranges = partition(&partition_arrays)
             .map_err(|e| Error::generic(format!("arrow partition failed: {e}")))?
             .ranges();
 
-        // Slice each adjacent group and group by partition key. Slices are zero-copy
-        // (offset+length views over the original batch buffers).
+        println!(
+            "[write_partitioned_parquet] phase 2: found {} adjacent runs from {} rows",
+            ranges.len(),
+            batch.num_rows()
+        );
+
+        // === PHASE 3: Group runs by partition key, merging non-adjacent runs ===
+        //
+        // We need to collect all rows for each distinct partition together, even if
+        // they appeared in multiple non-adjacent runs. We use a HashMap keyed by the
+        // serialized partition values (the "group key").
+        //
+        // The group key is a Vec<Option<String>> where each element is the serialized
+        // partition value for one partition column (None = null). For example:
+        //   ("US", "A") serializes to [Some("US"), Some("A")]
+        //   ("EU", "B") serializes to [Some("EU"), Some("B")]
+        //
+        // Each map entry stores:
+        //   (HashMap<String, Scalar>, Vec<RecordBatch>)
+        //    ^                         ^
+        //    |                         |
+        //    typed partition values    all slices belonging to this partition
+        //    (for write_context)       (will be concatenated if > 1)
         let mut groups: HashMap<PartitionGroupKey, (HashMap<String, Scalar>, Vec<RecordBatch>)> =
             HashMap::new();
 
         for range in &ranges {
+            // batch.slice(offset, length) creates a zero-copy view: no data is copied,
+            // it just records "start at row `offset`, include `length` rows" over the
+            // same underlying Arrow buffers.
+            //
+            // For range 0..2: slice = rows 0-1 (length 2)
+            // For range 2..3: slice = row 2 (length 1)
+            // For range 3..4: slice = row 3 (length 1)
+            // For range 4..6: slice = rows 4-5 (length 2)
             let slice = batch.slice(range.start, range.end - range.start);
 
+            // For this slice, extract the typed Scalar value for each partition column
+            // from row 0 of the slice (all rows in a run have identical partition values,
+            // since that is exactly what `partition()` guarantees).
+            //
+            // For slice [rows 0-1], partition cols at indices [1,2]:
+            //   extract_scalar(region_array, 0) => Scalar::String("US")
+            //   extract_scalar(category_array, 0) => Scalar::String("A")
+            //
+            // `values` = {"region": Scalar::String("US"), "category": Scalar::String("A")}
+            // `group_key` = [Some("US"), Some("A")]
+            //
+            // The group_key uses the *serialized* string form so it can be used as a
+            // HashMap key (Scalar itself does not implement Hash because of floats).
             let mut values = HashMap::with_capacity(col_indices.len());
             let mut group_key = Vec::with_capacity(col_indices.len());
             for (name, &idx) in partition_cols.iter().zip(&col_indices) {
@@ -384,6 +483,24 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 values.insert(name.clone(), scalar);
             }
 
+            // Insert into the groups map. If this partition key already exists (because
+            // we saw it in an earlier non-adjacent run), we append this slice to its
+            // Vec<RecordBatch>. Otherwise, create a new entry.
+            //
+            // After processing all 4 ranges from our example:
+            //   groups = {
+            //     [Some("US"), Some("A")] => ({"region":"US","category":"A"}, [slice(0..2), slice(3..4)])
+            //     [Some("EU"), Some("B")] => ({"region":"EU","category":"B"}, [slice(2..3), slice(4..6)])
+            //   }
+            //
+            // The ("US","A") partition has 2 non-adjacent slices that will be merged next.
+            println!(
+                "[write_partitioned_parquet] phase 3: range {:?} -> key={:?} ({} rows)",
+                range,
+                group_key,
+                range.end - range.start,
+            );
+
             groups
                 .entry(group_key)
                 .or_insert_with(|| (values, Vec::new()))
@@ -391,19 +508,50 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 .push(slice);
         }
 
-        // Rejoin non-adjacent groups: concat slices that share the same partition key.
-        // If a partition has only one contiguous run, the original zero-copy slice is
-        // used directly (no data copied).
+        println!(
+            "[write_partitioned_parquet] phase 3 done: {} distinct partitions from {} runs",
+            groups.len(),
+            ranges.len()
+        );
+
+        // === PHASE 4: Rejoin non-adjacent runs into one batch per partition ===
+        //
+        // After phase 3, groups might look like:
+        //   ("US","A") => [slice(0..2), slice(3..4)]   <-- 2 slices, need merging
+        //   ("EU","B") => [slice(2..3), slice(4..6)]   <-- 2 slices, need merging
+        //
+        // If the input data happened to be pre-sorted by partition columns, each
+        // partition would have exactly 1 slice (the common/fast case). In that case
+        // we skip the concat and use the zero-copy slice directly.
+        //
+        // When there are multiple non-adjacent slices (as above), we use
+        // `concat_batches` to physically copy and merge them into a single contiguous
+        // RecordBatch. This is the only place data is actually copied.
+        //
+        // Result for our example:
+        //   partitions = [
+        //     ({"region":"US","category":"A"}, RecordBatch[rows 0,1,3]),  <-- 3 rows merged
+        //     ({"region":"EU","category":"B"}, RecordBatch[rows 2,4,5]),  <-- 3 rows merged
+        //   ]
         let partitions: Vec<(HashMap<String, Scalar>, RecordBatch)> = groups
             .into_values()
+            .enumerate()
             .map(
-                |(values, slices): (HashMap<String, Scalar>, Vec<RecordBatch>)| {
+                |(i, (values, slices)): (usize, (HashMap<String, Scalar>, Vec<RecordBatch>))| {
+                    let total_rows: usize =
+                        slices.iter().map(|s| s.num_rows()).sum();
+                    println!(
+                        "[write_partitioned_parquet] phase 4: partition {}: {} slices, {} total rows, values={:?}",
+                        i, slices.len(), total_rows, values
+                    );
                     if slices.len() == 1 {
+                        // Fast path: single contiguous run, no copy needed.
                         let batch = slices.into_iter().next().ok_or_else(|| {
                             Error::generic("expected at least one slice in partition group")
                         })?;
                         Ok((values, batch))
                     } else {
+                        // Slow path: multiple non-adjacent runs, must copy data to merge.
                         let merged = concat_batches(&slices[0].schema(), &slices)
                             .map_err(|e| Error::generic(format!("concat_batches failed: {e}")))?;
                         Ok((values, merged))
@@ -412,7 +560,25 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             )
             .collect::<DeltaResult<_>>()?;
 
-        // Write each partition concurrently (buffered stream, up to 50 in-flight).
+        // === PHASE 5: Write each partition to its own parquet file ===
+        //
+        // For each (partition_values, batch) pair:
+        //   1. txn.partitioned_write_context(values) validates the partition values,
+        //      serializes them, translates logical column names to physical names, and
+        //      builds a WriteContext that knows the target directory and schema.
+        //   2. self.write_parquet(batch, write_context) transforms the data from
+        //      logical to physical schema (removing partition columns from the parquet
+        //      file when applicable), writes the parquet file to object storage, and
+        //      returns an EngineData batch containing the Add action metadata (file
+        //      path, size, stats, partitionValues).
+        //
+        // `.buffered(50)` runs up to 50 writes concurrently. Each write is an async
+        // operation (uploading to object storage), so parallelism helps throughput.
+        //
+        // For our example, this produces 2 parquet files:
+        //   file1: region=US/category=A/<uuid>.parquet  (3 rows: ids 1,2,3)
+        //   file2: region=EU/category=B/<uuid>.parquet  (3 rows: ids 2,4,5)
+        // And 2 EngineData batches, each with one row of Add action metadata.
         let results: Vec<Box<dyn EngineData>> = stream::iter(partitions)
             .map(|(values, group_batch)| async move {
                 let wc = txn.partitioned_write_context(values)?;
@@ -423,7 +589,18 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             .try_collect()
             .await?;
 
-        // Merge all per-partition metadata into a single EngineData batch.
+        println!(
+            "[write_partitioned_parquet] phase 5 done: wrote {} parquet files",
+            results.len()
+        );
+
+        // === PHASE 6: Merge metadata into a single batch ===
+        //
+        // Each write_parquet call returned one EngineData batch with 1 row of Add
+        // action metadata (path, size, partitionValues, stats). Merge them into a
+        // single batch so the caller can do one txn.add_files(metadata) call.
+        //
+        // For our example: merges 2 single-row batches into 1 two-row batch.
         merge_add_file_metadata(results)
     }
 }

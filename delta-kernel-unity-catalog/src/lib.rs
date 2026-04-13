@@ -213,33 +213,82 @@ mod tests {
 
     // ignored test which you can run manually to play around with writing to a UC table. run with:
     // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t write_uc_table --nocapture -- --ignored`
+    //
+    // Table schema (created via Databricks SQL):
+    //   p_date DATE, value STRING, p_bool BOOLEAN, p_string STRING, p_int INT
+    //   PARTITIONED BY (p_string, p_int, p_date, p_bool)
+    //
+    // Note: schema order != partition order. This exercises col_indices resolution.
     #[ignore]
     #[tokio::test(flavor = "multi_thread")]
     async fn write_uc_table() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use delta_kernel::arrow::array::{
+            BooleanArray, Date32Array, Int32Array, RecordBatch, StringArray,
+        };
+        use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use delta_kernel::engine::arrow_data::ArrowEngineData;
+
         let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
         let token = env::var("TOKEN").expect("TOKEN environment variable not set");
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
 
+        println!("endpoint: {endpoint}");
+        println!("table_name: {table_name}");
+
         // build shared config
         let config =
             unity_catalog_delta_rest_client::ClientConfig::build(&endpoint, &token).build()?;
+        println!("workspace_url: {}", config.workspace_url);
 
         // build clients
         let client = UCClient::new(config.clone())?;
-        let commits_client = Arc::new(UCCommitsRestClient::new(config)?);
+        let commits_client = Arc::new(UCCommitsRestClient::new(config.clone())?);
 
-        let (table_id, table_uri) = get_table(&client, &table_name).await?;
+        // Debug: raw HTTP call to see what we're actually getting back
+        {
+            let debug_url = format!("{}tables/{}", config.workspace_url, table_name);
+            println!("debug GET: {debug_url}");
+            let http = unity_catalog_delta_rest_client::http::build_http_client(&config)?;
+            let resp = http.get(&debug_url).send().await
+                .map_err(|e| format!("send failed: {e}"))?;
+            println!("debug status: {}", resp.status());
+            println!("debug url after redirects: {}", resp.url());
+            let body = resp.text().await.map_err(|e| format!("body read failed: {e}"))?;
+            println!(
+                "debug body (first 500 chars): {}",
+                &body[..body.len().min(500)]
+            );
+        }
+
+        println!("calling get_table...");
+        let table_res = client.get_table(&table_name).await?;
+        let table_id = table_res.table_id.clone();
+        let table_uri = table_res.storage_location.clone();
+        println!("table_id: {table_id}, table_uri: {table_uri}");
+        println!("properties: {:?}", table_res.properties);
+
+        let is_catalog_managed = table_res
+            .properties
+            .get("delta.feature.catalogManaged")
+            .map_or(false, |v| v == "supported");
+        println!("is_catalog_managed: {is_catalog_managed}");
+
+        // Get cloud storage credentials
+        println!("calling get_credentials for table_id={table_id}...");
         let creds = client
             .get_credentials(&table_id, Operation::ReadWrite)
             .await
             .map_err(|e| format!("Failed to get credentials: {e}"))?;
+        println!("got credentials, aws={}", creds.aws_temp_credentials.is_some());
 
-        let catalog = UCKernelClient::new(commits_client.as_ref());
-
-        // TODO: support non-AWS
         let creds = creds
             .aws_temp_credentials
             .ok_or("No AWS temporary credentials found")?;
+        println!(
+            "aws creds: access_key_id={}..., session_token_len={}",
+            &creds.access_key_id[..12.min(creds.access_key_id.len())],
+            creds.session_token.len()
+        );
 
         let options = [
             ("region", "us-west-2"),
@@ -249,32 +298,166 @@ mod tests {
         ];
 
         let table_url = Url::parse(&table_uri)?;
+        println!("table_url: {table_url}");
         let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
         let store = Arc::new(store);
 
         let engine = DefaultEngineBuilder::new(store.clone()).build();
-        let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
-        let snapshot = catalog
-            .load_snapshot(&table_id, &table_uri, &engine)
+
+        // Load snapshot and build committer based on catalog-managed status.
+        let snapshot = if is_catalog_managed {
+            println!("catalog-managed table: using UC commits client for snapshot + commit");
+            let catalog = UCKernelClient::new(commits_client.as_ref());
+            catalog
+                .load_snapshot(&table_id, &table_uri, &engine)
+                .await?
+        } else {
+            println!("non-catalog-managed table: using filesystem snapshot");
+            Snapshot::builder_for(table_url.clone()).build(&engine)?
+        };
+        println!("loaded snapshot version: {:?}", snapshot.version());
+        println!("schema: {:?}", snapshot.schema());
+        println!(
+            "partition cols: {:?}",
+            snapshot.table_configuration().partition_columns()
+        );
+
+        // Build a batch matching the table schema: p_date, value, p_bool, p_string, p_int
+        // 12 rows with non-adjacent partitions to exercise grouping/merging.
+        //
+        // Rows are intentionally NOT sorted by partition values:
+        //   rows 0,3,6  -> ("US",    2024, 2025-03-31, true)   partition A
+        //   rows 1,4    -> ("EU",    2025, 2025-01-15, false)  partition B
+        //   rows 2,5    -> ("AP",    2024, 2025-06-01, true)   partition C
+        //   rows 7,8    -> (NULL,    NULL, NULL,       NULL)   partition D (all nulls)
+        //   row  9      -> ("US/East", 2024, 2025-01-01, true) partition E (special chars)
+        //   row  10     -> ("100%",  2024, 2025-01-01, false)  partition F (special chars)
+        //   row  11     -> ("a=b",   2024, 2025-01-01, true)   partition G (special chars)
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("p_date", ArrowDataType::Date32, true),
+            Field::new("value", ArrowDataType::Utf8, true),
+            Field::new("p_bool", ArrowDataType::Boolean, true),
+            Field::new("p_string", ArrowDataType::Utf8, true),
+            Field::new("p_int", ArrowDataType::Int32, true),
+        ]));
+
+        // Days since epoch for test dates
+        let d_2025_03_31 = 20178; // 2025-03-31
+        let d_2025_01_15 = 20103; // 2025-01-15
+        let d_2025_06_01 = 20240; // 2025-06-01
+        let d_2025_01_01 = 20089; // 2025-01-01
+
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                // p_date (schema col 0, partition col 3 in partition order)
+                Arc::new(Date32Array::from(vec![
+                    Some(d_2025_03_31), // row0: partition A
+                    Some(d_2025_01_15), // row1: partition B
+                    Some(d_2025_06_01), // row2: partition C
+                    Some(d_2025_03_31), // row3: partition A (non-adjacent)
+                    Some(d_2025_01_15), // row4: partition B (non-adjacent)
+                    Some(d_2025_06_01), // row5: partition C (non-adjacent)
+                    Some(d_2025_03_31), // row6: partition A (third occurrence)
+                    None,               // row7: partition D (all null)
+                    None,               // row8: partition D (all null)
+                    Some(d_2025_01_01), // row9: partition E (special: US/East)
+                    Some(d_2025_01_01), // row10: partition F (special: 100%)
+                    Some(d_2025_01_01), // row11: partition G (special: a=b)
+                ])),
+                // value (schema col 1, NOT a partition column)
+                Arc::new(StringArray::from(vec![
+                    Some("row0"),
+                    Some("row1"),
+                    Some("row2"),
+                    Some("row3"),
+                    Some("row4"),
+                    Some("row5"),
+                    Some("row6"),
+                    Some("row7"),
+                    Some("row8"),
+                    Some("row9"),
+                    Some("row10"),
+                    Some("row11"),
+                ])),
+                // p_bool (schema col 2, partition col 4 in partition order)
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),  // row0
+                    Some(false), // row1
+                    Some(true),  // row2
+                    Some(true),  // row3
+                    Some(false), // row4
+                    Some(true),  // row5
+                    Some(true),  // row6
+                    None,        // row7
+                    None,        // row8
+                    Some(true),  // row9
+                    Some(false), // row10
+                    Some(true),  // row11
+                ])),
+                // p_string (schema col 3, partition col 1 in partition order)
+                Arc::new(StringArray::from(vec![
+                    Some("US"),      // row0
+                    Some("EU"),      // row1
+                    Some("AP"),      // row2
+                    Some("US"),      // row3
+                    Some("EU"),      // row4
+                    Some("AP"),      // row5
+                    Some("US"),      // row6
+                    None,            // row7
+                    None,            // row8
+                    Some("US/East"), // row9
+                    Some("100%"),    // row10
+                    Some("a=b"),     // row11
+                ])),
+                // p_int (schema col 4, partition col 2 in partition order)
+                Arc::new(Int32Array::from(vec![
+                    Some(2024), // row0
+                    Some(2025), // row1
+                    Some(2024), // row2
+                    Some(2024), // row3
+                    Some(2025), // row4
+                    Some(2024), // row5
+                    Some(2024), // row6
+                    None,       // row7
+                    None,       // row8
+                    Some(2024), // row9
+                    Some(2024), // row10
+                    Some(2024), // row11
+                ])),
+            ],
+        )?;
+
+        println!("built batch: {} rows, {} cols", batch.num_rows(), batch.num_columns());
+
+        // Write using write_partitioned_parquet
+        let committer: Box<dyn delta_kernel::committer::Committer> = if is_catalog_managed {
+            Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()))
+        } else {
+            Box::new(delta_kernel::committer::FileSystemCommitter::new())
+        };
+        println!("committer: catalog_managed={is_catalog_managed}");
+
+        let mut txn = snapshot
+            .clone()
+            .transaction(committer, &engine)?
+            .with_engine_info("kernel-partition-test")
+            .with_data_change(true);
+
+        let metadata = engine
+            .write_partitioned_parquet(&ArrowEngineData::new(batch), &txn)
             .await?;
-        println!("latest snapshot version: {:?}", snapshot.version());
-        let txn = snapshot.clone().transaction(committer, &engine)?;
-        let _write_context = txn.unpartitioned_write_context()?;
+        txn.add_files(metadata);
 
         match txn.commit(&engine)? {
             CommitResult::CommittedTransaction(t) => {
                 println!("committed version {}", t.commit_version());
-                // TODO: should use post-commit snapshot here (plumb through log tail)
-                let _snapshot = catalog
-                    .load_snapshot_at(&table_id, &table_uri, t.commit_version(), &engine)
-                    .await?;
-                // then do publish
             }
             CommitResult::ConflictedTransaction(t) => {
                 println!("commit conflicted at version {}", t.conflict_version());
             }
             CommitResult::RetryableTransaction(_) => {
-                println!("we should retry...");
+                println!("retryable, we should retry...");
             }
         }
         Ok(())
