@@ -170,31 +170,24 @@ pub enum DataLayout {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum TimeTravel {
-    /// Snapshot/read version from the workload JSON. It is i64 so that negative values from
-    /// the test spec can be deserialized correctly; We rely on [`TimeTravel::as_version`] to reject
-    /// values below zero.
-    Version {
-        version: i64,
-    },
-    Timestamp {
-        timestamp: String,
-    },
+    /// Timetravel to a specific snapshot/read version specified by the workload JSON.
+    /// It is i64 so that negative values from the test spec can be deserialized correctly.
+    /// [`TimeTravel::as_version`] will reject values below zero.
+    Version { version: i64 },
+    /// Timetravel to a specific timestamp specified by the workload JSON.
+    /// (not yet supported)
+    Timestamp { timestamp: String },
 }
 
 impl TimeTravel {
     /// Returns the version if this is version-based time travel and the version is non-negative.
     ///
-    /// Returns an error for negative versions or for timestamp-based time travel( which is not
+    /// Returns an error for negative versions or for timestamp-based time travel (which is not
     /// yet supported).
     pub fn as_version(&self) -> Result<u64, &'static str> {
         match self {
-            TimeTravel::Version { version } => {
-                if *version < 0 {
-                    Err("Only non-negative snapshot versions are supported")
-                } else {
-                    Ok(*version as u64)
-                }
-            }
+            TimeTravel::Version { version } => u64::try_from(*version)
+                .map_err(|_| "Only non-negative snapshot versions are supported"),
             TimeTravel::Timestamp { .. } => Err("Timestamp-based time travel is not yet supported"),
         }
     }
