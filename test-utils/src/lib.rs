@@ -2,7 +2,7 @@
 
 pub mod counting_reporter;
 pub mod table_builder;
-pub use counting_reporter::CountingReporter;
+pub use counting_reporter::{CountingReporter, RelaxedCounter};
 
 use std::collections::HashMap;
 use std::sync::Arc;
