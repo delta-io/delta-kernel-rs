@@ -2480,6 +2480,17 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_from_json_bad_syntax() {
+        let json = r#"{not valid json at all"#;
+        let result = unsafe { schema_from_json(kernel_string_slice!(json), allocate_err) };
+        assert_extern_result_error_with_message(
+            result,
+            KernelError::MalformedJsonError,
+            Some("key must be a string at line 1 column 2"),
+        );
+    }
+
+    #[test]
     fn test_schema_from_json_empty_struct() {
         let json = r#"{"type":"struct","fields":[]}"#;
         let result = unsafe { schema_from_json(kernel_string_slice!(json), allocate_err) };
