@@ -164,5 +164,5 @@
 //! system prevents non-UTF-8 bytes from reaching the encoding layer.
 
 pub(crate) mod hive;
-pub(crate) mod serialization;
+pub mod serialization;
 pub(crate) mod validation;

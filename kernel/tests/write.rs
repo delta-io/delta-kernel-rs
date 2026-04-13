@@ -768,7 +768,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
             .map(|(data, partition_val)| {
                 let write_context = Arc::new(
                     txn.partitioned_write_context(HashMap::from([(
-                        "partition".to_string(),
+                        partition_col.to_string(),
                         Scalar::String(partition_val.into()),
                     )]))
                     .unwrap(),

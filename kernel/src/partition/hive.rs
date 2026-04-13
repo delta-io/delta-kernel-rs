@@ -24,8 +24,6 @@
 //! [hive]: https://github.com/apache/hive/blob/trunk/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
 //! [spark]: https://github.com/apache/spark/blob/master/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/catalog/ExternalCatalogUtils.scala
 
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";

@@ -856,7 +856,7 @@ impl<S> Transaction<S> {
         let mut serialized = HashMap::with_capacity(normalized.len());
         for logical_name in &shared.logical_partition_columns {
             let scalar = normalized.get(logical_name).ok_or_else(|| {
-                Error::generic(format!(
+                Error::internal_error(format!(
                     "partition column '{logical_name}' missing after validation"
                 ))
             })?;
@@ -865,7 +865,7 @@ impl<S> Transaction<S> {
                 .logical_schema
                 .field(logical_name)
                 .ok_or_else(|| {
-                    Error::generic(format!(
+                    Error::internal_error(format!(
                         "partition column '{logical_name}' not found in schema after validation"
                     ))
                 })?
@@ -1621,6 +1621,8 @@ mod tests {
 
     /// Helper: loads a test table snapshot and returns both the snapshot and its write context.
     /// For partitioned tables, creates a partitioned write context with null values.
+    /// Returns a snapshot and a partitioned write context (with null partition values) for the
+    /// given test table. The table must be partitioned.
     fn snapshot_and_partitioned_write_context(
         table_path: &str,
     ) -> Result<(Arc<Snapshot>, WriteContext), Box<dyn std::error::Error>> {
@@ -1632,19 +1634,19 @@ mod tests {
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
         let partition_cols = txn.logical_partition_columns();
-        let wc = if partition_cols.is_empty() {
-            txn.unpartitioned_write_context()?
-        } else {
-            let schema = snapshot.schema();
-            let pvs: HashMap<String, Scalar> = partition_cols
-                .iter()
-                .map(|col| {
-                    let dt = schema.field(col).unwrap().data_type().clone();
-                    (col.clone(), Scalar::Null(dt))
-                })
-                .collect();
-            txn.partitioned_write_context(pvs)?
-        };
+        assert!(
+            !partition_cols.is_empty(),
+            "expected a partitioned table at {table_path}"
+        );
+        let schema = snapshot.schema();
+        let partition_vals: HashMap<String, Scalar> = partition_cols
+            .iter()
+            .map(|col| {
+                let dt = schema.field(col).unwrap().data_type().clone();
+                (col.clone(), Scalar::Null(dt))
+            })
+            .collect();
+        let wc = txn.partitioned_write_context(partition_vals)?;
         Ok((snapshot, wc))
     }
 

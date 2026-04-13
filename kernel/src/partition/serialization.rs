@@ -55,7 +55,7 @@ const UNIX_EPOCH_CE_DAYS: i32 = 719_163;
 /// The inverse of [`PrimitiveType::parse_scalar`].
 ///
 /// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
-pub(crate) fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> {
+pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> {
     match value {
         Scalar::Null(_) => Ok(None),
         Scalar::String(s) => Ok(if s.is_empty() { None } else { Some(s.clone()) }),

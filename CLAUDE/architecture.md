@@ -64,10 +64,10 @@ set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and
 
 `Snapshot` -> `Transaction` -> commit
 
-The kernel coordinates the write transaction: it provides the write context (target directory,
-physical schema, stats columns), assembles commit actions (CommitInfo, Add files), enforces
-protocol compliance (table features, schema validation), and delegates the atomic commit to a
-`Committer`.
+The kernel coordinates the write transaction: it provides the write context (validated partition
+values, recommended write directory, physical schema, stats columns), assembles commit actions
+(CommitInfo, Add files), enforces protocol compliance (table features, schema validation), and
+delegates the atomic commit to a `Committer`.
 
 **Steps:**
 1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)

@@ -727,7 +727,9 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn test_as_record_batch(#[values(true, false)] test_empty_str: bool) {
+    fn test_as_record_batch(
+        #[values(None, Some("a".to_string()))] partition_value: Option<String>,
+    ) {
         let location = Url::parse("file:///test_url").unwrap();
         let size = 1_000_000;
         let last_modified = 10000000000;
@@ -747,12 +749,7 @@ mod tests {
         )
         .unwrap();
         let data_file_metadata = DataFileMetadata::new(file_metadata, stats.clone());
-        let partition_value = if test_empty_str {
-            None
-        } else {
-            Some("a".to_string())
-        };
-        let partition_values = HashMap::from([("partition1".to_string(), partition_value)]);
+        let partition_values = HashMap::from([("partition1".to_string(), partition_value.clone())]);
         let actual = data_file_metadata
             .as_record_batch(&partition_values)
             .unwrap();
@@ -769,10 +766,9 @@ mod tests {
         );
 
         partition_values_builder.keys().append_value("partition1");
-        if test_empty_str {
-            partition_values_builder.values().append_null(); // empty string should go to null
-        } else {
-            partition_values_builder.values().append_value("a");
+        match &partition_value {
+            None => partition_values_builder.values().append_null(),
+            Some(v) => partition_values_builder.values().append_value(v),
         }
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
