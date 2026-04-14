@@ -1033,6 +1033,7 @@ version = "0.20.0"
 dependencies = [
  "clap",
  "delta_kernel",
+ "tracing",
  "url",
 ]
 
@@ -2205,6 +2206,8 @@ dependencies = [
  "common",
  "delta_kernel",
  "env_logger",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
