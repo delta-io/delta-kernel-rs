@@ -1,0 +1,2 @@
+{"commitInfo":{"timestamp":1775494297252,"operation":"ADD FEATURE","operationParameters":{"name":"[\"timestampNanos\"]"},"engineInfo":"delta-rs:py-1.4.2","clientVersion":"delta-rs.py-1.4.2"}}
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["timestampNanos"],"writerFeatures":["timestampNanos"]}}
