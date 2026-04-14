@@ -1449,4 +1449,55 @@ mod tests {
             "Parquet file should not contain embedded Arrow schema metadata"
         );
     }
+
+    #[tokio::test]
+    async fn write_parquet_file_creates_parent_directories() {
+        // GIVEN a file path whose parent directories do not exist
+        let temp_dir = tempfile::tempdir().unwrap();
+        let nested_path = temp_dir.path().join("a/b/c/output.parquet");
+        assert!(!nested_path.parent().unwrap().exists());
+
+        let store = Arc::new(LocalFileSystem::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "x",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data)));
+
+        // WHEN we write a parquet file to that path
+        let file_url = Url::from_file_path(&nested_path).unwrap();
+        parquet_handler
+            .write_parquet_file(file_url.clone(), data_iter)
+            .unwrap();
+
+        // THEN the file is created and contains the expected data
+        assert!(nested_path.exists());
+
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let batches: Vec<RecordBatch> = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .build()
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(col.values(), &[1, 2, 3]);
+    }
 }
