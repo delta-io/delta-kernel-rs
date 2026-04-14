@@ -116,12 +116,14 @@ use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, 
 use url::Url;
 
 mod checkpoint_transform;
+#[allow(unused)]
+// Used once sidecar checkpoint writing is enabled
+mod sidecar;
 
 use checkpoint_transform::{
     build_checkpoint_output_schema, build_checkpoint_read_schema, build_checkpoint_transform,
     StatsTransformConfig,
 };
-
 #[cfg(test)]
 mod tests;
 

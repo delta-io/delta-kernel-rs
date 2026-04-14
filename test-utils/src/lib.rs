@@ -2,7 +2,7 @@
 
 pub mod counting_reporter;
 pub mod table_builder;
-pub use counting_reporter::CountingReporter;
+pub use counting_reporter::{CountingReporter, RelaxedCounter};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +25,7 @@ use delta_kernel::engine::default::executor::tokio::{
 use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::ObjectStoreExt as _;
@@ -670,9 +671,9 @@ pub async fn insert_data<E: TaskExecutor>(
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
-    let write_context = txn.get_write_context();
+    let write_context = txn.unpartitioned_write_context()?;
     let add_files_metadata = engine
-        .write_parquet(&ArrowEngineData::new(batch), &write_context, HashMap::new())
+        .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;
     txn.add_files(add_files_metadata);
 
@@ -1005,20 +1006,24 @@ pub async fn write_batch_to_table(
     snapshot: &Arc<Snapshot>,
     engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
     data: RecordBatch,
-    partition_values: std::collections::HashMap<String, String>,
+    partition_values: HashMap<String, Scalar>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
-    let write_context = txn.get_write_context();
+    let write_context = if txn.logical_partition_columns().is_empty() {
+        assert!(
+            partition_values.is_empty(),
+            "partition_values should be empty for unpartitioned tables"
+        );
+        txn.unpartitioned_write_context()?
+    } else {
+        txn.partitioned_write_context(partition_values)?
+    };
     let add_meta = engine
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            &write_context,
-            partition_values,
-        )
+        .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
     txn.add_files(add_meta);
     match txn.commit(engine)? {
