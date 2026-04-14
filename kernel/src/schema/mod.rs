@@ -742,6 +742,7 @@ impl StructType {
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate
     /// field is not a struct type.
+    #[internal_api]
     pub(crate) fn walk_column_fields<'a>(
         &'a self,
         col: &ColumnName,
@@ -1496,6 +1497,7 @@ impl PrimitiveType {
     /// - Timestamp interchangeability: Timestamp <-> TimestampNtz (both are i64 microseconds
     ///   since epoch, differing only in timezone semantics; this is a physical read
     ///   accommodation, not a Delta protocol type widening rule)
+    #[internal_api]
     pub(crate) fn can_widen_to(&self, target: &Self) -> bool {
         use PrimitiveType::*;
         matches!(
