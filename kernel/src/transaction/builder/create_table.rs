@@ -185,12 +185,12 @@ fn add_feature_to_lists(
     }
 }
 
-/// Test-only helper for clustering support during table creation.
-///
-/// Validates clustering columns, adds the `DomainMetadata` and `ClusteredTable` features
-/// directly, and creates the domain metadata action.
+/// Test-only helper that validates clustering columns, then adds the `DomainMetadata` and
+/// `ClusteredTable` features directly and creates the domain metadata action. Unlike the
+/// production path (`apply_data_layout`), this adds `DomainMetadata` directly rather than
+/// relying on inline dependency handling.
 #[cfg(test)]
-fn make_clustering_domain_metadata(
+fn validate_clustering_and_make_domain_metadata(
     logical_schema: &SchemaRef,
     logical_columns: &[ColumnName],
     reader_features: &mut Vec<TableFeature>,
@@ -383,7 +383,7 @@ fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProp
                     &mut validated.writer_features,
                 );
                 // RowTracking requires DomainMetadata as a dependency
-                if matches!(feature, TableFeature::RowTracking) {
+                if *feature == TableFeature::RowTracking {
                     add_feature_to_lists(
                         TableFeature::DomainMetadata,
                         &mut validated.reader_features,
@@ -564,7 +564,7 @@ fn validate_extract_table_features_and_properties(
         }
 
         // Add to appropriate feature lists based on feature type
-        let needs_domain_metadata = matches!(feature, TableFeature::RowTracking);
+        let needs_domain_metadata = feature == TableFeature::RowTracking;
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
         // RowTracking requires DomainMetadata as a dependency
         if needs_domain_metadata {
@@ -987,7 +987,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let dm = make_clustering_domain_metadata(
+        let dm = validate_clustering_and_make_domain_metadata(
             &schema,
             &[ColumnName::new(["id"])],
             &mut reader_features,
@@ -1016,7 +1016,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let dm = make_clustering_domain_metadata(
+        let dm = validate_clustering_and_make_domain_metadata(
             &schema,
             &[ColumnName::new(["id"]), ColumnName::new(["date"])],
             &mut reader_features,
@@ -1045,7 +1045,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let result = make_clustering_domain_metadata(
+        let result = validate_clustering_and_make_domain_metadata(
             &schema,
             &[ColumnName::new(["nonexistent"])],
             &mut reader_features,
@@ -1077,7 +1077,7 @@ mod tests {
         let mut writer_features = vec![];
 
         let nested_col = ColumnName::new(["address", "city"]);
-        let dm = make_clustering_domain_metadata(
+        let dm = validate_clustering_and_make_domain_metadata(
             &schema,
             &[nested_col],
             &mut reader_features,
@@ -1494,12 +1494,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_row_tracking_property_enables_features() {
-        let properties: HashMap<String, String> =
-            [(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]
-                .into_iter()
-                .collect();
+    /// Verifies that both activation paths add `RowTracking` and `DomainMetadata` to
+    /// `writer_features`. For the feature-signal path, `delta.enableRowTracking` must NOT
+    /// be present in the properties (signal grants support, not enablement).
+    #[rstest::rstest]
+    #[case::enablement_property(
+        HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
+        true, // enablement property is set
+    )]
+    #[case::feature_signal(
+        HashMap::from([("delta.feature.rowTracking".to_string(), "supported".to_string())]),
+        false, // enablement property is NOT set
+    )]
+    fn test_row_tracking_activation_adds_required_features(
+        #[case] properties: HashMap<String, String>,
+        #[case] expect_enablement_property: bool,
+    ) {
         let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
 
@@ -1515,27 +1525,10 @@ mod tests {
                 .contains(&TableFeature::DomainMetadata),
             "Expected DomainMetadata in writer_features"
         );
-    }
-
-    #[test]
-    fn test_row_tracking_feature_signal_adds_domain_metadata_dependency() {
-        let properties: HashMap<String, String> = [(
-            "delta.feature.rowTracking".to_string(),
-            "supported".to_string(),
-        )]
-        .into_iter()
-        .collect();
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
-
-        // Feature signal adds both RowTracking and its DomainMetadata dependency
-        assert!(validated
-            .writer_features
-            .contains(&TableFeature::RowTracking));
-        assert!(
-            validated
-                .writer_features
-                .contains(&TableFeature::DomainMetadata),
-            "Expected DomainMetadata to be added alongside RowTracking"
+        assert_eq!(
+            validated.properties.contains_key(ENABLE_ROW_TRACKING),
+            expect_enablement_property,
+            "delta.enableRowTracking presence mismatch"
         );
     }
 

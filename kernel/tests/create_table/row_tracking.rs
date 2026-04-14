@@ -12,6 +12,7 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::row_tracking::RowTrackingDomainMetadata;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -19,29 +20,12 @@ use delta_kernel::table_features::{
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
-use itertools::Itertools;
 use rstest::rstest;
-use serde_json::Deserializer;
-use test_utils::test_table_setup;
-
-/// Reads the commit JSON at the given version from the local filesystem and returns parsed
-/// JSON actions.
-fn read_commit_actions(table_path: &str, version: u64) -> Vec<serde_json::Value> {
-    let commit_path = format!("{}/_delta_log/{:020}.json", table_path, version);
-    let data = std::fs::read(&commit_path).unwrap();
-    Deserializer::from_slice(&data)
-        .into_iter::<serde_json::Value>()
-        .try_collect()
-        .unwrap()
-}
-
-/// Extracts domain metadata actions from parsed commit JSON.
-fn find_domain_metadata_actions(actions: &[serde_json::Value]) -> Vec<&serde_json::Value> {
-    actions
-        .iter()
-        .filter_map(|a| a.get("domainMetadata"))
-        .collect()
-}
+use test_utils::{
+    get_materialized_row_tracking_column_names, get_row_tracking_add_actions, insert_data,
+    read_actions_from_commit, test_table_setup,
+};
+use url::Url;
 
 /// Asserts protocol features are correct for row tracking on a snapshot.
 fn assert_row_tracking_protocol(snapshot: &Snapshot) {
@@ -92,7 +76,7 @@ async fn test_create_table_with_row_tracking(
     #[values(false, true)] with_data: bool,
 ) -> DeltaResult<()> {
     let (key, value) = activation;
-    let is_property_enabled = key == "delta.enableRowTracking";
+    let expect_property_enabled = key == "delta.enableRowTracking";
 
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = super::simple_schema()?;
@@ -138,35 +122,23 @@ async fn test_create_table_with_row_tracking(
         assert_row_tracking_protocol(&disk_snapshot);
     }
 
-    let actions = read_commit_actions(&table_path, 0);
+    let table_url = Url::from_directory_path(&table_path).expect("valid path");
 
-    // Verify row tracking domain metadata
-    let dm_actions = find_domain_metadata_actions(&actions);
-    let row_tracking_dm: Vec<_> = dm_actions
-        .iter()
-        .filter(|dm| dm["domain"] == "delta.rowTracking")
-        .collect();
-    assert_eq!(
-        row_tracking_dm.len(),
-        1,
-        "Expected exactly one row tracking domain metadata"
-    );
-    let dm_config: serde_json::Value =
-        serde_json::from_str(row_tracking_dm[0]["configuration"].as_str().unwrap()).unwrap();
+    // Verify row tracking high water mark via snapshot API
+    let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let expected_high_water_mark: i64 = if with_data { 4 } else { -1 };
-    assert_eq!(dm_config["rowIdHighWaterMark"], expected_high_water_mark);
+    assert_eq!(
+        RowTrackingDomainMetadata::get_high_water_mark(&disk_snapshot, engine.as_ref())?,
+        Some(expected_high_water_mark),
+    );
 
     // Verify add actions
-    let add_actions: Vec<_> = actions.iter().filter_map(|a| a.get("add")).collect();
+    let add_actions = get_row_tracking_add_actions(&table_url, 0).expect("failed to read commit");
     if with_data {
         assert_eq!(add_actions.len(), 1, "Expected one add action");
+        assert_eq!(add_actions[0].base_row_id, Some(0), "baseRowId should be 0");
         assert_eq!(
-            add_actions[0]["baseRowId"].as_i64(),
-            Some(0),
-            "baseRowId should be 0"
-        );
-        assert_eq!(
-            add_actions[0]["defaultRowCommitVersion"].as_i64(),
+            add_actions[0].default_row_commit_version,
             Some(0),
             "defaultRowCommitVersion should be 0"
         );
@@ -179,20 +151,19 @@ async fn test_create_table_with_row_tracking(
 
     // Verify materialized column name properties.
     // Only set when delta.enableRowTracking=true; feature-signal-only tables do not get them.
-    let metadata_actions: Vec<_> = actions.iter().filter_map(|a| a.get("metaData")).collect();
-    assert_eq!(metadata_actions.len(), 1);
-    let meta_config = metadata_actions[0].get("configuration").unwrap();
+    let col_names =
+        get_materialized_row_tracking_column_names(&table_url, 0).expect("failed to read commit");
 
-    if is_property_enabled {
-        let row_id_col = meta_config
-            .get("delta.rowTracking.materializedRowIdColumnName")
-            .and_then(|v| v.as_str())
+    if expect_property_enabled {
+        let row_id_col = col_names
+            .row_id_column_name
+            .as_deref()
             .expect("materializedRowIdColumnName should be set");
         assert!(row_id_col.starts_with("_row-id-col-"), "got {row_id_col}");
 
-        let commit_version_col = meta_config
-            .get("delta.rowTracking.materializedRowCommitVersionColumnName")
-            .and_then(|v| v.as_str())
+        let commit_version_col = col_names
+            .row_commit_version_column_name
+            .as_deref()
             .expect("materializedRowCommitVersionColumnName should be set");
         assert!(
             commit_version_col.starts_with("_row-commit-version-col-"),
@@ -200,19 +171,22 @@ async fn test_create_table_with_row_tracking(
         );
     } else {
         assert!(
-            meta_config
-                .get("delta.rowTracking.materializedRowIdColumnName")
-                .is_none(),
+            col_names.row_id_column_name.is_none(),
             "materializedRowIdColumnName should NOT be set for feature-signal-only tables"
         );
         assert!(
-            meta_config
-                .get("delta.rowTracking.materializedRowCommitVersionColumnName")
-                .is_none(),
+            col_names.row_commit_version_column_name.is_none(),
             "materializedRowCommitVersionColumnName should NOT be set for feature-signal-only tables"
         );
+
+        // Also verify the enablement property itself is absent
+        let metadata_actions =
+            read_actions_from_commit(&table_url, 0, "metaData").expect("failed to read commit");
         assert!(
-            meta_config.get("delta.enableRowTracking").is_none(),
+            metadata_actions[0]
+                .get("configuration")
+                .and_then(|c| c.get("delta.enableRowTracking"))
+                .is_none(),
             "delta.enableRowTracking should NOT be set for feature-signal-only tables"
         );
     }
@@ -275,33 +249,25 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(committed.commit_version(), 0);
 
-    // Verify commit file contents
-    let actions = read_commit_actions(&table_path, 0);
-    let mut add_actions: Vec<_> = actions.iter().filter_map(|a| a.get("add")).collect();
+    let table_url = Url::from_directory_path(&table_path).expect("valid path");
+
+    // Verify add actions (already sorted by baseRowId)
+    let add_actions = get_row_tracking_add_actions(&table_url, 0).expect("failed to read commit");
     assert_eq!(add_actions.len(), 2, "Expected two add actions");
 
-    // Sort by baseRowId to get deterministic order
-    add_actions.sort_by_key(|a| a["baseRowId"].as_i64().unwrap());
-
     // First file (3 rows): baseRowId = 0
-    assert_eq!(add_actions[0]["baseRowId"].as_i64(), Some(0));
-    assert_eq!(add_actions[0]["defaultRowCommitVersion"].as_i64(), Some(0));
+    assert_eq!(add_actions[0].base_row_id, Some(0));
+    assert_eq!(add_actions[0].default_row_commit_version, Some(0));
 
     // Second file (5 rows): baseRowId = 3 (first file had 3 rows)
-    assert_eq!(add_actions[1]["baseRowId"].as_i64(), Some(3));
-    assert_eq!(add_actions[1]["defaultRowCommitVersion"].as_i64(), Some(0));
+    assert_eq!(add_actions[1].base_row_id, Some(3));
+    assert_eq!(add_actions[1].default_row_commit_version, Some(0));
 
     // HWM should be 7 (IDs 0-2 from file 1, IDs 3-7 from file 2)
-    let dm_actions = find_domain_metadata_actions(&actions);
-    let row_tracking_dm: Vec<_> = dm_actions
-        .iter()
-        .filter(|dm| dm["domain"] == "delta.rowTracking")
-        .collect();
-    assert_eq!(row_tracking_dm.len(), 1);
-    let config: serde_json::Value =
-        serde_json::from_str(row_tracking_dm[0]["configuration"].as_str().unwrap()).unwrap();
+    let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
-        config["rowIdHighWaterMark"], 7,
+        RowTrackingDomainMetadata::get_high_water_mark(&disk_snapshot, engine.as_ref())?,
+        Some(7),
         "HWM should be 7 for 8 total rows (3 + 5) starting from -1"
     );
 
@@ -325,6 +291,7 @@ fn test_create_table_with_row_tracking_and_clustering() -> DeltaResult<()> {
     let snapshot = committed
         .post_commit_snapshot()
         .expect("should have snapshot");
+    let table_url = Url::from_directory_path(&table_path).expect("valid path");
     let protocol = snapshot.table_configuration().protocol();
     let writer_features = protocol
         .writer_features()
@@ -340,8 +307,8 @@ fn test_create_table_with_row_tracking_and_clustering() -> DeltaResult<()> {
     assert_eq!(dm_count, 1, "DomainMetadata should not be duplicated");
 
     // Verify both domain metadata entries are present in the commit
-    let actions = read_commit_actions(&table_path, 0);
-    let dm_actions = find_domain_metadata_actions(&actions);
+    let dm_actions =
+        read_actions_from_commit(&table_url, 0, "domainMetadata").expect("failed to read commit");
     assert!(
         dm_actions
             .iter()
@@ -353,6 +320,154 @@ fn test_create_table_with_row_tracking_and_clustering() -> DeltaResult<()> {
             .iter()
             .any(|dm| dm["domain"] == "delta.clustering"),
         "clustering domain metadata should be present"
+    );
+
+    Ok(())
+}
+
+/// Verifies that row tracking and clustering work together when the table has data (CTAS).
+/// Both features generate domain metadata and the add files need row tracking columns.
+/// Verifies that both domain metadata entries survive when add files are also written.
+#[tokio::test]
+async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = super::simple_schema()?;
+    let mut txn = create_table(&table_path, schema.clone(), "Test/1.0")
+        .with_table_properties([("delta.enableRowTracking", "true")])
+        .with_data_layout(DataLayout::clustered(["id"]))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+    let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+        ],
+    )
+    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+
+    let write_context = Arc::new(txn.get_write_context());
+    let add_files = engine
+        .write_parquet(
+            &ArrowEngineData::new(batch),
+            write_context.as_ref(),
+            HashMap::new(),
+        )
+        .await?;
+    txn.add_files(add_files);
+
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let snapshot = committed
+        .post_commit_snapshot()
+        .expect("should have snapshot");
+    let table_url = Url::from_directory_path(&table_path).expect("valid path");
+
+    // Both features must be present in the protocol exactly once
+    let writer_features = snapshot
+        .table_configuration()
+        .protocol()
+        .writer_features()
+        .expect("should have writer features");
+    assert!(writer_features.contains(&TableFeature::RowTracking));
+    assert!(writer_features.contains(&TableFeature::ClusteredTable));
+    assert_eq!(
+        writer_features
+            .iter()
+            .filter(|f| **f == TableFeature::DomainMetadata)
+            .count(),
+        1,
+        "DomainMetadata should appear exactly once"
+    );
+
+    // Both domain metadata entries must survive alongside the add actions
+    let dm_actions =
+        read_actions_from_commit(&table_url, 0, "domainMetadata").expect("failed to read commit");
+    assert!(
+        dm_actions
+            .iter()
+            .any(|dm| dm["domain"] == "delta.rowTracking"),
+        "row tracking domain metadata should be present"
+    );
+    assert!(
+        dm_actions
+            .iter()
+            .any(|dm| dm["domain"] == "delta.clustering"),
+        "clustering domain metadata should be present"
+    );
+
+    // Add action must have correct row tracking fields
+    let add_actions = get_row_tracking_add_actions(&table_url, 0).expect("failed to read commit");
+    assert_eq!(add_actions.len(), 1, "Expected one add action");
+    assert_eq!(add_actions[0].base_row_id, Some(0));
+    assert_eq!(add_actions[0].default_row_commit_version, Some(0));
+
+    // High water mark should reflect the 5 written rows
+    let disk_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        RowTrackingDomainMetadata::get_high_water_mark(&disk_snapshot, engine.as_ref())?,
+        Some(4),
+        "5 rows -> high water mark = 4"
+    );
+
+    Ok(())
+}
+
+/// Verifies that a table created with the feature signal only (`delta.feature.rowTracking=supported`,
+/// no `delta.enableRowTracking=true`) correctly handles a subsequent data append. The initial
+/// create writes `rowIdHighWaterMark = -1`; the append must read that and assign `baseRowId = 0`
+/// to the first file.
+#[tokio::test]
+async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // Create empty table with feature signal only (no enablement property)
+    let _ = create_table(&table_path, super::simple_schema()?, "Test/1.0")
+        .with_table_properties([("delta.feature.rowTracking", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let table_url = Url::from_directory_path(&table_path).expect("valid path");
+
+    // Initial commit must have written rowIdHighWaterMark = -1
+    let v0_snapshot = Snapshot::builder_for(&table_path)
+        .at_version(0)
+        .build(engine.as_ref())?;
+    assert_eq!(
+        RowTrackingDomainMetadata::get_high_water_mark(&v0_snapshot, engine.as_ref())?,
+        Some(-1),
+        "Initial high water mark should be -1"
+    );
+
+    // Append 3 rows to the table
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let _ = insert_data(
+        snapshot,
+        &engine,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .await?;
+
+    // The append must read the HWM from the create commit and assign baseRowId = 0
+    let add_actions = get_row_tracking_add_actions(&table_url, 1).expect("failed to read commit");
+    assert_eq!(add_actions.len(), 1, "Expected one add action");
+    assert_eq!(
+        add_actions[0].base_row_id,
+        Some(0),
+        "First file after create should start at baseRowId 0 (high water mark was -1)"
+    );
+    assert_eq!(add_actions[0].default_row_commit_version, Some(1));
+
+    // High water mark after append: 3 rows starting from 0 -> high water mark = 2
+    let v1_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        RowTrackingDomainMetadata::get_high_water_mark(&v1_snapshot, engine.as_ref())?,
+        Some(2),
+        "3 rows starting from 0 -> high water mark = 2"
     );
 
     Ok(())

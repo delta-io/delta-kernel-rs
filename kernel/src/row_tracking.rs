@@ -10,7 +10,7 @@ use crate::{DeltaResult, Engine, Error, Snapshot};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RowTrackingDomainMetadata {
+pub struct RowTrackingDomainMetadata {
     // NB: The Delta spec does not rule out negative high water marks
     row_id_high_water_mark: i64,
 }
@@ -53,7 +53,7 @@ impl RowTrackingDomainMetadata {
     /// This method will return an error if:
     /// - The domain metadata configuration cannot be read from the log segment
     /// - The domain metadata JSON cannot be deserialized into `RowTrackingDomainMetadata`
-    pub(crate) fn get_high_water_mark(
+    pub fn get_high_water_mark(
         snapshot: &Snapshot,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
