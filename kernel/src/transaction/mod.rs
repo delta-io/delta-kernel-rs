@@ -57,6 +57,9 @@ pub(crate) mod data_layout;
 
 mod commit_info;
 mod domain_metadata;
+#[cfg(feature = "internal-api")]
+pub mod stats_verifier;
+#[cfg(not(feature = "internal-api"))]
 mod stats_verifier;
 mod update;
 mod write_context;

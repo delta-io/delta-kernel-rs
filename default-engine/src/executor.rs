@@ -12,7 +12,7 @@
 //! and multi-threaded executor based on Tokio.
 use futures::{future::BoxFuture, Future};
 
-use crate::DeltaResult;
+use delta_kernel::DeltaResult;
 
 /// An executor that can be used to run async tasks. This is used by IO functions
 /// within the `DefaultEngine`.
@@ -49,7 +49,6 @@ pub trait TaskExecutor: Send + Sync + 'static {
     fn enter(&self) -> Self::Guard<'_>;
 }
 
-#[cfg(any(feature = "tokio", test))]
 pub mod tokio {
     use super::TaskExecutor;
     use futures::TryFutureExt;
@@ -58,7 +57,7 @@ pub mod tokio {
     use std::sync::mpsc::channel;
     use tokio::runtime::{EnterGuard, Handle, RuntimeFlavor};
 
-    use crate::{DeltaResult, Error};
+    use delta_kernel::{DeltaResult, Error};
 
     /// A [`TaskExecutor`] that uses the tokio single-threaded runtime in a
     /// background thread to service tasks.
@@ -441,7 +440,8 @@ pub mod tokio {
                 tx.send(result).ok();
             });
 
-            // With 1 worker thread, 1 blocking thread and 4 nested block_on calls, this should deadlock
+            // With 1 worker thread, 1 blocking thread and 4 nested block_on calls,
+            // this should deadlock
             let timeout = Duration::from_millis(500);
             let result = rx.recv_timeout(timeout);
 

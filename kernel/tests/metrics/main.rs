@@ -18,11 +18,11 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{insert_data, test_table_setup_mt, CountingReporter};
 use url::Url;
@@ -35,7 +35,9 @@ mod snapshot_load;
 fn measuring_engine(
     store: Arc<dyn delta_kernel::object_store::ObjectStore>,
 ) -> (
-    DefaultEngine<delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor>,
+    DefaultEngine<
+        test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor,
+    >,
     Arc<CountingReporter>,
 ) {
     let reporter = Arc::new(CountingReporter::default());
@@ -58,7 +60,9 @@ fn simple_schema() -> Arc<StructType> {
 async fn insert_rows(
     table_url: &Url,
     engine: &Arc<
-        DefaultEngine<delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor>,
+        DefaultEngine<
+            test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor,
+        >,
     >,
     start_val: i32,
     count: i32,

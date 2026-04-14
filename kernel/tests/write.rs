@@ -18,12 +18,6 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::{
-    TokioBackgroundExecutor, TokioMultiThreadExecutor,
-};
-use delta_kernel::engine::default::parquet::DefaultParquetHandler;
-use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
@@ -31,6 +25,12 @@ use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
 use tempfile::TempDir;
+use test_utils::delta_kernel_default_engine::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
+use test_utils::delta_kernel_default_engine::parquet::DefaultParquetHandler;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 
 use test_utils::set_json_value;
 
@@ -3709,12 +3709,12 @@ async fn test_checkpoint_non_kernel_written_table() {
     let url = Url::from_directory_path(&table_path).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let executor = Arc::new(
-        delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor::new(
+        test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),
         ),
     );
-    let engine: Arc<delta_kernel::engine::default::DefaultEngine<_>> = Arc::new(
-        delta_kernel::engine::default::DefaultEngineBuilder::new(store)
+    let engine: Arc<test_utils::delta_kernel_default_engine::DefaultEngine<_>> = Arc::new(
+        test_utils::delta_kernel_default_engine::DefaultEngineBuilder::new(store)
             .with_task_executor(executor)
             .build(),
     );

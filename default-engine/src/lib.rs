@@ -12,19 +12,22 @@ use std::sync::Arc;
 use futures::stream::{BoxStream, StreamExt as _};
 use url::Url;
 
-use self::executor::TaskExecutor;
-use self::filesystem::ObjectStoreStorageHandler;
-use self::json::DefaultJsonHandler;
-use self::parquet::DefaultParquetHandler;
-use super::arrow_conversion::TryFromArrow as _;
-use super::arrow_data::ArrowEngineData;
-use super::arrow_expression::ArrowEvaluationHandler;
-use crate::metrics::MetricsReporter;
-use crate::object_store::DynObjectStore;
-use crate::schema::Schema;
-use crate::transaction::WriteContext;
-use crate::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+use crate::executor::TaskExecutor;
+use crate::filesystem::ObjectStoreStorageHandler;
+use crate::json::DefaultJsonHandler;
+use crate::parquet::DefaultParquetHandler;
+use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
+use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::schema::Schema;
+use delta_kernel::transaction::WriteContext;
+
+// Re-export delta_kernel types commonly used by engine implementations and their tests.
+pub use delta_kernel::metrics::{MetricEvent, MetricsReporter};
+pub use delta_kernel::{
+    DeltaResult, Engine, EngineData, Error, EvaluationHandler, FileDataReadResultIterator,
+    FileMeta, FileSlice, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, StorageHandler,
 };
 
 pub mod executor;
@@ -87,22 +90,22 @@ const DEFAULT_BATCH_SIZE: usize = 1000;
 /// Wraps a [`FileDataReadResultIterator`] to emit a [`MetricEvent`] exactly once when the iterator
 /// is either exhausted or dropped. Used by JSON and Parquet handlers to report the number of files
 /// and bytes requested per `read_*_files` call.
-pub(super) struct ReadMetricsIterator {
-    inner: crate::FileDataReadResultIterator,
-    reporter: Arc<dyn crate::metrics::MetricsReporter>,
+pub(crate) struct ReadMetricsIterator {
+    inner: delta_kernel::FileDataReadResultIterator,
+    reporter: Arc<dyn delta_kernel::metrics::MetricsReporter>,
     num_files: u64,
     bytes_read: u64,
     emitted: bool,
-    make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
+    make_event: fn(u64, u64) -> delta_kernel::metrics::MetricEvent,
 }
 
 impl ReadMetricsIterator {
-    pub(super) fn new(
-        inner: crate::FileDataReadResultIterator,
-        reporter: Arc<dyn crate::metrics::MetricsReporter>,
+    pub(crate) fn new(
+        inner: delta_kernel::FileDataReadResultIterator,
+        reporter: Arc<dyn delta_kernel::metrics::MetricsReporter>,
         num_files: u64,
         bytes_read: u64,
-        make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
+        make_event: fn(u64, u64) -> delta_kernel::metrics::MetricEvent,
     ) -> Self {
         Self {
             inner,
@@ -124,7 +127,7 @@ impl ReadMetricsIterator {
 }
 
 impl Iterator for ReadMetricsIterator {
-    type Item = crate::DeltaResult<Box<dyn crate::EngineData>>;
+    type Item = DeltaResult<Box<dyn EngineData>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let item = self.inner.next();
@@ -276,8 +279,8 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// [`Transaction::unpartitioned_write_context`], which handle partition value validation,
     /// serialization, and logical-to-physical key translation.
     ///
-    /// [`Transaction::partitioned_write_context`]: crate::transaction::Transaction::partitioned_write_context
-    /// [`Transaction::unpartitioned_write_context`]: crate::transaction::Transaction::unpartitioned_write_context
+    /// [`Transaction::partitioned_write_context`]: delta_kernel::transaction::Transaction::partitioned_write_context
+    /// [`Transaction::unpartitioned_write_context`]: delta_kernel::transaction::Transaction::unpartitioned_write_context
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,
@@ -313,7 +316,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 /// should call this to produce the Add action metadata for [`Transaction::add_files`].
 ///
 /// [`DataFileMetadata`]: parquet::DataFileMetadata
-/// [`Transaction::add_files`]: crate::transaction::Transaction::add_files
+/// [`Transaction::add_files`]: delta_kernel::transaction::Transaction::add_files
 pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
     write_context: &WriteContext,
@@ -375,9 +378,9 @@ impl UrlExt for Url {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::tests::test_arrow_engine;
-    use crate::metrics::MetricEvent;
-    use crate::object_store::local::LocalFileSystem;
+
+    use delta_kernel::metrics::MetricEvent;
+    use delta_kernel::object_store::local::LocalFileSystem;
 
     #[derive(Debug)]
     struct TestMetricsReporter;
@@ -387,76 +390,13 @@ mod tests {
     }
 
     #[test]
-    fn test_default_engine() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngineBuilder::new(object_store).build();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_default_engine_builder_new_and_build() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngineBuilder::new(object_store).build();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
     fn test_default_engine_builder_with_metrics_reporter() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
         let reporter = Arc::new(TestMetricsReporter);
         let engine = DefaultEngineBuilder::new(object_store)
             .with_metrics_reporter(reporter)
             .build();
         assert!(engine.get_metrics_reporter().is_some());
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_default_engine_builder_with_custom_executor() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let executor = Arc::new(executor::tokio::TokioMultiThreadExecutor::new(
-            rt.handle().clone(),
-        ));
-        let engine = DefaultEngineBuilder::new(object_store)
-            .with_task_executor(executor)
-            .build();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_default_engine_builder_method() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::builder(object_store).build();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_default_engine_builder_all_options() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let reporter = Arc::new(TestMetricsReporter);
-        let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
-        let engine = DefaultEngineBuilder::new(object_store)
-            .with_metrics_reporter(reporter)
-            .with_task_executor(executor)
-            .build();
-        assert!(engine.get_metrics_reporter().is_some());
-        test_arrow_engine(&engine, &url);
     }
 
     #[test]

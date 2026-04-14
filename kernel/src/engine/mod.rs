@@ -6,12 +6,15 @@
 use crate::parquet::arrow::arrow_reader::ArrowReaderOptions;
 #[cfg(feature = "arrow-expression")]
 use crate::parquet::arrow::arrow_writer::ArrowWriterOptions;
+#[cfg(feature = "arrow-expression")]
+use delta_kernel_derive::internal_api;
 
 /// Returns the standard [`ArrowReaderOptions`] for all default engine parquet reads.
 ///
 /// Skipping the embedded Arrow IPC schema avoids dependence on Arrow-specific metadata and
 /// ensures that type resolution is driven by the kernel schema rather than the file's schema.
 #[cfg(feature = "arrow-expression")]
+#[internal_api]
 pub(crate) fn reader_options() -> ArrowReaderOptions {
     ArrowReaderOptions::new().with_skip_arrow_metadata(true)
 }
@@ -21,6 +24,7 @@ pub(crate) fn reader_options() -> ArrowReaderOptions {
 /// Omitting the Arrow IPC schema from the file metadata keeps Delta files interoperable with
 /// non-Arrow readers and avoids encoding Arrow-specific type information.
 #[cfg(feature = "arrow-expression")]
+#[internal_api]
 pub(crate) fn writer_options() -> ArrowWriterOptions {
     ArrowWriterOptions::new().with_skip_arrow_metadata(true)
 }
@@ -36,9 +40,6 @@ pub mod arrow_utils;
 pub(crate) mod arrow_utils;
 #[cfg(feature = "internal-api")]
 pub use self::arrow_utils::{parse_json, to_json_bytes};
-
-#[cfg(feature = "default-engine-base")]
-pub mod default;
 
 #[cfg(test)]
 pub(crate) mod sync;

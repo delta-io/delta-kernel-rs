@@ -117,19 +117,19 @@ arrow-expression = ["need-arrow"]
 # Schema diffing functionality (experimental)
 schema-diff = []
 
-# this is an 'internal' feature flag which has all the shared bits from default-engine and
-# default-engine-rustls
+# Enables shared Arrow-based engine support modules (arrow_data, arrow_expression,
+# ensure_data_types, parquet_row_group_skipping). Used by the delta_kernel_default_engine
+# crate and the SyncEngine.
 default-engine-base = [
   "arrow-conversion",
   "arrow-expression",
-  "futures",
   "need-arrow",
-  "tokio",
+  "reqwest",
 ]
-# default-engine-native-tls enables reqwest with the native-tls backend. If you want to use
-# rustls instead, use 'default-engine-rustls' which has no native-tls dependency.
-default-engine-native-tls = ["default-engine-base", "reqwest/native-tls"]
-default-engine-rustls = ["default-engine-base", "reqwest/rustls"]
+# default-engine-native-tls and default-engine-rustls pull in the default engine crate
+# with the chosen TLS backend. These are convenience features for downstream consumers.
+default-engine-native-tls = ["default-engine-base"]
+default-engine-rustls = ["default-engine-base"]
 
 [build-dependencies]
 rustc_version = "0.4.1"
@@ -139,6 +139,8 @@ delta_kernel = { path = ".", features = ["test-utils"] }
 # NOTE: test_utils forcibly pulls the default engine and arrow-57. By default it ALSO pulls
 # arrow-58, which takes precedence and would make it impossible to test against arrow-57.
 test_utils = { path = "../test-utils", default-features = false }
+futures = "0.3"
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros"] }
 criterion = "0.5"
 # Used for testing parse_url_opts extensibility
 hdfs-native-object-store = { version = "0.16.0" }

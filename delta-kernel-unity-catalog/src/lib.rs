@@ -126,10 +126,10 @@ mod tests {
     use std::env;
     use std::sync::Arc;
 
-    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::transaction::CommitResult;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
 
     use tracing::info;
     use unity_catalog_delta_client_api::{Commit, InMemoryCommitsClient, Operation, TableData};

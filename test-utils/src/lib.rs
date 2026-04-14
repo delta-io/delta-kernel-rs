@@ -4,6 +4,8 @@ pub mod counting_reporter;
 pub mod table_builder;
 pub use counting_reporter::{CountingReporter, RelaxedCounter};
 
+pub use delta_kernel_default_engine;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -19,12 +21,6 @@ use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
-use delta_kernel::engine::default::executor::tokio::{
-    TokioBackgroundExecutor, TokioMultiThreadExecutor,
-};
-use delta_kernel::engine::default::executor::TaskExecutor;
-use delta_kernel::engine::default::storage::store_from_url;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::memory::InMemory;
@@ -36,6 +32,12 @@ use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot};
+use delta_kernel_default_engine::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
+use delta_kernel_default_engine::executor::TaskExecutor;
+use delta_kernel_default_engine::storage::store_from_url;
+use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 
 use itertools::Itertools;
 use serde_json::{json, to_vec, Deserializer};
@@ -1003,7 +1005,7 @@ pub fn create_add_files_metadata(
 /// snapshot.
 pub async fn write_batch_to_table(
     snapshot: &Arc<Snapshot>,
-    engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
+    engine: &DefaultEngine<impl delta_kernel_default_engine::executor::TaskExecutor>,
     data: RecordBatch,
     partition_values: HashMap<String, Scalar>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {

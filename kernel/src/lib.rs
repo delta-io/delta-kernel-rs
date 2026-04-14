@@ -126,6 +126,9 @@ pub mod column_trie;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod column_trie;
 pub mod kernel_predicates;
+#[cfg(feature = "internal-api")]
+pub mod utils;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod utils;
 
 #[cfg(feature = "internal-api")]
@@ -936,6 +939,7 @@ pub trait Engine: AsAny {
     not(any(
         feature = "default-engine-native-tls",
         feature = "default-engine-rustls",
+        feature = "internal-api",
     ))
 ))]
 compile_error!(

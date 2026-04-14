@@ -6,23 +6,21 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use delta_kernel_derive::internal_api;
-
-use crate::arrow::array::{
+use delta_kernel::arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array,
     LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
 };
-use crate::arrow::compute::kernels::aggregate::{max, max_string, min, min_string};
-use crate::arrow::datatypes::{
+use delta_kernel::arrow::compute::kernels::aggregate::{max, max_string, min, min_string};
+use delta_kernel::arrow::datatypes::{
     ArrowPrimitiveType, DataType, Date32Type, Date64Type, Decimal128Type, Field, Float32Type,
     Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, TimeUnit, TimestampMicrosecondType,
     TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type,
     UInt64Type, UInt8Type,
 };
-use crate::column_trie::ColumnTrie;
-use crate::engine::arrow_utils::fix_nested_null_masks;
-use crate::expressions::ColumnName;
-use crate::{DeltaResult, Error};
+use delta_kernel::column_trie::ColumnTrie;
+use delta_kernel::engine::arrow_utils::fix_nested_null_masks;
+use delta_kernel::expressions::ColumnName;
+use delta_kernel::{DeltaResult, Error};
 
 /// Maximum prefix length for string statistics (Delta protocol requirement).
 const STRING_PREFIX_LENGTH: usize = 32;
@@ -46,7 +44,7 @@ const UTF8_MAX_CHAR: char = '\u{10FFFF}';
 /// be <= the original, which is correct for min statistics.
 ///
 /// Returns the original string if it's already within the limit.
-fn truncate_min_string(s: &str) -> &str {
+pub(crate) fn truncate_min_string(s: &str) -> &str {
     if s.len() <= STRING_PREFIX_LENGTH {
         return s;
     }
@@ -80,7 +78,7 @@ fn truncate_min_string(s: &str) -> &str {
 ///
 /// Returns `Cow::Borrowed` if no truncation needed (avoiding allocation), `Cow::Owned` when
 /// truncation is performed, or `None` if the string is too long to truncate safely.
-fn truncate_max_string(s: &str) -> Option<Cow<'_, str>> {
+pub(crate) fn truncate_max_string(s: &str) -> Option<Cow<'_, str>> {
     if s.len() <= STRING_PREFIX_LENGTH {
         return Some(Cow::Borrowed(s));
     }
@@ -163,7 +161,7 @@ fn agg_timestamp<T>(
     agg: Agg,
 ) -> DeltaResult<Option<ArrayRef>>
 where
-    T: crate::arrow::datatypes::ArrowTimestampType,
+    T: delta_kernel::arrow::datatypes::ArrowTimestampType,
     PrimitiveArray<T>: From<Vec<Option<i64>>>,
 {
     let array = column.as_primitive_opt::<T>().ok_or_else(|| {
@@ -492,7 +490,6 @@ impl StatsAccumulator {
 /// * `batch` - The RecordBatch to collect statistics from
 /// * `stats_columns` - Column names that should have statistics collected (allowlist).
 ///   Only these columns will appear in nullCount/minValues/maxValues.
-#[internal_api]
 pub(crate) fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
@@ -542,18 +539,21 @@ pub(crate) fn collect_stats(
     StructArray::try_new(fields.into(), arrays, None)
         .map_err(|e| Error::generic(format!("Failed to create stats struct: {e}")))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{Array, AsArray, Int32Array, Int64Array, StringArray};
-    use crate::arrow::buffer::NullBuffer;
-    use crate::arrow::compute::concat_batches;
-    use crate::arrow::datatypes::{Fields, Schema};
-    use crate::arrow::datatypes::{Int32Type, Int64Type};
-    use crate::engine::arrow_expression::evaluate_expression::to_json;
-    use crate::expressions::column_name;
-    use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use delta_kernel::arrow::array::{
+        Array, ArrayRef, AsArray, Int32Array, Int64Array, LargeStringArray, StringArray,
+        StringViewArray,
+    };
+    use delta_kernel::arrow::buffer::NullBuffer;
+    use delta_kernel::arrow::compute::concat_batches;
+    use delta_kernel::arrow::datatypes::{Fields, Schema};
+    use delta_kernel::arrow::datatypes::{Int32Type, Int64Type};
+    use rstest::rstest;
+    use delta_kernel::engine::arrow_expression::evaluate_expression::to_json;
+    use delta_kernel::expressions::column_name;
+    use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     #[test]
     fn test_collect_stats_single_batch() {
@@ -1123,8 +1123,8 @@ mod tests {
 
     #[test]
     fn test_collect_stats_complex_types_null_count_only() {
-        use crate::arrow::array::ListArray;
-        use crate::arrow::buffer::OffsetBuffer;
+        use delta_kernel::arrow::array::ListArray;
+        use delta_kernel::arrow::buffer::OffsetBuffer;
 
         // Schema with list column - should have nullCount but no min/max
         let schema = Arc::new(Schema::new(vec![
@@ -1289,7 +1289,7 @@ mod tests {
         field_name: &str,
     ) -> T::Native
     where
-        T: crate::arrow::datatypes::ArrowPrimitiveType,
+        T: delta_kernel::arrow::datatypes::ArrowPrimitiveType,
     {
         stats
             .column_by_name(stat_name)
@@ -1448,6 +1448,134 @@ mod tests {
         assert!(result.is_err(), "should panic on string mismatch");
     }
 
+    /// Verifies that stats collected from non-standard Arrow string representations
+    /// (LargeUtf8/LargeStringArray, Utf8View/StringViewArray) can be validated by
+    /// StatsVerifier, which expects Delta's logical STRING type. Engines may use any of
+    /// these representations, and the stats pipeline must handle them without type errors.
+    #[rstest]
+    #[case::large_utf8(Arc::new(LargeStringArray::from(vec!["Austin", "Boston", "Chicago"])) as ArrayRef)]
+    #[case::utf8_view(Arc::new(StringViewArray::from(vec!["Austin", "Boston", "Chicago"])) as ArrayRef)]
+    fn test_verify_string_stats(#[case] values: ArrayRef) {
+        use delta_kernel::engine::arrow_data::ArrowEngineData;
+        use delta_kernel::transaction::stats_verifier::StatsVerifier;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "city",
+            values.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("city")]).unwrap();
+
+        let path_array = StringArray::from(vec!["file1.parquet"]);
+        let add_file_schema = Arc::new(Schema::new(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new("stats", stats.data_type().clone(), true),
+        ]));
+        let add_file_batch = RecordBatch::try_new(
+            add_file_schema,
+            vec![
+                Arc::new(path_array) as ArrayRef,
+                Arc::new(stats) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let engine_data: Box<dyn delta_kernel::EngineData> =
+            Box::new(ArrowEngineData::new(add_file_batch));
+
+        let verifier = StatsVerifier::new(vec![(
+            delta_kernel::expressions::ColumnName::new(["city"]),
+            delta_kernel::schema::DataType::STRING,
+        )]);
+        verifier.verify(&[engine_data]).unwrap();
+    }
+
+    /// Round-trip test: collect_stats produces stats that pass verification for all null
+    /// patterns. The all-null and empty cases are regression tests -- collect_stats must keep
+    /// the field present (with null value) so the verifier's all_null check can run.
+    #[rstest]
+    #[case::non_null(vec![Some(1i64), Some(2), Some(3)])]
+    #[case::all_null(vec![None, None, None])]
+    #[case::empty(vec![])]
+    fn test_collected_stats_pass_verification(#[case] values: Vec<Option<i64>>) {
+        use delta_kernel::engine::arrow_data::ArrowEngineData;
+        use delta_kernel::transaction::stats_verifier::StatsVerifier;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int64, true)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef])
+                .unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("col")]).unwrap();
+
+        let path_array = StringArray::from(vec!["file1.parquet"]);
+        let add_file_schema = Arc::new(Schema::new(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new("stats", stats.data_type().clone(), true),
+        ]));
+        let add_file_batch = RecordBatch::try_new(
+            add_file_schema,
+            vec![
+                Arc::new(path_array) as ArrayRef,
+                Arc::new(stats) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let engine_data: Box<dyn delta_kernel::EngineData> =
+            Box::new(ArrowEngineData::new(add_file_batch));
+
+        let verifier = StatsVerifier::new(vec![(
+            delta_kernel::expressions::ColumnName::new(["col"]),
+            delta_kernel::schema::DataType::LONG,
+        )]);
+        verifier.verify(&[engine_data]).unwrap();
+    }
+
+    /// Verify collect_stats produces correct stats shape for all-null and empty batches.
+    /// These cases keep the column in minValues/maxValues with null values (so that
+    /// StatsVerifier can find the field via visit_rows and check nullCount == numRecords).
+    #[rstest]
+    #[case::all_null_values(Arc::new(Int64Array::from(vec![None::<i64>, None, None])) as ArrayRef)]
+    #[case::empty_batch(Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef)]
+    fn test_collected_stats_shape_for_all_null_and_empty(#[case] values: ArrayRef) {
+        let num_rows = values.len();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col",
+            values.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("col")]).unwrap();
+
+        let num_records = stats
+            .column_by_name("numRecords")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(num_records.value(0), num_rows as i64);
+
+        let min_values = stats
+            .column_by_name("minValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(min_values.column_by_name("col").unwrap().is_null(0));
+
+        let max_values = stats
+            .column_by_name("maxValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(max_values.column_by_name("col").unwrap().is_null(0));
+    }
+
     /// Validates that kernel's `collect_stats()` produces file statistics matching Spark's output.
     ///
     /// Uses test data generated by PySpark containing all supported stat types: integers, floats,
@@ -1460,7 +1588,7 @@ mod tests {
         // Load a PySpark-generated Delta table containing all supported stat types
         // and extract Spark's reference stats from the commit log.
         let test_path =
-            std::fs::canonicalize("./tests/data/stats-writing-all-types/delta").unwrap();
+            std::fs::canonicalize("../kernel/tests/data/stats-writing-all-types/delta").unwrap();
 
         let commit_path = test_path
             .join("_delta_log")

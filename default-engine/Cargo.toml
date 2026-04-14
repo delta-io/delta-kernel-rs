@@ -1,0 +1,46 @@
+[package]
+name = "delta_kernel_default_engine"
+description = "Default Arrow/Tokio-based engine implementation for delta_kernel."
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+# for cargo-release
+[package.metadata.release]
+release = false
+
+[dependencies]
+delta_kernel = { path = "../kernel", features = [
+  "default-engine-base",
+  "internal-api",
+] }
+bytes = "1.10"
+futures = "0.3"
+itertools = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "system-proxy"] }
+tokio = { version = "1.47", features = ["rt-multi-thread"] }
+tracing = { version = "0.1", features = ["log"] }
+url = "2"
+uuid = { version = "1.18.0", features = ["v4"] }
+
+[features]
+default = ["arrow"]
+arrow = ["arrow-58"]
+arrow-58 = ["delta_kernel/arrow-58"]
+arrow-57 = ["delta_kernel/arrow-57"]
+native-tls = ["reqwest/native-tls"]
+rustls = ["reqwest/rustls"]
+
+[dev-dependencies]
+async-trait = "0.1"
+rstest = "0.23"
+serde_json = "1"
+tempfile = "3"
+test_utils = { path = "../test-utils", default-features = false }
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+hdfs-native-object-store = { version = "0.16.0" }

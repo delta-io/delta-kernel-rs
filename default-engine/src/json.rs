@@ -4,25 +4,27 @@ use std::io::BufReader;
 use std::sync::Arc;
 use std::task::Poll;
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use crate::arrow::json::ReaderBuilder;
-use crate::arrow::record_batch::RecordBatch;
-use crate::object_store::path::Path;
-use crate::object_store::{self, DynObjectStore, GetResultPayload, ObjectStoreExt as _, PutMode};
 use bytes::{Buf, Bytes};
+use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use delta_kernel::arrow::json::ReaderBuilder;
+use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{
+    self, DynObjectStore, GetResultPayload, ObjectStoreExt as _, PutMode,
+};
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
 use url::Url;
 
-use super::executor::TaskExecutor;
-use crate::engine::arrow_utils::{
+use crate::executor::TaskExecutor;
+use delta_kernel::engine::arrow_utils::{
     build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
     to_json_bytes,
 };
-use crate::engine_data::FilteredEngineData;
-use crate::metrics::{MetricEvent, MetricsReporter};
-use crate::schema::SchemaRef;
-use crate::{
+use delta_kernel::engine_data::FilteredEngineData;
+use delta_kernel::metrics::{MetricEvent, MetricsReporter};
+use delta_kernel::schema::SchemaRef;
+use delta_kernel::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
 
@@ -48,8 +50,8 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         Self {
             store,
             task_executor,
-            buffer_size: super::DEFAULT_BUFFER_SIZE,
-            batch_size: super::DEFAULT_BATCH_SIZE,
+            buffer_size: crate::DEFAULT_BUFFER_SIZE,
+            batch_size: crate::DEFAULT_BATCH_SIZE,
             reporter: None,
         }
     }
@@ -82,7 +84,7 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     /// See [Decoder::with_buffer_size] for details on constraining memory usage with buffer size
     /// and batch size.
     ///
-    /// [Decoder::with_buffer_size]: crate::arrow::json::reader::Decoder
+    /// [Decoder::with_buffer_size]: delta_kernel::arrow::json::reader::Decoder
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
@@ -179,11 +181,11 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             self.batch_size,
             self.buffer_size,
         );
-        let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        let inner = crate::stream_future_to_iter(self.task_executor.clone(), future)?;
         if let Some(reporter) = &self.reporter {
             let num_files = files.len() as u64;
             let bytes_read = files.iter().map(|f| f.size).sum();
-            Ok(Box::new(super::ReadMetricsIterator::new(
+            Ok(Box::new(crate::ReadMetricsIterator::new(
                 inner,
                 reporter.clone(),
                 num_files,
@@ -291,28 +293,36 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::task::Waker;
 
-    use crate::actions::get_commit_schema;
-    use crate::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
-    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-    use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
-    use crate::engine::default::executor::tokio::{
-        TokioBackgroundExecutor, TokioMultiThreadExecutor,
-    };
-    use crate::object_store::local::LocalFileSystem;
-    use crate::object_store::memory::InMemory;
-    use crate::object_store::PutMultipartOptions;
+    use crate::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
+    use delta_kernel::actions::get_commit_schema;
+    use delta_kernel::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
+    use delta_kernel::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
+    use delta_kernel::object_store::local::LocalFileSystem;
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::PutMultipartOptions;
     #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
-    use crate::object_store::{CopyOptions, ObjectStore};
-    use crate::object_store::{
+    use delta_kernel::object_store::{CopyOptions, ObjectStore};
+    use delta_kernel::object_store::{
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutOptions, PutPayload,
         PutResult, Result,
     };
-    use crate::schema::{DataType as DeltaDataType, Schema, StructField};
-    use crate::utils::test_utils::string_array_to_engine_data;
+    use delta_kernel::schema::{DataType as DeltaDataType, Schema, StructField};
     use futures::future;
     use itertools::Itertools;
     use serde_json::json;
     use tracing::info;
+
+    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn delta_kernel::EngineData> {
+        use delta_kernel::arrow::array::RecordBatch;
+        use delta_kernel::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use delta_kernel::engine::arrow_data::ArrowEngineData;
+        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
+        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
+            .expect("Can't convert to record batch");
+        Box::new(ArrowEngineData::new(batch))
+    }
 
     // TODO: should just use the one from test_utils, but running into dependency issues
     fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
@@ -326,10 +336,10 @@ mod tests {
     // A wrapper trait that allows us to work with the ObjectStore trait, without directly importing
     // it and the ambiguous method errors it would bring.
     #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-    trait ObjectStore: crate::object_store::ObjectStore {}
+    trait ObjectStore: delta_kernel::object_store::ObjectStore {}
 
     #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-    impl<T: crate::object_store::ObjectStore + ?Sized> ObjectStore for T {}
+    impl<T: delta_kernel::object_store::ObjectStore + ?Sized> ObjectStore for T {}
 
     /// Store wrapper that wraps an inner store to guarantee the ordering of GET requests. Note
     /// that since the keys are resolved in order, requests to subsequent keys in the order will
@@ -386,7 +396,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl<T: ObjectStore> crate::object_store::ObjectStore for OrderedGetStore<T> {
+    impl<T: ObjectStore> delta_kernel::object_store::ObjectStore for OrderedGetStore<T> {
         async fn put_opts(
             &self,
             location: &Path,
@@ -619,7 +629,7 @@ mod tests {
         let store = Arc::new(LocalFileSystem::new());
 
         let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/data/table-with-dv-small/_delta_log/00000000000000000000.json",
+            "../kernel/tests/data/table-with-dv-small/_delta_log/00000000000000000000.json",
         ))
         .unwrap();
         let url = Url::from_file_path(path).unwrap();
@@ -715,9 +725,9 @@ mod tests {
         );
     }
 
-    use crate::engine::default::DefaultEngineBuilder;
-    use crate::schema::StructType;
-    use crate::Engine;
+    use crate::DefaultEngineBuilder;
+    use delta_kernel::schema::StructType;
+    use delta_kernel::Engine;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -736,7 +746,7 @@ mod tests {
         let _ = tracing_subscriber::fmt().try_init();
         let (_temp_file1, file_url1) = make_invalid_named_temp();
         let (_temp_file2, file_url2) = make_invalid_named_temp();
-        let field = StructField::nullable("name", crate::schema::DataType::BOOLEAN);
+        let field = StructField::nullable("name", delta_kernel::schema::DataType::BOOLEAN);
         let schema = Arc::new(StructType::try_new(vec![field]).unwrap());
         let default_engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build();
 

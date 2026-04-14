@@ -4,17 +4,17 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use delta_kernel_derive::internal_api;
+
 use futures::stream::{self, BoxStream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
 
-use super::UrlExt;
-use crate::engine::default::executor::TaskExecutor;
-use crate::metrics::{MetricEvent, MetricsReporter};
-use crate::object_store::path::Path;
-use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use crate::executor::TaskExecutor;
+use crate::UrlExt;
+use delta_kernel::metrics::{MetricEvent, MetricsReporter};
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
+use delta_kernel::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 /// Iterator wrapper that emits metrics when exhausted
 ///
@@ -120,7 +120,6 @@ pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
 }
 
 impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
-    #[internal_api]
     pub(crate) fn new(
         store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
@@ -322,7 +321,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
         let future = list_from_impl(self.inner.clone(), path.clone(), self.reporter.clone());
-        let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        let iter = crate::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
 
@@ -342,7 +341,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             self.readahead,
             self.reporter.clone(),
         );
-        let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        let iter = crate::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
 
@@ -393,7 +392,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 ///   page](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) does say: "This page
 ///   shows you how to list the [objects](https://cloud.google.com/storage/docs/objects) stored
 ///   in your Cloud Storage buckets, which are ordered in the list lexicographically by name."
-fn supports_ordered_listing(url: &Url) -> bool {
+pub(crate) fn supports_ordered_listing(url: &Url) -> bool {
     !((url.scheme() == "file")
         // S3 Directory Buckets
         || url.domain().map(|d| d.contains("--x-s3")).unwrap_or(false)
@@ -410,12 +409,12 @@ mod tests {
 
     use test_utils::delta_path_for_version;
 
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::DefaultEngineBuilder;
-    use crate::object_store::local::LocalFileSystem;
-    use crate::object_store::memory::InMemory;
-    use crate::utils::current_time_duration;
-    use crate::Engine as _;
+    use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::DefaultEngineBuilder;
+    use delta_kernel::object_store::local::LocalFileSystem;
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::utils::current_time_duration;
+    use delta_kernel::Engine as _;
 
     use super::*;
 

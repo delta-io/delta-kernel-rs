@@ -11,12 +11,12 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::object_store::{path::Path, DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Error, Snapshot};
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
 
 use test_utils::{create_table, engine_store_setup, read_scan, test_read};
 
