@@ -20,7 +20,8 @@ use test_utils::{create_table_and_load_snapshot, test_table_setup};
 
 use super::simple_schema;
 
-/// Helper to strip column mapping metadata (IDs and physical names) from all StructFields recursively.
+/// Helper to strip column mapping metadata (IDs and physical names) from all StructFields
+/// recursively.
 pub(super) fn strip_column_mapping_metadata(schema: &StructType) -> StructType {
     let cm_id = ColumnMetadataKey::ColumnMappingId.as_ref();
     let cm_name = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();

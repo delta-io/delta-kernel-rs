@@ -1,4 +1,6 @@
 //! EngineData related ffi code
+use std::ffi::c_void;
+
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::arrow;
 #[cfg(feature = "default-engine-base")]
@@ -11,15 +13,13 @@ use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _}
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::DeltaResult;
 use delta_kernel::EngineData;
-use std::ffi::c_void;
 
+use super::handle::Handle;
 #[cfg(feature = "default-engine-base")]
 use crate::error::AllocateErrorFn;
 use crate::ExclusiveEngineData;
 #[cfg(feature = "default-engine-base")]
 use crate::{ExternResult, IntoExternResult, SharedExternEngine};
-
-use super::handle::Handle;
 
 /// Get the number of rows in an engine data
 ///
@@ -31,13 +31,13 @@ pub unsafe extern "C" fn engine_data_length(data: &mut Handle<ExclusiveEngineDat
     data.len()
 }
 
-/// Allow an engine to "unwrap" an [`ExclusiveEngineData`] into the raw pointer for the case it wants
-/// to use its own engine data format
+/// Allow an engine to "unwrap" an [`ExclusiveEngineData`] into the raw pointer for the case it
+/// wants to use its own engine data format
 ///
 /// # Safety
 ///
-/// `data_handle` must be a valid pointer to a kernel allocated `ExclusiveEngineData`. The Engine must
-/// ensure the handle outlives the returned pointer.
+/// `data_handle` must be a valid pointer to a kernel allocated `ExclusiveEngineData`. The Engine
+/// must ensure the handle outlives the returned pointer.
 // TODO(frj): What is the engine actually doing with this method?? If we need access to raw extern
 // pointers, we will need to define an `ExternEngineData` trait that exposes such capability, along
 // with an ExternEngineDataVtable that implements it. See `ExternEngine` and `ExternEngineVtable`

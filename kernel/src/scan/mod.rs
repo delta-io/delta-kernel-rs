@@ -10,12 +10,8 @@ use itertools::Itertools;
 use tracing::{debug, info};
 use url::Url;
 
-use crate::metrics::MetricId;
-use crate::scan::metrics::ScanMetrics;
-use crate::utils::IteratorExt;
-
 use self::data_skipping::as_checkpoint_skipping_predicate;
-use self::log_replay::get_scan_metadata_transform_expr;
+use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
@@ -28,12 +24,13 @@ use crate::kernel_predicates::{
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::ScanType;
+use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
-use crate::scan::log_replay::ScanLogReplayProcessor;
 use crate::scan::log_replay::{
-    BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
+    ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
+    DEFAULT_ROW_COMMIT_VERSION_NAME,
 };
+use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
@@ -41,9 +38,8 @@ use crate::schema::{
 };
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{ExpressionTransform, SchemaTransform};
+use crate::utils::IteratorExt;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
-
-use self::log_replay::scan_action_iter;
 
 pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
@@ -172,9 +168,9 @@ impl ScanBuilder {
     /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
     /// have been filtered out but were kept).
     ///
-    /// This method can be combined with [`include_all_stats_columns`]. When both are used, the kernel
-    /// performs data skipping internally using the predicate AND outputs parsed statistics to the
-    /// engine via the `stats_parsed` column in scan metadata.
+    /// This method can be combined with [`include_all_stats_columns`]. When both are used, the
+    /// kernel performs data skipping internally using the predicate AND outputs parsed
+    /// statistics to the engine via the `stats_parsed` column in scan metadata.
     ///
     /// [`include_all_stats_columns`]: ScanBuilder::include_all_stats_columns
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
@@ -220,8 +216,8 @@ impl ScanBuilder {
     /// When enabled:
     /// - Parquet checkpoint reads use column projection to skip the stats column
     /// - The `stats` field in scan results will be `None`
-    /// - Columnar data skipping is disabled (no stats-based or partition-value-based pruning),
-    ///   but row-level partition filtering still applies
+    /// - Columnar data skipping is disabled (no stats-based or partition-value-based pruning), but
+    ///   row-level partition filtering still applies
     ///
     /// If called after [`include_all_stats_columns`] or [`with_stats_columns`], the last call wins.
     ///
@@ -274,10 +270,10 @@ pub(crate) enum PhysicalPredicate {
 }
 
 impl PhysicalPredicate {
-    /// If we have a predicate, verify the columns it references and apply column mapping. First, get
-    /// the set of references; use that to filter the schema to only the columns of interest (and
-    /// verify that all referenced columns exist); then use the resulting logical/physical mappings
-    /// to rewrite the expression with physical column names.
+    /// If we have a predicate, verify the columns it references and apply column mapping. First,
+    /// get the set of references; use that to filter the schema to only the columns of interest
+    /// (and verify that all referenced columns exist); then use the resulting logical/physical
+    /// mappings to rewrite the expression with physical column names.
     ///
     /// NOTE: It is possible the predicate resolves to FALSE even ignoring column references,
     /// e.g. `col > 10 AND FALSE`. Such predicates can statically skip the whole query.
@@ -467,11 +463,12 @@ pub fn get_transform_for_row(
     transforms.get(row).cloned().flatten()
 }
 
-/// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
-/// and (2) a vector of transforms (one transform per scan file) that must be applied to the data read
-/// from those files.
+/// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be
+/// scanned and (2) a vector of transforms (one transform per scan file) that must be applied to the
+/// data read from those files.
 pub struct ScanMetadata {
-    /// Filtered engine data with one row per file to scan (and only selected rows should be scanned)
+    /// Filtered engine data with one row per file to scan (and only selected rows should be
+    /// scanned)
     pub scan_files: FilteredEngineData,
 
     /// Row-level transformations to apply to data read from files.
@@ -533,8 +530,8 @@ impl Scan {
     }
 
     /// The table's root URL. Any relative paths returned from `scan_data` (or in a callback from
-    /// [`ScanMetadata::visit_scan_files`]) must be resolved against this root to get the actual path to
-    /// the file.
+    /// [`ScanMetadata::visit_scan_files`]) must be resolved against this root to get the actual
+    /// path to the file.
     ///
     /// [`ScanMetadata::visit_scan_files`]: crate::scan::ScanMetadata::visit_scan_files
     // NOTE: this is obviously included in the snapshot, just re-exposed here for convenience.
@@ -587,16 +584,16 @@ impl Scan {
     /// - `Box<dyn EngineData>`: Data in engine format, where each row represents a file to be
     ///   scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
     /// - `Vec<bool>`: A selection vector. If a row is at index `i` and this vector is `false` at
-    ///   index `i`, then that row should *not* be processed (i.e. it is filtered out). If the vector
-    ///   is `true` at index `i` the row *should* be processed. If the selection vector is *shorter*
-    ///   than the number of rows returned, missing elements are considered `true`, i.e. included in
-    ///   the query. NB: If you are using the default engine and plan to call arrow's
+    ///   index `i`, then that row should *not* be processed (i.e. it is filtered out). If the
+    ///   vector is `true` at index `i` the row *should* be processed. If the selection vector is
+    ///   *shorter* than the number of rows returned, missing elements are considered `true`, i.e.
+    ///   included in the query. NB: If you are using the default engine and plan to call arrow's
     ///   `filter_record_batch`, you _need_ to extend this vector to the full length of the batch or
     ///   arrow will drop the extra rows.
     /// - `Vec<Option<Expression>>`: Transformation expressions that need to be applied. For each
-    ///   row at index `i` in the above data, if an expression exists at index `i` in the `Vec`,
-    ///   the associated expression _must_ be applied to the data read from the file specified by
-    ///   the row. The resultant schema for this expression is guaranteed to be
+    ///   row at index `i` in the above data, if an expression exists at index `i` in the `Vec`, the
+    ///   associated expression _must_ be applied to the data read from the file specified by the
+    ///   row. The resultant schema for this expression is guaranteed to be
     ///   [`Self::logical_schema()`]. If the item at index `i` in this `Vec` is `None`, or if the
     ///   `Vec` contains fewer than `i` elements, no expression need be applied and the data read
     ///   from disk is already in the correct logical state.
@@ -608,16 +605,17 @@ impl Scan {
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
 
-    /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
+    /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of
+    /// [`EngineData`]s.
     ///
     /// The existing iterator is assumed to contain data from a previous call to `scan_metadata`.
     /// Engines may decide to cache the results of `scan_metadata` to avoid additional IO operations
     /// required to replay the log.
     ///
-    /// As such the new scan's predicate must "contain" the previous scan's predicate. That is, the new
-    /// scan's predicate MUST skip all files the previous scan's predicate skipped. The new scan's
-    /// predicate is also allowed to skip files the previous predicate kept. For example, if the previous
-    /// scan predicate was
+    /// As such the new scan's predicate must "contain" the previous scan's predicate. That is, the
+    /// new scan's predicate MUST skip all files the previous scan's predicate skipped. The new
+    /// scan's predicate is also allowed to skip files the previous predicate kept. For example,
+    /// if the previous scan predicate was
     /// ```sql
     /// WHERE a < 42 AND b = 10
     /// ```

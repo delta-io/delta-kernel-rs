@@ -7,6 +7,7 @@ use std::iter::{DoubleEndedIterator, FusedIterator};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::internal_api;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -15,12 +16,10 @@ use tracing::warn;
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
-use crate::table_features::get_field_column_mapping_info;
-use crate::table_features::ColumnMappingMode;
+use crate::table_features::{get_field_column_mapping_info, ColumnMappingMode};
 use crate::transforms::SchemaTransform;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
-use delta_kernel_derive::internal_api;
 
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
@@ -213,7 +212,8 @@ pub struct StructField {
 impl StructField {
     /// The name of the default row index metadata column.
     ///
-    /// Note that the dot does not indicate a nested field, it is just a separator for the metadata column name.
+    /// Note that the dot does not indicate a nested field, it is just a separator for the metadata
+    /// column name.
     const DEFAULT_ROW_INDEX_COLUMN_NAME: &'static str = "_metadata.row_index";
 
     /////////////////
@@ -544,8 +544,8 @@ pub struct StructType {
     // for each field by name would be potentially quite expensive for large schemas.
     fields: IndexMap<String, StructField>,
     /// The metadata columns in this struct
-    // We use a dedicated map for metadata columns to allow for fast lookup without having to iterate
-    // over all fields.
+    // We use a dedicated map for metadata columns to allow for fast lookup without having to
+    // iterate over all fields.
     metadata_columns: HashMap<MetadataColumnSpec, usize>,
 }
 
@@ -615,7 +615,8 @@ impl StructType {
                 }
             }
 
-            // Delta column names are case-insensitive; reject schemas with duplicates that differ only by case.
+            // Delta column names are case-insensitive; reject schemas with duplicates that differ
+            // only by case.
             let key = field.name.to_lowercase();
             if !seen_lowercase_names.insert(key) {
                 return Err(Error::schema(format!(
@@ -750,8 +751,10 @@ impl StructType {
         self.walk_column_fields_by(col, |s, name| s.field(name))
     }
 
-    /// Helper to walk through nested columns. For each path component in `col`, calls                                                                                                                                                   
-    /// `find_field(current_struct, component)` to locate the matching field, then descends                                                                                                                                              
+    /// Helper to walk through nested columns. For each path component in `col`, calls
+    ///                                                                                             
+    /// `find_field(current_struct, component)` to locate the matching field, then descends
+    ///                                                                                             
     /// into the next nested struct. Returns references to all [`StructField`]s along the path.
     pub(crate) fn walk_column_fields_by<'a, F>(
         &'a self,
@@ -933,7 +936,8 @@ impl StructType {
                     Self::ensure_no_metadata_columns(&mut struct_type.fields())?;
                 }
             }
-            // Primitive types cannot contain nested metadata columns and variant types are validated at creation
+            // Primitive types cannot contain nested metadata columns and variant types are
+            // validated at creation
             DataType::Primitive(_) | DataType::Variant(_) => {}
         };
 
@@ -1409,7 +1413,8 @@ impl MapType {
         self.value_contains_null
     }
 
-    /// Create a schema assuming the map is stored as a struct with the specified key and value field names
+    /// Create a schema assuming the map is stored as a struct with the specified key and value
+    /// field names
     pub fn as_struct_schema(&self, key_name: String, val_name: String) -> Schema {
         StructType::new_unchecked([
             StructField::not_null(key_name, self.key_type.clone()),
@@ -1494,9 +1499,9 @@ impl PrimitiveType {
     /// Widening rules:
     /// - Integer widening: byte -> short -> int -> long (Delta protocol type widening)
     /// - Float widening: float -> double (Delta protocol type widening)
-    /// - Timestamp interchangeability: Timestamp <-> TimestampNtz (both are i64 microseconds
-    ///   since epoch, differing only in timezone semantics; this is a physical read
-    ///   accommodation, not a Delta protocol type widening rule)
+    /// - Timestamp interchangeability: Timestamp <-> TimestampNtz (both are i64 microseconds since
+    ///   epoch, differing only in timezone semantics; this is a physical read accommodation, not a
+    ///   Delta protocol type widening rule)
     #[internal_api]
     pub(crate) fn can_widen_to(&self, target: &Self) -> bool {
         use PrimitiveType::*;
@@ -2000,14 +2005,14 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+    use serde_json;
+
+    use super::*;
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_deep_nested_schema_missing_leaf_cm,
     };
-
-    use super::*;
-    use rstest::rstest;
-    use serde_json;
 
     fn example_schema_metadata() -> &'static str {
         r#"

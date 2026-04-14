@@ -1,24 +1,22 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::sync::Arc;
 
+use apply_schema::{apply_schema, apply_schema_to};
+use evaluate_expression::{evaluate_expression, evaluate_predicate, extract_column};
+use itertools::Itertools;
+use tracing::debug;
+
+use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
-
-use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
-
-use itertools::Itertools;
-use tracing::debug;
-
-use apply_schema::{apply_schema, apply_schema_to};
-use evaluate_expression::{evaluate_expression, evaluate_predicate, extract_column};
 
 mod apply_schema;
 pub mod evaluate_expression;

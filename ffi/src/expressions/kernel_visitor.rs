@@ -346,7 +346,8 @@ pub extern "C" fn visit_expression_literal_timestamp(
     wrap_expression(state, Expression::literal(Scalar::Timestamp(value)))
 }
 
-/// visit a timestamp_ntz literal expression 'value' (i64 representing microseconds since unix epoch)
+/// visit a timestamp_ntz literal expression 'value' (i64 representing microseconds since unix
+/// epoch)
 #[no_mangle]
 pub extern "C" fn visit_expression_literal_timestamp_ntz(
     state: &mut KernelExpressionVisitorState,

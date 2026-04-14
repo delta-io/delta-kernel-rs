@@ -4,12 +4,6 @@ mod write_context;
 
 use std::sync::Arc;
 
-use crate::error::{ExternResult, IntoExternResult};
-use crate::handle::Handle;
-use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
-use crate::{DeltaResult, ExternEngine, Snapshot, Url};
-use crate::{ExclusiveEngineData, SharedExternEngine};
-use crate::{KernelStringSlice, SharedSchema, SharedSnapshot};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::{
@@ -17,6 +11,14 @@ use delta_kernel::transaction::create_table::{
 };
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
+
+use crate::error::{ExternResult, IntoExternResult};
+use crate::handle::Handle;
+use crate::{
+    unwrap_and_parse_path_as_url, DeltaResult, ExclusiveEngineData, ExternEngine,
+    KernelStringSlice, SharedExternEngine, SharedSchema, SharedSnapshot, Snapshot,
+    TryFromStringSlice, Url,
+};
 
 /// A handle for an existing-table transaction (`Transaction<ExistingTable>`).
 ///
@@ -552,51 +554,44 @@ pub unsafe extern "C" fn remove_files(
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::schema::{DataType, StructField, StructType};
-    use delta_kernel::table_features::TableFeature;
+    use std::sync::Arc;
 
     use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
     use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
     use delta_kernel::arrow::ffi::to_ffi;
     use delta_kernel::arrow::json::reader::ReaderBuilder;
     use delta_kernel::arrow::record_batch::RecordBatch;
-
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
-
-    use delta_kernel_ffi::engine_data::get_engine_data;
-    use delta_kernel_ffi::engine_data::ArrowFFIData;
-
+    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::table_features::TableFeature;
+    use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
     use delta_kernel_ffi::error::KernelError;
     use delta_kernel_ffi::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
         ok_or_panic, recover_error, recover_string,
     };
     use delta_kernel_ffi::tests::get_default_engine;
-
-    use crate::{free_engine, free_schema, free_snapshot, kernel_string_slice};
-    use crate::{logical_schema, version};
+    use itertools::Itertools;
+    use serde_json::{json, Deserializer};
+    use test_utils::{set_json_value, setup_test_tables, test_read};
     use write_context::{
         free_write_context, get_unpartitioned_write_context, get_write_path, get_write_schema,
     };
 
-    use test_utils::{set_json_value, setup_test_tables, test_read};
-
-    use itertools::Itertools;
-    use serde_json::json;
-    use serde_json::Deserializer;
-
-    use std::sync::Arc;
+    use crate::{
+        free_engine, free_schema, free_snapshot, kernel_string_slice, logical_schema, version,
+    };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
-    use super::*;
-
     use tempfile::tempdir;
+
+    use super::*;
 
     fn check_txn_id_exists(commit_info: &serde_json::Value) {
         commit_info["txnId"]
@@ -1085,15 +1080,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg_attr(miri, ignore)]
     async fn test_transaction_with_uc_committer() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::delta_kernel_unity_catalog::{
-            free_uc_commit_client, get_uc_commit_client, get_uc_committer,
-            tests::{cast_test_context, get_test_context, recover_test_context},
-            CommitRequest,
-        };
-        use crate::{Handle, NullableCvoid, OptionalValue};
         use delta_kernel_ffi::{
             get_snapshot_builder, snapshot_builder_build, snapshot_builder_set_max_catalog_version,
         };
+
+        use crate::delta_kernel_unity_catalog::tests::{
+            cast_test_context, get_test_context, recover_test_context,
+        };
+        use crate::delta_kernel_unity_catalog::{
+            free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
+        };
+        use crate::{Handle, NullableCvoid, OptionalValue};
 
         #[no_mangle]
         extern "C" fn test_uc_commit(

@@ -231,8 +231,8 @@ struct DataLayoutResult {
 /// 1. Top-level columns (nested paths are not supported)
 /// 2. Present in the schema
 /// 3. Not duplicated
-/// 4. Of a primitive type (Struct, Array, Map are rejected because partition values
-///    must be representable as directory-path strings)
+/// 4. Of a primitive type (Struct, Array, Map are rejected because partition values must be
+///    representable as directory-path strings)
 /// 5. A strict subset of the schema columns (at least one non-partition column required)
 fn validate_partition_columns(
     schema: &StructType,
@@ -285,10 +285,10 @@ fn validate_partition_columns(
 /// Handles all [`DataLayout`] variants:
 ///
 /// - **None**: Returns defaults (no domain metadata, no clustering/partition columns).
-/// - **Clustered**: Validates clustering columns, resolves to physical names, adds
-///   `DomainMetadata` + `ClusteredTable` features, creates clustering domain metadata.
-/// - **Partitioned**: Validates partition columns and stores logical names. No domain
-///   metadata or special features are needed (partitioning is a core Delta feature).
+/// - **Clustered**: Validates clustering columns, resolves to physical names, adds `DomainMetadata`
+///   + `ClusteredTable` features, creates clustering domain metadata.
+/// - **Partitioned**: Validates partition columns and stores logical names. No domain metadata or
+///   special features are needed (partitioning is a core Delta feature).
 fn apply_data_layout(
     data_layout: &DataLayout,
     effective_schema: &SchemaRef,
@@ -617,8 +617,8 @@ impl CreateTableTransactionBuilder {
     ///
     /// - [`DataLayout::None`]: No special organization (default)
     /// - [`DataLayout::Clustered`]: Data files are optimized for queries on clustering columns
-    /// - [`DataLayout::Partitioned`]: Data files are organized into directories by partition
-    ///   column values
+    /// - [`DataLayout::Partitioned`]: Data files are organized into directories by partition column
+    ///   values
     ///
     /// Partitioning and clustering are mutually exclusive.
     ///

@@ -4,16 +4,6 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
-use crate::arrow::datatypes::{DataType, Field, Schema};
-use crate::object_store::path::Path;
-use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use crate::parquet::arrow::async_writer::AsyncArrowWriter;
-use crate::parquet::arrow::async_writer::ParquetObjectWriter;
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
@@ -21,6 +11,9 @@ use uuid::Uuid;
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use super::stats::collect_stats;
 use super::UrlExt;
+use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
+use crate::arrow::datatypes::{DataType, Field, Schema};
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
@@ -29,15 +22,20 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::engine::{reader_options, writer_options};
 use crate::expressions::ColumnName;
 use crate::metrics::{MetricEvent, MetricsReporter};
+use crate::object_store::path::Path;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
+use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use crate::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
 use crate::schema::{SchemaRef, StructType};
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
     ParquetHandler, PredicateRef,
 };
-
-use crate::engine::{reader_options, writer_options};
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -114,7 +112,8 @@ impl DataFileMetadata {
 
         let stats_array = Arc::new(stats.clone());
 
-        // Build schema dynamically based on stats (stats schema varies based on collected statistics)
+        // Build schema dynamically based on stats (stats schema varies based on collected
+        // statistics)
         let key_value_struct = DataType::Struct(
             vec![
                 Field::new("key", DataType::Utf8, false),
@@ -228,8 +227,8 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
     /// is a generated UUIDv4).
     ///
-    /// Note that the schema does not contain the dataChange column. In order to set `data_change` flag,
-    /// use [`crate::transaction::Transaction::with_data_change`].
+    /// Note that the schema does not contain the dataChange column. In order to set `data_change`
+    /// flag, use [`crate::transaction::Transaction::with_data_change`].
     ///
     /// [add file metadata]: crate::transaction::Transaction::add_files_schema
     pub async fn write_parquet_file(
@@ -346,8 +345,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     ///
     /// # Parameters
     ///
-    /// - `location` - The full URL path where the Parquet file should be written
-    ///   (e.g., `s3://bucket/path/file.parquet`, `file:///path/to/file.parquet`).
+    /// - `location` - The full URL path where the Parquet file should be written (e.g., `s3://bucket/path/file.parquet`,
+    ///   `file:///path/to/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
     ///
     /// # Returns
@@ -597,6 +596,10 @@ mod tests {
     use std::path::PathBuf;
     use std::slice;
 
+    use itertools::Itertools;
+    use url::Url;
+
+    use super::*;
     use crate::arrow::array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
         Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
@@ -607,17 +610,13 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DEFAULT_BATCH_SIZE;
-    use crate::object_store::{local::LocalFileSystem, memory::InMemory};
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
     use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use crate::schema::ColumnMetadataKey;
-    use crate::EngineData;
-    use itertools::Itertools;
-    use url::Url;
-
     use crate::utils::current_time_ms;
     use crate::utils::test_utils::assert_result_error_with_message;
-
-    use super::*;
+    use crate::EngineData;
 
     fn into_record_batch(
         engine_data: DeltaResult<Box<dyn EngineData>>,
@@ -1262,8 +1261,8 @@ mod tests {
 
     /// Test that field IDs are accessible via ColumnMetadataKey::ParquetFieldId as documented.
     ///
-    /// Per trait definitions in lib.rs, field IDs should be accessible via StructField::get_config_value
-    /// with ColumnMetadataKey::ParquetFieldId.
+    /// Per trait definitions in lib.rs, field IDs should be accessible via
+    /// StructField::get_config_value with ColumnMetadataKey::ParquetFieldId.
     #[test]
     fn test_parquet_footer_read_with_field_id() {
         // Write parquet file with field ID

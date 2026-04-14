@@ -16,7 +16,6 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use rstest::rstest;
-
 use test_utils::{
     generate_batch, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table, IntoArray,
 };

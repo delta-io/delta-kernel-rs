@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use super::validation::{validate_read_result, validate_snapshot};
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::filter_record_batch;
@@ -16,6 +15,8 @@ use delta_kernel_benchmarks::models::{ReadSpec, SnapshotConstructionSpec, Spec, 
 use delta_kernel_benchmarks::predicate_parser::parse_predicate;
 use itertools::Itertools;
 use url::Url;
+
+use super::validation::{validate_read_result, validate_snapshot};
 
 /// Result of executing a read workload.
 #[derive(Debug)]

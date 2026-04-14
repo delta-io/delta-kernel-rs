@@ -36,11 +36,11 @@ pub(super) struct SharedWriteState {
 /// (serialized partition values with physical column names as keys). How you use a
 /// `WriteContext` depends on your engine:
 ///
-/// - **`DefaultEngine` consumers**: pass this to [`DefaultEngine::write_parquet`], which
-///   handles everything (transform, write, partition metadata).
-/// - **Arrow-based custom engines**: write parquet yourself, then call
-///   [`build_add_file_metadata`] with the resulting `DataFileMetadata` and this
-///   `WriteContext` to produce the Add action `EngineData` for [`Transaction::add_files`].
+/// - **`DefaultEngine` consumers**: pass this to [`DefaultEngine::write_parquet`], which handles
+///   everything (transform, write, partition metadata).
+/// - **Arrow-based custom engines**: write parquet yourself, then call [`build_add_file_metadata`]
+///   with the resulting `DataFileMetadata` and this `WriteContext` to produce the Add action
+///   `EngineData` for [`Transaction::add_files`].
 /// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
 ///   `partitionValues` map in Add actions directly.
 ///
@@ -171,10 +171,9 @@ impl WriteContext {
     ///
     /// # Arguments
     ///
-    /// * `random_prefix` - A random prefix to use for the deletion vector file name.
-    ///   Making this non-empty can help distributed load on object storage when writing/reading
-    ///   to avoid throttling.  Typically a random string of 2-4 characters is sufficient
-    ///   for this purpose.
+    /// * `random_prefix` - A random prefix to use for the deletion vector file name. Making this
+    ///   non-empty can help distributed load on object storage when writing/reading to avoid
+    ///   throttling.  Typically a random string of 2-4 characters is sufficient for this purpose.
     ///
     /// # Examples
     ///
@@ -203,13 +202,13 @@ fn random_alphanumeric_prefix() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::expressions::Expression;
     use std::collections::HashSet;
     use std::sync::Arc;
 
     use rstest::rstest;
 
+    use super::*;
+    use crate::expressions::Expression;
     use crate::schema::{DataType, StructField, StructType};
 
     fn make_write_context(

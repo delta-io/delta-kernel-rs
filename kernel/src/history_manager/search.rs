@@ -7,11 +7,11 @@ use std::fmt::Debug;
 /// Defines the type of bound to return from a binary search operation.
 ///
 /// For a search operation over `values` using key `key`:
-/// * [`Bound::LeastUpper`] - Finds the smallest index `i` such that `values[i] >= key`.
-///   This represents the first element greater than or equal to the search key.
+/// * [`Bound::LeastUpper`] - Finds the smallest index `i` such that `values[i] >= key`. This
+///   represents the first element greater than or equal to the search key.
 ///
-/// * [`Bound::GreatestLower`] - Finds the largest index `i` such that `values[i] <= key`.
-///   This represents the last element less than or equal to the search key.
+/// * [`Bound::GreatestLower`] - Finds the largest index `i` such that `values[i] <= key`. This
+///   represents the last element less than or equal to the search key.
 #[allow(unused)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Bound {
@@ -32,8 +32,8 @@ pub(crate) enum SearchError<T: Error> {
     ///   to the provided key.
     OutOfRange,
     /// Error that occurs when the `key_fn` fails when retrieving the key in
-    /// [`binary_search_by_key_with_bounds`]. The error that occurred in the `key_fn` is returned in
-    /// this error variant.
+    /// [`binary_search_by_key_with_bounds`]. The error that occurred in the `key_fn` is returned
+    /// in this error variant.
     KeyFunctionError(T),
 }
 
@@ -54,8 +54,8 @@ pub(crate) enum SearchError<T: Error> {
 ///
 /// * Ok(usize) - The index of the found element
 /// * [`SearchError::OutOfRange`] - If no suitable bound exists in the slice
-/// * [`SearchError::KeyFunctionError`] - If the key function fails. This contains the error
-///   emitted by the `key_fn`.
+/// * [`SearchError::KeyFunctionError`] - If the key function fails. This contains the error emitted
+///   by the `key_fn`.
 ///
 /// #Safety
 /// Assumes that the provided input is sorted by key using the `key_fn`. If the input is not

@@ -3,6 +3,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc};
 use std::thread;
 
+use clap::Parser;
 use common::{LocationArgs, ParseWithExamples, ScanArgs};
 use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::arrow::compute::filter_record_batch;
@@ -12,8 +13,6 @@ use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, ScanFile};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{DeltaResult, Engine, ExpressionRef, FileMeta, Snapshot};
-
-use clap::Parser;
 use url::Url;
 
 /// An example program that reads a table using multiple threads. This shows the use of the
@@ -123,8 +122,8 @@ fn try_main() -> DeltaResult<()> {
             });
         });
 
-        // have handed out all copies needed, drop so record_batch_rx will exit when the last thread is
-        // done sending
+        // have handed out all copies needed, drop so record_batch_rx will exit when the last thread
+        // is done sending
         drop(record_batch_tx);
 
         for res in scan_metadata {

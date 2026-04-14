@@ -153,8 +153,9 @@ fn needs_escaping(b: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rstest::rstest;
+
+    use super::*;
 
     /// Inverse of `escape_partition_value` for round-trip testing.
     /// Ported from Hive's `FileUtils.unescapePathName`.

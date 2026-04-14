@@ -4,8 +4,6 @@
 
 use std::sync::Arc;
 
-use crate::expressions::{SharedExpression, SharedPredicate};
-use crate::handle::Handle;
 use delta_kernel::expressions::{
     column_expr, column_name, column_pred, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
     Expression as Expr, MapData, OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred, Scalar,
@@ -17,6 +15,9 @@ use delta_kernel::kernel_predicates::{
 };
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
 use delta_kernel::DeltaResult;
+
+use crate::expressions::{SharedExpression, SharedPredicate};
+use crate::handle::Handle;
 
 #[derive(Debug, PartialEq)]
 struct OpaqueTestOp(String);
@@ -68,8 +69,8 @@ impl OpaquePredicateOp for OpaqueTestOp {
     }
 }
 
-/// Constructs a kernel expression that is passed back as a [`SharedExpression`] handle. The expected
-/// output expression can be found in `ffi/tests/test_expression_visitor/expected.txt`.
+/// Constructs a kernel expression that is passed back as a [`SharedExpression`] handle. The
+/// expected output expression can be found in `ffi/tests/test_expression_visitor/expected.txt`.
 ///
 /// # Safety
 /// The caller is responsible for freeing the returned memory, either by calling

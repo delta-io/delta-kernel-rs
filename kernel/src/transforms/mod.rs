@@ -41,9 +41,9 @@ where
 
 /// Rebuilds a two-child parent from transformed children only when needed.
 ///
-/// If either child is filtered out (`None`), filter out the parent by returning `None`. If both children survive as
-/// borrowed values, this returns a borrowed parent. Otherwise, it uses the provided `map_owned` function to rebuild and return an owned
-/// parent.
+/// If either child is filtered out (`None`), filter out the parent by returning `None`. If both
+/// children survive as borrowed values, this returns a borrowed parent. Otherwise, it uses the
+/// provided `map_owned` function to rebuild and return an owned parent.
 pub(crate) fn map_owned_pair_or_else<'a, Parent, Child>(
     parent: &'a Parent,
     left: Option<Cow<'a, Child>>,
