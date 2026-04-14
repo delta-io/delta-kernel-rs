@@ -41,7 +41,7 @@
 //! # use delta_kernel::Error;
 //! # use delta_kernel::FileMeta;
 //! # use url::Url;
-//! fn write_checkpoint_file(path: Url, data: &mut ActionReconciliationIterator) -> DeltaResult<FileMeta> {
+//! fn write_checkpoint_file(path: Url, data: ActionReconciliationIterator) -> DeltaResult<FileMeta> {
 //!     todo!() /* engine-specific logic to write data to object storage*/
 //! }
 //!
@@ -52,7 +52,7 @@
 //! let snapshot = Snapshot::builder_for(url).build(engine)?;
 //!
 //! // Create a checkpoint writer from the snapshot
-//! let mut writer = snapshot.create_checkpoint_writer()?;
+//! let writer = snapshot.create_checkpoint_writer()?;
 //!
 //! // Get the checkpoint path and data
 //! let checkpoint_path = writer.checkpoint_path()?;
@@ -62,8 +62,8 @@
 //! let state = checkpoint_data.state();
 //!
 //! // Write the checkpoint data to the object store and collect metadata
-//! let metadata: FileMeta = write_checkpoint_file(checkpoint_path, &mut checkpoint_data)?;
-//!
+//! // The write function consumes the iterator, dropping its Arc reference to the state.
+//! let metadata: FileMeta = write_checkpoint_file(checkpoint_path, checkpoint_data)?;
 //! /* IMPORTANT: All data must be written before finalizing the checkpoint */
 //!
 //! // Build checkpoint stats from the exhausted iterator state
@@ -152,7 +152,7 @@ impl CheckpointActionStats {
         state: ActionReconciliationIteratorState,
     ) -> DeltaResult<Self> {
         if !state.is_exhausted() {
-            return Err(Error::internal_error(
+            return Err(Error::checkpoint_write(
                 "Cannot build CheckpointActionStats: the reconciliation iterator has not been \
                  fully exhausted",
             ));
@@ -332,7 +332,7 @@ impl CheckpointWriter {
     ///
     /// The returned [`ActionReconciliationIterator`] yields [`FilteredEngineData`] batches with
     /// stats transforms already applied. Use [`ActionReconciliationIterator::state`] to get the
-    /// shared state for passing to [`CheckpointWriter::finalize`].
+    /// shared state for building [`CheckpointActionStats`] after the iterator is exhausted.
     ///
     /// # Engine Usage
     ///
@@ -343,7 +343,11 @@ impl CheckpointWriter {
     ///     let data = batch?.apply_selection_vector()?;
     ///     parquet_writer.write(&data).await?;
     /// }
-    /// writer.finalize(&engine, &metadata, &state)?;
+    /// drop(checkpoint_data);
+    /// let state = Arc::into_inner(state)
+    ///     .ok_or(Error::internal_error("checkpoint state Arc still has other references"))?;
+    /// let stats = CheckpointActionStats::from_reconciliation_state(state)?;
+    /// writer.finalize(&engine, &metadata, &stats)?;
     /// ```
     // Implementation overview:
     // 1. Determines whether to write a V1 or V2 checkpoint based on `v2Checkpoints` feature
