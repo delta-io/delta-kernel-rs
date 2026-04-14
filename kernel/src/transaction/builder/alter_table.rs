@@ -80,7 +80,29 @@ impl AlterTableTransactionBuilder<Ready> {
         self.transition()
     }
 
+    /// Drop a column from the table schema. Supports nested columns via [`ColumnName`] paths
+    /// (e.g. `column_name!("address.city")`).
+    ///
+    /// Requires column mapping to be enabled (mode = name or id). The column is removed from the
+    /// logical schema but physical data in existing Parquet files is untouched.
+    ///
+    /// # Errors (at build time)
+    ///
+    /// - Column does not exist in the current schema
+    /// - Column mapping is not enabled on the table
+    /// - Column is a partition column or clustering column
+    pub fn drop_column(mut self, path: ColumnName) -> AlterTableTransactionBuilder<Modifying> {
+        self.operations.push(SchemaOperation::DropColumn { path });
+        self.transition()
+    }
+
     /// Change a column's nullability from NOT NULL to nullable.
+    ///
+    /// If the column is already nullable, this is a no-op.
+    ///
+    /// # Errors (at build time)
+    ///
+    /// - Column does not exist
     pub fn set_nullable(mut self, path: ColumnName) -> AlterTableTransactionBuilder<Modifying> {
         self.operations.push(SchemaOperation::SetNullable { path });
         self.transition()
@@ -91,6 +113,12 @@ impl AlterTableTransactionBuilder<Modifying> {
     /// Add a new top-level nullable column to the table schema.
     pub fn add_column(mut self, field: StructField) -> Self {
         self.operations.push(SchemaOperation::AddColumn { field });
+        self
+    }
+
+    /// Drop a column from the table schema. Supports nested paths. Requires column mapping.
+    pub fn drop_column(mut self, path: ColumnName) -> Self {
+        self.operations.push(SchemaOperation::DropColumn { path });
         self
     }
 
@@ -117,7 +145,7 @@ impl AlterTableTransactionBuilder<Modifying> {
     ///   `timestampNtz` column without the `timestampNtz` feature)
     pub fn build(
         self,
-        _engine: &dyn Engine, // used by later operations (e.g., drop_column reads clustering columns)
+        engine: &dyn Engine,
         committer: Box<dyn Committer>,
     ) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
@@ -137,6 +165,8 @@ impl AlterTableTransactionBuilder<Modifying> {
                 })
             })
             .transpose()?;
+        let partition_columns = table_config.metadata().partition_columns();
+        let clustering_columns = self.snapshot.get_logical_clustering_columns(engine)?;
         let SchemaEvolutionResult {
             schema: evolved_schema,
             new_max_column_id,
@@ -145,6 +175,8 @@ impl AlterTableTransactionBuilder<Modifying> {
             self.operations,
             column_mapping_mode,
             current_max_column_id,
+            partition_columns,
+            clustering_columns.as_deref(),
         )?;
 
         let mut evolved_metadata = table_config
