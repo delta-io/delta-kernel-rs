@@ -675,6 +675,18 @@ impl Snapshot {
         Transaction::try_new_existing_table(self, committer, engine)
     }
 
+    /// Creates a builder for altering this table's schema.
+    ///
+    /// The returned builder allows chaining schema evolution operations (such as adding columns)
+    /// before building an [`AlterTableTransaction`] that can be committed.
+    ///
+    /// [`AlterTableTransaction`]: crate::transaction::alter_table::AlterTableTransaction
+    pub fn alter_table(
+        self: Arc<Self>,
+    ) -> crate::transaction::builder::alter_table::AlterTableTransactionBuilder {
+        crate::transaction::builder::alter_table::AlterTableTransactionBuilder::new(self)
+    }
+
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the
     /// txn based on the delta.setTransactionRetentionDuration property and lastUpdated.
     ///
