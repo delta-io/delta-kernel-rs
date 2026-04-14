@@ -20,11 +20,13 @@ use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::metrics::WithMetricsReporterLayer as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{insert_data, test_table_setup_mt, CountingReporter};
+use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
 
 mod scan;
@@ -32,16 +34,22 @@ mod snapshot_load;
 
 /// Build a `DefaultEngine` + `CountingReporter` backed by `store`, for use in the
 /// *measurement* phase (building a snapshot and asserting metric counters).
+///
+/// Returns the engine, the reporter, and a tracing `DefaultGuard` that must be kept alive
+/// for the duration of the test. When the guard is dropped the subscriber is uninstalled.
 fn measuring_engine(
     store: Arc<dyn delta_kernel::object_store::ObjectStore>,
 ) -> (
     DefaultEngine<delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor>,
     Arc<CountingReporter>,
+    tracing::subscriber::DefaultGuard,
 ) {
     let reporter = Arc::new(CountingReporter::default());
-    let engine = DefaultEngineBuilder::new(store)
-        .build();
-    (engine, reporter)
+    let engine = DefaultEngineBuilder::new(store).build();
+    let guard = tracing_subscriber::registry()
+        .with_metrics_reporter_layer(reporter.clone())
+        .set_default();
+    (engine, reporter, guard)
 }
 
 /// Build a minimal single-column INTEGER schema for test tables.

@@ -173,16 +173,14 @@ async fn list_from_impl(
         // Local filesystem doesn't return sorted list - need to collect and sort
         let mut items: Vec<_> = stream.try_collect().await?;
         items.sort_unstable();
-        let duration = start.elapsed();
-        let _span = tracing::span!(
-            tracing::Level::INFO,
-            "storage",
-            report = tracing::field::Empty,
-            name = LIST_COMPLETED_NAME,
-            num_files = items.len() as u64,
-            duration = duration.as_nanos() as u64,
+        // Wrap in MetricsIterator so the metric fires in Drop on the caller's thread
+        // (not here on the background thread where no tracing subscriber is installed).
+        let stream = MetricsIterator::new(
+            stream::iter(items.into_iter().map(Ok::<FileMeta, crate::Error>)),
+            LIST_COMPLETED_NAME,
+            start,
         );
-        Ok(Box::pin(stream::iter(items.into_iter().map(Ok))))
+        Ok(Box::pin(stream))
     } else {
         let stream = MetricsIterator::new(stream, LIST_COMPLETED_NAME, start);
         Ok(Box::pin(stream))
