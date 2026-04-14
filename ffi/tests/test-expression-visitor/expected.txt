@@ -154,6 +154,7 @@ StructExpression
   Timestamp(1234567890)
   TimestampNtz(9876543210)
   Null(Integer)
+  Null(Decimal(10,5))
   Add
     Integer(10)
     Integer(20)

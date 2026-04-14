@@ -439,6 +439,9 @@ pub(crate) enum NullTypeTag {
     /// Null of type `timestamp_ntz` (microseconds since epoch, no timezone).
     TimestampNtz = 11,
     /// Null of type `decimal`. Requires valid `precision` and `scale` parameters.
+    ///
+    /// WARNING: This variant MUST remain `= 12`. It is the only tag with special handling
+    /// (precision/scale parameters), and C consumers key on the value `12` directly.
     Decimal = 12,
     /// Sentinel for non-primitive null types (struct, array, map, variant). Emitted by the
     /// kernel-to-engine visitor when the null's type is not a primitive. Engines that receive
