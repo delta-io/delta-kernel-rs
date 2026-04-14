@@ -179,9 +179,9 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
         &DataType::TIMESTAMP => Ok(&COL_TYPES_TIMESTAMP),
         &DataType::TIMESTAMP_NTZ => Ok(&COL_TYPES_TIMESTAMP_NTZ),
         DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(&COL_TYPES_DECIMAL),
-        _ => Err(Error::internal_error(format!(
-            "Unsupported data type for stats validation: {dt}"
-        ))),
+        DataType::Struct(_) | DataType::Array(_) | DataType::Map(_) | DataType::Variant(_) => Err(
+            Error::internal_error(format!("Unsupported data type for stats validation: {dt}")),
+        ),
     }
 }
 
@@ -209,9 +209,11 @@ fn is_stat_present<'b>(
         DataType::Primitive(PrimitiveType::Decimal(_)) => {
             Ok(getter.get_decimal(row_idx, field_name)?.is_some())
         }
-        _ => Err(Error::internal_error(format!(
-            "Unsupported data type for stats presence check: {data_type}"
-        ))),
+        DataType::Struct(_) | DataType::Array(_) | DataType::Map(_) | DataType::Variant(_) => {
+            Err(Error::internal_error(format!(
+                "Unsupported data type for stats presence check: {data_type}"
+            )))
+        }
     }
 }
 
@@ -629,45 +631,6 @@ mod tests {
         verifier.verify(&[engine_data]).unwrap();
     }
 
-    /// Round-trip test: collect_stats produces stats that pass verification for all null
-    /// patterns. The all-null and empty cases are regression tests -- collect_stats must keep
-    /// the field present (with null value) so the verifier's all_null check can run.
-    #[rstest]
-    #[case::non_null(vec![Some(1i64), Some(2), Some(3)])]
-    #[case::all_null(vec![None, None, None])]
-    #[case::empty(vec![])]
-    fn test_collected_stats_pass_verification(#[case] values: Vec<Option<i64>>) {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "col",
-            ArrowDataType::Int64,
-            true,
-        )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef])
-                .unwrap();
-
-        let stats = collect_stats(&batch, &[column_name!("col")]).unwrap();
-
-        let path_array = StringArray::from(vec!["file1.parquet"]);
-        let add_file_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("path", ArrowDataType::Utf8, false),
-            ArrowField::new("stats", stats.data_type().clone(), true),
-        ]));
-        let add_file_batch = RecordBatch::try_new(
-            add_file_schema,
-            vec![
-                Arc::new(path_array) as ArrayRef,
-                Arc::new(stats) as ArrayRef,
-            ],
-        )
-        .unwrap();
-
-        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(add_file_batch));
-
-        let verifier = StatsVerifier::new(vec![(ColumnName::new(["col"]), DataType::LONG)]);
-        verifier.verify(&[engine_data]).unwrap();
-    }
-
     /// Verify collect_stats produces correct stats shape for all-null and empty batches.
     /// These cases keep the column in minValues/maxValues with null values (so that
     /// StatsVerifier can find the field via visit_rows and check nullCount == numRecords).
@@ -713,9 +676,7 @@ mod tests {
     }
 
     /// Round-trip test: collect_stats produces stats that pass verification for every
-    /// stats-eligible type. Covers both non-null and all-null patterns per type.
-    /// The byte/short cases are regression tests for a bug where tables with byte/short
-    /// columns failed on write with "Unsupported data type for stats validation".
+    /// stats-eligible type. Covers non-null, all-null, and empty patterns per type.
     #[rstest]
     // Note: BOOLEAN and BINARY are omitted for non-null cases because collect_stats does not
     // produce min/max for those types (they fall through to the wildcard in compute_leaf_agg).
@@ -754,6 +715,10 @@ mod tests {
     )]
     #[case::long_all_null(
         Arc::new(Int64Array::from(vec![None::<i64>, None, None])) as ArrayRef,
+        DataType::LONG,
+    )]
+    #[case::long_empty(
+        Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef,
         DataType::LONG,
     )]
     #[case::float(
