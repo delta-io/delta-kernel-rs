@@ -9,6 +9,8 @@ use url::Url;
 use uuid::Uuid;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+#[cfg(feature = "nanosecond-timestamps")]
+use delta_kernel::arrow::array::TimestampNanosecondArray;
 use delta_kernel::arrow::array::{Array, ArrayRef, BinaryArray, Int64Array, StructArray};
 use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
 use delta_kernel::arrow::buffer::NullBuffer;
@@ -1153,32 +1155,6 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
-    // setup tracing
-    let _ = tracing_subscriber::fmt::try_init();
-
-    // create a table with TIMESTAMP_NTZ column
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "ts_ntz",
-        DataType::TIMESTAMP_NTZ,
-    )])?);
-
-    let (store, engine, table_location) = engine_store_setup("test_table_timestamp_ntz", None);
-    let table_url = create_table(
-        store.clone(),
-        table_location,
-        schema.clone(),
-        &[],
-        true,
-        vec!["timestampNtz"],
-        vec!["timestampNtz"],
-    )
-    .await?;
-
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-        .with_engine_info("default engine");
-
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
     // These are microseconds since Unix epoch
     let timestamp_values = vec![
@@ -1190,9 +1166,72 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         -62135596800000000i64, // 0001-01-01T00:00:00.000000 (near min valid timestamp)
     ];
 
+    test_append_timestamp(
+        DataType::TIMESTAMP_NTZ,
+        "ts_ntz",
+        "test_table_timestamp_ntz",
+        "timestampNtz",
+        Arc::new(TimestampMicrosecondArray::from(timestamp_values)),
+    )
+    .await
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+#[tokio::test]
+async fn test_append_timestamp_nanos() -> Result<(), Box<dyn std::error::Error>> {
+    let timestamp_values = vec![
+        0i64,
+        1634567890123456000i64,
+        1634567950654321000i64,
+        1672531200000000000i64,
+        253402300799999999i64,
+        -62135596800000000i64,
+    ];
+
+    test_append_timestamp(
+        DataType::TIMESTAMP_NANOS,
+        "ts_nanos",
+        "test_table_timestamp_nanos",
+        "timestampNanos",
+        Arc::new(TimestampNanosecondArray::from(timestamp_values).with_timezone("UTC")),
+    )
+    .await
+}
+
+async fn test_append_timestamp(
+    dtype: DataType,
+    col: &str,
+    path: &str,
+    feature: &str,
+    timestamp_values: ArrayRef,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        col, dtype,
+    )])?);
+
+    let (store, engine, table_location) = engine_store_setup(path, None);
+    let table_url = create_table(
+        store.clone(),
+        table_location,
+        schema.clone(),
+        &[],
+        true,
+        vec![feature],
+        vec![feature],
+    )
+    .await?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .with_engine_info("default engine");
+
     let data = RecordBatch::try_new(
         Arc::new(schema.as_ref().try_into_arrow()?),
-        vec![Arc::new(TimestampMicrosecondArray::from(timestamp_values))],
+        vec![timestamp_values],
     )?;
 
     // Write data
@@ -1210,9 +1249,9 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify the commit was written correctly
     let commit1 = store
-        .get(&Path::from(
-            "/test_table_timestamp_ntz/_delta_log/00000000000000000001.json",
-        ))
+        .get(&Path::from(format!(
+            "/{path}/_delta_log/00000000000000000001.json"
+        )))
         .await?;
 
     let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)

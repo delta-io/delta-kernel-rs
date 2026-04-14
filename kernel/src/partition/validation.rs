@@ -307,6 +307,26 @@ mod tests {
         assert_type_ok(data_type, value);
     }
 
+    #[cfg(feature = "nanosecond-timestamps")]
+    /// Nanosecond timestamps encoding validation.
+    #[rstest]
+    #[case(
+        DataType::TIMESTAMP_NANOS,
+        Scalar::TimestampNanos(1_718_451_045_000_000_000)
+    )]
+    #[case(DataType::TIMESTAMP_NANOS, Scalar::TimestampNanos(0))]
+    #[case(
+        DataType::TIMESTAMP_NANOS,
+        Scalar::TimestampNanos(1_718_499_599_999_999_999)
+    )]
+    #[case(DataType::TIMESTAMP_NANOS, Scalar::Null(DataType::TIMESTAMP_NANOS))]
+    fn test_validate_nanos_encoding_table_rows_return_ok(
+        #[case] data_type: DataType,
+        #[case] value: Scalar,
+    ) {
+        assert_type_ok(data_type, value);
+    }
+
     /// Every non-null row from the "String and binary encoding" table in
     /// `partition/mod.rs`. Row numbers reference that table.
     #[rstest]
