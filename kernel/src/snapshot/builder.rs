@@ -447,24 +447,6 @@ mod tests {
         (reporter, guard)
     }
 
-    fn assert_has_event(reporter: &CapturingReporter, pred: fn(&MetricEvent) -> bool, msg: &str) {
-        let events = reporter.events();
-        assert!(events.iter().any(pred), "{msg}");
-    }
-
-    fn assert_no_event(reporter: &CapturingReporter, pred: fn(&MetricEvent) -> bool, msg: &str) {
-        let events = reporter.events();
-        assert!(!events.iter().any(pred), "{msg}");
-    }
-
-    fn is_snapshot_completed(e: &MetricEvent) -> bool {
-        matches!(e, MetricEvent::SnapshotCompleted { .. })
-    }
-
-    fn is_snapshot_failed(e: &MetricEvent) -> bool {
-        matches!(e, MetricEvent::SnapshotFailed { .. })
-    }
-
     #[test_log::test(tokio::test)]
     async fn snapshot_failed_emits_metric_on_error() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
