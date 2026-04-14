@@ -16,6 +16,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::committer::Committer;
+use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
@@ -69,12 +70,24 @@ impl AlterTableTransactionBuilder<Ready> {
         self.operations.push(SchemaOperation::AddColumn { field });
         self.transition()
     }
+
+    /// Change a column's nullability from NOT NULL to nullable.
+    pub fn set_nullable(mut self, path: ColumnName) -> AlterTableTransactionBuilder<Modifying> {
+        self.operations.push(SchemaOperation::SetNullable { path });
+        self.transition()
+    }
 }
 
 impl AlterTableTransactionBuilder<Modifying> {
     /// Add a new top-level nullable column to the table schema.
     pub fn add_column(mut self, field: StructField) -> Self {
         self.operations.push(SchemaOperation::AddColumn { field });
+        self
+    }
+
+    /// Change a column's nullability from NOT NULL to nullable.
+    pub fn set_nullable(mut self, path: ColumnName) -> Self {
+        self.operations.push(SchemaOperation::SetNullable { path });
         self
     }
 

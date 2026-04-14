@@ -7,6 +7,7 @@ use delta_kernel::arrow::array::{Array, Int32Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+use delta_kernel::expressions::column_name;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::transaction::create_table::create_table;
@@ -160,6 +161,105 @@ async fn add_non_nullable_column_fails() -> DeltaResult<()> {
         .build(engine.as_ref(), committer());
     assert!(err.is_err());
     assert!(err.unwrap_err().to_string().contains("non-nullable"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_nullable_changes_required_to_nullable() -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref())?;
+
+    // "id" is NOT NULL -- set it to nullable
+    let committed = snapshot
+        .alter_table()
+        .set_nullable(column_name!("id"))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let snapshot = committed.post_commit_snapshot().unwrap().clone();
+
+    let schema = snapshot.schema();
+    let id_field = schema.field("id").unwrap();
+    assert!(id_field.is_nullable());
+
+    // Write data with NULL id (now allowed since we set it nullable)
+    let arrow_schema: delta_kernel::arrow::datatypes::SchemaRef =
+        Arc::new(schema.as_ref().try_into_arrow().unwrap());
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![None, Some(1)])),
+            Arc::new(StringArray::from(vec!["null_id", "has_id"])),
+        ],
+    )
+    .unwrap();
+    let _ = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+
+    // Scan back -- should have 2 rows
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let scan = reloaded.scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_nullable_already_nullable_is_noop() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref())?;
+
+    // "name" is already nullable
+    let _ = snapshot
+        .alter_table()
+        .set_nullable(column_name!("name"))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    let name_field = schema.field("name").unwrap();
+    assert!(name_field.is_nullable());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_nullable_nonexistent_column_fails() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref())?;
+
+    let err = snapshot
+        .alter_table()
+        .set_nullable(column_name!("nonexistent"))
+        .build(engine.as_ref(), committer());
+    assert!(err.is_err());
+    assert!(err.unwrap_err().to_string().contains("does not exist"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn chain_add_column_and_set_nullable() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref())?;
+
+    // Add a column then set "id" nullable in one commit
+    let _ = snapshot
+        .alter_table()
+        .add_column(StructField::nullable("email", DataType::STRING))
+        .set_nullable(column_name!("id"))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    assert_eq!(reloaded.schema().fields().count(), 3);
+    assert!(reloaded.schema().field("email").is_some());
+    assert!(reloaded.schema().field("id").unwrap().is_nullable());
 
     Ok(())
 }
