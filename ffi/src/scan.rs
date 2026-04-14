@@ -12,6 +12,8 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 
+#[cfg(feature = "default-engine-base")]
+use crate::engine_data::ArrowFFIData;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
@@ -697,6 +699,98 @@ fn visit_scan_metadata_impl(
     };
     scan_metadata.visit_scan_files(context_wrapper, rust_callback)?;
     Ok(true)
+}
+
+// === Arrow batch-mode scan metadata ===
+
+/// Result of [`scan_metadata_next_arrow`]: an Arrow C Data Interface batch plus a selection vector.
+///
+/// The engine must free this by calling [`free_scan_metadata_arrow_result`] exactly once.
+#[cfg(feature = "default-engine-base")]
+#[repr(C)]
+pub struct ScanMetadataArrowResult {
+    pub arrow_data: ArrowFFIData,
+    pub selection_vector: KernelBoolSlice,
+}
+
+/// Get the next scan metadata batch as Arrow via the C Data Interface.
+///
+/// Advances the iterator by one batch and returns the scan file metadata as an Arrow
+/// RecordBatch (with `SCAN_ROW_SCHEMA`) plus a selection vector indicating active rows.
+/// Returns a null pointer when the iterator is exhausted.
+///
+/// This is an alternative to the callback-based [`scan_metadata_next`] +
+/// [`visit_scan_metadata`] path, avoiding per-row FFI overhead.
+///
+/// # Safety
+///
+/// `data` must be a valid [`SharedScanMetadataIterator`] handle.
+/// `engine` must be a valid [`SharedExternEngine`] handle.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn scan_metadata_next_arrow(
+    data: Handle<SharedScanMetadataIterator>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<*mut ScanMetadataArrowResult> {
+    let data = unsafe { data.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    scan_metadata_next_arrow_impl(data).into_extern_result(&engine)
+}
+
+#[cfg(feature = "default-engine-base")]
+fn scan_metadata_next_arrow_impl(
+    data: &ScanMetadataIterator,
+) -> DeltaResult<*mut ScanMetadataArrowResult> {
+    use delta_kernel::arrow::array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+    use delta_kernel::arrow::array::{ArrayData, StructArray};
+    use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
+
+    let mut iter = data
+        .data
+        .lock()
+        .map_err(|_| Error::generic("poisoned mutex"))?;
+
+    match iter.next().transpose()? {
+        Some(scan_metadata) => {
+            let (engine_data, selection_vector) = scan_metadata.scan_files.into_parts();
+            let record_batch = engine_data.try_into_record_batch()?;
+            let sa: StructArray = record_batch.into();
+            let array_data: ArrayData = sa.into();
+            let array = FFI_ArrowArray::new(&array_data);
+            let schema = FFI_ArrowSchema::try_from(array_data.data_type())?;
+            let result = Box::new(ScanMetadataArrowResult {
+                arrow_data: ArrowFFIData { array, schema },
+                selection_vector: selection_vector.into(),
+            });
+            Ok(Box::into_raw(result))
+        }
+        None => Ok(std::ptr::null_mut()),
+    }
+}
+
+/// Free a [`ScanMetadataArrowResult`] returned by [`scan_metadata_next_arrow`].
+///
+/// # Safety
+///
+/// `result` must be a valid pointer returned by [`scan_metadata_next_arrow`], or null.
+/// Must be called at most once per result.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn free_scan_metadata_arrow_result(result: *mut ScanMetadataArrowResult) {
+    if result.is_null() {
+        return;
+    }
+    let result = unsafe { *Box::from_raw(result) };
+    let ScanMetadataArrowResult {
+        arrow_data,
+        selection_vector,
+    } = result;
+    // KernelBoolSlice is a leaked Vec<bool>; reconstitute and drop to free
+    let _ = unsafe { selection_vector.into_vec() };
+    // ArrowFFIData's FFI_ArrowArray/FFI_ArrowSchema have Drop impls that call
+    // their release callbacks if non-null. If the consumer already imported the
+    // data (calling release), the pointers are null and drop is a no-op.
+    drop(arrow_data);
 }
 
 #[cfg(test)]
