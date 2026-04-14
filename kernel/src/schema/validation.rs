@@ -83,7 +83,7 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
         // column names can contain literal dots when column mapping is enabled. A dot
         // separator would make column "a.b" indistinguishable from nested field b in
         // struct a. Null bytes cannot appear in column names, so they are safe to use.
-        self.current_path.push(field.name().to_lowercase());
+        self.current_path.push(field.name().to_ascii_lowercase());
         let key = self.current_path.join("\0");
         if !self.seen_paths.insert(key) {
             self.errors.push(format!(
@@ -135,7 +135,7 @@ mod tests {
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use rstest::rstest;
 
-    // -- Schema builders for test cases --
+    // === Schema builders for test cases ===
 
     fn simple_schema() -> StructType {
         StructType::new_unchecked(vec![
@@ -273,7 +273,7 @@ mod tests {
         ])
     }
 
-    // -- Valid schemas --
+    // === Valid schemas ===
 
     #[rstest]
     #[case::simple(simple_schema(), ColumnMappingMode::None)]
@@ -285,7 +285,7 @@ mod tests {
         assert!(validate_schema_for_create(&schema, cm).is_ok());
     }
 
-    // -- Invalid schemas --
+    // === Invalid schemas ===
 
     #[rstest]
     #[case::empty_schema(StructType::new_unchecked(vec![]), ColumnMappingMode::None, &["cannot be empty"])]

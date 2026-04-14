@@ -221,14 +221,17 @@ struct DataLayoutResult {
     partition_columns: Option<Vec<ColumnName>>,
 }
 
-/// Normalizes column name segments to match the casing in the schema.
+/// Normalizes column name field names to match the casing in the schema.
 ///
-/// Walks each path segment through the schema's struct hierarchy, replacing user-provided
-/// casing with the schema's canonical casing. If a segment isn't found case-insensitively,
-/// keeps the original (subsequent validation catches it).
+/// Walks each field name through the schema's struct hierarchy, replacing user-provided
+/// casing with the schema's canonical casing. If a field name isn't found
+/// case-insensitively, keeps the original (subsequent validation catches it).
 ///
-/// Precondition: validation (validate_partition_columns or validate_clustering_columns) is
-/// called after this to catch unrecognized or invalid columns.
+/// For example, given schema `{ Id: int, Name: string }` and user-provided columns
+/// `["id", "name"]`, returns `["Id", "Name"]` -- matching the schema's canonical casing.
+///
+/// Note: Must be called before validation (`validate_partition_columns` or
+/// `validate_clustering_columns`) so that case-normalized names match the schema.
 fn normalize_column_names_to_schema_casing(
     schema: &StructType,
     columns: &[ColumnName],
@@ -236,24 +239,29 @@ fn normalize_column_names_to_schema_casing(
     columns
         .iter()
         .map(|col| {
+            let path = col.path();
+            let mut normalized: Vec<String> = Vec::with_capacity(path.len());
             let mut current_schema = schema;
-            let normalized_segments: Vec<String> = col
-                .path()
-                .iter()
-                .map(|segment| {
-                    let canonical = current_schema
-                        .fields()
-                        .find(|f| f.name().eq_ignore_ascii_case(segment))
-                        .map(|f| {
-                            if let DataType::Struct(inner) = f.data_type() {
-                                current_schema = inner;
-                            }
-                            f.name().to_string()
-                        });
-                    canonical.unwrap_or_else(|| segment.to_string())
-                })
-                .collect();
-            ColumnName::new(normalized_segments.iter().map(|s| s.as_str()))
+            for (i, field_name) in path.iter().enumerate() {
+                match current_schema
+                    .fields()
+                    .find(|f| f.name().eq_ignore_ascii_case(field_name))
+                {
+                    Some(f) => {
+                        normalized.push(f.name().to_string());
+                        if let DataType::Struct(inner) = f.data_type() {
+                            current_schema = inner;
+                        }
+                    }
+                    None => {
+                        // Field name not found at this level -- keep remaining path
+                        // unchanged so validation reports the user's original input.
+                        normalized.extend(path[i..].iter().cloned());
+                        break;
+                    }
+                }
+            }
+            ColumnName::new(normalized.iter().map(|s| s.as_str()))
         })
         .collect()
 }
@@ -336,6 +344,9 @@ fn apply_data_layout(
         DataLayout::None => Ok(DataLayoutResult::default()),
 
         DataLayout::Clustered { columns } => {
+            // Normalize clustering column names to match schema casing. This allows users
+            // to specify clustering columns case-insensitively (e.g. schema has columns
+            // "A", "B", "C" and user clusters by "c", "a").
             let normalized = normalize_column_names_to_schema_casing(effective_schema, columns);
             validate_clustering_columns(effective_schema, &normalized)?;
 
@@ -740,7 +751,7 @@ impl CreateTableTransactionBuilder {
         let (effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
 
-        // Validate schema (non-empty, column names, data types, duplicates)
+        // Validate schema (non-empty, column names, duplicates)
         crate::schema::validation::validate_schema_for_create(
             &effective_schema,
             column_mapping_mode,
@@ -1516,7 +1527,7 @@ mod tests {
             ["EventDate"]
         );
 
-        // Nested path -> each segment normalized
+        // Nested path -> each field name normalized
         let cols = vec![ColumnName::new(["address", "city"])];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
