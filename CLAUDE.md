@@ -82,9 +82,9 @@ version. From it you build a `Scan` (reads) or `Transaction` (writes).
 `execute()` (simple), `scan_metadata()` (advanced/distributed),
 `parallel_scan_metadata()` (two-phase distributed log replay).
 
-**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Kernel provides `WriteContext`,
-assembles commit actions, enforces protocol compliance, delegates atomic commit to a
-`Committer`.
+**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Kernel provides `WriteContext`
+(via `partitioned_write_context` or `unpartitioned_write_context`), assembles commit
+actions, enforces protocol compliance, delegates atomic commit to a `Committer`.
 
 **Engine trait:** five handlers (`StorageHandler`, `JsonHandler`, `ParquetHandler`,
 `EvaluationHandler`, optional `MetricsReporter`). `DefaultEngine` lives in
@@ -114,6 +114,12 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   or inputs. Prefer `#[case]` over duplicating test functions. When parameters are
   independent and form a cartesian product, prefer `#[values]` over enumerating
   every combination with `#[case]`.
+- Actively look for rstest consolidation opportunities: when writing multiple tests
+  that share the same setup/flow and differ only in configuration and expected
+  outcome, write one parameterized rstest instead of separate functions. Also check
+  whether a new test duplicates the flow of an existing nearby test and should be
+  merged into it as a new `#[case]`. A common pattern is toggling a feature (e.g.
+  column mapping on/off) and asserting success vs. error.
 - Reuse helpers from `test_utils` instead of writing custom ones when possible.
 - **`add_commit` and table setup in tests:** `add_commit` takes a `table_root` string and
   resolves it to an absolute object-store path. The `table_root` must be a proper URL string

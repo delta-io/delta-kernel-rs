@@ -1,4 +1,6 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
+use delta_kernel_derive::internal_api;
+
 use crate::engine::arrow_utils::RowIndexBuilder;
 use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
@@ -15,6 +17,7 @@ use tracing::debug;
 mod tests;
 
 /// An extension trait for [`ArrowReaderBuilder`] that injects row group skipping capability.
+#[internal_api]
 pub(crate) trait ParquetRowGroupSkipping {
     /// Instructs the parquet reader to perform row group skipping, eliminating any row group whose
     /// stats prove that none of the group's rows can satisfy the given `predicate`.

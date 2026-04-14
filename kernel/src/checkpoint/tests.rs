@@ -151,7 +151,7 @@ fn test_create_last_checkpoint_data() -> DeltaResult<()> {
 
 /// TODO(#855): Merge copies and move to `test_utils`
 /// Create an in-memory store and return the store and the URL for the store's _delta_log directory.
-fn new_in_memory_store() -> (Arc<InMemory>, Url) {
+pub(super) fn new_in_memory_store() -> (Arc<InMemory>, Url) {
     (
         Arc::new(InMemory::new()),
         Url::parse("memory:///")
@@ -164,7 +164,7 @@ fn new_in_memory_store() -> (Arc<InMemory>, Url) {
 /// TODO(#855): Merge copies and move to `test_utils`
 /// Writes all actions to a _delta_log json commit file in the store.
 /// This function formats the provided filename into the _delta_log directory.
-async fn write_commit_to_store(
+pub(super) async fn write_commit_to_store(
     store: &Arc<InMemory>,
     actions: Vec<Action>,
     version: u64,
@@ -196,7 +196,7 @@ fn create_catalog_managed_protocol_action() -> Action {
 }
 
 /// Create a Protocol action with v2Checkpoint feature support
-fn create_v2_checkpoint_protocol_action() -> Action {
+pub(super) fn create_v2_checkpoint_protocol_action() -> Action {
     Action::Protocol(Protocol::try_new_modern(vec!["v2Checkpoint"], vec!["v2Checkpoint"]).unwrap())
 }
 
@@ -219,12 +219,12 @@ fn create_metadata_action_with_config(configuration: HashMap<String, String>) ->
 }
 
 /// Create a Metadata action with no configuration.
-fn create_metadata_action() -> Action {
+pub(super) fn create_metadata_action() -> Action {
     create_metadata_action_with_config(HashMap::new())
 }
 
 /// Create a simple Add action with the specified path (no stats)
-fn create_add_action(path: &str) -> Action {
+pub(super) fn create_add_action(path: &str) -> Action {
     Action::Add(Add {
         path: path.into(),
         data_change: true,
@@ -236,7 +236,7 @@ fn create_add_action(path: &str) -> Action {
 ///
 /// The remove action has deletion_timestamp set to i64::MAX to ensure the
 /// remove action is not considered expired during testing.
-fn create_remove_action(path: &str) -> Action {
+pub(super) fn create_remove_action(path: &str) -> Action {
     Action::Remove(Remove {
         path: path.into(),
         data_change: true,
@@ -859,7 +859,7 @@ fn create_metadata_with_stats_config(
 }
 
 /// Helper to create metadata action with stats settings and partition columns
-fn create_metadata_with_stats_config_and_partitions(
+pub(super) fn create_metadata_with_stats_config_and_partitions(
     write_stats_as_json: bool,
     write_stats_as_struct: bool,
     partition_columns: Vec<String>,

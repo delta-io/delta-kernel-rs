@@ -1,5 +1,8 @@
 //! A composable test table builder for delta-kernel-rs.
 //!
+//! The builder writes data by default (1 parquet file with 10 rows per commit). Override
+//! with [`TestTableBuilder::with_data`] when a test needs specific file/row counts.
+//!
 //! Provides three orthogonal axes for parameterized testing:
 //! - [`LogState`] -- what log files exist on disk (commits, checkpoints, CRC)
 //! - [`FeatureSet`] -- which Delta table features are enabled
@@ -38,7 +41,15 @@
 use std::fmt;
 use std::sync::Arc;
 
+use delta_kernel::arrow::array::{
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
+};
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::arrow_conversion::TryFromKernel;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::memory::InMemory;
@@ -178,6 +189,8 @@ pub struct TestTableBuilder {
     log_state: LogState,
     features: FeatureSet,
     schema: SchemaRef,
+    num_data_files: usize,
+    rows_per_file: usize,
 }
 
 impl Default for TestTableBuilder {
@@ -187,38 +200,67 @@ impl Default for TestTableBuilder {
 }
 
 impl TestTableBuilder {
-    /// Create a builder with sensible defaults: 1 commit, no features.
+    /// Create a builder with sensible defaults: 1 commit, no features, 1 data file
+    /// with 10 rows per commit.
     pub fn new() -> Self {
         Self {
             log_state: LogState::with_commits(1),
             features: FeatureSet::empty(),
             schema: default_schema(),
+            num_data_files: 1,
+            rows_per_file: 10,
         }
     }
 
     /// Set the log state (what files exist on disk).
-    pub fn log_state(mut self, s: LogState) -> Self {
+    pub fn with_log_state(mut self, s: LogState) -> Self {
         self.log_state = s;
         self
     }
 
     /// Set the table features.
-    pub fn features(mut self, f: FeatureSet) -> Self {
+    pub fn with_features(mut self, f: FeatureSet) -> Self {
         self.features = f;
         self
     }
 
     /// Override the default schema.
-    pub fn schema(mut self, s: SchemaRef) -> Self {
+    pub fn with_schema(mut self, s: SchemaRef) -> Self {
         self.schema = s;
         self
     }
 
+    /// Override the number of parquet data files per commit and rows per file. Defaults
+    /// are 1 file with 10 rows -- most tests don't need to call this.
+    ///
+    /// Note: for partitioned tables the file count is determined by the number of distinct
+    /// partition values, so `files_per_commit` is ignored in that case.
+    pub fn with_data(mut self, files_per_commit: usize, rows_per_file: usize) -> Self {
+        self.num_data_files = files_per_commit;
+        self.rows_per_file = rows_per_file;
+        self
+    }
+
     /// Build the table and return a [`TestTable`] handle to the store.
+    ///
+    /// Safe to call from both sync tests and `#[tokio::test]` -- uses a dedicated runtime
+    /// on a background thread to avoid panicking on nested runtimes.
     pub fn build(self) -> DeltaResult<TestTable> {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tokio::runtime::Runtime::new()
+                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?
+                    .block_on(self.build_async())
+            })
+            .join()
+            .expect("builder thread panicked")
+        })
+    }
+
+    async fn build_async(self) -> DeltaResult<TestTable> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
         let schema = self.schema;
 
         // Version 0: CreateTable
@@ -232,15 +274,22 @@ impl TestTableBuilder {
             );
         }
         let committed = builder
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
-            .commit(&engine)?
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
             .unwrap_committed();
         let mut snapshot = committed.post_commit_snapshot().unwrap().clone();
 
         // Data commits (versions 1..N)
         let total = self.log_state.num_versions();
-        for _v in 1..total {
-            let result = write_empty_commit(snapshot.clone(), &engine)?;
+        for v in 1..total {
+            let result = write_data_commit(
+                snapshot.clone(),
+                &engine,
+                self.num_data_files,
+                self.rows_per_file,
+                v,
+            )
+            .await?;
             snapshot = result
                 .unwrap_committed()
                 .post_commit_snapshot()
@@ -257,18 +306,125 @@ impl TestTableBuilder {
 }
 
 // ===========================================================================
-// Empty commit
+// Data commit via kernel write path
 // ===========================================================================
 
-/// Write an empty commit (no data files) using kernel's transaction path.
-fn write_empty_commit(
+/// Write a data commit using kernel's transaction + write_parquet path.
+/// Produces `num_files` parquet files with `rows_per_file` rows each. For partitioned
+/// tables, each partition value produces a separate file regardless of `num_files`.
+async fn write_data_commit(
     snapshot: Arc<Snapshot>,
-    engine: &dyn delta_kernel::Engine,
+    engine: &DefaultEngine<TokioBackgroundExecutor>,
+    num_files: usize,
+    rows_per_file: usize,
+    version: u64,
 ) -> DeltaResult<delta_kernel::transaction::CommitResult> {
-    let txn = snapshot
+    let logical_schema = snapshot.schema().clone();
+    let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(logical_schema.as_ref())
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+
+    let mut txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
-        .with_operation("WRITE".to_string());
+        .with_operation("WRITE".to_string())
+        .with_data_change(true);
+
+    let write_context = txn.unpartitioned_write_context()?;
+
+    for file_idx in 0..num_files {
+        let base = (version as i32 * 1000) + (file_idx as i32 * 100);
+        let columns: Vec<ArrayRef> = arrow_schema
+            .fields()
+            .iter()
+            .map(|f| generate_column(f.data_type(), rows_per_file, base))
+            .collect();
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns)
+            .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+
+        let add_files = engine
+            .write_parquet(&ArrowEngineData::new(batch), &write_context)
+            .await?;
+        txn.add_files(add_files);
+    }
+
     txn.commit(engine)
+}
+
+/// Generate a single column of data based on its Arrow type.
+/// Data is deterministic: values are derived from `base` (version * 1000 + file_idx * 100).
+fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayRef {
+    match arrow_type {
+        #[allow(unknown_lints, clippy::manual_is_multiple_of)]
+        ArrowDataType::Boolean => {
+            let values: Vec<bool> = (0..rows).map(|i| (base as usize + i) % 2 == 0).collect();
+            Arc::new(BooleanArray::from(values))
+        }
+        ArrowDataType::Int8 => {
+            let values: Vec<i8> = (0..rows).map(|i| ((base + i as i32) % 120) as i8).collect();
+            Arc::new(Int8Array::from(values))
+        }
+        ArrowDataType::Int16 => {
+            let values: Vec<i16> = (0..rows)
+                .map(|i| ((base + i as i32) % 30000) as i16)
+                .collect();
+            Arc::new(Int16Array::from(values))
+        }
+        ArrowDataType::Int32 => {
+            let values: Vec<i32> = (0..rows).map(|i| base + i as i32).collect();
+            Arc::new(Int32Array::from(values))
+        }
+        ArrowDataType::Int64 => {
+            let values: Vec<i64> = (0..rows).map(|i| (base + i as i32) as i64 * 1000).collect();
+            Arc::new(Int64Array::from(values))
+        }
+        ArrowDataType::Float32 => {
+            let values: Vec<f32> = (0..rows).map(|i| base as f32 + i as f32 * 0.5).collect();
+            Arc::new(Float32Array::from(values))
+        }
+        ArrowDataType::Float64 => {
+            let values: Vec<f64> = (0..rows).map(|i| base as f64 + i as f64 * 0.25).collect();
+            Arc::new(Float64Array::from(values))
+        }
+        ArrowDataType::Utf8 => {
+            let values: Vec<String> = (0..rows)
+                .map(|i| format!("val_{}", base + i as i32))
+                .collect();
+            Arc::new(StringArray::from(values))
+        }
+        ArrowDataType::Binary => {
+            let values: Vec<Vec<u8>> = (0..rows)
+                .map(|i| format!("bin_{}", base + i as i32).into_bytes())
+                .collect();
+            Arc::new(BinaryArray::from(
+                values.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+            ))
+        }
+        ArrowDataType::Date32 => {
+            let values: Vec<i32> = (0..rows).map(|i| 18000 + base + i as i32).collect();
+            Arc::new(Date32Array::from(values))
+        }
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            let values: Vec<i64> = (0..rows)
+                .map(|i| (18000 + base + i as i32) as i64 * 86_400_000_000)
+                .collect();
+            let array = TimestampMicrosecondArray::from(values);
+            match tz {
+                Some(tz) => Arc::new(array.with_timezone(tz.as_ref())),
+                None => Arc::new(array),
+            }
+        }
+        ArrowDataType::Decimal128(precision, scale) => {
+            let scale_factor = 10i128.pow(*scale as u32);
+            let values: Vec<i128> = (0..rows)
+                .map(|i| (base + i as i32) as i128 * scale_factor)
+                .collect();
+            Arc::new(
+                Decimal128Array::from(values)
+                    .with_precision_and_scale(*precision, *scale)
+                    .expect("valid decimal"),
+            )
+        }
+        other => panic!("unsupported Arrow type in test data generation: {other:?}"),
+    }
 }
 
 // ===========================================================================
@@ -328,8 +484,8 @@ impl fmt::Display for TestTable {
 /// Used by the `test_context!` macro and available for direct use in tests.
 pub fn test_table(log_state: LogState, feature_set: FeatureSet) -> TestTable {
     TestTableBuilder::new()
-        .log_state(log_state)
-        .features(feature_set)
+        .with_log_state(log_state)
+        .with_features(feature_set)
         .build()
         .expect("failed to build test table")
 }
@@ -428,7 +584,7 @@ mod tests {
     #[test]
     fn test_commits_only() -> DeltaResult<()> {
         let table = TestTableBuilder::new()
-            .log_state(LogState::with_commits(3))
+            .with_log_state(LogState::with_commits(3))
             .build()?;
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
@@ -454,6 +610,22 @@ mod tests {
             VersionTarget::AtVersion(v) => *v,
         };
         assert_eq!(snap.version(), expected);
+    }
+
+    #[test]
+    fn test_scan_with_data() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_commits(2))
+            .with_data(2, 5)
+            .build()?;
+        let engine: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+        let scan = snap.scan_builder().build()?;
+        let batches = crate::read_scan(&scan, engine)?;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 10);
+        Ok(())
     }
 
     #[test]

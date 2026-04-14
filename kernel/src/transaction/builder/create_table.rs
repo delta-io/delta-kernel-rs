@@ -33,7 +33,7 @@ use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
     ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_TYPE_WIDENING, SET_TRANSACTION_RETENTION_DURATION,
+    ENABLE_TYPE_WIDENING, PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -89,6 +89,8 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     APPEND_ONLY,
     // Set transaction retention duration: controls expiration of txn identifiers
     SET_TRANSACTION_RETENTION_DURATION,
+    // Parquet format version: controls the Parquet writer version for data files
+    PARQUET_FORMAT_VERSION,
 ];
 
 /// Ensures that no Delta table exists at the given path.
@@ -787,7 +789,7 @@ mod tests {
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_features::FeatureType;
-    use crate::table_properties::ENABLE_ICEBERG_COMPAT_V1;
+    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V1, PARQUET_FORMAT_VERSION};
     use crate::utils::test_utils::assert_result_error_with_message;
 
     fn test_schema() -> SchemaRef {
@@ -879,6 +881,19 @@ mod tests {
             validated.properties.get("custom.setting"),
             Some(&"value".to_string())
         );
+    }
+
+    #[test]
+    fn test_parquet_format_version_accepted() {
+        let properties =
+            HashMap::from([(PARQUET_FORMAT_VERSION.to_string(), "2.12.0".to_string())]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert_eq!(
+            validated.properties.get(PARQUET_FORMAT_VERSION),
+            Some(&"2.12.0".to_string()),
+        );
+        assert!(validated.reader_features.is_empty());
+        assert!(validated.writer_features.is_empty());
     }
 
     #[test]

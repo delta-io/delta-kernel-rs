@@ -110,10 +110,16 @@ pub(crate) struct LogSegment {
     pub end_version: Version,
     pub checkpoint_version: Option<Version>,
     pub log_root: Url,
-    /// Metadata from the `_last_checkpoint` hint file.
-    pub last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
     /// The set of log files found during listing.
     pub listed: LogSegmentFiles,
+
+    /// Metadata from the `_last_checkpoint` hint file.
+    ///
+    /// Note: This is only populated if the hint file was read during creation of this
+    /// log segment. The hint may describe a different checkpoint version than the one in this
+    /// segment. Callers should use explicit getters (such as [`Self::checkpoint_schema`]) rather
+    /// than reading this field directly.
+    last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
 }
 
 /// Returns the identifying leaf column path for a known action type, used to build IS NOT NULL
@@ -209,6 +215,33 @@ impl LogSegment {
         Ok(log_segment)
     }
 
+    /// Returns the checkpoint version from the `_last_checkpoint` hint
+    pub(crate) fn last_checkpoint_version(&self) -> Option<Version> {
+        self.last_checkpoint_metadata.as_ref().map(|m| m.version)
+    }
+
+    /// Returns the checkpoint schema from the `_last_checkpoint` hint when it is safe to use for
+    /// this segment's checkpoint parquet.
+    ///
+    /// Returns `None` if there is no hint, if the hint omitted `checkpointSchema`, if this segment
+    /// has no checkpoint on disk, or if the hint's checkpoint version does not match this segment's
+    /// checkpoint version.
+    pub(crate) fn checkpoint_schema(&self) -> Option<SchemaRef> {
+        let m = self.last_checkpoint_metadata.as_ref()?;
+        if Some(m.version) != self.checkpoint_version {
+            return None;
+        }
+        m.schema.clone()
+    }
+
+    /// Returns a copy of the stored `_last_checkpoint` hint summary.
+    ///
+    /// Prefer [`Self::checkpoint_schema`] or [`Self::last_checkpoint_version`] when requiring
+    /// individual values from the hint.
+    pub(crate) fn last_checkpoint_hint_summary(&self) -> Option<LastCheckpointHintSummary> {
+        self.last_checkpoint_metadata.clone()
+    }
+
     /// Succinct summary string for logging purposes.
     fn summary(&self) -> String {
         format!(
@@ -292,10 +325,7 @@ impl LogSegment {
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        // TODO(#2361): This is a bug -> checkpoint schema is being loaded from last_checkpoint
-        // hint file and stored in log_segment even if the checkpoint version from the hint file
-        // is newer than time_travel_version.
-        let last_checkpoint_metadata =
+        let last_checkpoint_summary =
             checkpoint_hint
                 .as_ref()
                 .map(|hint| LastCheckpointHintSummary {
@@ -341,7 +371,7 @@ impl LogSegment {
             listed_files,
             log_root,
             time_travel_version,
-            last_checkpoint_metadata,
+            last_checkpoint_summary,
         )
     }
 
@@ -717,10 +747,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
-        let hint_schema = self
-            .last_checkpoint_metadata
-            .as_ref()
-            .and_then(|m| m.schema.as_ref());
+        let hint_schema = self.checkpoint_schema();
 
         // All parts of a multi-part checkpoint belong to the same table version and follow
         // the same V1 spec, so reading any one part's schema is sufficient.
@@ -731,7 +758,8 @@ impl LogSegment {
         match &checkpoint.file_type {
             MultiPartCheckpoint { .. } => {
                 // Multi-part checkpoints are always V1 and never have sidecars.
-                let schema = Self::read_checkpoint_schema(engine, checkpoint, hint_schema)?;
+                let schema =
+                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
                 Ok((Some(schema), vec![]))
             }
             UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
@@ -743,7 +771,7 @@ impl LogSegment {
                 // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
                 // Check for sidecar column to distinguish.
                 let checkpoint_schema =
-                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema)?;
+                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
                 if checkpoint_schema.field(SIDECAR_NAME).is_some() {
                     self.read_sidecar_schema_and_files(engine, checkpoint, Some(&checkpoint_schema))
                 } else {

@@ -1,4 +1,6 @@
-//! Conversions from kernel schema types to arrow schema types.
+//! Conversions between kernel schema types and arrow schema types.
+
+pub mod scalar;
 
 use std::collections::HashMap;
 use std::sync::Arc;
