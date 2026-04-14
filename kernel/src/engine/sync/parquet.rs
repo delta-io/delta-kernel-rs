@@ -178,28 +178,9 @@ mod tests {
         let file_path = temp_dir.path().join("test.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
 
-        // Create test data
-        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(
-            RecordBatch::try_from_iter(vec![
-                (
-                    "id",
-                    Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
-                ),
-                (
-                    "name",
-                    Arc::new(StringArray::from(vec!["a", "b", "c"])) as Arc<dyn Array>,
-                ),
-            ])
-            .unwrap(),
-        ));
-
-        // Create iterator with single batch
-        let data_iter: Box<
-            dyn Iterator<Item = crate::DeltaResult<Box<dyn crate::EngineData>>> + Send,
-        > = Box::new(std::iter::once(Ok(engine_data)));
-
-        // Write the file
-        handler.write_parquet_file(url.clone(), data_iter).unwrap();
+        handler
+            .write_parquet_file(url.clone(), test_data_iter())
+            .unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());
