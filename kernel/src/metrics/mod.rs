@@ -80,16 +80,25 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
-/// An extension trait to add a convenience method for adding a layer that will send reports to a
-/// `MetricsReporter`
-pub trait WithMetricsReporterLayer: Subscriber {
-    /// Add a layer that will generate [`MetricEvent`]s. This is how you can register to get metric
-    /// reports if you prefer to consume things that way. For example, to write reports out as logs:
+/// Extension trait that adds [`with_metrics_reporter_layer`] to any compatible tracing subscriber.
+///
+/// Only implemented for subscribers that also implement [`LookupSpan`], which is required by
+/// [`ReportGeneratorLayer`] to store and retrieve per-span state.
+pub trait WithMetricsReporterLayer: Subscriber + for<'lookup> LookupSpan<'lookup> {
+    /// Wrap this subscriber with a [`ReportGeneratorLayer`] that converts tracing spans into
+    /// [`MetricEvent`]s and forwards them to `reporter`.
+    ///
+    /// # Example
+    ///
     /// ```
+    /// use std::sync::Arc;
+    /// use delta_kernel::metrics::{WithMetricsReporterLayer, LoggingMetricsReporter};
+    /// use tracing_subscriber::prelude::*;
+    ///
     /// tracing_subscriber::registry()
-    ///    .with_metrics_reporter_layer(
-    ///        Arc::new(LoggingMetricsReporter::new(tracing::Level::INFO))
-    ///    )
+    ///     .with_metrics_reporter_layer(
+    ///         Arc::new(LoggingMetricsReporter::new(tracing::Level::INFO))
+    ///     );
     /// ```
     fn with_metrics_reporter_layer(
         self,
@@ -97,10 +106,13 @@ pub trait WithMetricsReporterLayer: Subscriber {
     ) -> Layered<ReportGeneratorLayer, Self>
     where
         Self: Sized,
-        for<'lookup> Self: LookupSpan<'lookup>,
     {
         self.with(ReportGeneratorLayer::new(reporter))
     }
 }
 
-impl<S> WithMetricsReporterLayer for S where S: Subscriber {}
+impl<S> WithMetricsReporterLayer for S
+where
+    S: Subscriber,
+    for<'lookup> S: LookupSpan<'lookup>,
+{}

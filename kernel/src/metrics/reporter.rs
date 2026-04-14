@@ -41,7 +41,7 @@ impl LoggingMetricsReporter {
 
 impl MetricsReporter for LoggingMetricsReporter {
     fn report(&self, event: MetricEvent) {
-        // event! wants a constant, so we have to do this sillyness we also set the parent span to
+        // event! wants a constant, so we have to do this silliness we also set the parent span to
         // none so this just logs the report and not a bunch of context from the span that generated
         // the report
         match self.level {
@@ -81,16 +81,12 @@ impl EventVisitor {
     }
 
     fn set_duration(&mut self, target_duration: std::time::Duration) {
-        if let Some(event) = &mut self.event {
-            if let MetricEvent::LogSegmentLoaded { duration, .. } = event {
-                *duration = target_duration;
-            }
-            if let MetricEvent::ProtocolMetadataLoaded { duration, .. } = event {
-                *duration = target_duration;
-            }
-            if let MetricEvent::SnapshotCompleted { total_duration, .. } = event {
-                *total_duration = target_duration;
-            }
+        match &mut self.event {
+            Some(MetricEvent::LogSegmentLoaded { duration, .. }) => *duration = target_duration,
+            Some(MetricEvent::ProtocolMetadataLoaded { duration, .. }) => *duration = target_duration,
+            Some(MetricEvent::SnapshotCompleted { total_duration, .. }) => *total_duration = target_duration,
+            Some(MetricEvent::SnapshotFailed { duration, .. }) => *duration = target_duration,
+            _ => {}
         }
     }
 }
@@ -108,7 +104,7 @@ impl Visit for EventVisitor {
                 "num_commit_files" => *num_commit_files = value,
                 "num_checkpoint_files" => *num_checkpoint_files = value,
                 "num_compaction_files" => *num_compaction_files = value,
-                _ => warn!("Invalid field recorded on segment.read_metadata span"),
+                _ => warn!("Invalid field recorded on segment.for_snapshot span"),
             }
         }
 
@@ -474,10 +470,14 @@ where
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
-        // Store the start time when the span is entered
+        // Record the start time on first entry only. Spans that are entered and exited
+        // multiple times (e.g. iterator adapters) keep the timestamp from the first entry
+        // so that on_close measures elapsed wall time from the span's beginning.
         if let Some(span) = ctx.span(id) {
             let mut extensions = span.extensions_mut();
-            extensions.insert(Instant::now());
+            if extensions.get_mut::<Instant>().is_none() {
+                extensions.insert(Instant::now());
+            }
         }
     }
 

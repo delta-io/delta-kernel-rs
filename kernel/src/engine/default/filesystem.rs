@@ -16,11 +16,12 @@ use crate::object_store::path::Path;
 use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
-/// Iterator wrapper that emits metrics when exhausted
+/// Stream wrapper that emits a storage metric span when dropped.
 ///
-/// Generic over the inner iterator type and item type.
-/// The `event_fn` receives (duration, num_files, bytes_read) to construct the appropriate MetricEvent.
-/// Metrics are emitted either when the iterator is exhausted or when dropped.
+/// The span is always emitted on the thread that drops this iterator, which is the caller's
+/// thread.
+///
+/// Generic over the inner stream type and item type.
 struct MetricsIterator<I, T> {
     inner: I,
     name: &'static str,
@@ -41,8 +42,10 @@ impl<I, T> MetricsIterator<I, T> {
             _phantom: std::marker::PhantomData,
         }
     }
+}
 
-    fn emit_metrics_once(&mut self) {
+impl<I, T> Drop for MetricsIterator<I, T> {
+    fn drop(&mut self) {
         let duration = self.start.elapsed();
         let _span = tracing::span!(
             tracing::Level::INFO,
@@ -52,13 +55,7 @@ impl<I, T> MetricsIterator<I, T> {
             num_files = self.num_files,
             bytes_read = self.bytes_read,
             duration = duration.as_nanos() as u64,
-        ); // when this is dropped we emit
-    }
-}
-
-impl<I, T> Drop for MetricsIterator<I, T> {
-    fn drop(&mut self) {
-        self.emit_metrics_once();
+        );
     }
 }
 
@@ -76,10 +73,7 @@ where
                 }
                 Poll::Ready(Some(item))
             }
-            None => {
-                self.emit_metrics_once();
-                Poll::Ready(None)
-            }
+            None => Poll::Ready(None),
         }
     }
 }
@@ -99,10 +93,7 @@ where
                 }
                 Poll::Ready(Some(item))
             }
-            None => {
-                self.emit_metrics_once();
-                Poll::Ready(None)
-            }
+            None => Poll::Ready(None),
         }
     }
 }
