@@ -149,6 +149,46 @@ pub(crate) const COPY_COMPLETED_NAME: &str = "copy_completed";
 pub(crate) const LIST_COMPLETED_NAME: &str = "list_completed";
 pub(crate) const READ_COMPLETED_NAME: &str = "read_completed";
 
+// Span names for file-read events emitted by the JSON and Parquet handlers.
+const JSON_READ_COMPLETED_SPAN: &str = "json_read_completed";
+const PARQUET_READ_COMPLETED_SPAN: &str = "parquet_read_completed";
+
+/// Emit a `JsonReadCompleted` metric event via a tracing span.
+///
+/// Creates and immediately drops a span whose `on_close` hook will fire
+/// [`MetricEvent::JsonReadCompleted`] to any registered [`MetricsReporter`].
+///
+/// Call this once per [`crate::JsonHandler::read_json_files`] invocation, after the file list
+/// is known but before the iterator is consumed (i.e. at iterator exhaustion or drop).
+pub(crate) fn emit_json_read_completed(num_files: u64, bytes_read: u64) {
+    // Span name must match JSON_READ_COMPLETED_SPAN used in ReportGeneratorLayer::on_new_span.
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        "json_read_completed",
+        report = tracing::field::Empty,
+        num_files,
+        bytes_read,
+    );
+}
+
+/// Emit a `ParquetReadCompleted` metric event via a tracing span.
+///
+/// Creates and immediately drops a span whose `on_close` hook will fire
+/// [`MetricEvent::ParquetReadCompleted`] to any registered [`MetricsReporter`].
+///
+/// Call this once per [`crate::ParquetHandler::read_parquet_files`] invocation, after the file
+/// list is known but before the iterator is consumed (i.e. at iterator exhaustion or drop).
+pub(crate) fn emit_parquet_read_completed(num_files: u64, bytes_read: u64) {
+    // Span name must match PARQUET_READ_COMPLETED_SPAN used in ReportGeneratorLayer::on_new_span.
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        "parquet_read_completed",
+        report = tracing::field::Empty,
+        num_files,
+        bytes_read,
+    );
+}
+
 impl Visit for StorageEventTypeVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "name" {
@@ -166,6 +206,25 @@ impl Visit for StorageEventTypeVisitor {
             "num_files" => self.num_files = value,
             "bytes_read" => self.bytes_read = value,
             "duration" => self.duration = value,
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+}
+
+/// Visitor for extracting `num_files` and `bytes_read` from file-read spans.
+#[derive(Default)]
+struct FileReadVisitor {
+    num_files: u64,
+    bytes_read: u64,
+}
+
+impl Visit for FileReadVisitor {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "num_files" => self.num_files = value,
+            "bytes_read" => self.bytes_read = value,
             _ => {}
         }
     }
@@ -243,6 +302,22 @@ where
                         bytes_read: storage_visitor.bytes_read,
                     }),
                 }
+            }
+            JSON_READ_COMPLETED_SPAN => {
+                let mut v = FileReadVisitor::default();
+                attrs.record(&mut v);
+                Some(MetricEvent::JsonReadCompleted {
+                    num_files: v.num_files,
+                    bytes_read: v.bytes_read,
+                })
+            }
+            PARQUET_READ_COMPLETED_SPAN => {
+                let mut v = FileReadVisitor::default();
+                attrs.record(&mut v);
+                Some(MetricEvent::ParquetReadCompleted {
+                    num_files: v.num_files,
+                    bytes_read: v.bytes_read,
+                })
             }
             _ => None,
         };

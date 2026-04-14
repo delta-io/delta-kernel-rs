@@ -1,5 +1,4 @@
 //! Builder for creating [`Snapshot`] instances.
-use std::sync::Arc;
 // use std::time::Instant;
 
 use tracing::{info, instrument};

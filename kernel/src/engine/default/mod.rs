@@ -86,63 +86,62 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
 
-// TODO: reimplement using tracing spans instead of reporter
-// /// Wraps a [`FileDataReadResultIterator`] to emit a [`MetricEvent`] exactly once when the
-// /// iterator is either exhausted or dropped. Used by JSON and Parquet handlers to report
-// /// the number of files and bytes requested per `read_*_files` call.
-// pub(super) struct ReadMetricsIterator {
-//     inner: crate::FileDataReadResultIterator,
-//     reporter: Arc<dyn crate::metrics::MetricsReporter>,
-//     num_files: u64,
-//     bytes_read: u64,
-//     emitted: bool,
-//     make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
-// }
-//
-// impl ReadMetricsIterator {
-//     pub(super) fn new(
-//         inner: crate::FileDataReadResultIterator,
-//         reporter: Arc<dyn crate::metrics::MetricsReporter>,
-//         num_files: u64,
-//         bytes_read: u64,
-//         make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
-//     ) -> Self {
-//         Self {
-//             inner,
-//             reporter,
-//             num_files,
-//             bytes_read,
-//             emitted: false,
-//             make_event,
-//         }
-//     }
-//
-//     fn emit_once(&mut self) {
-//         if !self.emitted {
-//             self.emitted = true;
-//             self.reporter
-//                 .report((self.make_event)(self.num_files, self.bytes_read));
-//         }
-//     }
-// }
-//
-// impl Iterator for ReadMetricsIterator {
-//     type Item = crate::DeltaResult<Box<dyn crate::EngineData>>;
-//
-//     fn next(&mut self) -> Option<Self::Item> {
-//         let item = self.inner.next();
-//         if item.is_none() {
-//             self.emit_once();
-//         }
-//         item
-//     }
-// }
-//
-// impl Drop for ReadMetricsIterator {
-//     fn drop(&mut self) {
-//         self.emit_once();
-//     }
-// }
+/// Wraps a [`crate::FileDataReadResultIterator`] to emit a metrics event exactly once when the
+/// iterator is either exhausted or dropped.
+///
+/// Used by the JSON and Parquet handlers to report the number of files and bytes requested per
+/// `read_*_files` call. The `emit_fn` is called with `(num_files, bytes_read)` and is expected
+/// to create and immediately drop a tracing span, which triggers the `ReportGeneratorLayer` to
+/// fire the appropriate [`crate::metrics::MetricEvent`] to any registered reporter.
+pub(super) struct ReadMetricsIterator {
+    inner: crate::FileDataReadResultIterator,
+    num_files: u64,
+    bytes_read: u64,
+    emitted: bool,
+    emit_fn: fn(u64, u64),
+}
+
+impl ReadMetricsIterator {
+    pub(super) fn new(
+        inner: crate::FileDataReadResultIterator,
+        num_files: u64,
+        bytes_read: u64,
+        emit_fn: fn(u64, u64),
+    ) -> Self {
+        Self {
+            inner,
+            num_files,
+            bytes_read,
+            emitted: false,
+            emit_fn,
+        }
+    }
+
+    fn emit_once(&mut self) {
+        if !self.emitted {
+            self.emitted = true;
+            (self.emit_fn)(self.num_files, self.bytes_read);
+        }
+    }
+}
+
+impl Iterator for ReadMetricsIterator {
+    type Item = crate::DeltaResult<Box<dyn crate::EngineData>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.inner.next();
+        if item.is_none() {
+            self.emit_once();
+        }
+        item
+    }
+}
+
+impl Drop for ReadMetricsIterator {
+    fn drop(&mut self) {
+        self.emit_once();
+    }
+}
 
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {

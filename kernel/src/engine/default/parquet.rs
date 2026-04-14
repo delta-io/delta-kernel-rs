@@ -32,8 +32,7 @@ use crate::engine::arrow_utils::{
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::expressions::ColumnName;
-// TODO: reimplement using tracing spans instead of reporter
-// use crate::metrics::{MetricEvent, MetricsReporter};
+use crate::metrics::reporter::emit_parquet_read_completed;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
@@ -47,9 +46,6 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
     readahead: usize,
-    // TODO: reimplement using tracing spans instead of reporter
-    // /// Optional reporter for emitting [`MetricEvent::ParquetReadCompleted`] events.
-    // reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 /// Metadata of a data file (typically a parquet file).
@@ -150,7 +146,6 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             store,
             task_executor,
             readahead: 10,
-            // reporter: None, // TODO: reimplement using tracing spans
         }
     }
 
@@ -161,13 +156,6 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         self.readahead = readahead;
         self
     }
-
-    // TODO: reimplement using tracing spans instead of reporter
-    // /// Set a metrics reporter to receive [`MetricEvent::ParquetReadCompleted`] events.
-    // pub fn with_reporter(mut self, reporter: Option<Arc<dyn MetricsReporter>>) -> Self {
-    //     self.reporter = reporter;
-    //     self
-    // }
 
     // Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
     // metadata (where `<uuid>` is a generated UUIDv4).
@@ -315,6 +303,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        let num_files = files.len() as u64;
+        let bytes_read = files.iter().map(|f| f.size).sum();
         let future = read_parquet_files_impl(
             self.store.clone(),
             files.to_vec(),
@@ -322,24 +312,12 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             predicate,
         );
         let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
-        // TODO: reimplement using tracing spans instead of reporter
-        // if let Some(reporter) = &self.reporter {
-        //     let num_files = files.len() as u64;
-        //     let bytes_read = files.iter().map(|f| f.size).sum();
-        //     Ok(Box::new(super::ReadMetricsIterator::new(
-        //         inner,
-        //         reporter.clone(),
-        //         num_files,
-        //         bytes_read,
-        //         |num_files, bytes_read| MetricEvent::ParquetReadCompleted {
-        //             num_files,
-        //             bytes_read,
-        //         },
-        //     )))
-        // } else {
-        //     Ok(inner)
-        // }
-        Ok(inner)
+        Ok(Box::new(super::ReadMetricsIterator::new(
+            inner,
+            num_files,
+            bytes_read,
+            emit_parquet_read_completed,
+        )))
     }
 
     /// Writes engine data to a Parquet file at the specified location.
