@@ -21,6 +21,8 @@ use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
+#[cfg(feature = "nanosecond-timestamps")]
+use crate::table_features::schema_contains_timestamp_nanos;
 use crate::table_features::{
     assign_column_mapping_metadata, get_any_level_column_physical_name,
     get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
@@ -358,6 +360,19 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+/// Conditionally adds the `timestampNanos` feature to the protocol when the schema contains
+/// TimestampNanos columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
+fn maybe_enable_timestamp_nanos(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_contains_timestamp_nanos(schema) {
+        add_feature_to_lists(
+            TableFeature::TimestampNanos,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -717,6 +732,10 @@ impl CreateTableTransactionBuilder {
         // Schema-driven auto-enablement: detect types that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+
+        // Auto-enable timestampNanos feature if schema contains TimestampNanos columns
+        #[cfg(feature = "nanosecond-timestamps")]
+        maybe_enable_timestamp_nanos(&effective_schema, &mut validated);
 
         // Property-driven auto-enablement: check enablement properties
         maybe_auto_enable_property_driven_features(&mut validated);

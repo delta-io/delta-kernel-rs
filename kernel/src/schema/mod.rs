@@ -1480,6 +1480,9 @@ pub enum PrimitiveType {
     Timestamp,
     #[serde(rename = "timestamp_ntz")]
     TimestampNtz,
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[serde(rename = "timestamp_nanos")]
+    TimestampNanos,
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
 }
@@ -1586,6 +1589,8 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "date" => Ok(PrimitiveType::Date),
             "timestamp" => Ok(PrimitiveType::Timestamp),
             "timestamp_ntz" => Ok(PrimitiveType::TimestampNtz),
+            #[cfg(feature = "nanosecond-timestamps")]
+            "timestamp_nanos" => Ok(PrimitiveType::TimestampNanos),
             decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
                 // Parse decimal type
                 let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');
@@ -1635,6 +1640,8 @@ impl Display for PrimitiveType {
             PrimitiveType::Date => write!(f, "date"),
             PrimitiveType::Timestamp => write!(f, "timestamp"),
             PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
+            #[cfg(feature = "nanosecond-timestamps")]
+            PrimitiveType::TimestampNanos => write!(f, "timestamp_nanos"),
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
@@ -1769,7 +1776,8 @@ impl DataType {
     pub const DATE: Self = DataType::Primitive(PrimitiveType::Date);
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
-
+    #[cfg(feature = "nanosecond-timestamps")]
+    pub const TIMESTAMP_NANOS: Self = DataType::Primitive(PrimitiveType::TimestampNanos);
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
         Ok(PrimitiveType::decimal(precision, scale)?.into())

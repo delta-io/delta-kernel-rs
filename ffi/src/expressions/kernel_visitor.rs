@@ -347,6 +347,16 @@ pub extern "C" fn visit_expression_literal_timestamp(
     wrap_expression(state, Expression::literal(Scalar::Timestamp(value)))
 }
 
+#[cfg(feature = "nanosecond-timestamps")]
+/// visit a timestamp literal expression 'value' (i64 representing nanoseconds since unix epoch)
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_timestamp_nanos(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+) -> usize {
+    wrap_expression(state, Expression::literal(Scalar::TimestampNanos(value)))
+}
+
 /// visit a timestamp_ntz literal expression 'value' (i64 representing microseconds since unix epoch)
 #[no_mangle]
 pub extern "C" fn visit_expression_literal_timestamp_ntz(
@@ -443,6 +453,10 @@ pub(crate) enum NullTypeTag {
     /// WARNING: This variant MUST remain `= 12`. It is the only tag with special handling
     /// (precision/scale parameters), and C consumers key on the value `12` directly.
     Decimal = 12,
+    // Deliberately not feature gated, so this number allocation is there even
+    // if the feature is disabled.
+    /// EXPERIMENTAL. Null of type `timestamp_nanos` (nanoseconds since epoch, UTC-adjusted).
+    TimestampNanos = 13,
     /// Sentinel for non-primitive null types (struct, array, map, variant). Emitted by the
     /// kernel-to-engine visitor when the null's type is not a primitive. Engines that receive
     /// this tag should use opaque expressions or a schema visitor to obtain full type details.
@@ -470,6 +484,7 @@ impl TryFrom<u8> for NullTypeTag {
             10 => Ok(Self::Timestamp),
             11 => Ok(Self::TimestampNtz),
             12 => Ok(Self::Decimal),
+            13 => Ok(Self::TimestampNanos),
             255 => Ok(Self::NonPrimitive),
             other => Err(delta_kernel::Error::generic(format!(
                 "Unrecognized null type tag: {other}"
@@ -496,6 +511,8 @@ impl NullTypeTag {
                 PrimitiveType::String => (Self::String, 0, 0),
                 PrimitiveType::Binary => (Self::Binary, 0, 0),
                 PrimitiveType::Date => (Self::Date, 0, 0),
+                #[cfg(feature = "nanosecond-timestamps")]
+                PrimitiveType::TimestampNanos => (Self::TimestampNanos, 0, 0),
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
@@ -524,6 +541,12 @@ impl NullTypeTag {
             Self::String => Ok(DataType::STRING),
             Self::Binary => Ok(DataType::BINARY),
             Self::Date => Ok(DataType::DATE),
+            #[cfg(not(feature = "nanosecond-timestamps"))]
+            Self::TimestampNanos => Err(delta_kernel::Error::generic(
+                "`nanosecond-timestamps` Cargo feature not enabled",
+            )),
+            #[cfg(feature = "nanosecond-timestamps")]
+            Self::TimestampNanos => Ok(DataType::TIMESTAMP_NANOS),
             Self::Timestamp => Ok(DataType::TIMESTAMP),
             Self::TimestampNtz => Ok(DataType::TIMESTAMP_NTZ),
             Self::Decimal => Ok(DataType::Primitive(PrimitiveType::decimal(
@@ -830,13 +853,14 @@ mod tests {
     #[case(10, NullTypeTag::Timestamp)]
     #[case(11, NullTypeTag::TimestampNtz)]
     #[case(12, NullTypeTag::Decimal)]
+    #[case(13, NullTypeTag::TimestampNanos)]
     #[case(255, NullTypeTag::NonPrimitive)]
     fn try_from_u8_valid(#[case] value: u8, #[case] expected: NullTypeTag) {
         assert_eq!(NullTypeTag::try_from(value).unwrap(), expected);
     }
 
     #[rstest]
-    #[case(13)]
+    #[case(14)]
     #[case(42)]
     #[case(254)]
     fn try_from_u8_invalid(#[case] value: u8) {
@@ -862,7 +886,7 @@ mod tests {
     #[test]
     fn visit_null_unrecognized_tag_returns_error() {
         let mut state = KernelExpressionVisitorState::default();
-        assert!(visit_expression_literal_null_impl(&mut state, 13, 0, 0).is_err());
+        assert!(visit_expression_literal_null_impl(&mut state, 14, 0, 0).is_err());
     }
 
     #[test]

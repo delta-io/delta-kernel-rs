@@ -5,6 +5,8 @@ use itertools::Itertools;
 use tracing::debug;
 
 use crate::arrow::array::cast::AsArray;
+#[cfg(feature = "nanosecond-timestamps")]
+use crate::arrow::array::types::TimestampNanosecondType;
 use crate::arrow::array::types::{
     Date32Type, Decimal128Type, Float32Type, Float64Type, GenericStringType, Int16Type, Int32Type,
     Int64Type, Int8Type, TimestampMicrosecondType,
@@ -464,6 +466,13 @@ impl ArrowEngineData {
             &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => {
                 debug!("Pushing timestamp array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<TimestampMicrosecondType>()
+                    .map(|a| a as _)
+                    .ok_or("timestamp")
+            }
+            #[cfg(feature = "nanosecond-timestamps")]
+            &DataType::TIMESTAMP_NANOS => {
+                debug!("Pushing timestamp array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<TimestampNanosecondType>()
                     .map(|a| a as _)
                     .ok_or("timestamp")
             }
