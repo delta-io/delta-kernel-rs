@@ -1186,9 +1186,6 @@ pub struct AddActionRowTracking {
 
 /// Reads all add actions from a commit and returns their row tracking fields, sorted by
 /// `baseRowId` for deterministic ordering.
-///
-/// Use this instead of reading raw commit JSON when verifying that row tracking fields
-/// (`baseRowId`, `defaultRowCommitVersion`) are correctly assigned to add actions.
 pub fn get_row_tracking_add_actions(
     table_url: &Url,
     version: u64,
@@ -1214,10 +1211,7 @@ pub struct MaterializedRowTrackingColumnNames {
 }
 
 /// Reads the materialized row tracking column name properties from a commit's metadata action.
-///
 /// These properties are table properties stored in the metadata `configuration` map.
-/// They are inaccessible via the public snapshot API because `TableConfiguration::table_properties`
-/// is `pub(crate)`. Use this helper instead of parsing commit JSON directly in tests.
 pub fn get_materialized_row_tracking_column_names(
     table_url: &Url,
     version: u64,

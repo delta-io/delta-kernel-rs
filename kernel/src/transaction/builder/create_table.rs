@@ -185,10 +185,10 @@ fn add_feature_to_lists(
     }
 }
 
-/// Test-only helper that validates clustering columns, then adds the `DomainMetadata` and
-/// `ClusteredTable` features directly and creates the domain metadata action. Unlike the
-/// production path (`apply_data_layout`), this adds `DomainMetadata` directly rather than
-/// relying on inline dependency handling.
+/// Test-only helper for clustering support during table creation.
+///
+/// Validates clustering columns, adds the `DomainMetadata` and `ClusteredTable` features
+/// directly, and creates the domain metadata action.
 #[cfg(test)]
 fn validate_clustering_and_make_domain_metadata(
     logical_schema: &SchemaRef,
