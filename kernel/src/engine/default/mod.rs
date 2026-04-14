@@ -351,7 +351,7 @@ trait UrlExt {
 
 impl UrlExt for Url {
     fn is_presigned(&self) -> bool {
-        // Presigned URL signature keys, one per supported cloud/vendor:
+        // We search a URL query string for these keys to see if we should consider it a presigned URL:
         // - AWS: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
         // - Cloudflare R2: https://developers.cloudflare.com/r2/api/s3/presigned-urls/
         // - Azure Blob (SAS): https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas#version-2020-12-06-and-later
