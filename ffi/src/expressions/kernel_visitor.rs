@@ -536,12 +536,12 @@ impl NullTypeTag {
 
 /// Visit a typed null literal expression.
 ///
-/// The `type_tag` identifies the data type (see [`NullTypeTag`]). For decimal nulls
+/// The `type_tag` identifies the data type using the `NullTypeTag` encoding. For decimal nulls
 /// (`type_tag == 12`), `precision` and `scale` specify the decimal type parameters; for all
 /// other types, callers should pass 0 for both.
 ///
-/// Returns an error if the type tag is unrecognized, if the tag is
-/// [`NonPrimitive`](NullTypeTag::NonPrimitive), or if the decimal precision/scale is invalid.
+/// Returns an error if the type tag is unrecognized, if the tag is `NonPrimitive` (255), or
+/// if the decimal precision/scale is invalid.
 #[no_mangle]
 pub extern "C" fn visit_expression_literal_null(
     state: &mut KernelExpressionVisitorState,

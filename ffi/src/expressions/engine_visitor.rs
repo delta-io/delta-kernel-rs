@@ -131,10 +131,10 @@ pub struct EngineExpressionVisitor {
     ),
     /// Visits a typed null value belonging to the list identified by `sibling_list_id`.
     ///
-    /// The `type_tag` identifies the data type (see [`NullTypeTag`]). For decimal nulls
-    /// (`type_tag == 12`), `precision` and `scale` carry the decimal type parameters; for all
-    /// other types, they are zero. See [`NullTypeTag::NonPrimitive`] for non-primitive null
-    /// types.
+    /// The `type_tag` identifies the data type using the `NullTypeTag` encoding. For decimal
+    /// nulls (`type_tag == 12`), `precision` and `scale` carry the decimal type parameters;
+    /// for all other types, they are zero. Non-primitive types (struct, array, map, variant)
+    /// use `type_tag == 255`.
     pub visit_literal_null: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
