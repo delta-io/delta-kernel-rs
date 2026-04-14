@@ -120,7 +120,7 @@ impl SnapshotBuilder {
     #[instrument(
         name = "snap.build",
         skip_all,
-        fields(path = %self.table_path()),
+        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = tracing::field::Empty),
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
@@ -143,6 +143,7 @@ impl SnapshotBuilder {
 
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
         let operation_id = MetricId::new();
+        tracing::Span::current().record("operation_id", tracing::field::display(operation_id));
 
         // Pre-build validations for catalog-managed tables
         Self::validate_catalog_managed_build_inputs(version, max_catalog_version, &log_tail)?;
@@ -188,10 +189,14 @@ impl SnapshotBuilder {
         };
 
         // Post-build validations for catalog-managed tables
-        result.and_then(|snapshot| {
+        let result = result.and_then(|snapshot| {
             Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
             Ok(snapshot)
-        })
+        });
+        if let Ok(ref snapshot) = result {
+            tracing::Span::current().record("version", snapshot.version());
+        }
+        result
     }
 
     // ===== Catalog-managed Validations =====
@@ -318,15 +323,20 @@ impl SnapshotBuilder {
 mod tests {
     use std::sync::Arc;
 
+    use std::time::Duration;
+
     use crate::engine::default::{
         executor::tokio::TokioBackgroundExecutor, DefaultEngine, DefaultEngineBuilder,
     };
+    use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
+    use crate::utils::test_utils::CapturingReporter;
     use itertools::Itertools;
     use serde_json::json;
     use test_utils::{actions_to_string, add_commit, TestAction};
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
     use super::*;
 
@@ -434,71 +444,156 @@ mod tests {
         Ok(())
     }
 
-    // TODO: reimplement these tests using tracing-based metrics instead of reporter
-    // fn setup_test_with_reporter() -> (
-    //     Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    //     Arc<DynObjectStore>,
-    //     String,
-    //     Arc<CapturingReporter>,
-    // ) {
-    //     let table_root = String::from("memory:///");
-    //     let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
-    //     let reporter = Arc::new(CapturingReporter::default());
-    //     let engine = Arc::new(
-    //         DefaultEngineBuilder::new(store.clone())
-    //             .with_metrics_reporter(reporter.clone())
-    //             .build(),
-    //     );
-    //     (engine, store, table_root, reporter)
-    // }
-    //
-    // fn assert_has_event(reporter: &CapturingReporter, pred: fn(&MetricEvent) -> bool, msg: &str) {
-    //     let events = reporter.events();
-    //     assert!(events.iter().any(pred), "{msg}");
-    // }
-    //
-    // fn assert_no_event(reporter: &CapturingReporter, pred: fn(&MetricEvent) -> bool, msg: &str) {
-    //     let events = reporter.events();
-    //     assert!(!events.iter().any(pred), "{msg}");
-    // }
-    //
-    // fn is_snapshot_completed(e: &MetricEvent) -> bool {
-    //     matches!(e, MetricEvent::SnapshotCompleted { .. })
-    // }
-    //
-    // fn is_snapshot_failed(e: &MetricEvent) -> bool {
-    //     matches!(e, MetricEvent::SnapshotFailed { .. })
-    // }
-    //
-    // #[test_log::test(tokio::test)]
-    // async fn snapshot_failed_emits_metric_on_error() {
-    //     let (engine, store, table_root, reporter) = setup_test_with_reporter();
-    //     // Write a commit with an unsupported schema type to force a build failure
-    //     let commit0_data = [...];
-    //     let path = Path::from("_delta_log/00000000000000000000.json");
-    //     store.put(&path, commit0_data.into()).await.unwrap();
-    //     let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
-    //     assert!(result.is_err());
-    //     assert_has_event(&reporter, is_snapshot_failed, "expected a SnapshotFailed event");
-    //     assert_no_event(&reporter, is_snapshot_completed, "should not emit SnapshotCompleted on failure");
-    // }
-    //
-    // #[test_log::test(tokio::test)]
-    // async fn snapshot_update_from_existing_emits_metric() {
-    //     // Tests that SnapshotCompleted is emitted with correct version and non-zero duration
-    //     // after incremental snapshot update via SnapshotBuilder::new_from.
-    // }
-    //
-    // #[test_log::test(tokio::test)]
-    // async fn snapshot_update_to_earlier_version_emits_failed_metric() {
-    //     // Tests that SnapshotFailed is emitted when updating to an earlier version.
-    // }
-    //
-    // #[test_log::test(tokio::test)]
-    // async fn snapshot_completed_duration_includes_log_segment_loading() {
-    //     // Tests that SnapshotCompleted.total_duration >= LogSegmentLoaded.duration,
-    //     // and that exactly one SnapshotCompleted event is emitted.
-    // }
+    fn measuring_reporter() -> (Arc<CapturingReporter>, tracing::subscriber::DefaultGuard) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let guard = tracing_subscriber::registry()
+            .with_metrics_reporter_layer(reporter.clone())
+            .set_default();
+        (reporter, guard)
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn snapshot_failed_emits_metric_on_error() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+
+        // Unsupported schema type forces a build failure
+        let protocol = json!({"minReaderVersion": 1, "minWriterVersion": 2});
+        let metadata = json!({
+            "id": "test-table-id",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": r#"{"type":"struct","fields":[{"name":"id","type":"interval second","nullable":true,"metadata":{}}]}"#,
+            "partitionColumns": [],
+            "configuration": {},
+            "createdTime": 1587968585495i64
+        });
+        let commit0_data = [json!({"protocol": protocol}), json!({"metaData": metadata})]
+            .iter()
+            .map(ToString::to_string)
+            .collect_vec()
+            .join("\n");
+        store
+            .put(
+                &Path::from("_delta_log/00000000000000000000.json"),
+                commit0_data.into(),
+            )
+            .await?;
+
+        let (reporter, _guard) = measuring_reporter();
+        let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
+        assert!(result.is_err());
+
+        let events = reporter.events();
+        assert!(
+            events.iter().any(|e| matches!(e, MetricEvent::SnapshotFailed { .. })),
+            "expected SnapshotFailed event on build failure"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. })),
+            "should not emit SnapshotCompleted on failure"
+        );
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn snapshot_update_from_existing_emits_metric() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (engine, store, table_root) = setup_test();
+        create_table(&store, &table_root).await?;
+
+        // Build v0 snapshot before installing the reporter so only the update is measured
+        let snap_v0 = SnapshotBuilder::new_for(table_root)
+            .at_version(0)
+            .build(engine.as_ref())?;
+        assert_eq!(snap_v0.version(), 0);
+
+        let (reporter, _guard) = measuring_reporter();
+
+        let snap_v1 = SnapshotBuilder::new_from(snap_v0).build(engine.as_ref())?;
+        assert_eq!(snap_v1.version(), 1);
+
+        let events = reporter.events();
+        let (version, total_duration) = events
+            .iter()
+            .find_map(|e| {
+                if let MetricEvent::SnapshotCompleted { version, total_duration, .. } = e {
+                    Some((*version, *total_duration))
+                } else {
+                    None
+                }
+            })
+            .expect("expected SnapshotCompleted event");
+        assert_eq!(version, 1, "version should match the updated snapshot");
+        assert!(total_duration > Duration::ZERO, "total_duration should be non-zero");
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn snapshot_update_to_earlier_version_emits_failed_metric(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        create_table(&store, &table_root).await?;
+
+        // Build v1 snapshot before installing the reporter
+        let snap_v1 = SnapshotBuilder::new_for(table_root).build(engine.as_ref())?;
+        assert_eq!(snap_v1.version(), 1);
+
+        let (reporter, _guard) = measuring_reporter();
+
+        let result = SnapshotBuilder::new_from(snap_v1)
+            .at_version(0)
+            .build(engine.as_ref());
+        assert!(result.is_err(), "updating to an earlier version should fail");
+
+        let events = reporter.events();
+        assert!(
+            events.iter().any(|e| matches!(e, MetricEvent::SnapshotFailed { .. })),
+            "expected SnapshotFailed when version update goes backwards"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. })),
+            "should not emit SnapshotCompleted when version update fails"
+        );
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn snapshot_completed_total_duration_exceeds_log_segment_load_duration(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        create_table(&store, &table_root).await?;
+
+        let (reporter, _guard) = measuring_reporter();
+        let _snap = SnapshotBuilder::new_for(table_root).build(engine.as_ref())?;
+
+        let events = reporter.events();
+        let total_duration = events
+            .iter()
+            .find_map(|e| {
+                if let MetricEvent::SnapshotCompleted { total_duration, .. } = e {
+                    Some(*total_duration)
+                } else {
+                    None
+                }
+            })
+            .expect("expected SnapshotCompleted event");
+        let segment_duration = events
+            .iter()
+            .find_map(|e| {
+                if let MetricEvent::LogSegmentLoaded { duration, .. } = e {
+                    Some(*duration)
+                } else {
+                    None
+                }
+            })
+            .expect("expected LogSegmentLoaded event");
+
+        assert!(total_duration > Duration::ZERO, "total_duration should be non-zero");
+        assert!(
+            total_duration >= segment_duration,
+            "SnapshotCompleted.total_duration ({total_duration:?}) should be >= LogSegmentLoaded.duration ({segment_duration:?})"
+        );
+        Ok(())
+    }
 
     mod catalog_managed_tests {
         use super::*;

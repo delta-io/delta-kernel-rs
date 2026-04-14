@@ -171,8 +171,8 @@ impl Snapshot {
     /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
     /// snapshot to a later version.
     ///
-    /// Reports metrics: `SnapshotCompleted` or `SnapshotFailed`.
-    #[instrument(name = "snap.completed", err, fields(report, version, operation_id = %operation_id), skip(engine, target_version))]
+    ///
+    #[instrument(err, fields(version, operation_id = %operation_id), skip(engine, target_version))]
     fn try_new_from(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
@@ -343,6 +343,7 @@ impl Snapshot {
             old_log_segment.last_checkpoint_hint_summary(),
         )?;
 
+        tracing::Span::current().record("version", table_configuration.version());
         Ok(Arc::new(Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
@@ -374,8 +375,8 @@ impl Snapshot {
 
     /// Create a new [`Snapshot`] instance.
     ///
-    /// Reports metrics: `SnapshotCompleted` or `SnapshotFailed`.
-    #[instrument(err, name = "snap.completed", fields(report, version, operation_id = %operation_id), skip(engine))]
+    ///
+    #[instrument(err, fields(version, operation_id = %operation_id), skip(engine))]
     fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,

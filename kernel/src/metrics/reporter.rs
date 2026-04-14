@@ -110,7 +110,7 @@ impl Visit for EventVisitor {
         {
             match field.name() {
                 "version" => *version = value,
-                _ => warn!("Invalid field recorded on snap.completed span"),
+                _ => warn!("Invalid field recorded on snap.build span"),
             }
         }
     }
@@ -274,7 +274,7 @@ where
                 operation_id: MetricId(new_span_visitor.uuid),
                 duration: std::time::Duration::default(),
             }),
-            "snap.completed" => Some(MetricEvent::SnapshotCompleted {
+            "snap.build" => Some(MetricEvent::SnapshotCompleted {
                 operation_id: MetricId(new_span_visitor.uuid),
                 version: 0,
                 total_duration: std::time::Duration::default(),
