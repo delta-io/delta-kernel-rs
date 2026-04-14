@@ -7,13 +7,17 @@ use tempfile::tempdir;
 use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
 use url::Url;
 
+use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::action_reconciliation::{
     deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
 use crate::arrow::array::{create_array, Array, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{DataType, Field, Schema};
-use crate::checkpoint::{create_last_checkpoint_data, CHECKPOINT_ACTIONS_SCHEMA_V2};
+use crate::checkpoint::{
+    create_last_checkpoint_data, CheckpointActionStats, CheckpointWriter,
+    CHECKPOINT_ACTIONS_SCHEMA_V2,
+};
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
@@ -247,6 +251,19 @@ pub(super) fn create_remove_action(path: &str) -> Action {
     })
 }
 
+fn try_finalize_checkpoint(
+    writer: CheckpointWriter,
+    engine: &dyn crate::Engine,
+    metadata: &FileMeta,
+    data_iter: ActionReconciliationIterator,
+) -> DeltaResult<()> {
+    let state = data_iter.state();
+    drop(data_iter);
+    let state = Arc::into_inner(state).expect("no other Arc references");
+    let stats = CheckpointActionStats::from_reconciliation_state(state)?;
+    writer.finalize(engine, metadata, &stats)
+}
+
 /// Helper to verify the contents of the `_last_checkpoint` file
 async fn assert_last_checkpoint_contents(
     store: &Arc<InMemory>,
@@ -341,7 +358,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, &data_iter.state())?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
     // Asserts the checkpoint file contents:
     // - version: latest version (2)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action
@@ -409,7 +426,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, &data_iter.state())?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
     // Asserts the checkpoint file contents:
     // - version: specified version (0)
     // - size: 1 metadata + 1 protocol
@@ -442,20 +459,15 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
 
     /* The returned data iterator has batches that we do not consume */
 
-    let size_in_bytes = 10;
-    let metadata = FileMeta {
-        location: Url::parse("memory:///fake_path_2")?,
-        last_modified: 0,
-        size: size_in_bytes,
-    };
-
-    // Attempt to finalize the checkpoint with an iterator that has not been fully consumed
-    let err = writer
-        .finalize(&engine, &metadata, &data_iter.state())
-        .expect_err("finalize should fail");
-    assert!(
-        err.to_string().contains("Error writing checkpoint: The checkpoint data iterator must be fully consumed and written to storage before calling finalize")
-    );
+    // Attempting to build CheckpointActionStats from a non-exhausted state should fail
+    let state = data_iter.state();
+    drop(data_iter);
+    let state = Arc::into_inner(state).expect("no other Arc references");
+    let err = CheckpointActionStats::from_reconciliation_state(state)
+        .expect_err("from_reconciliation_state should fail on non-exhausted iterator");
+    assert!(err
+        .to_string()
+        .contains("the reconciliation iterator has not been fully exhausted"),);
 
     Ok(())
 }
@@ -527,7 +539,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, &data_iter.state())?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
     // Asserts the checkpoint file contents:
     // - version: latest version (1)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action + 1 checkpointMetadata
