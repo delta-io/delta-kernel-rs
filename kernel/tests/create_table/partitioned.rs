@@ -11,19 +11,24 @@ use test_utils::test_table_setup;
 
 use super::partition_test_schema;
 
-#[test]
-fn test_create_table_partitioned_basic() -> DeltaResult<()> {
+use rstest::rstest;
+
+#[rstest]
+#[case::exact_casing("date")]
+#[case::mismatched_casing("DATE")]
+fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> DeltaResult<()> {
     let schema = partition_test_schema()?;
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let _ = create_table(&table_path, schema, "Test/1.0")
-        .with_data_layout(DataLayout::partitioned(["date"]))
+        .with_data_layout(DataLayout::partitioned([partition_col]))
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
 
+    // Partition column should be stored matching the casing in the schema
     let partition_cols = snapshot.table_configuration().partition_columns();
     assert_eq!(partition_cols, &["date"]);
 
