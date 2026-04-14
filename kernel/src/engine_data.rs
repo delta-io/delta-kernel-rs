@@ -227,6 +227,8 @@ macro_rules! impl_default_get {
 pub trait GetData<'a> {
     impl_default_get!(
         (get_bool, bool),
+        (get_byte, i8),
+        (get_short, i16),
         (get_int, i32),
         (get_long, i64),
         (get_float, f32),
@@ -254,6 +256,8 @@ macro_rules! impl_null_get {
 impl<'a> GetData<'a> for () {
     impl_null_get!(
         (get_bool, bool),
+        (get_byte, i8),
+        (get_short, i16),
         (get_int, i32),
         (get_long, i64),
         (get_float, f32),
@@ -297,6 +301,8 @@ macro_rules! impl_typed_get_data {
 // Use get_date/get_timestamp directly instead of through TypedGetData.
 impl_typed_get_data!(
     (get_bool, bool),
+    (get_byte, i8),
+    (get_short, i16),
     (get_int, i32),
     (get_long, i64),
     (get_float, f32),
