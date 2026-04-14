@@ -1,11 +1,9 @@
 //! Builder for creating [`Snapshot`] instances.
-// use std::time::Instant;
 
 use tracing::{info, instrument};
 
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
-// use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::metrics::MetricId;
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;

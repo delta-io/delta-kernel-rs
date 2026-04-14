@@ -170,8 +170,6 @@ impl Snapshot {
     /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
     /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
     /// snapshot to a later version.
-    ///
-    ///
     #[instrument(err, fields(version, operation_id = %operation_id), skip(engine, target_version))]
     fn try_new_from(
         existing_snapshot: Arc<Snapshot>,
@@ -374,8 +372,6 @@ impl Snapshot {
     }
 
     /// Create a new [`Snapshot`] instance.
-    ///
-    ///
     #[instrument(err, fields(version, operation_id = %operation_id), skip(engine))]
     fn try_new_from_log_segment(
         location: Url,

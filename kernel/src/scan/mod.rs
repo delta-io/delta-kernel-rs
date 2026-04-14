@@ -788,6 +788,7 @@ impl Scan {
 
         let on_complete = move || {
             let event = metrics.to_event(operation_id, ScanType::Full, start.elapsed());
+            info!(%event);
             emit_scan_metadata_completed(&event);
         };
         Ok(iter.into_iter().flatten().on_complete(on_complete))

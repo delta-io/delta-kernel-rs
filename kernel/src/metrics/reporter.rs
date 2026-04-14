@@ -26,13 +26,14 @@ pub trait MetricsReporter: Send + Sync + std::fmt::Debug {
     fn report(&self, event: MetricEvent);
 }
 
-/// A metrics reporter that will just log things at the specified level
+/// A [`MetricsReporter`] that logs each event as a tracing event at the configured level.
 #[derive(Debug)]
 pub struct LoggingMetricsReporter {
     level: Level,
 }
 
 impl LoggingMetricsReporter {
+    /// Create a new reporter that logs each [`MetricEvent`] at the given tracing level.
     pub fn new(level: Level) -> Self {
         LoggingMetricsReporter { level }
     }
@@ -53,11 +54,18 @@ impl MetricsReporter for LoggingMetricsReporter {
     }
 }
 
+/// A [`tracing_subscriber::Layer`] that converts tracing spans into [`MetricEvent`]s and
+/// forwards them to a registered [`MetricsReporter`].
+///
+/// Typically added to a subscriber via [`WithMetricsReporterLayer::with_metrics_reporter_layer`]
+/// rather than constructed directly.
+#[derive(Debug)]
 pub struct ReportGeneratorLayer {
     reporter: Arc<dyn MetricsReporter>,
 }
 
 impl ReportGeneratorLayer {
+    /// Create a new layer that forwards metric events to the given reporter.
     pub fn new(reporter: Arc<dyn MetricsReporter>) -> Self {
         ReportGeneratorLayer { reporter }
     }
