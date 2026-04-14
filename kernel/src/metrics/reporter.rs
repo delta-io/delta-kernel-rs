@@ -152,6 +152,7 @@ pub(crate) const READ_COMPLETED_NAME: &str = "read_completed";
 // Span names for file-read events emitted by the JSON and Parquet handlers.
 const JSON_READ_COMPLETED_SPAN: &str = "json_read_completed";
 const PARQUET_READ_COMPLETED_SPAN: &str = "parquet_read_completed";
+const SCAN_METADATA_COMPLETED_SPAN: &str = "scan.metadata_completed";
 
 /// Emit a `JsonReadCompleted` metric event via a tracing span.
 ///
@@ -187,6 +188,117 @@ pub(crate) fn emit_parquet_read_completed(num_files: u64, bytes_read: u64) {
         num_files,
         bytes_read,
     );
+}
+
+/// Emit a `ScanMetadataCompleted` metric event via a tracing span.
+///
+/// Creates and immediately drops a span whose `on_close` hook will fire
+/// [`MetricEvent::ScanMetadataCompleted`] to any registered [`MetricsReporter`].
+///
+/// The `event` must be a [`MetricEvent::ScanMetadataCompleted`] variant; other variants are
+/// ignored. Call this when the scan metadata iterator is exhausted or dropped.
+pub(crate) fn emit_scan_metadata_completed(event: &MetricEvent) {
+    // Span name must match SCAN_METADATA_COMPLETED_SPAN used in ReportGeneratorLayer::on_new_span.
+    let MetricEvent::ScanMetadataCompleted {
+        operation_id,
+        scan_type,
+        total_duration,
+        num_add_files_seen,
+        num_active_add_files,
+        num_remove_files_seen,
+        num_non_file_actions,
+        num_predicate_filtered,
+        peak_hash_set_size,
+        dedup_visitor_time_ms,
+        predicate_eval_time_ms,
+    } = event
+    else {
+        return;
+    };
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        "scan.metadata_completed",
+        report = tracing::field::Empty,
+        operation_id = %operation_id,
+        scan_type = %scan_type,
+        total_duration_ns = total_duration.as_nanos() as u64,
+        num_add_files_seen = *num_add_files_seen,
+        num_active_add_files = *num_active_add_files,
+        num_remove_files_seen = *num_remove_files_seen,
+        num_non_file_actions = *num_non_file_actions,
+        num_predicate_filtered = *num_predicate_filtered,
+        peak_hash_set_size = *peak_hash_set_size as u64,
+        dedup_visitor_time_ms = *dedup_visitor_time_ms,
+        predicate_eval_time_ms = *predicate_eval_time_ms,
+    );
+}
+
+#[derive(Default)]
+struct ScanMetadataVisitor {
+    operation_id: Uuid,
+    scan_type_str: String,
+    total_duration_ns: u64,
+    num_add_files_seen: u64,
+    num_active_add_files: u64,
+    num_remove_files_seen: u64,
+    num_non_file_actions: u64,
+    num_predicate_filtered: u64,
+    peak_hash_set_size: u64,
+    dedup_visitor_time_ms: u64,
+    predicate_eval_time_ms: u64,
+}
+
+impl ScanMetadataVisitor {
+    fn into_event(self) -> MetricEvent {
+        use crate::metrics::ScanType;
+        let scan_type = match self.scan_type_str.as_str() {
+            "sequential" => ScanType::SequentialPhase,
+            "parallel" => ScanType::ParallelPhase,
+            _ => ScanType::Full,
+        };
+        MetricEvent::ScanMetadataCompleted {
+            operation_id: MetricId(self.operation_id),
+            scan_type,
+            total_duration: std::time::Duration::from_nanos(self.total_duration_ns),
+            num_add_files_seen: self.num_add_files_seen,
+            num_active_add_files: self.num_active_add_files,
+            num_remove_files_seen: self.num_remove_files_seen,
+            num_non_file_actions: self.num_non_file_actions,
+            num_predicate_filtered: self.num_predicate_filtered,
+            peak_hash_set_size: self.peak_hash_set_size as usize,
+            dedup_visitor_time_ms: self.dedup_visitor_time_ms,
+            predicate_eval_time_ms: self.predicate_eval_time_ms,
+        }
+    }
+}
+
+impl Visit for ScanMetadataVisitor {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "total_duration_ns" => self.total_duration_ns = value,
+            "num_add_files_seen" => self.num_add_files_seen = value,
+            "num_active_add_files" => self.num_active_add_files = value,
+            "num_remove_files_seen" => self.num_remove_files_seen = value,
+            "num_non_file_actions" => self.num_non_file_actions = value,
+            "num_predicate_filtered" => self.num_predicate_filtered = value,
+            "peak_hash_set_size" => self.peak_hash_set_size = value,
+            "dedup_visitor_time_ms" => self.dedup_visitor_time_ms = value,
+            "predicate_eval_time_ms" => self.predicate_eval_time_ms = value,
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let s = format!("{:?}", value);
+        match field.name() {
+            "operation_id" => match Uuid::from_str(&s) {
+                Ok(u) => self.operation_id = u,
+                Err(e) => warn!("Invalid uuid recorded to scan.metadata_completed span: {s}. {e}"),
+            },
+            "scan_type" => self.scan_type_str = s,
+            _ => {}
+        }
+    }
 }
 
 impl Visit for StorageEventTypeVisitor {
@@ -318,6 +430,11 @@ where
                     num_files: v.num_files,
                     bytes_read: v.bytes_read,
                 })
+            }
+            SCAN_METADATA_COMPLETED_SPAN => {
+                let mut v = ScanMetadataVisitor::default();
+                attrs.record(&mut v);
+                Some(v.into_event())
             }
             _ => None,
         };

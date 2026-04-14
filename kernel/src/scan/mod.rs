@@ -10,6 +10,7 @@ use itertools::Itertools;
 use tracing::{debug, info};
 use url::Url;
 
+use crate::metrics::reporter::emit_scan_metadata_completed;
 use crate::metrics::MetricId;
 use crate::scan::metrics::ScanMetrics;
 use crate::utils::IteratorExt;
@@ -787,7 +788,7 @@ impl Scan {
 
         let on_complete = move || {
             let event = metrics.to_event(operation_id, ScanType::Full, start.elapsed());
-            info!(%event);
+            emit_scan_metadata_completed(&event);
         };
         Ok(iter.into_iter().flatten().on_complete(on_complete))
     }

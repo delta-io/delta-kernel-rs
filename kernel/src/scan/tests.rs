@@ -1515,116 +1515,123 @@ fn execute_does_not_error_when_parquet_returns_empty_and_stats_absent() {
     );
 }
 
-// TODO: reimplement using tracing spans instead of reporter
-// /// Tests for ScanMetadataCompleted event emission
-// mod scan_metadata_completed_tests {
-//     use std::path::PathBuf;
-//     use std::sync::Arc;
-//     use std::time::Duration;
-//
-//     use rstest::rstest;
-//
-//     use crate::engine::default::DefaultEngineBuilder;
-//     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
-//     use crate::metrics::MetricEvent;
-//     use crate::object_store::local::LocalFileSystem;
-//     use crate::utils::test_utils::CapturingReporter;
-//     use crate::Snapshot;
-//
-//     fn run_scan(table: &str, predicate: Option<Arc<Pred>>) -> (Arc<CapturingReporter>, usize) {
-//         let path = std::fs::canonicalize(PathBuf::from(table)).unwrap();
-//         let url = url::Url::from_directory_path(&path).unwrap();
-//         let reporter = Arc::new(CapturingReporter::default());
-//         let engine = Arc::new(
-//             DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
-//                 .with_metrics_reporter(reporter.clone())
-//                 .build(),
-//         );
-//         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-//         let mut builder = snapshot.scan_builder();
-//         if let Some(pred) = predicate {
-//             builder = builder.with_predicate(pred);
-//         }
-//         let scan = builder.build().unwrap();
-//         let results: Vec<_> = scan
-//             .scan_metadata(engine.as_ref())
-//             .unwrap()
-//             .collect::<Result<Vec<_>, _>>()
-//             .unwrap();
-//         (reporter, results.len())
-//     }
-//
-//     fn get_scan_event(reporter: &CapturingReporter) -> MetricEvent {
-//         reporter
-//             .events()
-//             .into_iter()
-//             .find(|e| matches!(e, MetricEvent::ScanMetadataCompleted { .. }))
-//             .expect("expected ScanMetadataCompleted event")
-//     }
-//
-//     #[rstest]
-//     #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 0, 0)]
-//     #[case::static_skip_all(
-//         "./tests/data/parsed-stats/",
-//         Some(Arc::new(Pred::literal(false))),
-//         0,
-//         0,
-//         0,
-//         0
-//     )]
-//     #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 2, 0)]
-//     #[case::with_removes("./tests/data/with_checkpoint_no_last_checkpoint/", None, 2, 1, 1, 0)]
-//     #[case::partition_filter(
-//         "./tests/data/basic_partitioned/",
-//         Some(Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))),
-//         2, 2, 0, 4
-//     )]
-//     fn test_scan_metrics(
-//         #[case] table: &str,
-//         #[case] predicate: Option<Arc<Pred>>,
-//         #[case] expected_add_seen: u64,
-//         #[case] expected_active: u64,
-//         #[case] expected_removes: u64,
-//         #[case] expected_filtered: u64,
-//     ) {
-//         let (reporter, _) = run_scan(table, predicate);
-//         let MetricEvent::ScanMetadataCompleted {
-//             total_duration,
-//             num_add_files_seen,
-//             num_active_add_files,
-//             num_remove_files_seen,
-//             num_predicate_filtered,
-//             ..
-//         } = get_scan_event(&reporter)
-//         else {
-//             panic!("expected ScanMetadataCompleted");
-//         };
-//         assert!(total_duration > Duration::ZERO);
-//         assert_eq!(num_add_files_seen, expected_add_seen);
-//         assert_eq!(num_active_add_files, expected_active);
-//         assert_eq!(num_remove_files_seen, expected_removes);
-//         assert_eq!(num_predicate_filtered, expected_filtered);
-//     }
-//
-//     #[test]
-//     fn test_no_metrics_on_early_drop() {
-//         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-//         let url = url::Url::from_directory_path(&path).unwrap();
-//         let reporter = Arc::new(CapturingReporter::default());
-//         let engine = Arc::new(
-//             DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
-//                 .with_metrics_reporter(reporter.clone())
-//                 .build(),
-//         );
-//         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-//         let scan = snapshot.scan_builder().build().unwrap();
-//         {
-//             let mut iter = scan.scan_metadata(engine.as_ref()).unwrap();
-//             let _ = iter.next();
-//         }
-//         assert!(reporter
-//             .events()
-//             .iter()
-//             .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted { .. })));
-//     }
-// }
+/// Tests for `ScanMetadataCompleted` event emission via the tracing-based metrics system.
+mod scan_metadata_completed_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use rstest::rstest;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    use crate::engine::default::DefaultEngineBuilder;
+    use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
+    use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
+    use crate::object_store::local::LocalFileSystem;
+    use crate::utils::test_utils::CapturingReporter;
+    use crate::Snapshot;
+
+    fn run_scan(
+        table: &str,
+        predicate: Option<Arc<Pred>>,
+    ) -> (Arc<CapturingReporter>, tracing::subscriber::DefaultGuard, usize) {
+        let path = std::fs::canonicalize(PathBuf::from(table)).unwrap();
+        let url = url::Url::from_directory_path(&path).unwrap();
+        let reporter = Arc::new(CapturingReporter::default());
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build(),
+        );
+        let guard = tracing_subscriber::registry()
+            .with_metrics_reporter_layer(reporter.clone())
+            .set_default();
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let mut builder = snapshot.scan_builder();
+        if let Some(pred) = predicate {
+            builder = builder.with_predicate(pred);
+        }
+        let scan = builder.build().unwrap();
+        let results: Vec<_> = scan
+            .scan_metadata(engine.as_ref())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        (reporter, guard, results.len())
+    }
+
+    fn get_scan_event(reporter: &CapturingReporter) -> MetricEvent {
+        reporter
+            .events()
+            .into_iter()
+            .find(|e| matches!(e, MetricEvent::ScanMetadataCompleted { .. }))
+            .expect("expected ScanMetadataCompleted event")
+    }
+
+    #[rstest]
+    #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 0, 0)]
+    #[case::static_skip_all(
+        "./tests/data/parsed-stats/",
+        Some(Arc::new(Pred::literal(false))),
+        0,
+        0,
+        0,
+        0
+    )]
+    #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 2, 0)]
+    #[case::with_checkpoint("./tests/data/with_checkpoint_no_last_checkpoint/", None, 2, 1, 1, 0)]
+    #[case::partition_filter(
+        "./tests/data/basic_partitioned/",
+        Some(Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))),
+        2, 2, 0, 4
+    )]
+    fn test_scan_metrics(
+        #[case] table: &str,
+        #[case] predicate: Option<Arc<Pred>>,
+        #[case] expected_add_seen: u64,
+        #[case] expected_active: u64,
+        #[case] expected_removes: u64,
+        #[case] expected_filtered: u64,
+    ) {
+        let (reporter, _guard, _) = run_scan(table, predicate);
+        let MetricEvent::ScanMetadataCompleted {
+            total_duration,
+            num_add_files_seen,
+            num_active_add_files,
+            num_remove_files_seen,
+            num_predicate_filtered,
+            ..
+        } = get_scan_event(&reporter)
+        else {
+            panic!("expected ScanMetadataCompleted");
+        };
+        assert!(total_duration > Duration::ZERO);
+        assert_eq!(num_add_files_seen, expected_add_seen);
+        assert_eq!(num_active_add_files, expected_active);
+        assert_eq!(num_remove_files_seen, expected_removes);
+        assert_eq!(num_predicate_filtered, expected_filtered);
+    }
+
+    #[test]
+    fn scan_metadata_completed_not_emitted_on_early_drop() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+        let url = url::Url::from_directory_path(&path).unwrap();
+        let reporter = Arc::new(CapturingReporter::default());
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build(),
+        );
+        let _guard = tracing_subscriber::registry()
+            .with_metrics_reporter_layer(reporter.clone())
+            .set_default();
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
+        {
+            let mut iter = scan.scan_metadata(engine.as_ref()).unwrap();
+            let _ = iter.next();
+            // Drop without exhausting -- callback must not fire
+        }
+        assert!(reporter
+            .events()
+            .iter()
+            .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted { .. })));
+    }
+}
