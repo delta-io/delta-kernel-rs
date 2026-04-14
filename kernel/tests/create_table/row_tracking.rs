@@ -4,7 +4,6 @@
 //! `rowTracking` and `domainMetadata` features to the protocol and writes the initial row
 //! tracking domain metadata with `rowIdHighWaterMark = -1`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int32Array, StringArray};
@@ -97,13 +96,9 @@ async fn test_create_table_with_row_tracking(
         )
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
-        let write_context = Arc::new(txn.get_write_context());
+        let write_context = Arc::new(txn.unpartitioned_write_context()?);
         let add_files = engine
-            .write_parquet(
-                &ArrowEngineData::new(batch),
-                write_context.as_ref(),
-                HashMap::new(),
-            )
+            .write_parquet(&ArrowEngineData::new(batch), write_context.as_ref())
             .await?;
         txn.add_files(add_files);
     }
@@ -227,20 +222,12 @@ async fn test_create_table_with_multiple_files_and_row_tracking() -> DeltaResult
     )
     .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context()?);
     let adds1 = engine
-        .write_parquet(
-            &ArrowEngineData::new(batch1),
-            write_context.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(batch1), write_context.as_ref())
         .await?;
     let adds2 = engine
-        .write_parquet(
-            &ArrowEngineData::new(batch2),
-            write_context.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(batch2), write_context.as_ref())
         .await?;
 
     txn.add_files(adds1);
@@ -348,13 +335,9 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaR
     )
     .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context()?);
     let add_files = engine
-        .write_parquet(
-            &ArrowEngineData::new(batch),
-            write_context.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(batch), write_context.as_ref())
         .await?;
     txn.add_files(add_files);
 
