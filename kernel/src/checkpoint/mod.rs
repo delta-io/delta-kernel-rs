@@ -127,9 +127,9 @@ use checkpoint_transform::{
 #[cfg(test)]
 mod tests;
 
-/// Schemas needed for checkpoint.
+/// Schemas and configs needed for building the checkpoint read/output schemas.
 struct CheckpointSchemaContext {
-    config: StatsTransformConfig,
+    stats_config: StatsTransformConfig,
     base_schema: &'static StructType,
     stats_schema: SchemaRef,
     partition_schema: Option<SchemaRef>,
@@ -273,6 +273,7 @@ impl CheckpointWriter {
         )
         .map(|parsed| parsed.location)
     }
+
     /// Computes the checkpoint schema context from the snapshot and engine.
     fn checkpoint_schema_context(
         &self,
@@ -301,7 +302,7 @@ impl CheckpointWriter {
         // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
         let partition_schema = tc.build_partition_values_parsed_schema();
         Ok(CheckpointSchemaContext {
-            config,
+            stats_config: config,
             base_schema,
             stats_schema,
             partition_schema,
@@ -374,7 +375,7 @@ impl CheckpointWriter {
 
         let output_schema = self.get_or_init_output_schema(|| {
             build_checkpoint_output_schema(
-                &schema_context.config,
+                &schema_context.stats_config,
                 schema_context.base_schema,
                 &schema_context.stats_schema,
                 schema_context.partition_schema.as_deref(),
@@ -384,7 +385,7 @@ impl CheckpointWriter {
         // Build transform expression and create expression evaluator.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
         let transform_expr = build_checkpoint_transform(
-            &schema_context.config,
+            &schema_context.stats_config,
             &schema_context.stats_schema,
             schema_context.partition_schema.as_ref(),
         );
