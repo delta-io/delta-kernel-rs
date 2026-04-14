@@ -1,3 +1,7 @@
+// Allow unreachable_pub because this module is pub when test-utils is enabled,
+// making the pub items reachable from integration tests.
+#![allow(unreachable_pub)]
+
 use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
