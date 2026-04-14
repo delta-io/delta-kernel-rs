@@ -82,9 +82,9 @@ version. From it you build a `Scan` (reads) or `Transaction` (writes).
 `execute()` (simple), `scan_metadata()` (advanced/distributed),
 `parallel_scan_metadata()` (two-phase distributed log replay).
 
-**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Kernel provides `WriteContext`,
-assembles commit actions, enforces protocol compliance, delegates atomic commit to a
-`Committer`.
+**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Kernel provides `WriteContext`
+(via `partitioned_write_context` or `unpartitioned_write_context`), assembles commit
+actions, enforces protocol compliance, delegates atomic commit to a `Committer`.
 
 **Engine trait:** five handlers (`StorageHandler`, `JsonHandler`, `ParquetHandler`,
 `EvaluationHandler`, optional `MetricsReporter`). `DefaultEngine` lives in

@@ -38,7 +38,6 @@
 //! The macros expand there, so types resolve to the caller's kernel crate -- avoiding
 //! the type mismatch between `test_utils`'s kernel and `kernel/src/` unit tests.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -329,7 +328,7 @@ async fn write_data_commit(
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
-    let write_context = txn.get_write_context();
+    let write_context = txn.unpartitioned_write_context()?;
 
     for file_idx in 0..num_files {
         let base = (version as i32 * 1000) + (file_idx as i32 * 100);
@@ -342,7 +341,7 @@ async fn write_data_commit(
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
         let add_files = engine
-            .write_parquet(&ArrowEngineData::new(batch), &write_context, HashMap::new())
+            .write_parquet(&ArrowEngineData::new(batch), &write_context)
             .await?;
         txn.add_files(add_files);
     }

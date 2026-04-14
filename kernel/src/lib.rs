@@ -845,7 +845,8 @@ pub trait ParquetHandler: AsAny {
     ///
     /// This method writes the provided `data` to a Parquet file at the given `url`.
     ///
-    /// This will overwrite the file if it already exists.
+    /// This will overwrite the file if it already exists. For filesystem-backed
+    /// implementations, the parent directories must be created if they do not exist.
     ///
     /// # Parameters
     ///

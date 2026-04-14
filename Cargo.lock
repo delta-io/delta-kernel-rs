@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acceptance"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "datatest-stable",
  "delta_kernel",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "clap",
  "delta_kernel",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "delta-kernel-unity-catalog"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "delta_kernel",
  "itertools 0.14.0",
@@ -1263,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "arrow 57.3.0",
  "arrow 58.1.0",
@@ -1284,6 +1284,7 @@ dependencies = [
  "parquet 57.3.0",
  "parquet 58.1.0",
  "paste",
+ "rand 0.9.2",
  "reqwest 0.13.2",
  "roaring",
  "rstest",
@@ -1306,12 +1307,13 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_benchmarks"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "criterion",
  "delta-kernel-unity-catalog",
  "delta_kernel",
  "flate2",
+ "itertools 0.14.0",
  "object_store 0.12.5",
  "rayon",
  "rstest",
@@ -1329,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1338,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_ffi"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "cbindgen",
  "delta-kernel-unity-catalog",
@@ -1364,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_ffi_macros"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1515,7 +1517,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "feature_tests"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "delta_kernel",
  "reqwest 0.13.2",
@@ -2526,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "mem-test"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "delta_kernel",
  "dhat",
@@ -4062,7 +4064,7 @@ dependencies = [
 
 [[package]]
 name = "test_utils"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "delta_kernel",
  "itertools 0.14.0",
@@ -4497,7 +4499,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "unity-catalog-delta-client-api"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "chrono",
  "serde",
@@ -4508,7 +4510,7 @@ dependencies = [
 
 [[package]]
 name = "unity-catalog-delta-rest-client"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "chrono",
  "clap",
