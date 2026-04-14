@@ -340,7 +340,7 @@ mod tests {
         verify_sequential_processing(
             "with_checkpoint_no_last_checkpoint",
             &["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"], /* Add from commit 3 */
-            &[], // No sidecars
+            &[],                                                                      // No sidecars
         )
     }
 }

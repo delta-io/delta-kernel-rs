@@ -27,7 +27,8 @@
 //! 2. Get the checkpoint data from [`CheckpointWriter::checkpoint_data`]
 //! 3. Write the data to the path in object storage (engine-specific)
 //! 4. Collect metadata ([`FileMeta`]) from the write operation
-//! 5. Pass the metadata and exhausted data iterator to [`CheckpointWriter::finalize`]
+//! 5. Build [`CheckpointActionStats`] from the exhausted iterator state
+//! 6. Pass the metadata and stats to [`CheckpointWriter::finalize`]
 //!
 //! ```no_run
 //! # use std::sync::Arc;
@@ -57,7 +58,7 @@
 //! let checkpoint_path = writer.checkpoint_path()?;
 //! let checkpoint_data = writer.checkpoint_data(engine)?;
 //!
-//! // Get the iterator state
+//! // Get the iterator state before consuming the data
 //! let state = checkpoint_data.state();
 //!
 //! // Write the checkpoint data to the object store and collect metadata
@@ -65,8 +66,13 @@
 //!
 //! /* IMPORTANT: All data must be written before finalizing the checkpoint */
 //!
-//! // Finalize the checkpoint by passing the metadata and state handle
-//! writer.finalize(engine, &metadata, &state)?;
+//! // Build checkpoint stats from the exhausted iterator state
+//! let state = std::sync::Arc::into_inner(state)
+//!     .expect("no other Arc references");
+//! let stats = delta_kernel::checkpoint::CheckpointActionStats::from_reconciliation_state(state)?;
+//!
+//! // Finalize the checkpoint by passing the metadata and stats
+//! writer.finalize(engine, &metadata, &stats)?;
 //!
 //! # Ok::<_, Error>(())
 //! ```
@@ -126,6 +132,47 @@ use checkpoint_transform::{
 };
 #[cfg(test)]
 mod tests;
+
+/// Stats needed to write the `_last_checkpoint` hint file.
+///
+/// Constructed via [`CheckpointActionStats::from_reconciliation_state`] after the reconciliation
+/// iterator is fully exhausted, then passed to [`CheckpointWriter::finalize`].
+#[derive(Debug)]
+pub struct CheckpointActionStats {
+    actions_count: i64,
+    add_actions_count: i64,
+}
+
+impl CheckpointActionStats {
+    /// Builds checkpoint action stats from a fully-exhausted [`ActionReconciliationIteratorState`].
+    ///
+    /// Returns an error if the iterator has not been fully exhausted, since the counts
+    /// would be incomplete.
+    pub fn from_reconciliation_state(
+        state: ActionReconciliationIteratorState,
+    ) -> DeltaResult<Self> {
+        if !state.is_exhausted() {
+            return Err(Error::internal_error(
+                "Cannot build CheckpointActionStats: the reconciliation iterator has not been \
+                 fully exhausted",
+            ));
+        }
+        Ok(Self {
+            actions_count: state.actions_count(),
+            add_actions_count: state.add_actions_count(),
+        })
+    }
+
+    /// Total number of actions in the checkpoint.
+    pub fn actions_count(&self) -> i64 {
+        self.actions_count
+    }
+
+    /// Number of add-file actions in the checkpoint.
+    pub fn add_actions_count(&self) -> i64 {
+        self.add_actions_count
+    }
+}
 
 /// Schemas and configs needed for building the checkpoint read/output schemas.
 struct CheckpointSchemaContext {
@@ -393,28 +440,20 @@ impl CheckpointWriter {
     /// 2. All data has been successfully written to object storage
     ///
     /// # Parameters
-    /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `metadata`: The metadata of the written checkpoint file
-    /// - `checkpoint_iter_state`: The state of the checkpoint data iterator
+    /// - `engine`: Implementation of [`Engine`] APIs.
+    /// - `metadata`: The metadata of the written checkpoint file.
+    /// - `stats`: Action counts from the checkpoint data.
     ///
-    /// # Returns: `Ok` if the checkpoint was successfully finalized
+    /// # Returns: `Ok` if the checkpoint was successfully finalized.
     // Internally, this method:
-    // 1. Validates that the checkpoint data iterator is fully exhausted
-    // 2. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
-    // 3. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the delta log
+    // 1. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
+    // 2. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the delta log
     pub fn finalize(
         self,
         engine: &dyn Engine,
         metadata: &FileMeta,
-        checkpoint_iter_state: &ActionReconciliationIteratorState,
+        stats: &CheckpointActionStats,
     ) -> DeltaResult<()> {
-        // Ensure the checkpoint data iterator is fully exhausted
-        if !checkpoint_iter_state.is_exhausted() {
-            return Err(Error::checkpoint_write(
-                "The checkpoint data iterator must be fully consumed and written to storage before calling finalize"
-            ));
-        }
-
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
         // checkpoint, to avoid regressing the hint.
         let checkpoint_version = self.snapshot.version();
@@ -439,8 +478,8 @@ impl CheckpointWriter {
         let data = create_last_checkpoint_data(
             engine,
             self.version,
-            checkpoint_iter_state.actions_count(),
-            checkpoint_iter_state.add_actions_count(),
+            stats.actions_count,
+            stats.add_actions_count,
             size_in_bytes,
         );
 
