@@ -115,6 +115,7 @@ impl SnapshotBuilder {
     /// # Parameters
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
+    // Span name must match `SNAP_BUILD_SPAN` in `metrics::reporter`.
     #[instrument(
         name = "snap.build",
         skip_all,

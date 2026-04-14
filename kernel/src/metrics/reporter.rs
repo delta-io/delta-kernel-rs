@@ -104,7 +104,7 @@ impl Visit for EventVisitor {
                 "num_commit_files" => *num_commit_files = value,
                 "num_checkpoint_files" => *num_checkpoint_files = value,
                 "num_compaction_files" => *num_compaction_files = value,
-                _ => warn!("Invalid field recorded on segment.for_snapshot span"),
+                _ => warn!("Invalid field recorded on {SEGMENT_FOR_SNAPSHOT_SPAN} span"),
             }
         }
 
@@ -114,7 +114,7 @@ impl Visit for EventVisitor {
         {
             match field.name() {
                 "version" => *version = value,
-                _ => warn!("Invalid field recorded on snap.build span"),
+                _ => warn!("Invalid field recorded on {SNAP_BUILD_SPAN} span"),
             }
         }
     }
@@ -153,7 +153,14 @@ pub(crate) const COPY_COMPLETED_NAME: &str = "copy_completed";
 pub(crate) const LIST_COMPLETED_NAME: &str = "list_completed";
 pub(crate) const READ_COMPLETED_NAME: &str = "read_completed";
 
-// Span names for file-read events emitted by the JSON and Parquet handlers.
+// Span names for metric-bearing spans. Each constant is used both at the span creation site
+// and in the `on_new_span` match below. `#[instrument(name = "...")]` requires a string literal,
+// so those sites carry a comment referencing the constant instead; `tracing::span!()` sites use
+// the constant directly.
+pub(crate) const SEGMENT_FOR_SNAPSHOT_SPAN: &str = "segment.for_snapshot";
+pub(crate) const SEGMENT_READ_METADATA_SPAN: &str = "segment.read_metadata";
+pub(crate) const SNAP_BUILD_SPAN: &str = "snap.build";
+pub(crate) const STORAGE_SPAN: &str = "storage";
 const JSON_READ_COMPLETED_SPAN: &str = "json_read_completed";
 const PARQUET_READ_COMPLETED_SPAN: &str = "parquet_read_completed";
 const SCAN_METADATA_COMPLETED_SPAN: &str = "scan.metadata_completed";
@@ -379,23 +386,23 @@ where
         attrs.record(&mut new_span_visitor);
         let name = metadata.name();
         let event = match name {
-            "segment.for_snapshot" => Some(MetricEvent::LogSegmentLoaded {
+            SEGMENT_FOR_SNAPSHOT_SPAN => Some(MetricEvent::LogSegmentLoaded {
                 operation_id: MetricId(new_span_visitor.uuid),
                 duration: std::time::Duration::default(),
                 num_commit_files: 0,
                 num_checkpoint_files: 0,
                 num_compaction_files: 0,
             }),
-            "segment.read_metadata" => Some(MetricEvent::ProtocolMetadataLoaded {
+            SEGMENT_READ_METADATA_SPAN => Some(MetricEvent::ProtocolMetadataLoaded {
                 operation_id: MetricId(new_span_visitor.uuid),
                 duration: std::time::Duration::default(),
             }),
-            "snap.build" => Some(MetricEvent::SnapshotCompleted {
+            SNAP_BUILD_SPAN => Some(MetricEvent::SnapshotCompleted {
                 operation_id: MetricId(new_span_visitor.uuid),
                 version: 0,
                 total_duration: std::time::Duration::default(),
             }),
-            "storage" => {
+            STORAGE_SPAN => {
                 let mut storage_visitor = StorageEventTypeVisitor {
                     typ: StorageEventType::None,
                     num_files: 0,

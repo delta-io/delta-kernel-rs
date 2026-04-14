@@ -11,7 +11,9 @@ use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
-use crate::metrics::reporter::{COPY_COMPLETED_NAME, LIST_COMPLETED_NAME, READ_COMPLETED_NAME};
+use crate::metrics::reporter::{
+    COPY_COMPLETED_NAME, LIST_COMPLETED_NAME, READ_COMPLETED_NAME, STORAGE_SPAN,
+};
 use crate::object_store::path::Path;
 use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
@@ -49,7 +51,7 @@ impl<I, T> Drop for MetricsIterator<I, T> {
         let duration = self.start.elapsed();
         let _span = tracing::span!(
             tracing::Level::INFO,
-            "storage",
+            STORAGE_SPAN,
             report = tracing::field::Empty,
             name = self.name,
             num_files = self.num_files,

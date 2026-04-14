@@ -19,6 +19,7 @@ impl LogSegment {
     ///
     /// This is the checked variant of [`Self::read_protocol_metadata_unchecked`], used for
     /// fresh snapshot creation where both Protocol and Metadata must exist.
+    // Span name must match `SEGMENT_READ_METADATA_SPAN` in `metrics::reporter`.
     #[instrument(name = "segment.read_metadata", fields(report, operation_id = %operation_id), skip(engine))]
     pub(crate) fn read_protocol_metadata(
         &self,

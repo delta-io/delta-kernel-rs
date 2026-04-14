@@ -273,6 +273,7 @@ impl LogSegment {
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
     /// Reports metrics: `LogSegmentLoaded`.
+    // Span name must match `SEGMENT_FOR_SNAPSHOT_SPAN` in `metrics::reporter`.
     #[instrument(
         name = "segment.for_snapshot",
         err,
