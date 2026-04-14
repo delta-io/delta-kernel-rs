@@ -17,8 +17,8 @@ pub(crate) use column_mapping::physical_to_logical_column_name;
 pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
 pub(crate) use column_mapping::{
-    assign_column_mapping_metadata, column_mapping_mode, get_column_mapping_mode_from_properties,
-    get_field_column_mapping_info,
+    assign_column_mapping_metadata, assign_field_column_mapping, column_mapping_mode,
+    get_column_mapping_mode_from_properties, get_field_column_mapping_info,
 };
 pub(crate) use timestamp_ntz::{
     schema_contains_timestamp_ntz, validate_timestamp_ntz_feature_support,
