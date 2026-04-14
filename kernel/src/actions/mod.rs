@@ -355,6 +355,14 @@ impl Metadata {
         })
     }
 
+    /// Returns a new Metadata with the configuration replaced, preserving all other fields.
+    pub(crate) fn with_configuration(self, configuration: HashMap<String, String>) -> Self {
+        Self {
+            configuration,
+            ..self
+        }
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_unchecked(

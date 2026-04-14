@@ -72,7 +72,9 @@ impl AlterTableTransactionBuilder<Ready> {
     ///
     /// The field must not already exist in the schema (case-insensitive). The field must be
     /// nullable because existing data files do not contain this column and will read NULL for it.
-    /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
+    /// If column mapping is enabled, the builder automatically assigns a new column ID and physical
+    /// name at build time. These constraints are validated during
+    /// [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
         self.operations.push(SchemaOperation::AddColumn { field });
         self.transition()
@@ -115,21 +117,49 @@ impl AlterTableTransactionBuilder<Modifying> {
     ///   `timestampNtz` column without the `timestampNtz` feature)
     pub fn build(
         self,
-        _engine: &dyn Engine,
+        _engine: &dyn Engine, // used by later operations (e.g., drop_column reads clustering columns)
         committer: Box<dyn Committer>,
     ) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
         table_config.ensure_operation_supported(Operation::Write)?;
 
         let schema = Arc::unwrap_or_clone(table_config.logical_schema());
+        let column_mapping_mode = table_config.column_mapping_mode();
+        let current_max_column_id = table_config
+            .metadata()
+            .configuration()
+            .get(crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID)
+            .map(|v| {
+                v.parse::<i64>().map_err(|_| {
+                    crate::Error::generic(format!(
+                        "Invalid delta.columnMapping.maxColumnId value: '{v}'"
+                    ))
+                })
+            })
+            .transpose()?;
         let SchemaEvolutionResult {
             schema: evolved_schema,
-        } = apply_schema_operations(schema, self.operations)?;
+            new_max_column_id,
+        } = apply_schema_operations(
+            schema,
+            self.operations,
+            column_mapping_mode,
+            current_max_column_id,
+        )?;
 
-        let evolved_metadata = table_config
+        let mut evolved_metadata = table_config
             .metadata()
             .clone()
             .with_schema(evolved_schema.clone())?;
+
+        if let Some(new_id) = new_max_column_id {
+            let mut config = table_config.metadata().configuration().clone();
+            config.insert(
+                crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID.to_string(),
+                new_id.to_string(),
+            );
+            evolved_metadata = evolved_metadata.with_configuration(config);
+        }
 
         // Validates the evolved metadata against the protocol.
         let evolved_table_config = TableConfiguration::try_new_with_schema(

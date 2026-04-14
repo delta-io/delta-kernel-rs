@@ -245,7 +245,7 @@ pub(crate) fn get_column_mapping_mode_from_properties(
 /// arrays, and maps. Each field is assigned a new unique ID and physical name.
 ///
 /// Fields with pre-existing column mapping metadata (id or physicalName) are rejected
-/// to avoid conflicts. ALTER TABLE will need different handling in the future.
+/// to avoid conflicts.
 ///
 /// # Arguments
 ///
@@ -271,8 +271,12 @@ pub(crate) fn assign_column_mapping_metadata(
 /// Assigns column mapping metadata to a single field, recursively processing nested types.
 ///
 /// Rejects fields with pre-existing column mapping metadata. Otherwise, assigns a new
-/// unique ID and physical name (incrementing `max_id`).
-fn assign_field_column_mapping(field: &StructField, max_id: &mut i64) -> DeltaResult<StructField> {
+/// unique ID and physical name (incrementing `max_id`). Used during CREATE TABLE for the full
+/// schema and during ALTER TABLE ADD COLUMN for newly added fields.
+pub(crate) fn assign_field_column_mapping(
+    field: &StructField,
+    max_id: &mut i64,
+) -> DeltaResult<StructField> {
     let has_id = field
         .get_config_value(&ColumnMetadataKey::ColumnMappingId)
         .is_some();
@@ -280,15 +284,14 @@ fn assign_field_column_mapping(field: &StructField, max_id: &mut i64) -> DeltaRe
         .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
         .is_some();
 
-    // For CREATE TABLE, reject any pre-existing column mapping metadata.
-    // This avoids conflicts between user-provided IDs/physical names and the ones we assign.
-    // ALTER TABLE (adding columns) will need different handling in the future.
+    // Reject fields with pre-existing column mapping metadata to avoid ID/physical-name
+    // conflicts with the ones we assign.
     // TODO: Also check for nested column IDs (`delta.columnMapping.nested.ids`) once
     // Iceberg compatibility (IcebergCompatV2+) is supported. See issue #1125.
     if has_id || has_physical_name {
         return Err(Error::generic(format!(
             "Field '{}' already has column mapping metadata. \
-             Pre-existing column mapping metadata is not supported for CREATE TABLE.",
+             Pre-existing column mapping metadata is not supported when adding columns.",
             field.name
         )));
     }

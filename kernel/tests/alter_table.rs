@@ -8,7 +8,9 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::column_name;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{
+    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::DeltaResult;
@@ -33,8 +35,10 @@ fn create_test_table(
     table_path: &str,
     schema: SchemaRef,
     engine: &dyn delta_kernel::Engine,
+    properties: &[(&str, &str)],
 ) -> DeltaResult<Arc<Snapshot>> {
     let committed = create_table(table_path, schema, "Test/1.0")
+        .with_table_properties(properties.to_vec())
         .build(engine, committer())?
         .commit(engine)?
         .unwrap_committed();
@@ -47,7 +51,7 @@ fn create_test_table(
 #[tokio::test]
 async fn add_column_reload_snapshot_verify_schema() -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref())?;
+    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
     // Write data before adding the column
     let batch = RecordBatch::try_new(
@@ -134,7 +138,7 @@ async fn add_column_reload_snapshot_verify_schema() -> Result<(), Box<dyn std::e
 #[tokio::test]
 async fn add_column_multiple_in_one_commit() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref())?;
+    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
     let _ = snapshot
         .alter_table()
@@ -165,7 +169,7 @@ async fn add_column_failures(
     #[case] error_contains: &str,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref())?;
+    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
     let err = snapshot
         .alter_table()
@@ -180,7 +184,7 @@ async fn add_column_failures(
 #[tokio::test]
 async fn set_nullable_already_nullable_is_noop() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref())?;
+    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
     // "name" is already nullable
     let _ = snapshot
@@ -201,7 +205,7 @@ async fn set_nullable_already_nullable_is_noop() -> DeltaResult<()> {
 #[tokio::test]
 async fn set_nullable_nonexistent_column_fails() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref())?;
+    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
     let err = snapshot
         .alter_table()
@@ -216,7 +220,7 @@ async fn set_nullable_nonexistent_column_fails() -> DeltaResult<()> {
 #[tokio::test]
 async fn chain_add_column_and_set_nullable() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref())?;
+    let snapshot = create_test_table(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
     // Add a column then set "id" nullable in one commit
     let _ = snapshot
@@ -231,6 +235,161 @@ async fn chain_add_column_and_set_nullable() -> DeltaResult<()> {
     assert_eq!(reloaded.schema().fields().count(), 3);
     assert!(reloaded.schema().field("email").is_some());
     assert!(reloaded.schema().field("id").unwrap().is_nullable());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_column_with_column_mapping_assigns_metadata() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_test_table(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+
+    let original_max_id: i64 = snapshot
+        .table_configuration()
+        .metadata()
+        .configuration()
+        .get("delta.columnMapping.maxColumnId")
+        .and_then(|v| v.parse().ok())
+        .expect("should have maxColumnId");
+
+    // Add column
+    let _ = snapshot
+        .alter_table()
+        .add_column(StructField::nullable("email", DataType::STRING))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    let email_field = schema.field("email").expect("email should exist");
+
+    // Verify column mapping ID was assigned
+    let cm_id = email_field
+        .get_config_value(&ColumnMetadataKey::ColumnMappingId)
+        .expect("should have column mapping ID");
+    match cm_id {
+        MetadataValue::Number(id) => assert!(*id > original_max_id),
+        other => panic!("Expected Number, got: {other:?}"),
+    }
+
+    // Verify physical name was assigned
+    let cm_name = email_field
+        .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+        .expect("should have physical name");
+    match cm_name {
+        MetadataValue::String(s) => assert!(s.starts_with("col-")),
+        other => panic!("Expected String, got: {other:?}"),
+    }
+
+    // Verify maxColumnId was updated in table properties
+    let new_max_id: i64 = reloaded
+        .table_configuration()
+        .metadata()
+        .configuration()
+        .get("delta.columnMapping.maxColumnId")
+        .and_then(|v| v.parse().ok())
+        .expect("should have maxColumnId");
+    assert!(new_max_id > original_max_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_column_with_column_mapping_name_mode_data_survives(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_test_table(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+
+    // Write data before adding the column
+    let arrow_schema = Arc::new(snapshot.schema().as_ref().try_into_arrow().unwrap());
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+
+    // Add column
+    let _ = snapshot
+        .alter_table()
+        .add_column(StructField::nullable("email", DataType::STRING))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // Scan back -- old rows should have NULL for the new column
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let scan = reloaded.scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine.clone())?;
+
+    assert!(!batches.is_empty());
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3);
+    assert_eq!(batches[0].num_columns(), 3);
+
+    let email_col = batches[0].column_by_name("email").expect("email column");
+    assert_eq!(email_col.null_count(), email_col.len());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_column_with_column_mapping_id_mode_data_survives(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_test_table(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "id")],
+    )?;
+
+    // Write data before adding the column
+    let arrow_schema = Arc::new(snapshot.schema().as_ref().try_into_arrow().unwrap());
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![10, 20])),
+            Arc::new(StringArray::from(vec!["x", "y"])),
+        ],
+    )
+    .unwrap();
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+
+    // Add column
+    let _ = snapshot
+        .alter_table()
+        .add_column(StructField::nullable("age", DataType::INTEGER))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // Scan back -- old rows should have NULL for the new column
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let scan = reloaded.scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine.clone())?;
+
+    assert!(!batches.is_empty());
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+    assert_eq!(batches[0].num_columns(), 3);
+
+    let age_col = batches[0].column_by_name("age").expect("age column");
+    assert_eq!(age_col.null_count(), age_col.len());
 
     Ok(())
 }
