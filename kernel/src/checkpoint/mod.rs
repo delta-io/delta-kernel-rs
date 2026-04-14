@@ -24,11 +24,11 @@
 //!
 //! 1. Create a [`CheckpointWriter`] using [`Snapshot::create_checkpoint_writer`]
 //! 2. Get the checkpoint path from [`CheckpointWriter::checkpoint_path`]
-//! 2. Get the checkpoint data from [`CheckpointWriter::checkpoint_data`]
-//! 3. Write the data to the path in object storage (engine-specific)
-//! 4. Collect metadata ([`FileMeta`]) from the write operation
-//! 5. Build [`CheckpointActionStats`] from the exhausted iterator state
-//! 6. Pass the metadata and stats to [`CheckpointWriter::finalize`]
+//! 3. Get the checkpoint data from [`CheckpointWriter::checkpoint_data`]
+//! 4. Write the data to the path in object storage (engine-specific)
+//! 5. Collect metadata ([`FileMeta`]) from the write operation
+//! 6. Build [`CheckpointActionStats`] from the exhausted iterator state
+//! 7. Pass the metadata and stats to [`CheckpointWriter::finalize`]
 //!
 //! ```no_run
 //! # use std::sync::Arc;
