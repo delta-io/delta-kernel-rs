@@ -115,4 +115,5 @@ impl<S> WithMetricsReporterLayer for S
 where
     S: Subscriber,
     for<'lookup> S: LookupSpan<'lookup>,
-{}
+{
+}

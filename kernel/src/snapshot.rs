@@ -1,9 +1,9 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
+use delta_kernel_derive::internal_api;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use delta_kernel_derive::internal_api;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
@@ -391,7 +391,11 @@ impl Snapshot {
 
         tracing::Span::current().record("version", table_configuration.version());
 
-        Ok(Self::new_with_crc(log_segment, table_configuration, lazy_crc))
+        Ok(Self::new_with_crc(
+            log_segment,
+            table_configuration,
+            lazy_crc,
+        ))
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.

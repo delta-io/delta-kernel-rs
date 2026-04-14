@@ -83,8 +83,12 @@ impl EventVisitor {
     fn set_duration(&mut self, target_duration: std::time::Duration) {
         match &mut self.event {
             Some(MetricEvent::LogSegmentLoaded { duration, .. }) => *duration = target_duration,
-            Some(MetricEvent::ProtocolMetadataLoaded { duration, .. }) => *duration = target_duration,
-            Some(MetricEvent::SnapshotCompleted { total_duration, .. }) => *total_duration = target_duration,
+            Some(MetricEvent::ProtocolMetadataLoaded { duration, .. }) => {
+                *duration = target_duration
+            }
+            Some(MetricEvent::SnapshotCompleted { total_duration, .. }) => {
+                *total_duration = target_duration
+            }
             Some(MetricEvent::SnapshotFailed { duration, .. }) => *duration = target_duration,
             _ => {}
         }

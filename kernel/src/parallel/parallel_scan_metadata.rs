@@ -59,7 +59,9 @@ impl SequentialScanMetadata {
                     ScanType::SequentialPhase,
                     self.start.elapsed(),
                 );
-                processor.get_metrics().log("Sequential scan metadata completed");
+                processor
+                    .get_metrics()
+                    .log("Sequential scan metadata completed");
                 emit_scan_metadata_completed(&event);
                 Ok(AfterSequentialScanMetadata::Done)
             }
@@ -69,7 +71,9 @@ impl SequentialScanMetadata {
                     ScanType::SequentialPhase,
                     self.start.elapsed(),
                 );
-                processor.get_metrics().log("Sequential scan metadata completed");
+                processor
+                    .get_metrics()
+                    .log("Sequential scan metadata completed");
                 emit_scan_metadata_completed(&event);
                 processor.get_metrics().reset_counters();
 
@@ -142,7 +146,9 @@ impl ParallelState {
             ScanType::ParallelPhase,
             self.parallel_start.elapsed(),
         );
-        self.inner.get_metrics().log("Parallel scan metadata completed");
+        self.inner
+            .get_metrics()
+            .log("Parallel scan metadata completed");
         emit_scan_metadata_completed(&event);
     }
 

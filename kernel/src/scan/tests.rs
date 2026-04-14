@@ -1534,13 +1534,15 @@ mod scan_metadata_completed_tests {
     fn run_scan(
         table: &str,
         predicate: Option<Arc<Pred>>,
-    ) -> (Arc<CapturingReporter>, tracing::subscriber::DefaultGuard, usize) {
+    ) -> (
+        Arc<CapturingReporter>,
+        tracing::subscriber::DefaultGuard,
+        usize,
+    ) {
         let path = std::fs::canonicalize(PathBuf::from(table)).unwrap();
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
-        let engine = Arc::new(
-            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build(),
-        );
+        let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
         let guard = tracing_subscriber::registry()
             .with_metrics_reporter_layer(reporter.clone())
             .set_default();
@@ -1612,13 +1614,10 @@ mod scan_metadata_completed_tests {
 
     #[test]
     fn scan_metadata_completed_not_emitted_on_early_drop() {
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
-        let engine = Arc::new(
-            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build(),
-        );
+        let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
         let _guard = tracing_subscriber::registry()
             .with_metrics_reporter_layer(reporter.clone())
             .set_default();

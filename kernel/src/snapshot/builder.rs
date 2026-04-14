@@ -161,13 +161,8 @@ impl SnapshotBuilder {
                     effective_version,
                     operation_id,
                 )?;
-                Snapshot::try_new_from_log_segment(
-                    table_url,
-                    log_segment,
-                    engine,
-                    operation_id,
-                )
-                .map(Into::into)
+                Snapshot::try_new_from_log_segment(table_url, log_segment, engine, operation_id)
+                    .map(Into::into)
             })
         } else {
             existing_snapshot
@@ -483,11 +478,15 @@ mod tests {
 
         let events = reporter.events();
         assert!(
-            events.iter().any(|e| matches!(e, MetricEvent::SnapshotFailed { .. })),
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::SnapshotFailed { .. })),
             "expected SnapshotFailed event on build failure"
         );
         assert!(
-            !events.iter().any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. })),
             "should not emit SnapshotCompleted on failure"
         );
         Ok(())
@@ -514,7 +513,12 @@ mod tests {
         let (version, total_duration) = events
             .iter()
             .find_map(|e| {
-                if let MetricEvent::SnapshotCompleted { version, total_duration, .. } = e {
+                if let MetricEvent::SnapshotCompleted {
+                    version,
+                    total_duration,
+                    ..
+                } = e
+                {
                     Some((*version, *total_duration))
                 } else {
                     None
@@ -522,7 +526,10 @@ mod tests {
             })
             .expect("expected SnapshotCompleted event");
         assert_eq!(version, 1, "version should match the updated snapshot");
-        assert!(total_duration > Duration::ZERO, "total_duration should be non-zero");
+        assert!(
+            total_duration > Duration::ZERO,
+            "total_duration should be non-zero"
+        );
         Ok(())
     }
 
@@ -541,15 +548,22 @@ mod tests {
         let result = SnapshotBuilder::new_from(snap_v1)
             .at_version(0)
             .build(engine.as_ref());
-        assert!(result.is_err(), "updating to an earlier version should fail");
+        assert!(
+            result.is_err(),
+            "updating to an earlier version should fail"
+        );
 
         let events = reporter.events();
         assert!(
-            events.iter().any(|e| matches!(e, MetricEvent::SnapshotFailed { .. })),
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::SnapshotFailed { .. })),
             "expected SnapshotFailed when version update goes backwards"
         );
         assert!(
-            !events.iter().any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. })),
             "should not emit SnapshotCompleted when version update fails"
         );
         Ok(())
@@ -586,7 +600,10 @@ mod tests {
             })
             .expect("expected LogSegmentLoaded event");
 
-        assert!(total_duration > Duration::ZERO, "total_duration should be non-zero");
+        assert!(
+            total_duration > Duration::ZERO,
+            "total_duration should be non-zero"
+        );
         assert!(
             total_duration >= segment_duration,
             "SnapshotCompleted.total_duration ({total_duration:?}) should be >= LogSegmentLoaded.duration ({segment_duration:?})"

@@ -213,7 +213,6 @@ pub(crate) mod test_utils {
         pub(crate) fn events(&self) -> Vec<MetricEvent> {
             self.events.lock().unwrap().clone()
         }
-
     }
 
     #[derive(Serialize)]

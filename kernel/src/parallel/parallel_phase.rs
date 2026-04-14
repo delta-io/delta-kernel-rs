@@ -130,6 +130,7 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
+    use crate::metrics::{MetricEvent, ScanType, WithMetricsReporterLayer};
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -140,7 +141,6 @@ mod tests {
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::schema::{DataType, StructField, StructType};
-    use crate::metrics::{MetricEvent, ScanType, WithMetricsReporterLayer};
     use crate::utils::test_utils::{load_test_table, parse_json_batch, CapturingReporter};
     use crate::{PredicateRef, SnapshotRef};
     use std::collections::HashSet;
@@ -962,7 +962,10 @@ mod tests {
         for result in sequential.by_ref() {
             result?;
         }
-        assert!(matches!(sequential.finish()?, AfterSequentialScanMetadata::Done));
+        assert!(matches!(
+            sequential.finish()?,
+            AfterSequentialScanMetadata::Done
+        ));
 
         let events = reporter.events();
         let scan_events: Vec<&ScanType> = events
@@ -973,7 +976,11 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(scan_events.len(), 1, "expected exactly one ScanMetadataCompleted event");
+        assert_eq!(
+            scan_events.len(),
+            1,
+            "expected exactly one ScanMetadataCompleted event"
+        );
         assert_eq!(*scan_events[0], ScanType::SequentialPhase);
         Ok(())
     }
