@@ -21,8 +21,6 @@
 //! - [`validate_types`]: checks that each `Scalar`'s type matches the
 //!   partition column's schema type. Null scalars skip the type check.
 
-#![allow(dead_code)] // callers are in a later PR in the stack
-
 use std::collections::HashMap;
 
 use crate::expressions::Scalar;

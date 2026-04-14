@@ -62,9 +62,9 @@
 //! 13  |                | -32768 (min)                 | p=-32768                                  | same               | "-32768"
 //! 14  |                | NULL                         | p=__HIVE_DEFAULT_PARTITION__              | same               | null
 //! 15  | DOUBLE         | 0.0                          | p=0.0                                     | same               | "0.0"
-//! 16  |                | -0.0                         | p=0.0                                     | same               | "0.0"
+//! 16  |                | -0.0                         | p=-0.0*                                   | same               | "-0.0"*
 //! 17  |                | 1.7976931348623157E308 (max) | p=1.7976931348623157E308                  | same               | "1.7976931348623157E308"
-//! 18  |                | 4.9E-324 (min positive)      | p=4.9E-324                                | same               | "4.9E-324"
+//! 18  |                | 5E-324 (min subnormal)       | p=5.0E-324*                               | same               | "5.0E-324"*
 //! 19  |                | NaN                          | p=NaN                                     | same               | "NaN"
 //! 20  |                | Infinity                     | p=Infinity                                | same               | "Infinity"
 //! 21  |                | -Infinity                    | p=-Infinity                               | same               | "-Infinity"
@@ -90,17 +90,24 @@
 //! 41  |                | 1970-01-01 00:00:00          | p=1970-01-01 00%3A00%3A00                 | p=...%2000%253A... | "1970-01-01T08:00:00.000000Z"
 //! 42  |                | 2024-06-15 23:59:59.999999   | p=2024-06-15 23%3A59%3A59.999999          | p=...%2023%253A... | "2024-06-16T06:59:59.999999Z"
 //! 43  |                | NULL                         | p=__HIVE_DEFAULT_PARTITION__              | same               | null
-//! 44  | TIMESTAMP_NTZ  | 2024-06-15 12:30:45          | p=2024-06-15 12%3A30%3A45                 | p=...%2012%253A... | "2024-06-15 12:30:45"
-//! 45  |                | 1970-01-01 00:00:00          | p=1970-01-01 00%3A00%3A00                 | p=...%2000%253A... | "1970-01-01 00:00:00"
+//! 44  | TIMESTAMP_NTZ  | 2024-06-15 12:30:45          | p=2024-06-15 12%3A30%3A45                 | p=...%2012%253A... | "2024-06-15 12:30:45.000000"*
+//! 45  |                | 1970-01-01 00:00:00          | p=1970-01-01 00%3A00%3A00                 | p=...%2000%253A... | "1970-01-01 00:00:00.000000"*
 //! 46  |                | NULL                         | p=__HIVE_DEFAULT_PARTITION__              | same               | null
 //! ```
 //!
 //! Notable behaviors:
-//! - DOUBLE `-0.0` normalizes to `"0.0"` everywhere.
 //! - DECIMAL always includes the full scale (18 trailing digits for `DECIMAL(38,18)`).
 //! - TIMESTAMP `partitionValues` are UTC ISO-8601 with microsecond precision. The
 //!   filesystem dir and `add.path` use local time without timezone.
 //! - TIMESTAMP_NTZ `partitionValues` omit the timezone and use space-separated format.
+//!
+//! `*` = kernel diverges from Delta-Spark:
+//! - Row 16: Delta-Spark normalizes `-0.0` to `"0.0"` at the SQL layer. Kernel preserves
+//!   the sign, producing `"-0.0"` (matching Java's `Double.toString(-0.0)`).
+//! - Row 18: Delta-Spark formats the smallest subnormal as `"4.9E-324"`. Rust's shortest-
+//!   representation algorithm produces `"5.0E-324"`. Both parse to the same `f64`.
+//! - Rows 44-45: Delta-Spark omits `.000000` when sub-seconds are zero. Kernel always
+//!   includes microsecond precision. Both formats round-trip through `parse_scalar`.
 //!
 //! # String and binary encoding
 //!
@@ -157,5 +164,5 @@
 //! system prevents non-UTF-8 bytes from reaching the encoding layer.
 
 pub(crate) mod hive;
-pub(crate) mod serialization;
+pub mod serialization;
 pub(crate) mod validation;

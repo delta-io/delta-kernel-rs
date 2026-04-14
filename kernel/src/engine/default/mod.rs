@@ -6,12 +6,10 @@
 //! a separate thread pool, provided by the [`TaskExecutor`] trait. Read more in
 //! the [executor] module.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt as _};
-use itertools::Itertools as _;
 use url::Url;
 
 use self::executor::TaskExecutor;
@@ -26,8 +24,7 @@ use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler, ParquetHandler,
-    StorageHandler,
+    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
 
 pub mod executor;
@@ -275,34 +272,17 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 
     /// Write `data` as a parquet file using the provided `write_context`.
     ///
-    /// The `partition_values` keys should use **logical** column names. They will be
-    /// automatically translated to physical names using the column mapping mode from
-    /// `write_context`.
+    /// The `write_context` must be created by [`Transaction::partitioned_write_context`] or
+    /// [`Transaction::unpartitioned_write_context`], which handle partition value validation,
+    /// serialization, and logical-to-physical key translation.
+    ///
+    /// [`Transaction::partitioned_write_context`]: crate::transaction::Transaction::partitioned_write_context
+    /// [`Transaction::unpartitioned_write_context`]: crate::transaction::Transaction::unpartitioned_write_context
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,
         write_context: &WriteContext,
-        partition_values: HashMap<String, String>,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        // Validate partition columns exist in the schema and translate logical names to physical names.
-        let physical_partition_values: HashMap<String, String> = partition_values
-            .into_iter()
-            .map(|(logical_name, value)| -> DeltaResult<(String, String)> {
-                let field = write_context
-                    .logical_schema()
-                    .field(&logical_name)
-                    .ok_or_else(|| {
-                        Error::generic(format!(
-                            "Partition column '{logical_name}' not found in table schema"
-                        ))
-                    })?;
-                let physical_name = field
-                    .physical_name(write_context.column_mapping_mode())
-                    .to_string();
-                Ok((physical_name, value))
-            })
-            .try_collect()?;
-
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
         let output_schema = write_context.physical_schema();
@@ -312,15 +292,33 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             output_schema.clone().into(),
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
+        // Random 2-char prefix for CM tables, Hive-style for partitioned, else table root.
+        let write_dir = write_context.write_dir();
         self.parquet
             .write_parquet_file(
-                write_context.target_dir(),
+                &write_dir,
                 physical_data,
-                physical_partition_values,
+                write_context.physical_partition_values(),
                 Some(write_context.stats_columns()),
             )
             .await
     }
+}
+
+/// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values
+/// from the provided [`WriteContext`].
+///
+/// This is the public API for building Add action metadata from file write results. Custom
+/// Arrow-based engines that write parquet files themselves (bypassing [`DefaultEngine::write_parquet`])
+/// should call this to produce the Add action metadata for [`Transaction::add_files`].
+///
+/// [`DataFileMetadata`]: parquet::DataFileMetadata
+/// [`Transaction::add_files`]: crate::transaction::Transaction::add_files
+pub fn build_add_file_metadata(
+    file_metadata: parquet::DataFileMetadata,
+    write_context: &WriteContext,
+) -> DeltaResult<Box<dyn EngineData>> {
+    file_metadata.as_record_batch(write_context.physical_partition_values())
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
