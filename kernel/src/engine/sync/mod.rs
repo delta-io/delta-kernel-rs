@@ -6,6 +6,7 @@
 
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
+use crate::metrics::MetricsReporter;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
@@ -30,6 +31,7 @@ pub(crate) struct SyncEngine {
     json_handler: Arc<json::SyncJsonHandler>,
     parquet_handler: Arc<parquet::SyncParquetHandler>,
     evaluation_handler: Arc<ArrowEvaluationHandler>,
+    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl SyncEngine {
@@ -40,6 +42,7 @@ impl SyncEngine {
             json_handler: Arc::new(json::SyncJsonHandler::new()),
             parquet_handler: Arc::new(parquet::SyncParquetHandler::new()),
             evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
+            metrics_reporter: None,
         }
     }
 
@@ -51,7 +54,14 @@ impl SyncEngine {
             json_handler: Arc::new(json::SyncJsonHandler::with_store(store.clone())),
             parquet_handler: Arc::new(parquet::SyncParquetHandler::with_store(store)),
             evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
+            metrics_reporter: None,
         }
+    }
+
+    /// Set a metrics reporter for the engine.
+    pub(crate) fn with_metrics_reporter(mut self, reporter: Arc<dyn MetricsReporter>) -> Self {
+        self.metrics_reporter = Some(reporter);
+        self
     }
 }
 
@@ -70,6 +80,10 @@ impl Engine for SyncEngine {
 
     fn json_handler(&self) -> Arc<dyn JsonHandler> {
         self.json_handler.clone()
+    }
+
+    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
+        self.metrics_reporter.clone()
     }
 }
 
