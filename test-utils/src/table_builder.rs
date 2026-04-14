@@ -3,10 +3,11 @@
 //! The builder writes data by default (1 parquet file with 10 rows per commit). Override
 //! with [`TestTableBuilder::with_data`] when a test needs specific file/row counts.
 //!
-//! Provides three orthogonal axes for parameterized testing:
+//! Provides four orthogonal axes for parameterized testing:
 //! - [`LogState`] -- what log files exist on disk (commits, checkpoints, CRC)
 //! - [`FeatureSet`] -- which Delta table features are enabled
 //! - [`VersionTarget`] -- how the snapshot is loaded (latest, time travel, incremental)
+//! - [`DataLayoutConfig`] -- data layout (unpartitioned, partitioned by type)
 //!
 //! # Quick start
 //!
@@ -38,6 +39,7 @@
 //! The macros expand there, so types resolve to the caller's kernel crate -- avoiding
 //! the type mismatch between `test_utils`'s kernel and `kernel/src/` unit tests.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -54,8 +56,10 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::DynObjectStore;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::expressions::Scalar;
 use delta_kernel::{DeltaResult, Snapshot};
 
 // ===========================================================================
@@ -147,6 +151,70 @@ impl fmt::Display for FeatureSet {
 }
 
 // ===========================================================================
+// DataLayoutConfig
+// ===========================================================================
+
+/// Data layout configuration for cross-product testing.
+///
+/// Designed for rstest `#[values]` parameterization alongside [`LogState`] and
+/// [`FeatureSet`].
+#[derive(Clone, Debug)]
+pub enum DataLayoutConfig {
+    /// No partition columns (default schema).
+    Unpartitioned,
+    /// Partition by every valid primitive type: ts_ntz, bool, string, date, int, long,
+    /// decimal, timestamp. Uses [`partitioned_schema`] with all columns as partition columns.
+    AllTypes,
+}
+
+impl DataLayoutConfig {
+    /// The partition column names for this config, referencing [`partitioned_schema`] columns.
+    pub fn columns(&self) -> Vec<&'static str> {
+        match self {
+            DataLayoutConfig::Unpartitioned => vec![],
+            DataLayoutConfig::AllTypes => vec![
+                "part_ts_ntz",
+                "part_bool",
+                "part_string",
+                "part_date",
+                "part_int",
+                "part_long",
+                "part_decimal",
+                "part_ts",
+            ],
+        }
+    }
+}
+
+impl fmt::Display for DataLayoutConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DataLayoutConfig::Unpartitioned => write!(f, "unpartitioned"),
+            DataLayoutConfig::AllTypes => write!(f, "partitioned(all_types)"),
+        }
+    }
+}
+
+/// Schema with all partition-valid primitive types. Use with [`DataLayoutConfig`] to select
+/// which columns are partition columns. Includes `TimestampNtz` which auto-enables the
+/// `timestampNtz` table feature.
+pub fn partitioned_schema() -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        // Partition-candidate columns (all valid partition types)
+        StructField::new("part_bool", DataType::BOOLEAN, true),
+        StructField::new("part_int", DataType::INTEGER, true),
+        StructField::new("part_long", DataType::LONG, true),
+        StructField::new("part_string", DataType::STRING, true),
+        StructField::new("part_date", DataType::DATE, true),
+        StructField::new("part_ts", DataType::TIMESTAMP, true),
+        StructField::new("part_ts_ntz", DataType::TIMESTAMP_NTZ, true),
+        StructField::new("part_decimal", DataType::decimal(10, 2).unwrap(), true),
+        // Non-partition data column (required: at least one non-partition column)
+        StructField::new("value", DataType::INTEGER, true),
+    ]))
+}
+
+// ===========================================================================
 // VersionTarget
 // ===========================================================================
 
@@ -189,6 +257,7 @@ pub struct TestTableBuilder {
     log_state: LogState,
     features: FeatureSet,
     schema: SchemaRef,
+    partition_columns: Vec<String>,
     num_data_files: usize,
     rows_per_file: usize,
 }
@@ -207,6 +276,7 @@ impl TestTableBuilder {
             log_state: LogState::with_commits(1),
             features: FeatureSet::empty(),
             schema: default_schema(),
+            partition_columns: Vec::new(),
             num_data_files: 1,
             rows_per_file: 10,
         }
@@ -232,13 +302,31 @@ impl TestTableBuilder {
 
     /// Override the number of parquet data files per commit and rows per file. Defaults
     /// are 1 file with 10 rows -- most tests don't need to call this.
-    ///
-    /// Note: for partitioned tables the file count is determined by the number of distinct
-    /// partition values, so `files_per_commit` is ignored in that case.
     pub fn with_data(mut self, files_per_commit: usize, rows_per_file: usize) -> Self {
         self.num_data_files = files_per_commit;
         self.rows_per_file = rows_per_file;
         self
+    }
+
+    /// Set partition columns by logical name. The columns must exist in the schema.
+    /// Each data file gets deterministic partition values derived from version and file index.
+    pub fn with_partition_columns(
+        mut self,
+        cols: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.partition_columns = cols.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Apply a [`DataLayoutConfig`], setting the schema and partition columns accordingly.
+    /// For [`DataLayoutConfig::Unpartitioned`], leaves the schema and columns unchanged.
+    pub fn with_data_layout(self, config: DataLayoutConfig) -> Self {
+        let cols = config.columns();
+        if cols.is_empty() {
+            return self;
+        }
+        self.with_schema(partitioned_schema())
+            .with_partition_columns(cols)
     }
 
     /// Build the table and return a [`TestTable`] handle to the store.
@@ -273,6 +361,11 @@ impl TestTableBuilder {
                     .map(|(k, v)| (k.as_str(), v.as_str())),
             );
         }
+        if !self.partition_columns.is_empty() {
+            builder = builder.with_data_layout(DataLayout::partitioned(
+                self.partition_columns.iter().map(|s| s.as_str()),
+            ));
+        }
         let committed = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?
@@ -287,6 +380,7 @@ impl TestTableBuilder {
                 &engine,
                 self.num_data_files,
                 self.rows_per_file,
+                &self.partition_columns,
                 v,
             )
             .await?;
@@ -310,13 +404,15 @@ impl TestTableBuilder {
 // ===========================================================================
 
 /// Write a data commit using kernel's transaction + write_parquet path.
-/// Produces `num_files` parquet files with `rows_per_file` rows each. For partitioned
-/// tables, each partition value produces a separate file regardless of `num_files`.
+/// Produces `num_files` parquet files with `rows_per_file` rows each. For partition
+/// columns, all rows in a file share the same value (matching the declared partition
+/// values); non-partition columns get varying data.
 async fn write_data_commit(
     snapshot: Arc<Snapshot>,
     engine: &DefaultEngine<TokioBackgroundExecutor>,
     num_files: usize,
     rows_per_file: usize,
+    partition_columns: &[String],
     version: u64,
 ) -> DeltaResult<delta_kernel::transaction::CommitResult> {
     let logical_schema = snapshot.schema().clone();
@@ -328,17 +424,31 @@ async fn write_data_commit(
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
-    let write_context = txn.unpartitioned_write_context()?;
-
     for file_idx in 0..num_files {
         let base = (version as i32 * 1000) + (file_idx as i32 * 100);
+        let partition_seed = (version as usize) * 1000 + file_idx * 100;
         let columns: Vec<ArrayRef> = arrow_schema
             .fields()
             .iter()
-            .map(|f| generate_column(f.data_type(), rows_per_file, base))
+            .zip(logical_schema.fields())
+            .map(|(arrow_field, kernel_field)| {
+                if partition_columns.contains(&kernel_field.name().to_string()) {
+                    generate_constant_column(arrow_field.data_type(), rows_per_file, partition_seed)
+                } else {
+                    generate_column(arrow_field.data_type(), rows_per_file, base)
+                }
+            })
             .collect();
         let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns)
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+
+        let write_context = if partition_columns.is_empty() {
+            txn.unpartitioned_write_context()?
+        } else {
+            let partition_values =
+                generate_partition_values(logical_schema.as_ref(), partition_columns, version, file_idx);
+            txn.partitioned_write_context(partition_values)?
+        };
 
         let add_files = engine
             .write_parquet(&ArrowEngineData::new(batch), &write_context)
@@ -347,6 +457,71 @@ async fn write_data_commit(
     }
 
     txn.commit(engine)
+}
+
+/// Generate a constant column where all rows have the same value derived from `seed`.
+/// Used for partition columns so the data matches the declared partition values.
+fn generate_constant_column(arrow_type: &ArrowDataType, rows: usize, seed: usize) -> ArrayRef {
+    match arrow_type {
+        ArrowDataType::Boolean => {
+            let v = seed.is_multiple_of(2);
+            Arc::new(BooleanArray::from(vec![v; rows]))
+        }
+        ArrowDataType::Int8 => {
+            let v = (seed % 100) as i8;
+            Arc::new(Int8Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Int16 => {
+            let v = (seed % 100) as i16;
+            Arc::new(Int16Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Int32 => {
+            let v = (seed % 100) as i32;
+            Arc::new(Int32Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Int64 => {
+            let v = (seed * 1000) as i64;
+            Arc::new(Int64Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Float32 => {
+            let v = seed as f32 * 0.5;
+            Arc::new(Float32Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Float64 => {
+            let v = seed as f64 * 0.25;
+            Arc::new(Float64Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Utf8 => {
+            let v = format!("part_{seed}");
+            Arc::new(StringArray::from(vec![v.as_str(); rows]))
+        }
+        ArrowDataType::Binary => {
+            let v = format!("bin_{seed}").into_bytes();
+            Arc::new(BinaryArray::from(vec![v.as_slice(); rows]))
+        }
+        ArrowDataType::Date32 => {
+            let v = 18000 + seed as i32;
+            Arc::new(Date32Array::from(vec![v; rows]))
+        }
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            let v = (18000 + seed as i64) * 86_400_000_000;
+            let array = TimestampMicrosecondArray::from(vec![v; rows]);
+            match tz {
+                Some(tz) => Arc::new(array.with_timezone(tz.as_ref())),
+                None => Arc::new(array),
+            }
+        }
+        ArrowDataType::Decimal128(precision, scale) => {
+            let scale_factor = 10i128.pow(*scale as u32);
+            let v = seed as i128 * scale_factor;
+            Arc::new(
+                Decimal128Array::from(vec![v; rows])
+                    .with_precision_and_scale(*precision, *scale)
+                    .expect("valid decimal"),
+            )
+        }
+        other => panic!("unsupported Arrow type for partition column: {other:?}"),
+    }
 }
 
 /// Generate a single column of data based on its Arrow type.
@@ -544,6 +719,67 @@ macro_rules! test_context {
 }
 
 // ===========================================================================
+// Partition value generation
+// ===========================================================================
+
+/// Generate deterministic partition values for a given version and file index.
+/// Follows the Delta protocol partition value serialization format.
+fn generate_partition_values(
+    schema: &StructType,
+    partition_columns: &[String],
+    version: u64,
+    file_idx: usize,
+) -> HashMap<String, Scalar> {
+    let seed = (version as usize) * 1000 + file_idx * 100;
+    partition_columns
+        .iter()
+        .map(|col_name| {
+            let field = schema
+                .field(col_name)
+                .unwrap_or_else(|| panic!("partition column '{col_name}' not in schema"));
+            let value = scalar_for_type(field.data_type(), seed);
+            (col_name.clone(), value)
+        })
+        .collect()
+}
+
+/// Generate a deterministic [`Scalar`] partition value for the given data type.
+fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
+    match data_type {
+        DataType::Primitive(p) => match p {
+            PrimitiveType::Boolean => Scalar::Boolean(seed.is_multiple_of(2)),
+            PrimitiveType::Byte => Scalar::Byte((seed % 100) as i8),
+            PrimitiveType::Short => Scalar::Short((seed % 100) as i16),
+            PrimitiveType::Integer => Scalar::Integer((seed % 100) as i32),
+            PrimitiveType::Long => Scalar::Long((seed * 1000) as i64),
+            PrimitiveType::Float => Scalar::Float(seed as f32 * 0.5),
+            PrimitiveType::Double => Scalar::Double(seed as f64 * 0.25),
+            PrimitiveType::String => Scalar::String(format!("part_{seed}")),
+            PrimitiveType::Binary => Scalar::Binary(format!("bin_{seed}").into_bytes()),
+            PrimitiveType::Date => {
+                // Days since epoch (1970-01-01)
+                Scalar::Date(18000 + seed as i32)
+            }
+            PrimitiveType::Timestamp => {
+                // Microseconds since epoch (UTC)
+                Scalar::Timestamp((18000 + seed as i64) * 86_400_000_000)
+            }
+            PrimitiveType::TimestampNtz => {
+                // Microseconds since epoch (no timezone)
+                Scalar::TimestampNtz((18000 + seed as i64) * 86_400_000_000)
+            }
+            PrimitiveType::Decimal(dt) => {
+                let scale_factor = 10i128.pow(dt.scale() as u32);
+                let bits = seed as i128 * scale_factor;
+                Scalar::decimal(bits, dt.precision(), dt.scale())
+                    .expect("test seed produced invalid decimal")
+            }
+        },
+        other => panic!("partition columns must be primitive types, got: {other:?}"),
+    }
+}
+
+// ===========================================================================
 // Helpers: schema
 // ===========================================================================
 
@@ -624,6 +860,25 @@ mod tests {
         let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
         let scan = snap.scan_builder().build()?;
         let batches = crate::read_scan(&scan, engine)?;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn test_partitioned_table() -> DeltaResult<()> {
+        let data_layout_config = DataLayoutConfig::AllTypes;
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_commits(2))
+            .with_data_layout(data_layout_config)
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 1);
+        let scan = snap.scan_builder().build()?;
+        let engine_arc: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let batches = crate::read_scan(&scan, engine_arc)?;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 10);
         Ok(())
