@@ -143,8 +143,6 @@ impl SnapshotBuilder {
 
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
         let operation_id = MetricId::new();
-        // let reporter = engine.get_metrics_reporter();
-        // let start = Instant::now();
 
         // Pre-build validations for catalog-managed tables
         Self::validate_catalog_managed_build_inputs(version, max_catalog_version, &log_tail)?;
@@ -194,42 +192,7 @@ impl SnapshotBuilder {
             Self::validate_catalog_managed_build_result(&snapshot, max_catalog_version)?;
             Ok(snapshot)
         })
-
-        // TODO: replace with tracing-based metrics reporting
-        // Self::report_snapshot_build_result(result, start, operation_id, reporter.as_ref())
     }
-
-    // TODO: reimplement using tracing spans instead of reporter
-    // /// Emit [`MetricEvent::SnapshotCompleted`] or [`MetricEvent::SnapshotFailed`] based on the
-    // /// result, measuring total duration from `start`.
-    // fn report_snapshot_build_result(
-    //     result: DeltaResult<SnapshotRef>,
-    //     start: Instant,
-    //     operation_id: MetricId,
-    //     reporter: Option<&Arc<dyn MetricsReporter>>,
-    // ) -> DeltaResult<SnapshotRef> {
-    //     let snapshot_duration = start.elapsed();
-    //     match &result {
-    //         Ok(snapshot) => {
-    //             reporter.inspect(|r| {
-    //                 r.report(MetricEvent::SnapshotCompleted {
-    //                     operation_id,
-    //                     version: snapshot.version(),
-    //                     total_duration: snapshot_duration,
-    //                 });
-    //             });
-    //         }
-    //         Err(_) => {
-    //             reporter.inspect(|r| {
-    //                 r.report(MetricEvent::SnapshotFailed {
-    //                     operation_id,
-    //                     duration: snapshot_duration,
-    //                 });
-    //             });
-    //         }
-    //     }
-    //     result
-    // }
 
     // ===== Catalog-managed Validations =====
 
@@ -358,11 +321,9 @@ mod tests {
     use crate::engine::default::{
         executor::tokio::TokioBackgroundExecutor, DefaultEngine, DefaultEngineBuilder,
     };
-    // use crate::metrics::MetricEvent; // TODO: needed once reporter tests are ported to tracing
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-    // use crate::utils::test_utils::CapturingReporter; // TODO: needed once reporter tests are ported to tracing
     use itertools::Itertools;
     use serde_json::json;
     use test_utils::{actions_to_string, add_commit, TestAction};

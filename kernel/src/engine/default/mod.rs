@@ -227,14 +227,10 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             json: Arc::new(DefaultJsonHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
-            // TODO: reimplement using tracing spans instead of reporter
-            // .with_reporter(metrics_reporter.clone()),
             )),
             parquet: Arc::new(DefaultParquetHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
-            // TODO: reimplement using tracing spans instead of reporter
-            // .with_reporter(metrics_reporter.clone()),
             )),
             object_store,
             task_executor,

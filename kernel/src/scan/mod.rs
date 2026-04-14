@@ -766,8 +766,6 @@ impl Scan {
         >,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         let start = Instant::now();
-        // TODO: reimplement using tracing spans instead of reporter
-        // let reporter = engine.get_metrics_reporter();
         let operation_id = MetricId::new();
 
         let (iter, metrics) = match self.state_info.physical_predicate {
@@ -790,10 +788,6 @@ impl Scan {
         let on_complete = move || {
             let event = metrics.to_event(operation_id, ScanType::Full, start.elapsed());
             info!(%event);
-            // TODO: reimplement using tracing spans instead of reporter
-            // if let Some(r) = reporter {
-            //     r.report(event);
-            // }
         };
         Ok(iter.into_iter().flatten().on_complete(on_complete))
     }
