@@ -241,6 +241,9 @@ pub enum Scalar {
     Timestamp(i64),
     /// Microsecond precision timestamp, with no timezone.
     TimestampNtz(i64),
+    #[cfg(feature = "nanosecond-timestamps")]
+    /// Nanosecond precision timestamp, adjusted to UTC.
+    TimestampNanos(i64),
     /// Date stored as a signed 32bit int days since UNIX epoch 1970-01-01
     Date(i32),
     /// Binary data
@@ -270,6 +273,8 @@ impl Scalar {
             Self::Boolean(_) => DataType::BOOLEAN,
             Self::Timestamp(_) => DataType::TIMESTAMP,
             Self::TimestampNtz(_) => DataType::TIMESTAMP_NTZ,
+            #[cfg(feature = "nanosecond-timestamps")]
+            Self::TimestampNanos(_) => DataType::TIMESTAMP_NANOS,
             Self::Date(_) => DataType::DATE,
             Self::Binary(_) => DataType::BINARY,
             Self::Decimal(d) => DataType::from(*d.ty()),
@@ -368,6 +373,8 @@ impl Display for Scalar {
             Self::Boolean(b) => write!(f, "{b}"),
             Self::Timestamp(ts) => write!(f, "{ts}"),
             Self::TimestampNtz(ts) => write!(f, "{ts}"),
+            #[cfg(feature = "nanosecond-timestamps")]
+            Self::TimestampNanos(ts) => write!(f, "{ts}"),
             Self::Date(d) => write!(f, "{d}"),
             Self::Binary(b) => write!(f, "{b:?}"),
             Self::Decimal(d) => match d.scale().cmp(&0) {
@@ -485,6 +492,10 @@ impl Scalar {
             (Timestamp(_), _) => None,
             (TimestampNtz(a), TimestampNtz(b)) => a.partial_cmp(b),
             (TimestampNtz(_), _) => None,
+            #[cfg(feature = "nanosecond-timestamps")]
+            (TimestampNanos(a), TimestampNanos(b)) => a.partial_cmp(b),
+            #[cfg(feature = "nanosecond-timestamps")]
+            (TimestampNanos(_), _) => None,
             (Date(a), Date(b)) => a.partial_cmp(b),
             (Date(_), _) => None,
             (Binary(a), Binary(b)) => a.partial_cmp(b),
@@ -755,6 +766,26 @@ impl PrimitiveType {
                     TimestampNtz => Ok(Scalar::TimestampNtz(micros)),
                     _ => unreachable!(),
                 }
+            }
+            #[cfg(feature = "nanosecond-timestamps")]
+            // TimestampNanos are parsed into nanoseconds since unix epoch. It
+            // may have the format `{year}-{month}-{day}
+            // {hour}:{minute}:{second}` or as a ISO 8601 formatted string such
+            // as `1970-01-01T00:00:00.123456789Z`.
+            TimestampNanos => {
+                let mut timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f");
+
+                if timestamp.is_err() {
+                    // Note: `%+` specifies the ISO 8601 / RFC 3339 format
+                    timestamp = NaiveDateTime::parse_from_str(raw, "%+");
+                }
+                let timestamp = timestamp.map_err(|_| self.parse_error(raw))?;
+                let timestamp = Utc.from_utc_datetime(&timestamp);
+                let nanos = timestamp
+                    .signed_duration_since(DateTime::UNIX_EPOCH)
+                    .num_nanoseconds()
+                    .ok_or(self.parse_error(raw))?;
+                Ok(Scalar::TimestampNanos(nanos))
             }
         }
     }
@@ -1083,6 +1114,24 @@ mod tests {
         assert_timestamp_eq("1970-01-01 00:00:00", 0);
     }
 
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[test]
+    fn test_timestamp_nanos_parse() {
+        let assert_timestamp_eq = |scalar_string, nanos| {
+            let scalar = PrimitiveType::TimestampNanos
+                .parse_scalar(scalar_string)
+                .unwrap();
+            assert_eq!(scalar, Scalar::TimestampNanos(nanos));
+        };
+        assert_timestamp_eq("1971-07-22T03:06:40.678910Z", 49000000678910000);
+        assert_timestamp_eq("1971-07-22T03:06:40.678910674Z", 49000000678910674);
+        assert_timestamp_eq("1971-07-22T03:06:40Z", 49000000000000000);
+        assert_timestamp_eq("2011-01-11 13:06:07", 1294751167000000000);
+        assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456000);
+        assert_timestamp_eq("2011-01-11 13:06:07.123456789", 1294751167123456789);
+        assert_timestamp_eq("1970-01-01 00:00:00", 0);
+    }
+
     #[test]
     fn test_timestamp_parse_fails() {
         let assert_timestamp_fails = |p_type: &PrimitiveType, scalar_string| {
@@ -1097,39 +1146,64 @@ mod tests {
 
         let p_type = PrimitiveType::Timestamp;
         assert_timestamp_fails(&p_type, "1971-07-22");
+
+        #[cfg(feature = "nanosecond-timestamps")]
+        {
+            let p_type = PrimitiveType::TimestampNanos;
+            assert_timestamp_fails(&p_type, "1971-07-22");
+        }
     }
 
     #[test]
-    fn test_partial_cmp() {
-        let a = Scalar::Integer(1);
-        let b = Scalar::Integer(2);
-        let c = Scalar::Null(DataType::INTEGER);
+    fn test_partial_cmp_integer() {
+        test_partial_cmp(Scalar::Integer(1), Scalar::Integer(2), DataType::INTEGER);
+    }
+
+    /// Compare two scalars of the given datatype; a should be smaller than b.
+    fn test_partial_cmp(a: Scalar, b: Scalar, dtype: DataType) {
+        let null = Scalar::Null(dtype);
 
         assert_eq!(a.logical_partial_cmp(&b), Some(Ordering::Less));
         assert_eq!(b.logical_partial_cmp(&a), Some(Ordering::Greater));
         assert_eq!(a.logical_partial_cmp(&a), Some(Ordering::Equal));
         assert_eq!(b.logical_partial_cmp(&b), Some(Ordering::Equal));
-        assert_eq!(a.logical_partial_cmp(&c), None);
-        assert_eq!(c.logical_partial_cmp(&a), None);
+        assert_eq!(a.logical_partial_cmp(&null), None);
+        assert_eq!(null.logical_partial_cmp(&a), None);
 
         // assert that NULL values are incomparable
-        let null = Scalar::Null(DataType::INTEGER);
         assert_eq!(null.logical_partial_cmp(&null), None);
     }
 
     #[test]
-    fn test_partial_eq() {
-        let a = Scalar::Integer(1);
-        let b = Scalar::Integer(2);
-        let c = Scalar::Null(DataType::INTEGER);
+    fn test_partial_eq_integer() {
+        test_partial_eq(Scalar::Integer(1), Scalar::Integer(2), DataType::INTEGER);
+    }
+
+    /// Compare two scalars of the given datatype; a should be different than b.
+    fn test_partial_eq(a: Scalar, b: Scalar, dtype: DataType) {
+        let null = Scalar::Null(dtype);
         assert!(!a.logical_eq(&b));
         assert!(a.logical_eq(&a));
-        assert!(!a.logical_eq(&c));
-        assert!(!c.logical_eq(&a));
+        assert!(!a.logical_eq(&null));
+        assert!(!null.logical_eq(&a));
 
         // assert that NULL values are incomparable
-        let null = Scalar::Null(DataType::INTEGER);
         assert!(!null.logical_eq(&null));
+    }
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[test]
+    fn test_partial_eq_cmp_timestamp_nanos() {
+        test_partial_eq(
+            Scalar::TimestampNanos(-123),
+            Scalar::TimestampNanos(123),
+            DataType::TIMESTAMP_NANOS,
+        );
+        test_partial_cmp(
+            Scalar::TimestampNanos(-123),
+            Scalar::TimestampNanos(123),
+            DataType::TIMESTAMP_NANOS,
+        );
     }
 
     #[test]

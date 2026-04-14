@@ -993,6 +993,17 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
                 None => Arc::new(array),
             }
         }
+        #[cfg(feature = "nanosecond-timestamps")]
+        ArrowDataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            let values: Vec<i64> = (0..rows)
+                .map(|i| (18000 + base + i as i32) as i64 * 86_400_000_000_000)
+                .collect();
+            let array = TimestampMicrosecondArray::from(values);
+            match tz {
+                Some(tz) => Arc::new(array.with_timezone(tz.as_ref())),
+                None => Arc::new(array),
+            }
+        }
         ArrowDataType::Decimal128(precision, scale) => {
             let scale_factor = 10i128.pow(*scale as u32);
             let values: Vec<i128> = (0..rows)
@@ -1201,6 +1212,8 @@ pub(crate) fn default_schema() -> SchemaRef {
         StructField::new("string_col", DataType::STRING, true),
         StructField::new("binary_col", DataType::BINARY, true),
         StructField::new("date_col", DataType::DATE, true),
+        #[cfg(feature = "nanosecond-timestamps")]
+        StructField::new("ts_nanos_col", DataType::TIMESTAMP, true),
         StructField::new("ts_col", DataType::TIMESTAMP, true),
         StructField::new("ts_ntz_col", DataType::TIMESTAMP_NTZ, true),
         StructField::new("decimal_col", DataType::decimal(10, 2).unwrap(), true),

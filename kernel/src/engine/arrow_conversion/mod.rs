@@ -176,6 +176,11 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
+                    #[cfg(feature = "nanosecond-timestamps")]
+                    PrimitiveType::TimestampNanos => Ok(ArrowDataType::Timestamp(
+                        TimeUnit::Nanosecond,
+                        Some("UTC".into()),
+                    )),
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
@@ -295,11 +300,15 @@ impl TryFromArrow<&ArrowDataType> for DataType {
             {
                 Ok(DataType::TIMESTAMP)
             }
+            // TODO Once there is a nanosecond timestamp type without timezones,
+            // we can use that instead when feature = "nanosecond-timestamps" is
+            // enabled.
             ArrowDataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(DataType::TIMESTAMP_NTZ),
+            #[cfg(feature = "nanosecond-timestamps")]
             ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz))
                 if tz.eq_ignore_ascii_case("utc") =>
             {
-                Ok(DataType::TIMESTAMP)
+                Ok(DataType::TIMESTAMP_NANOS)
             }
             ArrowDataType::Struct(fields) => DataType::try_struct_type_from_results(
                 fields.iter().map(|field| field.as_ref().try_into_kernel()),
