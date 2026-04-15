@@ -1227,6 +1227,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "test_utils",
  "tokio",
  "tracing",
  "unity-catalog-delta-client-api",
