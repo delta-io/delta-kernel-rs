@@ -524,8 +524,8 @@ impl Snapshot {
         let state = Arc::into_inner(state).ok_or_else(|| {
             Error::internal_error("ActionReconciliationIteratorState Arc has other references")
         })?;
-        let stats = CheckpointActionStats::from_reconciliation_state(state)?;
-        writer.finalize(engine, &file_meta, &stats)?;
+        let action_stats = CheckpointActionStats::from_reconciliation_state(state)?;
+        writer.finalize(engine, &file_meta, &action_stats)?;
 
         let checkpoint_log_path = ParsedLogPath::try_from(file_meta)?.ok_or_else(|| {
             Error::internal_error("Checkpoint path could not be parsed as a log path")
