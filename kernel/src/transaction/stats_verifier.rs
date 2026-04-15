@@ -281,6 +281,8 @@ mod tests {
     use crate::arrow::array::types::{
         Date32Type, Decimal128Type, Float32Type, Float64Type, Int32Type, TimestampMicrosecondType,
     };
+    #[cfg(feature = "nanosecond-timestamps")]
+    use crate::arrow::array::TimestampNanosecondArray;
     use crate::arrow::array::{
         Array, ArrayRef, BinaryArray, BooleanArray, Int16Array, Int64Array, Int8Array,
         LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
@@ -765,6 +767,14 @@ mod tests {
         Arc::new(PrimitiveArray::<TimestampMicrosecondType>::from(vec![None::<i64>, None, None])) as ArrayRef,
         DataType::TIMESTAMP_NTZ,
     )]
+    #[cfg_attr(feature = "nanosecond-timestamps", case::timestamp_nanos(
+        Arc::new(TimestampNanosecondArray::from(vec![Some(1_000_000i64), Some(2_000_000), Some(3_000_123)])) as ArrayRef,
+        DataType::TIMESTAMP_NANOS,
+    ))]
+    #[cfg_attr(feature = "nanosecond-timestamps", case::timestamp_nanos_all_null(
+        Arc::new(TimestampNanosecondArray::from(vec![None::<i64>, None, None])) as ArrayRef,
+        DataType::TIMESTAMP_NANOS,
+    ))]
     #[case::string(
         Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("c")])) as ArrayRef,
         DataType::STRING,
