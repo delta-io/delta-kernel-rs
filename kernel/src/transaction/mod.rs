@@ -820,45 +820,19 @@ impl<S> Transaction<S> {
     }
 
     /// Lazily builds and caches the [`SharedWriteState`] for this transaction.
-    ///
-    /// Resolves partition column names (logical to physical) once and caches the result.
-    /// Returns an error if a partition column is not found in the table schema.
-    // TODO: replace with `get_or_try_init` when stable (rust#109737). That avoids the
-    // early-return + fallible compute + `get_or_init` dance, and prevents a concurrent
-    // caller from redundantly recomputing the state when the first caller is still running.
-    fn shared_write_state(&self) -> DeltaResult<&Arc<SharedWriteState>> {
-        if let Some(state) = self.shared_write_state.get() {
-            return Ok(state);
-        }
-        let table_config = self.read_snapshot.table_configuration();
-        let logical_schema = self.read_snapshot.schema();
-        let cm_mode = table_config.column_mapping_mode();
-        let logical_and_physical_partition_columns: Vec<(String, String)> = table_config
-            .partition_columns()
-            .iter()
-            .map(|logical_name| {
-                let physical_name = logical_schema
-                    .field(logical_name)
-                    .ok_or_else(|| {
-                        Error::internal_error(format!(
-                            "partition column '{logical_name}' not found in table schema"
-                        ))
-                    })?
-                    .physical_name(cm_mode)
-                    .to_string();
-                Ok((logical_name.clone(), physical_name))
+    fn shared_write_state(&self) -> &Arc<SharedWriteState> {
+        self.shared_write_state.get_or_init(|| {
+            let table_config = self.read_snapshot.table_configuration();
+            Arc::new(SharedWriteState {
+                table_root: self.read_snapshot.table_root().clone(),
+                logical_schema: self.read_snapshot.schema(),
+                physical_schema: table_config.physical_write_schema(),
+                logical_to_physical: Arc::new(self.generate_logical_to_physical()),
+                column_mapping_mode: table_config.column_mapping_mode(),
+                stats_columns: self.stats_columns(),
+                logical_partition_columns: table_config.partition_columns().to_vec(),
             })
-            .collect::<DeltaResult<_>>()?;
-        let state = Arc::new(SharedWriteState {
-            table_root: self.read_snapshot.table_root().clone(),
-            logical_schema,
-            physical_schema: table_config.physical_write_schema(),
-            logical_to_physical: Arc::new(self.generate_logical_to_physical()),
-            column_mapping_mode: cm_mode,
-            stats_columns: self.stats_columns(),
-            logical_and_physical_partition_columns,
-        });
-        Ok(self.shared_write_state.get_or_init(|| state))
+        })
     }
 
     /// Creates a write context for writing data to a specific partition.
@@ -900,37 +874,46 @@ impl<S> Transaction<S> {
         &self,
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
-        let shared = self.shared_write_state()?;
+        let shared = self.shared_write_state();
         require!(
-            !shared.logical_and_physical_partition_columns.is_empty(),
+            !shared.logical_partition_columns.is_empty(),
             Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
         );
 
         // Validate keys (completeness, case normalization) and value types, then return
         // the map re-keyed to schema case.
-        let logical_names: Vec<String> = shared
-            .logical_and_physical_partition_columns
-            .iter()
-            .map(|(logical, _)| logical.clone())
-            .collect();
-        let normalized =
-            validate_partition_values(&logical_names, &shared.logical_schema, partition_values)?;
+        let normalized = validate_partition_values(
+            &shared.logical_partition_columns,
+            &shared.logical_schema,
+            partition_values,
+        )?;
 
-        // Serialize values using the pre-resolved (logical, physical) pairs from shared
-        // state. WriteContext::new derives the logical partition path from these pairs.
-        let mut physical_partition_values =
-            HashMap::with_capacity(shared.logical_and_physical_partition_columns.len());
-        for (logical_name, physical_name) in &shared.logical_and_physical_partition_columns {
+        // Serialize values and translate keys from logical to physical names.
+        let mut serialized = HashMap::with_capacity(normalized.len());
+        for logical_name in &shared.logical_partition_columns {
             let scalar = normalized.get(logical_name).ok_or_else(|| {
                 Error::internal_error(format!(
                     "partition column '{logical_name}' missing after validation"
                 ))
             })?;
             let value = serialize_partition_value(scalar)?;
-            physical_partition_values.insert(physical_name.clone(), value);
+            let physical_name = shared
+                .logical_schema
+                .field(logical_name)
+                .ok_or_else(|| {
+                    Error::internal_error(format!(
+                        "partition column '{logical_name}' not found in schema after validation"
+                    ))
+                })?
+                .physical_name(shared.column_mapping_mode)
+                .to_string();
+            serialized.insert(physical_name, value);
         }
 
-        Ok(WriteContext::new(shared.clone(), physical_partition_values))
+        Ok(WriteContext {
+            shared: shared.clone(),
+            physical_partition_values: serialized,
+        })
     }
 
     /// Creates a write context for writing data to an unpartitioned table.
@@ -938,12 +921,15 @@ impl<S> Transaction<S> {
     /// Returns an error if the table has partition columns (use
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
-        let shared = self.shared_write_state()?;
+        let shared = self.shared_write_state();
         require!(
-            shared.logical_and_physical_partition_columns.is_empty(),
+            shared.logical_partition_columns.is_empty(),
             Error::generic("table is partitioned; use partitioned_write_context() instead")
         );
-        Ok(WriteContext::new(shared.clone(), HashMap::new()))
+        Ok(WriteContext {
+            shared: shared.clone(),
+            physical_partition_values: HashMap::new(),
+        })
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
@@ -1411,7 +1397,6 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
-    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{MapData, Scalar, StructData};
     use crate::object_store::local::LocalFileSystem;
@@ -1813,44 +1798,6 @@ mod tests {
             "expected '{expected_msg}' in error, got: {err}"
         );
         Ok(())
-    }
-
-    #[test]
-    fn test_write_context_partition_col_not_in_schema_returns_error() {
-        let storage = Arc::new(InMemory::new());
-        let table_root = Url::parse("memory:///").unwrap();
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-
-        // Schema has only "id", but metadata claims "ghost" is a partition column.
-        let actions = [
-            r#"{"commitInfo":{"timestamp":1587968586154}}"#,
-            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
-            concat!(
-                r#"{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"#,
-                r#""schemaString":"{\"type\":\"struct\",\"fields\":"#,
-                r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","#,
-                r#""partitionColumns":["ghost"],"configuration":{},"createdTime":1587968585495}}"#,
-            ),
-        ]
-        .join("\n");
-
-        let commit_path = Path::from("_delta_log/00000000000000000000.json");
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(storage.put(&commit_path, actions.into()))
-            .unwrap();
-
-        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
-            .unwrap();
-        let err = txn
-            .partitioned_write_context(HashMap::from([("ghost".into(), Scalar::Integer(1))]))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.starts_with("Internal error partition column 'ghost' not found in table schema."),
-            "unexpected error: {err}"
-        );
     }
 
     /// Tests that update_deletion_vectors validates table protocol requirements.
