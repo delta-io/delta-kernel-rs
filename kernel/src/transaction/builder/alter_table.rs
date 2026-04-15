@@ -7,8 +7,9 @@
 //!
 //! - [`Ready`]: Initial state. Operations are available, but `build()` is not (at least one
 //!   operation is required).
-//! - [`Modifying`]: After at least one operation (`add_column`, `set_nullable`). Can chain more
-//!   operations, and `build()` is available.
+//! - [`Modifying`]: After `add_column`, `drop_column`, or `set_nullable`. These can be chained,
+//!   and `build()` is available.
+//! - [`Renaming`]: After `rename_column`. Only `build()` is available (rename is terminal).
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -30,6 +31,9 @@ pub struct Ready;
 
 /// State after at least one operation has been added. `add_column` and `build()` are available.
 pub struct Modifying;
+
+/// State after rename_column. Only `build()` is available (rename is terminal).
+pub struct Renaming;
 
 /// Builder for constructing an [`AlterTableTransaction`] with schema evolution operations.
 ///
@@ -107,6 +111,30 @@ impl AlterTableTransactionBuilder<Ready> {
         self.operations.push(SchemaOperation::SetNullable { path });
         self.transition()
     }
+
+    /// Rename a column in the table schema. Supports nested columns via [`ColumnName`] paths.
+    ///
+    /// Requires column mapping mode = name or id. Only the logical name changes; the physical
+    /// name and column ID remain the same.
+    ///
+    /// Rename is a terminal operation -- no further operations can be chained.
+    ///
+    /// # Errors (at build time)
+    ///
+    /// - Column does not exist
+    /// - Column mapping mode is not enabled
+    /// - New name conflicts with an existing column at the same level
+    pub fn rename_column(
+        mut self,
+        path: ColumnName,
+        new_name: impl Into<String>,
+    ) -> AlterTableTransactionBuilder<Renaming> {
+        self.operations.push(SchemaOperation::RenameColumn {
+            path,
+            new_name: new_name.into(),
+        });
+        self.transition()
+    }
 }
 
 impl AlterTableTransactionBuilder<Modifying> {
@@ -127,7 +155,21 @@ impl AlterTableTransactionBuilder<Modifying> {
         self.operations.push(SchemaOperation::SetNullable { path });
         self
     }
+}
 
+/// Marker trait for builder states that support `build()`. Sealed to prevent external impls.
+pub trait Buildable: sealed::Sealed {}
+impl Buildable for Modifying {}
+impl Buildable for Renaming {}
+
+mod sealed {
+    /// Prevents external implementations of [`Buildable`](super::Buildable).
+    pub trait Sealed {}
+    impl Sealed for super::Modifying {}
+    impl Sealed for super::Renaming {}
+}
+
+impl<S: Buildable> AlterTableTransactionBuilder<S> {
     /// Validate and apply schema operations, then build the [`AlterTableTransaction`].
     ///
     /// This method:

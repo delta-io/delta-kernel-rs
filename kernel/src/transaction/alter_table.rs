@@ -4,6 +4,8 @@
 //! [`try_new_alter_table`](AlterTableTransaction::try_new_alter_table) constructor.
 //! The builder logic lives in [`builder::alter_table`](super::builder::alter_table).
 
+// Allow `pub` items -- module visibility controls external access; items are `pub` for
+// use within the crate and for tests.
 #![allow(unreachable_pub)]
 
 use std::marker::PhantomData;

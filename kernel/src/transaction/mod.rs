@@ -445,10 +445,9 @@ impl<S> Transaction<S> {
         let remove_actions =
             self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
 
-        // Build the action chain
-        // For create-table: CommitInfo -> Protocol -> Metadata -> adds -> txns -> domain_metadata
-        // -> removes For existing table: CommitInfo -> adds -> txns -> domain_metadata ->
-        // removes
+        // Build the action chain:
+        // CommitInfo -> Protocol (if emitted) -> Metadata (if emitted) -> adds -> txns ->
+        // domain_metadata -> removes
         let actions = iter::once(commit_info_action)
             .chain(protocol_action.map(Ok))
             .chain(metadata_action.map(Ok))
@@ -740,6 +739,11 @@ impl<S> Transaction<S> {
         // must be the larger of:
         // - The time at which the writer attempted the commit
         // - One millisecond later than the previous commit's inCommitTimestamp
+        //
+        // TODO: When ALTER TABLE supports enabling ICT for the first time, the read snapshot
+        // won't have a prior ICT. In that case we should fall back to self.commit_timestamp
+        // (same as CREATE TABLE). Currently protocol evolution is out of scope so this path
+        // is not reachable.
         Ok(self
             .read_snapshot()?
             .get_in_commit_timestamp(engine)?

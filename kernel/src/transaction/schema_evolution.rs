@@ -25,15 +25,18 @@ pub(crate) enum SchemaOperation {
     /// Requires column mapping.
     DropColumn { path: ColumnName },
 
+    /// Rename a column by path. Supports nested columns. Requires column mapping.
+    RenameColumn { path: ColumnName, new_name: String },
+
     /// Change a column's nullability from NOT NULL to nullable.
     SetNullable { path: ColumnName },
 }
 
 // === Schema tree manipulation helpers ===
 
-/// Modify a field at the given path using the provided function. For nested paths, rebuilds
-/// parent structs along the way since `StructType.fields` is private. `full_path` is threaded
-/// through unchanged for error messages; `remaining` drives the traversal.
+// Modify a field at the given path using the provided function. For nested paths, rebuilds
+// parent structs along the way since `StructType.fields` is private. `full_path` is threaded
+// through unchanged for error messages; `remaining` drives the traversal.
 fn modify_field_at_path(
     mut fields: Vec<StructField>,
     full_path: &[String],
@@ -130,8 +133,8 @@ fn remove_field_at_path(fields: &[StructField], path: &[String]) -> DeltaResult<
     }
 }
 
-/// Get the sibling field names at the same level as the target path, excluding the target.
-#[allow(dead_code)] // used by rename_column in a later PR
+/// Get sibling field names at the same level as the target path, excluding the target itself.
+/// Used by rename to check whether the new name conflicts with an existing sibling.
 fn sibling_names_at_path(fields: &[StructField], path: &[String]) -> DeltaResult<Vec<String>> {
     let (first, rest) = path
         .split_first()
@@ -188,6 +191,17 @@ pub(crate) fn apply_schema_operations(
     partition_columns: &[String],
     clustering_columns: Option<&[ColumnName]>,
 ) -> DeltaResult<SchemaEvolutionResult> {
+    // Defense-in-depth: RenameColumn must be the sole operation (enforced at compile time
+    // by the type-state builder, but verify at runtime for direct callers).
+    let has_rename = operations
+        .iter()
+        .any(|op| matches!(op, SchemaOperation::RenameColumn { .. }));
+    if has_rename && operations.len() > 1 {
+        return Err(Error::generic(
+            "RENAME COLUMN cannot be combined with other operations in the same ALTER TABLE",
+        ));
+    }
+
     // Keys are lowercased for O(1) case-insensitive lookup; StructFields retain original casing.
     let mut fields: IndexMap<String, StructField> = schema
         .into_fields()
@@ -279,7 +293,7 @@ pub(crate) fn apply_schema_operations(
                     )));
                 }
                 if let Some(clustering_cols) = clustering_columns {
-                    if clustering_cols.iter().any(|cc| cc == path) {
+                    if clustering_cols.iter().any(|cc| cc == &path) {
                         return Err(Error::generic(format!(
                             "Cannot drop column '{path}': it is a clustering column"
                         )));
@@ -289,6 +303,51 @@ pub(crate) fn apply_schema_operations(
                 // and rejects dropping the last field at any level.
                 let current_fields: Vec<StructField> = fields.into_values().collect();
                 let updated = remove_field_at_path(&current_fields, path.path())?;
+                fields = updated
+                    .into_iter()
+                    .map(|f| (f.name().to_lowercase(), f))
+                    .collect();
+            }
+            SchemaOperation::RenameColumn { path, new_name } => {
+                if new_name.is_empty() {
+                    return Err(Error::generic(format!(
+                        "Cannot rename column '{path}': new name must not be empty"
+                    )));
+                }
+                if column_mapping_mode == ColumnMappingMode::None {
+                    return Err(Error::generic(
+                        "RENAME COLUMN requires column mapping to be enabled \
+                         (delta.columnMapping.mode = 'name' or 'id')",
+                    ));
+                }
+                // Partition columns are always top-level
+                if path.path().len() == 1
+                    && partition_columns.iter().any(|pc| pc == &path.path()[0])
+                {
+                    return Err(Error::generic(format!(
+                        "Cannot rename column '{path}': it is a partition column"
+                    )));
+                }
+                if let Some(clustering_cols) = clustering_columns {
+                    if clustering_cols.iter().any(|cc| cc == &path) {
+                        return Err(Error::generic(format!(
+                            "Cannot rename column '{path}': it is a clustering column"
+                        )));
+                    }
+                }
+                // Check new name doesn't conflict with siblings (case-insensitive)
+                let current_fields: Vec<StructField> = fields.into_values().collect();
+                let siblings = sibling_names_at_path(&current_fields, path.path())?;
+                if siblings.iter().any(|s| s.eq_ignore_ascii_case(&new_name)) {
+                    return Err(Error::generic(format!(
+                        "Cannot rename column '{path}' to '{new_name}': \
+                         a column with that name already exists"
+                    )));
+                }
+                let segments = path.path();
+                let updated = modify_field_at_path(current_fields, segments, segments, &|field| {
+                    Ok(field.with_name(&new_name))
+                })?;
                 fields = updated
                     .into_iter()
                     .map(|f| (f.name().to_lowercase(), f))
@@ -495,7 +554,7 @@ mod tests {
         }];
         let result = apply_schema_operations(
             simple_schema(),
-            &ops,
+            ops,
             ColumnMappingMode::None,
             None,
             &[],
@@ -513,7 +572,7 @@ mod tests {
         }];
         let result = apply_schema_operations(
             simple_schema(),
-            &ops,
+            ops,
             ColumnMappingMode::None,
             None,
             &[],
@@ -531,7 +590,7 @@ mod tests {
         }];
         let err = apply_schema_operations(
             simple_schema(),
-            &ops,
+            ops,
             ColumnMappingMode::None,
             None,
             &[],
@@ -607,7 +666,7 @@ mod tests {
         }];
         let err = apply_schema_operations(
             simple_schema(),
-            &ops,
+            ops,
             ColumnMappingMode::None,
             None,
             &[],
@@ -629,7 +688,7 @@ mod tests {
         ];
         let result = apply_schema_operations(
             simple_schema(),
-            &ops,
+            ops,
             ColumnMappingMode::None,
             None,
             &[],
@@ -647,7 +706,7 @@ mod tests {
         }];
         let result = apply_schema_operations(
             simple_schema(),
-            &ops,
+            ops,
             ColumnMappingMode::Name,
             Some(2),
             &[],
@@ -682,7 +741,7 @@ mod tests {
         }];
         let result = apply_schema_operations(
             simple_schema(),
-            &ops,
+            ops,
             ColumnMappingMode::Id,
             Some(5),
             &[],
@@ -707,7 +766,7 @@ mod tests {
         }];
         let err = apply_schema_operations(
             simple_schema(),
-            &ops,
+            ops,
             ColumnMappingMode::Name,
             None,
             &[],
@@ -725,7 +784,7 @@ mod tests {
         }];
         let err = apply_schema_operations(
             schema.clone(),
-            &ops,
+            ops,
             ColumnMappingMode::None,
             None,
             &[],
@@ -743,7 +802,7 @@ mod tests {
         }];
         let result = apply_schema_operations(
             schema.clone(),
-            &ops,
+            ops,
             ColumnMappingMode::Name,
             Some(2),
             &[],
@@ -763,7 +822,7 @@ mod tests {
         }];
         let err = apply_schema_operations(
             schema.clone(),
-            &ops,
+            ops,
             ColumnMappingMode::Name,
             Some(2),
             &[],
@@ -781,7 +840,7 @@ mod tests {
         }];
         let err = apply_schema_operations(
             schema.clone(),
-            &ops,
+            ops,
             ColumnMappingMode::Name,
             Some(2),
             &["name".to_string()],
@@ -800,7 +859,7 @@ mod tests {
         }];
         let err = apply_schema_operations(
             single_col_schema.clone(),
-            &ops,
+            ops,
             ColumnMappingMode::Name,
             Some(1),
             &[],
@@ -826,7 +885,7 @@ mod tests {
         }];
         let err = apply_schema_operations(
             schema.clone(),
-            &ops,
+            ops,
             ColumnMappingMode::Name,
             Some(3),
             &[],
@@ -857,7 +916,7 @@ mod tests {
         ];
         let result = apply_schema_operations(
             schema.clone(),
-            &ops,
+            ops,
             ColumnMappingMode::Name,
             Some(3),
             &[],
@@ -883,7 +942,7 @@ mod tests {
         ];
         let result = apply_schema_operations(
             schema.clone(),
-            &ops,
+            ops,
             ColumnMappingMode::Name,
             Some(2),
             &[],
@@ -904,7 +963,7 @@ mod tests {
         let clustering = vec![column_name!("name")];
         let err = apply_schema_operations(
             schema.clone(),
-            &ops,
+            ops,
             ColumnMappingMode::Name,
             Some(2),
             &[],
@@ -938,7 +997,7 @@ mod tests {
         }];
         let result = apply_schema_operations(
             schema.clone(),
-            &ops,
+            ops,
             ColumnMappingMode::Name,
             Some(4),
             &[],
@@ -968,7 +1027,7 @@ mod tests {
         }];
         let err = apply_schema_operations(
             schema.clone(),
-            &ops,
+            ops,
             ColumnMappingMode::Name,
             Some(4),
             &[],
@@ -987,7 +1046,7 @@ mod tests {
         }];
         let err = apply_schema_operations(
             schema.clone(),
-            &ops,
+            ops,
             ColumnMappingMode::Name,
             Some(2),
             &[],
@@ -995,5 +1054,231 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("not a struct"));
+    }
+
+    #[test]
+    fn rename_column_without_column_mapping_fails() {
+        let schema = simple_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            path: column_name!("name"),
+            new_name: "full_name".to_string(),
+        }];
+        let err = apply_schema_operations(
+            schema.clone(),
+            ops,
+            ColumnMappingMode::None,
+            None,
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("column mapping"));
+    }
+
+    #[test]
+    fn rename_column_succeeds() {
+        let schema = simple_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            path: column_name!("name"),
+            new_name: "full_name".to_string(),
+        }];
+        let result = apply_schema_operations(
+            schema.clone(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(2),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(result.schema.field("full_name").is_some());
+        assert!(result.schema.field("name").is_none());
+        assert_eq!(result.schema.fields().count(), 2);
+    }
+
+    #[test]
+    fn rename_nonexistent_column_fails() {
+        let schema = simple_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            path: column_name!("nonexistent"),
+            new_name: "new_name".to_string(),
+        }];
+        let err = apply_schema_operations(
+            schema.clone(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(2),
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn rename_to_existing_name_fails() {
+        let schema = simple_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            path: column_name!("name"),
+            new_name: "id".to_string(),
+        }];
+        let err = apply_schema_operations(
+            schema.clone(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(2),
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn rename_empty_name_fails() {
+        let schema = simple_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            path: column_name!("name"),
+            new_name: String::new(),
+        }];
+        let err = apply_schema_operations(
+            schema.clone(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(2),
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn rename_partition_column_fails() {
+        let schema = simple_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            path: column_name!("name"),
+            new_name: "full_name".to_string(),
+        }];
+        let err = apply_schema_operations(
+            schema.clone(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(2),
+            &["name".to_string()],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("partition column"));
+    }
+
+    #[test]
+    fn rename_clustering_column_fails() {
+        let clustering = vec![column_name!("name")];
+        let schema = simple_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            path: column_name!("name"),
+            new_name: "full_name".to_string(),
+        }];
+        let err = apply_schema_operations(
+            schema.clone(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(2),
+            &[],
+            Some(&clustering),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("clustering column"));
+    }
+
+    #[test]
+    fn rename_nested_column_succeeds() {
+        let schema = nested_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            path: column_name!("address.city"),
+            new_name: "town".to_string(),
+        }];
+        let result = apply_schema_operations(
+            schema.clone(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(4),
+            &[],
+            None,
+        )
+        .unwrap();
+        let addr = result.schema.field("address").unwrap();
+        match addr.data_type() {
+            DataType::Struct(s) => {
+                assert!(s.field("town").is_some());
+                assert!(s.field("city").is_none());
+                assert_eq!(s.fields().count(), 3); // street, town, zip
+            }
+            other => panic!("Expected Struct, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_nested_to_existing_sibling_fails() {
+        let schema = nested_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            path: column_name!("address.city"),
+            new_name: "street".to_string(), // "street" already exists in address
+        }];
+        let err = apply_schema_operations(
+            schema.clone(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(4),
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn rename_case_change_succeeds() {
+        let schema = simple_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            path: column_name!("name"),
+            new_name: "Name".to_string(),
+        }];
+        let result = apply_schema_operations(
+            schema.clone(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(2),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(result.schema.field("Name").is_some());
+        assert!(result.schema.field("name").is_none());
+    }
+
+    #[test]
+    fn rename_combined_with_other_ops_fails_at_runtime() {
+        let schema = simple_schema();
+        let ops = vec![
+            SchemaOperation::RenameColumn {
+                path: column_name!("name"),
+                new_name: "full_name".to_string(),
+            },
+            SchemaOperation::AddColumn {
+                field: StructField::nullable("email", DataType::STRING),
+            },
+        ];
+        let err = apply_schema_operations(
+            schema.clone(),
+            ops,
+            ColumnMappingMode::Name,
+            Some(2),
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"));
     }
 }
