@@ -130,7 +130,9 @@ mod tests;
 /// Schemas and configs needed for building the checkpoint read/output schemas.
 struct CheckpointSchemaContext {
     stats_config: StatsTransformConfig,
-    base_schema: &'static StructType,
+    /// The checkpoint schema before table-specific fields like
+    /// `stats_parsed` and `partitionValues_parsed` are injected.
+    checkpoint_base_schema: SchemaRef,
     stats_schema: SchemaRef,
     partition_schema: Option<SchemaRef>,
     is_v2: bool,
@@ -274,42 +276,6 @@ impl CheckpointWriter {
         .map(|parsed| parsed.location)
     }
 
-    /// Computes the checkpoint schema context from the snapshot and engine.
-    fn checkpoint_schema_context(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<CheckpointSchemaContext> {
-        let tc = self.snapshot.table_configuration();
-        let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
-
-        // Select schema based on V2 checkpoint support
-        let is_v2 = tc.is_feature_supported(&TableFeature::V2Checkpoint);
-        let base_schema = if is_v2 {
-            &CHECKPOINT_ACTIONS_SCHEMA_V2
-        } else {
-            &CHECKPOINT_ACTIONS_SCHEMA_V1
-        };
-
-        // Get clustering columns so they are always included in stats per the Delta protocol.
-        let physical_clustering_columns = self.snapshot.get_physical_clustering_columns(engine)?;
-
-        // Get stats schema from table configuration.
-        // This already excludes partition columns and applies column mapping.
-        let stats_schema = tc
-            .build_expected_stats_schemas(physical_clustering_columns.as_deref(), None)?
-            .physical;
-
-        // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
-        let partition_schema = tc.build_partition_values_parsed_schema();
-        Ok(CheckpointSchemaContext {
-            stats_config: config,
-            base_schema,
-            stats_schema,
-            partition_schema,
-            is_v2,
-        })
-    }
-
     /// Returns the checkpoint data to be written to the checkpoint file.
     ///
     /// This method reads actions from the log segment, processes them for checkpoint creation,
@@ -355,7 +321,7 @@ impl CheckpointWriter {
         // output_schema: Only includes the stats fields that the table config requests
         // (e.g., only `stats` if writeStatsAsJson=true and writeStatsAsStruct=false).
         let read_schema = build_checkpoint_read_schema(
-            schema_context.base_schema,
+            &schema_context.checkpoint_base_schema,
             &schema_context.stats_schema,
             schema_context.partition_schema.as_deref(),
         )?;
@@ -376,7 +342,7 @@ impl CheckpointWriter {
         let output_schema = self.get_or_init_output_schema(|| {
             build_checkpoint_output_schema(
                 &schema_context.stats_config,
-                schema_context.base_schema,
+                &schema_context.checkpoint_base_schema,
                 &schema_context.stats_schema,
                 schema_context.partition_schema.as_deref(),
             )
@@ -545,6 +511,42 @@ impl CheckpointWriter {
             filtered_data,
             actions_count: 1,
             add_actions_count: 0,
+        })
+    }
+
+    /// Helper for computing the checkpoint schema context from the snapshot and engine.
+    fn checkpoint_schema_context(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<CheckpointSchemaContext> {
+        let tc = self.snapshot.table_configuration();
+        let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
+
+        // Select schema based on V2 checkpoint support
+        let is_v2 = tc.is_feature_supported(&TableFeature::V2Checkpoint);
+        let base_schema = if is_v2 {
+            CHECKPOINT_ACTIONS_SCHEMA_V2.clone()
+        } else {
+            CHECKPOINT_ACTIONS_SCHEMA_V1.clone()
+        };
+
+        // Get clustering columns so they are always included in stats per the Delta protocol.
+        let physical_clustering_columns = self.snapshot.get_physical_clustering_columns(engine)?;
+
+        // Get stats schema from table configuration.
+        // This already excludes partition columns and applies column mapping.
+        let stats_schema = tc
+            .build_expected_stats_schemas(physical_clustering_columns.as_deref(), None)?
+            .physical;
+
+        // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
+        let partition_schema = tc.build_partition_values_parsed_schema();
+        Ok(CheckpointSchemaContext {
+            stats_config: config,
+            checkpoint_base_schema: base_schema,
+            stats_schema,
+            partition_schema,
+            is_v2,
         })
     }
 }
