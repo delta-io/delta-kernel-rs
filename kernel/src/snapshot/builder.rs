@@ -115,6 +115,9 @@ impl SnapshotBuilder {
     /// # Parameters
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
+    ///
+    /// [`MetricEvent::SnapshotCompleted`]: crate::metrics::MetricEvent::SnapshotCompleted
+    /// [`MetricEvent::SnapshotFailed`]: crate::metrics::MetricEvent::SnapshotFailed
     // Span name must match `SNAP_BUILD_SPAN` in `metrics::reporter`.
     #[instrument(
         name = "snap.build",

@@ -84,6 +84,8 @@ use tracing_subscriber::{
 ///
 /// Only implemented for subscribers that also implement [`LookupSpan`], which is required by
 /// [`ReportGeneratorLayer`] to store and retrieve per-span state.
+///
+/// [`with_metrics_reporter_layer`]: WithMetricsReporterLayer::with_metrics_reporter_layer
 pub trait WithMetricsReporterLayer: Subscriber + for<'lookup> LookupSpan<'lookup> {
     /// Wrap this subscriber with a [`ReportGeneratorLayer`] that converts tracing spans into
     /// [`MetricEvent`]s and forwards them to `reporter`.

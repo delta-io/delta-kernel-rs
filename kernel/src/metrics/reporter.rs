@@ -57,7 +57,7 @@ impl MetricsReporter for LoggingMetricsReporter {
 /// A [`tracing_subscriber::Layer`] that converts tracing spans into [`MetricEvent`]s and
 /// forwards them to a registered [`MetricsReporter`].
 ///
-/// Typically added to a subscriber via [`WithMetricsReporterLayer::with_metrics_reporter_layer`]
+/// Typically added to a subscriber via [`super::WithMetricsReporterLayer::with_metrics_reporter_layer`]
 /// rather than constructed directly.
 #[derive(Debug)]
 pub struct ReportGeneratorLayer {
