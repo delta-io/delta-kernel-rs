@@ -20,7 +20,7 @@ use crate::engine::arrow_utils::{
     to_json_bytes,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::metrics::reporter::emit_json_read_completed;
+use crate::metrics::emit_json_read_completed;
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,

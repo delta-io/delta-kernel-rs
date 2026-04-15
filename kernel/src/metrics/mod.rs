@@ -73,7 +73,7 @@ pub(crate) mod reporter;
 use std::sync::Arc;
 
 pub use events::{MetricEvent, MetricId, ScanType};
-pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer};
+pub use reporter::{LoggingMetricsReporter, MetricsReporter, ReportGeneratorLayer, emit_json_read_completed, emit_parquet_read_completed};
 use tracing::Subscriber;
 use tracing_subscriber::{
     layer::{Layered, SubscriberExt as _},

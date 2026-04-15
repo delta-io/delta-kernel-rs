@@ -176,7 +176,7 @@ const SCAN_METADATA_COMPLETED_SPAN: &str = "scan.metadata_completed";
 ///
 /// Call this once per [`crate::JsonHandler::read_json_files`] invocation, after the file list
 /// is known but before the iterator is consumed (i.e. at iterator exhaustion or drop).
-pub(crate) fn emit_json_read_completed(num_files: u64, bytes_read: u64) {
+pub fn emit_json_read_completed(num_files: u64, bytes_read: u64) {
     // Span name must match JSON_READ_COMPLETED_SPAN used in ReportGeneratorLayer::on_new_span.
     let _span = tracing::span!(
         tracing::Level::INFO,
@@ -194,7 +194,7 @@ pub(crate) fn emit_json_read_completed(num_files: u64, bytes_read: u64) {
 ///
 /// Call this once per [`crate::ParquetHandler::read_parquet_files`] invocation, after the file
 /// list is known but before the iterator is consumed (i.e. at iterator exhaustion or drop).
-pub(crate) fn emit_parquet_read_completed(num_files: u64, bytes_read: u64) {
+pub fn emit_parquet_read_completed(num_files: u64, bytes_read: u64) {
     // Span name must match PARQUET_READ_COMPLETED_SPAN used in ReportGeneratorLayer::on_new_span.
     let _span = tracing::span!(
         tracing::Level::INFO,

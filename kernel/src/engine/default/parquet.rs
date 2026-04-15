@@ -30,7 +30,7 @@ use crate::engine::arrow_utils::{
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::expressions::ColumnName;
-use crate::metrics::reporter::emit_parquet_read_completed;
+use crate::metrics::emit_parquet_read_completed;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
