@@ -5,6 +5,7 @@ use crate::expressions::{
 };
 use crate::{handle::Handle, kernel_string_slice, KernelStringSlice, SharedSchema};
 
+use super::kernel_visitor::NullTypeTag;
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     ColumnName, Expression, ExpressionRef, JunctionPredicate, JunctionPredicateOp, MapData,
@@ -57,9 +58,9 @@ type VisitParseJsonFn = extern "C" fn(
 ///
 /// WARNING: The visitor MUST NOT retain internal references to string slices or binary data passed
 /// to visitor methods
-/// TODO: Visit type information in struct field and null. This will likely involve using the schema
-/// visitor. Note that struct literals are currently in flux, and may change significantly. Here is
-/// the relevant issue: <https://github.com/delta-io/delta-kernel-rs/issues/412>
+/// TODO: Visit type information in struct field. This will likely involve using the schema visitor.
+/// Note that struct literals are currently in flux, and may change significantly. Here is the
+/// relevant issue: <https://github.com/delta-io/delta-kernel-rs/issues/412>
 #[repr(C)]
 pub struct EngineExpressionVisitor {
     /// An opaque engine state pointer
@@ -128,8 +129,19 @@ pub struct EngineExpressionVisitor {
         key_list_id: usize,
         value_list_id: usize,
     ),
-    /// Visits a null value belonging to the list identified by `sibling_list_id.
-    pub visit_literal_null: extern "C" fn(data: *mut c_void, sibling_list_id: usize),
+    /// Visits a typed null value belonging to the list identified by `sibling_list_id`.
+    ///
+    /// The `type_tag` identifies the data type using the `NullTypeTag` encoding. For decimal
+    /// nulls (`type_tag == 12`), `precision` and `scale` carry the decimal type parameters;
+    /// for all other types, they are zero. Non-primitive types (struct, array, map, variant)
+    /// use `type_tag == 255`.
+    pub visit_literal_null: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        type_tag: u8,
+        precision: u8,
+        scale: u8,
+    ),
     /// Visits an `and` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expressions of the array are in a list identified by `child_list_id`
     pub visit_and: VisitJunctionFn,
@@ -587,7 +599,17 @@ fn visit_expression_scalar(
                 v.scale()
             )
         }
-        Scalar::Null(_) => call!(visitor, visit_literal_null, sibling_list_id),
+        Scalar::Null(data_type) => {
+            let (tag, precision, scale) = NullTypeTag::from_data_type(data_type);
+            call!(
+                visitor,
+                visit_literal_null,
+                sibling_list_id,
+                tag as u8,
+                precision,
+                scale
+            )
+        }
         Scalar::Struct(struct_data) => {
             visit_expression_struct_literal(visitor, struct_data, sibling_list_id)
         }

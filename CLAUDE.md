@@ -121,6 +121,10 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   merged into it as a new `#[case]`. A common pattern is toggling a feature (e.g.
   column mapping on/off) and asserting success vs. error.
 - Reuse helpers from `test_utils` instead of writing custom ones when possible.
+- **Prefer snapshot/public API assertions over reading raw commit JSON.** Only read raw
+  commit JSON when the data is inaccessible via public API (e.g., system domain metadata
+  is blocked by `get_domain_metadata`). For commit JSON reads, use `read_actions_from_commit`
+  from `test_utils` -- do NOT write local helpers that duplicate this.
 - **`add_commit` and table setup in tests:** `add_commit` takes a `table_root` string and
   resolves it to an absolute object-store path. The `table_root` must be a proper URL string
   with a trailing slash (e.g. `"memory:///"`, `"file:///tmp/my_table/"`). Avoid using the

@@ -259,6 +259,42 @@ impl<S> std::fmt::Debug for Transaction<S> {
     }
 }
 
+/// Transforms add file metadata into commit-ready add actions by converting stats to JSON
+/// and setting the `dataChange` field.
+fn build_add_actions<'a, I, T>(
+    engine: &dyn Engine,
+    add_files_metadata: I,
+    input_schema: SchemaRef,
+    output_schema: SchemaRef,
+    data_change: bool,
+) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a
+where
+    I: Iterator<Item = DeltaResult<T>> + Send + 'a,
+    T: Deref<Target = dyn EngineData> + Send + 'a,
+{
+    let evaluation_handler = engine.evaluation_handler();
+    add_files_metadata.map(move |add_files_batch| {
+        let transform = Expression::transform(
+            Transform::new_top_level()
+                .with_inserted_field(
+                    Some("modificationTime"),
+                    Expression::literal(data_change).into(),
+                )
+                .with_replaced_field(
+                    "stats",
+                    Expression::unary(ToJson, Expression::column(["stats"])).into(),
+                ),
+        );
+        let adds_expr = Expression::struct_from([transform]);
+        let adds_evaluator = evaluation_handler.new_expression_evaluator(
+            input_schema.clone(),
+            Arc::new(adds_expr),
+            as_log_add_schema(output_schema.clone()).into(),
+        )?;
+        adds_evaluator.evaluate(add_files_batch?.deref())
+    })
+}
+
 // =============================================================================
 // Shared methods available on ALL transaction types
 // =============================================================================
@@ -784,19 +820,45 @@ impl<S> Transaction<S> {
     }
 
     /// Lazily builds and caches the [`SharedWriteState`] for this transaction.
-    fn shared_write_state(&self) -> &Arc<SharedWriteState> {
-        self.shared_write_state.get_or_init(|| {
-            let table_config = self.read_snapshot.table_configuration();
-            Arc::new(SharedWriteState {
-                table_root: self.read_snapshot.table_root().clone(),
-                logical_schema: self.read_snapshot.schema(),
-                physical_schema: table_config.physical_write_schema(),
-                logical_to_physical: Arc::new(self.generate_logical_to_physical()),
-                column_mapping_mode: table_config.column_mapping_mode(),
-                stats_columns: self.stats_columns(),
-                logical_partition_columns: table_config.partition_columns().to_vec(),
+    ///
+    /// Resolves partition column names (logical to physical) once and caches the result.
+    /// Returns an error if a partition column is not found in the table schema.
+    // TODO: replace with `get_or_try_init` when stable (rust#109737). That avoids the
+    // early-return + fallible compute + `get_or_init` dance, and prevents a concurrent
+    // caller from redundantly recomputing the state when the first caller is still running.
+    fn shared_write_state(&self) -> DeltaResult<&Arc<SharedWriteState>> {
+        if let Some(state) = self.shared_write_state.get() {
+            return Ok(state);
+        }
+        let table_config = self.read_snapshot.table_configuration();
+        let logical_schema = self.read_snapshot.schema();
+        let cm_mode = table_config.column_mapping_mode();
+        let logical_and_physical_partition_columns: Vec<(String, String)> = table_config
+            .partition_columns()
+            .iter()
+            .map(|logical_name| {
+                let physical_name = logical_schema
+                    .field(logical_name)
+                    .ok_or_else(|| {
+                        Error::internal_error(format!(
+                            "partition column '{logical_name}' not found in table schema"
+                        ))
+                    })?
+                    .physical_name(cm_mode)
+                    .to_string();
+                Ok((logical_name.clone(), physical_name))
             })
-        })
+            .collect::<DeltaResult<_>>()?;
+        let state = Arc::new(SharedWriteState {
+            table_root: self.read_snapshot.table_root().clone(),
+            logical_schema,
+            physical_schema: table_config.physical_write_schema(),
+            logical_to_physical: Arc::new(self.generate_logical_to_physical()),
+            column_mapping_mode: cm_mode,
+            stats_columns: self.stats_columns(),
+            logical_and_physical_partition_columns,
+        });
+        Ok(self.shared_write_state.get_or_init(|| state))
     }
 
     /// Creates a write context for writing data to a specific partition.
@@ -838,46 +900,37 @@ impl<S> Transaction<S> {
         &self,
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
-        let shared = self.shared_write_state();
+        let shared = self.shared_write_state()?;
         require!(
-            !shared.logical_partition_columns.is_empty(),
+            !shared.logical_and_physical_partition_columns.is_empty(),
             Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
         );
 
         // Validate keys (completeness, case normalization) and value types, then return
         // the map re-keyed to schema case.
-        let normalized = validate_partition_values(
-            &shared.logical_partition_columns,
-            &shared.logical_schema,
-            partition_values,
-        )?;
+        let logical_names: Vec<String> = shared
+            .logical_and_physical_partition_columns
+            .iter()
+            .map(|(logical, _)| logical.clone())
+            .collect();
+        let normalized =
+            validate_partition_values(&logical_names, &shared.logical_schema, partition_values)?;
 
-        // Serialize values and translate keys from logical to physical names.
-        let mut serialized = HashMap::with_capacity(normalized.len());
-        for logical_name in &shared.logical_partition_columns {
+        // Serialize values using the pre-resolved (logical, physical) pairs from shared
+        // state. WriteContext::new derives the logical partition path from these pairs.
+        let mut physical_partition_values =
+            HashMap::with_capacity(shared.logical_and_physical_partition_columns.len());
+        for (logical_name, physical_name) in &shared.logical_and_physical_partition_columns {
             let scalar = normalized.get(logical_name).ok_or_else(|| {
                 Error::internal_error(format!(
                     "partition column '{logical_name}' missing after validation"
                 ))
             })?;
             let value = serialize_partition_value(scalar)?;
-            let physical_name = shared
-                .logical_schema
-                .field(logical_name)
-                .ok_or_else(|| {
-                    Error::internal_error(format!(
-                        "partition column '{logical_name}' not found in schema after validation"
-                    ))
-                })?
-                .physical_name(shared.column_mapping_mode)
-                .to_string();
-            serialized.insert(physical_name, value);
+            physical_partition_values.insert(physical_name.clone(), value);
         }
 
-        Ok(WriteContext {
-            shared: shared.clone(),
-            physical_partition_values: serialized,
-        })
+        Ok(WriteContext::new(shared.clone(), physical_partition_values))
     }
 
     /// Creates a write context for writing data to an unpartitioned table.
@@ -885,15 +938,12 @@ impl<S> Transaction<S> {
     /// Returns an error if the table has partition columns (use
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
-        let shared = self.shared_write_state();
+        let shared = self.shared_write_state()?;
         require!(
-            shared.logical_partition_columns.is_empty(),
+            shared.logical_and_physical_partition_columns.is_empty(),
             Error::generic("table is partitioned; use partitioned_write_context() instead")
         );
-        Ok(WriteContext {
-            shared: shared.clone(),
-            physical_partition_values: HashMap::new(),
-        })
+        Ok(WriteContext::new(shared.clone(), HashMap::new()))
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
@@ -941,7 +991,7 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
-    /// Generate add actions, handling row tracking internally if needed
+    /// Generates add actions and row tracking domain metadata for a commit.
     #[instrument(name = "txn.gen_adds", skip_all, err)]
     fn generate_adds<'a>(
         &'a self,
@@ -951,116 +1001,29 @@ impl<S> Transaction<S> {
         EngineDataResultIterator<'a>,
         Option<RowTrackingDomainMetadata>,
     )> {
-        fn build_add_actions<'a, I, T>(
-            engine: &dyn Engine,
-            add_files_metadata: I,
-            input_schema: SchemaRef,
-            output_schema: SchemaRef,
-            data_change: bool,
-        ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a
-        where
-            I: Iterator<Item = DeltaResult<T>> + Send + 'a,
-            T: Deref<Target = dyn EngineData> + Send + 'a,
-        {
-            let evaluation_handler = engine.evaluation_handler();
-
-            add_files_metadata.map(move |add_files_batch| {
-                // Convert stats to a JSON string and nest the add action in a top-level struct
-                let transform = Expression::transform(
-                    Transform::new_top_level()
-                        .with_inserted_field(
-                            Some("modificationTime"),
-                            Expression::literal(data_change).into(),
-                        )
-                        .with_replaced_field(
-                            "stats",
-                            Expression::unary(ToJson, Expression::column(["stats"])).into(),
-                        ),
-                );
-                let adds_expr = Expression::struct_from([transform]);
-                let adds_evaluator = evaluation_handler.new_expression_evaluator(
-                    input_schema.clone(),
-                    Arc::new(adds_expr),
-                    as_log_add_schema(output_schema.clone()).into(),
-                )?;
-                adds_evaluator.evaluate(add_files_batch?.deref())
-            })
-        }
+        // Note: this does not require delta.enableRowTracking=true. "supported" is sufficient
+        // for writers to assign row IDs.
+        let row_tracking_supported = self
+            .read_snapshot
+            .table_configuration()
+            .should_write_row_tracking();
 
         if self.add_files_metadata.is_empty() {
-            return Ok((Box::new(iter::empty()), None));
+            // No files to add. For an empty CREATE TABLE with row tracking, emit the initial
+            // high water mark domain metadata (rowIdHighWaterMark = -1) so subsequent writes
+            // have a valid starting point. For all other empty commits (metadata-only, etc.),
+            // nothing row-tracking-related needs to be written.
+            let row_tracking_dm = (row_tracking_supported && self.is_create_table())
+                .then(RowTrackingDomainMetadata::initial);
+            return Ok((Box::new(iter::empty()), row_tracking_dm));
         }
 
         let commit_version = i64::try_from(commit_version)
             .map_err(|_| Error::generic("Commit version too large to fit in i64"))?;
 
-        let needs_row_tracking = self
-            .read_snapshot
-            .table_configuration()
-            .should_write_row_tracking();
-
-        // Row tracking is not yet supported for create-table with data
-        if needs_row_tracking && self.is_create_table() {
-            return Err(Error::unsupported(
-                "Row tracking is not yet supported for create table with data",
-            ));
-        }
-
-        if needs_row_tracking {
-            // Read the current rowIdHighWaterMark from the snapshot's row tracking domain metadata
-            let row_id_high_water_mark =
-                RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
-
-            // Create a row tracking visitor and visit all files to collect row tracking information
-            let mut row_tracking_visitor = RowTrackingVisitor::new(
-                row_id_high_water_mark,
-                Some(self.add_files_metadata.len()),
-            );
-
-            // We visit all files with the row visitor before creating the add action iterator
-            // because we need to know the final row ID high water mark to create the domain metadata action
-            for add_files_batch in &self.add_files_metadata {
-                row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
-            }
-
-            // Deconstruct the row tracking visitor to avoid borrowing issues
-            let RowTrackingVisitor {
-                base_row_id_batches,
-                row_id_high_water_mark,
-            } = row_tracking_visitor;
-
-            // Create extended add files with row tracking columns
-            let extended_add_files = self.add_files_metadata.iter().zip(base_row_id_batches).map(
-                move |(add_files_batch, base_row_ids)| {
-                    let commit_versions = vec![commit_version; base_row_ids.len()];
-                    let base_row_ids_array =
-                        ArrayData::try_new(ArrayType::new(DataType::LONG, true), base_row_ids)?;
-                    let commit_versions_array =
-                        ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
-
-                    add_files_batch.append_columns(
-                        with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![]))),
-                        vec![base_row_ids_array, commit_versions_array],
-                    )
-                },
-            );
-
-            // Generate add actions including row tracking metadata
-            let add_actions = build_add_actions(
-                engine,
-                extended_add_files,
-                with_row_tracking_cols(self.add_files_schema()),
-                with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
-                self.data_change,
-            );
-
-            // Generate a row tracking domain metadata based on the final high water mark
-            let row_tracking_domain_metadata: RowTrackingDomainMetadata =
-                RowTrackingDomainMetadata::new(row_id_high_water_mark);
-
-            Ok((Box::new(add_actions), Some(row_tracking_domain_metadata)))
+        if row_tracking_supported {
+            self.generate_adds_with_row_tracking(engine, commit_version)
         } else {
-            // Simple case without row tracking
             let add_actions = build_add_actions(
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
@@ -1068,9 +1031,78 @@ impl<S> Transaction<S> {
                 with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()),
                 self.data_change,
             );
-
             Ok((Box::new(add_actions), None))
         }
+    }
+
+    /// Generates add actions with row tracking columns and the row ID high water mark
+    /// domain metadata.
+    ///
+    /// Visits all add file batches once to read `numRecords` per file, assigning a unique
+    /// non-overlapping `baseRowId` range to each file and computing the final high water mark
+    /// for the domain metadata action. The initial high water mark is read from the snapshot
+    /// for existing tables, or defaults to -1 for create-table (no prior log to read from).
+    fn generate_adds_with_row_tracking<'a>(
+        &'a self,
+        engine: &dyn Engine,
+        commit_version: i64,
+    ) -> DeltaResult<(
+        EngineDataResultIterator<'a>,
+        Option<RowTrackingDomainMetadata>,
+    )> {
+        let row_id_high_water_mark = if self.is_create_table() {
+            None
+        } else {
+            RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?
+        };
+
+        // Create a row tracking visitor and visit all files to collect row tracking information
+        let mut row_tracking_visitor =
+            RowTrackingVisitor::new(row_id_high_water_mark, Some(self.add_files_metadata.len()));
+
+        // We visit all files with the row visitor before creating the add action iterator because
+        // we need to know the final row ID high water mark to create the domain metadata action.
+        for add_files_batch in &self.add_files_metadata {
+            row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
+        }
+
+        // Destructure the visitor to move base_row_id_batches into the add-files iterator
+        // while also extracting the final high water mark for the domain metadata action.
+        let RowTrackingVisitor {
+            base_row_id_batches,
+            row_id_high_water_mark,
+        } = row_tracking_visitor;
+
+        // Create extended add files with row tracking columns
+        let extended_add_files = self.add_files_metadata.iter().zip(base_row_id_batches).map(
+            move |(add_files_batch, base_row_ids)| {
+                let commit_versions = vec![commit_version; base_row_ids.len()];
+                let base_row_ids_array =
+                    ArrayData::try_new(ArrayType::new(DataType::LONG, true), base_row_ids)?;
+                let commit_versions_array =
+                    ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
+
+                add_files_batch.append_columns(
+                    with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![]))),
+                    vec![base_row_ids_array, commit_versions_array],
+                )
+            },
+        );
+
+        // Generate add actions including row tracking metadata
+        let add_actions = build_add_actions(
+            engine,
+            extended_add_files,
+            with_row_tracking_cols(self.add_files_schema()),
+            with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
+            self.data_change,
+        );
+
+        // Generate a row tracking domain metadata based on the final high water mark
+        let row_tracking_domain_metadata: RowTrackingDomainMetadata =
+            RowTrackingDomainMetadata::new(row_id_high_water_mark);
+
+        Ok((Box::new(add_actions), Some(row_tracking_domain_metadata)))
     }
 
     fn into_committed(
@@ -1379,6 +1411,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{MapData, Scalar, StructData};
     use crate::object_store::local::LocalFileSystem;
@@ -1780,6 +1813,44 @@ mod tests {
             "expected '{expected_msg}' in error, got: {err}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_write_context_partition_col_not_in_schema_returns_error() {
+        let storage = Arc::new(InMemory::new());
+        let table_root = Url::parse("memory:///").unwrap();
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+
+        // Schema has only "id", but metadata claims "ghost" is a partition column.
+        let actions = [
+            r#"{"commitInfo":{"timestamp":1587968586154}}"#,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            concat!(
+                r#"{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"#,
+                r#""schemaString":"{\"type\":\"struct\",\"fields\":"#,
+                r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","#,
+                r#""partitionColumns":["ghost"],"configuration":{},"createdTime":1587968585495}}"#,
+            ),
+        ]
+        .join("\n");
+
+        let commit_path = Path::from("_delta_log/00000000000000000000.json");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(storage.put(&commit_path, actions.into()))
+            .unwrap();
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .unwrap();
+        let err = txn
+            .partitioned_write_context(HashMap::from([("ghost".into(), Scalar::Integer(1))]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("Internal error partition column 'ghost' not found in table schema."),
+            "unexpected error: {err}"
+        );
     }
 
     /// Tests that update_deletion_vectors validates table protocol requirements.
