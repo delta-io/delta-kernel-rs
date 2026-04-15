@@ -474,12 +474,13 @@ pub async fn create_table(
             config.insert("delta.columnMapping.mode".to_string(), json!("name"));
         }
         if writer_features.contains(&"rowTracking") {
+            config.insert("delta.enableRowTracking".to_string(), json!("true"));
             config.insert(
-                "delta.materializedRowIdColumnName".to_string(),
+                "delta.rowTracking.materializedRowIdColumnName".to_string(),
                 json!("some_dummy_column_name"),
             );
             config.insert(
-                "delta.materializedRowCommitVersionColumnName".to_string(),
+                "delta.rowTracking.materializedRowCommitVersionColumnName".to_string(),
                 json!("another_dummy_column_name"),
             );
         }
@@ -1177,6 +1178,63 @@ pub fn read_actions_from_commit(
         .into_iter()
         .filter_map(|v| v.get(action_type).cloned())
         .collect())
+}
+
+/// Row tracking fields extracted from a single add action in a commit.
+pub struct AddActionRowTracking {
+    /// The base row ID assigned to the first row in the file.
+    pub base_row_id: Option<i64>,
+    /// The version of the commit in which this file was first written.
+    pub default_row_commit_version: Option<i64>,
+}
+
+/// Reads all add actions from a commit and returns their row tracking fields, sorted by
+/// `baseRowId` for deterministic ordering.
+pub fn get_row_tracking_add_actions(
+    table_url: &Url,
+    version: u64,
+) -> Result<Vec<AddActionRowTracking>, Box<dyn std::error::Error>> {
+    let mut actions: Vec<AddActionRowTracking> =
+        read_actions_from_commit(table_url, version, "add")?
+            .into_iter()
+            .map(|a| AddActionRowTracking {
+                base_row_id: a["baseRowId"].as_i64(),
+                default_row_commit_version: a["defaultRowCommitVersion"].as_i64(),
+            })
+            .collect();
+    actions.sort_by_key(|a| a.base_row_id);
+    Ok(actions)
+}
+
+/// Materialized row tracking column name properties extracted from a commit's metadata action.
+pub struct MaterializedRowTrackingColumnNames {
+    /// Value of `delta.rowTracking.materializedRowIdColumnName`, or `None` if not set.
+    pub row_id_column_name: Option<String>,
+    /// Value of `delta.rowTracking.materializedRowCommitVersionColumnName`, or `None` if not set.
+    pub row_commit_version_column_name: Option<String>,
+}
+
+/// Reads the materialized row tracking column name properties from a commit's metadata action.
+/// These properties are table properties stored in the metadata `configuration` map.
+pub fn get_materialized_row_tracking_column_names(
+    table_url: &Url,
+    version: u64,
+) -> Result<MaterializedRowTrackingColumnNames, Box<dyn std::error::Error>> {
+    let metadata_actions = read_actions_from_commit(table_url, version, "metaData")?;
+    let config = metadata_actions
+        .first()
+        .and_then(|m| m.get("configuration"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    Ok(MaterializedRowTrackingColumnNames {
+        row_id_column_name: config["delta.rowTracking.materializedRowIdColumnName"]
+            .as_str()
+            .map(str::to_owned),
+        row_commit_version_column_name: config
+            ["delta.rowTracking.materializedRowCommitVersionColumnName"]
+            .as_str()
+            .map(str::to_owned),
+    })
 }
 
 /// Removes all scan files from the snapshot, commits the transaction, and returns

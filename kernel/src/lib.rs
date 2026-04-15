@@ -115,7 +115,11 @@ pub mod transforms;
 
 pub use log_path::LogPath;
 
-mod row_tracking;
+// Public under test-utils so integration tests can call get_high_water_mark via snapshot.
+#[cfg(feature = "test-utils")]
+pub mod row_tracking;
+#[cfg(not(feature = "test-utils"))]
+pub(crate) mod row_tracking;
 
 pub(crate) mod clustering;
 

@@ -545,6 +545,7 @@ pub(crate) static BASE_ROW_ID_NAME: &str = "baseRowId";
 pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersion";
 pub(crate) static CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
 pub(crate) static TAGS_NAME: &str = "tags";
+pub(crate) static STATS_PARSED_NAME: &str = "stats_parsed";
 
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
@@ -592,7 +593,7 @@ fn scan_row_schema_with_parsed_columns(
     let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
     if let Some(schema) = stats_schema {
         fields.push(StructField::nullable(
-            "stats_parsed",
+            STATS_PARSED_NAME,
             schema.as_ref().clone(),
         ));
     }

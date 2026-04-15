@@ -72,7 +72,9 @@ uintptr_t convert_engine_to_kernel_literal(
       return result.ok;
     }
     case Null: {
-      ExternResultusize result = visit_expression_literal_null(state, allocate_error);
+      struct NullTypeInfo* nt = &lit->value.null_type;
+      ExternResultusize result = visit_expression_literal_null(
+          state, nt->type_tag, nt->precision, nt->scale, allocate_error);
       if (result.tag == Errusize) {
         print_error("visit_expression_literal_null failed", (Error*)result.err);
         free_error((Error*)result.err);

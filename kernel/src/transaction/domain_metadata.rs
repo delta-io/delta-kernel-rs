@@ -199,14 +199,7 @@ impl<S> Transaction<S> {
         // Validate domain operations (includes feature validation)
         self.validate_domain_metadata_operations()?;
 
-        // TODO(sanuj) Create-table must not have row tracking or removals
-        // Defensive. Needs to be updated when row tracking support is added.
         if is_create {
-            if row_tracking_high_watermark.is_some() {
-                return Err(Error::internal_error(
-                    "CREATE TABLE cannot have row tracking domain metadata",
-                ));
-            }
             // user_domain_removals already validated above, but be explicit
             debug_assert!(self.user_domain_removals.is_empty());
         }
@@ -214,7 +207,7 @@ impl<S> Transaction<S> {
         // Generate removal actions (empty for create-table due to validation above)
         let removal_actions = self.generate_user_domain_removal_actions(engine)?;
 
-        // Generate row tracking domain action (None for create-table)
+        // Generate row tracking domain action.
         let row_tracking_domain_action = row_tracking_high_watermark
             .map(DomainMetadata::try_from)
             .transpose()?

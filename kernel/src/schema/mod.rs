@@ -29,6 +29,7 @@ pub(crate) mod diff;
 pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
+pub(crate) mod validation;
 pub(crate) mod variant_utils;
 
 pub type Schema = StructType;
@@ -1288,6 +1289,51 @@ pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
     let mut checker = InvariantChecker(false);
     let _ = checker.transform_struct(schema);
     checker.0
+}
+
+/// Normalizes column name field names to match the casing in the schema.
+///
+/// Walks each field name through the schema's struct hierarchy, replacing user-provided
+/// casing with the schema's canonical casing. If a field name isn't found
+/// case-insensitively, keeps the original (subsequent validation catches it).
+///
+/// For example, given schema `{ Id: int, Name: string }` and user-provided columns
+/// `["id", "name"]`, returns `["Id", "Name"]` -- matching the schema's canonical casing.
+///
+/// Note: Must be called before validation (`validate_partition_columns` or
+/// `validate_clustering_columns`) so that case-normalized names match the schema.
+pub(crate) fn normalize_column_names_to_schema_casing(
+    schema: &StructType,
+    columns: &[ColumnName],
+) -> Vec<ColumnName> {
+    columns
+        .iter()
+        .map(|col| {
+            let path = col.path();
+            let mut normalized: Vec<String> = Vec::with_capacity(path.len());
+            let mut current_schema = schema;
+            for (i, field_name) in path.iter().enumerate() {
+                match current_schema
+                    .fields()
+                    .find(|f| f.name().eq_ignore_ascii_case(field_name))
+                {
+                    Some(f) => {
+                        normalized.push(f.name().to_string());
+                        if let DataType::Struct(inner) = f.data_type() {
+                            current_schema = inner;
+                        }
+                    }
+                    None => {
+                        // Field name not found at this level -- keep remaining path
+                        // unchanged so validation reports the user's original input.
+                        normalized.extend(path[i..].iter().cloned());
+                        break;
+                    }
+                }
+            }
+            ColumnName::new(normalized.iter().map(|s| s.as_str()))
+        })
+        .collect()
 }
 
 /// Helper for RowVisitor implementations
@@ -3819,5 +3865,44 @@ mod tests {
         let schema = walk_test_schema();
         let result = schema.walk_column_fields(&ColumnName::new(col_path.iter().copied()));
         assert_result_error_with_message(result, expected_error);
+    }
+
+    #[test]
+    fn test_normalize_column_names_to_schema_casing() {
+        let inner =
+            StructType::new_unchecked(vec![StructField::new("City", DataType::STRING, false)]);
+        let schema = StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("EventDate", DataType::DATE, false),
+            StructField::new("Address", DataType::Struct(Box::new(inner)), false),
+        ]);
+
+        // Mismatched casing -> normalized to schema
+        let cols = vec![ColumnName::new(["eventdate"])];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["EventDate"]
+        );
+
+        // Nested path -> each field name normalized
+        let cols = vec![ColumnName::new(["address", "city"])];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["Address", "City"]
+        );
+
+        // Already matching -> unchanged
+        let cols = vec![ColumnName::new(["id"])];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["id"]
+        );
+
+        // Unrecognized -> keeps original
+        let cols = vec![ColumnName::new(["nonexistent"])];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["nonexistent"]
+        );
     }
 }

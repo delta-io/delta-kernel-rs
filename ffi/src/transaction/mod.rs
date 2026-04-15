@@ -14,10 +14,11 @@ use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
+use crate::scan::EngineSchema;
+use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
     unwrap_and_parse_path_as_url, DeltaResult, ExclusiveEngineData, ExternEngine,
-    KernelStringSlice, SharedExternEngine, SharedSchema, SharedSnapshot, Snapshot,
-    TryFromStringSlice, Url,
+    KernelStringSlice, SharedExternEngine, SharedSnapshot, Snapshot, TryFromStringSlice, Url,
 };
 
 /// A handle for an existing-table transaction (`Transaction<ExistingTable>`).
@@ -368,6 +369,10 @@ pub struct ExclusiveCreateTableBuilder;
 
 /// Create a new [`CreateTableTransactionBuilder`] for creating a Delta table at the given path.
 ///
+/// The schema is provided via the engine's visitor callback pattern ([`EngineSchema`]): the
+/// kernel allocates a [`KernelSchemaVisitorState`], calls the engine's visitor function to
+/// populate it via `visit_field_*` downcalls, then extracts the final schema.
+///
 /// The returned builder can be configured with [`create_table_builder_with_table_property`]
 /// before building with [`create_table_builder_build`]. The engine is only used for error
 /// reporting at this stage.
@@ -375,29 +380,30 @@ pub struct ExclusiveCreateTableBuilder;
 /// # Safety
 ///
 /// Caller is responsible for passing a valid `path`, `schema`, `engine_info`, and `engine`.
-/// Does NOT consume the `schema` handle -- the caller is still responsible for freeing it.
 #[no_mangle]
 pub unsafe extern "C" fn get_create_table_builder(
     path: KernelStringSlice,
-    schema: Handle<SharedSchema>,
+    schema: &EngineSchema,
     engine_info: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
     let engine = unsafe { engine.as_ref() };
     let path = unsafe { TryFromStringSlice::try_from_slice(&path) };
     let info = unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
-    let schema = unsafe { schema.clone_as_arc() };
     get_create_table_builder_impl(path, schema, info).into_extern_result(&engine)
 }
 
 fn get_create_table_builder_impl(
     path: DeltaResult<&str>,
-    schema: Arc<delta_kernel::schema::Schema>,
+    schema: &EngineSchema,
     engine_info: DeltaResult<&str>,
 ) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
+    let mut visitor_state = KernelSchemaVisitorState::default();
+    let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
+    let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
     let builder = delta_kernel::transaction::create_table::create_table(
         path?,
-        schema,
+        Arc::new(schema),
         engine_info?.to_string(),
     );
     Ok(Box::new(builder).into())
@@ -554,6 +560,7 @@ pub unsafe extern "C" fn remove_files(
 
 #[cfg(test)]
 mod tests {
+    use std::os::raw::c_void;
     use std::sync::Arc;
 
     use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
@@ -578,20 +585,21 @@ mod tests {
     use delta_kernel_ffi::tests::get_default_engine;
     use itertools::Itertools;
     use serde_json::{json, Deserializer};
+    use tempfile::tempdir;
     use test_utils::{set_json_value, setup_test_tables, test_read};
     use write_context::{
         free_write_context, get_unpartitioned_write_context, get_write_path, get_write_schema,
     };
 
+    use super::*;
+    use crate::schema_visitor::{
+        visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
+    };
     use crate::{
         free_engine, free_schema, free_snapshot, kernel_string_slice, logical_schema, version,
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
-
-    use tempfile::tempdir;
-
-    use super::*;
 
     fn check_txn_id_exists(commit_info: &serde_json::Value) {
         commit_info["txnId"]
@@ -1298,6 +1306,57 @@ mod tests {
         Ok(())
     }
 
+    /// Schema visitor callback for tests: encodes the schema stored in the `schema` pointer
+    /// (which points to a `Vec<StructField>`) into the kernel's `KernelSchemaVisitorState`.
+    /// Only supports primitive fields (no nested structs/arrays/maps) -- sufficient for tests.
+    extern "C" fn visit_test_schema(
+        schema_ptr: *mut c_void,
+        state: &mut KernelSchemaVisitorState,
+    ) -> usize {
+        let fields = unsafe { &*(schema_ptr as *const Vec<StructField>) };
+        let field_ids: Vec<usize> = fields
+            .iter()
+            .map(|field| {
+                let name = field.name.as_str();
+                let nullable = field.nullable;
+                unsafe {
+                    ok_or_panic(match field.data_type {
+                        DataType::INTEGER => visit_field_integer(
+                            state,
+                            kernel_string_slice!(name),
+                            nullable,
+                            allocate_err,
+                        ),
+                        DataType::STRING => visit_field_string(
+                            state,
+                            kernel_string_slice!(name),
+                            nullable,
+                            allocate_err,
+                        ),
+                        DataType::LONG => visit_field_long(
+                            state,
+                            kernel_string_slice!(name),
+                            nullable,
+                            allocate_err,
+                        ),
+                        _ => panic!("Unsupported test field type: {:?}", field.data_type),
+                    })
+                }
+            })
+            .collect();
+        let root = "schema";
+        unsafe {
+            ok_or_panic(visit_field_struct(
+                state,
+                kernel_string_slice!(root),
+                field_ids.as_ptr(),
+                field_ids.len(),
+                false,
+                allocate_err,
+            ))
+        }
+    }
+
     /// Create a [`CreateTableTransactionBuilder`] handle via the FFI, using the given schema
     /// fields. Returns `(table_path, engine_handle, builder_handle)`. The caller is responsible
     /// for freeing/consuming the engine and builder handles.
@@ -1310,20 +1369,20 @@ mod tests {
         Handle<ExclusiveCreateTableBuilder>,
     ) {
         let table_path = tmp_dir.path().to_str().unwrap().to_string();
-        let schema = Arc::new(StructType::try_new(fields).unwrap());
         let engine = get_default_engine(&table_path);
-        let schema_handle: Handle<SharedSchema> = schema.into();
         let engine_info = "test-engine/1.0";
+        let schema_arg = EngineSchema {
+            schema: &fields as *const Vec<StructField> as *mut c_void,
+            visitor: visit_test_schema,
+        };
         let builder = ok_or_panic(unsafe {
             get_create_table_builder(
                 kernel_string_slice!(table_path),
-                schema_handle.shallow_copy(),
+                &schema_arg,
                 kernel_string_slice!(engine_info),
                 engine.shallow_copy(),
             )
         });
-        // get_create_table_builder does NOT consume the schema handle -- free it
-        unsafe { free_schema(schema_handle) };
         (table_path, engine, builder)
     }
 
@@ -1555,26 +1614,27 @@ mod tests {
         tmp_dir: &tempfile::TempDir,
     ) -> Result<(String, Handle<SharedExternEngine>), Box<dyn std::error::Error>> {
         let table_path = tmp_dir.path().to_str().unwrap();
-        let schema = Arc::new(StructType::try_new(vec![
+        let fields = vec![
             StructField::nullable("number", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
-        ])?);
+        ];
 
         let engine = get_default_engine(table_path);
-        let schema_handle: Handle<SharedSchema> = schema.into();
 
         // Create the table
         let engine_info = "test-engine/1.0";
+        let schema_arg = EngineSchema {
+            schema: &fields as *const Vec<StructField> as *mut c_void,
+            visitor: visit_test_schema,
+        };
         let builder = ok_or_panic(unsafe {
             get_create_table_builder(
                 kernel_string_slice!(table_path),
-                schema_handle.shallow_copy(),
+                &schema_arg,
                 kernel_string_slice!(engine_info),
                 engine.shallow_copy(),
             )
         });
-        // get_create_table_builder does NOT consume the schema handle -- free it
-        unsafe { free_schema(schema_handle) };
         build_and_commit(builder, &engine);
 
         // Write a parquet file and commit it

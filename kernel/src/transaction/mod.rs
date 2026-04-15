@@ -25,7 +25,8 @@ use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
-    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
+    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
+    STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
@@ -255,6 +256,42 @@ impl<S> std::fmt::Debug for Transaction<S> {
             self.engine_info.is_some()
         ))
     }
+}
+
+/// Transforms add file metadata into commit-ready add actions by converting stats to JSON
+/// and setting the `dataChange` field.
+fn build_add_actions<'a, I, T>(
+    engine: &dyn Engine,
+    add_files_metadata: I,
+    input_schema: SchemaRef,
+    output_schema: SchemaRef,
+    data_change: bool,
+) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a
+where
+    I: Iterator<Item = DeltaResult<T>> + Send + 'a,
+    T: Deref<Target = dyn EngineData> + Send + 'a,
+{
+    let evaluation_handler = engine.evaluation_handler();
+    add_files_metadata.map(move |add_files_batch| {
+        let transform = Expression::transform(
+            Transform::new_top_level()
+                .with_inserted_field(
+                    Some("modificationTime"),
+                    Expression::literal(data_change).into(),
+                )
+                .with_replaced_field(
+                    "stats",
+                    Expression::unary(ToJson, Expression::column(["stats"])).into(),
+                ),
+        );
+        let adds_expr = Expression::struct_from([transform]);
+        let adds_evaluator = evaluation_handler.new_expression_evaluator(
+            input_schema.clone(),
+            Arc::new(adds_expr),
+            as_log_add_schema(output_schema.clone()).into(),
+        )?;
+        adds_evaluator.evaluate(add_files_batch?.deref())
+    })
 }
 
 // =============================================================================
@@ -941,7 +978,7 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
-    /// Generate add actions, handling row tracking internally if needed
+    /// Generates add actions and row tracking domain metadata for a commit.
     #[instrument(name = "txn.gen_adds", skip_all, err)]
     fn generate_adds<'a>(
         &'a self,
@@ -951,117 +988,29 @@ impl<S> Transaction<S> {
         EngineDataResultIterator<'a>,
         Option<RowTrackingDomainMetadata>,
     )> {
-        fn build_add_actions<'a, I, T>(
-            engine: &dyn Engine,
-            add_files_metadata: I,
-            input_schema: SchemaRef,
-            output_schema: SchemaRef,
-            data_change: bool,
-        ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a
-        where
-            I: Iterator<Item = DeltaResult<T>> + Send + 'a,
-            T: Deref<Target = dyn EngineData> + Send + 'a,
-        {
-            let evaluation_handler = engine.evaluation_handler();
-
-            add_files_metadata.map(move |add_files_batch| {
-                // Convert stats to a JSON string and nest the add action in a top-level struct
-                let transform = Expression::transform(
-                    Transform::new_top_level()
-                        .with_inserted_field(
-                            Some("modificationTime"),
-                            Expression::literal(data_change).into(),
-                        )
-                        .with_replaced_field(
-                            "stats",
-                            Expression::unary(ToJson, Expression::column(["stats"])).into(),
-                        ),
-                );
-                let adds_expr = Expression::struct_from([transform]);
-                let adds_evaluator = evaluation_handler.new_expression_evaluator(
-                    input_schema.clone(),
-                    Arc::new(adds_expr),
-                    as_log_add_schema(output_schema.clone()).into(),
-                )?;
-                adds_evaluator.evaluate(add_files_batch?.deref())
-            })
-        }
+        // Note: this does not require delta.enableRowTracking=true. "supported" is sufficient
+        // for writers to assign row IDs.
+        let row_tracking_supported = self
+            .read_snapshot
+            .table_configuration()
+            .should_write_row_tracking();
 
         if self.add_files_metadata.is_empty() {
-            return Ok((Box::new(iter::empty()), None));
+            // No files to add. For an empty CREATE TABLE with row tracking, emit the initial
+            // high water mark domain metadata (rowIdHighWaterMark = -1) so subsequent writes
+            // have a valid starting point. For all other empty commits (metadata-only, etc.),
+            // nothing row-tracking-related needs to be written.
+            let row_tracking_dm = (row_tracking_supported && self.is_create_table())
+                .then(RowTrackingDomainMetadata::initial);
+            return Ok((Box::new(iter::empty()), row_tracking_dm));
         }
 
         let commit_version = i64::try_from(commit_version)
             .map_err(|_| Error::generic("Commit version too large to fit in i64"))?;
 
-        let needs_row_tracking = self
-            .read_snapshot
-            .table_configuration()
-            .should_write_row_tracking();
-
-        // Row tracking is not yet supported for create-table with data
-        if needs_row_tracking && self.is_create_table() {
-            return Err(Error::unsupported(
-                "Row tracking is not yet supported for create table with data",
-            ));
-        }
-
-        if needs_row_tracking {
-            // Read the current rowIdHighWaterMark from the snapshot's row tracking domain metadata
-            let row_id_high_water_mark =
-                RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
-
-            // Create a row tracking visitor and visit all files to collect row tracking information
-            let mut row_tracking_visitor = RowTrackingVisitor::new(
-                row_id_high_water_mark,
-                Some(self.add_files_metadata.len()),
-            );
-
-            // We visit all files with the row visitor before creating the add action iterator
-            // because we need to know the final row ID high water mark to create the domain
-            // metadata action
-            for add_files_batch in &self.add_files_metadata {
-                row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
-            }
-
-            // Deconstruct the row tracking visitor to avoid borrowing issues
-            let RowTrackingVisitor {
-                base_row_id_batches,
-                row_id_high_water_mark,
-            } = row_tracking_visitor;
-
-            // Create extended add files with row tracking columns
-            let extended_add_files = self.add_files_metadata.iter().zip(base_row_id_batches).map(
-                move |(add_files_batch, base_row_ids)| {
-                    let commit_versions = vec![commit_version; base_row_ids.len()];
-                    let base_row_ids_array =
-                        ArrayData::try_new(ArrayType::new(DataType::LONG, true), base_row_ids)?;
-                    let commit_versions_array =
-                        ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
-
-                    add_files_batch.append_columns(
-                        with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![]))),
-                        vec![base_row_ids_array, commit_versions_array],
-                    )
-                },
-            );
-
-            // Generate add actions including row tracking metadata
-            let add_actions = build_add_actions(
-                engine,
-                extended_add_files,
-                with_row_tracking_cols(self.add_files_schema()),
-                with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
-                self.data_change,
-            );
-
-            // Generate a row tracking domain metadata based on the final high water mark
-            let row_tracking_domain_metadata: RowTrackingDomainMetadata =
-                RowTrackingDomainMetadata::new(row_id_high_water_mark);
-
-            Ok((Box::new(add_actions), Some(row_tracking_domain_metadata)))
+        if row_tracking_supported {
+            self.generate_adds_with_row_tracking(engine, commit_version)
         } else {
-            // Simple case without row tracking
             let add_actions = build_add_actions(
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
@@ -1069,9 +1018,78 @@ impl<S> Transaction<S> {
                 with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()),
                 self.data_change,
             );
-
             Ok((Box::new(add_actions), None))
         }
+    }
+
+    /// Generates add actions with row tracking columns and the row ID high water mark
+    /// domain metadata.
+    ///
+    /// Visits all add file batches once to read `numRecords` per file, assigning a unique
+    /// non-overlapping `baseRowId` range to each file and computing the final high water mark
+    /// for the domain metadata action. The initial high water mark is read from the snapshot
+    /// for existing tables, or defaults to -1 for create-table (no prior log to read from).
+    fn generate_adds_with_row_tracking<'a>(
+        &'a self,
+        engine: &dyn Engine,
+        commit_version: i64,
+    ) -> DeltaResult<(
+        EngineDataResultIterator<'a>,
+        Option<RowTrackingDomainMetadata>,
+    )> {
+        let row_id_high_water_mark = if self.is_create_table() {
+            None
+        } else {
+            RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?
+        };
+
+        // Create a row tracking visitor and visit all files to collect row tracking information
+        let mut row_tracking_visitor =
+            RowTrackingVisitor::new(row_id_high_water_mark, Some(self.add_files_metadata.len()));
+
+        // We visit all files with the row visitor before creating the add action iterator because
+        // we need to know the final row ID high water mark to create the domain metadata action.
+        for add_files_batch in &self.add_files_metadata {
+            row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
+        }
+
+        // Destructure the visitor to move base_row_id_batches into the add-files iterator
+        // while also extracting the final high water mark for the domain metadata action.
+        let RowTrackingVisitor {
+            base_row_id_batches,
+            row_id_high_water_mark,
+        } = row_tracking_visitor;
+
+        // Create extended add files with row tracking columns
+        let extended_add_files = self.add_files_metadata.iter().zip(base_row_id_batches).map(
+            move |(add_files_batch, base_row_ids)| {
+                let commit_versions = vec![commit_version; base_row_ids.len()];
+                let base_row_ids_array =
+                    ArrayData::try_new(ArrayType::new(DataType::LONG, true), base_row_ids)?;
+                let commit_versions_array =
+                    ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
+
+                add_files_batch.append_columns(
+                    with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![]))),
+                    vec![base_row_ids_array, commit_versions_array],
+                )
+            },
+        );
+
+        // Generate add actions including row tracking metadata
+        let add_actions = build_add_actions(
+            engine,
+            extended_add_files,
+            with_row_tracking_cols(self.add_files_schema()),
+            with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
+            self.data_change,
+        );
+
+        // Generate a row tracking domain metadata based on the final high water mark
+        let row_tracking_domain_metadata: RowTrackingDomainMetadata =
+            RowTrackingDomainMetadata::new(row_id_high_water_mark);
+
+        Ok((Box::new(add_actions), Some(row_tracking_domain_metadata)))
     }
 
     fn into_committed(
@@ -1183,62 +1201,111 @@ impl<S> Transaction<S> {
         let target_schema = schema_with_all_fields_nullable(get_log_remove_schema())?;
         let evaluation_handler = engine.evaluation_handler();
 
-        // Create the transform expression once, since it only contains literals and column
-        // references
-        let mut transform = Transform::new_top_level()
-            // deletionTimestamp
-            .with_inserted_field(
-                Some("path"),
-                Expression::literal(self.commit_timestamp).into(),
+        let make_eval = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {
+            let transform = build_remove_transform(
+                self.commit_timestamp,
+                self.data_change,
+                columns_to_drop,
+                coalesce_stats_with_parsed,
+            );
+            let expr = Arc::new(Expression::struct_from([Expression::transform(transform)]));
+            evaluation_handler.new_expression_evaluator(
+                input_schema.clone(),
+                expr,
+                target_schema.clone().into(),
             )
-            // dataChange
-            .with_inserted_field(Some("path"), Expression::literal(self.data_change).into())
-            .with_inserted_field(
-                // extended_file_metadata
-                Some("path"),
-                Expression::literal(true).into(),
-            )
-            .with_inserted_field(
-                Some("path"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
-            )
-            // tags
-            .with_inserted_field(
-                Some("stats"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
-            )
-            .with_inserted_field(
-                Some("deletionVector"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
-            )
-            .with_inserted_field(
-                Some("deletionVector"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME])
-                    .into(),
-            )
-            .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-            .with_dropped_field("modificationTime");
+        };
 
-        // Drop any additional columns specified in columns_to_drop
-        for column_to_drop in columns_to_drop {
-            transform = transform.with_dropped_field(*column_to_drop);
-        }
-
-        let expr = Arc::new(Expression::struct_from([Expression::transform(transform)]));
-        let file_action_eval = Arc::new(evaluation_handler.new_expression_evaluator(
-            input_schema.clone(),
-            expr.clone(),
-            target_schema.into(),
-        )?);
+        // Build two evaluators: one for the common case where scan files do not include a
+        // stats_parsed column, and one for predicate-based scans that include stats_parsed.
+        // The stats_parsed evaluator coalesces stats with ToJson(stats_parsed) to handle the
+        // case where stats is null (e.g., when skip_stats=true was used) and then drops the
+        // stats_parsed column.
+        let base_eval = Arc::new(make_eval(false)?);
+        let stats_parsed_eval = Arc::new(make_eval(true)?);
+        let stats_parsed_col = ColumnName::new([STATS_PARSED_NAME]);
 
         Ok(remove_files_metadata.map(move |file_metadata_batch| {
-            let updated_engine_data = file_action_eval.evaluate(file_metadata_batch.data())?;
+            let data = file_metadata_batch.data();
+            let evaluator = if data.has_field(&stats_parsed_col) {
+                &stats_parsed_eval
+            } else {
+                &base_eval
+            };
+            let updated_engine_data = evaluator.evaluate(data)?;
             FilteredEngineData::try_new(
                 updated_engine_data,
                 file_metadata_batch.selection_vector().to_vec(),
             )
         }))
     }
+}
+
+/// Builds the transform expression for converting scan row metadata into a Remove action.
+///
+/// When `coalesce_stats_with_parsed` is true, the `stats` field is replaced with
+/// `COALESCE(stats, TO_JSON(stats_parsed))` and `stats_parsed` is dropped. This handles
+/// scan files produced by predicate-based scans that include a `stats_parsed` column: if
+/// `stats` is null (e.g., because `skip_stats=true` was used), the stats are reconstructed
+/// from the parsed representation before writing the remove action.
+fn build_remove_transform(
+    commit_timestamp: i64,
+    data_change: bool,
+    columns_to_drop: &[&str],
+    coalesce_stats_with_parsed: bool,
+) -> Transform {
+    let mut transform = Transform::new_top_level()
+        // deletionTimestamp
+        .with_inserted_field(Some("path"), Expression::literal(commit_timestamp).into())
+        // dataChange
+        .with_inserted_field(Some("path"), Expression::literal(data_change).into())
+        // extended_file_metadata
+        .with_inserted_field(Some("path"), Expression::literal(true).into())
+        .with_inserted_field(
+            Some("path"),
+            Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
+        );
+
+    if coalesce_stats_with_parsed {
+        // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)), then insert tags after.
+        // Both expressions are registered on the "stats" field_transform (is_replace=true),
+        // so the evaluator emits [coalesced_stats, tags] in place of the original stats field.
+        let coalesce_stats = Expression::coalesce([
+            Expression::column(["stats"]),
+            Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
+        ]);
+        transform = transform
+            .with_replaced_field("stats", coalesce_stats.into())
+            .with_inserted_field(
+                Some("stats"),
+                Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+            )
+            .with_dropped_field_if_exists(STATS_PARSED_NAME);
+    } else {
+        // tags inserted after stats; stats passes through unchanged
+        transform = transform.with_inserted_field(
+            Some("stats"),
+            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+        );
+    }
+
+    transform = transform
+        .with_inserted_field(
+            Some("deletionVector"),
+            Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
+        )
+        .with_inserted_field(
+            Some("deletionVector"),
+            Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into(),
+        )
+        .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
+        .with_dropped_field("modificationTime");
+
+    for column_to_drop in columns_to_drop {
+        transform = transform.with_dropped_field(*column_to_drop);
+    }
+
+    transform
 }
 
 /// Kernel exposes information about the state of the table that engines might want to use to
