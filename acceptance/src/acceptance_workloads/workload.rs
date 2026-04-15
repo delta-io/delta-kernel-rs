@@ -9,7 +9,7 @@ use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_predicate;
 use delta_kernel::expressions::Predicate;
-use delta_kernel::schema::Schema;
+use delta_kernel::schema::LogicalSchemaRef;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, Error, Version};
 use delta_kernel_benchmarks::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
@@ -22,8 +22,8 @@ use url::Url;
 pub struct ReadResult {
     /// The record batches from the scan.
     pub batches: Vec<RecordBatch>,
-    /// The kernel schema of the data.
-    pub schema: Arc<Schema>,
+    /// The logical schema of the data.
+    pub schema: LogicalSchemaRef,
     /// Total number of rows in the result.
     pub row_count: u64,
 }
@@ -83,7 +83,7 @@ pub fn execute_read_workload(
     }
     let scan = scan_builder.build()?;
 
-    let schema = scan.logical_schema();
+    let schema = scan.logical_schema().clone();
 
     // Execute scan to get all batches
     let batches: Vec<RecordBatch> = scan

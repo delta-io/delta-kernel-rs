@@ -96,7 +96,7 @@ pub fn validate_read_result(
             // Validate data content
             let expected_data = read_expected_data(expected_dir)?;
 
-            let schema = ArrowSchema::try_from_kernel(read_result.schema.as_ref())
+            let schema = ArrowSchema::try_from_kernel(read_result.schema.raw_schema().as_ref())
                 .map_err(|e| e.to_string())?;
             let schema = std::sync::Arc::new(schema);
             assert_data_matches(read_result.batches, &schema, expected_data)

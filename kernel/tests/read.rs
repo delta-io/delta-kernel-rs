@@ -7,7 +7,6 @@ use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{
     Field as ArrowField, Int64Type, Schema as ArrowSchema, TimeUnit,
 };
-use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{

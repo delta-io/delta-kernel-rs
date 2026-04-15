@@ -434,21 +434,6 @@ impl TableConfiguration {
         self.physical_schemas.full.clone()
     }
 
-    /// The physical schema for writing data files.
-    ///
-    /// When [`MaterializePartitionColumns`] is enabled, returns the full physical schema
-    /// (partition columns are materialized in data files). Otherwise, returns the physical
-    /// schema with partition columns excluded.
-    ///
-    /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
-    pub(crate) fn physical_write_schema(&self) -> SchemaRef {
-        if self.is_feature_enabled(&TableFeature::MaterializePartitionColumns) {
-            self.physical_schema()
-        } else {
-            self.physical_data_schema_without_partition_columns()
-        }
-    }
-
     /// The [`TableProperties`] of this table at this version.
     #[internal_api]
     pub(crate) fn table_properties(&self) -> &TableProperties {
