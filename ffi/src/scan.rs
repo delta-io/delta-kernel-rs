@@ -712,16 +712,19 @@ mod scan_builder_tests {
         visit_expression_column, visit_expression_literal_int, visit_predicate_lt,
         KernelExpressionVisitorState,
     };
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic, recover_error, setup_snapshot};
+    use crate::ffi_test_utils::{allocate_err, allocate_str, ok_or_panic, recover_error, recover_string, setup_snapshot};
     use crate::schema_visitor::{
         visit_field_integer, visit_field_struct, KernelSchemaVisitorState,
     };
-    use crate::{free_engine, free_schema, free_snapshot, kernel_string_slice, ExternResult};
+    use crate::{
+        free_engine, free_schema, free_snapshot, kernel_string_slice, ExternResult,
+        KernelStringSlice, NullableCvoid,
+    };
 
     use super::{
         free_scan, free_scan_builder, scan_builder, scan_builder_build,
         scan_builder_with_predicate, scan_builder_with_schema, scan_logical_schema,
-        EnginePredicate, EngineSchema,
+        scan_table_root, EnginePredicate, EngineSchema,
     };
 
     /// Schema visitor that produces `{id: integer (nullable)}` -- a single-column projection of
@@ -975,6 +978,94 @@ mod scan_builder_tests {
         let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
         // Drop without building -- must not panic or leak
         unsafe { free_scan_builder(builder) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn scan_table_root_returns_correct_url() {
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+
+        let result = unsafe { scan_table_root(scan.shallow_copy(), allocate_str) };
+
+        let ptr = result.expect("scan_table_root returned null");
+        let root = recover_string(ptr);
+        assert_eq!(root, "memory:///");
+
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn scan_table_root_does_not_consume_scan_handle() {
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+
+        // Call twice on the same handle -- as_ref() borrows without consuming.
+        let result1 = unsafe { scan_table_root(scan.shallow_copy(), allocate_str) };
+        let result2 = unsafe { scan_table_root(scan.shallow_copy(), allocate_str) };
+
+        let root1 = recover_string(result1.expect("first call returned null"));
+        let root2 = recover_string(result2.expect("second call returned null"));
+        assert_eq!(root1, root2);
+
+        // free_scan must not panic -- the handle must still be valid.
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn scan_table_root_passes_full_string_to_allocator() {
+        // Custom allocator that captures the length of the slice it receives.
+        extern "C" fn capturing_allocator(s: KernelStringSlice) -> NullableCvoid {
+            // Verify the length matches the expected URL before allocating.
+            assert_eq!(s.len, "memory:///".len());
+            allocate_str(s)
+        }
+
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+
+        let result = unsafe { scan_table_root(scan.shallow_copy(), capturing_allocator) };
+
+        let ptr = result.expect("scan_table_root returned null");
+        let root = recover_string(ptr);
+        assert_eq!(root, "memory:///");
+
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn scan_table_root_propagates_null_from_allocator() {
+        extern "C" fn null_allocator(_: KernelStringSlice) -> NullableCvoid {
+            None
+        }
+
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+
+        let result = unsafe { scan_table_root(scan.shallow_copy(), null_allocator) };
+
+        assert!(result.is_none(), "expected None when allocator returns null");
+
+        unsafe { free_scan(scan) };
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
     }
