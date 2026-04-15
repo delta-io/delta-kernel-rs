@@ -133,6 +133,8 @@ macro_rules! define_column_types {
 }
 
 define_column_types!(COL_TYPES_BOOL, DataType::BOOLEAN);
+define_column_types!(COL_TYPES_BYTE, DataType::BYTE);
+define_column_types!(COL_TYPES_SHORT, DataType::SHORT);
 define_column_types!(COL_TYPES_INT, DataType::INTEGER);
 define_column_types!(COL_TYPES_LONG, DataType::LONG);
 define_column_types!(COL_TYPES_STRING, DataType::STRING);
@@ -165,6 +167,8 @@ static COL_TYPES_DECIMAL: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
 fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> {
     match dt {
         &DataType::BOOLEAN => Ok(&COL_TYPES_BOOL),
+        &DataType::BYTE => Ok(&COL_TYPES_BYTE),
+        &DataType::SHORT => Ok(&COL_TYPES_SHORT),
         &DataType::INTEGER => Ok(&COL_TYPES_INT),
         &DataType::LONG => Ok(&COL_TYPES_LONG),
         &DataType::STRING => Ok(&COL_TYPES_STRING),
@@ -175,9 +179,9 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
         &DataType::TIMESTAMP => Ok(&COL_TYPES_TIMESTAMP),
         &DataType::TIMESTAMP_NTZ => Ok(&COL_TYPES_TIMESTAMP_NTZ),
         DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(&COL_TYPES_DECIMAL),
-        _ => Err(Error::internal_error(format!(
-            "Unsupported data type for stats validation: {dt}"
-        ))),
+        DataType::Struct(_) | DataType::Array(_) | DataType::Map(_) | DataType::Variant(_) => Err(
+            Error::internal_error(format!("Unsupported data type for stats validation: {dt}")),
+        ),
     }
 }
 
@@ -190,6 +194,8 @@ fn is_stat_present<'b>(
     let field_name = "stat";
     match data_type {
         &DataType::BOOLEAN => Ok(getter.get_bool(row_idx, field_name)?.is_some()),
+        &DataType::BYTE => Ok(getter.get_byte(row_idx, field_name)?.is_some()),
+        &DataType::SHORT => Ok(getter.get_short(row_idx, field_name)?.is_some()),
         &DataType::INTEGER => Ok(getter.get_int(row_idx, field_name)?.is_some()),
         &DataType::LONG => Ok(getter.get_long(row_idx, field_name)?.is_some()),
         &DataType::FLOAT => Ok(getter.get_float(row_idx, field_name)?.is_some()),
@@ -203,9 +209,11 @@ fn is_stat_present<'b>(
         DataType::Primitive(PrimitiveType::Decimal(_)) => {
             Ok(getter.get_decimal(row_idx, field_name)?.is_some())
         }
-        _ => Err(Error::internal_error(format!(
-            "Unsupported data type for stats presence check: {data_type}"
-        ))),
+        DataType::Struct(_) | DataType::Array(_) | DataType::Map(_) | DataType::Variant(_) => {
+            Err(Error::internal_error(format!(
+                "Unsupported data type for stats presence check: {data_type}"
+            )))
+        }
     }
 }
 
@@ -266,8 +274,12 @@ mod tests {
     use rstest::rstest;
 
     use crate::arrow::array::{
-        Array, ArrayRef, Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray,
-        StructArray,
+        types::{
+            Date32Type, Decimal128Type, Float32Type, Float64Type, Int32Type,
+            TimestampMicrosecondType,
+        },
+        Array, ArrayRef, BinaryArray, BooleanArray, Int16Array, Int64Array, Int8Array,
+        LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
@@ -619,45 +631,6 @@ mod tests {
         verifier.verify(&[engine_data]).unwrap();
     }
 
-    /// Round-trip test: collect_stats produces stats that pass verification for all null
-    /// patterns. The all-null and empty cases are regression tests -- collect_stats must keep
-    /// the field present (with null value) so the verifier's all_null check can run.
-    #[rstest]
-    #[case::non_null(vec![Some(1i64), Some(2), Some(3)])]
-    #[case::all_null(vec![None, None, None])]
-    #[case::empty(vec![])]
-    fn test_collected_stats_pass_verification(#[case] values: Vec<Option<i64>>) {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "col",
-            ArrowDataType::Int64,
-            true,
-        )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef])
-                .unwrap();
-
-        let stats = collect_stats(&batch, &[column_name!("col")]).unwrap();
-
-        let path_array = StringArray::from(vec!["file1.parquet"]);
-        let add_file_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("path", ArrowDataType::Utf8, false),
-            ArrowField::new("stats", stats.data_type().clone(), true),
-        ]));
-        let add_file_batch = RecordBatch::try_new(
-            add_file_schema,
-            vec![
-                Arc::new(path_array) as ArrayRef,
-                Arc::new(stats) as ArrayRef,
-            ],
-        )
-        .unwrap();
-
-        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(add_file_batch));
-
-        let verifier = StatsVerifier::new(vec![(ColumnName::new(["col"]), DataType::LONG)]);
-        verifier.verify(&[engine_data]).unwrap();
-    }
-
     /// Verify collect_stats produces correct stats shape for all-null and empty batches.
     /// These cases keep the column in minValues/maxValues with null values (so that
     /// StatsVerifier can find the field via visit_rows and check nullCount == numRecords).
@@ -700,5 +673,144 @@ mod tests {
             .downcast_ref::<StructArray>()
             .unwrap();
         assert!(max_values.column_by_name("col").unwrap().is_null(0));
+    }
+
+    /// Round-trip test: collect_stats produces stats that pass verification for every
+    /// stats-eligible type. Covers non-null, all-null, and empty patterns per type.
+    #[rstest]
+    // Note: BOOLEAN and BINARY are omitted for non-null cases because collect_stats does not
+    // produce min/max for those types (they fall through to the wildcard in compute_leaf_agg).
+    // All-null cases are still tested since null min/max is valid when nullCount == numRecords.
+    #[case::boolean_all_null(
+        Arc::new(BooleanArray::from(vec![None::<bool>, None, None])) as ArrayRef,
+        DataType::BOOLEAN,
+    )]
+    #[case::byte(
+        Arc::new(Int8Array::from(vec![Some(1i8), Some(2), Some(3)])) as ArrayRef,
+        DataType::BYTE,
+    )]
+    #[case::byte_all_null(
+        Arc::new(Int8Array::from(vec![None::<i8>, None, None])) as ArrayRef,
+        DataType::BYTE,
+    )]
+    #[case::short(
+        Arc::new(Int16Array::from(vec![Some(100i16), Some(200), Some(300)])) as ArrayRef,
+        DataType::SHORT,
+    )]
+    #[case::short_all_null(
+        Arc::new(Int16Array::from(vec![None::<i16>, None, None])) as ArrayRef,
+        DataType::SHORT,
+    )]
+    #[case::integer(
+        Arc::new(PrimitiveArray::<Int32Type>::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef,
+        DataType::INTEGER,
+    )]
+    #[case::integer_all_null(
+        Arc::new(PrimitiveArray::<Int32Type>::from(vec![None::<i32>, None, None])) as ArrayRef,
+        DataType::INTEGER,
+    )]
+    #[case::long(
+        Arc::new(Int64Array::from(vec![Some(1i64), Some(2), Some(3)])) as ArrayRef,
+        DataType::LONG,
+    )]
+    #[case::long_all_null(
+        Arc::new(Int64Array::from(vec![None::<i64>, None, None])) as ArrayRef,
+        DataType::LONG,
+    )]
+    #[case::long_empty(
+        Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef,
+        DataType::LONG,
+    )]
+    #[case::float(
+        Arc::new(PrimitiveArray::<Float32Type>::from(vec![Some(1.0f32), Some(2.0), Some(3.0)])) as ArrayRef,
+        DataType::FLOAT,
+    )]
+    #[case::float_all_null(
+        Arc::new(PrimitiveArray::<Float32Type>::from(vec![None::<f32>, None, None])) as ArrayRef,
+        DataType::FLOAT,
+    )]
+    #[case::double(
+        Arc::new(PrimitiveArray::<Float64Type>::from(vec![Some(1.0f64), Some(2.0), Some(3.0)])) as ArrayRef,
+        DataType::DOUBLE,
+    )]
+    #[case::double_all_null(
+        Arc::new(PrimitiveArray::<Float64Type>::from(vec![None::<f64>, None, None])) as ArrayRef,
+        DataType::DOUBLE,
+    )]
+    #[case::date(
+        Arc::new(PrimitiveArray::<Date32Type>::from(vec![Some(18000), Some(19000), Some(20000)])) as ArrayRef,
+        DataType::DATE,
+    )]
+    #[case::date_all_null(
+        Arc::new(PrimitiveArray::<Date32Type>::from(vec![None::<i32>, None, None])) as ArrayRef,
+        DataType::DATE,
+    )]
+    #[case::timestamp(
+        Arc::new(PrimitiveArray::<TimestampMicrosecondType>::from(vec![Some(1_000_000i64), Some(2_000_000), Some(3_000_000)])) as ArrayRef,
+        DataType::TIMESTAMP,
+    )]
+    #[case::timestamp_all_null(
+        Arc::new(PrimitiveArray::<TimestampMicrosecondType>::from(vec![None::<i64>, None, None])) as ArrayRef,
+        DataType::TIMESTAMP,
+    )]
+    #[case::timestamp_ntz(
+        Arc::new(PrimitiveArray::<TimestampMicrosecondType>::from(vec![Some(1_000_000i64), Some(2_000_000), Some(3_000_000)])) as ArrayRef,
+        DataType::TIMESTAMP_NTZ,
+    )]
+    #[case::timestamp_ntz_all_null(
+        Arc::new(PrimitiveArray::<TimestampMicrosecondType>::from(vec![None::<i64>, None, None])) as ArrayRef,
+        DataType::TIMESTAMP_NTZ,
+    )]
+    #[case::string(
+        Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("c")])) as ArrayRef,
+        DataType::STRING,
+    )]
+    #[case::string_all_null(
+        Arc::new(StringArray::from(vec![None::<&str>, None, None])) as ArrayRef,
+        DataType::STRING,
+    )]
+    #[case::binary_all_null(
+        Arc::new(BinaryArray::from(vec![None::<&[u8]>, None, None])) as ArrayRef,
+        DataType::BINARY,
+    )]
+    #[case::decimal(
+        Arc::new(PrimitiveArray::<Decimal128Type>::from(vec![Some(100i128), Some(200), Some(300)]).with_precision_and_scale(10, 2).unwrap()) as ArrayRef,
+        DataType::decimal(10, 2).unwrap(),
+    )]
+    #[case::decimal_all_null(
+        Arc::new(PrimitiveArray::<Decimal128Type>::from(vec![None::<i128>, None, None]).with_precision_and_scale(10, 2).unwrap()) as ArrayRef,
+        DataType::decimal(10, 2).unwrap(),
+    )]
+    fn test_collected_stats_pass_verification_all_types(
+        #[case] values: ArrayRef,
+        #[case] dt: DataType,
+    ) {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "col",
+            values.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("col")]).unwrap();
+
+        let path_array = StringArray::from(vec!["file1.parquet"]);
+        let add_file_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("path", ArrowDataType::Utf8, false),
+            ArrowField::new("stats", stats.data_type().clone(), true),
+        ]));
+        let add_file_batch = RecordBatch::try_new(
+            add_file_schema,
+            vec![
+                Arc::new(path_array) as ArrayRef,
+                Arc::new(stats) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(add_file_batch));
+
+        let verifier = StatsVerifier::new(vec![(ColumnName::new(["col"]), dt)]);
+        verifier.verify(&[engine_data]).unwrap();
     }
 }

@@ -129,7 +129,7 @@ int main(int argc, char* argv[])
     HandleSharedFfiUCCommitClient uc_client = get_uc_commit_client(context, commit_callback);
 
     // Create a UC committer for a specific table
-    const char* table_id = "my_catalog.my_schema.my_table";
+    const char* table_id = "64dcd182-b3b4-4ee0-88e0-63c159a4121c";
     KernelStringSlice table_id_slice = { .ptr = table_id, .len = strlen(table_id) };
 
     ExternResultHandleMutableCommitter committer_res =
@@ -168,10 +168,23 @@ int main(int argc, char* argv[])
 
     SharedExternEngine* engine = engine_res.ok;
 
-    ExternResultHandleSharedSnapshot snapshot_res = snapshot(table_path_slice, engine);
+    ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res = get_snapshot_builder(table_path_slice, engine);
+    if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
+      print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
+      free_error((Error*)snapshot_builder_res.err);
+      free_engine(engine);
+      free_uc_commit_client(uc_client);
+      return -1;
+    }
+    // The test table is catalog-managed, so we must set the max catalog version.
+    // Version 0 is the only commit on disk (staged commits are not loaded here).
+    snapshot_builder_set_max_catalog_version(&snapshot_builder_res.ok, 0);
+    ExternResultHandleSharedSnapshot snapshot_res = snapshot_builder_build(snapshot_builder_res.ok);
     if (snapshot_res.tag != OkHandleSharedSnapshot) {
       print_error("Failed to create snapshot.", (Error*)snapshot_res.err);
       free_error((Error*)snapshot_res.err);
+      free_engine(engine);
+      free_uc_commit_client(uc_client);
       return -1;
     }
 

@@ -176,9 +176,21 @@ void print_tree_helper(ExpressionItem ref, int depth) {
                  dec->scale);
           break;
         }
-        case Null:
-          printf("Null\n");
+        case Null: {
+          static const char* null_type_names[] = {
+            "Boolean", "Byte", "Short", "Integer", "Long", "Float",
+            "Double", "String", "Binary", "Date", "Timestamp", "TimestampNtz",
+          };
+          struct NullTypeInfo* nt = &lit->value.null_type;
+          if (nt->type_tag < 12) { // 12 == Decimal (has special precision/scale handling)
+            printf("Null(%s)\n", null_type_names[nt->type_tag]);
+          } else if (nt->type_tag == 12) {
+            printf("Null(Decimal(%d,%d))\n", nt->precision, nt->scale);
+          } else {
+            printf("Null(tag=%d)\n", nt->type_tag);
+          }
           break;
+        }
         case Struct:
           printf("Struct\n");
           struct Struct* struct_data = &lit->value.struct_data;

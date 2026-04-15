@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use url::Url;
+use uuid::Uuid;
 
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
@@ -18,7 +19,7 @@ use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
 use crate::schema::variant_utils::schema_contains_variant_type;
-use crate::schema::{DataType, SchemaRef, StructType};
+use crate::schema::{normalize_column_names_to_schema_casing, DataType, SchemaRef, StructType};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -28,9 +29,11 @@ use crate::table_features::{
     SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
-    TableProperties, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
+    TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
-    ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS, SET_TRANSACTION_RETENTION_DURATION,
+    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS,
+    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -51,11 +54,20 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::InCommitTimestamp,
     // VacuumProtocolCheck ensures consistent protocol checks during VACUUM
     TableFeature::VacuumProtocolCheck,
+    // CatalogManaged enables catalog-managed table support
+    TableFeature::CatalogManaged,
     // Note: Clustering is NOT included here. Users should not enable clustering via
     // `delta.feature.clustering = supported`. Instead, clustering is enabled by
     // specifying clustering columns via `with_data_layout()`.
     TableFeature::DeletionVectors,
     TableFeature::V2Checkpoint,
+    // Simple protocol-only features: enabling these only updates the protocol action.
+    // They can also be auto-enabled via their enablement properties (e.g. delta.appendOnly=true)
+    // through `maybe_auto_enable_property_driven_features`.
+    TableFeature::AppendOnly,
+    TableFeature::ChangeDataFeed,
+    TableFeature::TypeWidening,
+    TableFeature::RowTracking,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
@@ -71,10 +83,16 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // Checkpoint stats format properties
     CHECKPOINT_WRITE_STATS_AS_JSON,
     CHECKPOINT_WRITE_STATS_AS_STRUCT,
-    // DeletionVectors enablement property: auto-enables the DeletionVectors feature
+    // Property-driven feature enablement properties
     ENABLE_DELETION_VECTORS,
+    ENABLE_CHANGE_DATA_FEED,
+    ENABLE_TYPE_WIDENING,
+    APPEND_ONLY,
+    ENABLE_ROW_TRACKING,
     // Set transaction retention duration: controls expiration of txn identifiers
     SET_TRANSACTION_RETENTION_DURATION,
+    // Parquet format version: controls the Parquet writer version for data files
+    PARQUET_FORMAT_VERSION,
 ];
 
 /// Ensures that no Delta table exists at the given path.
@@ -167,11 +185,12 @@ fn add_feature_to_lists(
     }
 }
 
-/// Configures clustering support for table creation (used by unit tests).
+/// Test-only helper for clustering support during table creation.
 ///
-/// Validates clustering columns, adds required features (DomainMetadata, ClusteredTable),
-/// and creates the domain metadata action.
-fn apply_clustering_for_table_create(
+/// Validates clustering columns, adds the `DomainMetadata` and `ClusteredTable` features
+/// directly, and creates the domain metadata action.
+#[cfg(test)]
+fn validate_clustering_and_make_domain_metadata(
     logical_schema: &SchemaRef,
     logical_columns: &[ColumnName],
     reader_features: &mut Vec<TableFeature>,
@@ -271,8 +290,8 @@ fn validate_partition_columns(
 /// Handles all [`DataLayout`] variants:
 ///
 /// - **None**: Returns defaults (no domain metadata, no clustering/partition columns).
-/// - **Clustered**: Validates clustering columns, resolves to physical names, adds
-///   `DomainMetadata` + `ClusteredTable` features, creates clustering domain metadata.
+/// - **Clustered**: Validates clustering columns, resolves to physical names, adds the
+///   `DomainMetadata` and `ClusteredTable` features, creates clustering domain metadata.
 /// - **Partitioned**: Validates partition columns and stores logical names. No domain
 ///   metadata or special features are needed (partitioning is a core Delta feature).
 fn apply_data_layout(
@@ -285,9 +304,13 @@ fn apply_data_layout(
         DataLayout::None => Ok(DataLayoutResult::default()),
 
         DataLayout::Clustered { columns } => {
-            validate_clustering_columns(effective_schema, columns)?;
+            // Normalize clustering column names to match schema casing. This allows users
+            // to specify clustering columns case-insensitively (e.g. schema has columns
+            // "A", "B", "C" and user clusters by "c", "a").
+            let normalized = normalize_column_names_to_schema_casing(effective_schema, columns);
+            validate_clustering_columns(effective_schema, &normalized)?;
 
-            let physical_columns: Vec<ColumnName> = columns
+            let physical_columns: Vec<ColumnName> = normalized
                 .iter()
                 .map(|c| {
                     get_any_level_column_physical_name(effective_schema, c, column_mapping_mode)
@@ -315,12 +338,13 @@ fn apply_data_layout(
         }
 
         DataLayout::Partitioned { columns } => {
-            validate_partition_columns(effective_schema, columns)?;
+            let normalized = normalize_column_names_to_schema_casing(effective_schema, columns);
+            validate_partition_columns(effective_schema, &normalized)?;
 
             Ok(DataLayoutResult {
                 system_domain_metadata: vec![],
                 clustering_columns: None,
-                partition_columns: Some(columns.clone()),
+                partition_columns: Some(normalized),
             })
         }
     }
@@ -363,9 +387,82 @@ fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProp
                     &mut validated.reader_features,
                     &mut validated.writer_features,
                 );
+                // RowTracking requires DomainMetadata as a dependency
+                if *feature == TableFeature::RowTracking {
+                    add_feature_to_lists(
+                        TableFeature::DomainMetadata,
+                        &mut validated.reader_features,
+                        &mut validated.writer_features,
+                    );
+                }
             }
         }
     }
+}
+
+/// Sets materialized column name properties when row tracking is enabled.
+///
+/// Writes `delta.rowTracking.materializedRowIdColumnName` and
+/// `delta.rowTracking.materializedRowCommitVersionColumnName` into the table
+/// properties using UUID-based column names (`_row-id-col-{uuid}` and
+/// `_row-commit-version-col-{uuid}`). These names record which physical columns
+/// store materialized row IDs and commit versions.
+///
+/// Only fires when `delta.enableRowTracking=true` is set. Feature-signal-only tables
+/// (`delta.feature.rowTracking=supported` without the enablement property) do not get
+/// these properties because the materialized columns are part of the "enabled" state, not
+/// the "supported" state.
+fn maybe_set_materialized_row_tracking_column_name_properties(
+    validated: &mut ValidatedTableProperties,
+) {
+    if validated
+        .properties
+        .get(ENABLE_ROW_TRACKING)
+        .is_none_or(|v| v != "true")
+    {
+        return;
+    }
+    validated.properties.insert(
+        MATERIALIZED_ROW_ID_COLUMN_NAME.to_string(),
+        format!("_row-id-col-{}", Uuid::new_v4()),
+    );
+    validated.properties.insert(
+        MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME.to_string(),
+        format!("_row-commit-version-col-{}", Uuid::new_v4()),
+    );
+}
+
+/// Ensures that `inCommitTimestamp` is enabled when `catalogManaged` is present. Adds the ICT
+/// feature to the protocol and sets the enablement property if not already present.
+fn maybe_enable_ict_for_catalog_managed(
+    validated: &mut ValidatedTableProperties,
+) -> DeltaResult<()> {
+    let has_catalog_managed = validated
+        .writer_features
+        .contains(&TableFeature::CatalogManaged);
+    if has_catalog_managed {
+        if validated
+            .properties
+            .get(ENABLE_IN_COMMIT_TIMESTAMPS)
+            .is_some_and(|v| v != "true")
+        {
+            return Err(Error::generic(format!(
+                "Catalog-managed tables require '{ENABLE_IN_COMMIT_TIMESTAMPS}=true', \
+                 but it was explicitly set to '{}'",
+                validated.properties[ENABLE_IN_COMMIT_TIMESTAMPS]
+            )));
+        }
+        add_feature_to_lists(
+            TableFeature::InCommitTimestamp,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+        validated
+            .properties
+            .entry(ENABLE_IN_COMMIT_TIMESTAMPS.to_string())
+            .or_insert_with(|| "true".to_string());
+    }
+    Ok(())
 }
 
 /// Conditionally applies column mapping for table creation based on the mode in properties.
@@ -472,7 +569,16 @@ fn validate_extract_table_features_and_properties(
         }
 
         // Add to appropriate feature lists based on feature type
+        let needs_domain_metadata = feature == TableFeature::RowTracking;
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
+        // RowTracking requires DomainMetadata as a dependency
+        if needs_domain_metadata {
+            add_feature_to_lists(
+                TableFeature::DomainMetadata,
+                &mut reader_features,
+                &mut writer_features,
+            );
+        }
     }
 
     // Validate remaining delta.* properties against allow list
@@ -639,10 +745,6 @@ impl CreateTableTransactionBuilder {
         // Validate path
         let table_url = try_parse_uri(&self.path)?;
 
-        // Validate schema is non-empty
-        if self.schema.fields().len() == 0 {
-            return Err(Error::generic("Schema cannot be empty"));
-        }
         // Check if table already exists by looking for _delta_log directory
         let delta_log_url = table_url.join("_delta_log/")?;
         let storage = engine.storage_handler();
@@ -657,6 +759,12 @@ impl CreateTableTransactionBuilder {
         // Apply column mapping if mode is name or id (must happen BEFORE data layout)
         let (effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
+
+        // Validate schema (non-empty, column names, duplicates)
+        crate::schema::validation::validate_schema_for_create(
+            &effective_schema,
+            column_mapping_mode,
+        )?;
 
         // Validate data layout and resolve column names (physical for clustering, logical
         // for partitioning). Adds required table features for clustering.
@@ -673,6 +781,12 @@ impl CreateTableTransactionBuilder {
 
         // Property-driven auto-enablement: check enablement properties
         maybe_auto_enable_property_driven_features(&mut validated);
+
+        // Auto-enable inCommitTimestamp for catalogManaged tables
+        maybe_enable_ict_for_catalog_managed(&mut validated)?;
+
+        // Set materialized row tracking column names when row tracking is enabled.
+        maybe_set_materialized_row_tracking_column_name_properties(&mut validated);
 
         // Create Protocol action with table features support
         let protocol =
@@ -719,6 +833,8 @@ mod tests {
     use super::*;
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, StructField, StructType};
+    use crate::table_features::FeatureType;
+    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V1, PARQUET_FORMAT_VERSION};
     use crate::utils::test_utils::assert_result_error_with_message;
 
     fn test_schema() -> SchemaRef {
@@ -810,34 +926,29 @@ mod tests {
             validated.properties.get("custom.setting"),
             Some(&"value".to_string())
         );
+    }
 
-        // Feature signal for domainMetadata IS allowed (it's in ALLOWED_DELTA_FEATURES)
-        let properties = HashMap::from([(
-            "delta.feature.domainMetadata".to_string(),
-            "supported".to_string(),
-        )]);
-        let result = validate_extract_table_features_and_properties(properties);
-        assert!(result.is_ok());
-        let validated = result.unwrap();
-        // Feature signals are removed from properties (not stored in metadata)
-        assert!(validated.properties.is_empty());
-        // DomainMetadata is a writer-only feature
+    #[test]
+    fn test_parquet_format_version_accepted() {
+        let properties =
+            HashMap::from([(PARQUET_FORMAT_VERSION.to_string(), "2.12.0".to_string())]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert_eq!(
+            validated.properties.get(PARQUET_FORMAT_VERSION),
+            Some(&"2.12.0".to_string()),
+        );
         assert!(validated.reader_features.is_empty());
-        assert!(validated
-            .writer_features
-            .contains(&TableFeature::DomainMetadata));
+        assert!(validated.writer_features.is_empty());
     }
 
     #[test]
     fn test_validate_unsupported_properties() {
-        use crate::table_properties::{APPEND_ONLY, ENABLE_CHANGE_DATA_FEED};
-
         // Delta properties not on allow list are rejected
         let mut properties = HashMap::new();
-        properties.insert(ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string());
+        properties.insert(ENABLE_ICEBERG_COMPAT_V1.to_string(), "true".to_string());
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
-            "Setting delta property 'delta.enableChangeDataFeed' is not supported",
+            "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
         );
 
         // Feature signals for features not in ALLOWED_DELTA_FEATURES are rejected
@@ -863,10 +974,10 @@ mod tests {
         // Mixed properties with unsupported delta property are rejected
         let mut properties = HashMap::new();
         properties.insert("myapp.version".to_string(), "1.0".to_string());
-        properties.insert(APPEND_ONLY.to_string(), "true".to_string());
+        properties.insert(ENABLE_ICEBERG_COMPAT_V1.to_string(), "true".to_string());
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
-            "Setting delta property 'delta.appendOnly' is not supported",
+            "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
         );
     }
 
@@ -883,7 +994,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let dm = apply_clustering_for_table_create(
+        let dm = validate_clustering_and_make_domain_metadata(
             &schema,
             &[ColumnName::new(["id"])],
             &mut reader_features,
@@ -912,7 +1023,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let dm = apply_clustering_for_table_create(
+        let dm = validate_clustering_and_make_domain_metadata(
             &schema,
             &[ColumnName::new(["id"]), ColumnName::new(["date"])],
             &mut reader_features,
@@ -941,7 +1052,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let result = apply_clustering_for_table_create(
+        let result = validate_clustering_and_make_domain_metadata(
             &schema,
             &[ColumnName::new(["nonexistent"])],
             &mut reader_features,
@@ -973,7 +1084,7 @@ mod tests {
         let mut writer_features = vec![];
 
         let nested_col = ColumnName::new(["address", "city"]);
-        let dm = apply_clustering_for_table_create(
+        let dm = validate_clustering_and_make_domain_metadata(
             &schema,
             &[nested_col],
             &mut reader_features,
@@ -1129,29 +1240,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_vacuum_protocol_check_feature_signal() {
-        let properties = HashMap::from([(
-            "delta.feature.vacuumProtocolCheck".to_string(),
-            "supported".to_string(),
-        )]);
+    #[rstest::rstest]
+    #[case::vacuum_protocol_check(TableFeature::VacuumProtocolCheck, "vacuumProtocolCheck")]
+    #[case::domain_metadata(TableFeature::DomainMetadata, "domainMetadata")]
+    #[case::column_mapping(TableFeature::ColumnMapping, "columnMapping")]
+    #[case::in_commit_timestamp(TableFeature::InCommitTimestamp, "inCommitTimestamp")]
+    #[case::deletion_vectors(TableFeature::DeletionVectors, "deletionVectors")]
+    #[case::v2_checkpoint(TableFeature::V2Checkpoint, "v2Checkpoint")]
+    #[case::append_only(TableFeature::AppendOnly, "appendOnly")]
+    #[case::change_data_feed(TableFeature::ChangeDataFeed, "changeDataFeed")]
+    #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
+    #[case::catalog_managed(TableFeature::CatalogManaged, "catalogManaged")]
+    fn test_feature_signal_accepted(#[case] feature: TableFeature, #[case] feature_name: &str) {
+        let key = format!("delta.feature.{feature_name}");
+        let properties = HashMap::from([(key, "supported".to_string())]);
         let validated = validate_extract_table_features_and_properties(properties).unwrap();
+
         assert!(
             validated.properties.is_empty(),
             "Feature signal should be removed from properties"
         );
         assert!(
-            validated
-                .writer_features
-                .contains(&TableFeature::VacuumProtocolCheck),
-            "VacuumProtocolCheck should be in writer_features"
+            validated.writer_features.contains(&feature),
+            "{feature:?} should be in writer_features"
         );
-        assert!(
-            validated
-                .reader_features
-                .contains(&TableFeature::VacuumProtocolCheck),
-            "VacuumProtocolCheck should be in reader_features (ReaderWriter feature)"
-        );
+        match feature.feature_type() {
+            FeatureType::ReaderWriter => assert!(
+                validated.reader_features.contains(&feature),
+                "{feature:?} is ReaderWriter but missing from reader_features"
+            ),
+            _ => assert!(
+                validated.reader_features.is_empty(),
+                "{feature:?} is WriterOnly but reader_features is not empty"
+            ),
+        }
     }
 
     fn multi_column_schema() -> SchemaRef {
@@ -1329,5 +1451,112 @@ mod tests {
         ]);
         let columns = vec![ColumnName::new(["col"])];
         assert!(validate_partition_columns(&schema, &columns).is_ok());
+    }
+
+    #[test]
+    fn test_catalog_managed_auto_enables_ict() {
+        let properties = HashMap::from([(
+            "delta.feature.catalogManaged".to_string(),
+            "supported".to_string(),
+        )]);
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        maybe_auto_enable_property_driven_features(&mut validated);
+        maybe_enable_ict_for_catalog_managed(&mut validated).unwrap();
+
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::InCommitTimestamp),
+            "ICT should be auto-added to writer_features"
+        );
+        assert_eq!(
+            validated.properties.get(ENABLE_IN_COMMIT_TIMESTAMPS),
+            Some(&"true".to_string()),
+            "delta.enableInCommitTimestamps should be set to true"
+        );
+    }
+
+    #[test]
+    fn test_catalog_managed_with_ict_true_succeeds() {
+        let properties = HashMap::from([
+            (
+                "delta.feature.catalogManaged".to_string(),
+                "supported".to_string(),
+            ),
+            (
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        maybe_auto_enable_property_driven_features(&mut validated);
+        maybe_enable_ict_for_catalog_managed(&mut validated).unwrap();
+
+        assert!(validated
+            .writer_features
+            .contains(&TableFeature::InCommitTimestamp));
+        assert_eq!(
+            validated.properties.get(ENABLE_IN_COMMIT_TIMESTAMPS),
+            Some(&"true".to_string()),
+        );
+    }
+
+    /// Verifies that both activation paths add `RowTracking` and `DomainMetadata` to
+    /// `writer_features`. For the feature-signal path, `delta.enableRowTracking` must NOT
+    /// be present in the properties (signal grants support, not enablement).
+    #[rstest::rstest]
+    #[case::enablement_property(
+        HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
+        true, // enablement property is set
+    )]
+    #[case::feature_signal(
+        HashMap::from([("delta.feature.rowTracking".to_string(), "supported".to_string())]),
+        false, // enablement property is NOT set
+    )]
+    fn test_row_tracking_activation_adds_required_features(
+        #[case] properties: HashMap<String, String>,
+        #[case] expect_enablement_property: bool,
+    ) {
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        maybe_auto_enable_property_driven_features(&mut validated);
+
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::RowTracking),
+            "Expected RowTracking in writer_features"
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::DomainMetadata),
+            "Expected DomainMetadata in writer_features"
+        );
+        assert_eq!(
+            validated.properties.contains_key(ENABLE_ROW_TRACKING),
+            expect_enablement_property,
+            "delta.enableRowTracking presence mismatch"
+        );
+    }
+
+    #[test]
+    fn test_catalog_managed_with_ict_false_fails() {
+        let properties = HashMap::from([
+            (
+                "delta.feature.catalogManaged".to_string(),
+                "supported".to_string(),
+            ),
+            (
+                "delta.enableInCommitTimestamps".to_string(),
+                "false".to_string(),
+            ),
+        ]);
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        maybe_auto_enable_property_driven_features(&mut validated);
+        let err = maybe_enable_ict_for_catalog_managed(&mut validated).unwrap_err();
+        assert!(
+            err.to_string().contains("enableInCommitTimestamps"),
+            "expected ICT conflict error, got: {err}"
+        );
     }
 }

@@ -16,6 +16,8 @@ use delta_kernel::expressions::ColumnName;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::DynObjectStore;
+#[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     get_any_level_column_physical_name, ColumnMappingMode, TableFeature,
@@ -102,7 +104,7 @@ fn verify_column_names_in_clustering_metadata(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = snapshot.schema();
     let clustering_columns = snapshot
-        .get_clustering_columns_physical(engine)?
+        .get_physical_clustering_columns(engine)?
         .expect("Clustering columns should be present");
 
     assert_eq!(
@@ -260,13 +262,9 @@ async fn run_ctas_test(
     }
     let mut tgt_txn = tgt_builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    let write_context = Arc::new(tgt_txn.get_write_context());
+    let write_context = Arc::new(tgt_txn.unpartitioned_write_context()?);
     let add_meta = engine
-        .write_parquet(
-            &ArrowEngineData::new(source_data),
-            write_context.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(source_data), write_context.as_ref())
         .await?;
     tgt_txn.add_files(add_meta);
 

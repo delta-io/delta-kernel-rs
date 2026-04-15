@@ -100,6 +100,7 @@ mod log_compaction;
 mod log_path;
 mod log_reader;
 pub mod metrics;
+pub mod partition;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -112,14 +113,21 @@ pub mod transforms;
 
 pub use log_path::LogPath;
 
-mod row_tracking;
+// Public under test-utils so integration tests can call get_high_water_mark via snapshot.
+#[cfg(feature = "test-utils")]
+pub mod row_tracking;
+#[cfg(not(feature = "test-utils"))]
+pub(crate) mod row_tracking;
 
 pub(crate) mod clustering;
 
 mod arrow_compat;
-#[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
+#[cfg(any(feature = "arrow-57", feature = "arrow-58"))]
 pub use arrow_compat::*;
 
+#[cfg(feature = "internal-api")]
+pub mod column_trie;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod column_trie;
 pub mod kernel_predicates;
 pub(crate) mod utils;
@@ -842,7 +850,8 @@ pub trait ParquetHandler: AsAny {
     ///
     /// This method writes the provided `data` to a Parquet file at the given `url`.
     ///
-    /// This will overwrite the file if it already exists.
+    /// This will overwrite the file if it already exists. For filesystem-backed
+    /// implementations, the parent directories must be created if they do not exist.
     ///
     /// # Parameters
     ///

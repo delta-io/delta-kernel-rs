@@ -39,12 +39,13 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.20.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.21.0" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
 indexmap = "2.10.0"
 itertools = "0.14"
+rand = "0.9"
 roaring = "0.11.2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
@@ -66,18 +67,7 @@ reqwest = { version = "0.13", default-features = false, optional = true, feature
 tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
 # both arrow versions below are optional and require object_store
 object_store_12 = { package = "object_store", version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
-
-# arrow 56
-[dependencies.arrow_56]
-package = "arrow"
-version = "56"
-features = ["chrono-tz", "ffi", "json"]
-optional = true
-[dependencies.parquet_56]
-package = "parquet"
-version = "56"
-features = ["async", "object_store"]
-optional = true
+object_store_13 = { package = "object_store", version = "0.13.1", optional = true, features = ["aws", "azure", "gcp", "http"] }
 
 # arrow 57
 [dependencies.arrow_57]
@@ -91,30 +81,38 @@ version = "57"
 features = ["async", "object_store"]
 optional = true
 
+# arrow 58
+[dependencies.arrow_58]
+package = "arrow"
+version = "58"
+features = ["chrono-tz", "ffi", "json"]
+optional = true
+[dependencies.parquet_58]
+package = "parquet"
+version = "58"
+features = ["async", "object_store"]
+optional = true
+
 [features]
 # no default features
 default = []
 # internal-api will make everything marked #[internal_api] public
 internal-api = []
 # prettyprint enables Arrow pretty-print helpers (test/example oriented).
-prettyprint = ["arrow_56?/prettyprint", "arrow_57?/prettyprint"]
+prettyprint = ["arrow_57?/prettyprint", "arrow_58?/prettyprint"]
 # test-utils exposes test-only constructors for downstream crate tests
 test-utils = ["prettyprint"]
 # integration-test turns on a particularly heavy test for hdfs-object-store
 integration-test = ["hdfs-native-object-store/integration-test"]
 
 # The default versions for arrow/parquet/object_store
-arrow = ["arrow-57"] # latest arrow version
+arrow = ["arrow-58"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
-arrow-56 = ["dep:arrow_56", "dep:parquet_56", "dep:object_store_12"]
 arrow-57 = ["dep:arrow_57", "dep:parquet_57", "dep:object_store_12"]
+arrow-58 = ["dep:arrow_58", "dep:parquet_58", "dep:object_store_13"]
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow"]
-
-# WARNING: experimental feature, still under active development
-# enables new experimental catalog-managed tables support
-catalog-managed = []
 
 # Schema diffing functionality (experimental)
 schema-diff = []
@@ -137,14 +135,14 @@ default-engine-rustls = ["default-engine-base", "reqwest/rustls"]
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-delta_kernel = { path = ".", features = ["catalog-managed", "test-utils"] }
-# NOTE: test_utils forcibly pulls the default engine and arrow-56. By default it ALSO pulls
-# arrow-57, which takes precedence and would make it impossible to test against arrow-56.
+delta_kernel = { path = ".", features = ["test-utils"] }
+# NOTE: test_utils forcibly pulls the default engine and arrow-57. By default it ALSO pulls
+# arrow-58, which takes precedence and would make it impossible to test against arrow-57.
 test_utils = { path = "../test-utils", default-features = false }
 criterion = "0.5"
 # Used for testing parse_url_opts extensibility
-hdfs-native-object-store = { version = "0.15.0" }
-hdfs-native = "0.12.2"
+hdfs-native-object-store = { version = "0.16.0" }
+hdfs-native = "0.13.4"
 walkdir = { version = "2.5.0" }
 async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
 paste = "1.0"

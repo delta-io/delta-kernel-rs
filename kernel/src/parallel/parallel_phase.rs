@@ -132,7 +132,7 @@ mod tests {
     use crate::log_segment::CheckpointReadInfo;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStore;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::parallel::parallel_scan_metadata::AfterSequentialScanMetadata;
     use crate::parallel::parallel_scan_metadata::{ParallelScanMetadata, ParallelState};
     use crate::parquet::arrow::arrow_writer::ArrowWriter;

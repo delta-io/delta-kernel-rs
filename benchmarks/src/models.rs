@@ -30,6 +30,15 @@ pub enum ParallelScan {
     Enabled { num_threads: usize },
 }
 
+/// Info needed to access a UC-managed table via credential vending.
+/// This covers both catalog-managed and non-catalog-managed UC tables.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogInfo {
+    /// Fully-qualified table name: "catalog.schema.table"
+    pub table_name: String,
+}
+
 /// Table info JSON files are located at the root of each table directory
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,8 +52,15 @@ pub struct TableInfo {
     pub description: String,
     /// URL to the table. Used for remote tables (e.g. `s3://my-bucket/my-table`) or (rarely)
     /// absolute local paths. If `None`, the table is assumed to be in the `delta/` subdirectory
-    /// next to `tableInfo.json`.
+    /// next to `tableInfo.json`. Mutually exclusive with `catalog_info`.
     pub table_path: Option<Url>,
+    /// Info needed to access a UC-managed table via credential vending.
+    /// When present, the engine is set up with UC-vended credentials instead of local/S3 access.
+    /// Whether to use `UCKernelClient` (catalog-managed) or standard snapshot builder is
+    /// determined by the `delta.feature.catalogManaged` property.
+    /// Mutually exclusive with `table_path`.
+    /// TODO(#2303): Create an enum type that ensures table_path and catalog_info are mutually exclusive
+    pub catalog_info: Option<CatalogInfo>,
     /// Schema at the latest version of the table, in Delta protocol JSON format
     /// e.g. `{"type": "struct", "fields": [...]}`
     pub schema: Schema,
@@ -87,6 +103,12 @@ impl TableInfo {
     pub fn from_json_path<P: AsRef<Path>>(path: P) -> Result<Self, serde_json::Error> {
         let content = std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
         let mut table_info: TableInfo = serde_json::from_str(&content)?;
+        if table_info.catalog_info.is_some() && table_info.table_path.is_some() {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "catalog_info and table_path are mutually exclusive",
+            )));
+        }
         // Stores the parent directory of the `tableInfo.json` file
         if let Some(parent) = path.as_ref().parent() {
             table_info.table_info_dir = parent.to_path_buf();
@@ -148,17 +170,24 @@ pub enum DataLayout {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum TimeTravel {
-    Version { version: u64 },
+    /// Timetravel to a specific snapshot/read version specified by the workload JSON.
+    /// It is i64 so that negative values from the test spec can be deserialized correctly.
+    /// [`TimeTravel::as_version`] will reject values below zero.
+    Version { version: i64 },
+    /// Timetravel to a specific timestamp specified by the workload JSON.
+    /// (not yet supported)
     Timestamp { timestamp: String },
 }
 
 impl TimeTravel {
-    /// Returns the version if this is version-based time travel.
+    /// Returns the version if this is version-based time travel and the version is non-negative.
     ///
-    /// Returns an error message for timestamp-based time travel, which is not yet supported.
+    /// Returns an error for negative versions or for timestamp-based time travel (which is not
+    /// yet supported).
     pub fn as_version(&self) -> Result<u64, &'static str> {
         match self {
-            TimeTravel::Version { version } => Ok(*version),
+            TimeTravel::Version { version } => u64::try_from(*version)
+                .map_err(|_| "Only non-negative snapshot versions are supported"),
             TimeTravel::Timestamp { .. } => Err("Timestamp-based time travel is not yet supported"),
         }
     }
@@ -396,6 +425,46 @@ mod tests {
     }
 
     #[rstest]
+    #[case(
+        r#"{
+            "name": "catalog_table", "description": "A catalog-managed table",
+            "catalogInfo": {"tableName": "main.schema.table"},
+            "schema": {"type": "struct", "fields": []},
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+            "properties": {}, "dataLayout": {}, "tags": []
+        }"#,
+        true,
+        "main.schema.table"
+    )]
+    #[case(
+        r#"{
+            "name": "local_table", "description": "A local table",
+            "schema": {"type": "struct", "fields": []},
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+            "properties": {}, "dataLayout": {}, "tags": []
+        }"#,
+        false,
+        ""
+    )]
+    fn test_deserialize_catalog_info_field(
+        #[case] json: &str,
+        #[case] expect_present: bool,
+        #[case] expected_table_name: &str,
+    ) {
+        let table_info: TableInfo =
+            serde_json::from_str(json).expect("Failed to deserialize table info");
+        assert_eq!(table_info.catalog_info.is_some(), expect_present);
+        if expect_present {
+            assert_eq!(
+                table_info.catalog_info.unwrap().table_name,
+                expected_table_name
+            );
+        }
+    }
+
+    #[rstest]
     #[case(r#"{"description": "missing name"}"#, "missing field")]
     #[case(
         r#"{"name": "missing_schema", "description": "d",
@@ -428,10 +497,16 @@ mod tests {
         "snapshotConstruction",
         Some(7)
     )]
+    #[case(
+        r#"{"type": "snapshotConstruction", "version": -1}"#,
+        "snapshotConstruction",
+        Some(-1)
+    )]
+    #[case(r#"{"type": "read", "version": -1}"#, "read", Some(-1))]
     fn test_deserialize_spec(
         #[case] json: &str,
         #[case] expected_type: &str,
-        #[case] expected_version: Option<u64>,
+        #[case] expected_version: Option<i64>,
     ) {
         let spec: Spec = serde_json::from_str(json).expect("Failed to deserialize spec");
         assert_eq!(spec.as_str(), expected_type);
@@ -449,6 +524,15 @@ mod tests {
         };
 
         assert_eq!(version, expected_version);
+    }
+
+    #[test]
+    fn test_time_travel_as_version_rejects_negative() {
+        let tt = TimeTravel::Version { version: -1 };
+        assert_eq!(
+            tt.as_version(),
+            Err("Only non-negative snapshot versions are supported")
+        );
     }
 
     #[rstest]
