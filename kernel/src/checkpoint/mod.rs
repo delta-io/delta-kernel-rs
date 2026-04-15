@@ -66,13 +66,13 @@
 //! let metadata: FileMeta = write_checkpoint_file(checkpoint_path, checkpoint_data)?;
 //! /* IMPORTANT: All data must be written before finalizing the checkpoint */
 //!
-//! // Build checkpoint stats from the exhausted iterator state
+//! // Build checkpoint action stats from the exhausted iterator state
 //! let state = std::sync::Arc::into_inner(state)
-//!     .expect("no other Arc references");
-//! let stats = delta_kernel::checkpoint::CheckpointActionStats::from_reconciliation_state(state)?;
+//!     .ok_or(Error::internal_error("checkpoint state Arc still has other references"))?;
+//! let action_stats = delta_kernel::checkpoint::CheckpointActionStats::from_reconciliation_state(state)?;
 //!
-//! // Finalize the checkpoint by passing the metadata and stats
-//! writer.finalize(engine, &metadata, &stats)?;
+//! // Finalize the checkpoint by passing the metadata and action stats
+//! writer.finalize(engine, &metadata, &action_stats)?;
 //!
 //! # Ok::<_, Error>(())
 //! ```
@@ -346,8 +346,8 @@ impl CheckpointWriter {
     /// drop(checkpoint_data);
     /// let state = Arc::into_inner(state)
     ///     .ok_or(Error::internal_error("checkpoint state Arc still has other references"))?;
-    /// let stats = CheckpointActionStats::from_reconciliation_state(state)?;
-    /// writer.finalize(&engine, &metadata, &stats)?;
+    /// let action_stats = CheckpointActionStats::from_reconciliation_state(state)?;
+    /// writer.finalize(&engine, &metadata, &action_stats)?;
     /// ```
     // Implementation overview:
     // 1. Determines whether to write a V1 or V2 checkpoint based on `v2Checkpoints` feature
@@ -446,7 +446,7 @@ impl CheckpointWriter {
     /// # Parameters
     /// - `engine`: Implementation of [`Engine`] APIs.
     /// - `metadata`: The metadata of the written checkpoint file.
-    /// - `stats`: Action counts from the checkpoint data.
+    /// - `action_stats`: Action counts from the checkpoint data.
     ///
     /// # Returns: `Ok` if the checkpoint was successfully finalized.
     // Internally, this method:
@@ -456,7 +456,7 @@ impl CheckpointWriter {
         self,
         engine: &dyn Engine,
         metadata: &FileMeta,
-        stats: &CheckpointActionStats,
+        action_stats: &CheckpointActionStats,
     ) -> DeltaResult<()> {
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
         // checkpoint, to avoid regressing the hint.
@@ -482,8 +482,8 @@ impl CheckpointWriter {
         let data = create_last_checkpoint_data(
             engine,
             self.version,
-            stats.actions_count,
-            stats.add_actions_count,
+            action_stats.actions_count,
+            action_stats.add_actions_count,
             size_in_bytes,
         );
 
