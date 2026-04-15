@@ -8,7 +8,7 @@ internals. Kernel never does I/O directly -- it defines _what_ to do via its API
 (`Snapshot`, `Scan`, `Transaction`) and delegates _how_ to the `Engine` trait.
 
 Current capabilities: table reads with predicates, data skipping, deletion vectors, change
-data feed, checkpoints (V1 & V2), log compaction, blind append writes, table creation
+data feed, checkpoints (V1 & V2), log compaction (disabled, #2337), blind append writes, table creation
 (including clustered tables), and catalog-managed table support.
 
 ## Build & Test Commands
@@ -47,16 +47,17 @@ cargo fmt \
 
 ### Crate Names for `-p` Flag
 
-| Crate                  | Directory       | Description                                    |
-|------------------------|-----------------|------------------------------------------------|
-| `delta_kernel`         | `kernel/`       | Core library                                   |
-| `delta_kernel_ffi`     | `ffi/`          | C/C++ FFI bindings                             |
-| `delta_kernel_derive`  | `derive-macros/`| Proc macros                                    |
-| `acceptance`           | `acceptance/`   | Acceptance tests (DAT)                         |
-| `test_utils`           | `test-utils/`   | Shared test utilities                          |
-| `feature_tests`        | `feature-tests/`| Feature flag tests                             |
-| `uc-catalog`           | `uc-catalog/`   | Unity Catalog integration (UCCatalog, UCCommitter) |
-| `uc-client`            | `uc-client/`    | Unity Catalog REST client                      |
+| Crate                                    | Directory                                  | Description                                             |
+|------------------------------------------|--------------------------------------------|---------------------------------------------------------|
+| `delta_kernel`                           | `kernel/`                                  | Core library                                            |
+| `delta_kernel_ffi`                       | `ffi/`                                     | C/C++ FFI bindings                                      |
+| `delta_kernel_derive`                    | `derive-macros/`                           | Proc macros                                             |
+| `acceptance`                             | `acceptance/`                              | Acceptance tests (DAT)                                  |
+| `test_utils`                             | `test-utils/`                              | Shared test utilities                                   |
+| `feature_tests`                          | `feature-tests/`                           | Feature flag tests                                      |
+| `delta-kernel-unity-catalog`             | `delta-kernel-unity-catalog/`              | Unity Catalog integration (UCKernelClient, UCCommitter) |
+| `unity-catalog-delta-client-api`         | `unity-catalog-delta-client-api/`          | Unity Catalog client traits and shared models           |
+| `unity-catalog-delta-rest-client`        | `unity-catalog-delta-rest-client/`         | Unity Catalog REST client                               |
 
 ### Feature Flags
 
@@ -67,7 +68,6 @@ cargo fmt \
   but default-engine does.
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
-- `catalog-managed` -- catalog-managed table support (experimental)
 - `clustered-table` -- clustered table write support (experimental)
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
@@ -82,9 +82,9 @@ version. From it you build a `Scan` (reads) or `Transaction` (writes).
 `execute()` (simple), `scan_metadata()` (advanced/distributed),
 `parallel_scan_metadata()` (two-phase distributed log replay).
 
-**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Kernel provides `WriteContext`,
-assembles commit actions, enforces protocol compliance, delegates atomic commit to a
-`Committer`.
+**Write path:** `Snapshot` -> `Transaction` -> `commit()`. Kernel provides `WriteContext`
+(via `partitioned_write_context` or `unpartitioned_write_context`), assembles commit
+actions, enforces protocol compliance, delegates atomic commit to a `Committer`.
 
 **Engine trait:** five handlers (`StorageHandler`, `JsonHandler`, `ParquetHandler`,
 `EvaluationHandler`, optional `MetricsReporter`). `DefaultEngine` lives in
@@ -114,7 +114,17 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   or inputs. Prefer `#[case]` over duplicating test functions. When parameters are
   independent and form a cartesian product, prefer `#[values]` over enumerating
   every combination with `#[case]`.
+- Actively look for rstest consolidation opportunities: when writing multiple tests
+  that share the same setup/flow and differ only in configuration and expected
+  outcome, write one parameterized rstest instead of separate functions. Also check
+  whether a new test duplicates the flow of an existing nearby test and should be
+  merged into it as a new `#[case]`. A common pattern is toggling a feature (e.g.
+  column mapping on/off) and asserting success vs. error.
 - Reuse helpers from `test_utils` instead of writing custom ones when possible.
+- **Prefer snapshot/public API assertions over reading raw commit JSON.** Only read raw
+  commit JSON when the data is inaccessible via public API (e.g., system domain metadata
+  is blocked by `get_domain_metadata`). For commit JSON reads, use `read_actions_from_commit`
+  from `test_utils` -- do NOT write local helpers that duplicate this.
 - **`add_commit` and table setup in tests:** `add_commit` takes a `table_root` string and
   resolves it to an absolute object-store path. The `table_root` must be a proper URL string
   with a trailing slash (e.g. `"memory:///"`, `"file:///tmp/my_table/"`). Avoid using the
@@ -153,9 +163,9 @@ is the source of truth. Key concepts:
   `allowColumnDefaults`, `changeDataFeed`, `identityColumns`, `rowTracking`,
   `domainMetadata`, `icebergCompatV1`, `icebergCompatV2`, `clustering`,
   `inCommitTimestamp`
-- Reader + writer: `columnMapping`, `deletionVectors`, `timestampNtz`,
-  `v2Checkpoint`, `vacuumProtocolCheck`, `variantType`, `variantType-preview`,
-  `typeWidening`
+- Reader + writer: `catalogManaged`, `catalogOwned-preview`, `columnMapping`,
+  `deletionVectors`, `timestampNtz`, `v2Checkpoint`, `vacuumProtocolCheck`,
+  `variantType`, `variantType-preview`, `typeWidening`
 
 Keep this list updated when new protocol features are added to kernel.
 
@@ -171,6 +181,9 @@ Keep this list updated when new protocol features are added to kernel.
 
 ## Code Style / Documentation
 
+- Line width is 100 characters. Wrap comments and string literals at 100, not 80.
+- Use `==` as a visual section divider in comments (e.g. `// === Helpers ===` or
+  `// ============`).
 - MUST include doc comments for all public functions, structs, enums, and methods.
 - MUST document function parameters, return values, and errors.
 - Keep comments up-to-date with code changes.

@@ -1,6 +1,6 @@
 //! Data models for workload specifications
 
-use delta_kernel::actions::Protocol;
+use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::schema::Schema;
 use serde::Deserialize;
 use url::Url;
@@ -30,6 +30,15 @@ pub enum ParallelScan {
     Enabled { num_threads: usize },
 }
 
+/// Info needed to access a UC-managed table via credential vending.
+/// This covers both catalog-managed and non-catalog-managed UC tables.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogInfo {
+    /// Fully-qualified table name: "catalog.schema.table"
+    pub table_name: String,
+}
+
 /// Table info JSON files are located at the root of each table directory
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,8 +52,15 @@ pub struct TableInfo {
     pub description: String,
     /// URL to the table. Used for remote tables (e.g. `s3://my-bucket/my-table`) or (rarely)
     /// absolute local paths. If `None`, the table is assumed to be in the `delta/` subdirectory
-    /// next to `tableInfo.json`.
+    /// next to `tableInfo.json`. Mutually exclusive with `catalog_info`.
     pub table_path: Option<Url>,
+    /// Info needed to access a UC-managed table via credential vending.
+    /// When present, the engine is set up with UC-vended credentials instead of local/S3 access.
+    /// Whether to use `UCKernelClient` (catalog-managed) or standard snapshot builder is
+    /// determined by the `delta.feature.catalogManaged` property.
+    /// Mutually exclusive with `table_path`.
+    /// TODO(#2303): Create an enum type that ensures table_path and catalog_info are mutually exclusive
+    pub catalog_info: Option<CatalogInfo>,
     /// Schema at the latest version of the table, in Delta protocol JSON format
     /// e.g. `{"type": "struct", "fields": [...]}`
     pub schema: Schema,
@@ -62,6 +78,7 @@ pub struct TableInfo {
     pub data_layout: DataLayout,
     /// Tags for filtering which tables are benchmarked via `BENCH_TAGS`. Use `[]` if none.
     /// Built-in tag: `base` (run in CI). e.g. `["base", "my-feature"]`
+    #[serde(default)]
     pub tags: Vec<String>,
     /// Path to the directory containing the `tableInfo.json` file
     #[serde(skip, default)]
@@ -86,6 +103,12 @@ impl TableInfo {
     pub fn from_json_path<P: AsRef<Path>>(path: P) -> Result<Self, serde_json::Error> {
         let content = std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
         let mut table_info: TableInfo = serde_json::from_str(&content)?;
+        if table_info.catalog_info.is_some() && table_info.table_path.is_some() {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "catalog_info and table_path are mutually exclusive",
+            )));
+        }
         // Stores the parent directory of the `tableInfo.json` file
         if let Some(parent) = path.as_ref().parent() {
             table_info.table_info_dir = parent.to_path_buf();
@@ -143,22 +166,58 @@ pub enum DataLayout {
     None {},
 }
 
+/// Time travel parameter. Either version or timestamp.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TimeTravel {
+    /// Timetravel to a specific snapshot/read version specified by the workload JSON.
+    /// It is i64 so that negative values from the test spec can be deserialized correctly.
+    /// [`TimeTravel::as_version`] will reject values below zero.
+    Version { version: i64 },
+    /// Timetravel to a specific timestamp specified by the workload JSON.
+    /// (not yet supported)
+    Timestamp { timestamp: String },
+}
+
+impl TimeTravel {
+    /// Returns the version if this is version-based time travel and the version is non-negative.
+    ///
+    /// Returns an error for negative versions or for timestamp-based time travel (which is not
+    /// yet supported).
+    pub fn as_version(&self) -> Result<u64, &'static str> {
+        match self {
+            TimeTravel::Version { version } => u64::try_from(*version)
+                .map_err(|_| "Only non-negative snapshot versions are supported"),
+            TimeTravel::Timestamp { .. } => Err("Timestamp-based time travel is not yet supported"),
+        }
+    }
+}
+
 /// Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
 /// There will be multiple specs for a given table
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Spec {
     Read(ReadSpec),
-    SnapshotConstruction(SnapshotConstructionSpec),
+    #[serde(alias = "snapshot_construction")]
+    SnapshotConstruction(Box<SnapshotConstructionSpec>),
 }
 
+/// Specification for a read workload.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReadSpec {
-    /// Version to read; if `None`, reads the latest version
-    pub version: Option<u64>,
+    // Time travel version or timestamp for the read
+    #[serde(flatten)]
+    pub time_travel: Option<TimeTravel>,
     /// SQL WHERE clause expression (e.g. "id < 500"). Parsed into a kernel `Predicate`
     /// and passed to the scan builder for data skipping.
     pub predicate: Option<String>,
+    // Column projections to read
+    pub columns: Option<Vec<String>>,
+    /// Expected outcome - either success with row count or error with code.
+    #[serde(flatten)]
+    pub expected: Option<ReadExpected>,
 }
 
 impl ReadSpec {
@@ -167,10 +226,16 @@ impl ReadSpec {
     }
 }
 
+/// Specification for a snapshot construction workload.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SnapshotConstructionSpec {
-    /// Version to construct the snapshot at; if `None`, uses the latest version
-    pub version: Option<u64>,
+    // Time travel version or timestamp for the read
+    #[serde(flatten)]
+    pub time_travel: Option<TimeTravel>,
+    /// Expected outcome - either success with protocol/metadata or error with code.
+    #[serde(flatten)]
+    pub expected: Option<SnapshotExpected>,
 }
 
 impl SnapshotConstructionSpec {
@@ -194,6 +259,47 @@ impl Spec {
         let spec: Spec = serde_json::from_str(&content)?;
         Ok(spec)
     }
+}
+
+/// Expected error outcome for a workload.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpectedError {
+    pub error_code: String,
+    pub error_message: Option<String>,
+}
+
+/// Expected success outcome for a read workload.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadExpectedSuccess {
+    pub row_count: u64,
+    pub file_count: Option<u64>,
+    pub files_skipped: Option<u64>,
+}
+
+/// Expected result for read operations - either success or error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ReadExpected {
+    Success { expected: ReadExpectedSuccess },
+    Error { error: ExpectedError },
+}
+
+/// Expected success outcome for a snapshot construction workload.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotExpectedSuccess {
+    pub protocol: Box<Protocol>,
+    pub metadata: Box<Metadata>,
+}
+
+/// Expected result for snapshot operations - either success or error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SnapshotExpected {
+    Success { expected: SnapshotExpectedSuccess },
+    Error { error: ExpectedError },
 }
 
 /// For Read specs, we will either run a read data operation or a read metadata operation
@@ -319,6 +425,46 @@ mod tests {
     }
 
     #[rstest]
+    #[case(
+        r#"{
+            "name": "catalog_table", "description": "A catalog-managed table",
+            "catalogInfo": {"tableName": "main.schema.table"},
+            "schema": {"type": "struct", "fields": []},
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+            "properties": {}, "dataLayout": {}, "tags": []
+        }"#,
+        true,
+        "main.schema.table"
+    )]
+    #[case(
+        r#"{
+            "name": "local_table", "description": "A local table",
+            "schema": {"type": "struct", "fields": []},
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+            "properties": {}, "dataLayout": {}, "tags": []
+        }"#,
+        false,
+        ""
+    )]
+    fn test_deserialize_catalog_info_field(
+        #[case] json: &str,
+        #[case] expect_present: bool,
+        #[case] expected_table_name: &str,
+    ) {
+        let table_info: TableInfo =
+            serde_json::from_str(json).expect("Failed to deserialize table info");
+        assert_eq!(table_info.catalog_info.is_some(), expect_present);
+        if expect_present {
+            assert_eq!(
+                table_info.catalog_info.unwrap().table_name,
+                expected_table_name
+            );
+        }
+    }
+
+    #[rstest]
     #[case(r#"{"description": "missing name"}"#, "missing field")]
     #[case(
         r#"{"name": "missing_schema", "description": "d",
@@ -351,21 +497,42 @@ mod tests {
         "snapshotConstruction",
         Some(7)
     )]
+    #[case(
+        r#"{"type": "snapshotConstruction", "version": -1}"#,
+        "snapshotConstruction",
+        Some(-1)
+    )]
+    #[case(r#"{"type": "read", "version": -1}"#, "read", Some(-1))]
     fn test_deserialize_spec(
         #[case] json: &str,
         #[case] expected_type: &str,
-        #[case] expected_version: Option<u64>,
+        #[case] expected_version: Option<i64>,
     ) {
         let spec: Spec = serde_json::from_str(json).expect("Failed to deserialize spec");
         assert_eq!(spec.as_str(), expected_type);
         let version = match &spec {
-            Spec::Read(read_spec) => read_spec.version,
+            Spec::Read(read_spec) => match &read_spec.time_travel {
+                Some(TimeTravel::Version { version }) => Some(*version),
+                _ => None,
+            },
             Spec::SnapshotConstruction(snapshot_construction_spec) => {
-                snapshot_construction_spec.version
+                match &snapshot_construction_spec.time_travel {
+                    Some(TimeTravel::Version { version }) => Some(*version),
+                    _ => None,
+                }
             }
         };
 
         assert_eq!(version, expected_version);
+    }
+
+    #[test]
+    fn test_time_travel_as_version_rejects_negative() {
+        let tt = TimeTravel::Version { version: -1 };
+        assert_eq!(
+            tt.as_version(),
+            Err("Only non-negative snapshot versions are supported")
+        );
     }
 
     #[rstest]

@@ -10,7 +10,7 @@
 //! [`Schema`]: crate::schema::Schema
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use url::Url;
 
@@ -69,6 +69,35 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
     }
 }
 
+/// Physical schema variants for a table.
+///
+/// - `full`: physical representations of all columns from [`TableConfiguration::logical_schema`].
+/// - `without_partition`: lazily computed variant that excludes partition columns.
+#[derive(Debug, Clone, Eq)]
+struct PhysicalSchemas {
+    full: SchemaRef,
+    without_partition: OnceLock<SchemaRef>,
+}
+
+impl PhysicalSchemas {
+    fn new(full: SchemaRef) -> Self {
+        Self {
+            full,
+            without_partition: OnceLock::new(),
+        }
+    }
+}
+
+impl PartialEq for PhysicalSchemas {
+    fn eq(&self, other: &Self) -> bool {
+        // `without_partition` is deterministically derived from `full` and partition columns
+        // (compared via `metadata` in TableConfiguration's PartialEq), so comparing it is
+        // redundant. Two PhysicalSchemas with the same `full` are considered equal even if
+        // one has `without_partition` initialized and the other does not.
+        self.full == other.full
+    }
+}
+
 /// Holds all the configuration for a table at a specific version. This includes the supported
 /// reader and writer features, table properties, schema, version, and table root. This can be used
 /// to check whether a table supports a feature or has it enabled. For example, deletion vector
@@ -86,9 +115,7 @@ pub(crate) struct TableConfiguration {
     protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
     logical_schema: SchemaRef,
-    /// Physical schema: field names are the physical column names (same as logical when
-    /// `ColumnMappingMode::None`, otherwise derived from column mapping metadata).
-    physical_schema: SchemaRef,
+    physical_schemas: PhysicalSchemas,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
     table_root: Url,
@@ -127,10 +154,11 @@ impl TableConfiguration {
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
         let physical_schema = Arc::new(logical_schema.make_physical(column_mapping_mode)?);
+        let physical_schemas = PhysicalSchemas::new(physical_schema);
 
         let table_config = Self {
             logical_schema,
-            physical_schema,
+            physical_schemas,
             metadata,
             protocol,
             table_properties,
@@ -220,11 +248,11 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn build_expected_stats_schemas(
         &self,
-        required_columns_physical: Option<&[ColumnName]>,
-        requested_columns_physical: Option<&[ColumnName]>,
+        required_physical_columns: Option<&[ColumnName]>,
+        requested_physical_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<ExpectedStatsSchemas> {
         let physical_data_schema = self.physical_data_schema_without_partition_columns();
-        let required_physical_stats_columns = self.required_stats_columns_physical();
+        let required_physical_stats_columns = self.required_physical_stats_columns();
         let config = StatsConfig {
             data_skipping_stats_columns: required_physical_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: self.table_properties().data_skipping_num_indexed_cols,
@@ -232,8 +260,8 @@ impl TableConfiguration {
         let physical_stats_schema = Arc::new(expected_stats_schema(
             &physical_data_schema,
             &config,
-            required_columns_physical,
-            requested_columns_physical,
+            required_physical_columns,
+            requested_physical_columns,
         )?);
         let physical_stats_schema = strip_metadata(physical_stats_schema);
 
@@ -243,16 +271,25 @@ impl TableConfiguration {
     }
 
     /// Returns the list of physical column names that should have statistics collected.
-    pub(crate) fn stats_column_names_physical(
+    ///
+    /// Partition columns are excluded first (their values are already in the Add action's
+    /// `partitionValues` field). Among the remaining columns, if `required_columns` is `Some`,
+    /// those columns are always included regardless of `dataSkippingNumIndexedCols` or
+    /// `dataSkippingStatsColumns` settings (e.g. clustering columns).
+    pub(crate) fn physical_stats_column_names(
         &self,
         required_columns: Option<&[ColumnName]>,
     ) -> Vec<ColumnName> {
-        let physical_stats_columns = self.required_stats_columns_physical();
+        let physical_stats_columns = self.required_physical_stats_columns();
         let config = StatsConfig {
             data_skipping_stats_columns: physical_stats_columns.as_deref(),
             data_skipping_num_indexed_cols: self.table_properties().data_skipping_num_indexed_cols,
         };
-        stats_column_names(&self.physical_schema(), &config, required_columns)
+        stats_column_names(
+            &self.physical_data_schema_without_partition_columns(),
+            &config,
+            required_columns,
+        )
     }
 
     /// Returns the physical partition schema for `partitionValues_parsed`.
@@ -303,30 +340,34 @@ impl TableConfiguration {
     }
 
     /// Returns the physical data schema excluding partition columns.
-    fn physical_data_schema_without_partition_columns(&self) -> SchemaRef {
-        let partition_columns: HashSet<&str> = self
-            .partition_columns()
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        // Safety: subset of an already-valid schema.
-        let schema = StructType::new_unchecked(
-            self.logical_schema()
-                .fields()
-                .zip(self.physical_schema().fields())
-                .filter(|(logical_field, _)| {
-                    !partition_columns.contains(logical_field.name().as_str())
-                })
-                .map(|(_, physical_field)| physical_field.clone()),
-        );
-        Arc::new(schema)
+    pub(crate) fn physical_data_schema_without_partition_columns(&self) -> SchemaRef {
+        self.physical_schemas
+            .without_partition
+            .get_or_init(|| {
+                let partition_columns: HashSet<&str> = self
+                    .partition_columns()
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                // Safety: subset of an already-valid schema.
+                Arc::new(StructType::new_unchecked(
+                    self.logical_schema()
+                        .fields()
+                        .zip(self.physical_schemas.full.fields())
+                        .filter(|(logical_field, _)| {
+                            !partition_columns.contains(logical_field.name().as_str())
+                        })
+                        .map(|(_, physical_field)| physical_field.clone()),
+                ))
+            })
+            .clone()
     }
 
     /// Translates `delta.dataSkippingStatsColumns` entries to physical column names.
     ///
     /// Returns `None` if the table property is not set. Entries that cannot be resolved
     /// (e.g. non-existent columns) are silently skipped with a warning.
-    fn required_stats_columns_physical(&self) -> Option<Vec<ColumnName>> {
+    fn required_physical_stats_columns(&self) -> Option<Vec<ColumnName>> {
         self.table_properties()
             .data_skipping_stats_columns
             .as_ref()
@@ -377,7 +418,22 @@ impl TableConfiguration {
     /// mapping metadata.
     #[internal_api]
     pub(crate) fn physical_schema(&self) -> SchemaRef {
-        self.physical_schema.clone()
+        self.physical_schemas.full.clone()
+    }
+
+    /// The physical schema for writing data files.
+    ///
+    /// When [`MaterializePartitionColumns`] is enabled, returns the full physical schema
+    /// (partition columns are materialized in data files). Otherwise, returns the physical
+    /// schema with partition columns excluded.
+    ///
+    /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
+    pub(crate) fn physical_write_schema(&self) -> SchemaRef {
+        if self.is_feature_enabled(&TableFeature::MaterializePartitionColumns) {
+            self.physical_schema()
+        } else {
+            self.physical_data_schema_without_partition_columns()
+        }
     }
 
     /// The [`TableProperties`] of this table at this version.
@@ -724,7 +780,7 @@ impl TableConfiguration {
 
                 reader_supported && writer_supported
             }
-            FeatureType::Unknown => false,
+            FeatureType::Unknown => Self::has_feature(self.protocol.writer_features(), feature),
         }
     }
 
@@ -762,7 +818,9 @@ mod test {
         FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
     };
-    use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
+    use crate::table_properties::{
+        TableProperties, COLUMN_MAPPING_MODE, ENABLE_IN_COMMIT_TIMESTAMPS,
+    };
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
         test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
@@ -1336,16 +1394,89 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_is_feature_supported_returns_false_for_unknown_feature() {
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
-        assert!(!config.is_feature_supported(&TableFeature::unknown("futureFeature")));
+    #[derive(Debug, Clone, Copy)]
+    enum UnknownFeatureShape {
+        NotListed,
+        WriterOnly,
+        ReaderWriter,
     }
 
-    #[test]
-    fn test_is_feature_enabled_returns_false_for_unknown_feature() {
-        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
-        assert!(!config.is_feature_enabled(&TableFeature::unknown("futureFeature")));
+    fn create_unknown_feature_config(
+        shape: UnknownFeatureShape,
+    ) -> (TableFeature, TableConfiguration) {
+        const UNKNOWN: &str = "futureFeature";
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                "value",
+                DataType::INTEGER,
+            )])),
+            vec![],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let reader_features = match shape {
+            UnknownFeatureShape::ReaderWriter => vec![UNKNOWN],
+            _ => vec![],
+        };
+        let writer_features = match shape {
+            UnknownFeatureShape::NotListed => vec![],
+            _ => vec![UNKNOWN],
+        };
+        let protocol = Protocol::try_new_modern(reader_features, writer_features).unwrap();
+
+        let tc = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        (TableFeature::unknown(UNKNOWN), tc)
+    }
+
+    #[rstest]
+    #[case::not_listed(UnknownFeatureShape::NotListed, false)]
+    #[case::writer_only(UnknownFeatureShape::WriterOnly, true)]
+    #[case::reader_writer(UnknownFeatureShape::ReaderWriter, true)]
+    fn test_unknown_feature_protocol_support(
+        #[case] shape: UnknownFeatureShape,
+        #[case] expected_supported: bool,
+    ) {
+        let (unknown, config) = create_unknown_feature_config(shape);
+        assert_eq!(config.is_feature_supported(&unknown), expected_supported);
+    }
+
+    #[rstest]
+    #[case::not_listed(UnknownFeatureShape::NotListed, false)]
+    #[case::writer_only(UnknownFeatureShape::WriterOnly, true)]
+    #[case::reader_writer(UnknownFeatureShape::ReaderWriter, true)]
+    fn test_unknown_feature_protocol_enablement(
+        #[case] shape: UnknownFeatureShape,
+        #[case] expected_enabled: bool,
+    ) {
+        let (unknown, config) = create_unknown_feature_config(shape);
+        assert_eq!(config.is_feature_enabled(&unknown), expected_enabled);
+    }
+
+    #[rstest]
+    fn test_unknown_feature_capabilities(
+        #[values(
+            UnknownFeatureShape::NotListed,
+            UnknownFeatureShape::WriterOnly,
+            UnknownFeatureShape::ReaderWriter
+        )]
+        shape: UnknownFeatureShape,
+        #[values(Operation::Scan, Operation::Cdf, Operation::Write)] operation: Operation,
+    ) {
+        let (_, config) = create_unknown_feature_config(shape);
+        let expected_ok = match shape {
+            UnknownFeatureShape::NotListed => true,
+            UnknownFeatureShape::WriterOnly => operation != Operation::Write,
+            UnknownFeatureShape::ReaderWriter => false,
+        };
+        assert_eq!(
+            config.ensure_operation_supported(operation).is_ok(),
+            expected_ok
+        );
     }
 
     #[test]
@@ -1534,13 +1665,25 @@ mod test {
         );
     }
 
-    #[cfg(feature = "catalog-managed")]
     #[test]
     fn test_catalog_managed_writes() {
-        let config = create_mock_table_config(&[], &[TableFeature::CatalogManaged]);
+        // CatalogManaged requires ICT to be supported and enabled
+        let config = create_mock_table_config(
+            &[(ENABLE_IN_COMMIT_TIMESTAMPS, "true")],
+            &[
+                TableFeature::CatalogManaged,
+                TableFeature::InCommitTimestamp,
+            ],
+        );
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
 
-        let config = create_mock_table_config(&[], &[TableFeature::CatalogOwnedPreview]);
+        let config = create_mock_table_config(
+            &[(ENABLE_IN_COMMIT_TIMESTAMPS, "true")],
+            &[
+                TableFeature::CatalogOwnedPreview,
+                TableFeature::InCommitTimestamp,
+            ],
+        );
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
     }
 
@@ -1587,6 +1730,20 @@ mod test {
         column_mapping_mode: &str,
         extra_props: impl IntoIterator<Item = (&'static str, &'static str)>,
     ) -> TableConfiguration {
+        create_partitioned_table_config_with_column_mapping(
+            schema,
+            column_mapping_mode,
+            vec![], // partition_columns
+            extra_props,
+        )
+    }
+
+    fn create_partitioned_table_config_with_column_mapping(
+        schema: SchemaRef,
+        column_mapping_mode: &str,
+        partition_columns: Vec<String>,
+        extra_props: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> TableConfiguration {
         let mut props: HashMap<String, String> = extra_props
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1596,7 +1753,7 @@ mod test {
             column_mapping_mode.to_string(),
         );
 
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
+        let metadata = Metadata::try_new(None, None, schema, partition_columns, 0, props).unwrap();
 
         // Use reader version 2 which supports column mapping
         let protocol = Protocol::try_new_legacy(2, 5).unwrap();
@@ -1722,9 +1879,10 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_build_expected_stats_schemas_excludes_partition_columns() {
-        let field_a: StructField = serde_json::from_str(
+    /// Schema with a data column and two partition columns, all with column mapping metadata.
+    /// data_col (long) -> phys_data, part_a (string) -> phys_part_a, part_b (integer) -> phys_part_b
+    fn partitioned_schema_with_column_mapping() -> SchemaRef {
+        let data_col: StructField = serde_json::from_str(
             r#"{
                 "name": "data_col",
                 "type": "long",
@@ -1736,28 +1894,41 @@ mod test {
             }"#,
         )
         .unwrap();
-
-        let field_b: StructField = serde_json::from_str(
+        let part_a: StructField = serde_json::from_str(
             r#"{
-                "name": "part_col",
+                "name": "part_a",
                 "type": "string",
                 "nullable": true,
                 "metadata": {
                     "delta.columnMapping.id": 2,
-                    "delta.columnMapping.physicalName": "phys_part"
+                    "delta.columnMapping.physicalName": "phys_part_a"
                 }
             }"#,
         )
         .unwrap();
+        let part_b: StructField = serde_json::from_str(
+            r#"{
+                "name": "part_b",
+                "type": "integer",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 3,
+                    "delta.columnMapping.physicalName": "phys_part_b"
+                }
+            }"#,
+        )
+        .unwrap();
+        Arc::new(StructType::new_unchecked([data_col, part_a, part_b]))
+    }
 
-        let schema = Arc::new(StructType::new_unchecked([field_a, field_b]));
-        let mut props = HashMap::new();
-        props.insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
-        let metadata =
-            Metadata::try_new(None, None, schema, vec!["part_col".to_string()], 0, props).unwrap();
-        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+    #[test]
+    fn test_build_expected_stats_schemas_excludes_partition_columns() {
+        let config = create_partitioned_table_config_with_column_mapping(
+            partitioned_schema_with_column_mapping(),
+            "name",
+            vec!["part_a".to_string(), "part_b".to_string()],
+            [],
+        );
 
         let stats_schemas = config.build_expected_stats_schemas(None, None).unwrap();
 
@@ -1774,22 +1945,90 @@ mod test {
             "Data column should be present with physical name"
         );
         assert!(
-            inner.field("phys_part").is_none(),
-            "Partition column should be excluded"
+            inner.field("phys_part_a").is_none(),
+            "Partition column a should be excluded"
         );
         assert!(
-            inner.field("part_col").is_none(),
-            "Partition column logical name should also be absent"
+            inner.field("phys_part_b").is_none(),
+            "Partition column b should be excluded"
         );
     }
 
     #[test]
-    fn test_stats_column_names_physical_returns_physical_names() {
-        // stats_column_names_physical should return physical column names
+    fn test_physical_stats_column_names_excludes_partition_columns() {
+        let config = create_partitioned_table_config_with_column_mapping(
+            partitioned_schema_with_column_mapping(),
+            "name",
+            vec!["part_a".to_string(), "part_b".to_string()],
+            [],
+        );
+
+        let column_names = config.physical_stats_column_names(None);
+        assert_eq!(column_names, vec![ColumnName::new(["phys_data"])]);
+
+        // Also verify partition columns are excluded when passed as required columns
+        let required = [
+            ColumnName::new(["phys_part_a"]),
+            ColumnName::new(["phys_part_b"]),
+        ];
+        let column_names = config.physical_stats_column_names(Some(&required));
+        assert_eq!(column_names, vec![ColumnName::new(["phys_data"])]);
+    }
+
+    #[test]
+    fn test_physical_stats_column_names_excludes_partition_columns_no_column_mapping() {
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("data_col", DataType::LONG),
+            StructField::nullable("part_a", DataType::STRING),
+            StructField::nullable("part_b", DataType::INTEGER),
+        ]));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec!["part_a".to_string(), "part_b".to_string()],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        let column_names = config.physical_stats_column_names(None);
+        assert_eq!(column_names, vec![ColumnName::new(["data_col"])]);
+    }
+
+    #[test]
+    fn test_physical_stats_column_names_all_partition_columns_returns_empty() {
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("part_a", DataType::STRING),
+            StructField::nullable("part_b", DataType::INTEGER),
+        ]));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec!["part_a".to_string(), "part_b".to_string()],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        let column_names = config.physical_stats_column_names(None);
+        assert!(column_names.is_empty());
+    }
+
+    #[test]
+    fn test_physical_stats_column_names_returns_physical_names() {
+        // physical_stats_column_names should return physical column names
         let schema = schema_with_column_mapping();
         let config = create_table_config_with_column_mapping(schema, "name");
 
-        let column_names = config.stats_column_names_physical(None /* required_columns */);
+        let column_names = config.physical_stats_column_names(None /* required_columns */);
 
         // Should return physical names, not logical names
         assert_eq!(
@@ -1803,13 +2042,13 @@ mod test {
     }
 
     #[test]
-    fn test_stats_column_names_physical_with_data_skipping_stats_columns() {
+    fn test_physical_stats_column_names_with_data_skipping_stats_columns() {
         let config = create_table_config_with_column_mapping_and_props(
             test_schema_nested_with_column_mapping(),
             "name",
             [("delta.dataSkippingStatsColumns", "id,info.name")],
         );
-        let column_names = config.stats_column_names_physical(None);
+        let column_names = config.physical_stats_column_names(None);
         assert_eq!(
             column_names,
             vec![
@@ -1820,13 +2059,13 @@ mod test {
     }
 
     #[test]
-    fn test_stats_column_names_physical_skips_nonexistent_data_skipping_stats_column() {
+    fn test_physical_stats_column_names_skips_nonexistent_data_skipping_stats_column() {
         let config = create_table_config_with_column_mapping_and_props(
             test_schema_nested_with_column_mapping(),
             "name",
             [("delta.dataSkippingStatsColumns", "id,nonexistent")],
         );
-        let column_names = config.stats_column_names_physical(None);
+        let column_names = config.physical_stats_column_names(None);
         assert_eq!(column_names, vec![ColumnName::new(["phys_id"])],);
     }
 
@@ -1907,13 +2146,13 @@ mod test {
         "id",
         vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
     )]
-    fn test_stats_column_names_physical_all_schemas(
+    fn test_physical_stats_column_names_all_schemas(
         #[case] schema: SchemaRef,
         #[case] mode: &str,
         #[case] expected_physical: Vec<ColumnName>,
     ) {
         let config = create_table_config_with_column_mapping(schema, mode);
-        let physical_names = config.stats_column_names_physical(None);
+        let physical_names = config.physical_stats_column_names(None);
         assert_eq!(
             physical_names, expected_physical,
             "Incorrect physical column names for mode '{mode}'"

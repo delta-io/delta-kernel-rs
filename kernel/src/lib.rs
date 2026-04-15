@@ -100,6 +100,7 @@ mod log_compaction;
 mod log_path;
 mod log_reader;
 pub mod metrics;
+pub mod partition;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -112,14 +113,21 @@ pub mod transforms;
 
 pub use log_path::LogPath;
 
-mod row_tracking;
+// Public under test-utils so integration tests can call get_high_water_mark via snapshot.
+#[cfg(feature = "test-utils")]
+pub mod row_tracking;
+#[cfg(not(feature = "test-utils"))]
+pub(crate) mod row_tracking;
 
 pub(crate) mod clustering;
 
 mod arrow_compat;
-#[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
+#[cfg(any(feature = "arrow-57", feature = "arrow-58"))]
 pub use arrow_compat::*;
 
+#[cfg(feature = "internal-api")]
+pub mod column_trie;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod column_trie;
 pub mod kernel_predicates;
 pub(crate) mod utils;
@@ -474,6 +482,37 @@ pub trait EvaluationHandler: AsAny {
     // NOTE: we should probably allow DataType instead of SchemaRef, but can expand that in the
     // future.
     fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>>;
+
+    /// Create a multi-row [`EngineData`] by applying the given schema to multiple rows of values.
+    ///
+    /// Each element in `rows` represents one row of data, where each row is a slice of structured
+    /// scalar values (one scalar per top-level field in the schema).
+    ///
+    /// # Parameters
+    ///
+    /// - `schema`: Schema describing the structure of each row.
+    /// - `rows`: Slice of rows, where each row contains one structured scalar per top-level schema
+    ///   field.
+    ///
+    /// # Returns
+    ///
+    /// A multi-row `EngineData` containing all rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any row has a number of scalars that does not match the number of
+    /// top-level fields in `schema`, or if any scalar value cannot be appended to its corresponding
+    /// field's builder (e.g. due to a type mismatch).
+    ///
+    /// # Example
+    ///
+    /// For a schema with fields `[add: Struct, remove: Struct]`, each row should contain exactly 2
+    /// scalars: one for the `add` field and one for the `remove` field.
+    fn create_many(
+        &self,
+        schema: SchemaRef,
+        rows: &[&[Scalar]],
+    ) -> DeltaResult<Box<dyn EngineData>>;
 }
 
 /// Internal trait to allow us to have a private `create_one` API that's implemented for all
@@ -809,7 +848,8 @@ pub trait ParquetHandler: AsAny {
 
     /// Write data to a Parquet file at the specified location.
     ///
-    /// This will overwrite the file if it already exists.
+    /// This will overwrite the file if it already exists. For filesystem-backed
+    /// implementations, the parent directories must be created if they do not exist.
     ///
     /// # Parameters
     ///

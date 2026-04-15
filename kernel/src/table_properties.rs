@@ -58,6 +58,7 @@ pub(crate) const MATERIALIZED_ROW_ID_COLUMN_NAME: &str =
 pub(crate) const MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME: &str =
     "delta.rowTracking.materializedRowCommitVersionColumnName";
 pub(crate) const ROW_TRACKING_SUSPENDED: &str = "delta.rowTrackingSuspended";
+pub(crate) const PARQUET_FORMAT_VERSION: &str = "delta.parquet.format.version";
 pub(crate) const ENABLE_IN_COMMIT_TIMESTAMPS: &str = "delta.enableInCommitTimestamps";
 pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION: &str =
     "delta.inCommitTimestampEnablementVersion";
@@ -201,6 +202,11 @@ pub struct TableProperties {
 
     /// The name of the internal column that contains the materialized row commit version.
     pub materialized_row_commit_version_column_name: Option<String>,
+
+    /// The Parquet format version used when writing data files. Valid values are `"1.0.0"`
+    /// (DataPageV1) and any `"2.x.x"` such as `"2.12.0"` (DataPageV2). Writers SHOULD default
+    /// to `"1.0.0"` when absent. Connectors read this to configure their Parquet writers.
+    pub parquet_format_version: Option<String>,
 
     /// Whether to enable [In-Commit Timestamps]. The in-commit timestamps writer feature strongly
     /// associates a monotonically increasing timestamp with each commit by storing it in the
@@ -390,6 +396,7 @@ mod tests {
             "delta.rowTracking.materializedRowCommitVersionColumnName"
         );
         assert_eq!(ROW_TRACKING_SUSPENDED, "delta.rowTrackingSuspended");
+        assert_eq!(PARQUET_FORMAT_VERSION, "delta.parquet.format.version");
         assert_eq!(
             ENABLE_IN_COMMIT_TIMESTAMPS,
             "delta.enableInCommitTimestamps"
@@ -509,6 +516,7 @@ mod tests {
             (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "15"),
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, "1612345678"),
+            (PARQUET_FORMAT_VERSION, "2.12.0"),
         ];
         let actual = TableProperties::from(properties.into_iter());
         let expected = TableProperties {
@@ -544,6 +552,7 @@ mod tests {
             row_tracking_suspended: Some(false),
             enable_in_commit_timestamps: Some(true),
             in_commit_timestamp_enablement_version: Some(15),
+            parquet_format_version: Some("2.12.0".to_string()),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
             unknown_properties: HashMap::new(),
         };

@@ -7,7 +7,9 @@ pub mod arrow_conversion;
 
 #[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
 pub mod arrow_expression;
-#[cfg(feature = "arrow-expression")]
+#[cfg(all(feature = "arrow-expression", feature = "internal-api"))]
+pub mod arrow_utils;
+#[cfg(all(feature = "arrow-expression", not(feature = "internal-api")))]
 pub(crate) mod arrow_utils;
 #[cfg(feature = "internal-api")]
 pub use self::arrow_utils::{parse_json, to_json_bytes};
@@ -22,9 +24,12 @@ pub(crate) mod sync;
 pub mod arrow_data;
 #[cfg(feature = "default-engine-base")]
 pub(crate) mod arrow_get_data;
-#[cfg(feature = "default-engine-base")]
+#[cfg(all(feature = "default-engine-base", feature = "internal-api"))]
+pub mod ensure_data_types;
+#[cfg(all(feature = "default-engine-base", not(feature = "internal-api")))]
 pub(crate) mod ensure_data_types;
 #[cfg(feature = "default-engine-base")]
+// module is always pub; trait inside is gated by #[internal_api]
 pub mod parquet_row_group_skipping;
 
 #[cfg(test)]
