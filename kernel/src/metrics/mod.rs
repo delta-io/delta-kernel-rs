@@ -70,5 +70,5 @@
 mod events;
 mod reporter;
 
-pub use events::{MetricEvent, MetricId};
+pub use events::{MetricEvent, MetricId, ScanType};
 pub use reporter::MetricsReporter;

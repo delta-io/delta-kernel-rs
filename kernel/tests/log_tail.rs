@@ -5,27 +5,12 @@ use url::Url;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::object_store::path::Path;
-use delta_kernel::{FileMeta, LogPath, Snapshot};
+use delta_kernel::Snapshot;
 
 use test_utils::{
-    actions_to_string, add_commit, add_staged_commit, delta_path_for_version, TestAction,
+    actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
+    create_log_path, delta_path_for_version, TestAction,
 };
-
-/// Helper function to create a LogPath for a commit at the given version
-fn create_log_path(table_root: &Url, commit_path: Path) -> LogPath {
-    let file_meta = create_file_meta(table_root, commit_path);
-    LogPath::try_new(file_meta).expect("Failed to create LogPath")
-}
-
-fn create_file_meta(table_root: &Url, commit_path: Path) -> FileMeta {
-    let commit_url = table_root.join(commit_path.as_ref()).unwrap();
-    FileMeta {
-        location: commit_url,
-        last_modified: 123,
-        size: 100, // arbitrary size
-    }
-}
 
 fn setup_test() -> (
     Arc<InMemory>,
@@ -44,12 +29,18 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     let table_root = table_url.as_str();
 
     // with staged commits:
-    // _delta_log/0.json (PM in here)
+    // _delta_log/0.json (PM in here, catalog-managed)
     // _delta_log/_staged_commits/1.uuid.json
     // _delta_log/_staged_commits/1.uuid.json // add an unused staged commit at version 1
     // _delta_log/_staged_commits/2.uuid.json
     let actions = vec![TestAction::Metadata];
-    add_commit(table_root, storage.as_ref(), 0, actions_to_string(actions)).await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_catalog_managed(actions),
+    )
+    .await?;
     let path1 = add_staged_commit(table_root, storage.as_ref(), 1, String::from("{}")).await?;
     let _ = add_staged_commit(table_root, storage.as_ref(), 1, String::from("{}")).await?;
     let path2 = add_staged_commit(table_root, storage.as_ref(), 2, String::from("{}")).await?;
@@ -61,6 +52,7 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     ];
     let snapshot = Snapshot::builder_for(table_root)
         .with_log_tail(log_tail.clone())
+        .with_max_catalog_version(2)
         .build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 2);
     let log_segment = snapshot.log_segment();
@@ -91,6 +83,7 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     let snapshot = Snapshot::builder_for(table_root)
         .with_log_tail(log_tail)
         .at_version(1)
+        .with_max_catalog_version(2)
         .build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 1);
     let log_segment = snapshot.log_segment();
@@ -114,6 +107,7 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     let log_tail = vec![create_log_path(&table_url, path1.clone())];
     let snapshot = Snapshot::builder_for(table_root)
         .with_log_tail(log_tail)
+        .with_max_catalog_version(1)
         .build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 1);
     let log_segment = snapshot.log_segment();
@@ -134,7 +128,9 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     );
 
     // 4. Check if we don't pass log tail
-    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root)
+        .with_max_catalog_version(0)
+        .build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 0);
     let log_segment = snapshot.log_segment();
     assert_eq!(log_segment.listed.ascending_commit_files.len(), 1);
@@ -153,6 +149,7 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     )];
     let snapshot = Snapshot::builder_for(table_root)
         .with_log_tail(log_tail)
+        .with_max_catalog_version(0)
         .build(engine.as_ref())?;
 
     assert_eq!(snapshot.version(), 0);
@@ -236,9 +233,15 @@ async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
-    // commits 0, 1, 2 in storage
+    // commits 0, 1, 2 in storage (catalog-managed)
     let actions = vec![TestAction::Metadata];
-    add_commit(table_root, storage.as_ref(), 0, actions_to_string(actions)).await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_catalog_managed(actions),
+    )
+    .await?;
     let actions = vec![TestAction::Add("file_1.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 1, actions_to_string(actions)).await?;
     let actions = vec![TestAction::Add("file_2.parquet".to_string())];
@@ -247,6 +250,7 @@ async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::
     // initial snapshot at version 1
     let initial_snapshot = Snapshot::builder_for(table_root)
         .at_version(1)
+        .with_max_catalog_version(2)
         .build(engine.as_ref())?;
     assert_eq!(initial_snapshot.version(), 1);
 
@@ -268,10 +272,64 @@ async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::
     // Build incremental snapshot with log_tail
     let new_snapshot = Snapshot::builder_from(initial_snapshot)
         .with_log_tail(log_tail)
+        .with_max_catalog_version(4)
         .build(engine.as_ref())?;
 
     // Verify we advanced to version 4
     assert_eq!(new_snapshot.version(), 4);
+
+    Ok(())
+}
+
+/// Verify that `builder_from` with `max_catalog_version` stops at the catalog-ratified version
+/// even when later commits exist on the filesystem.
+#[tokio::test]
+async fn incremental_snapshot_caps_at_max_catalog_version() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    // commits 0, 1, 2 in storage (catalog-managed)
+    let actions = vec![TestAction::Metadata];
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_catalog_managed(actions),
+    )
+    .await?;
+    let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+    add_commit(table_root, storage.as_ref(), 1, actions_to_string(actions)).await?;
+    let actions = vec![TestAction::Add("file_2.parquet".to_string())];
+    add_commit(table_root, storage.as_ref(), 2, actions_to_string(actions)).await?;
+
+    // Simulate a request to the catalog which reports max_catalog_version = 2
+    let mcv = 2;
+
+    // Build initial snapshot at version 1, catalog knows about version 2
+    let initial_snapshot = Snapshot::builder_for(table_root)
+        .at_version(1)
+        .with_max_catalog_version(mcv)
+        .build(engine.as_ref())?;
+    assert_eq!(initial_snapshot.version(), 1);
+
+    // Catalog reported v2 as the max ratified version. A moment later, v3 was
+    // ratified and published to the log -- but the client is unaware of v3.
+    let actions = vec![TestAction::Add("file_3.parquet".to_string())];
+    add_commit(table_root, storage.as_ref(), 3, actions_to_string(actions)).await?;
+
+    // Incremental update: catalog reported v2 as max, log_tail includes v2
+    let log_tail = vec![create_log_path(
+        &table_url,
+        delta_path_for_version(mcv, "json"),
+    )];
+    let new_snapshot = Snapshot::builder_from(initial_snapshot)
+        .with_log_tail(log_tail)
+        .with_max_catalog_version(mcv)
+        .build(engine.as_ref())?;
+
+    // Snapshot respects the catalog's reported max version (v2)
+    assert_eq!(new_snapshot.version(), 2);
 
     Ok(())
 }

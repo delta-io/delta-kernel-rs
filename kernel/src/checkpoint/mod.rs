@@ -87,7 +87,9 @@
 // Future extensions:
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
+
+use tracing::info;
 
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
@@ -114,12 +116,14 @@ use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, 
 use url::Url;
 
 mod checkpoint_transform;
+#[allow(unused)]
+// Used once sidecar checkpoint writing is enabled
+mod sidecar;
 
 use checkpoint_transform::{
     build_checkpoint_output_schema, build_checkpoint_read_schema, build_checkpoint_transform,
     StatsTransformConfig,
 };
-
 #[cfg(test)]
 mod tests;
 
@@ -192,6 +196,9 @@ pub struct CheckpointWriter {
     /// Note: Although the version is stored as a u64 in the snapshot, it is stored as an i64
     /// field here to avoid multiple type conversions.
     version: i64,
+
+    /// Cached checkpoint output schema.
+    checkpoint_output_schema: OnceLock<SchemaRef>,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -215,8 +222,31 @@ impl CheckpointWriter {
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;
 
-        Ok(Self { snapshot, version })
+        Ok(Self {
+            snapshot,
+            version,
+            checkpoint_output_schema: OnceLock::new(),
+        })
     }
+    /// Returns the cached output schema, initializing it with `f` on first call.
+    ///
+    /// `OnceLock::get_or_try_init` is unstable, so we use a custom implementation.
+    /// (tracking issue: <https://github.com/rust-lang/rust/issues/109737>).
+    fn get_or_init_output_schema(
+        &self,
+        f: impl FnOnce() -> DeltaResult<SchemaRef>,
+    ) -> DeltaResult<SchemaRef> {
+        if let Some(schema) = self.checkpoint_output_schema.get() {
+            return Ok(schema.clone());
+        }
+        let schema = f()?;
+        let _ = self.checkpoint_output_schema.set(schema);
+        self.checkpoint_output_schema
+            .get()
+            .cloned()
+            .ok_or_else(|| Error::internal_error("OnceLock should be initialized"))
+    }
+
     /// Returns the URL where the checkpoint file should be written.
     ///
     /// This method generates the checkpoint path based on the table's root and the version
@@ -270,12 +300,12 @@ impl CheckpointWriter {
 
         // Get clustering columns so they are always included in stats per the Delta protocol.
         let tc = self.snapshot.table_configuration();
-        let clustering_columns_physical = self.snapshot.get_clustering_columns_physical(engine)?;
+        let physical_clustering_columns = self.snapshot.get_physical_clustering_columns(engine)?;
 
         // Get stats schema from table configuration.
         // This already excludes partition columns and applies column mapping.
         let stats_schema = tc
-            .build_expected_stats_schemas(clustering_columns_physical.as_deref(), None)?
+            .build_expected_stats_schemas(physical_clustering_columns.as_deref(), None)?
             .physical;
 
         // Select schema based on V2 checkpoint support
@@ -322,12 +352,14 @@ impl CheckpointWriter {
         )
         .process_actions_iter(actions);
 
-        let output_schema = build_checkpoint_output_schema(
-            &config,
-            base_schema,
-            &stats_schema,
-            partition_schema.as_deref(),
-        )?;
+        let output_schema = self.get_or_init_output_schema(|| {
+            build_checkpoint_output_schema(
+                &config,
+                base_schema,
+                &stats_schema,
+                partition_schema.as_deref(),
+            )
+        })?;
 
         // Build transform expression and create expression evaluator.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
@@ -390,6 +422,20 @@ impl CheckpointWriter {
             return Err(Error::checkpoint_write(
                 "The checkpoint data iterator must be fully consumed and written to storage before calling finalize"
             ));
+        }
+
+        // Skip writing `_last_checkpoint` if the existing hint already points to a newer
+        // checkpoint, to avoid regressing the hint.
+        let checkpoint_version = self.snapshot.version();
+        if let Some(hint_version) = self.snapshot.log_segment().last_checkpoint_version() {
+            if hint_version > checkpoint_version {
+                info!(
+                    hint_version,
+                    checkpoint_version,
+                    "Skipping _last_checkpoint write: existing hint is newer than checkpoint"
+                );
+                return Ok(());
+            }
         }
 
         let size_in_bytes = i64::try_from(metadata.size).map_err(|e| {

@@ -6,8 +6,8 @@ use tracing::debug;
 
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{
-    Date32Type, Decimal128Type, Float32Type, Float64Type, GenericStringType, Int32Type, Int64Type,
-    TimestampMicrosecondType,
+    Date32Type, Decimal128Type, Float32Type, Float64Type, GenericStringType, Int16Type, Int32Type,
+    Int64Type, Int8Type, TimestampMicrosecondType,
 };
 use crate::arrow::array::{
     Array, ArrayRef, GenericByteArray, OffsetSizeTrait, RecordBatch, RunArray, StringViewArray,
@@ -438,6 +438,18 @@ impl ArrowEngineData {
                     .or_else(|| col.as_binary_view_opt().map(|a| a as _))
                     .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("binary")
+            }
+            &DataType::BYTE => {
+                debug!("Pushing int8 array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<Int8Type>()
+                    .map(|a| a as _)
+                    .ok_or("byte")
+            }
+            &DataType::SHORT => {
+                debug!("Pushing int16 array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<Int16Type>()
+                    .map(|a| a as _)
+                    .ok_or("short")
             }
             &DataType::INTEGER => {
                 debug!("Pushing int32 array for {}", ColumnName::new(path));

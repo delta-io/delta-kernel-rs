@@ -5,9 +5,11 @@ use std::ops::Range;
 
 use tracing::debug;
 
+use crate::actions::visitors::SelectionVectorVisitor;
 use crate::expressions::ArrayData;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{ColumnName, DataType, SchemaRef};
+use crate::utils::require;
 use crate::{AsAny, DeltaResult, Error};
 
 /// Engine data paired with a selection vector indicating which rows are logically selected.
@@ -225,6 +227,8 @@ macro_rules! impl_default_get {
 pub trait GetData<'a> {
     impl_default_get!(
         (get_bool, bool),
+        (get_byte, i8),
+        (get_short, i16),
         (get_int, i32),
         (get_long, i64),
         (get_float, f32),
@@ -252,6 +256,8 @@ macro_rules! impl_null_get {
 impl<'a> GetData<'a> for () {
     impl_null_get!(
         (get_bool, bool),
+        (get_byte, i8),
+        (get_short, i16),
         (get_int, i32),
         (get_long, i64),
         (get_float, f32),
@@ -295,6 +301,8 @@ macro_rules! impl_typed_get_data {
 // Use get_date/get_timestamp directly instead of through TypedGetData.
 impl_typed_get_data!(
     (get_bool, bool),
+    (get_byte, i8),
+    (get_short, i16),
     (get_int, i32),
     (get_long, i64),
     (get_float, f32),
@@ -554,6 +562,26 @@ pub trait EngineData: AsAny {
     /// For a top-level field named `"foo"`, use `ColumnName::new(["foo"])`. For nested fields,
     /// each non-leaf element of the path must be a struct field at that level.
     fn has_field(&self, name: &ColumnName) -> bool;
+}
+
+/// Evaluates a predicate on the batch, extracts the resulting selection vector, and applies
+/// it to filter out rows that don't satisfy the predicate.
+pub(crate) fn filter_by_predicate(
+    filter: &dyn crate::PredicateEvaluator,
+    batch: Box<dyn EngineData>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    let predicate_result = filter.evaluate(batch.as_ref())?;
+    let mut visitor = SelectionVectorVisitor::default();
+    visitor.visit_rows_of(predicate_result.as_ref())?;
+    require!(
+        visitor.selection_vector.len() == batch.len(),
+        Error::internal_error(format!(
+            "predicate output length {} != batch length {}",
+            visitor.selection_vector.len(),
+            batch.len()
+        ))
+    );
+    batch.apply_selection_vector(visitor.selection_vector)
 }
 
 #[cfg(test)]
