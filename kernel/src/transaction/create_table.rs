@@ -15,7 +15,7 @@
 //! # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
 //!
 //! let schema = Arc::new(StructType::try_new(vec![
-//!     StructField::new("id", DataType::INTEGER, false),
+//!     StructField::new("id", DataType::INTEGER, true),
 //! ])?);
 //!
 //! let result = create_table("/path/to/table", schema, "MyApp/1.0")
@@ -72,7 +72,7 @@ use crate::DeltaResult;
 /// # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
 ///
 /// let schema = Arc::new(StructType::try_new(vec![
-///     StructField::new("id", DataType::INTEGER, false),
+///     StructField::new("id", DataType::INTEGER, true),
 /// ])?);
 ///
 /// let result = create_table("/path/to/table", schema, "MyApp/1.0")
@@ -106,7 +106,7 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 ///
 /// # fn main() -> delta_kernel::DeltaResult<()> {
 /// let schema = Arc::new(StructType::new_unchecked(vec![
-///     StructField::new("id", DataType::INTEGER, false),
+///     StructField::new("id", DataType::INTEGER, true),
 ///     StructField::new("name", DataType::STRING, true),
 /// ]));
 ///

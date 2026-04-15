@@ -648,7 +648,7 @@ impl CreateTableTransactionBuilder {
     /// # use delta_kernel::schema::{StructType, DataType, StructField};
     /// # use std::sync::Arc;
     /// # fn example() -> delta_kernel::DeltaResult<()> {
-    /// # let schema = Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)])?);
+    /// # let schema = Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)])?);
     /// let builder = create_table("/path/to/table", schema, "MyApp/1.0")
     ///     .with_table_properties([
     ///         ("myapp.version", "1.0"),
@@ -693,8 +693,8 @@ impl CreateTableTransactionBuilder {
     /// # use std::sync::Arc;
     /// # fn example() -> delta_kernel::DeltaResult<()> {
     /// # let schema = Arc::new(StructType::try_new(vec![
-    /// #     StructField::new("id", DataType::INTEGER, false),
-    /// #     StructField::new("date", DataType::STRING, false),
+    /// #     StructField::new("id", DataType::INTEGER, true),
+    /// #     StructField::new("date", DataType::STRING, true),
     /// # ])?);
     /// // Clustered layout:
     /// let builder = create_table("/path/to/table", schema.clone(), "MyApp/1.0")
@@ -721,6 +721,7 @@ impl CreateTableTransactionBuilder {
     /// - Checks that the table path is valid
     /// - Verifies the table doesn't already exist
     /// - Validates the schema is non-empty
+    /// - Rejects non-null columns unless `invariants` writer feature is enabled
     /// - Validates the data layout is valid
     /// - Validates table properties against the allow list
     ///
@@ -735,6 +736,7 @@ impl CreateTableTransactionBuilder {
     /// - The table path is invalid
     /// - A table already exists at the given path
     /// - The schema is empty
+    /// - The schema has non-null columns without the `invariants` writer feature
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
     pub fn build(
@@ -764,6 +766,9 @@ impl CreateTableTransactionBuilder {
         crate::schema::validation::validate_schema_for_create(
             &effective_schema,
             column_mapping_mode,
+            validated
+                .writer_features
+                .contains(&TableFeature::Invariants),
         )?;
 
         // Validate data layout and resolve column names (physical for clustering, logical
