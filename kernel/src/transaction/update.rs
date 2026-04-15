@@ -33,7 +33,7 @@ use crate::utils::current_time_ms;
 use crate::{DataType, DeltaResult, Engine, Expression};
 use delta_kernel_derive::internal_api;
 
-use super::Transaction;
+use super::{PathMode, Transaction};
 
 // =============================================================================
 // Update table transactions only
@@ -90,6 +90,7 @@ impl Transaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
+            path_mode: PathMode::default(),
             shared_write_state: OnceLock::new(),
             _state: PhantomData,
         })
