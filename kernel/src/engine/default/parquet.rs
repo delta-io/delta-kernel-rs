@@ -229,7 +229,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// Write `data` to a new parquet file under the [`WriteContext::write_dir`] and return
     /// Add action metadata ready for [`Transaction::add_files`].
     ///
-    /// The path format (relative or absolute) is controlled by [`WriteContext::path_mode`].
+    /// The path format (relative or absolute) is controlled by the [`PathMode`] set on
+    /// the transaction.
+    ///
+    /// [`PathMode`]: crate::transaction::PathMode
     ///
     /// [`WriteContext::write_dir`]: crate::transaction::WriteContext::write_dir
     /// [`Transaction::add_files`]: crate::transaction::Transaction::add_files

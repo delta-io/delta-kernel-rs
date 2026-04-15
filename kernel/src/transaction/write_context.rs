@@ -179,7 +179,7 @@ impl WriteContext {
     /// - `PathMode::Relative` + `s3://bucket/table/year=2024/abc.parquet` -> `"year=2024/abc.parquet"`
     /// - `PathMode::Absolute` + `s3://bucket/table/abc.parquet` -> `"s3://bucket/table/abc.parquet"`
     ///
-    /// Returns an error if the file is not under the table root.
+    /// In `Relative` mode, returns an error if the file is not under the table root.
     ///
     /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
     pub fn resolve_file_path(&self, file_location: &Url) -> DeltaResult<String> {

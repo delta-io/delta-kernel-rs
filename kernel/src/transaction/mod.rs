@@ -517,7 +517,12 @@ impl<S> Transaction<S> {
     }
 
     /// Same as [`Transaction::with_path_mode`] but set the value directly instead of
-    /// using a fluent API.
+    /// using a fluent API. Must be called before [`partitioned_write_context`] or
+    /// [`unpartitioned_write_context`], since the path mode is captured when the write
+    /// context is first created and cannot be changed afterward.
+    ///
+    /// [`partitioned_write_context`]: Transaction::partitioned_write_context
+    /// [`unpartitioned_write_context`]: Transaction::unpartitioned_write_context
     #[internal_api]
     #[allow(dead_code)] // used in FFI
     pub(crate) fn set_path_mode(&mut self, path_mode: PathMode) {

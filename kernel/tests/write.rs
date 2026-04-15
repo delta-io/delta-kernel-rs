@@ -4014,7 +4014,7 @@ async fn test_clustered_table_write_has_stats_parsed(
     Ok(())
 }
 
-// -- PathMode tests --
+// === PathMode tests ===
 
 fn get_simple_schema() -> SchemaRef {
     Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap())

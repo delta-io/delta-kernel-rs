@@ -302,7 +302,10 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 /// path mode, and table root from the provided [`WriteContext`].
 ///
 /// The path format in the returned Add action metadata (relative vs absolute) is controlled
-/// by [`WriteContext::path_mode`]. Relative paths are computed relative to the table root URL.
+/// by the [`PathMode`] set on the transaction. Relative paths are computed relative to the
+/// table root URL.
+///
+/// [`PathMode`]: crate::transaction::PathMode
 ///
 /// This is the public API for building Add action metadata from file write results. Custom
 /// Arrow-based engines that write parquet files themselves (bypassing [`DefaultEngine::write_parquet`])
