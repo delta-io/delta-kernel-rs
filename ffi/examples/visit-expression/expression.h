@@ -140,6 +140,11 @@ struct MapData {
   ExpressionItemList keys;
   ExpressionItemList vals;
 };
+struct NullTypeInfo {
+  uint8_t type_tag;
+  uint8_t precision;
+  uint8_t scale;
+};
 struct Literal {
   enum LitType type;
   union LiteralValue {
@@ -156,6 +161,7 @@ struct Literal {
     struct MapData map_data;
     struct BinaryData binary;
     struct Decimal decimal;
+    struct NullTypeInfo null_type;
   } value;
 };
 
@@ -269,9 +275,17 @@ void visit_expr_struct_literal(void* data,
   struct_data->values = get_expr_list(data, child_value_list_id);
   put_expr_item(data, sibling_list_id, literal, Literal);
 }
-void visit_expr_null_literal(void* data, uintptr_t sibling_id_list) {
+void visit_expr_null_literal(
+    void* data,
+    uintptr_t sibling_id_list,
+    uint8_t type_tag,
+    uint8_t precision,
+    uint8_t scale) {
   struct Literal* literal = malloc(sizeof(struct Literal));
   literal->type = Null;
+  literal->value.null_type.type_tag = type_tag;
+  literal->value.null_type.precision = precision;
+  literal->value.null_type.scale = scale;
   put_expr_item(data, sibling_id_list, literal, Literal);
 }
 

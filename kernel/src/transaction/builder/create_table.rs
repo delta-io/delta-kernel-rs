@@ -18,7 +18,7 @@ use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
 use crate::schema::variant_utils::schema_contains_variant_type;
-use crate::schema::{DataType, SchemaRef, StructType};
+use crate::schema::{normalize_column_names_to_schema_casing, DataType, SchemaRef, StructType};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -299,9 +299,13 @@ fn apply_data_layout(
         DataLayout::None => Ok(DataLayoutResult::default()),
 
         DataLayout::Clustered { columns } => {
-            validate_clustering_columns(effective_schema, columns)?;
+            // Normalize clustering column names to match schema casing. This allows users
+            // to specify clustering columns case-insensitively (e.g. schema has columns
+            // "A", "B", "C" and user clusters by "c", "a").
+            let normalized = normalize_column_names_to_schema_casing(effective_schema, columns);
+            validate_clustering_columns(effective_schema, &normalized)?;
 
-            let physical_columns: Vec<ColumnName> = columns
+            let physical_columns: Vec<ColumnName> = normalized
                 .iter()
                 .map(|c| {
                     get_any_level_column_physical_name(effective_schema, c, column_mapping_mode)
@@ -329,12 +333,13 @@ fn apply_data_layout(
         }
 
         DataLayout::Partitioned { columns } => {
-            validate_partition_columns(effective_schema, columns)?;
+            let normalized = normalize_column_names_to_schema_casing(effective_schema, columns);
+            validate_partition_columns(effective_schema, &normalized)?;
 
             Ok(DataLayoutResult {
                 system_domain_metadata: vec![],
                 clustering_columns: None,
-                partition_columns: Some(columns.clone()),
+                partition_columns: Some(normalized),
             })
         }
     }
@@ -686,10 +691,6 @@ impl CreateTableTransactionBuilder {
         // Validate path
         let table_url = try_parse_uri(&self.path)?;
 
-        // Validate schema is non-empty
-        if self.schema.fields().len() == 0 {
-            return Err(Error::generic("Schema cannot be empty"));
-        }
         // Check if table already exists by looking for _delta_log directory
         let delta_log_url = table_url.join("_delta_log/")?;
         let storage = engine.storage_handler();
@@ -704,6 +705,12 @@ impl CreateTableTransactionBuilder {
         // Apply column mapping if mode is name or id (must happen BEFORE data layout)
         let (effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
+
+        // Validate schema (non-empty, column names, duplicates)
+        crate::schema::validation::validate_schema_for_create(
+            &effective_schema,
+            column_mapping_mode,
+        )?;
 
         // Validate data layout and resolve column names (physical for clustering, logical
         // for partitioning). Adds required table features for clustering.
