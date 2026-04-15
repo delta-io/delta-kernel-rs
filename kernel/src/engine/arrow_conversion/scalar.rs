@@ -14,6 +14,8 @@
 // extraction into StructData/ArrayData/MapData when there is a concrete use case.
 
 use crate::arrow::array::cast::AsArray;
+#[cfg(feature = "nanosecond-timestamps")]
+use crate::arrow::array::types::TimestampNanosecondType;
 use crate::arrow::array::types::{
     Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
     Int8Type, TimestampMicrosecondType,
@@ -95,6 +97,14 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> DeltaResul
                     .value(row_idx),
             ))
         }
+        #[cfg(feature = "nanosecond-timestamps")]
+        ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) if !tz.is_empty() => {
+            Ok(Scalar::TimestampNanos(
+                array
+                    .as_primitive::<TimestampNanosecondType>()
+                    .value(row_idx),
+            ))
+        }
         ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => Ok(Scalar::TimestampNtz(
             array
                 .as_primitive::<TimestampMicrosecondType>()
@@ -147,6 +157,10 @@ fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> DeltaResult<Dat
         ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(tz)) if !tz.is_empty() => {
             Ok(DataType::TIMESTAMP)
         }
+        #[cfg(feature = "nanosecond-timestamps")]
+        ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) if !tz.is_empty() => {
+            Ok(DataType::TIMESTAMP_NANOS)
+        }
         ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => Ok(DataType::TIMESTAMP_NTZ),
         ArrowDataType::Decimal128(p, s) => {
             if *s < 0 {
@@ -166,6 +180,8 @@ fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> DeltaResult<Dat
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "nanosecond-timestamps")]
+    use crate::arrow::array::TimestampNanosecondArray;
     use crate::arrow::array::{
         new_null_array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
         Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
@@ -326,6 +342,27 @@ mod tests {
         );
     }
 
+    // See above for explanation of timezone handling.
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[rstest]
+    #[case::utc("UTC")]
+    #[case::utc_lowercase("utc")]
+    #[case::us_eastern("America/New_York")]
+    #[case::offset("+05:30")]
+    #[case::europe("Europe/Berlin")]
+    fn test_extract_primitive_scalar_timestamp_nanos(#[case] tz: &str) {
+        let array = TimestampNanosecondArray::from(vec![1_000_000i64]).with_timezone(tz);
+        assert_eq!(
+            extract_primitive_scalar(&array, 0).unwrap(),
+            Scalar::TimestampNanos(1_000_000)
+        );
+        let array = TimestampNanosecondArray::from(vec![None::<i64>]).with_timezone(tz);
+        assert_eq!(
+            extract_primitive_scalar(&array, 0).unwrap(),
+            Scalar::Null(DataType::TIMESTAMP_NANOS)
+        );
+    }
+
     #[rstest]
     #[case::utc("UTC")]
     #[case::us_eastern("America/New_York")]
@@ -389,6 +426,10 @@ mod tests {
         ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         DataType::TIMESTAMP
     )]
+    #[cfg_attr(feature="nanosecond-timestamps", case::timestamp_nanos_tz(
+        ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        DataType::TIMESTAMP_NANOS
+    ))]
     #[case::timestamp_ntz(
         ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
         DataType::TIMESTAMP_NTZ
@@ -553,6 +594,9 @@ mod tests {
         Arc::new(TimestampMicrosecondArray::from(vec![1_743_436_200_000_000i64]).with_timezone("UTC")) as ArrayRef
     )]
     #[case::timestamp_ntz(Arc::new(TimestampMicrosecondArray::from(vec![1_743_436_200_123_456i64])) as ArrayRef)]
+    #[cfg_attr(feature = "nanosecond-timestamps", case::timestamp_nanos_tz(
+        Arc::new(TimestampNanosecondArray::from(vec![1_743_436_200_000_000_123i64]).with_timezone("UTC")) as ArrayRef
+    ))]
     #[case::decimal(
         Arc::new(Decimal128Array::from(vec![12345i128]).with_precision_and_scale(10, 2).unwrap()) as ArrayRef
     )]
