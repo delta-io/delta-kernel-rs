@@ -827,24 +827,17 @@ impl Snapshot {
     }
 
     /// Returns file-level statistics, or `None` if no CRC with valid stats exists at this
-    /// snapshot's version.
-    ///
-    /// NOTE: This is an unstable API expected to change in future releases.
-    #[allow(unused)]
-    #[internal_api]
-    pub(crate) fn get_or_load_file_stats(&self, engine: &dyn Engine) -> Option<FileStats> {
+    /// snapshot's version. Attempts to load the CRC from storage if not already cached.
+    pub fn get_or_load_file_stats(&self, engine: &dyn Engine) -> Option<FileStats> {
         let crc = self
             .lazy_crc
             .get_or_load_if_at_version(engine, self.version())?;
         crc.file_stats()
     }
 
-    /// Returns file-level statistics, or `None` if CRC is not loaded, not at this
-    /// version, or has no valid file stats.
-    ///
-    /// NOTE: This API is purely opportunistic, no I/O.
-    #[internal_api]
-    pub(crate) fn get_file_stats_if_loaded(&self) -> Option<FileStats> {
+    /// Returns file-level statistics if the CRC is already loaded at this snapshot's version.
+    /// This method performs no I/O; it returns `None` if the CRC has not already been loaded.
+    pub fn get_file_stats_if_loaded(&self) -> Option<FileStats> {
         let crc = self.lazy_crc.get_if_loaded_at_version(self.version())?;
         crc.file_stats()
     }

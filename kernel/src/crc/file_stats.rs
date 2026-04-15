@@ -19,8 +19,12 @@ use crate::{DeltaResult, EngineData, Error, RowVisitor};
 
 /// File-level statistics for a table version: total file count, size, and histogram.
 ///
-/// Obtained via [`Crc::file_stats()`](super::Crc::file_stats), which returns `None` when
-/// the stats are not known to be valid.
+/// Obtained via [`Snapshot::get_or_load_file_stats`], [`Snapshot::get_file_stats_if_loaded`],
+/// or [`Crc::file_stats()`](super::Crc::file_stats). Returns `None` when the stats are not
+/// known to be valid.
+///
+/// [`Snapshot::get_or_load_file_stats`]: crate::snapshot::Snapshot::get_or_load_file_stats
+/// [`Snapshot::get_file_stats_if_loaded`]: crate::snapshot::Snapshot::get_file_stats_if_loaded
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStats {
     /// Number of active [`Add`](crate::actions::Add) file actions in this table version.
