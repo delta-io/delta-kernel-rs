@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use url::Url;
+use uuid::Uuid;
 
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
@@ -31,7 +32,8 @@ use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
     ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_TYPE_WIDENING, PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION,
+    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -65,6 +67,7 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::AppendOnly,
     TableFeature::ChangeDataFeed,
     TableFeature::TypeWidening,
+    TableFeature::RowTracking,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
@@ -85,6 +88,7 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     ENABLE_CHANGE_DATA_FEED,
     ENABLE_TYPE_WIDENING,
     APPEND_ONLY,
+    ENABLE_ROW_TRACKING,
     // Set transaction retention duration: controls expiration of txn identifiers
     SET_TRANSACTION_RETENTION_DURATION,
     // Parquet format version: controls the Parquet writer version for data files
@@ -181,11 +185,12 @@ fn add_feature_to_lists(
     }
 }
 
-/// Configures clustering support for table creation (used by unit tests).
+/// Test-only helper for clustering support during table creation.
 ///
-/// Validates clustering columns, adds required features (DomainMetadata, ClusteredTable),
-/// and creates the domain metadata action.
-fn apply_clustering_for_table_create(
+/// Validates clustering columns, adds the `DomainMetadata` and `ClusteredTable` features
+/// directly, and creates the domain metadata action.
+#[cfg(test)]
+fn validate_clustering_and_make_domain_metadata(
     logical_schema: &SchemaRef,
     logical_columns: &[ColumnName],
     reader_features: &mut Vec<TableFeature>,
@@ -285,8 +290,8 @@ fn validate_partition_columns(
 /// Handles all [`DataLayout`] variants:
 ///
 /// - **None**: Returns defaults (no domain metadata, no clustering/partition columns).
-/// - **Clustered**: Validates clustering columns, resolves to physical names, adds
-///   `DomainMetadata` + `ClusteredTable` features, creates clustering domain metadata.
+/// - **Clustered**: Validates clustering columns, resolves to physical names, adds the
+///   `DomainMetadata` and `ClusteredTable` features, creates clustering domain metadata.
 /// - **Partitioned**: Validates partition columns and stores logical names. No domain
 ///   metadata or special features are needed (partitioning is a core Delta feature).
 fn apply_data_layout(
@@ -382,9 +387,49 @@ fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProp
                     &mut validated.reader_features,
                     &mut validated.writer_features,
                 );
+                // RowTracking requires DomainMetadata as a dependency
+                if *feature == TableFeature::RowTracking {
+                    add_feature_to_lists(
+                        TableFeature::DomainMetadata,
+                        &mut validated.reader_features,
+                        &mut validated.writer_features,
+                    );
+                }
             }
         }
     }
+}
+
+/// Sets materialized column name properties when row tracking is enabled.
+///
+/// Writes `delta.rowTracking.materializedRowIdColumnName` and
+/// `delta.rowTracking.materializedRowCommitVersionColumnName` into the table
+/// properties using UUID-based column names (`_row-id-col-{uuid}` and
+/// `_row-commit-version-col-{uuid}`). These names record which physical columns
+/// store materialized row IDs and commit versions.
+///
+/// Only fires when `delta.enableRowTracking=true` is set. Feature-signal-only tables
+/// (`delta.feature.rowTracking=supported` without the enablement property) do not get
+/// these properties because the materialized columns are part of the "enabled" state, not
+/// the "supported" state.
+fn maybe_set_materialized_row_tracking_column_name_properties(
+    validated: &mut ValidatedTableProperties,
+) {
+    if validated
+        .properties
+        .get(ENABLE_ROW_TRACKING)
+        .is_none_or(|v| v != "true")
+    {
+        return;
+    }
+    validated.properties.insert(
+        MATERIALIZED_ROW_ID_COLUMN_NAME.to_string(),
+        format!("_row-id-col-{}", Uuid::new_v4()),
+    );
+    validated.properties.insert(
+        MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME.to_string(),
+        format!("_row-commit-version-col-{}", Uuid::new_v4()),
+    );
 }
 
 /// Ensures that `inCommitTimestamp` is enabled when `catalogManaged` is present. Adds the ICT
@@ -524,7 +569,16 @@ fn validate_extract_table_features_and_properties(
         }
 
         // Add to appropriate feature lists based on feature type
+        let needs_domain_metadata = feature == TableFeature::RowTracking;
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
+        // RowTracking requires DomainMetadata as a dependency
+        if needs_domain_metadata {
+            add_feature_to_lists(
+                TableFeature::DomainMetadata,
+                &mut reader_features,
+                &mut writer_features,
+            );
+        }
     }
 
     // Validate remaining delta.* properties against allow list
@@ -730,6 +784,9 @@ impl CreateTableTransactionBuilder {
 
         // Auto-enable inCommitTimestamp for catalogManaged tables
         maybe_enable_ict_for_catalog_managed(&mut validated)?;
+
+        // Set materialized row tracking column names when row tracking is enabled.
+        maybe_set_materialized_row_tracking_column_name_properties(&mut validated);
 
         // Create Protocol action with table features support
         let protocol =
@@ -937,7 +994,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let dm = apply_clustering_for_table_create(
+        let dm = validate_clustering_and_make_domain_metadata(
             &schema,
             &[ColumnName::new(["id"])],
             &mut reader_features,
@@ -966,7 +1023,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let dm = apply_clustering_for_table_create(
+        let dm = validate_clustering_and_make_domain_metadata(
             &schema,
             &[ColumnName::new(["id"]), ColumnName::new(["date"])],
             &mut reader_features,
@@ -995,7 +1052,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let result = apply_clustering_for_table_create(
+        let result = validate_clustering_and_make_domain_metadata(
             &schema,
             &[ColumnName::new(["nonexistent"])],
             &mut reader_features,
@@ -1027,7 +1084,7 @@ mod tests {
         let mut writer_features = vec![];
 
         let nested_col = ColumnName::new(["address", "city"]);
-        let dm = apply_clustering_for_table_create(
+        let dm = validate_clustering_and_make_domain_metadata(
             &schema,
             &[nested_col],
             &mut reader_features,
@@ -1441,6 +1498,44 @@ mod tests {
         assert_eq!(
             validated.properties.get(ENABLE_IN_COMMIT_TIMESTAMPS),
             Some(&"true".to_string()),
+        );
+    }
+
+    /// Verifies that both activation paths add `RowTracking` and `DomainMetadata` to
+    /// `writer_features`. For the feature-signal path, `delta.enableRowTracking` must NOT
+    /// be present in the properties (signal grants support, not enablement).
+    #[rstest::rstest]
+    #[case::enablement_property(
+        HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
+        true, // enablement property is set
+    )]
+    #[case::feature_signal(
+        HashMap::from([("delta.feature.rowTracking".to_string(), "supported".to_string())]),
+        false, // enablement property is NOT set
+    )]
+    fn test_row_tracking_activation_adds_required_features(
+        #[case] properties: HashMap<String, String>,
+        #[case] expect_enablement_property: bool,
+    ) {
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        maybe_auto_enable_property_driven_features(&mut validated);
+
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::RowTracking),
+            "Expected RowTracking in writer_features"
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::DomainMetadata),
+            "Expected DomainMetadata in writer_features"
+        );
+        assert_eq!(
+            validated.properties.contains_key(ENABLE_ROW_TRACKING),
+            expect_enablement_property,
+            "delta.enableRowTracking presence mismatch"
         );
     }
 
