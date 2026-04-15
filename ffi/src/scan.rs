@@ -52,13 +52,16 @@ pub struct EnginePredicate {
         extern "C" fn(predicate: *mut c_void, state: &mut KernelExpressionVisitorState) -> usize,
 }
 
-/// A schema for columns to select from the snapshot.
+/// An engine-provided schema along with a visitor function to convert it to a kernel schema.
 ///
-/// Used by [`scan`] and [`scan_builder_with_schema`] for projection pushdown or to specify
-/// metadata columns. The engine provides a pointer to its native schema representation along with
-/// a visitor function. The kernel allocates visitor state internally, which becomes the second
-/// argument to the schema visitor invocation. Thanks to this double indirection, engine and kernel
-/// each retain ownership of their respective objects with no need to coordinate memory lifetimes.
+/// Used by [`scan`] and [`scan_builder_with_schema`] for projection pushdown, and by
+/// [`get_create_table_builder`] to specify the table schema at creation time. The engine
+/// provides a pointer to its native schema representation along with a visitor function. The
+/// kernel allocates visitor state internally, which becomes the second argument to the schema
+/// visitor invocation. Thanks to this double indirection, engine and kernel each retain
+/// ownership of their respective objects with no need to coordinate memory lifetimes.
+///
+/// [`get_create_table_builder`]: crate::transaction::get_create_table_builder
 #[repr(C)]
 pub struct EngineSchema {
     pub schema: *mut c_void,
