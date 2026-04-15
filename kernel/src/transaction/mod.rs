@@ -1322,7 +1322,6 @@ fn build_remove_transform(
     transform
 }
 
-
 /// Kernel exposes information about the state of the table that engines might want to use to
 /// trigger actions like checkpointing or log compaction. This struct holds that information.
 #[derive(Debug)]
