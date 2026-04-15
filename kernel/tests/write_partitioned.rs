@@ -154,7 +154,7 @@ async fn test_write_partitioned_normal_values_roundtrip(
     assert_normal_values(&sorted);
 
     // ===== Step 5: Checkpoint, reload snapshot from checkpoint, read again. =====
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot_after_cp = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let sorted = read_sorted(&snapshot_after_cp, engine)?;
@@ -233,7 +233,7 @@ async fn test_write_partitioned_null_values_roundtrip(
     assert_all_partition_columns_null(&sorted);
 
     // ===== Step 5: Checkpoint, reload snapshot from checkpoint, read again. =====
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot_after_cp = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let sorted = read_sorted(&snapshot_after_cp, engine)?;

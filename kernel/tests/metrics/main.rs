@@ -109,7 +109,7 @@ async fn setup_table_with_v1_checkpoint() -> DeltaResult<(
         .post_commit_snapshot()
         .expect("post-commit snapshot")
         .clone()
-        .checkpoint(setup_engine.as_ref())?;
+        .checkpoint(setup_engine.as_ref(), None)?;
 
     Ok((table_url, setup_engine, temp_dir))
 }

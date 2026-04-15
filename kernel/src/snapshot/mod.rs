@@ -13,7 +13,7 @@ use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::{is_set_txn_expired, SetTransactionScanner};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
-    CheckpointActionStats, CheckpointSpec, CheckpointWriter, V2CheckpointConfig,
+    CheckpointSpec, CheckpointWriter, V2CheckpointConfig,
     DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
 };
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
