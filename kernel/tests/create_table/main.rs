@@ -5,6 +5,7 @@ mod column_mapping;
 mod ctas;
 mod ict;
 mod partitioned;
+mod row_tracking;
 mod timestamp_ntz;
 mod variant;
 
@@ -351,6 +352,7 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
 // WriterOnly features (EnabledIf -- feature signal alone does not enable)
 #[case("appendOnly", TableFeature::AppendOnly, false, false)]
 #[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false)]
+#[case("rowTracking", TableFeature::RowTracking, false, false)]
 fn test_create_table_with_feature_signal(
     #[case] feature_name: &str,
     #[case] feature: TableFeature,
@@ -432,6 +434,7 @@ fn test_create_table_with_checkpoint_stats_properties(
 // WriterOnly features
 #[case("delta.enableChangeDataFeed", TableFeature::ChangeDataFeed, false)]
 #[case("delta.appendOnly", TableFeature::AppendOnly, false)]
+#[case("delta.enableRowTracking", TableFeature::RowTracking, false)]
 fn test_create_table_with_enablement_property(
     #[case] property: &str,
     #[case] feature: TableFeature,
@@ -474,6 +477,50 @@ fn test_create_table_with_enablement_property(
                 .is_some_and(|f| f.contains(&feature)),
             expect_enabled,
             "{property}={value}: in reader features should be {expect_enabled}"
+        );
+    }
+
+    Ok(())
+}
+
+#[rstest]
+#[case::without_cm(false)]
+#[case::with_cm(true)]
+fn test_create_table_special_char_column_name(#[case] cm_enabled: bool) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("valid_col", DataType::INTEGER, false),
+        StructField::new("bad column", DataType::STRING, true),
+    ])?);
+
+    let mut builder = create_table(&table_path, schema, "Test/1.0");
+    if cm_enabled {
+        builder = builder.with_table_properties([("delta.columnMapping.mode", "name")]);
+    }
+    let result = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    if cm_enabled {
+        let txn = result?;
+        let _ = txn.commit(engine.as_ref())?;
+
+        let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+        assert_eq!(snapshot.version(), 0);
+        let field_names: Vec<_> = snapshot
+            .schema()
+            .fields()
+            .map(|f| f.name().clone())
+            .collect();
+        assert!(
+            field_names.contains(&"bad column".to_string()),
+            "Schema should contain field 'bad column', got: {field_names:?}"
+        );
+    } else {
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid character"),
+            "Expected invalid character error, got: {err}"
         );
     }
 

@@ -2,7 +2,7 @@
 
 pub mod counting_reporter;
 pub mod table_builder;
-pub use counting_reporter::CountingReporter;
+pub use counting_reporter::{CountingReporter, RelaxedCounter};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +25,7 @@ use delta_kernel::engine::default::executor::tokio::{
 use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::ObjectStoreExt as _;
@@ -669,9 +670,9 @@ pub async fn insert_data<E: TaskExecutor>(
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
-    let write_context = txn.get_write_context();
+    let write_context = txn.unpartitioned_write_context()?;
     let add_files_metadata = engine
-        .write_parquet(&ArrowEngineData::new(batch), &write_context, HashMap::new())
+        .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;
     txn.add_files(add_files_metadata);
 
@@ -1004,20 +1005,24 @@ pub async fn write_batch_to_table(
     snapshot: &Arc<Snapshot>,
     engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
     data: RecordBatch,
-    partition_values: std::collections::HashMap<String, String>,
+    partition_values: HashMap<String, Scalar>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
-    let write_context = txn.get_write_context();
+    let write_context = if txn.logical_partition_columns().is_empty() {
+        assert!(
+            partition_values.is_empty(),
+            "partition_values should be empty for unpartitioned tables"
+        );
+        txn.unpartitioned_write_context()?
+    } else {
+        txn.partitioned_write_context(partition_values)?
+    };
     let add_meta = engine
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            &write_context,
-            partition_values,
-        )
+        .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
     txn.add_files(add_meta);
     match txn.commit(engine)? {
@@ -1169,6 +1174,63 @@ pub fn read_actions_from_commit(
         .into_iter()
         .filter_map(|v| v.get(action_type).cloned())
         .collect())
+}
+
+/// Row tracking fields extracted from a single add action in a commit.
+pub struct AddActionRowTracking {
+    /// The base row ID assigned to the first row in the file.
+    pub base_row_id: Option<i64>,
+    /// The version of the commit in which this file was first written.
+    pub default_row_commit_version: Option<i64>,
+}
+
+/// Reads all add actions from a commit and returns their row tracking fields, sorted by
+/// `baseRowId` for deterministic ordering.
+pub fn get_row_tracking_add_actions(
+    table_url: &Url,
+    version: u64,
+) -> Result<Vec<AddActionRowTracking>, Box<dyn std::error::Error>> {
+    let mut actions: Vec<AddActionRowTracking> =
+        read_actions_from_commit(table_url, version, "add")?
+            .into_iter()
+            .map(|a| AddActionRowTracking {
+                base_row_id: a["baseRowId"].as_i64(),
+                default_row_commit_version: a["defaultRowCommitVersion"].as_i64(),
+            })
+            .collect();
+    actions.sort_by_key(|a| a.base_row_id);
+    Ok(actions)
+}
+
+/// Materialized row tracking column name properties extracted from a commit's metadata action.
+pub struct MaterializedRowTrackingColumnNames {
+    /// Value of `delta.rowTracking.materializedRowIdColumnName`, or `None` if not set.
+    pub row_id_column_name: Option<String>,
+    /// Value of `delta.rowTracking.materializedRowCommitVersionColumnName`, or `None` if not set.
+    pub row_commit_version_column_name: Option<String>,
+}
+
+/// Reads the materialized row tracking column name properties from a commit's metadata action.
+/// These properties are table properties stored in the metadata `configuration` map.
+pub fn get_materialized_row_tracking_column_names(
+    table_url: &Url,
+    version: u64,
+) -> Result<MaterializedRowTrackingColumnNames, Box<dyn std::error::Error>> {
+    let metadata_actions = read_actions_from_commit(table_url, version, "metaData")?;
+    let config = metadata_actions
+        .first()
+        .and_then(|m| m.get("configuration"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    Ok(MaterializedRowTrackingColumnNames {
+        row_id_column_name: config["delta.rowTracking.materializedRowIdColumnName"]
+            .as_str()
+            .map(str::to_owned),
+        row_commit_version_column_name: config
+            ["delta.rowTracking.materializedRowCommitVersionColumnName"]
+            .as_str()
+            .map(str::to_owned),
+    })
 }
 
 /// Removes all scan files from the snapshot, commits the transaction, and returns

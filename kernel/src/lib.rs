@@ -113,7 +113,11 @@ pub mod transforms;
 
 pub use log_path::LogPath;
 
-mod row_tracking;
+// Public under test-utils so integration tests can call get_high_water_mark via snapshot.
+#[cfg(feature = "test-utils")]
+pub mod row_tracking;
+#[cfg(not(feature = "test-utils"))]
+pub(crate) mod row_tracking;
 
 pub(crate) mod clustering;
 
@@ -846,7 +850,8 @@ pub trait ParquetHandler: AsAny {
     ///
     /// This method writes the provided `data` to a Parquet file at the given `url`.
     ///
-    /// This will overwrite the file if it already exists.
+    /// This will overwrite the file if it already exists. For filesystem-backed
+    /// implementations, the parent directories must be created if they do not exist.
     ///
     /// # Parameters
     ///
