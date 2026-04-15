@@ -313,9 +313,14 @@ impl Metadata {
     }
 
     #[internal_api]
-    #[allow(dead_code)]
     pub(crate) fn configuration(&self) -> &HashMap<String, String> {
         &self.configuration
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn format_provider(&self) -> &str {
+        &self.format.provider
     }
 
     #[internal_api]
@@ -786,7 +791,14 @@ pub(crate) struct Remove {
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) extended_file_metadata: Option<bool>,
 
-    /// A map from partition column to value for this logical file.
+    /// A map from partition column to value for this logical file. This map can contain null in
+    /// the values meaning a partition is null. We drop those values from this map, due to the
+    /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
+    /// null values. This means an engine can assume that if a partition is found in
+    /// [`Metadata::partition_columns`] but not in this map, its value is null.
+    ///
+    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    #[allow_null_container_values]
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) partition_values: Option<HashMap<String, String>>,
 
@@ -800,7 +812,8 @@ pub(crate) struct Remove {
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub stats: Option<String>,
 
-    /// Map containing metadata about this logical file.
+    /// Map containing metadata about this logical file. Values can be null.
+    #[allow_null_container_values]
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) tags: Option<HashMap<String, String>>,
 
@@ -850,7 +863,8 @@ pub(crate) struct Cdc {
     /// data of the table
     pub data_change: bool,
 
-    /// Map containing metadata about this logical file.
+    /// Map containing metadata about this logical file. Values can be null.
+    #[allow_null_container_values]
     pub tags: Option<HashMap<String, String>>,
 }
 
@@ -900,7 +914,8 @@ pub(crate) struct Sidecar {
     /// The time this logical file was created, as milliseconds since the epoch.
     pub modification_time: i64,
 
-    /// A map containing any additional metadata about the logicial file.
+    /// A map containing any additional metadata about the logical file. Values can be null.
+    #[allow_null_container_values]
     pub tags: Option<HashMap<String, String>>,
 }
 
@@ -937,7 +952,8 @@ pub(crate) struct CheckpointMetadata {
     /// See issue #786 for tracking progress.
     pub(crate) version: i64,
 
-    /// Map containing any additional metadata about the V2 spec checkpoint.
+    /// Map containing any additional metadata about the V2 spec checkpoint. Values can be null.
+    #[allow_null_container_values]
     pub(crate) tags: Option<HashMap<String, String>>,
 }
 
@@ -1153,14 +1169,14 @@ mod tests {
     fn tags_field() -> StructField {
         StructField::nullable(
             "tags",
-            MapType::new(DataType::STRING, DataType::STRING, false),
+            MapType::new(DataType::STRING, DataType::STRING, true),
         )
     }
 
     fn partition_values_field() -> StructField {
         StructField::nullable(
             "partitionValues",
-            MapType::new(DataType::STRING, DataType::STRING, false),
+            MapType::new(DataType::STRING, DataType::STRING, true),
         )
     }
 

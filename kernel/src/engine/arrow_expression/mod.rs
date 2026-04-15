@@ -275,6 +275,60 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into_arrow()?), arrays)?;
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
+
+    fn create_many(
+        &self,
+        schema: SchemaRef,
+        rows: &[&[Scalar]],
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
+        if rows.is_empty() {
+            return Ok(Box::new(ArrowEngineData::new(RecordBatch::new_empty(
+                arrow_schema,
+            ))));
+        }
+
+        let num_rows = rows.len();
+        let num_fields = schema.fields().len();
+        for (row_idx, row) in rows.iter().enumerate() {
+            if row.len() != num_fields {
+                return Err(Error::generic(format!(
+                    "Row {} has {} scalars but schema has {} fields",
+                    row_idx,
+                    row.len(),
+                    num_fields
+                )));
+            }
+        }
+
+        let mut builders: Vec<Box<dyn ArrayBuilder>> = arrow_schema
+            .fields()
+            .iter()
+            .map(|field| array::make_builder(field.data_type(), num_rows))
+            .collect();
+
+        let fields: Vec<_> = schema.fields().collect();
+        for (col_idx, builder) in builders.iter_mut().enumerate() {
+            let field_name = fields[col_idx].name();
+            for (row_idx, row) in rows.iter().enumerate() {
+                row[col_idx].append_to(builder.as_mut(), 1).map_err(|e| {
+                    Error::generic(format!(
+                        "Row {row_idx}, field '{field_name}' \
+                            (expected type {}, got {}): {e}",
+                        fields[col_idx].data_type(),
+                        row[col_idx].data_type()
+                    ))
+                })?;
+            }
+        }
+
+        let arrays: Vec<ArrayRef> = builders.into_iter().map(|mut b| b.finish()).collect();
+
+        Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
+            arrow_schema,
+            arrays,
+        )?)))
+    }
 }
 
 #[derive(Debug)]
