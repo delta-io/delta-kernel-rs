@@ -1313,10 +1313,13 @@ mod scan_metadata_arrow_tests {
         for (i, &selected) in sv.iter().enumerate() {
             let result = unsafe { get_transform_for_row(i, &transforms) };
             if selected {
-                assert!(
-                    matches!(result, crate::OptionalValue::Some(_)),
-                    "selected row {i} should have a transform for partitioned table"
-                );
+                // get_transform_for_row clones the Arc into a Handle; must free it
+                match result {
+                    crate::OptionalValue::Some(handle) => unsafe { handle.drop_handle() },
+                    crate::OptionalValue::None => {
+                        panic!("selected row {i} should have a transform for partitioned table")
+                    }
+                }
             }
         }
 
