@@ -10,6 +10,7 @@ use itertools::Itertools;
 use tracing::{debug, info};
 use url::Url;
 
+use crate::metrics::reporter::emit_scan_metadata_completed;
 use crate::metrics::MetricId;
 use crate::scan::metrics::ScanMetrics;
 use crate::utils::IteratorExt;
@@ -766,7 +767,6 @@ impl Scan {
         >,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         let start = Instant::now();
-        let reporter = engine.get_metrics_reporter();
         let operation_id = MetricId::new();
 
         let (iter, metrics) = match self.state_info.physical_predicate {
@@ -789,9 +789,7 @@ impl Scan {
         let on_complete = move || {
             let event = metrics.to_event(operation_id, ScanType::Full, start.elapsed());
             info!(%event);
-            if let Some(r) = reporter {
-                r.report(event);
-            }
+            emit_scan_metadata_completed(&event);
         };
         Ok(iter.into_iter().flatten().on_complete(on_complete))
     }

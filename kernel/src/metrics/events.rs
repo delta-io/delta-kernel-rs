@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Each operation (Snapshot, Transaction, Scan) gets a unique MetricId that
 /// is used to correlate all events from that operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MetricId(Uuid);
+pub struct MetricId(pub(crate) Uuid);
 
 /// Identifies which scan execution path produced a scan metadata metrics event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
