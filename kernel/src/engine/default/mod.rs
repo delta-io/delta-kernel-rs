@@ -351,24 +351,24 @@ trait UrlExt {
 
 impl UrlExt for Url {
     fn is_presigned(&self) -> bool {
+        // We search a URL query string for these keys to see if we should consider it a presigned URL:
+        // - AWS: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+        // - Cloudflare R2: https://developers.cloudflare.com/r2/api/s3/presigned-urls/
+        // - Azure Blob (SAS): https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas#version-2020-12-06-and-later
+        // - Google Cloud Storage: https://cloud.google.com/storage/docs/authentication/signatures
+        // - Alibaba Cloud OSS: https://www.alibabacloud.com/help/en/oss/user-guide/upload-files-using-presigned-urls
+        // - Databricks presigned URLs
+        const PRESIGNED_KEYS: &[&str] = &[
+            "X-Amz-Signature",
+            "sp",
+            "X-Goog-Credential",
+            "X-OSS-Credential",
+            "X-Databricks-Signature",
+        ];
         matches!(self.scheme(), "http" | "https")
-            && (
-                // https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
-                // https://developers.cloudflare.com/r2/api/s3/presigned-urls/
-                self
+            && self
                 .query_pairs()
-                .any(|(k, _)| k.eq_ignore_ascii_case("X-Amz-Signature")) ||
-                // https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas#version-2020-12-06-and-later
-                // note signed permission (sp) must always be present
-                self
-                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("sp")) ||
-                // https://cloud.google.com/storage/docs/authentication/signatures
-                self
-                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("X-Goog-Credential")) ||
-                // https://www.alibabacloud.com/help/en/oss/user-guide/upload-files-using-presigned-urls
-                self
-                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("X-OSS-Credential"))
-            )
+                .any(|(k, _)| PRESIGNED_KEYS.iter().any(|p| k.eq_ignore_ascii_case(p)))
     }
 }
 
@@ -471,6 +471,11 @@ mod tests {
         assert!(url.is_presigned());
 
         let url = Url::parse("https://example.com?X-OSS-Credential=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url =
+            Url::parse("https://example.com?X-Databricks-TTL=3599545&X-Databricks-Signature=bar")
+                .unwrap();
         assert!(url.is_presigned());
 
         // assert that query keys are case insensitive
