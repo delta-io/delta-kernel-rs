@@ -263,8 +263,12 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                     .with_reporter(metrics_reporter.clone()),
             ),
             parquet: Arc::new(
-                DefaultParquetHandler::new(object_store.clone(), task_executor.clone(), parquet_writer_config)
-                    .with_reporter(metrics_reporter.clone()),
+                DefaultParquetHandler::new(
+                    object_store.clone(),
+                    task_executor.clone(),
+                    parquet_writer_config,
+                )
+                .with_reporter(metrics_reporter.clone()),
             ),
             object_store,
             task_executor,
