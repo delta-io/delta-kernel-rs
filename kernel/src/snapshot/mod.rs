@@ -12,7 +12,10 @@ use url::Url;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::{is_set_txn_expired, SetTransactionScanner};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
-use crate::checkpoint::CheckpointWriter;
+use crate::checkpoint::{
+    CheckpointActionStats, CheckpointSpec, CheckpointWriter, V2CheckpointConfig,
+    DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
+};
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 #[cfg(any(test, feature = "test-utils"))]
@@ -532,8 +535,12 @@ impl Snapshot {
 
         let file_meta = engine.storage_handler().head(&checkpoint_path)?;
 
-        // Finalize the checkpoint (writes `_last_checkpoint` file).
-        writer.finalize(engine, &file_meta, &state)?;
+        // Build checkpoint stats from the iterator state, then finalize(writes `_last_checkpoint`).
+        let state = Arc::into_inner(state).ok_or_else(|| {
+            Error::internal_error("ActionReconciliationIteratorState Arc has other references")
+        })?;
+        let action_stats = CheckpointActionStats::from_reconciliation_state(state)?;
+        writer.finalize(engine, &file_meta, &action_stats)?;
 
         let checkpoint_log_path = ParsedLogPath::try_from(file_meta)?.ok_or_else(|| {
             Error::internal_error("Checkpoint path could not be parsed as a log path")
@@ -549,6 +556,62 @@ impl Snapshot {
                 self.lazy_crc.clone(),
             )),
         ))
+    }
+
+    /// Writes a checkpoint according to the [`CheckpointSpec`].
+    ///
+    /// # Parameters
+    /// - `engine`: Engine for data processing and I/O
+    /// - `spec`: Checkpoint format specification. `None` uses the default checkpoint
+    ///   settings (auto-detecting V1/V2 from table features). For V2 checkpoints, the
+    ///   default is to not write sidecar files.
+    ///
+    /// # Errors
+    /// - If `CheckpointSpec::V2` is used but the table does not support the `v2Checkpoint`
+    ///   feature.
+    /// - If `CheckpointSpec::V1` is used but the table supports `v2Checkpoint` feature.
+    /// - If `file_actions_per_sidecar_hint` is `Some(0)`.
+    ///
+    /// [`CheckpointSpec`]: crate::checkpoint::CheckpointSpec
+    /// This method is for review only, and will be merged into snapshot::checkpoint() in the next PR:
+    /// https://github.com/delta-io/delta-kernel-rs/pull/2333
+    #[instrument(parent = &self.span, name = "snap.checkpoint_placeholder", skip_all, err)]
+    pub fn snapshot_checkpoint_placeholder(
+        self: Arc<Self>,
+        engine: &dyn Engine,
+        spec: Option<&CheckpointSpec>,
+    ) -> DeltaResult<()> {
+        let v2_supported = self
+            .table_configuration()
+            .is_feature_supported(&TableFeature::V2Checkpoint);
+        match spec {
+            Some(CheckpointSpec::V2(_)) if !v2_supported => {
+                return Err(Error::checkpoint_write(
+                    "CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
+                ));
+            }
+            Some(CheckpointSpec::V1) if v2_supported => {
+                return Err(Error::checkpoint_write(
+                    "Kernel does not support writing V1 checkpoints when the table supports v2Checkpoint",
+                ));
+            }
+            _ => {}
+        }
+
+        let writer = self.create_checkpoint_writer()?;
+
+        let info = match spec {
+            Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+                file_actions_per_sidecar_hint,
+            })) => {
+                let hint =
+                    file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
+                writer.write_checkpoint_with_sidecars(engine, hint)?
+            }
+            _ => writer.write_checkpoint_without_sidecars(engine)?,
+        };
+
+        writer.finalize(engine, &info.file_meta, &info.action_stats)
     }
 
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
