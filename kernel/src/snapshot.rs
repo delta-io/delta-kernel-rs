@@ -232,8 +232,9 @@ impl Snapshot {
         // OR could be from 1 -> new_version
         // Save the latest_commit before moving new_listed_files
         let new_latest_commit_file = new_listed_files.latest_commit_file().clone();
-        // Note: new_log_segment won't have checkpoint_schema since we're listing without a hint.
-        // If it has a checkpoint, we use it as-is. Otherwise, we preserve the old checkpoint_schema.
+        // Note: new_log_segment won't have last_checkpoint_metadata since we're listing without a hint.
+        // If the new segment has a checkpoint, we will return it as is. Otherwise, we will preserve
+        // last_checkpoint_metadata when merging the new log segment with the old one.
         let mut new_log_segment =
             LogSegment::try_new(new_listed_files, log_root.clone(), requested_version, None)?;
 
@@ -332,8 +333,8 @@ impl Snapshot {
             },
             log_root,
             requested_version,
-            // Preserve checkpoint schema from old segment
-            old_log_segment.checkpoint_schema.clone(),
+            // Preserve `_last_checkpoint` hint from old segment
+            old_log_segment.last_checkpoint_hint_summary(),
         )?;
 
         Ok(Arc::new(Snapshot::new_with_crc(
@@ -568,6 +569,8 @@ impl Snapshot {
     ///
     /// # Returns
     /// A [`LogCompactionWriter`] that can be used to generate the compaction file.
+    ///
+    /// NOTE: This method is currently a no-op because log compaction is disabled (#2337)
     pub fn log_compaction_writer(
         self: Arc<Self>,
         start_version: Version,
@@ -1169,6 +1172,7 @@ mod tests {
 
     use rstest::rstest;
     use serde_json::json;
+    use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
     use test_utils::{add_commit, delta_path_for_version};
 
     use crate::actions::{DomainMetadata, Protocol};
@@ -1188,7 +1192,7 @@ mod tests {
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStore;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::{LogPathFileType, ParsedLogPath};
     use crate::schema::{DataType, StructField, StructType};
@@ -1970,6 +1974,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "log compaction disabled (#2337)"]
     fn test_log_compaction_writer() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
@@ -1993,6 +1998,20 @@ mod tests {
         // Test equal version range (also invalid)
         let result = snapshot.log_compaction_writer(1, 1);
         assert_result_error_with_message(result, "Invalid version range");
+    }
+
+    // TODO(#2337): remove this test when log compaction is re-enabled.
+    #[test]
+    fn test_log_compaction_writer_unsupported() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+        let result = snapshot.log_compaction_writer(0, 1);
+        assert_result_error_with_message(result, "not currently supported");
     }
 
     #[tokio::test]
@@ -2371,38 +2390,27 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory:///test_table/";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+    // Verifies the test_context! macro works from kernel/src/ unit tests
+    // (crosses the crate type boundary via macro expansion).
+    #[test]
+    fn test_context_macro_works_in_unit_test() {
+        let (_engine, snap, _table) = test_utils::test_context!(
+            LogState::with_commits(3),
+            FeatureSet::empty(),
+            VersionTarget::Latest
+        );
+        assert_eq!(snap.version(), 2);
+    }
 
-        // Create initial commit
-        let commit0 = vec![
-            json!({
-                "protocol": {
-                    "minReaderVersion": 1,
-                    "minWriterVersion": 2
-                }
-            }),
-            json!({
-                "metaData": {
-                    "id": "test-id",
-                    "format": {"provider": "parquet", "options": {}},
-                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
-                    "partitionColumns": [],
-                    "configuration": {},
-                    "createdTime": 1587968585495i64
-                }
-            }),
-        ];
-        commit(table_root, store.as_ref(), 0, commit0).await;
+    #[test]
+    fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
+        let table = TestTableBuilder::new().build().unwrap();
+        let engine = DefaultEngineBuilder::new(table.store().clone()).build();
 
-        let base_snapshot = Snapshot::builder_for(table_root)
+        let base_snapshot = Snapshot::builder_for(table.table_root())
             .at_version(0)
             .build(&engine)?;
 
-        // Test with empty log tail - should return same snapshot
         let result = Snapshot::try_new_from_impl(
             base_snapshot.clone(),
             vec![],
@@ -2653,6 +2661,22 @@ mod tests {
         Ok(IncrementalSnapshotTestContext { store, url, engine })
     }
 
+
+    /// Compares two Snapshots field-by-field. LogSegment fields are compared individually,
+    /// intentionally skipping `last_checkpoint_metadata` which is only populated on the
+    /// from-scratch path (via `_last_checkpoint` hint) and not on the incremental update path.
+    fn compare_snapshots(left: &Snapshot, right: &Snapshot) {
+        assert_eq!(left.table_configuration, right.table_configuration);
+        assert_eq!(left.log_segment.end_version, right.log_segment.end_version);
+        assert_eq!(
+            left.log_segment.checkpoint_version,
+            right.log_segment.checkpoint_version
+        );
+        assert_eq!(left.log_segment.log_root, right.log_segment.log_root);
+        assert_eq!(left.log_segment.listed, right.log_segment.listed);
+    }
+
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version(
     ) -> DeltaResult<()> {
@@ -2674,7 +2698,7 @@ mod tests {
         let updated = Snapshot::builder_from(snapshot_v1).build(ctx.engine.as_ref())?;
         assert_eq!(updated.version(), 1);
         assert_eq!(updated.log_segment.checkpoint_version, Some(1));
-        assert_eq!(updated, fresh);
+        compare_snapshots(&updated, &fresh);
 
         Ok(())
     }
@@ -2708,7 +2732,7 @@ mod tests {
         let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
         assert_eq!(updated.version(), 3);
         assert_eq!(updated.log_segment.checkpoint_version, Some(2));
-        assert_eq!(updated, fresh);
+        compare_snapshots(&updated, &fresh);
 
         Ok(())
     }
@@ -2738,10 +2762,85 @@ mod tests {
 
         Ok(())
     }
+
+    // TODO(#2337): remove this test when log compaction is re-enabled.
+    #[tokio::test]
+    async fn test_compaction_files_ignored_on_read() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+        // Create commits 0-2 and write compaction files to storage
+        setup_test_table_with_commits(table_root, &store, 3).await?;
+        write_compaction_file(&store, 0, 1).await?;
+        write_compaction_file(&store, 0, 2).await?;
+
+        // Compaction files exist on disk but should be skipped during listing
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        assert!(
+            snapshot
+                .log_segment
+                .listed
+                .ascending_compaction_files
+                .is_empty(),
+            "Compaction files should be ignored when log compaction is disabled"
+        );
+
+        Ok(())
+    }
+
+    // TODO(#2337): remove this test when log compaction is re-enabled.
+    #[tokio::test]
+    async fn test_incremental_snapshot_ignores_compaction_files() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+        // Create commits 0-2 with compaction files in storage
+        setup_test_table_with_commits(table_root, &store, 3).await?;
+        write_compaction_file(&store, 0, 1).await?;
+        write_compaction_file(&store, 0, 2).await?;
+
+        // Build base snapshot at v2
+        let snapshot_v2 = Snapshot::builder_for(table_root)
+            .at_version(2)
+            .build(&engine)?;
+        assert_eq!(snapshot_v2.version(), 2);
+        assert!(snapshot_v2
+            .log_segment
+            .listed
+            .ascending_compaction_files
+            .is_empty());
+
+        // Add commit 3
+        commit(
+            table_root,
+            &store,
+            3,
+            vec![json!({"add": {"path": "file4.parquet", "partitionValues": {}, "size": 400, "modificationTime": 4000, "dataChange": true}})],
+        )
+        .await;
+
+        // Build v3 incrementally -- compaction files should still be skipped
+        let snapshot_v3 = Snapshot::builder_from(snapshot_v2)
+            .at_version(3)
+            .build(&engine)?;
+        assert_eq!(snapshot_v3.version(), 3);
+        assert!(snapshot_v3
+            .log_segment
+            .listed
+            .ascending_compaction_files
+            .is_empty());
+
+        Ok(())
+    }
+
+
     /// The incremental snapshot path (try_new_from_impl) re-lists files from the checkpoint
     /// version onwards. We must ensure that it deduplicates compaction files, since producing
     /// duplicates violated the sort invariant in LogSegmentFilesBuilder::build().
     #[tokio::test]
+    #[ignore = "log compaction disabled (#2337)"]
     async fn test_incremental_snapshot_with_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
@@ -2797,6 +2896,7 @@ mod tests {
     /// added after building the base snapshot at v2 gets filtered out because its start version
     /// (1) <= old_version (2).
     #[tokio::test]
+    #[ignore = "log compaction disabled (#2337)"]
     async fn test_incremental_snapshot_with_new_compaction_files() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";

@@ -7,13 +7,14 @@ use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{
     Field as ArrowField, Int64Type, Schema as ArrowSchema, TimeUnit,
 };
+use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred, Scalar,
 };
 use delta_kernel::log_segment::LogSegment;
-use delta_kernel::object_store::{memory::InMemory, path::Path, ObjectStore};
+use delta_kernel::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};
@@ -34,6 +35,19 @@ mod common;
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
 const PARQUET_FILE3: &str = "part-00002-c506e79a-0bf8-4e2b-a42b-9731b2e490ff-c000.snappy.parquet";
+
+#[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+/// Bridge the new `Path::join` method that deprecates `Path::child` in object_store 0.13.
+trait PathExt {
+    fn join(&self, other: &str) -> Self;
+}
+
+#[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+impl PathExt for Path {
+    fn join(&self, other: &str) -> Self {
+        self.child(other)
+    }
+}
 
 /// Convert all top-level fields in a RecordBatch to nullable, matching Delta table schema
 /// conventions where the table metadata declares columns as nullable.
@@ -988,13 +1002,13 @@ async fn partition_pruning_with_column_mapping(
     add_commit(table_root, storage.as_ref(), 0, actions.iter().join("\n")).await?;
     storage
         .put(
-            &Path::from("phys_category=A").child(PARQUET_FILE1),
+            &Path::from("phys_category=A").join(PARQUET_FILE1),
             record_batch_to_bytes(&batch).into(),
         )
         .await?;
     storage
         .put(
-            &Path::from("phys_category=B").child(PARQUET_FILE2),
+            &Path::from("phys_category=B").join(PARQUET_FILE2),
             record_batch_to_bytes(&batch).into(),
         )
         .await?;
@@ -1329,13 +1343,13 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
     add_commit(table_root, storage.as_ref(), 0, actions.iter().join("\n")).await?;
     storage
         .put(
-            &Path::from("id=1").child(PARQUET_FILE1),
+            &Path::from("id=1").join(PARQUET_FILE1),
             record_batch_to_bytes(&batch).into(),
         )
         .await?;
     storage
         .put(
-            &Path::from("id=2").child(PARQUET_FILE2),
+            &Path::from("id=2").join(PARQUET_FILE2),
             record_batch_to_bytes(&batch).into(),
         )
         .await?;

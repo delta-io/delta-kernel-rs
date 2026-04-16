@@ -95,11 +95,10 @@ mod tests {
     use crate::engine::default::DefaultEngineBuilder;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStore as _;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
     use url::Url;
 
-    #[cfg(feature = "catalog-managed")]
     #[tokio::test]
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
         let storage = Arc::new(InMemory::new());
@@ -116,6 +115,7 @@ mod tests {
         storage.put(&commit_path, actions.into()).await.unwrap();
 
         let snapshot = crate::snapshot::SnapshotBuilder::new_for(table_root)
+            .with_max_catalog_version(0)
             .build(&engine)
             .unwrap();
         // Try to commit a transaction with FileSystemCommitter

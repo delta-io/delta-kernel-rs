@@ -18,11 +18,11 @@ use crate::predicate_parser::parse_predicate;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::PredicateRef;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::Engine;
 use delta_kernel::Snapshot;
 use delta_kernel_unity_catalog::UCKernelClient;
-use object_store::local::LocalFileSystem;
 use unity_catalog_delta_client_api::{Error as UcApiError, Operation};
 use unity_catalog_delta_rest_client::{
     ClientConfig, Error as UcRestError, UCClient, UCCommitsRestClient,
@@ -41,7 +41,7 @@ pub trait WorkloadRunner {
 }
 
 fn build_engine(
-    store: Arc<dyn object_store::ObjectStore>,
+    store: Arc<delta_kernel::object_store::DynObjectStore>,
     runtime: Arc<tokio::runtime::Runtime>,
 ) -> Arc<dyn Engine> {
     let executor = TokioMultiThreadExecutor::new(runtime.handle().clone());
@@ -154,7 +154,7 @@ fn resolve_snapshot_strategy(
         ("secret_access_key", aws.secret_access_key.as_str()),
         ("session_token", aws.session_token.as_str()),
     ];
-    let (store, _) = object_store::parse_url_opts(&table_url, options)?;
+    let (store, _) = delta_kernel::object_store::parse_url_opts(&table_url, options)?;
     let engine = build_engine(store.into(), runtime);
 
     let is_catalog_managed = uc_properties
@@ -194,7 +194,7 @@ fn resolve_engine_for_url(
                     opts.push((opt_key, v));
                 }
             }
-            let (store, _) = object_store::parse_url_opts(url, opts)?;
+            let (store, _) = delta_kernel::object_store::parse_url_opts(url, opts)?;
             Ok(build_engine(store.into(), runtime))
         }
         "file" => Ok(build_engine(Arc::new(LocalFileSystem::new()), runtime)),
@@ -229,7 +229,7 @@ impl ReadMetadataRunner {
         let predicate = read_spec
             .predicate
             .as_deref()
-            .map(parse_predicate)
+            .map(|sql| parse_predicate(sql, &snapshot.schema()))
             .transpose()?
             .map(Arc::new);
 

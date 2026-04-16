@@ -63,20 +63,23 @@ pub fn execute_read_workload(
     table_root: &Url,
     read_spec: &ReadSpec,
 ) -> DeltaResult<ReadResult> {
-    // Parse predicate if present
-    let predicate = read_spec
-        .predicate
-        .as_deref()
-        .map(|p| parse_predicate(p))
-        .transpose()
-        .map_err(|e| Error::generic(format!("Failed to parse predicate: {e}")))?;
-
     let snapshot = build_snapshot(engine.as_ref(), table_root, read_spec.time_travel.as_ref())?;
 
     let table_schema = snapshot.schema();
 
-    // Build scan with column projection (no predicate pushdown - we filter after)
+    // Build scan with optional predicate and column projection
     let mut scan_builder = snapshot.scan_builder();
+
+    // Extract and parse the predicate if one is present
+    let predicate = if let Some(ref predicate_string) = read_spec.predicate {
+        let predicate = parse_predicate(predicate_string, &table_schema).map_err(Error::generic)?;
+        let predicate = Arc::new(predicate);
+        scan_builder = scan_builder.with_predicate(predicate.clone());
+        Some(predicate)
+    } else {
+        None
+    };
+
     if let Some(ref cols) = read_spec.columns {
         let projected_schema = table_schema.project(cols)?;
         scan_builder = scan_builder.with_schema(projected_schema);
@@ -85,14 +88,12 @@ pub fn execute_read_workload(
 
     let schema = scan.logical_schema().clone();
 
-    // Execute scan to get all batches
+    // Execute scan and apply row-level filtering
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|data| data?.try_into_record_batch())
         .try_collect()?;
-
-    // Filter batches using the predicate if present
-    let batches = filter_batches_with_predicate(batches, predicate.as_ref())?;
+    let batches = filter_batches_with_predicate(batches, predicate.as_deref())?;
 
     // Compute row count from filtered batches
     let row_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();

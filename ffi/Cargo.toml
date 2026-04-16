@@ -25,7 +25,7 @@ url = "2"
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
-delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.20.0" }
+delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.21.0" }
 delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog", optional = true }
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api", optional = true }
 
@@ -51,9 +51,9 @@ default-engine-native-tls = ["delta_kernel/default-engine-native-tls", "default-
 default-engine-rustls = ["delta_kernel/default-engine-rustls", "default-engine-base"]
 catalog-managed = ["delta_kernel/catalog-managed"]
 delta-kernel-unity-catalog = [ "dep:delta-kernel-unity-catalog", "dep:unity-catalog-delta-client-api" ]
-arrow = ["arrow-57"]
+arrow = ["arrow-58"]
+arrow-58 = ["delta_kernel/arrow-58"]
 arrow-57 = ["delta_kernel/arrow-57"]
-arrow-56 = ["delta_kernel/arrow-56"]
 
 # This is an 'internal' feature flag which has all the shared bits from default-engine-native-tls and
 # default-engine-rustls. There is a check in kernel/lib.rs to ensure you have enabled one of
