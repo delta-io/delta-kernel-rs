@@ -1,0 +1,21 @@
+name: Validate PR Body
+
+on:
+  pull_request:
+    types: [opened, edited]
+  merge_group:
+
+jobs:
+  validate-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR Body
+        shell: bash
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [[ "$var" =~ ^[[:ascii:]]*$ ]]; then
+            echo "All ASCII"
+          else
+            echo "Contains non-ASCII characters"
+          fi
