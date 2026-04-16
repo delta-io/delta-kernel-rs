@@ -29,7 +29,7 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
-use delta_kernel::transaction::{CommitResult, PathMode};
+use delta_kernel::transaction::CommitResult;
 use tempfile::TempDir;
 
 use test_utils::set_json_value;
@@ -4140,7 +4140,7 @@ async fn test_clustered_table_write_has_stats_parsed(
     Ok(())
 }
 
-// === PathMode tests ===
+// === Path format tests ===
 
 fn get_simple_schema() -> SchemaRef {
     Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap())
@@ -4154,18 +4154,16 @@ fn simple_id_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
     .unwrap()
 }
 
-/// Helper to write a batch with a specific PathMode and return the post-commit snapshot.
-async fn write_with_path_mode(
+/// Helper to write a batch and return the post-commit snapshot.
+async fn write_batch_to_table_simple(
     snapshot: &Arc<Snapshot>,
     engine: &DefaultEngine<TokioBackgroundExecutor>,
     data: RecordBatch,
-    path_mode: PathMode,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
-        .with_engine_info("test")
-        .with_path_mode(path_mode);
+        .with_engine_info("test");
     let write_context = txn.unpartitioned_write_context()?;
     let add_meta = engine
         .write_parquet(&ArrowEngineData::new(data), &write_context)
@@ -4175,40 +4173,28 @@ async fn write_with_path_mode(
     Ok(committed.post_commit_snapshot().unwrap().clone())
 }
 
-#[rstest::rstest]
-#[case::relative(PathMode::Relative)]
-#[case::absolute(PathMode::Absolute)]
 #[tokio::test]
-async fn test_path_mode_write_format_and_readback(
-    #[case] path_mode: PathMode,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_write_uses_relative_paths_and_readback() -> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_schema();
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
 
-    let snapshot = write_with_path_mode(
+    let snapshot = write_batch_to_table_simple(
         &snapshot,
         engine.as_ref(),
         simple_id_batch(&schema, vec![1, 2, 3]),
-        path_mode,
     )
     .await?;
 
-    // Verify path format in the log
+    // Verify paths in the log are relative (no scheme like "s3://")
     let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
     assert_eq!(add_infos.len(), 1);
     let path = &add_infos[0].path;
-    match path_mode {
-        PathMode::Relative => assert!(
-            !path.contains("://"),
-            "Relative mode should write relative paths, got: {path}"
-        ),
-        PathMode::Absolute => assert!(
-            path.contains("://"),
-            "Absolute mode should write absolute URLs, got: {path}"
-        ),
-    }
+    assert!(
+        !path.contains("://"),
+        "should produce relative paths, got: {path}"
+    );
 
     // Verify data is readable via scan
     let scan = snapshot.scan_builder().build()?;
@@ -4216,37 +4202,6 @@ async fn test_path_mode_write_format_and_readback(
     let batches = test_utils::read_scan(&scan, engine_ref)?;
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 3);
-
-    Ok(())
-}
-
-#[rstest::rstest]
-#[case::default_is_relative(None, true)]
-#[case::explicit_relative(Some(PathMode::Relative), true)]
-#[case::explicit_absolute(Some(PathMode::Absolute), false)]
-#[test]
-fn test_write_context_propagates_path_mode(
-    #[case] set_mode: Option<PathMode>,
-    #[case] expect_relative: bool,
-) -> DeltaResult<()> {
-    let schema = get_simple_schema();
-    let (_tmp_dir, table_path, engine) = test_table_setup()?;
-    let snapshot =
-        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
-    let file_url = snapshot.table_root().join("test.parquet").unwrap();
-
-    let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-    if let Some(mode) = set_mode {
-        txn = txn.with_path_mode(mode);
-    }
-    let wc = txn.unpartitioned_write_context()?;
-    let resolved = wc.resolve_file_path(&file_url)?;
-
-    if expect_relative {
-        assert_eq!(resolved, "test.parquet");
-    } else {
-        assert_eq!(resolved, file_url.as_str());
-    }
 
     Ok(())
 }
@@ -4316,20 +4271,15 @@ async fn test_multiple_commits_with_relative_paths_all_readable(
     Ok(())
 }
 
-#[rstest::rstest]
-#[case::relative(PathMode::Relative)]
-#[case::absolute(PathMode::Absolute)]
 #[tokio::test]
-async fn test_create_table_with_data_path_mode(
-    #[case] path_mode: PathMode,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_create_table_with_data_uses_relative_paths() -> Result<(), Box<dyn std::error::Error>>
+{
     let schema = get_simple_schema();
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
 
     let mut txn = create_table_txn(table_url.as_str(), schema.clone(), "test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .with_path_mode(path_mode);
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let write_context = txn.unpartitioned_write_context()?;
     let add_meta = engine
         .write_parquet(
@@ -4344,16 +4294,10 @@ async fn test_create_table_with_data_path_mode(
     let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
     assert_eq!(add_infos.len(), 1);
     let path = &add_infos[0].path;
-    match path_mode {
-        PathMode::Relative => assert!(
-            !path.contains("://"),
-            "Relative mode should write relative paths, got: {path}"
-        ),
-        PathMode::Absolute => assert!(
-            path.contains("://"),
-            "Absolute mode should write absolute URLs, got: {path}"
-        ),
-    }
+    assert!(
+        !path.contains("://"),
+        "should produce relative paths, got: {path}"
+    );
 
     // Verify data is readable
     let scan = snapshot.scan_builder().build()?;
