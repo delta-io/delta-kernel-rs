@@ -298,14 +298,10 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     }
 }
 
-/// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values,
-/// path mode, and table root from the provided [`WriteContext`].
+/// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values and
+/// table root from the provided [`WriteContext`].
 ///
-/// The path format in the returned Add action metadata (relative vs absolute) is controlled
-/// by the [`PathMode`] set on the transaction. Relative paths are computed relative to the
-/// table root URL.
-///
-/// [`PathMode`]: crate::transaction::PathMode
+/// Paths in the returned Add action metadata are stored relative to the table root.
 ///
 /// This is the public API for building Add action metadata from file write results. Custom
 /// Arrow-based engines that write parquet files themselves (bypassing [`DefaultEngine::write_parquet`])
