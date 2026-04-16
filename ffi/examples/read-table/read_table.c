@@ -132,6 +132,91 @@ void do_visit_scan_metadata(void* engine_context, HandleSharedScanMetadata scan_
   free_scan_metadata(scan_metadata);
 }
 
+// === Arrow batch-mode scan metadata ===
+//
+// Alternative to the callback-based scan_metadata_next + visit_scan_metadata path above.
+// Returns scan file metadata as an Arrow RecordBatch (via C Data Interface) plus a selection
+// vector and per-row transforms, avoiding per-row FFI overhead.
+//
+// This is useful for engines that can process Arrow data natively -- they can extract file
+// paths, sizes, deletion vector descriptors, and partition values directly from batch columns
+// rather than receiving them one-at-a-time via callbacks.
+#ifdef PRINT_ARROW_DATA
+void iterate_scan_metadata_arrow(
+  struct EngineContext* context,
+  SharedScanMetadataIterator* data_iter)
+{
+  for (;;) {
+    ExternResultScanMetadataArrowResult res =
+      scan_metadata_next_arrow(data_iter, context->engine);
+    if (res.tag != OkScanMetadataArrowResult) {
+      print_error("Failed to get arrow scan metadata.", (Error*)res.err);
+      free_error((Error*)res.err);
+      return;
+    }
+    ScanMetadataArrowResult* result = res.ok;
+    if (!result) {
+      print_diag("Arrow scan metadata iterator done\n");
+      break;
+    }
+
+    // Import the Arrow batch via C Data Interface
+    GError* error = NULL;
+    GArrowSchema* schema =
+      garrow_schema_import((gpointer)&result->arrow_data.schema, &error);
+    if (!schema) {
+      printf("Failed to import arrow schema: %s\n", error->message);
+      g_error_free(error);
+      free_scan_metadata_arrow_result(result);
+      return;
+    }
+    GArrowRecordBatch* batch =
+      garrow_record_batch_import((gpointer)&result->arrow_data.array, schema, &error);
+    if (!batch) {
+      printf("Failed to import arrow batch: %s\n", error->message);
+      g_error_free(error);
+      g_object_unref(schema);
+      free_scan_metadata_arrow_result(result);
+      return;
+    }
+
+    // Count selected rows from the selection vector
+    int64_t num_rows = garrow_record_batch_get_n_rows(batch);
+    uintptr_t selected_count = 0;
+    for (uintptr_t i = 0; i < result->selection_vector.len; i++) {
+      if (result->selection_vector.ptr[i]) {
+        selected_count++;
+      }
+    }
+    print_diag("Arrow scan metadata batch: %" PRId64 " rows, %" PRIuPTR " selected (files to scan)\n",
+               num_rows, selected_count);
+
+    // Access per-row transforms -- an engine would apply these when reading each file
+    for (uintptr_t i = 0; i < result->selection_vector.len; i++) {
+      if (!result->selection_vector.ptr[i]) {
+        continue;
+      }
+      struct OptionalValueHandleSharedExpression transform =
+        get_transform_for_row(i, result->transforms);
+      if (transform.tag == SomeHandleSharedExpression) {
+        print_diag("  row %" PRIuPTR ": has transform\n", i);
+        free_kernel_expression(transform.some);
+      } else {
+        print_diag("  row %" PRIuPTR ": no transform needed\n", i);
+      }
+    }
+
+    // A real engine would extract file paths, sizes, DV info, and partition values
+    // from the batch columns (path, size, modificationTime, stats, deletionVector,
+    // fileConstantValues) and use read_parquet_file() to read each file's data.
+
+    g_object_unref(batch);
+    g_object_unref(schema);
+    free_scan_metadata_arrow_result(result);
+  }
+}
+#endif // PRINT_ARROW_DATA
+
 // Called for each element of the partition StringSliceIterator. We just turn the slice into a
 // `char*` and append it to our list. We knew the total number of partitions up front, so this
 // assumes that `list->cols` has been allocated with enough space to store the pointer.
