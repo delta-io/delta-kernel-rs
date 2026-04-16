@@ -73,10 +73,8 @@ impl DataFileMetadata {
     /// converts nulls and empty strings to `None` before reaching this method, so `Some("")`
     /// is not expected in normal usage.
     ///
-    /// The `log_path` is the path string written to the Delta log's `add.path` field. The
-    /// caller determines whether this is relative or absolute based on [`PathMode`].
+    /// The `log_path` is the path string written to the Delta log's `add.path` field.
     ///
-    /// [`PathMode`]: crate::transaction::PathMode
     /// [`Transaction::add_files_schema`]: crate::transaction::Transaction::add_files_schema
     pub(crate) fn as_record_batch(
         &self,
@@ -230,11 +228,6 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     ///
     /// Note that the schema does not contain the dataChange column. In order to set `data_change`
     /// flag, use [`crate::transaction::Transaction::with_data_change`].
-    ///
-    /// The path format (relative or absolute) is controlled by the [`PathMode`] set on
-    /// the transaction.
-    ///
-    /// [`PathMode`]: crate::transaction::PathMode
     ///
     /// [`WriteContext::write_dir`]: crate::transaction::WriteContext::write_dir
     /// [`Transaction::add_files`]: crate::transaction::Transaction::add_files

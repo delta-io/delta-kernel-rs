@@ -16,7 +16,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
-use super::{PathMode, Transaction};
+use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::committer::Committer;
@@ -89,7 +89,6 @@ impl Transaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
-            path_mode: PathMode::default(),
             shared_write_state: OnceLock::new(),
             _state: PhantomData,
         })
