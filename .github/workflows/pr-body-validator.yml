@@ -6,7 +6,7 @@ on:
   merge_group:
 
 jobs:
-  validate-title:
+  validate-body:
     runs-on: ubuntu-latest
     steps:
       - name: Validate PR Body
@@ -14,7 +14,7 @@ jobs:
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          if [[ "$var" =~ ^[[:ascii:]]*$ ]]; then
+          if [[ "$PR_BODY" =~ ^[[:ascii:]]*$ ]]; then
             echo "All ASCII"
           else
             echo "Contains non-ASCII characters"
