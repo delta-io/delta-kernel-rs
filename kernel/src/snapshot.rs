@@ -2661,7 +2661,6 @@ mod tests {
         Ok(IncrementalSnapshotTestContext { store, url, engine })
     }
 
-
     /// Compares two Snapshots field-by-field. LogSegment fields are compared individually,
     /// intentionally skipping `last_checkpoint_metadata` which is only populated on the
     /// from-scratch path (via `_last_checkpoint` hint) and not on the incremental update path.
@@ -2675,7 +2674,6 @@ mod tests {
         assert_eq!(left.log_segment.log_root, right.log_segment.log_root);
         assert_eq!(left.log_segment.listed, right.log_segment.listed);
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_snapshot_picks_up_checkpoint_written_at_current_version(
@@ -2834,7 +2832,6 @@ mod tests {
 
         Ok(())
     }
-
 
     /// The incremental snapshot path (try_new_from_impl) re-lists files from the checkpoint
     /// version onwards. We must ensure that it deduplicates compaction files, since producing

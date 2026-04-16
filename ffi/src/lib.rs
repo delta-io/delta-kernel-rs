@@ -1503,7 +1503,6 @@ mod tests {
         snapshot_builder_build(ptr)
     }
 
-
     pub(crate) fn get_default_engine(path: &str) -> Handle<SharedExternEngine> {
         let path = kernel_string_slice!(path);
         let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };
@@ -2368,7 +2367,6 @@ mod tests {
         unsafe { free_engine(engine) };
         Ok(())
     }
-
 
     #[tokio::test]
     async fn test_builder_with_nonexistent_path_returns_error(

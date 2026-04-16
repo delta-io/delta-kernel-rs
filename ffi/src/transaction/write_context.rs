@@ -73,7 +73,7 @@ pub unsafe extern "C" fn get_write_schema(
     write_context: Handle<SharedWriteContext>,
 ) -> Handle<SharedSchema> {
     let write_context = unsafe { write_context.as_ref() };
-    write_context.logical_schema().raw_schema().clone().into()
+    write_context.logical_schema().clone().into()
 }
 
 /// Get the table root URL from a WriteContext handle. Returns the table root, not the

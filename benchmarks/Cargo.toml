@@ -20,7 +20,7 @@ tar = "0.4"
 ureq = "3.1"
 
 [dependencies]
-delta_kernel = { path = "../kernel", features = ["default-engine-rustls", "internal-api", "catalog-managed"] }
+delta_kernel = { path = "../kernel", features = ["default-engine-rustls", "internal-api"] }
 delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog" }
 itertools = "0.14"
 object_store = { version = "0.12.3", features = ["aws"] }

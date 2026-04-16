@@ -29,9 +29,7 @@ use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
-use crate::schema::{
-    ArrayType, LogicalSchema, MapType, SchemaRef, StructField, StructType, StructTypeBuilder,
-};
+use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::utils::require;
@@ -1249,7 +1247,11 @@ impl<S> Transaction<S> {
                     .into(),
             )
             .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-            .with_dropped_field("modificationTime");
+            .with_dropped_field("modificationTime")
+            // Scan results may include these optional columns depending on table configuration.
+            // They are not part of the remove action schema and must be dropped.
+            .with_dropped_field_if_exists("stats_parsed")
+            .with_dropped_field_if_exists("partitionValues_parsed");
 
         // Drop any additional columns specified in columns_to_drop
         for column_to_drop in columns_to_drop {
@@ -1696,7 +1698,7 @@ mod tests {
 
         let handler = ArrowEvaluationHandler;
         let evaluator = handler.new_expression_evaluator(
-            wc.logical_schema().raw_schema().clone(),
+            wc.logical_schema().clone(),
             l2p,
             physical_schema.clone().into(),
         )?;
@@ -2101,20 +2103,43 @@ mod tests {
 
     // ── WriteContext::physical_partition_values ──────────────────────────────
 
+    /// Helper: loads a test table snapshot and returns a transaction. Useful for tests
+    /// that need to call partitioned_write_context or unpartitioned_write_context directly.
+    fn snapshot_and_txn(
+        table_path: &str,
+    ) -> Result<(Arc<Snapshot>, Transaction), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+        let txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        Ok((snapshot, txn))
+    }
+
     #[test]
-    fn physical_partition_values_empty() -> Result<(), Box<dyn std::error::Error>> {
-        let (_, wc) = snapshot_and_write_context("./tests/data/partition_cm/none")?;
-        assert!(wc.physical_partition_values(HashMap::new())?.is_empty());
+    fn physical_partition_values_empty_for_unpartitioned_table(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_, txn) = snapshot_and_txn("./tests/data/app-txn-with-last-updated")?;
+        let wc = txn.unpartitioned_write_context()?;
+        assert!(wc.physical_partition_values().is_empty());
         Ok(())
     }
 
     #[test]
     fn physical_partition_values_none_mode_identity() -> Result<(), Box<dyn std::error::Error>> {
         // In None mode logical name == physical name
-        let (_, wc) = snapshot_and_write_context("./tests/data/partition_cm/none")?;
-        let input = HashMap::from([("category".to_string(), "foo".to_string())]);
-        let result = wc.physical_partition_values(input)?;
-        assert_eq!(result.get("category").map(String::as_str), Some("foo"));
+        let (_, txn) = snapshot_and_txn("./tests/data/partition_cm/none")?;
+        let wc = txn.partitioned_write_context(HashMap::from([(
+            "category".to_string(),
+            Scalar::String("foo".to_string()),
+        )]))?;
+        let result = wc.physical_partition_values();
+        assert_eq!(
+            result.get("category").and_then(|v| v.as_deref()),
+            Some("foo")
+        );
         Ok(())
     }
 
@@ -2124,21 +2149,31 @@ mod tests {
     fn physical_partition_values_column_mapping_translates_to_physical(
         #[case] table_path: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (_, wc) = snapshot_and_write_context(table_path)?;
-        let input = HashMap::from([("category".to_string(), "foo".to_string())]);
-        let result = wc.physical_partition_values(input)?;
+        let (_, txn) = snapshot_and_txn(table_path)?;
+        let wc = txn.partitioned_write_context(HashMap::from([(
+            "category".to_string(),
+            Scalar::String("foo".to_string()),
+        )]))?;
+        let result = wc.physical_partition_values();
         // The physical name is the UUID-based name, not "category"
         assert!(!result.contains_key("category"), "should use physical name");
         assert_eq!(result.len(), 1);
-        assert_eq!(result.values().next().map(String::as_str), Some("foo"));
+        assert_eq!(
+            result.values().next().and_then(|v| v.as_deref()),
+            Some("foo")
+        );
         Ok(())
     }
 
     #[test]
     fn physical_partition_values_unknown_column_errors() -> Result<(), Box<dyn std::error::Error>> {
-        let (_, wc) = snapshot_and_write_context("./tests/data/partition_cm/none")?;
-        let input = HashMap::from([("no_such_col".to_string(), "x".to_string())]);
-        let err = wc.physical_partition_values(input).unwrap_err();
+        let (_, txn) = snapshot_and_txn("./tests/data/partition_cm/none")?;
+        let err = txn
+            .partitioned_write_context(HashMap::from([(
+                "no_such_col".to_string(),
+                Scalar::String("x".to_string()),
+            )]))
+            .unwrap_err();
         assert!(err.to_string().contains("no_such_col"));
         Ok(())
     }
@@ -2165,8 +2200,8 @@ mod tests {
         let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.unpartitioned_write_context().unwrap();
         crate::utils::test_utils::validate_physical_schema_column_mapping(
-            write_context.logical_schema().raw_schema(),
-            write_context.physical_schema(),
+            write_context.logical_schema().as_ref(),
+            write_context.physical_schema().as_ref(),
             mode,
         );
         Ok(())
@@ -2270,7 +2305,7 @@ mod tests {
         use crate::arrow::array::Float64Array;
         let (_snap, wc) = snapshot_and_partitioned_write_context(table_path)?;
         let batch = RecordBatch::try_new(
-            Arc::new(wc.logical_schema().raw_schema().as_ref().try_into_arrow()?),
+            Arc::new(wc.logical_schema().as_ref().try_into_arrow()?),
             vec![
                 Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![42])),

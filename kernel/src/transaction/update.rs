@@ -473,7 +473,11 @@ impl<S> Transaction<S> {
                     "deletionVector",
                     Expression::column([NEW_DELETION_VECTOR_NAME]).into(),
                 )
-                .with_dropped_field(NEW_DELETION_VECTOR_NAME),
+                .with_dropped_field(NEW_DELETION_VECTOR_NAME)
+                // Scan results may include these optional columns depending on table configuration.
+                // They are not part of the scan row schema and must be dropped.
+                .with_dropped_field_if_exists("stats_parsed")
+                .with_dropped_field_if_exists("partitionValues_parsed"),
         );
         let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
             intermediate_dv_schema().clone(),

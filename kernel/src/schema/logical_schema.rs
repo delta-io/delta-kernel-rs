@@ -140,6 +140,7 @@ impl LogicalSchema {
 
     /// Returns `true` if the logical schema contains a top-level field with the given name.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn contains_top_level(&self, name: impl AsRef<str>) -> bool {
         self.schema.contains(name)
     }
@@ -166,6 +167,7 @@ impl LogicalSchema {
     }
 
     /// Returns the physical name for the given top-level logical column name, or `None` if not found.
+    #[allow(dead_code)]
     pub(crate) fn top_level_logical_to_physical_name<'a>(
         &'a self,
         logical_name: &str,
@@ -366,6 +368,7 @@ impl LogicalSchema {
     ///
     /// `include_partition_cols`: if false, partition columns are excluded from the result
     /// (they are stored in the file path, not in the data).
+    #[allow(dead_code)]
     pub(crate) fn compute_write_physical_schema(&self, include_partition_cols: bool) -> SchemaRef {
         let fields = self
             .schema

@@ -20,7 +20,7 @@ arrow-58 = ["delta_kernel/arrow-58"]
 arrow-57 = ["delta_kernel/arrow-57"]
 
 [dependencies]
-delta_kernel = { path = "../kernel", features = ["catalog-managed", "internal-api"] }
+delta_kernel = { path = "../kernel", features = ["internal-api"] }
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api" }
 itertools = "0.14"
 serde = { version = "1.0", features = ["derive"] }
@@ -31,7 +31,7 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-delta_kernel = { path = "../kernel", features = ["default-engine-rustls", "catalog-managed", "test-utils", "internal-api"] }
+delta_kernel = { path = "../kernel", features = ["default-engine-rustls", "test-utils", "internal-api"] }
 unity-catalog-delta-rest-client = { path = "../unity-catalog-delta-rest-client", features = ["test-utils"] }
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api" }
 tempfile = "3"
