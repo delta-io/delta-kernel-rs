@@ -61,11 +61,10 @@ cargo fmt \
 
 ### Feature Flags
 
-- `default-engine` / `default-engine-rustls` / `default-engine-native-tls` -- async
-  Arrow/Tokio engine (pick one TLS backend)
+- `default-engine-rustls` / `default-engine-native-tls` -- async Arrow/Tokio engine (pick a TLS backend)
 - `arrow`, `arrow-XX`, `arrow-YY` -- Arrow version selection (kernel tracks the latest two
   major Arrow releases; `arrow` defaults to latest). Kernel itself does not depend on Arrow,
-  but default-engine does.
+  but the default engine does.
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `clustered-table` -- clustered table write support (experimental)
