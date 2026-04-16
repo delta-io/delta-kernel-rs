@@ -2368,3 +2368,63 @@ fn timestamp_truncation_real_table_eq() -> Result<(), Box<dyn std::error::Error>
         ],
     )
 }
+
+// Verifies per-column degradation when stats_parsed has a type mismatch due to schema
+// evolution. The parquet reader null-pads the mismatched column, so data skipping still
+// works for columns with compatible types.
+//
+// Table: v1-struct-stats-schema-evolution -- checkpoint at v5 with stats_parsed for schema
+// (id: long, value: string), writeStatsAsJson=false. V6 commit evolves schema to
+// (id: long, value: long) and adds one file with JSON stats.
+//
+// The checkpoint's stats_parsed.minValues.value is string while the current schema expects
+// long. The parquet reader null-pads the mismatched value column, so data skipping has no
+// stats for value but still works for id.
+//
+// With predicate `id > 3 AND value > 5`:
+//   - 2 checkpoint files survive (id=4, id=5; id stats work, value stats null-padded)
+//   - 1 v6 file survives (has JSON stats: id=10, value=10)
+//   - 3 checkpoint files pruned (id=1, id=2, id=3; max(id) <= 3)
+#[test]
+fn stats_parsed_type_mismatch_degrades_to_per_column_skipping(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_path = std::fs::canonicalize("./tests/data/v1-struct-stats-schema-evolution/")?;
+    let url = Url::from_directory_path(&table_path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    let schema = snapshot.schema();
+    let value_field = schema.field("value").expect("value field exists");
+    assert_eq!(
+        value_field.data_type(),
+        &DataType::LONG,
+        "Table schema should have value: long after evolution"
+    );
+
+    let predicate = Arc::new(Pred::and(
+        column_expr!("id").gt(Expr::literal(3i64)),
+        column_expr!("value").gt(Expr::literal(5i64)),
+    ));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Some(predicate))
+        .build()?;
+
+    let scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+    let mut total_files = 0;
+    for res in scan_metadata_iter {
+        let scan_metadata = res?;
+        let file_count = scan_metadata.visit_scan_files(0usize, |count, _scan_file| {
+            *count += 1;
+        })?;
+        total_files += file_count;
+    }
+
+    assert_eq!(
+        total_files, 3,
+        "Expected 3 files: id=4 and id=5 from checkpoint (id stats work, value \
+         null-padded) + 1 new file from v6."
+    );
+
+    Ok(())
+}

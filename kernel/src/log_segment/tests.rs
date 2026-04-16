@@ -3015,7 +3015,7 @@ async fn test_max_published_version_checkpoint_only() {
 }
 
 // ============================================================================
-// schema_has_compatible_stats_parsed tests
+// checkpoint_has_stats_parsed tests
 // ============================================================================
 
 // Helper to create a checkpoint schema with stats_parsed for testing
@@ -3037,18 +3037,6 @@ fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField
     StructType::new_unchecked([StructField::nullable("add", add_schema)])
 }
 
-// Helper to create a stats_schema with proper structure (numRecords, minValues, maxValues)
-fn create_stats_schema(column_fields: Vec<StructField>) -> StructType {
-    StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
-        StructField::nullable(
-            "minValues",
-            StructType::new_unchecked(column_fields.clone()),
-        ),
-        StructField::nullable("maxValues", StructType::new_unchecked(column_fields)),
-    ])
-}
-
 // Helper to create a checkpoint schema without stats_parsed
 fn create_checkpoint_schema_without_stats_parsed() -> StructType {
     use crate::schema::StructType;
@@ -3062,482 +3050,57 @@ fn create_checkpoint_schema_without_stats_parsed() -> StructType {
 }
 
 #[test]
-fn test_schema_has_compatible_stats_parsed_basic() {
-    // Create a checkpoint schema with stats_parsed containing an integer column
+fn test_checkpoint_has_stats_parsed_basic() {
     let checkpoint_schema =
         create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
             "id",
             DataType::INTEGER,
         )]);
+    assert!(LogSegment::checkpoint_has_stats_parsed(&checkpoint_schema));
+}
 
-    // Exact type match should work
-    let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-
-    // Type widening (int -> long) should work
-    let stats_schema_widened =
-        create_stats_schema(vec![StructField::nullable("id", DataType::LONG)]);
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema_widened
-    ));
-
-    // Incompatible type (string -> int) should fail
-    let checkpoint_schema_string =
+#[test]
+fn test_checkpoint_has_stats_parsed_type_mismatch_still_usable() {
+    // Type mismatch (checkpoint has string, schema needs integer) is still usable --
+    // the parquet reader null-pads incompatible fields instead of erroring.
+    let checkpoint_schema =
         create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
             "id",
             DataType::STRING,
         )]);
-    assert!(!LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema_string,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_missing_column_ok() {
-    // Checkpoint has "id" column, stats schema needs "other" column
-    // Missing column is acceptable - it will return null when accessed
-    let checkpoint_schema =
-        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
-            "id",
-            DataType::INTEGER,
-        )]);
-
-    let stats_schema = create_stats_schema(vec![StructField::nullable("other", DataType::INTEGER)]);
-
-    // Missing column in checkpoint is OK - it will return null when accessed,
-    // which is acceptable for data skipping (just means we can't skip based on that column)
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_extra_column_ok() {
-    // Checkpoint has extra columns not needed by stats schema (should be OK)
-    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("extra", DataType::STRING),
-    ]);
-
-    let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
-
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_no_stats_parsed() {
-    // Checkpoint schema without stats_parsed field
-    let checkpoint_schema = create_checkpoint_schema_without_stats_parsed();
-
-    let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
-
-    assert!(!LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_empty_stats_schema() {
-    // Empty stats schema (no columns needed for data skipping)
-    let checkpoint_schema =
-        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
-            "id",
-            DataType::INTEGER,
-        )]);
-
-    let stats_schema = create_stats_schema(vec![]);
-
-    // If no columns are needed for data skipping, any stats_parsed is compatible
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_multiple_columns() {
-    // Multiple columns - check that we iterate over all columns and find incompatibility
-    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
-        StructField::nullable("good_col", DataType::LONG),
-        StructField::nullable("bad_col", DataType::STRING),
-    ]);
-
-    // First column matches, second is incompatible
-    let stats_schema = create_stats_schema(vec![
-        StructField::nullable("good_col", DataType::LONG),
-        StructField::nullable("bad_col", DataType::INTEGER),
-    ]);
-
-    assert!(!LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
-    // stats_parsed exists but has no minValues/maxValues fields - unusual but valid (continue case)
-    let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
-        // No minValues or maxValues fields
-    ]);
-
-    let add_schema = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("stats_parsed", stats_parsed),
-    ]);
-
-    let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
-
-    let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
-
-    // Should return true - missing minValues/maxValues is handled gracefully with continue
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_min_values_not_struct() {
-    // minValues/maxValues exist but are not Struct types - malformed schema (return false case)
-    let stats_parsed = StructType::new_unchecked([
-        StructField::nullable("numRecords", DataType::LONG),
-        // minValues is a primitive type instead of a Struct
-        StructField::nullable("minValues", DataType::STRING),
-        StructField::nullable("maxValues", DataType::STRING),
-    ]);
-
-    let add_schema = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("stats_parsed", stats_parsed),
-    ]);
-
-    let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
-
-    let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
-
-    // Should return false - minValues/maxValues must be Struct types
-    assert!(!LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_nested_struct() {
-    // Create a nested struct: user: { name: string, age: integer }
-    let user_struct = StructType::new_unchecked([
-        StructField::nullable("name", DataType::STRING),
-        StructField::nullable("age", DataType::INTEGER),
-    ]);
-
-    let checkpoint_schema =
-        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
-            "user",
-            user_struct.clone(),
-        )]);
-
-    // Exact match should work
-    let stats_schema = create_stats_schema(vec![StructField::nullable("user", user_struct)]);
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_nested_struct_with_extra_fields() {
-    // Checkpoint has extra nested fields not needed by stats schema
-    let checkpoint_user = StructType::new_unchecked([
-        StructField::nullable("name", DataType::STRING),
-        StructField::nullable("age", DataType::INTEGER),
-        StructField::nullable("extra", DataType::STRING), // extra field
-    ]);
-
-    let checkpoint_schema =
-        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
-            "user",
-            checkpoint_user,
-        )]);
-
-    // Stats schema only needs a subset of fields
-    let stats_user = StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
-
-    let stats_schema = create_stats_schema(vec![StructField::nullable("user", stats_user)]);
-
-    // Extra fields in checkpoint nested struct should be OK
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_nested_struct_missing_field_ok() {
-    // Checkpoint is missing a nested field that stats schema needs
-    let checkpoint_user =
-        StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
-
-    let checkpoint_schema =
-        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
-            "user",
-            checkpoint_user,
-        )]);
-
-    // Stats schema needs more fields than checkpoint has
-    let stats_user = StructType::new_unchecked([
-        StructField::nullable("name", DataType::STRING),
-        StructField::nullable("age", DataType::INTEGER), // missing in checkpoint
-    ]);
-
-    let stats_schema = create_stats_schema(vec![StructField::nullable("user", stats_user)]);
-
-    // Missing nested field is OK - it will return null when accessed
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_nested_struct_type_mismatch() {
-    // Checkpoint has incompatible type in nested field
-    let checkpoint_user = StructType::new_unchecked([
-        StructField::nullable("name", DataType::INTEGER), // wrong type!
-    ]);
-
-    let checkpoint_schema =
-        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
-            "user",
-            checkpoint_user,
-        )]);
-
-    let stats_user = StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
-
-    let stats_schema = create_stats_schema(vec![StructField::nullable("user", stats_user)]);
-
-    // Type mismatch in nested field should fail
-    assert!(!LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_deeply_nested() {
-    // Deeply nested: company: { department: { team: { name: string } } }
-    let team = StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
-    let department = StructType::new_unchecked([StructField::nullable("team", team.clone())]);
-    let company = StructType::new_unchecked([StructField::nullable("department", department)]);
-
-    let checkpoint_schema =
-        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
-            "company",
-            company.clone(),
-        )]);
-
-    let stats_schema = create_stats_schema(vec![StructField::nullable("company", company)]);
-
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_deeply_nested_type_mismatch() {
-    // Type mismatch deep in nested structure
-    let checkpoint_team =
-        StructType::new_unchecked([StructField::nullable("name", DataType::INTEGER)]); // wrong!
-    let checkpoint_dept =
-        StructType::new_unchecked([StructField::nullable("team", checkpoint_team)]);
-    let checkpoint_company =
-        StructType::new_unchecked([StructField::nullable("department", checkpoint_dept)]);
-
-    let checkpoint_schema =
-        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
-            "company",
-            checkpoint_company,
-        )]);
-
-    let stats_team = StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
-    let stats_dept = StructType::new_unchecked([StructField::nullable("team", stats_team)]);
-    let stats_company =
-        StructType::new_unchecked([StructField::nullable("department", stats_dept)]);
-
-    let stats_schema = create_stats_schema(vec![StructField::nullable("company", stats_company)]);
-
-    // Type mismatch deep in hierarchy should be detected
-    assert!(!LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_long_to_timestamp() {
-    // Checkpoint stores timestamp stats as Int64 (no logical type annotation)
-    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
-        StructField::nullable("ts_col", DataType::LONG),
-        StructField::nullable("ts_ntz_col", DataType::LONG),
-    ]);
-
-    // Stats schema expects Timestamp and TimestampNtz types
-    let stats_schema = create_stats_schema(vec![
-        StructField::nullable("ts_col", DataType::TIMESTAMP),
-        StructField::nullable("ts_ntz_col", DataType::TIMESTAMP_NTZ),
-    ]);
-
-    // Long -> Timestamp/TimestampNtz reinterpretation should be accepted
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_timestamp_to_long_rejected() {
-    // Checkpoint has Timestamp-typed stats
-    let checkpoint_schema =
-        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
-            "ts_col",
-            DataType::TIMESTAMP,
-        )]);
-
-    // Stats schema expects Long -- narrowing should be rejected
-    let stats_schema = create_stats_schema(vec![StructField::nullable("ts_col", DataType::LONG)]);
-
-    assert!(!LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_integer_to_date() {
-    // Checkpoint stores date stats as Int32 (no DATE logical annotation)
-    let checkpoint_schema =
-        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
-            "date_col",
-            DataType::INTEGER,
-        )]);
-
-    // Stats schema expects Date type
-    let stats_schema = create_stats_schema(vec![StructField::nullable("date_col", DataType::DATE)]);
-
-    // Integer -> Date reinterpretation should be accepted
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-#[test]
-fn test_schema_has_compatible_stats_parsed_date_to_integer_rejected() {
-    // Checkpoint has Date-typed stats
-    let checkpoint_schema =
-        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
-            "date_col",
-            DataType::DATE,
-        )]);
-
-    // Stats schema expects Integer -- narrowing should be rejected
-    let stats_schema =
-        create_stats_schema(vec![StructField::nullable("date_col", DataType::INTEGER)]);
-
-    assert!(!LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
-}
-
-// Type widening + checkpoint reinterpretation interaction scenarios.
-// Verifies that schema evolution doesn't create false-positive type matches.
-#[rstest]
-// Standard widening: Integer -> Long in old checkpoint after column was widened
-#[case::widening_integer_to_long(DataType::INTEGER, DataType::LONG, true)]
-// Checkpoint reinterpretation: Int32 without DATE annotation -> Date
-#[case::reinterpret_integer_to_date(DataType::INTEGER, DataType::DATE, true)]
-// Checkpoint reinterpretation: Int64 without TIMESTAMP annotation -> Timestamp
-#[case::reinterpret_long_to_timestamp(DataType::LONG, DataType::TIMESTAMP, true)]
-// Compound: checkpoint dropped Date annotation (Int32) + column widened to Timestamp.
-// Integer -> Timestamp is neither a widening nor reinterpretation rule.
-#[case::reinterpret_plus_widen_integer_to_timestamp(DataType::INTEGER, DataType::TIMESTAMP, false)]
-#[case::reinterpret_plus_widen_integer_to_timestamp_ntz(
-    DataType::INTEGER,
-    DataType::TIMESTAMP_NTZ,
-    false
-)]
-// Date -> Timestamp is a valid Delta type widening rule, but kernel's can_widen_to does not
-// currently support it. This test documents the current behavior.
-#[case::date_widened_to_timestamp(DataType::DATE, DataType::TIMESTAMP, false)]
-fn test_stats_parsed_widening_and_reinterpretation_interaction(
-    #[case] checkpoint_type: DataType,
-    #[case] stats_type: DataType,
-    #[case] expected: bool,
-) {
-    let checkpoint_schema =
-        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
-            "col",
-            checkpoint_type,
-        )]);
-    let stats_schema = create_stats_schema(vec![StructField::nullable("col", stats_type)]);
-
-    assert_eq!(
-        LogSegment::schema_has_compatible_stats_parsed(&checkpoint_schema, &stats_schema),
-        expected
+    assert!(
+        LogSegment::checkpoint_has_stats_parsed(&checkpoint_schema),
+        "Type mismatches are handled by parquet reader null-padding, not rejected here"
     );
 }
 
 #[test]
-fn test_stats_parsed_mixed_widening_and_reinterpretation() {
-    // Multiple columns with different compatibility paths should all pass.
-    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("ts_col", DataType::LONG),
-        StructField::nullable("date_col", DataType::INTEGER),
-    ]);
-    let stats_schema = create_stats_schema(vec![
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("ts_col", DataType::TIMESTAMP),
-        StructField::nullable("date_col", DataType::DATE),
-    ]);
-
-    assert!(LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
+fn test_checkpoint_has_stats_parsed_no_stats_parsed() {
+    let checkpoint_schema = create_checkpoint_schema_without_stats_parsed();
+    assert!(!LogSegment::checkpoint_has_stats_parsed(&checkpoint_schema));
 }
 
 #[test]
-fn test_stats_parsed_mixed_with_one_incompatible_rejects_all() {
-    // One incompatible column (Integer -> Timestamp) rejects the whole schema.
-    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("ts_col", DataType::LONG),
-        StructField::nullable("bad_col", DataType::INTEGER),
+fn test_checkpoint_has_stats_parsed_not_a_struct() {
+    // stats_parsed exists but is not a struct type
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", DataType::STRING),
     ]);
-    let stats_schema = create_stats_schema(vec![
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("ts_col", DataType::TIMESTAMP),
-        StructField::nullable("bad_col", DataType::TIMESTAMP),
-    ]);
+    let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
+    assert!(!LogSegment::checkpoint_has_stats_parsed(&checkpoint_schema));
+}
 
-    assert!(!LogSegment::schema_has_compatible_stats_parsed(
-        &checkpoint_schema,
-        &stats_schema
-    ));
+#[test]
+fn test_checkpoint_has_stats_parsed_empty_struct() {
+    // stats_parsed exists and is a struct but has no fields -- still structurally valid.
+    let stats_parsed = StructType::new_unchecked([]);
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", stats_parsed),
+    ]);
+    let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
+    assert!(LogSegment::checkpoint_has_stats_parsed(&checkpoint_schema));
 }
 
 // ============================================================================
