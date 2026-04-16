@@ -505,6 +505,9 @@ pub trait RowVisitor {
 ///   fn apply_selection_vector(self: Box<Self>, selection_vector: Vec<bool>) -> DeltaResult<Box<dyn EngineData>> {
 ///     todo!() // filter out unselected rows and return the new set of data
 ///   }
+///   fn has_field(&self, name: &ColumnName) -> bool {
+///     todo!() // determine whether the field exists in the data
+///   }
 /// }
 /// ```
 pub trait EngineData: AsAny {
