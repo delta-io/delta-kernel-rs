@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::action_reconciliation::{
     deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
 };
@@ -9,7 +10,10 @@ use crate::arrow::{
     array::{create_array, Array, AsArray, RecordBatch, StructArray},
     datatypes::{Field, Schema},
 };
-use crate::checkpoint::{create_last_checkpoint_data, CHECKPOINT_ACTIONS_SCHEMA_V2};
+use crate::checkpoint::{
+    create_last_checkpoint_data, CheckpointActionStats, CheckpointWriter,
+    CHECKPOINT_ACTIONS_SCHEMA_V2,
+};
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
@@ -245,6 +249,19 @@ pub(super) fn create_remove_action(path: &str) -> Action {
     })
 }
 
+fn try_finalize_checkpoint(
+    writer: CheckpointWriter,
+    engine: &dyn crate::Engine,
+    metadata: &FileMeta,
+    data_iter: ActionReconciliationIterator,
+) -> DeltaResult<()> {
+    let state = data_iter.state();
+    drop(data_iter);
+    let state = Arc::into_inner(state).expect("no other Arc references");
+    let stats = CheckpointActionStats::from_reconciliation_state(state)?;
+    writer.finalize(engine, metadata, &stats)
+}
+
 /// Helper to verify the contents of the `_last_checkpoint` file
 async fn assert_last_checkpoint_contents(
     store: &Arc<InMemory>,
@@ -339,7 +356,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, &data_iter.state())?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
     // Asserts the checkpoint file contents:
     // - version: latest version (2)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action
@@ -407,7 +424,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, &data_iter.state())?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
     // Asserts the checkpoint file contents:
     // - version: specified version (0)
     // - size: 1 metadata + 1 protocol
@@ -440,20 +457,15 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
 
     /* The returned data iterator has batches that we do not consume */
 
-    let size_in_bytes = 10;
-    let metadata = FileMeta {
-        location: Url::parse("memory:///fake_path_2")?,
-        last_modified: 0,
-        size: size_in_bytes,
-    };
-
-    // Attempt to finalize the checkpoint with an iterator that has not been fully consumed
-    let err = writer
-        .finalize(&engine, &metadata, &data_iter.state())
-        .expect_err("finalize should fail");
-    assert!(
-        err.to_string().contains("Error writing checkpoint: The checkpoint data iterator must be fully consumed and written to storage before calling finalize")
-    );
+    // Attempting to build CheckpointActionStats from a non-exhausted state should fail
+    let state = data_iter.state();
+    drop(data_iter);
+    let state = Arc::into_inner(state).expect("no other Arc references");
+    let err = CheckpointActionStats::from_reconciliation_state(state)
+        .expect_err("from_reconciliation_state should fail on non-exhausted iterator");
+    assert!(err
+        .to_string()
+        .contains("the reconciliation iterator has not been fully exhausted"),);
 
     Ok(())
 }
@@ -525,7 +537,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, &data_iter.state())?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
     // Asserts the checkpoint file contents:
     // - version: latest version (1)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action + 1 checkpointMetadata
@@ -667,7 +679,7 @@ async fn test_snapshot_checkpoint() -> DeltaResult<()> {
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
 
-    snapshot.checkpoint(&engine)?;
+    snapshot.checkpoint(&engine, None)?;
 
     // First checkpoint: 1 metadata + 1 protocol + 5 add + 3 remove = 10, numOfAddFiles = 5
     let checkpoint_path = Path::from("_delta_log/00000000000000000004.checkpoint.parquet");
@@ -691,7 +703,7 @@ async fn test_snapshot_checkpoint() -> DeltaResult<()> {
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
-    snapshot.checkpoint(&engine)?;
+    snapshot.checkpoint(&engine, None)?;
 
     // Second checkpoint: 1 metadata + 1 protocol + 7 add + 4 remove = 13, numOfAddFiles = 7
     let checkpoint_path = Path::from("_delta_log/00000000000000000006.checkpoint.parquet");
@@ -768,7 +780,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
     assert_eq!(domain_value, Some("bar2".to_string()));
 
     // Trigger checkpoint
-    snapshot.checkpoint(&engine)?;
+    snapshot.checkpoint(&engine, None)?;
 
     // ===== Case 2: Verify domain metadata is preserved *after* checkpoint =====
     let snapshot = Snapshot::builder_for(table_url)
@@ -826,7 +838,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     // Checkpoint at version 2
     let snapshot_v2 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
     assert_eq!(snapshot_v2.version(), 2);
-    snapshot_v2.checkpoint(&engine)?;
+    snapshot_v2.checkpoint(&engine, None)?;
     let last_checkpoint = read_last_checkpoint_file(&store).await?;
     let size_in_bytes = last_checkpoint
         .get("sizeInBytes")
@@ -840,7 +852,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     let snapshot_v1 = Snapshot::builder_for(table_root)
         .at_version(1)
         .build(&engine)?;
-    snapshot_v1.checkpoint(&engine)?;
+    snapshot_v1.checkpoint(&engine, None)?;
     assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await
 }
 
@@ -985,7 +997,7 @@ async fn test_stats_config_round_trip(
 
     // Write checkpoint 1 to parquet with (json1, struct1) settings
     let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-    snapshot1.checkpoint(&engine)?;
+    snapshot1.checkpoint(&engine, None)?;
 
     // Commit 2: update metadata with new settings
     write_commit_to_store(
@@ -1066,7 +1078,7 @@ async fn test_stats_config_round_trip_partitioned(
 
     // Write checkpoint 1 with (json1, struct1) settings
     let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-    snapshot1.checkpoint(&engine)?;
+    snapshot1.checkpoint(&engine, None)?;
 
     // Commit 2: update metadata with new settings
     write_commit_to_store(
@@ -1194,7 +1206,7 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> DeltaResult<()> {
     let table_root = Url::parse("memory:///")?;
     Snapshot::builder_for(table_root.clone())
         .build(&engine)?
-        .checkpoint(&engine)?;
+        .checkpoint(&engine, None)?;
 
     // Version 1: new metadata WITH __CHAR_VARCHAR_TYPE_STRING on the "name" field
     let schema_v1 = Arc::new(StructType::new_unchecked([
@@ -1218,7 +1230,7 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> DeltaResult<()> {
     // doesn't see a mismatch
     Snapshot::builder_for(table_root)
         .build(&engine)?
-        .checkpoint(&engine)?;
+        .checkpoint(&engine, None)?;
 
     Ok(())
 }
