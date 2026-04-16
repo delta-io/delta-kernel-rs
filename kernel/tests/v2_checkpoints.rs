@@ -150,10 +150,11 @@ fn get_without_sidecars_table() -> Vec<String> {
 /// The test cases below are derived from delta-spark's `CheckpointSuite`.
 ///
 /// These tests are converted from delta-spark using the following process:
-/// 1. Specific test cases of interest in `delta-spark` were modified to persist their generated tables
+/// 1. Specific test cases of interest in `delta-spark` were modified to persist their generated
+///    tables
 /// 2. These tables were compressed into `.tar.zst` archives and copied to delta-kernel-rs
-/// 3. Each test loads a stored table, scans it, and asserts that the returned table state
-///    matches the expected state derived from the corresponding table insertions in `delta-spark`
+/// 3. Each test loads a stored table, scans it, and asserts that the returned table state matches
+///    the expected state derived from the corresponding table insertions in `delta-spark`
 ///
 /// The following is the ported list of `delta-spark` tests -> `delta-kernel-rs` tests:
 ///
@@ -161,10 +162,14 @@ fn get_without_sidecars_table() -> Vec<String> {
 /// - `multipart v2 checkpoint` -> `v2_checkpoints_parquet_with_sidecars`
 /// - `All actions in V2 manifest` -> `v2_checkpoints_json_without_sidecars`
 /// - `All actions in V2 manifest` -> `v2_checkpoints_parquet_without_sidecars`
-/// - `V2 Checkpoint compat file equivalency to normal V2 Checkpoint` -> `v2_classic_checkpoint_json`
-/// - `V2 Checkpoint compat file equivalency to normal V2 Checkpoint` -> `v2_classic_checkpoint_parquet`
-/// - `last checkpoint contains correct schema for v1/v2 Checkpoints` -> `v2_checkpoints_json_with_last_checkpoint`
-/// - `last checkpoint contains correct schema for v1/v2 Checkpoints` -> `v2_checkpoints_parquet_with_last_checkpoint`
+/// - `V2 Checkpoint compat file equivalency to normal V2 Checkpoint` ->
+///   `v2_classic_checkpoint_json`
+/// - `V2 Checkpoint compat file equivalency to normal V2 Checkpoint` ->
+///   `v2_classic_checkpoint_parquet`
+/// - `last checkpoint contains correct schema for v1/v2 Checkpoints` ->
+///   `v2_checkpoints_json_with_last_checkpoint`
+/// - `last checkpoint contains correct schema for v1/v2 Checkpoints` ->
+///   `v2_checkpoints_parquet_with_last_checkpoint`
 #[test]
 fn v2_checkpoints_json_with_sidecars() -> DeltaResult<()> {
     test_v2_checkpoint_with_table(

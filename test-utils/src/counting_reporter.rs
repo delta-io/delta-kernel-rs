@@ -49,7 +49,8 @@ pub struct CountingReporter {
     pub list_calls: RelaxedCounter,
     /// Total files returned across all list calls.
     pub list_files_seen: RelaxedCounter,
-    /// Number of `StorageHandler::read_files` calls (one per [`MetricEvent::StorageReadCompleted`]).
+    /// Number of `StorageHandler::read_files` calls (one per
+    /// [`MetricEvent::StorageReadCompleted`]).
     pub storage_read_calls: RelaxedCounter,
     /// Total individual files read via `StorageHandler::read_files`.
     pub storage_read_files: RelaxedCounter,

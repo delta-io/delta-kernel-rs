@@ -117,8 +117,6 @@ pub fn get_final_required_properties_for_uc(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::sync::Arc;
 
     use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
@@ -129,6 +127,8 @@ mod tests {
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
     use delta_kernel::{DeltaResult, Engine, FileMeta, FilteredEngineData};
+
+    use super::*;
 
     /// A mock catalog committer that writes directly to the published path.
     struct MockCatalogCommitter;

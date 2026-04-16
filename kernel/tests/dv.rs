@@ -14,13 +14,12 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
+use itertools::Itertools;
 use tempfile::tempdir;
 use test_utils::{
     create_add_files_metadata, create_table, engine_store_setup, generate_batch, into_record_batch,
     record_batch_to_bytes, IntoArray,
 };
-
-use itertools::Itertools;
 
 /// Helper to write a parquet file with the given data to the table.
 /// Returns the file path (relative to table root) that was written.

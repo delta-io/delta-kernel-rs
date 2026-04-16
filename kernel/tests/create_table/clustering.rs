@@ -102,7 +102,8 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Delta
     Ok(())
 }
 
-/// Test that combining explicit feature signals with auto-enabled features doesn't create duplicates.
+/// Test that combining explicit feature signals with auto-enabled features doesn't create
+/// duplicates.
 ///
 /// This tests the edge case where a user provides `delta.feature.domainMetadata=supported`
 /// AND uses `DataLayout::Clustered`. Both would try to add DomainMetadata, but we should

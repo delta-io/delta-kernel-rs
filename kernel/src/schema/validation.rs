@@ -131,9 +131,10 @@ fn validate_field_name(name: &str, cm_enabled: bool) -> DeltaResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
-    use rstest::rstest;
 
     // === Schema builders for test cases ===
 

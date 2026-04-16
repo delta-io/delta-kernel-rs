@@ -1,12 +1,15 @@
 use std::ops::{Add, Div, Mul, Sub};
 
 use rstest::rstest;
+use Expression as Expr;
+use Predicate as Pred;
 
-use crate::arrow::array::ListViewArray;
+use super::apply_schema::apply_schema;
+use super::*;
 use crate::arrow::array::{
     create_array, Array, ArrayRef, BinaryViewArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder,
-    StringViewArray, StructArray,
+    Int32Builder, ListArray, ListViewArray, MapArray, MapBuilder, MapFieldNames, StringArray,
+    StringBuilder, StringViewArray, StructArray,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
@@ -24,13 +27,7 @@ use crate::kernel_predicates::{
 };
 use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
 use crate::utils::test_utils::assert_result_error_with_message;
-use crate::{EvaluationHandler as _, EvaluationHandlerExtension as _};
-
-use super::apply_schema::apply_schema;
-use super::*;
-
-use Expression as Expr;
-use Predicate as Pred;
+use crate::EvaluationHandlerExtension as _;
 
 #[test]
 fn test_array_column() {

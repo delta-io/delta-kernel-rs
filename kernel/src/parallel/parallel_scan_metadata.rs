@@ -38,7 +38,8 @@ impl SequentialScanMetadata {
     pub(crate) fn new(sequential: SequentialPhase<ScanLogReplayProcessor>) -> Self {
         Self {
             sequential,
-            // TODO: Associate a unique scan ID with this span to correlate sequential and parallel phases
+            // TODO: Associate a unique scan ID with this span to correlate sequential and parallel
+            // phases
             span: info_span!("sequential_scan_metadata"),
         }
     }

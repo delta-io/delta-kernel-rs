@@ -30,7 +30,7 @@ cargo nextest run -p delta_kernel --lib --all-features test_name_here
 cargo nextest run --workspace --all-features test_name_here
 
 # Format, lint, and doc check (always run after code changes)
-cargo fmt \
+cargo +nightly fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
   && cargo doc --workspace --all-features --no-deps
 
@@ -39,7 +39,7 @@ cargo clippy --workspace --no-default-features --features arrow \
   --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
 
 # Quick pre-push check (mimics CI)
-cargo fmt \
+cargo +nightly fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
   && cargo doc --workspace --all-features --no-deps \
   && cargo nextest run --workspace --all-features
@@ -226,7 +226,7 @@ and data flow. Keep it concise.
 a newer (potentially compromised) transitive dependency. If `Cargo.lock` is out of sync with
 `Cargo.toml`, the build fails immediately, forcing dependency changes to be explicit and
 reviewable. See the top-level comment in `build.yml` for full rationale. Commands exempt from
-`--locked`: `cargo fmt` (no dep resolution), `cargo msrv verify/show` (wrapper tool),
+`--locked`: `cargo +nightly fmt` (no dep resolution), `cargo msrv verify/show` (wrapper tool),
 `cargo miri setup` (tooling setup).
 
 Ensure that when writing any github action you are considering safety including thinking of

@@ -93,7 +93,7 @@ Our trunk branch is named `main`. Here's the typical workflow:
    # build docs
    cargo doc --workspace --all-features
    # highly recommend editor that automatically formats, but in case you need to:
-   cargo fmt
+   cargo +nightly fmt
 
    # run more tests
    cargo test --workspace --all-features -- --skip read_table_version_hdfs
@@ -116,7 +116,7 @@ Our trunk branch is named `main`. Here's the typical workflow:
 #### General Tips
 
 1. When making your first PR, please read our contributor guidelines: https://github.com/delta-incubator/delta-kernel-rs/blob/main/CONTRIBUTING.md
-2. Run `cargo t --all-features --all-targets` to get started testing, and run `cargo fmt`.
+2. Run `cargo t --all-features --all-targets` to get started testing, and run `cargo +nightly fmt`.
 3. Ensure you have added or run the appropriate tests for your PR.
 4. If the PR is unfinished, add '[WIP]' in your PR title, e.g., '[WIP] Your PR title ...'.
 5. Be sure to keep the PR description updated to reflect all changes.

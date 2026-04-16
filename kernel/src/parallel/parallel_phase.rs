@@ -9,15 +9,12 @@
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
+use itertools::Itertools;
 
-use crate::log_replay::ActionsBatch;
-use crate::log_replay::ParallelLogReplayProcessor;
+use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
-use crate::EngineData;
-use crate::{DeltaResult, Engine, FileMeta};
-
-use itertools::Itertools;
+use crate::{DeltaResult, Engine, EngineData, FileMeta};
 
 /// Processes checkpoint leaf files in parallel using a shared processor.
 ///
@@ -124,6 +121,12 @@ impl<P: ParallelLogReplayProcessor> Iterator for ParallelPhase<P> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::thread;
+
+    use url::Url;
+
     use super::*;
     use crate::actions::get_log_add_schema;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -133,8 +136,9 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
-    use crate::parallel::parallel_scan_metadata::AfterSequentialScanMetadata;
-    use crate::parallel::parallel_scan_metadata::{ParallelScanMetadata, ParallelState};
+    use crate::parallel::parallel_scan_metadata::{
+        AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState,
+    };
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state::ScanFile;
@@ -142,10 +146,6 @@ mod tests {
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::{load_test_table, parse_json_batch};
     use crate::{PredicateRef, SnapshotRef};
-    use std::collections::HashSet;
-    use std::sync::Arc;
-    use std::thread;
-    use url::Url;
 
     // ============================================================
     // Test helpers for focused ParallelPhase tests

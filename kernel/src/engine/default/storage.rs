@@ -111,10 +111,11 @@ where
 #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::object_store::{self, path::Path};
     use hdfs_native_object_store::HdfsObjectStoreBuilder;
+
+    use super::*;
+    use crate::object_store::path::Path;
+    use crate::object_store::{self};
 
     /// Example funciton of doing testing of a custom [HdfsObjectStore] construction
     fn parse_url_opts_hdfs_native<I, K, V>(

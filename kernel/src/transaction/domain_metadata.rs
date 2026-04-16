@@ -1,12 +1,11 @@
 use std::collections::HashSet;
 
+use super::{EngineDataResultIterator, Transaction};
 use crate::actions::{get_log_domain_metadata_schema, DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::error::Error;
 use crate::row_tracking::{RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME};
 use crate::table_features::TableFeature;
 use crate::{DeltaResult, Engine, IntoEngineData};
-
-use super::{EngineDataResultIterator, Transaction};
 
 impl<S> Transaction<S> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
@@ -109,7 +108,8 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
-    /// Validate that a system domain corresponds to a known feature and that the feature is supported.
+    /// Validate that a system domain corresponds to a known feature and that the feature is
+    /// supported.
     ///
     /// This prevents arbitrary `delta.*` domains from being added during table creation.
     /// Each known system domain must have its corresponding feature enabled in the protocol.
@@ -182,13 +182,13 @@ impl<S> Transaction<S> {
     ///
     /// Returns a tuple of `(action_iter, domain_metadata_vec)`.
     /// - The action iterator contains EngineData to be written to the commit file (`00N.json`).
-    /// - The `Vec<DomainMetadata>` is used to construct a [`CrcDelta`](crate::crc::CrcDelta),
-    ///   which feeds the post-commit snapshot with the domain metadata written in this transaction
-    ///   and powers CRC file writes.
+    /// - The `Vec<DomainMetadata>` is used to construct a [`CrcDelta`](crate::crc::CrcDelta), which
+    ///   feeds the post-commit snapshot with the domain metadata written in this transaction and
+    ///   powers CRC file writes.
     ///
-    /// This function may perform an expensive log replay operation if there are any domain removals.
-    /// The log replay is required to fetch the previous configuration value for the domain to preserve
-    /// in removal tombstones as mandated by the Delta spec.
+    /// This function may perform an expensive log replay operation if there are any domain
+    /// removals. The log replay is required to fetch the previous configuration value for the
+    /// domain to preserve in removal tombstones as mandated by the Delta spec.
     pub(super) fn generate_domain_metadata_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,

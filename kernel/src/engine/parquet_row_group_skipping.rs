@@ -1,5 +1,10 @@
-//! An implementation of parquet row group skipping using data skipping predicates over footer stats.
+//! An implementation of parquet row group skipping using data skipping predicates over footer
+//! stats.
+use std::collections::HashMap;
+
+use chrono::{DateTime, Days};
 use delta_kernel_derive::internal_api;
+use tracing::debug;
 
 use crate::engine::arrow_utils::RowIndexBuilder;
 use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
@@ -9,9 +14,6 @@ use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::file::statistics::Statistics;
 use crate::parquet::schema::types::ColumnDescPtr;
 use crate::schema::{DataType, DecimalType, PrimitiveType};
-use chrono::{DateTime, Days};
-use std::collections::HashMap;
-use tracing::debug;
 
 #[cfg(test)]
 mod tests;

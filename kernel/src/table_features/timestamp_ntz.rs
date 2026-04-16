@@ -1,13 +1,13 @@
 //! Validation for TIMESTAMP_NTZ feature support
 
+use std::borrow::Cow;
+
 use super::TableFeature;
 use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
 use crate::transforms::SchemaTransform;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
-
-use std::borrow::Cow;
 
 /// Validates that if a table schema contains TIMESTAMP_NTZ columns, the table must have the
 /// TimestampWithoutTimezone feature in both reader and writer features.

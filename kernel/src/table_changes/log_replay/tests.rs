@@ -1,5 +1,11 @@
-use super::table_changes_action_iter;
-use super::TableChangesScanMetadata;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use itertools::Itertools;
+use test_utils::LoggingTest;
+
+use super::{table_changes_action_iter, TableChangesScanMetadata};
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
@@ -13,14 +19,7 @@ use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
-use crate::Predicate;
-use crate::{DeltaResult, Engine, Error, Version};
-use test_utils::LoggingTest;
-
-use itertools::Itertools;
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use crate::{DeltaResult, Engine, Error, Predicate, Version};
 
 fn get_schema() -> SchemaRef {
     Arc::new(StructType::new_unchecked([
@@ -994,7 +993,8 @@ async fn print_table_info_post_phase1() {
 
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
-    // This specific commit (with these actions) isn't necessary to test the tracing for this test, we just need to have one commit with any actions
+    // This specific commit (with these actions) isn't necessary to test the tracing for this test,
+    // we just need to have one commit with any actions
     mock_table
         .commit([
             Action::Metadata(

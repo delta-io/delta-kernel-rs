@@ -4,10 +4,6 @@
 //! fast-path, CRC at prior version, checkpoint with tail commits) plus on-demand API calls
 //! (`get_domain_metadata`) that incur additional I/O after a snapshot is already built.
 
-use super::{
-    insert_rows, measuring_engine, setup_table_with_v1_checkpoint, simple_schema, LogState,
-    TestTableBuilder,
-};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,6 +18,11 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
 use test_utils::{insert_data, test_table_setup_mt};
 use url::Url;
+
+use super::{
+    insert_rows, measuring_engine, setup_table_with_v1_checkpoint, simple_schema, LogState,
+    TestTableBuilder,
+};
 
 // ============================================================================
 // Scenario 1: delta-only (2 commits, no checkpoint, no compaction)
