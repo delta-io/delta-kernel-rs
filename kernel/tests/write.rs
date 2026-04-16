@@ -4107,8 +4107,7 @@ fn test_write_context_propagates_path_mode(
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
-    let table_url = Url::from_directory_path(&table_path).unwrap();
-    let file_url = table_url.join("test.parquet").unwrap();
+    let file_url = snapshot.table_root().join("test.parquet").unwrap();
 
     let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
     if let Some(mode) = set_mode {
