@@ -59,6 +59,7 @@ pub(crate) const MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME: &str =
     "delta.rowTracking.materializedRowCommitVersionColumnName";
 pub(crate) const ROW_TRACKING_SUSPENDED: &str = "delta.rowTrackingSuspended";
 pub(crate) const PARQUET_FORMAT_VERSION: &str = "delta.parquet.format.version";
+pub(crate) const PARQUET_COMPRESSION_CODEC: &str = "delta.parquet.compression.codec";
 pub(crate) const ENABLE_IN_COMMIT_TIMESTAMPS: &str = "delta.enableInCommitTimestamps";
 pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION: &str =
     "delta.inCommitTimestampEnablementVersion";
@@ -208,6 +209,10 @@ pub struct TableProperties {
     /// to `"1.0.0"` when absent. Connectors read this to configure their Parquet writers.
     pub parquet_format_version: Option<String>,
 
+    /// The compression codec to use when writing Parquet data files.
+    /// If absent, the default codec for [`ParquetWriterConfig`] applies.
+    pub parquet_compression: Option<ParquetCompression>,
+
     /// Whether to enable [In-Commit Timestamps]. The in-commit timestamps writer feature strongly
     /// associates a monotonically increasing timestamp with each commit by storing it in the
     /// commit's metadata.
@@ -237,6 +242,16 @@ impl TableProperties {
     /// Default: `false` per the Delta protocol.
     pub fn should_write_stats_as_struct(&self) -> bool {
         self.checkpoint_write_stats_as_struct.unwrap_or(false)
+    }
+
+    /// Returns the [`ParquetWriterConfig`] derived from table properties.
+    ///
+    /// If `delta.parquet.compression.codec` is set, the returned config uses that codec.
+    /// Otherwise the [`ParquetWriterConfig`] default applies.
+    pub fn parquet_writer_config(&self) -> ParquetWriterConfig {
+        ParquetWriterConfig {
+            compression: self.parquet_compression.unwrap_or_default(),
+        }
     }
 }
 
@@ -299,6 +314,26 @@ pub enum IsolationLevel {
     SnapshotIsolation,
 }
 
+/// Compression codec to use when writing Parquet files.
+///
+/// String parsing is case-insensitive.
+#[derive(Debug, EnumString, Clone, Copy, PartialEq, Eq, Default)]
+#[strum(ascii_case_insensitive)]
+pub enum ParquetCompression {
+    /// Snappy compression (default).
+    #[default]
+    Snappy,
+    /// Zstandard compression.
+    Zstd,
+}
+
+/// Configuration for writing Parquet files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParquetWriterConfig {
+    /// Compression codec to use. Defaults to [`ParquetCompression::Snappy`].
+    pub compression: ParquetCompression,
+}
+
 /// The checkpoint policy applied when writing checkpoints
 #[derive(Debug, EnumString, Default, Clone, PartialEq, Eq)]
 #[strum(serialize_all = "camelCase")]
@@ -315,6 +350,7 @@ mod tests {
     use super::*;
 
     use crate::expressions::column_name;
+    use rstest::rstest;
     use std::collections::HashMap;
 
     #[test]
@@ -377,6 +413,7 @@ mod tests {
         );
         assert_eq!(ROW_TRACKING_SUSPENDED, "delta.rowTrackingSuspended");
         assert_eq!(PARQUET_FORMAT_VERSION, "delta.parquet.format.version");
+        assert_eq!(PARQUET_COMPRESSION_CODEC, "delta.parquet.compression.codec");
         assert_eq!(
             ENABLE_IN_COMMIT_TIMESTAMPS,
             "delta.enableInCommitTimestamps"
@@ -497,6 +534,7 @@ mod tests {
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, "15"),
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, "1612345678"),
             (PARQUET_FORMAT_VERSION, "2.12.0"),
+            (PARQUET_COMPRESSION_CODEC, "zstd"),
         ];
         let actual = TableProperties::from(properties.into_iter());
         let expected = TableProperties {
@@ -533,9 +571,28 @@ mod tests {
             enable_in_commit_timestamps: Some(true),
             in_commit_timestamp_enablement_version: Some(15),
             parquet_format_version: Some("2.12.0".to_string()),
+            parquet_compression: Some(ParquetCompression::Zstd),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
             unknown_properties: HashMap::new(),
         };
         assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    // None means no property is set; use None as a sentinel for "omit the key"
+    #[case(None, ParquetWriterConfig::default())]
+    #[case(Some("snappy"), ParquetWriterConfig { compression: ParquetCompression::Snappy })]
+    #[case(Some("ZSTD"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
+    // Unrecognized codec falls back to the default
+    #[case(Some("not_a_codec"), ParquetWriterConfig::default())]
+    fn test_parquet_writer_config(
+        #[case] codec: Option<&str>,
+        #[case] expected: ParquetWriterConfig,
+    ) {
+        let props = match codec {
+            Some(v) => TableProperties::from([(PARQUET_COMPRESSION_CODEC, v)]),
+            None => TableProperties::default(),
+        };
+        assert_eq!(props.parquet_writer_config(), expected);
     }
 }
