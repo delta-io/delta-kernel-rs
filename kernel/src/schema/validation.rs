@@ -20,7 +20,7 @@ const INVALID_PARQUET_CHARS: &[char] = &[' ', ',', ';', '{', '}', '(', ')', '\n'
 /// 1. Schema is non-empty
 /// 2. No duplicate column names (case-insensitive, including nested fields)
 /// 3. Column names contain only valid characters
-/// 4. No non-null columns unless the `invariants` writer feature is enabled
+/// 4. Rejects non-null columns when the `invariants` writer feature is not enabled
 pub(crate) fn validate_schema_for_create(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
@@ -78,12 +78,12 @@ impl SchemaValidator {
 }
 
 impl<'a> SchemaTransform<'a> for SchemaValidator {
-    /// Variant internal fields (metadata, value) are protocol-defined, not user-controlled,
-    /// and required to be non-null. Skip recursion to avoid rejecting these fixed fields.
-    fn transform_variant(
-        &mut self,
-        stype: &'a crate::schema::StructType,
-    ) -> Option<Cow<'a, crate::schema::StructType>> {
+    /// The default `transform_variant` recurses into the variant's struct fields
+    /// (metadata, value) via `recurse_into_struct`. Those fields are protocol-defined
+    /// and must be non-null -- they are not user-controlled schema columns. We override
+    /// to return the variant struct unchanged, skipping recursion so the non-null check
+    /// in `transform_struct_field` does not reject these fixed internal fields.
+    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
         Some(Cow::Borrowed(stype))
     }
 

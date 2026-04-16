@@ -18,6 +18,7 @@ use crate::clustering::{create_clustering_domain_metadata, validate_clustering_c
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
+use crate::schema::validation::validate_schema_for_create;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{normalize_column_names_to_schema_casing, DataType, SchemaRef, StructType};
 use crate::snapshot::Snapshot;
@@ -763,7 +764,7 @@ impl CreateTableTransactionBuilder {
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
 
         // Validate schema (non-empty, column names, duplicates)
-        crate::schema::validation::validate_schema_for_create(
+        validate_schema_for_create(
             &effective_schema,
             column_mapping_mode,
             validated
