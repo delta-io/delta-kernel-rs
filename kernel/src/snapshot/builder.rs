@@ -355,9 +355,7 @@ impl SnapshotBuilder {
 mod tests {
     use std::sync::Arc;
 
-    use crate::engine::default::{
-        executor::tokio::TokioBackgroundExecutor, DefaultEngine, DefaultEngineBuilder,
-    };
+    use crate::engine::sync::SyncEngine;
     use crate::metrics::MetricEvent;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
@@ -369,14 +367,10 @@ mod tests {
 
     use super::*;
 
-    fn setup_test() -> (
-        Arc<DefaultEngine<TokioBackgroundExecutor>>,
-        Arc<DynObjectStore>,
-        String,
-    ) {
+    fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
         let table_root = String::from("memory:///");
         let store = Arc::new(InMemory::new());
-        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+        let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
         (engine, store, table_root)
     }
 
@@ -474,7 +468,7 @@ mod tests {
     }
 
     fn setup_test_with_reporter() -> (
-        Arc<DefaultEngine<TokioBackgroundExecutor>>,
+        Arc<SyncEngine>,
         Arc<DynObjectStore>,
         String,
         Arc<CapturingReporter>,
@@ -483,9 +477,7 @@ mod tests {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let reporter = Arc::new(CapturingReporter::default());
         let engine = Arc::new(
-            DefaultEngineBuilder::new(store.clone())
-                .with_metrics_reporter(reporter.clone())
-                .build(),
+            SyncEngine::new_with_store(store.clone()).with_metrics_reporter(reporter.clone()),
         );
         (engine, store, table_root, reporter)
     }
@@ -687,11 +679,7 @@ mod tests {
 
         /// Creates an in-memory engine, store, and table root with an initial catalog-managed
         /// commit at version 0 (protocol + metadata).
-        async fn setup_catalog_managed_test() -> (
-            Arc<DefaultEngine<TokioBackgroundExecutor>>,
-            Arc<DynObjectStore>,
-            String,
-        ) {
+        async fn setup_catalog_managed_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
             let (engine, store, table_root) = setup_test();
             let actions = vec![TestAction::Metadata];
             add_commit(
