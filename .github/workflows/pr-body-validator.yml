@@ -14,8 +14,9 @@ jobs:
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          if [[ "$PR_BODY" =~ ^[[:ascii:]]*$ ]]; then
-            echo "All ASCII"
+          if LC_ALL=C grep -q '[^[:print:][:space:]]' <<< "$PR_BODY"; then
+            echo "file contains non-ascii characters"
           else
-            echo "Contains non-ASCII characters"
+            echo "file contains ascii characters only"
           fi
+
