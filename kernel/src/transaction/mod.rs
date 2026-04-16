@@ -63,6 +63,34 @@ use stats_verifier::StatsVerifier;
 use write_context::SharedWriteState;
 pub use write_context::WriteContext;
 
+/// Controls how file paths are stored in the Delta log for add actions.
+///
+/// The Delta protocol allows both relative and absolute paths in file actions. This setting
+/// determines which form kernel writes when committing a transaction.
+///
+/// The path mode should be consistent within a table's lifetime. Mixing relative and absolute
+/// paths across commits can cause incorrect log replay, since file action deduplication uses
+/// raw path string comparison.
+// TODO(#2402): normalize paths in FileActionKey so mixing is safe, then remove this warning.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PathMode {
+    /// Store paths relative to the table root. This is the default and matches the convention
+    /// used by Spark and most Delta implementations. Relative paths are resolved against
+    /// [`Scan::table_root()`] at read time.
+    ///
+    /// The exact relative path depends on table configuration:
+    /// - Unpartitioned: `abc.parquet`
+    /// - Partitioned (column mapping off): `year=2026/month=04/abc.parquet`
+    /// - Column mapping on: `r8/abc.parquet` (random 2-char prefix)
+    ///
+    /// [`Scan::table_root()`]: crate::scan::Scan::table_root
+    #[default]
+    Relative,
+    /// Store absolute URLs (e.g. `s3://bucket/table/abc.parquet`).
+    Absolute,
+}
+
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
@@ -236,6 +264,8 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
+    // Controls whether file paths in the Delta log are stored as relative or absolute.
+    path_mode: PathMode,
     // See `shared_write_state()` method.
     shared_write_state: OnceLock<Arc<SharedWriteState>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
@@ -476,6 +506,28 @@ impl<S> Transaction<S> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Set how file paths are stored in the Delta log for add file actions.
+    ///
+    /// Defaults to [`PathMode::Relative`], which stores paths relative to the table root.
+    /// Use [`PathMode::Absolute`] to store full URLs in the log.
+    pub fn with_path_mode(mut self, path_mode: PathMode) -> Self {
+        self.path_mode = path_mode;
+        self
+    }
+
+    /// Same as [`Transaction::with_path_mode`] but set the value directly instead of
+    /// using a fluent API. Must be called before [`partitioned_write_context`] or
+    /// [`unpartitioned_write_context`], since the path mode is captured when the write
+    /// context is first created and cannot be changed afterward.
+    ///
+    /// [`partitioned_write_context`]: Transaction::partitioned_write_context
+    /// [`unpartitioned_write_context`]: Transaction::unpartitioned_write_context
+    #[internal_api]
+    #[allow(dead_code)] // used in FFI
+    pub(crate) fn set_path_mode(&mut self, path_mode: PathMode) {
+        self.path_mode = path_mode;
     }
 
     /// Set the data change flag.
@@ -834,6 +886,7 @@ impl<S> Transaction<S> {
                 column_mapping_mode: table_config.column_mapping_mode(),
                 stats_columns: self.stats_columns(),
                 logical_partition_columns: table_config.partition_columns().to_vec(),
+                path_mode: self.path_mode,
             })
         })
     }

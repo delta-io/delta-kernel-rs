@@ -71,6 +71,20 @@ impl ArrowFFIData {
             schema: FFI_ArrowSchema::empty(),
         }
     }
+
+    /// Convert opaque engine data into Arrow C Data Interface structs.
+    ///
+    /// The returned `ArrowFFIData` owns the exported data. The caller is responsible for
+    /// either importing it (via `from_ffi`) or dropping it (the `Drop` impls on
+    /// `FFI_ArrowArray`/`FFI_ArrowSchema` call their release callbacks).
+    pub fn try_from_engine_data(data: Box<dyn EngineData>) -> DeltaResult<Self> {
+        let record_batch = data.try_into_record_batch()?;
+        let sa: StructArray = record_batch.into();
+        let array_data: ArrayData = sa.into();
+        let array = FFI_ArrowArray::new(&array_data);
+        let schema = FFI_ArrowSchema::try_from(array_data.data_type())?;
+        Ok(Self { array, schema })
+    }
 }
 
 // TODO: This should use a callback to avoid having to have the engine free the struct
@@ -92,17 +106,11 @@ pub unsafe extern "C" fn get_raw_arrow_data(
     get_raw_arrow_data_impl(data).into_extern_result(&engine.as_ref())
 }
 
-// TODO: This method leaks the returned pointer memory. How will the engine free it?
 #[cfg(feature = "default-engine-base")]
 fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> DeltaResult<*mut ArrowFFIData> {
-    let record_batch = data.try_into_record_batch()?;
-    let sa: StructArray = record_batch.into();
-    let array_data: ArrayData = sa.into();
-    // these call `clone`. is there a way to not copy anything and what exactly are they cloning?
-    let array = FFI_ArrowArray::new(&array_data);
-    let schema = FFI_ArrowSchema::try_from(array_data.data_type())?;
-    let ret_data = Box::new(ArrowFFIData { array, schema });
-    Ok(Box::leak(ret_data))
+    Ok(Box::into_raw(Box::new(ArrowFFIData::try_from_engine_data(
+        data,
+    )?)))
 }
 
 /// Creates engine data from Arrow C Data Interface array and schema.

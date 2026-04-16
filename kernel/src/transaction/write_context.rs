@@ -9,10 +9,12 @@ use crate::expressions::{ColumnName, ExpressionRef};
 use crate::partition::hive::build_partition_path;
 use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
+use crate::transaction::PathMode;
+use crate::{DeltaResult, Error};
 
 /// Table-wide write state shared across all [`WriteContext`] instances created by a
 /// [`Transaction`]. Holds the target directory, schemas, column mapping mode, stats columns,
-/// and logical partition column names.
+/// logical partition column names, and path mode.
 ///
 /// [`Transaction`]: super::Transaction
 #[derive(Debug)]
@@ -25,6 +27,8 @@ pub(super) struct SharedWriteState {
     pub(super) stats_columns: Vec<ColumnName>,
     /// Logical partition column names in metadata-defined order.
     pub(super) logical_partition_columns: Vec<String>,
+    /// How file paths should be stored in the Delta log.
+    pub(super) path_mode: PathMode,
 }
 
 /// A write context for a specific partition or an unpartitioned table. Created by
@@ -93,8 +97,6 @@ impl WriteContext {
                 }
             }
             ColumnMappingMode::Id | ColumnMappingMode::Name => {
-                // Column mapping ON: random 2-char prefix avoids S3 hotspots and avoids
-                // exposing physical UUID column names in Hive-style directory paths.
                 let prefix = random_alphanumeric_prefix();
                 url.set_path(&format!("{}{}/", url.path(), prefix));
             }
@@ -164,6 +166,50 @@ impl WriteContext {
         build_partition_path(&columns)
     }
 
+    /// Computes the `add.path` value for the Delta log from a file's absolute URL, formatted
+    /// according to this context's [`PathMode`].
+    ///
+    /// Custom engines that write parquet files themselves (bypassing
+    /// [`DefaultEngine::write_parquet`]) should call this after writing each file to produce
+    /// the path for their Add action metadata.
+    ///
+    /// # Examples
+    ///
+    /// Given a table root of `s3://bucket/table/`:
+    /// - `PathMode::Relative` + `s3://bucket/table/abc.parquet` -> `"abc.parquet"`
+    /// - `PathMode::Relative` + `s3://bucket/table/year=2024/abc.parquet` ->
+    ///   `"year=2024/abc.parquet"`
+    /// - `PathMode::Absolute` + `s3://bucket/table/abc.parquet` ->
+    ///   `"s3://bucket/table/abc.parquet"`
+    ///
+    /// In `Relative` mode, returns an error if the file is not under the table root.
+    ///
+    /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
+    pub fn resolve_file_path(&self, file_location: &Url) -> DeltaResult<String> {
+        match self.shared.path_mode {
+            PathMode::Relative => {
+                let relative = self
+                    .shared
+                    .table_root
+                    .make_relative(file_location)
+                    .ok_or_else(|| {
+                        Error::internal_error(format!(
+                            "file '{}' is not under table root '{}'",
+                            file_location, self.shared.table_root
+                        ))
+                    })?;
+                if relative.starts_with("..") {
+                    return Err(Error::internal_error(format!(
+                        "file '{}' is not under table root '{}'",
+                        file_location, self.shared.table_root
+                    )));
+                }
+                Ok(relative)
+            }
+            PathMode::Absolute => Ok(file_location.to_string()),
+        }
+    }
+
     /// Generate a new unique absolute URL for a deletion vector file.
     ///
     /// This method generates a unique file name in the table directory.
@@ -228,6 +274,7 @@ mod tests {
             column_mapping_mode: cm_mode,
             stats_columns: vec![],
             logical_partition_columns: partition_columns,
+            path_mode: PathMode::default(),
         });
         WriteContext {
             shared,
@@ -331,6 +378,68 @@ mod tests {
                 prefix.chars().all(|c| c.is_ascii_alphanumeric()),
                 "prefix should be alphanumeric, got: {prefix}"
             );
+        }
+    }
+
+    // === resolve_file_path tests ===
+
+    fn make_write_context_with_path_mode(path_mode: PathMode) -> WriteContext {
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
+        let shared = Arc::new(SharedWriteState {
+            table_root: Url::parse("s3://bucket/table/").unwrap(),
+            logical_schema: schema.clone(),
+            physical_schema: schema.clone(),
+            logical_to_physical: Arc::new(Expression::literal(true)),
+            column_mapping_mode: ColumnMappingMode::None,
+            stats_columns: vec![],
+            logical_partition_columns: vec![],
+            path_mode,
+        });
+        WriteContext {
+            shared,
+            physical_partition_values: HashMap::new(),
+        }
+    }
+
+    #[rstest]
+    #[case::relative_bare_file(
+        PathMode::Relative,
+        "s3://bucket/table/abc.parquet",
+        Ok("abc.parquet")
+    )]
+    #[case::relative_with_subdirectory(
+        PathMode::Relative,
+        "s3://bucket/table/year=2024/abc.parquet",
+        Ok("year=2024/abc.parquet")
+    )]
+    #[case::absolute_returns_full_url(
+        PathMode::Absolute,
+        "s3://bucket/table/abc.parquet",
+        Ok("s3://bucket/table/abc.parquet")
+    )]
+    #[case::error_different_scheme(
+        PathMode::Relative, "gs://other-bucket/table/abc.parquet", Err(())
+    )]
+    #[case::error_different_host(
+        PathMode::Relative, "s3://other-bucket/table/abc.parquet", Err(())
+    )]
+    #[case::error_outside_table_root(
+        PathMode::Relative, "s3://bucket/other/abc.parquet", Err(())
+    )]
+    #[test]
+    fn test_resolve_file_path(
+        #[case] path_mode: PathMode,
+        #[case] file_url: &str,
+        #[case] expected: Result<&str, ()>,
+    ) {
+        let wc = make_write_context_with_path_mode(path_mode);
+        let file = Url::parse(file_url).unwrap();
+        match expected {
+            Ok(exp) => assert_eq!(wc.resolve_file_path(&file).unwrap(), exp),
+            Err(()) => assert!(wc.resolve_file_path(&file).is_err()),
         }
     }
 }

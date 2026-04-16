@@ -839,7 +839,7 @@ mod tests {
         };
         let expected = vec![add1, add2, add3];
         assert_eq!(add_visitor.adds.len(), expected.len());
-        for (add, expected) in add_visitor.adds.into_iter().zip(expected.into_iter()) {
+        for (add, expected) in add_visitor.adds.into_iter().zip(expected) {
             assert_eq!(add, expected);
         }
     }

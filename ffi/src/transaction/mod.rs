@@ -9,7 +9,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::{
     CreateTableTransaction, CreateTableTransactionBuilder,
 };
-use delta_kernel::transaction::{CommitResult, Transaction};
+use delta_kernel::transaction::{CommitResult, PathMode, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::error::{ExternResult, IntoExternResult};
@@ -244,6 +244,20 @@ pub unsafe extern "C" fn set_data_change(mut txn: Handle<ExclusiveTransaction>, 
     underlying_txn.set_data_change(data_change);
 }
 
+/// Set the path mode for how file paths are stored in the Delta log.
+///
+/// Defaults to `Relative`, which matches the convention used by Spark.
+/// See [`PathMode`] for details.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn set_path_mode(mut txn: Handle<ExclusiveTransaction>, path_mode: PathMode) {
+    let underlying_txn = unsafe { txn.as_mut() };
+    underlying_txn.set_path_mode(path_mode);
+}
+
 /// Attempt to commit a transaction to the table. Returns version number if successful.
 /// Returns error if the commit fails.
 ///
@@ -330,6 +344,21 @@ pub unsafe extern "C" fn create_table_set_data_change(
 ) {
     let underlying_txn = unsafe { txn.as_mut() };
     underlying_txn.set_data_change(data_change);
+}
+
+/// Set the path mode for how file paths are stored in the Delta log for a create-table
+/// transaction. See [`set_path_mode`] for details.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn create_table_set_path_mode(
+    mut txn: Handle<ExclusiveCreateTransaction>,
+    path_mode: PathMode,
+) {
+    let underlying_txn = unsafe { txn.as_mut() };
+    underlying_txn.set_path_mode(path_mode);
 }
 
 /// Attempt to commit a create-table transaction. Returns version number if successful.

@@ -20,8 +20,8 @@ use std::collections::HashMap;
 
 #[allow(unused)]
 pub(crate) use delta::CrcDelta;
-pub(crate) use file_size_histogram::FileSizeHistogram;
-pub(crate) use file_stats::FileStats;
+pub use file_size_histogram::FileSizeHistogram;
+pub use file_stats::FileStats;
 #[allow(unused)]
 pub(crate) use file_stats::FileStatsDelta;
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
