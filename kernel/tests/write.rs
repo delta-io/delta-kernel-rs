@@ -29,7 +29,7 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, PathMode};
 use tempfile::TempDir;
 
 use test_utils::set_json_value;
@@ -39,7 +39,7 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
-use delta_kernel::expressions::{ColumnName, Scalar};
+use delta_kernel::expressions::{column_expr, ColumnName, Scalar};
 use delta_kernel::parquet::basic::Compression;
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{
@@ -48,6 +48,7 @@ use delta_kernel::schema::{
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::table_properties::{ParquetCompression, ParquetWriterConfig};
 use delta_kernel::FileMeta;
+use delta_kernel::{Expression as Expr, Predicate as Pred};
 
 use test_utils::create_default_engine_mt_executor;
 use test_utils::{
@@ -1393,12 +1394,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         .as_any()
         .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
         .unwrap()
-        .write_parquet_file(
-            write_context.table_root_dir(),
-            Box::new(ArrowEngineData::new(data.clone())),
-            &HashMap::new(),
-            Some(write_context.stats_columns()),
-        )
+        .write_parquet_file(Box::new(ArrowEngineData::new(data.clone())), &write_context)
         .await?;
 
     txn.add_files(add_files_metadata);
@@ -1567,12 +1563,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
         .as_any()
         .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
         .unwrap()
-        .write_parquet_file(
-            write_context.table_root_dir(),
-            Box::new(ArrowEngineData::new(data.clone())),
-            &HashMap::new(),
-            Some(write_context.stats_columns()),
-        )
+        .write_parquet_file(Box::new(ArrowEngineData::new(data.clone())), &write_context)
         .await?;
 
     txn.add_files(add_files_metadata);
@@ -3008,6 +2999,131 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
     Ok(())
 }
 
+/// Regression test for https://github.com/delta-io/delta-kernel-rs/issues/2040
+///
+/// When `scan_metadata()` is called with a predicate, the scan row schema includes a
+/// `stats_parsed` column (7th column). Passing that scan metadata to `remove_files()` then
+/// `commit()` previously failed with "Too few fields in output schema" because the transform
+/// evaluator exhausted the output schema when it encountered the extra column.
+///
+/// Both predicate and non-predicate scans are tested because `remove_files` should behave
+/// identically regardless. Cases also vary the checkpoint format:
+/// - `use_struct_stats_checkpoint=false`: `stats` is non-null (raw JSON from the Add action).
+///   The remove action's `stats` comes from passthrough.
+/// - `use_struct_stats_checkpoint=true`: a checkpoint is written with
+///   `writeStatsAsJson=false, writeStatsAsStruct=true`, so the checkpoint stores `stats_parsed`
+///   but omits the raw `stats` JSON string. Scan rows from that checkpoint have `stats=null` but
+///   `stats_parsed` non-null. The remove action's `stats` is produced via
+///   `coalesce(null, to_json(stats_parsed))`, which exercises the coalesce path in the fix.
+#[rstest::rstest]
+#[case(false, false)]
+#[case(false, true)]
+#[case(true, false)]
+#[case(true, true)]
+// Multi-thread runtime required because the struct-stats checkpoint case calls
+// `Snapshot::checkpoint`, which makes nested `block_on` calls that deadlock
+// a single-threaded executor. `TokioMultiThreadExecutor` uses `block_in_place`
+// which avoids the deadlock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
+    #[case] use_struct_stats_checkpoint: bool,
+    #[case] use_predicate: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = get_simple_int_schema();
+
+    // Use a local directory so we can inspect the commit log for stats content.
+    let tmp_dir = tempdir()?;
+    let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+
+    for (table_url, engine, _store, _table_name) in
+        setup_test_tables(schema.clone(), &[], Some(&tmp_url), "test_table").await?
+    {
+        let engine = Arc::new(engine);
+
+        // Write data (two parquet files with numbers [1,2,3] and [4,5,6]).
+        write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
+            .await?;
+
+        // When use_struct_stats_checkpoint=true, update table properties so the checkpoint
+        // omits the stats JSON string (writeStatsAsJson=false) but stores stats as a struct
+        // (writeStatsAsStruct=true). After checkpointing, scan rows from the checkpoint have
+        // stats=null and stats_parsed=non-null, exercising the coalesce path in the fix.
+        let snapshot = if use_struct_stats_checkpoint {
+            let table_path = table_url.to_file_path().unwrap();
+            let snapshot_v2 = set_table_properties(
+                table_path.to_str().unwrap(),
+                &table_url,
+                engine.as_ref(),
+                1,
+                &[
+                    ("delta.checkpoint.writeStatsAsJson", "false"),
+                    ("delta.checkpoint.writeStatsAsStruct", "true"),
+                ],
+            )?;
+            // `Snapshot::checkpoint` makes nested `block_on` calls internally (it reads the
+            // log segment lazily while writing). This requires `TokioMultiThreadExecutor`,
+            // which uses `block_in_place` to avoid deadlocking a single-thread runtime.
+            let mt_engine = create_default_engine_mt_executor(&table_url)?;
+            snapshot_v2.checkpoint(mt_engine.as_ref())?;
+            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
+        } else {
+            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
+        };
+
+        // commit_version = 2 (no checkpoint) or 3 (properties commit + checkpoint bump)
+        let expected_commit_version = if use_struct_stats_checkpoint { 3 } else { 2 };
+
+        // Always request all stats columns so stats_parsed is present in scan metadata
+        // regardless of whether a predicate is used. This ensures remove_files can always
+        // reconstruct stats (including the coalesce path when writeStatsAsJson=false).
+        let mut scan_builder = snapshot.clone().scan_builder().include_all_stats_columns();
+        if use_predicate {
+            scan_builder = scan_builder.with_predicate(Arc::new(Pred::gt(
+                column_expr!("number"),
+                Expr::literal(0_i32),
+            )));
+        }
+        let scan = scan_builder.build()?;
+
+        let mut txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_data_change(true);
+
+        // Pass scan metadata (which contains stats_parsed) directly to remove_files.
+        // This previously failed with "Too few fields in output schema".
+        for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+            txn.remove_files(scan_metadata?.scan_files);
+        }
+
+        let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        assert_eq!(committed.commit_version(), expected_commit_version);
+
+        let remove_actions =
+            read_actions_from_commit(&table_url, expected_commit_version, "remove")?;
+        assert!(
+            !remove_actions.is_empty(),
+            "expected remove actions in commit"
+        );
+
+        // stats must be populated in every remove action: stats_parsed is always present
+        // (via include_all_stats_columns), so the coalesce path handles even checkpoints
+        // that omit the raw JSON stats string (writeStatsAsJson=false).
+        for remove in &remove_actions {
+            let stats_str = remove["stats"]
+                .as_str()
+                .expect("stats field should be a non-null JSON string");
+            let stats: serde_json::Value = serde_json::from_str(stats_str)?;
+            assert!(
+                stats["numRecords"].as_i64().unwrap_or(0) > 0,
+                "stats.numRecords should be populated, got: {stats}"
+            );
+        }
+    }
+    Ok(())
+}
+
 // Helper function to create a table with CDF enabled
 async fn create_cdf_table(
     table_name: &str,
@@ -4082,6 +4198,231 @@ async fn test_engine_builder_with_parquet_writer_config(
     let reader = SerializedFileReader::new(file).unwrap();
     let actual_compression = reader.metadata().row_group(0).column(0).compression();
     assert_eq!(actual_compression, expected_compression);
+
+    Ok(())
+}
+
+// === PathMode tests ===
+
+fn get_simple_schema() -> SchemaRef {
+    Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap())
+}
+
+fn simple_id_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow().unwrap()),
+        vec![Arc::new(Int32Array::from(values))],
+    )
+    .unwrap()
+}
+
+/// Helper to write a batch with a specific PathMode and return the post-commit snapshot.
+async fn write_with_path_mode(
+    snapshot: &Arc<Snapshot>,
+    engine: &DefaultEngine<TokioBackgroundExecutor>,
+    data: RecordBatch,
+    path_mode: PathMode,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .with_engine_info("test")
+        .with_path_mode(path_mode);
+    let write_context = txn.unpartitioned_write_context()?;
+    let add_meta = engine
+        .write_parquet(&ArrowEngineData::new(data), &write_context)
+        .await?;
+    txn.add_files(add_meta);
+    let committed = txn.commit(engine)?.unwrap_committed();
+    Ok(committed.post_commit_snapshot().unwrap().clone())
+}
+
+#[rstest::rstest]
+#[case::relative(PathMode::Relative)]
+#[case::absolute(PathMode::Absolute)]
+#[tokio::test]
+async fn test_path_mode_write_format_and_readback(
+    #[case] path_mode: PathMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    let snapshot = write_with_path_mode(
+        &snapshot,
+        engine.as_ref(),
+        simple_id_batch(&schema, vec![1, 2, 3]),
+        path_mode,
+    )
+    .await?;
+
+    // Verify path format in the log
+    let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
+    assert_eq!(add_infos.len(), 1);
+    let path = &add_infos[0].path;
+    match path_mode {
+        PathMode::Relative => assert!(
+            !path.contains("://"),
+            "Relative mode should write relative paths, got: {path}"
+        ),
+        PathMode::Absolute => assert!(
+            path.contains("://"),
+            "Absolute mode should write absolute URLs, got: {path}"
+        ),
+    }
+
+    // Verify data is readable via scan
+    let scan = snapshot.scan_builder().build()?;
+    let engine_ref: Arc<dyn Engine> = engine;
+    let batches = test_utils::read_scan(&scan, engine_ref)?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 3);
+
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::default_is_relative(None, true)]
+#[case::explicit_relative(Some(PathMode::Relative), true)]
+#[case::explicit_absolute(Some(PathMode::Absolute), false)]
+#[test]
+fn test_write_context_propagates_path_mode(
+    #[case] set_mode: Option<PathMode>,
+    #[case] expect_relative: bool,
+) -> DeltaResult<()> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+    let file_url = snapshot.table_root().join("test.parquet").unwrap();
+
+    let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    if let Some(mode) = set_mode {
+        txn = txn.with_path_mode(mode);
+    }
+    let wc = txn.unpartitioned_write_context()?;
+    let resolved = wc.resolve_file_path(&file_url)?;
+
+    if expect_relative {
+        assert_eq!(resolved, "test.parquet");
+    } else {
+        assert_eq!(resolved, file_url.as_str());
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_multiple_files_in_commit_all_use_relative_paths(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("test");
+    let write_context = txn.unpartitioned_write_context().unwrap();
+    for values in [vec![1, 2], vec![3, 4]] {
+        let add_meta = engine
+            .write_parquet(
+                &ArrowEngineData::new(simple_id_batch(&schema, values)),
+                &write_context,
+            )
+            .await?;
+        txn.add_files(add_meta);
+    }
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let snapshot = committed.post_commit_snapshot().unwrap().clone();
+
+    let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
+    assert_eq!(add_infos.len(), 2);
+    for info in &add_infos {
+        assert!(
+            !info.path.contains("://"),
+            "Expected relative path, got: {}",
+            info.path
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_multiple_commits_with_relative_paths_all_readable(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let mut snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    for values in [vec![1, 2], vec![3, 4], vec![5, 6]] {
+        snapshot = write_batch_to_table(
+            &snapshot,
+            engine.as_ref(),
+            simple_id_batch(&schema, values),
+            HashMap::new(),
+        )
+        .await?;
+    }
+
+    let scan = snapshot.scan_builder().build()?;
+    let engine_ref: Arc<dyn Engine> = engine;
+    let batches = test_utils::read_scan(&scan, engine_ref)?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 6);
+
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::relative(PathMode::Relative)]
+#[case::absolute(PathMode::Absolute)]
+#[tokio::test]
+async fn test_create_table_with_data_path_mode(
+    #[case] path_mode: PathMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+
+    let mut txn = create_table_txn(table_url.as_str(), schema.clone(), "test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .with_path_mode(path_mode);
+    let write_context = txn.unpartitioned_write_context()?;
+    let add_meta = engine
+        .write_parquet(
+            &ArrowEngineData::new(simple_id_batch(&schema, vec![10, 20])),
+            &write_context,
+        )
+        .await?;
+    txn.add_files(add_meta);
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let snapshot = committed.post_commit_snapshot().unwrap().clone();
+
+    let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
+    assert_eq!(add_infos.len(), 1);
+    let path = &add_infos[0].path;
+    match path_mode {
+        PathMode::Relative => assert!(
+            !path.contains("://"),
+            "Relative mode should write relative paths, got: {path}"
+        ),
+        PathMode::Absolute => assert!(
+            path.contains("://"),
+            "Absolute mode should write absolute URLs, got: {path}"
+        ),
+    }
+
+    // Verify data is readable
+    let scan = snapshot.scan_builder().build()?;
+    let engine_ref: Arc<dyn Engine> = engine;
+    let batches = test_utils::read_scan(&scan, engine_ref)?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
 
     Ok(())
 }

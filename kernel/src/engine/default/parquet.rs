@@ -37,6 +37,7 @@ use crate::parquet::arrow::arrow_writer::ArrowWriterOptions;
 use crate::parquet::basic::Compression;
 use crate::schema::{SchemaRef, StructType};
 use crate::table_properties::{ParquetCompression, ParquetWriterConfig};
+use crate::transaction::WriteContext;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
     ParquetHandler, PredicateRef,
@@ -92,6 +93,11 @@ impl DataFileMetadata {
         Self { file_meta, stats }
     }
 
+    /// Returns the absolute URL of the written file.
+    pub fn location(&self) -> &url::Url {
+        &self.file_meta.location
+    }
+
     /// Converts this `DataFileMetadata` into an [`EngineData`] record batch matching the schema
     /// returned by [`Transaction::add_files_schema`].
     ///
@@ -100,23 +106,17 @@ impl DataFileMetadata {
     /// converts nulls and empty strings to `None` before reaching this method, so `Some("")`
     /// is not expected in normal usage.
     ///
+    /// The `log_path` is the path string written to the Delta log's `add.path` field. The
+    /// caller determines whether this is relative or absolute based on [`PathMode`].
+    ///
+    /// [`PathMode`]: crate::transaction::PathMode
     /// [`Transaction::add_files_schema`]: crate::transaction::Transaction::add_files_schema
     pub(crate) fn as_record_batch(
         &self,
         partition_values: &HashMap<String, Option<String>>,
+        log_path: &str,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let DataFileMetadata {
-            file_meta:
-                FileMeta {
-                    location,
-                    last_modified,
-                    size,
-                },
-            stats,
-            ..
-        } = self;
-        // create the record batch of the write metadata
-        let path = Arc::new(StringArray::from(vec![location.to_string()]));
+        let path = Arc::new(StringArray::from(vec![log_path]));
         let key_builder = StringBuilder::new();
         let val_builder = StringBuilder::new();
         let names = MapFieldNames {
@@ -137,13 +137,15 @@ impl DataFileMetadata {
         builder.append(true)?;
         let partitions = Arc::new(builder.finish());
         // this means max size we can write is i64::MAX (~8EB)
-        let size: i64 = (*size)
+        let size: i64 = self
+            .file_meta
+            .size
             .try_into()
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to i64"))?;
         let size = Arc::new(Int64Array::from(vec![size]));
-        let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
+        let modification_time = Arc::new(Int64Array::from(vec![self.file_meta.last_modified]));
 
-        let stats_array = Arc::new(stats.clone());
+        let stats_array = Arc::new(self.stats.clone());
 
         // Build schema dynamically based on stats (stats schema varies based on collected statistics)
         let key_value_struct = DataType::Struct(
@@ -258,25 +260,29 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         Ok(DataFileMetadata::new(file_meta, stats))
     }
 
-    /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
-    /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
-    /// is a generated UUIDv4).
+    /// Write `data` to a new parquet file under the [`WriteContext::write_dir`] and return
+    /// Add action metadata ready for [`Transaction::add_files`].
     ///
-    /// Note that the schema does not contain the dataChange column. In order to set `data_change` flag,
-    /// use [`crate::transaction::Transaction::with_data_change`].
+    /// The path format (relative or absolute) is controlled by the [`PathMode`] set on
+    /// the transaction.
     ///
-    /// [add file metadata]: crate::transaction::Transaction::add_files_schema
+    /// [`PathMode`]: crate::transaction::PathMode
+    ///
+    /// [`WriteContext::write_dir`]: crate::transaction::WriteContext::write_dir
+    /// [`Transaction::add_files`]: crate::transaction::Transaction::add_files
     pub async fn write_parquet_file(
         &self,
-        path: &url::Url,
         data: Box<dyn EngineData>,
-        partition_values: &HashMap<String, Option<String>>,
-        stats_columns: Option<&[ColumnName]>,
+        write_context: &WriteContext,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let parquet_metadata = self
-            .write_parquet(path, data, stats_columns.unwrap_or(&[]))
+        let file_metadata = self
+            .write_parquet(
+                &write_context.write_dir(),
+                data,
+                write_context.stats_columns(),
+            )
             .await?;
-        parquet_metadata.as_record_batch(partition_values)
+        super::build_add_file_metadata(file_metadata, write_context)
     }
 }
 
@@ -790,7 +796,7 @@ mod tests {
         let data_file_metadata = DataFileMetadata::new(file_metadata, stats.clone());
         let partition_values = HashMap::from([("partition1".to_string(), partition_value.clone())]);
         let actual = data_file_metadata
-            .as_record_batch(&partition_values)
+            .as_record_batch(&partition_values, "test_url")
             .unwrap();
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
@@ -842,7 +848,7 @@ mod tests {
         let expected = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec![location.to_string()])),
+                Arc::new(StringArray::from(vec!["test_url"])),
                 Arc::new(partition_values),
                 Arc::new(Int64Array::from(vec![size as i64])),
                 Arc::new(Int64Array::from(vec![last_modified])),

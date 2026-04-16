@@ -111,6 +111,7 @@ pub mod table_properties;
 pub mod transaction;
 pub mod transforms;
 
+pub use crc::{FileSizeHistogram, FileStats};
 pub use log_path::LogPath;
 
 // Public under test-utils so integration tests can call get_high_water_mark via snapshot.

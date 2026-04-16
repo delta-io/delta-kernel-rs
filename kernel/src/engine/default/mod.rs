@@ -314,21 +314,20 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             output_schema.clone().into(),
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
-        // Random 2-char prefix for CM tables, Hive-style for partitioned, else table root.
-        let write_dir = write_context.write_dir();
         self.parquet
-            .write_parquet_file(
-                &write_dir,
-                physical_data,
-                write_context.physical_partition_values(),
-                Some(write_context.stats_columns()),
-            )
+            .write_parquet_file(physical_data, write_context)
             .await
     }
 }
 
-/// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values
-/// from the provided [`WriteContext`].
+/// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values,
+/// path mode, and table root from the provided [`WriteContext`].
+///
+/// The path format in the returned Add action metadata (relative vs absolute) is controlled
+/// by the [`PathMode`] set on the transaction. Relative paths are computed relative to the
+/// table root URL.
+///
+/// [`PathMode`]: crate::transaction::PathMode
 ///
 /// This is the public API for building Add action metadata from file write results. Custom
 /// Arrow-based engines that write parquet files themselves (bypassing [`DefaultEngine::write_parquet`])
@@ -340,7 +339,8 @@ pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
     write_context: &WriteContext,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    file_metadata.as_record_batch(write_context.physical_partition_values())
+    let add_path = write_context.resolve_file_path(file_metadata.location())?;
+    file_metadata.as_record_batch(write_context.physical_partition_values(), &add_path)
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
@@ -373,24 +373,24 @@ trait UrlExt {
 
 impl UrlExt for Url {
     fn is_presigned(&self) -> bool {
+        // We search a URL query string for these keys to see if we should consider it a presigned URL:
+        // - AWS: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+        // - Cloudflare R2: https://developers.cloudflare.com/r2/api/s3/presigned-urls/
+        // - Azure Blob (SAS): https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas#version-2020-12-06-and-later
+        // - Google Cloud Storage: https://cloud.google.com/storage/docs/authentication/signatures
+        // - Alibaba Cloud OSS: https://www.alibabacloud.com/help/en/oss/user-guide/upload-files-using-presigned-urls
+        // - Databricks presigned URLs
+        const PRESIGNED_KEYS: &[&str] = &[
+            "X-Amz-Signature",
+            "sp",
+            "X-Goog-Credential",
+            "X-OSS-Credential",
+            "X-Databricks-Signature",
+        ];
         matches!(self.scheme(), "http" | "https")
-            && (
-                // https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
-                // https://developers.cloudflare.com/r2/api/s3/presigned-urls/
-                self
+            && self
                 .query_pairs()
-                .any(|(k, _)| k.eq_ignore_ascii_case("X-Amz-Signature")) ||
-                // https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas#version-2020-12-06-and-later
-                // note signed permission (sp) must always be present
-                self
-                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("sp")) ||
-                // https://cloud.google.com/storage/docs/authentication/signatures
-                self
-                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("X-Goog-Credential")) ||
-                // https://www.alibabacloud.com/help/en/oss/user-guide/upload-files-using-presigned-urls
-                self
-                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("X-OSS-Credential"))
-            )
+                .any(|(k, _)| PRESIGNED_KEYS.iter().any(|p| k.eq_ignore_ascii_case(p)))
     }
 }
 
@@ -493,6 +493,11 @@ mod tests {
         assert!(url.is_presigned());
 
         let url = Url::parse("https://example.com?X-OSS-Credential=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url =
+            Url::parse("https://example.com?X-Databricks-TTL=3599545&X-Databricks-Signature=bar")
+                .unwrap();
         assert!(url.is_presigned());
 
         // assert that query keys are case insensitive
