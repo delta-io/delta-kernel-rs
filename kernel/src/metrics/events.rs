@@ -65,6 +65,7 @@ pub enum MetricEvent {
         num_commit_files: u64,
         num_checkpoint_files: u64,
         num_compaction_files: u64,
+        has_latest_crc_file: bool,
     },
 
     /// Protocol and metadata loading completed.
@@ -117,6 +118,15 @@ pub enum MetricEvent {
     /// [`ParquetHandler::read_parquet_files`]: crate::ParquetHandler::read_parquet_files
     ParquetReadCompleted { num_files: u64, bytes_read: u64 },
 
+    /// CRC file read operation completed (one event per CRC file read).
+    ///
+    /// Emitted after the raw bytes are read from storage, regardless of whether JSON
+    /// deserialization succeeds.
+    ///
+    /// `bytes_read` is the number of bytes read from the CRC file.
+    /// `duration` is the duration of the read operation (not including deserialization).
+    CrcReadCompleted { duration: Duration, bytes_read: u64 },
+
     /// Scan metadata iteration completed.
     ///
     /// Emitted when the scan metadata iterator is exhausted. This event captures metrics about the
@@ -161,9 +171,12 @@ impl fmt::Display for MetricEvent {
                 num_commit_files,
                 num_checkpoint_files,
                 num_compaction_files,
+                has_latest_crc_file,
             } => write!(
                 f,
-                "LogSegmentLoaded(id={operation_id}, duration={duration:?}, commits={num_commit_files}, checkpoints={num_checkpoint_files}, compactions={num_compaction_files})"
+                "LogSegmentLoaded(id={operation_id}, duration={duration:?}, \
+                 commits={num_commit_files}, checkpoints={num_checkpoint_files}, \
+                 compactions={num_compaction_files}, has_latest_crc={has_latest_crc_file})"
             ),
             MetricEvent::ProtocolMetadataLoaded {
                 operation_id,
@@ -220,6 +233,12 @@ impl fmt::Display for MetricEvent {
                 f,
                 "ParquetReadCompleted(files={num_files}, bytes={bytes_read})"
             ),
+            MetricEvent::CrcReadCompleted {
+                duration,
+                bytes_read,
+            } => {
+                write!(f, "CrcReadCompleted(duration={duration:?}, bytes={bytes_read})")
+            }
             MetricEvent::ScanMetadataCompleted {
                 operation_id,
                 scan_type,
