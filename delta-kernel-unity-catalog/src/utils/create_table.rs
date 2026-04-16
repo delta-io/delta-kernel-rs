@@ -171,7 +171,7 @@ mod tests {
         let table_path = "memory:///test_table/";
         let schema = Arc::new(
             StructType::try_new(vec![
-                StructField::new("id", DataType::INTEGER, false),
+                StructField::new("id", DataType::INTEGER, true),
                 StructField::new("region", DataType::STRING, true),
             ])
             .unwrap(),
@@ -232,7 +232,7 @@ mod tests {
         ]);
         let schema = Arc::new(
             StructType::try_new(vec![
-                StructField::new("id", DataType::INTEGER, false),
+                StructField::new("id", DataType::INTEGER, true),
                 StructField::new("region", DataType::STRING, true),
                 StructField::new("address", DataType::Struct(Box::new(address_struct)), true),
             ])
@@ -278,7 +278,7 @@ mod tests {
         let engine = DefaultEngineBuilder::new(storage).build();
         let table_path = "memory:///test_version_check/";
         let schema = Arc::new(
-            StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap(),
+            StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap(),
         );
 
         // Create a table (version 0) and append (version 1)
