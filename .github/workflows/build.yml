@@ -97,6 +97,7 @@ jobs:
           pushd kernel
           echo "Testing with $(cargo msrv show --output-format minimal)"
           cargo +$(cargo msrv show --output-format minimal) nextest run --locked
+          cargo +$(cargo msrv show --output-format minimal) test --doc
   docs:
     runs-on: ubuntu-latest
     env:
