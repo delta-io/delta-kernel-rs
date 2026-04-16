@@ -292,21 +292,20 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             output_schema.clone().into(),
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
-        // Random 2-char prefix for CM tables, Hive-style for partitioned, else table root.
-        let write_dir = write_context.write_dir();
         self.parquet
-            .write_parquet_file(
-                &write_dir,
-                physical_data,
-                write_context.physical_partition_values(),
-                Some(write_context.stats_columns()),
-            )
+            .write_parquet_file(physical_data, write_context)
             .await
     }
 }
 
-/// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values
-/// from the provided [`WriteContext`].
+/// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values,
+/// path mode, and table root from the provided [`WriteContext`].
+///
+/// The path format in the returned Add action metadata (relative vs absolute) is controlled
+/// by the [`PathMode`] set on the transaction. Relative paths are computed relative to the
+/// table root URL.
+///
+/// [`PathMode`]: crate::transaction::PathMode
 ///
 /// This is the public API for building Add action metadata from file write results. Custom
 /// Arrow-based engines that write parquet files themselves (bypassing [`DefaultEngine::write_parquet`])
@@ -318,7 +317,8 @@ pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
     write_context: &WriteContext,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    file_metadata.as_record_batch(write_context.physical_partition_values())
+    let add_path = write_context.resolve_file_path(file_metadata.location())?;
+    file_metadata.as_record_batch(write_context.physical_partition_values(), &add_path)
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
