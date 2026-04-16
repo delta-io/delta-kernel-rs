@@ -12,6 +12,8 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 
+#[cfg(feature = "default-engine-base")]
+use crate::engine_data::ArrowFFIData;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
@@ -702,6 +704,109 @@ fn visit_scan_metadata_impl(
     Ok(true)
 }
 
+// === Arrow batch-mode scan metadata ===
+
+/// Result of [`scan_metadata_next_arrow`]: an Arrow C Data Interface batch, a selection
+/// vector, and per-row transformation expressions.
+///
+/// The engine must free this by calling [`free_scan_metadata_arrow_result`] exactly once.
+#[cfg(feature = "default-engine-base")]
+#[repr(C)]
+pub struct ScanMetadataArrowResult {
+    /// Arrow C Data Interface batch containing scan file metadata (path, size, stats, etc.).
+    pub arrow_data: ArrowFFIData,
+    /// Boolean selection vector indicating active rows. Length equals the batch row count;
+    /// `true` at index `i` means row `i` should be processed.
+    pub selection_vector: KernelBoolSlice,
+    /// Opaque pointer to per-row transformation expressions. Use [`get_transform_for_row`]
+    /// with a row index to retrieve the transform for that row. If non-null, the transform
+    /// must be applied to data read from the file to produce the correct logical schema.
+    /// Owned by this struct and freed by [`free_scan_metadata_arrow_result`].
+    pub transforms: *mut CTransforms,
+}
+
+/// Get the next scan metadata batch as Arrow via the C Data Interface.
+///
+/// Advances the iterator by one batch and returns a [`ScanMetadataArrowResult`] containing:
+/// - An Arrow RecordBatch with scan row schema columns (path, size, modificationTime,
+///   stats, deletionVector, fileConstantValues)
+/// - A boolean selection vector indicating active rows (true = selected)
+/// - Per-row transformation expressions (use [`get_transform_for_row`] to access)
+///
+/// Returns `Ok(non-null)` with the next batch, `Ok(null)` when the iterator is exhausted,
+/// or `Err` if an error occurred during iteration.
+///
+/// This is an alternative to the callback-based [`scan_metadata_next`] +
+/// [`visit_scan_metadata`] path, avoiding per-row FFI overhead.
+///
+/// # Safety
+///
+/// `data` must be a valid [`SharedScanMetadataIterator`] handle.
+/// `engine` must be a valid [`SharedExternEngine`] handle.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn scan_metadata_next_arrow(
+    data: Handle<SharedScanMetadataIterator>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<*mut ScanMetadataArrowResult> {
+    let data = unsafe { data.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    scan_metadata_next_arrow_impl(data).into_extern_result(&engine)
+}
+
+#[cfg(feature = "default-engine-base")]
+fn scan_metadata_next_arrow_impl(
+    data: &ScanMetadataIterator,
+) -> DeltaResult<*mut ScanMetadataArrowResult> {
+    let mut iter = data
+        .data
+        .lock()
+        .map_err(|_| Error::generic("poisoned mutex"))?;
+
+    match iter.next().transpose()? {
+        Some(scan_metadata) => {
+            let (engine_data, selection_vector) = scan_metadata.scan_files.into_parts();
+            let arrow_data = ArrowFFIData::try_from_engine_data(engine_data)?;
+            let result = Box::new(ScanMetadataArrowResult {
+                arrow_data,
+                selection_vector: selection_vector.into(),
+                transforms: Box::into_raw(Box::new(CTransforms {
+                    transforms: scan_metadata.scan_file_transforms,
+                })),
+            });
+            Ok(Box::into_raw(result))
+        }
+        None => Ok(std::ptr::null_mut()),
+    }
+}
+
+/// Free a [`ScanMetadataArrowResult`] returned by [`scan_metadata_next_arrow`].
+///
+/// # Safety
+///
+/// `result` must be a valid pointer returned by [`scan_metadata_next_arrow`], or null.
+/// Must be called at most once per result.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn free_scan_metadata_arrow_result(result: *mut ScanMetadataArrowResult) {
+    if result.is_null() {
+        return;
+    }
+    let ScanMetadataArrowResult {
+        arrow_data,
+        selection_vector,
+        transforms,
+    } = unsafe { *Box::from_raw(result) };
+    // KernelBoolSlice is a leaked Vec<bool>; reconstitute and drop to free
+    let _ = unsafe { selection_vector.into_vec() };
+    // ArrowFFIData's FFI_ArrowArray/FFI_ArrowSchema have Drop impls that call
+    // their release callbacks if non-null. If the consumer already imported the
+    // data (calling release), the pointers are null and drop is a no-op.
+    drop(arrow_data);
+    // CTransforms was heap-allocated; reconstitute the Box and drop it
+    drop(unsafe { Box::from_raw(transforms) });
+}
+
 #[cfg(test)]
 mod scan_builder_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -980,6 +1085,258 @@ mod scan_builder_tests {
         unsafe { free_scan_builder(builder) };
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
+    }
+}
+
+#[cfg(all(test, feature = "default-engine-base"))]
+mod scan_metadata_arrow_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use delta_kernel::arrow::array::ffi::from_ffi;
+    use delta_kernel::arrow::array::{RecordBatch, StructArray};
+    use test_utils::{actions_to_string, TestAction};
+
+    use crate::engine_data::ArrowFFIData;
+    use crate::ffi_test_utils::{ok_or_panic, setup_snapshot};
+    use crate::{free_engine, free_snapshot};
+
+    use super::{
+        free_scan, free_scan_metadata_arrow_result, free_scan_metadata_iter, get_transform_for_row,
+        scan_builder, scan_builder_build, scan_metadata_iter_init, scan_metadata_next_arrow_impl,
+        CTransforms, ScanMetadataArrowResult, SharedScan, SharedScanMetadataIterator,
+    };
+
+    /// Sets up engine, snapshot, scan, and scan metadata iterator from the given test actions.
+    async fn setup_scan_iter(
+        actions: Vec<TestAction>,
+    ) -> (
+        crate::handle::Handle<crate::SharedExternEngine>,
+        crate::handle::Handle<crate::SharedSnapshot>,
+        crate::handle::Handle<SharedScan>,
+        crate::handle::Handle<SharedScanMetadataIterator>,
+    ) {
+        let (engine, snapshot) = setup_snapshot(actions_to_string(actions)).await.unwrap();
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        let iter = unsafe {
+            ok_or_panic(scan_metadata_iter_init(
+                engine.shallow_copy(),
+                scan.shallow_copy(),
+            ))
+        };
+        (engine, snapshot, scan, iter)
+    }
+
+    /// Consume a non-null `ScanMetadataArrowResult` pointer, import the Arrow FFI data back
+    /// to a `RecordBatch`, and return the batch, selection vector, and transforms.
+    unsafe fn import_arrow_result(
+        ptr: *mut ScanMetadataArrowResult,
+    ) -> (RecordBatch, Vec<bool>, Box<CTransforms>) {
+        let ScanMetadataArrowResult {
+            arrow_data,
+            selection_vector,
+            transforms,
+        } = *Box::from_raw(ptr);
+        let ArrowFFIData { array, schema } = arrow_data;
+        let array_data = from_ffi(array, &schema).unwrap();
+        let batch: RecordBatch = StructArray::from(array_data).into();
+        let sv = selection_vector.into_vec();
+        (batch, sv, Box::from_raw(transforms))
+    }
+
+    #[tokio::test]
+    async fn returns_batch_then_null_on_exhaustion() {
+        let (engine, snapshot, scan, iter) = setup_scan_iter(vec![
+            TestAction::Metadata,
+            TestAction::Add("file1.parquet".into()),
+        ])
+        .await;
+
+        let iter_ref = unsafe { iter.as_ref() };
+
+        // First call returns a non-null batch
+        let ptr = scan_metadata_next_arrow_impl(iter_ref).unwrap();
+        assert!(!ptr.is_null());
+        unsafe { free_scan_metadata_arrow_result(ptr) };
+
+        // Subsequent calls return null (exhausted)
+        let ptr = scan_metadata_next_arrow_impl(iter_ref).unwrap();
+        assert!(ptr.is_null());
+        let ptr = scan_metadata_next_arrow_impl(iter_ref).unwrap();
+        assert!(ptr.is_null());
+
+        unsafe {
+            free_scan_metadata_iter(iter);
+            free_scan(scan);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+    }
+
+    #[tokio::test]
+    async fn arrow_data_round_trips_with_correct_schema() {
+        let (engine, snapshot, scan, iter) = setup_scan_iter(vec![
+            TestAction::Metadata,
+            TestAction::Add("file1.parquet".into()),
+        ])
+        .await;
+
+        let iter_ref = unsafe { iter.as_ref() };
+        let ptr = scan_metadata_next_arrow_impl(iter_ref).unwrap();
+        assert!(!ptr.is_null());
+
+        let (batch, sv, _transforms) = unsafe { import_arrow_result(ptr) };
+
+        // The batch includes all log entries (commitInfo, protocol, metadata, add) but only
+        // the add file row is selected. Verify schema columns match SCAN_ROW_SCHEMA.
+        let batch_schema = batch.schema();
+        assert!(batch_schema.field_with_name("path").is_ok());
+        assert!(batch_schema.field_with_name("size").is_ok());
+        assert!(batch_schema.field_with_name("modificationTime").is_ok());
+        assert!(batch_schema.field_with_name("stats").is_ok());
+        assert!(batch_schema.field_with_name("deletionVector").is_ok());
+        assert!(batch_schema.field_with_name("fileConstantValues").is_ok());
+
+        // Selection vector length matches batch rows; exactly 1 row selected (the add file)
+        assert_eq!(sv.len(), batch.num_rows());
+        assert_eq!(sv.iter().filter(|&&v| v).count(), 1);
+
+        unsafe {
+            free_scan_metadata_iter(iter);
+            free_scan(scan);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_add_files_all_selected() {
+        let (engine, snapshot, scan, iter) = setup_scan_iter(vec![
+            TestAction::Metadata,
+            TestAction::Add("a.parquet".into()),
+            TestAction::Add("b.parquet".into()),
+            TestAction::Add("c.parquet".into()),
+        ])
+        .await;
+
+        let iter_ref = unsafe { iter.as_ref() };
+        let mut total_selected = 0usize;
+
+        loop {
+            let ptr = scan_metadata_next_arrow_impl(iter_ref).unwrap();
+            if ptr.is_null() {
+                break;
+            }
+            let (batch, sv, _transforms) = unsafe { import_arrow_result(ptr) };
+            assert_eq!(sv.len(), batch.num_rows());
+            total_selected += sv.iter().filter(|&&v| v).count();
+        }
+
+        assert_eq!(total_selected, 3, "3 add files -> 3 selected rows");
+
+        unsafe {
+            free_scan_metadata_iter(iter);
+            free_scan(scan);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_table_returns_null_immediately() {
+        let (engine, snapshot, scan, iter) = setup_scan_iter(vec![TestAction::Metadata]).await;
+
+        let iter_ref = unsafe { iter.as_ref() };
+        let ptr = scan_metadata_next_arrow_impl(iter_ref).unwrap();
+        assert!(ptr.is_null(), "table with no data files -> immediate null");
+
+        unsafe {
+            free_scan_metadata_iter(iter);
+            free_scan(scan);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+    }
+
+    #[tokio::test]
+    async fn simple_table_has_no_transforms() {
+        let (engine, snapshot, scan, iter) = setup_scan_iter(vec![
+            TestAction::Metadata,
+            TestAction::Add("file1.parquet".into()),
+        ])
+        .await;
+
+        let iter_ref = unsafe { iter.as_ref() };
+        let ptr = scan_metadata_next_arrow_impl(iter_ref).unwrap();
+        assert!(!ptr.is_null());
+
+        let (_batch, _sv, transforms) = unsafe { import_arrow_result(ptr) };
+
+        // Simple table (no partitions, no column mapping) has an empty transforms vec.
+        // get_transform_for_row returns None for any row index.
+        assert!(transforms.transforms.is_empty());
+        let result = unsafe { get_transform_for_row(0, &transforms) };
+        assert!(matches!(result, crate::OptionalValue::None));
+
+        unsafe {
+            free_scan_metadata_iter(iter);
+            free_scan(scan);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+    }
+
+    #[tokio::test]
+    async fn partitioned_table_has_transforms() {
+        let (engine, snapshot) = setup_snapshot(test_utils::actions_to_string_partitioned(vec![
+            TestAction::Metadata,
+            TestAction::Add("val=a/file1.parquet".into()),
+        ]))
+        .await
+        .unwrap();
+
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        let iter = unsafe {
+            ok_or_panic(scan_metadata_iter_init(
+                engine.shallow_copy(),
+                scan.shallow_copy(),
+            ))
+        };
+
+        let iter_ref = unsafe { iter.as_ref() };
+        let ptr = scan_metadata_next_arrow_impl(iter_ref).unwrap();
+        assert!(!ptr.is_null());
+
+        let (batch, sv, transforms) = unsafe { import_arrow_result(ptr) };
+
+        // Partitioned table produces per-row transforms. The transforms vec has one
+        // entry per batch row. Selected (add-file) rows should have Some transform.
+        assert_eq!(transforms.transforms.len(), batch.num_rows());
+        for (i, &selected) in sv.iter().enumerate() {
+            let result = unsafe { get_transform_for_row(i, &transforms) };
+            if selected {
+                // get_transform_for_row clones the Arc into a Handle; must free it
+                match result {
+                    crate::OptionalValue::Some(handle) => unsafe { handle.drop_handle() },
+                    crate::OptionalValue::None => {
+                        panic!("selected row {i} should have a transform for partitioned table")
+                    }
+                }
+            }
+        }
+
+        unsafe {
+            free_scan_metadata_iter(iter);
+            free_scan(scan);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+    }
+
+    #[test]
+    fn free_null_is_safe() {
+        unsafe { free_scan_metadata_arrow_result(std::ptr::null_mut()) };
     }
 }
 
