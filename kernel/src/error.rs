@@ -225,6 +225,10 @@ pub enum Error {
     /// Validation error for file statistics (e.g., missing required clustering column stats)
     #[error("Stats validation error: {0}")]
     StatsValidation(String),
+
+    /// Error during log history operations (timestamp queries, version lookups)
+    #[error(transparent)]
+    LogHistory(#[from] Box<crate::history_manager::error::LogHistoryError>),
 }
 
 // Convenience constructors for Error types that take a String argument
