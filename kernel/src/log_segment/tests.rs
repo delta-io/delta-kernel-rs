@@ -4485,3 +4485,29 @@ async fn read_actions_with_null_map_values(
     }
     assert!(found, "Should have found a {action_name} action batch");
 }
+
+#[test]
+fn new_for_version_zero_creates_valid_log_segment() {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let commit_path = create_log_path("memory:///_delta_log/00000000000000000000.json");
+    let segment = super::LogSegment::new_for_version_zero(log_root.clone(), commit_path).unwrap();
+    assert_eq!(segment.end_version, 0);
+    assert_eq!(segment.log_root, log_root);
+}
+
+#[test]
+fn new_for_version_zero_rejects_non_zero_version() {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let commit_path = create_log_path("memory:///_delta_log/00000000000000000001.json");
+    let err = super::LogSegment::new_for_version_zero(log_root, commit_path).unwrap_err();
+    assert!(err.to_string().contains("version"));
+}
+
+#[test]
+fn new_for_version_zero_rejects_non_commit_file() {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let checkpoint_path =
+        create_log_path("memory:///_delta_log/00000000000000000000.checkpoint.parquet");
+    let err = super::LogSegment::new_for_version_zero(log_root, checkpoint_path).unwrap_err();
+    assert!(err.to_string().contains("non-commit"));
+}

@@ -17,11 +17,9 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
-use crate::log_segment::LogSegment;
 use crate::schema::validation::validate_schema_for_create;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{normalize_column_names_to_schema_casing, DataType, SchemaRef, StructType};
-use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     assign_column_mapping_metadata, get_any_level_column_physical_name,
@@ -40,7 +38,7 @@ use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
-use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
+use crate::{DeltaResult, Engine, Error, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
 ///
@@ -815,15 +813,12 @@ impl CreateTableTransactionBuilder {
             validated.properties,
         )?;
 
-        // Create pre-commit snapshot from protocol/metadata
-        let log_root = table_url.join("_delta_log/")?;
-        let log_segment = LogSegment::for_pre_commit(log_root);
-        let table_configuration =
-            TableConfiguration::try_new(metadata, protocol, table_url, PRE_COMMIT_VERSION)?;
+        // Build TableConfiguration directly for the new table
+        let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
 
-        // Create Transaction<CreateTable> with pre-commit snapshot
+        // Create Transaction<CreateTable> with the effective table configuration
         Transaction::try_new_create_table(
-            Arc::new(Snapshot::new(log_segment, table_configuration)),
+            table_configuration,
             self.engine_info,
             committer,
             data_layout_result.system_domain_metadata,

@@ -202,17 +202,25 @@ impl TableConfiguration {
     /// Creates a new [`TableConfiguration`] representing the table configuration immediately
     /// after a commit.
     ///
-    /// This method takes a pre-commit table configuration and produces a post-commit
-    /// configuration at the committed version. This allows immediate use of the new table
-    /// configuration without re-reading metadata from storage.
+    /// This method takes the current table configuration and produces a post-commit
+    /// configuration at the committed version. If the commit included new Protocol or Metadata
+    /// actions (e.g. ALTER TABLE), those are passed in and the configuration is rebuilt with
+    /// full validation. Otherwise the existing configuration is cloned with only the version
+    /// updated.
     ///
-    /// TODO: Take in Protocol (when Kernel-RS supports protocol changes)
-    /// TODO: Take in Metadata (when Kernel-RS supports metadata changes)
-    pub(crate) fn new_post_commit(table_configuration: &Self, new_version: Version) -> Self {
-        Self {
-            version: new_version,
-            ..table_configuration.clone()
-        }
+    /// Returns the new [`TableConfiguration`] at `new_version`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the new metadata/protocol combination fails
+    /// [`TableConfiguration::try_new`] validation (e.g., unsupported features, invalid schema).
+    pub(crate) fn new_post_commit(
+        table_configuration: &Self,
+        new_version: Version,
+        new_metadata: Option<Metadata>,
+        new_protocol: Option<Protocol>,
+    ) -> DeltaResult<Self> {
+        Self::try_new_from(table_configuration, new_metadata, new_protocol, new_version)
     }
 
     /// Generates the expected schema for file statistics.

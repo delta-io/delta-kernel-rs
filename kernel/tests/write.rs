@@ -3340,6 +3340,12 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
     let mut current_snapshot = match create_result {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(committed.commit_version(), 0);
+            // CREATE TABLE is the first commit: 1 commit since last checkpoint/compaction
+            assert_eq!(committed.post_commit_stats().commits_since_checkpoint, 1);
+            assert_eq!(
+                committed.post_commit_stats().commits_since_log_compaction,
+                1
+            );
             let post_snapshot = committed
                 .post_commit_snapshot()
                 .expect("should have post_commit_snapshot");
