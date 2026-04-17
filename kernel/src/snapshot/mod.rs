@@ -28,6 +28,7 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{physical_to_logical_column_name, ColumnMappingMode, TableFeature};
 use crate::table_properties::TableProperties;
+use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
@@ -656,6 +657,17 @@ impl Snapshot {
         engine: &dyn Engine,
     ) -> DeltaResult<Transaction> {
         Transaction::try_new_existing_table(self, committer, engine)
+    }
+
+    /// Creates a builder for altering this table's metadata. Currently supports schema change
+    /// operations.
+    ///
+    /// The returned builder allows chaining operations before building an
+    /// [`AlterTableTransaction`] that can be committed.
+    ///
+    /// [`AlterTableTransaction`]: crate::transaction::alter_table::AlterTableTransaction
+    pub fn alter_table(self: Arc<Self>) -> AlterTableTransactionBuilder {
+        AlterTableTransactionBuilder::new(self)
     }
 
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the
