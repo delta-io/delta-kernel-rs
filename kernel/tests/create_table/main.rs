@@ -12,7 +12,7 @@ mod variant;
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -217,18 +217,88 @@ fn nested_non_null_schema() -> Arc<StructType> {
     )
 }
 
+/// CREATE TABLE with non-null columns succeeds and auto-enables the `invariants`
+/// writer feature in the protocol. Delta-Spark treats non-null schema columns as
+/// implicit invariants and requires the feature to be declared.
 #[rstest]
 #[case::top_level_non_null(top_level_non_null_schema())]
 #[case::nested_non_null(nested_non_null_schema())]
-fn test_create_table_non_null_columns_require_invariants_feature(
+fn test_create_table_with_non_null_columns_auto_enables_invariants(
     #[case] schema: Arc<StructType>,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let result = create_table(&table_path, schema, "InvalidApp/0.1.0")
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let protocol = snapshot.table_configuration().protocol();
+    assert!(
+        protocol
+            .writer_features()
+            .is_some_and(|f| f.contains(&TableFeature::Invariants)),
+        "Invariants feature should be auto-added to writer features for non-null schema"
+    );
+    // Invariants is writer-only; reader features should not contain it.
+    assert!(
+        !protocol
+            .reader_features()
+            .is_some_and(|f| f.contains(&TableFeature::Invariants)),
+        "Invariants should not appear in reader features"
+    );
+
+    Ok(())
+}
+
+/// CREATE TABLE with `delta.feature.invariants=supported` on an all-nullable schema
+/// succeeds and lands the feature in writerFeatures. This lets users pre-enable the
+/// feature so a later ALTER TABLE ADD COLUMN NOT NULL does not need a protocol upgrade.
+#[tokio::test]
+async fn test_create_table_with_invariants_feature_signal_allowed() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = simple_schema()?;
+
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.feature.invariants", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let protocol = snapshot.table_configuration().protocol();
+    assert!(
+        protocol
+            .writer_features()
+            .is_some_and(|f| f.contains(&TableFeature::Invariants)),
+        "Invariants feature should appear in writerFeatures when enabled via feature signal"
+    );
+    assert!(
+        !protocol
+            .reader_features()
+            .is_some_and(|f| f.contains(&TableFeature::Invariants)),
+        "Invariants should not appear in readerFeatures (writer-only feature)"
+    );
+
+    Ok(())
+}
+
+/// CREATE TABLE rejects any schema with `delta.invariants` metadata annotations
+/// because kernel cannot evaluate SQL expression invariants.
+#[tokio::test]
+async fn test_create_table_rejects_delta_invariants_metadata() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let mut field = StructField::new("x", DataType::INTEGER, true);
+    field.metadata.insert(
+        ColumnMetadataKey::Invariants.as_ref().to_string(),
+        MetadataValue::String(r#"{"expression": {"expression": "x > 0"}}"#.to_string()),
+    );
+    let schema = Arc::new(StructType::try_new(vec![field])?);
+
+    let result = create_table(&table_path, schema, "Test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
-    assert_result_error_with_message(result, "Non-null column");
+    assert_result_error_with_message(result, "delta.invariants");
 
     Ok(())
 }
