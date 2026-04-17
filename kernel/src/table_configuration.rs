@@ -150,6 +150,29 @@ impl TableConfiguration {
         version: Version,
     ) -> DeltaResult<Self> {
         let logical_schema = Arc::new(metadata.parse_schema()?);
+        Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
+    }
+
+    /// Same as [`try_new`](Self::try_new), but accepts a pre-parsed schema to avoid re-parsing
+    /// the metadata's schema string. Use this when the caller already has the parsed schema
+    /// (e.g. after schema evolution).
+    pub(crate) fn try_new_with_schema(
+        metadata: Metadata,
+        protocol: Protocol,
+        table_root: Url,
+        version: Version,
+        logical_schema: SchemaRef,
+    ) -> DeltaResult<Self> {
+        Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
+    }
+
+    fn try_new_inner(
+        metadata: Metadata,
+        protocol: Protocol,
+        table_root: Url,
+        version: Version,
+        logical_schema: SchemaRef,
+    ) -> DeltaResult<Self> {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
