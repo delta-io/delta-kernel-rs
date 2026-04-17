@@ -905,7 +905,7 @@ fn evaluate_map_to_struct(
     Ok(StructArray::try_new(
         arrow_fields.into(),
         output_columns,
-        None,
+        map_array.nulls().cloned(),
     )?)
 }
 
