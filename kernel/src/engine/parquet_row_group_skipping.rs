@@ -37,10 +37,12 @@ pub(crate) trait ParquetRowGroupSkipping {
     /// under `add.partitionValues_parsed.*`.
     ///
     /// The `predicate` uses physical column names (e.g. `x > 10`, or `col-abc-123 > 10` under
-    /// column mapping), and the filter internally maps them to the checkpoint's nested layout.
+    /// column mapping), and the filter internally maps them to the checkpoint's nested stats
+    /// schema layout.
     /// Statistics for data columns are null-guarded: if a stat column contains any null values
     /// in the row group (indicating some files lack that statistic), the stat is treated as
     /// unavailable to prevent false pruning.
+    // TODO: remove #[allow(dead_code)] once production callers land
     #[allow(dead_code)]
     fn with_checkpoint_row_group_filter(
         self,
@@ -366,8 +368,7 @@ impl<'a> CheckpointRowGroupFilter<'a> {
 
     /// Returns `true` if the column is a partition column.
     fn is_partition_column(&self, col: &ColumnName) -> bool {
-        let path = col.path();
-        path.len() == 1 && self.partition_columns.contains(path[0].as_str())
+        is_partition_column(col, self.partition_columns)
     }
 
     /// Returns the footer statistics for a parquet column at the given index.
@@ -447,6 +448,10 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
 /// `stored_max <= actual_max <= stored_max + 999us`. Adding 999us ensures we never falsely
 /// prune files whose actual max exceeds the truncated value. Non-timestamp values pass through
 /// unchanged.
+///
+/// See also [`DataSkippingPredicateCreator::adjust_scalar_for_max_stat_truncation`] in
+/// `scan/data_skipping.rs`, which handles the same truncation issue from the predicate side
+/// (subtracting 999us from the comparison value instead of adding to the stat).
 #[allow(dead_code)]
 fn adjust_stats_for_truncation(val: Scalar) -> Scalar {
     match val {
@@ -491,9 +496,18 @@ pub(crate) fn compute_field_indices(
         .collect()
 }
 
+/// Returns `true` if the column is a top-level partition column.
+/// Delta partition columns are always top-level (no nested partition columns).
+#[allow(dead_code)]
+fn is_partition_column(col: &ColumnName, partition_columns: &HashSet<String>) -> bool {
+    let path = col.path();
+    path.len() == 1 && partition_columns.contains(path[0].as_str())
+}
+
 /// Builds column index mappings for checkpoint row group skipping. Maps each predicate column to
-/// its corresponding stats column indices (`add.stats_parsed.{minValues,maxValues,nullCount}.<col>`)
-/// or partition column index (`add.partitionValues_parsed.<col>`).
+/// its corresponding stats column indices
+/// (`add.stats_parsed.{minValues,maxValues,nullCount}.<col>`) or partition column index
+/// (`add.partitionValues_parsed.<col>`).
 #[allow(dead_code)]
 fn compute_checkpoint_field_indices(
     fields: &[ColumnDescPtr],
@@ -515,8 +529,7 @@ fn compute_checkpoint_field_indices(
         if parts.len() >= 3 && parts[0] == "add" && parts[1] == "partitionValues_parsed" {
             let col_name = ColumnName::new(&parts[2..]);
             if referenced_columns.contains(&col_name)
-                && col_name.path().len() == 1
-                && partition_columns.contains(col_name.path()[0].as_str())
+                && is_partition_column(&col_name, partition_columns)
             {
                 partition_indices.insert(col_name, i);
             }
@@ -529,8 +542,7 @@ fn compute_checkpoint_field_indices(
             let col_name = ColumnName::new(&parts[3..]);
             // Skip partition columns (they use partitionValues_parsed, not stats_parsed)
             if !referenced_columns.contains(&col_name)
-                || (col_name.path().len() == 1
-                    && partition_columns.contains(col_name.path()[0].as_str()))
+                || is_partition_column(&col_name, partition_columns)
             {
                 continue;
             }
