@@ -1525,6 +1525,7 @@ mod scan_metadata_completed_tests {
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
     use crate::metrics::MetricEvent;
     use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::path::Path;
     use crate::utils::test_utils::CapturingReporter;
     use crate::Snapshot;
 
@@ -1533,7 +1534,7 @@ mod scan_metadata_completed_tests {
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
         let engine = Arc::new(
-            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()), Path::from(""))
                 .with_metrics_reporter(reporter.clone())
                 .build(),
         );
@@ -1609,7 +1610,7 @@ mod scan_metadata_completed_tests {
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
         let engine = Arc::new(
-            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()), Path::from(""))
                 .with_metrics_reporter(reporter.clone())
                 .build(),
         );

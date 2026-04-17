@@ -224,7 +224,7 @@ mod tests {
     ) -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::builder(store.clone()).build();
+        let engine = DefaultEngine::builder(store.clone(), Path::from("")).build();
 
         // Create sidecar with add actions
         let json_adds = add_paths
@@ -311,7 +311,7 @@ mod tests {
         // This test uses multiple sidecar files, so we need custom logic
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::builder(store.clone()).build();
+        let engine = DefaultEngine::builder(store.clone(), Path::from("")).build();
 
         // Create two sidecars
         let sidecar1_data = parse_json_batch(vec![

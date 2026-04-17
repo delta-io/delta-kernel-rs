@@ -9,6 +9,7 @@ use futures::stream::{self, BoxStream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
 
+use super::storage::store_path_from_url;
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
 use crate::metrics::{MetricEvent, MetricsReporter};
@@ -117,6 +118,7 @@ pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
     task_executor: Arc<E>,
     reporter: Option<Arc<dyn MetricsReporter>>,
     readahead: usize,
+    url_path_prefix: Path,
 }
 
 impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
@@ -125,12 +127,14 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
         store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
         reporter: Option<Arc<dyn MetricsReporter>>,
+        url_path_prefix: Path,
     ) -> Self {
         Self {
             inner: store,
             task_executor,
             reporter,
             readahead: 10,
+            url_path_prefix,
         }
     }
 
@@ -146,6 +150,7 @@ async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
     reporter: Option<Arc<dyn MetricsReporter>>,
+    url_path_prefix: Path,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
     let start = Instant::now();
 
@@ -153,7 +158,7 @@ async fn list_from_impl(
     // directory. Unfortunately, `Path` provides no easy way to check whether a name is
     // directory-like, because it strips trailing /, so we're reduced to manually checking the
     // original URL.
-    let offset = Path::from_url_path(path.path())?;
+    let offset = store_path_from_url(&path, &url_path_prefix)?;
     let prefix = if path.path().ends_with('/') {
         offset.clone()
     } else {
@@ -172,8 +177,11 @@ async fn list_from_impl(
         .list_with_offset(Some(&prefix), &offset)
         .map(move |meta| {
             let meta = meta?;
+            // Reconstruct the full URL by prepending the URL path prefix back onto the
+            // store-relative path returned by the listing.
+            let full_path = Path::from_iter(url_path_prefix.parts().chain(meta.location.parts()));
             let mut location = path.clone();
-            location.set_path(&format!("/{}", meta.location.as_ref()));
+            location.set_path(&format!("/{}", full_path.as_ref()));
             Ok(FileMeta {
                 location,
                 last_modified: meta.last_modified.timestamp_millis(),
@@ -213,10 +221,12 @@ async fn read_files_impl(
     files: Vec<FileSlice>,
     readahead: usize,
     reporter: Option<Arc<dyn MetricsReporter>>,
+    url_path_prefix: Path,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Bytes>>> {
     let start = Instant::now();
     let files = stream::iter(files).map(move |(url, range)| {
         let store = store.clone();
+        let url_path_prefix = url_path_prefix.clone();
         async move {
             // Wasn't checking the scheme before calling to_file_path causing the url path to
             // be eaten in a strange way. Now, if not a file scheme, just blindly convert to a path.
@@ -229,7 +239,7 @@ async fn read_files_impl(
                 Path::from_absolute_path(file_path)
                     .map_err(|e| Error::InvalidTableLocation(format!("Invalid file path: {e}")))?
             } else {
-                Path::from(url.path())
+                store_path_from_url(&url, &url_path_prefix)?
             };
             if url.is_presigned() {
                 // have to annotate type here or rustc can't figure it out
@@ -308,8 +318,14 @@ async fn put_impl(
 }
 
 /// Native async implementation for head
-async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> DeltaResult<FileMeta> {
-    let meta = store.head(&Path::from_url_path(url.path())?).await?;
+async fn head_impl(
+    store: Arc<DynObjectStore>,
+    url: Url,
+    url_path_prefix: Path,
+) -> DeltaResult<FileMeta> {
+    let meta = store
+        .head(&store_path_from_url(&url, &url_path_prefix)?)
+        .await?;
     Ok(FileMeta {
         location: url,
         last_modified: meta.last_modified.timestamp_millis(),
@@ -322,7 +338,12 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        let future = list_from_impl(self.inner.clone(), path.clone(), self.reporter.clone());
+        let future = list_from_impl(
+            self.inner.clone(),
+            path.clone(),
+            self.reporter.clone(),
+            self.url_path_prefix.clone(),
+        );
         let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
@@ -342,20 +363,21 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             files,
             self.readahead,
             self.reporter.clone(),
+            self.url_path_prefix.clone(),
         );
         let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
 
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
-        let path = Path::from_url_path(path.path())?;
+        let path = store_path_from_url(path, &self.url_path_prefix)?;
         self.task_executor
             .block_on(put_impl(self.inner.clone(), path, data, overwrite))
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
-        let src_path = Path::from_url_path(src.path())?;
-        let dest_path = Path::from_url_path(dest.path())?;
+        let src_path = store_path_from_url(src, &self.url_path_prefix)?;
+        let dest_path = store_path_from_url(dest, &self.url_path_prefix)?;
         let future = copy_atomic_impl(
             self.inner.clone(),
             src_path,
@@ -366,7 +388,11 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     }
 
     fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
-        let future = head_impl(self.inner.clone(), path.clone());
+        let future = head_impl(
+            self.inner.clone(),
+            path.clone(),
+            self.url_path_prefix.clone(),
+        );
         self.task_executor.block_on(future)
     }
 }
@@ -424,7 +450,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = ObjectStoreStorageHandler::new(store.clone(), executor, None);
+        let handler = ObjectStoreStorageHandler::new(store.clone(), executor, None, Path::from(""));
         (tmp, store, handler)
     }
 
@@ -471,7 +497,7 @@ mod tests {
 
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor, None);
+        let storage = ObjectStoreStorageHandler::new(store, executor, None, Path::from(""));
 
         let mut slices: Vec<FileSlice> = Vec::new();
 
@@ -502,7 +528,7 @@ mod tests {
         store.put(&name, data.clone().into()).await.unwrap();
 
         let table_root = Url::parse("memory:///").expect("valid url");
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = DefaultEngineBuilder::new(store, Path::from("")).build();
         let files: Vec<_> = engine
             .storage_handler()
             .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
@@ -532,7 +558,7 @@ mod tests {
 
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = DefaultEngineBuilder::new(store, Path::from("")).build();
         let files = engine
             .storage_handler()
             .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())
@@ -662,5 +688,64 @@ mod tests {
             .collect();
         assert_eq!(read_back.len(), 1);
         assert_eq!(read_back[0], new_data);
+    }
+
+    /// Exercises all StorageHandler operations with a non-empty `url_path_prefix` to
+    /// verify that the prefix is stripped on writes and prepended on listings. Uses an
+    /// InMemory store with plain HTTPS URLs (no presigned query params).
+    #[tokio::test]
+    async fn storage_handler_operations_with_nonempty_url_path_prefix() {
+        let store = Arc::new(InMemory::new());
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let prefix = Path::from("mycontainer");
+        let handler = ObjectStoreStorageHandler::new(store.clone(), executor, None, prefix);
+
+        let base = Url::parse("https://acct.blob.core.windows.net/mycontainer/").unwrap();
+        let file_url = base.join("data/test.txt").unwrap();
+        let data = Bytes::from("hello-prefix");
+
+        // put: write through the handler using a URL that includes the prefix
+        handler.put(&file_url, data.clone(), false).unwrap();
+
+        // Verify the store received the path WITHOUT the container prefix
+        let stored = store
+            .get(&Path::from("data/test.txt"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(stored, data);
+
+        // head: verify metadata comes back with the correct URL and size
+        let meta = handler.head(&file_url).unwrap();
+        assert_eq!(meta.location, file_url);
+        assert_eq!(meta.size, data.len() as u64);
+
+        // list_from: verify listed URLs include the container prefix
+        let dir_url = base.join("data/").unwrap();
+        let listed: Vec<FileMeta> = handler.list_from(&dir_url).unwrap().try_collect().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].location, file_url);
+
+        // read_files: verify we can read back via the URL returned by list_from
+        let read_back: Vec<Bytes> = handler
+            .read_files(vec![(listed[0].location.clone(), None)])
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0], data);
+
+        // copy_atomic: copy using prefixed URLs, then read back the destination
+        let dest_url = base.join("data/copy.txt").unwrap();
+        handler.copy_atomic(&file_url, &dest_url).unwrap();
+        let copy_data: Vec<Bytes> = handler
+            .read_files(vec![(dest_url, None)])
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(copy_data.len(), 1);
+        assert_eq!(copy_data[0], data);
     }
 }

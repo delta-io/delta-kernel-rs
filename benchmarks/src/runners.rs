@@ -17,6 +17,7 @@ use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::PredicateRef;
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_unity_catalog::UCKernelClient;
@@ -46,7 +47,7 @@ fn build_engine(
 ) -> Arc<dyn Engine> {
     let executor = TokioMultiThreadExecutor::new(runtime.handle().clone());
     Arc::new(
-        DefaultEngine::builder(store)
+        DefaultEngine::builder(store, Path::from(""))
             .with_task_executor(Arc::new(executor))
             .build(),
     )

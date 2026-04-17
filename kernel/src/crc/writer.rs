@@ -38,6 +38,7 @@ mod tests {
     use crate::crc::{FileSizeHistogram, FileStatsValidity};
     use crate::engine::default::DefaultEngineBuilder;
     use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
     use crate::path::{AsUrl, ParsedLogPath};
     use crate::table_features::TableFeature;
 
@@ -99,7 +100,7 @@ mod tests {
     #[test]
     fn test_write_then_read_crc_file() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = DefaultEngineBuilder::new(store, Path::from("")).build();
         let table_root = url::Url::parse("memory:///test_table/").unwrap();
         let write_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
         let read_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
@@ -188,7 +189,7 @@ mod tests {
     #[test]
     fn test_write_crc_file_already_exists() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = DefaultEngineBuilder::new(store, Path::from("")).build();
         let table_root = url::Url::parse("memory:///test_table/").unwrap();
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
         let crc = test_crc();
@@ -203,7 +204,7 @@ mod tests {
     #[test]
     fn test_write_rejects_invalid_file_stats_with_checksum_write_unsupported() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = DefaultEngineBuilder::new(store, Path::from("")).build();
         let table_root = url::Url::parse("memory:///test_table/").unwrap();
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 

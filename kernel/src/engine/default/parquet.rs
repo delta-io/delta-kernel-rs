@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use super::stats::collect_stats;
+use super::storage::store_path_from_url;
 use super::UrlExt;
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
@@ -45,6 +46,8 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
     readahead: usize,
     /// Optional reporter for emitting [`MetricEvent::ParquetReadCompleted`] events.
     reporter: Option<Arc<dyn MetricsReporter>>,
+    /// URL path prefix to strip when converting URLs to store-relative paths.
+    url_path_prefix: Path,
 }
 
 /// Metadata of a data file (typically a parquet file).
@@ -144,12 +147,20 @@ impl DataFileMetadata {
 }
 
 impl<E: TaskExecutor> DefaultParquetHandler<E> {
-    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    /// Create a new Parquet handler backed by the given object store.
+    ///
+    /// The `url_path_prefix` is the prefix returned by [`storage::store_from_url`] that must
+    /// be stripped when converting URLs to store-relative paths. Pass an empty [`Path`] when
+    /// the URL scheme does not include a container prefix (S3, ABFSS, local filesystem).
+    ///
+    /// [`storage::store_from_url`]: super::storage::store_from_url
+    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>, url_path_prefix: Path) -> Self {
         Self {
             store,
             task_executor,
             readahead: 10,
             reporter: None,
+            url_path_prefix,
         }
     }
 
@@ -205,12 +216,11 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             )));
         }
         let path = path.join(&name)?;
+        let store_path = store_path_from_url(&path, &self.url_path_prefix)?;
 
-        self.store
-            .put(&Path::from_url_path(path.path())?, buffer.into())
-            .await?;
+        self.store.put(&store_path, buffer.into()).await?;
 
-        let metadata = self.store.head(&Path::from_url_path(path.path())?).await?;
+        let metadata = self.store.head(&store_path).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
         if size != metadata.size {
             return Err(Error::generic(format!(
@@ -253,6 +263,7 @@ async fn read_parquet_files_impl(
     files: Vec<FileMeta>,
     physical_schema: SchemaRef,
     predicate: Option<PredicateRef>,
+    url_path_prefix: Path,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
@@ -285,6 +296,7 @@ async fn read_parquet_files_impl(
         let store = store.clone();
         let schema = physical_schema.clone();
         let predicate = predicate.clone();
+        let url_path_prefix = url_path_prefix.clone();
         async move {
             open_parquet_file(
                 store,
@@ -293,6 +305,7 @@ async fn read_parquet_files_impl(
                 None,
                 super::DEFAULT_BATCH_SIZE,
                 file,
+                url_path_prefix,
             )
             .await
         }
@@ -320,6 +333,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             files.to_vec(),
             physical_schema,
             predicate,
+            self.url_path_prefix.clone(),
         );
         let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         if let Some(reporter) = &self.reporter {
@@ -360,9 +374,10 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
     ) -> DeltaResult<()> {
         let store = self.store.clone();
+        let url_path_prefix = self.url_path_prefix.clone();
 
         self.task_executor.block_on(async move {
-            let path = Path::from_url_path(location.path())?;
+            let path = store_path_from_url(&location, &url_path_prefix)?;
 
             // Get first batch to initialize writer with schema
             let first_batch = data.next().ok_or_else(|| {
@@ -397,6 +412,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         let store = self.store.clone();
         let location = file.location.clone();
         let file_size = file.size;
+        let url_path_prefix = self.url_path_prefix.clone();
 
         self.task_executor.block_on(async move {
             let metadata = if location.is_presigned() {
@@ -411,7 +427,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                     .map_err(|e| Error::generic(format!("Failed to read response bytes: {e}")))?;
                 ArrowReaderMetadata::load(&bytes, reader_options())?
             } else {
-                let path = Path::from_url_path(location.path())?;
+                let path = store_path_from_url(&location, &url_path_prefix)?;
                 let mut reader = ParquetObjectReader::new(store, path).with_file_size(file_size);
                 ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?
             };
@@ -432,9 +448,10 @@ async fn open_parquet_file(
     limit: Option<usize>,
     batch_size: usize,
     file_meta: FileMeta,
+    url_path_prefix: Path,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
     let file_location = file_meta.location.to_string();
-    let path = Path::from_url_path(file_meta.location.path())?;
+    let path = store_path_from_url(&file_meta.location, &url_path_prefix)?;
 
     let mut reader = {
         use crate::object_store::ObjectStoreScheme;
@@ -644,6 +661,7 @@ mod tests {
             None,
             DEFAULT_BATCH_SIZE,
             file_meta,
+            Path::from(""),
         )
         .await
         .unwrap();
@@ -711,7 +729,11 @@ mod tests {
             size: meta.size,
         }];
 
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultParquetHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Path::from(""),
+        );
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(
                 files,
@@ -819,8 +841,11 @@ mod tests {
     #[tokio::test]
     async fn test_write_parquet() {
         let store = Arc::new(InMemory::new());
-        let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let parquet_handler = DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+            Path::from(""),
+        );
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
@@ -898,8 +923,11 @@ mod tests {
     #[tokio::test]
     async fn test_disallow_non_trailing_slash() {
         let store = Arc::new(InMemory::new());
-        let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let parquet_handler = DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+            Path::from(""),
+        );
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
@@ -923,6 +951,7 @@ mod tests {
         let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
             store.clone(),
             Arc::new(TokioBackgroundExecutor::new()),
+            Path::from(""),
         ));
 
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
@@ -987,6 +1016,7 @@ mod tests {
         let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
             store.clone(),
             Arc::new(TokioBackgroundExecutor::new()),
+            Path::from(""),
         ));
 
         // Create test data with all Delta-supported primitive types
@@ -1288,7 +1318,11 @@ mod tests {
 
         // Read footer and verify field ID accessibility
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultParquetHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Path::from(""),
+        );
         let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
             location: Url::from_file_path(&file_path).unwrap(),
@@ -1382,7 +1416,11 @@ mod tests {
 
         // Read using kernel schema with different column names
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultParquetHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Path::from(""),
+        );
         let file_meta = FileMeta {
             location: Url::from_file_path(&file_path).unwrap(),
             last_modified: 0,
@@ -1423,8 +1461,11 @@ mod tests {
     #[tokio::test]
     async fn write_parquet_omits_arrow_schema_metadata() {
         let store = Arc::new(InMemory::new());
-        let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let parquet_handler = DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+            Path::from(""),
+        );
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
@@ -1462,6 +1503,7 @@ mod tests {
         let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
             store.clone(),
             Arc::new(TokioBackgroundExecutor::new()),
+            Path::from(""),
         ));
 
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
