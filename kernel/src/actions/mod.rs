@@ -343,6 +343,18 @@ impl Metadata {
         TableProperties::from(self.configuration.iter())
     }
 
+    /// Returns a new Metadata with the schema replaced, preserving all other fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if schema serialization fails.
+    pub(crate) fn with_schema(self, schema: SchemaRef) -> DeltaResult<Self> {
+        Ok(Self {
+            schema_string: serde_json::to_string(&schema)?,
+            ..self
+        })
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_unchecked(
