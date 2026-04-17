@@ -55,8 +55,10 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+pub(crate) mod alter_table;
 mod commit_info;
 mod domain_metadata;
+pub(crate) mod schema_evolution;
 mod stats_verifier;
 mod update;
 mod write_context;
@@ -177,6 +179,13 @@ pub struct ExistingTable;
 /// invalid for table creation (e.g. file removal, domain metadata removal) are not available.
 #[derive(Debug)]
 pub struct CreateTable;
+
+/// Marker type for alter-table (schema evolution) transactions.
+///
+/// Transactions in this state perform metadata-only commits. Data file operations are not
+/// available at compile time because `AlterTable` does not implement [`SupportsDataFiles`].
+#[derive(Debug)]
+pub struct AlterTable;
 
 /// Marker trait for transaction states that support data file operations.
 ///
@@ -665,6 +674,12 @@ impl<S> Transaction<S> {
                 "Blind append is not supported for create-table transactions",
             )
         );
+        // Metadata-only commits (e.g. ALTER TABLE) set isBlindAppend=true because they only
+        // add metadata, satisfying the blind append definition in the Delta protocol. The data
+        // file and data_change checks below only apply to data-writing transactions.
+        if self.add_files_metadata.is_empty() && !self.data_change {
+            return Ok(());
+        }
         require!(
             !self.add_files_metadata.is_empty(),
             Error::invalid_transaction_state("Blind append requires at least one added data file")
