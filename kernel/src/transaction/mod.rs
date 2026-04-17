@@ -2469,7 +2469,7 @@ mod tests {
 
         // Create a non-catalog-managed table using a catalog committer
         let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![
-            crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, false),
+            crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, true),
         ]));
         let committer = Box::new(MockCatalogCommitter);
         let err = create_table("memory:///", schema, "test-engine")

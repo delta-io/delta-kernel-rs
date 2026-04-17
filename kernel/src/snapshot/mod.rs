@@ -3030,7 +3030,7 @@ mod tests {
         let engine = DefaultEngineBuilder::new(storage).build();
         let schema = Arc::new(
             crate::schema::StructType::try_new(vec![
-                crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, false),
+                crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, true),
                 crate::schema::StructField::new("region", crate::schema::DataType::STRING, true),
             ])
             .unwrap(),

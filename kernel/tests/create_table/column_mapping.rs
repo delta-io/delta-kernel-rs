@@ -152,7 +152,7 @@ fn test_create_table_with_column_mapping_name_mode() -> DeltaResult<()> {
 
     let id_field = read_schema.field("id").expect("id field should exist");
     assert_eq!(id_field.data_type(), &DataType::INTEGER);
-    assert!(!id_field.is_nullable());
+    assert!(id_field.is_nullable());
 
     let value_field = read_schema
         .field("value")
@@ -170,7 +170,7 @@ fn test_create_table_with_column_mapping_id_mode() -> DeltaResult<()> {
     let schema = Arc::new(StructType::try_new(vec![StructField::new(
         "id",
         DataType::INTEGER,
-        false,
+        true,
     )])?);
 
     // Create table and load snapshot (validates column mapping on read)
@@ -188,7 +188,7 @@ fn test_create_table_with_column_mapping_id_mode() -> DeltaResult<()> {
     assert_eq!(read_schema.fields().count(), 1);
     let id_field = read_schema.field("id").expect("id field should exist");
     assert_eq!(id_field.data_type(), &DataType::INTEGER);
-    assert!(!id_field.is_nullable());
+    assert!(id_field.is_nullable());
 
     Ok(())
 }
@@ -259,7 +259,7 @@ fn test_column_mapping_invalid_mode_rejected() {
     let (_temp_dir, table_path, engine) = test_table_setup().unwrap();
 
     let schema = Arc::new(
-        StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap(),
+        StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap(),
     );
 
     // Try to create table with invalid column mapping mode
@@ -343,7 +343,7 @@ fn test_column_mapping_nested_schema() -> DeltaResult<()> {
     ])?;
 
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new("address", DataType::Struct(Box::new(address_type)), true),
     ])?);
 
@@ -365,7 +365,7 @@ fn test_column_mapping_nested_schema() -> DeltaResult<()> {
     // Verify top-level fields
     let id_field = read_schema.field("id").expect("id field should exist");
     assert_eq!(id_field.data_type(), &DataType::INTEGER);
-    assert!(!id_field.is_nullable());
+    assert!(id_field.is_nullable());
 
     let address_field = read_schema
         .field("address")
@@ -417,7 +417,7 @@ fn test_column_mapping_schema_with_maps_and_arrays() -> DeltaResult<()> {
     )])?;
 
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new(
             "tags",
             DataType::from(MapType::new(DataType::STRING, DataType::STRING, true)),
@@ -477,7 +477,7 @@ fn clustering_cm_test_schema() -> DeltaResult<Arc<StructType>> {
         true,
     )])?;
     Ok(Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new("name", DataType::STRING, true),
         StructField::new("address", DataType::Struct(Box::new(address)), true),
         StructField::new("l1", DataType::Struct(Box::new(l1)), true),

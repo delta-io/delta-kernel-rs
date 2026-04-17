@@ -492,7 +492,7 @@ pub(crate) mod test_utils {
     /// Flat schema: `[id: long, name: string]`
     pub(crate) fn test_schema_flat() -> SchemaRef {
         Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, false),
+            StructField::new("id", KernelDataType::LONG, true),
             StructField::nullable("name", KernelDataType::STRING),
         ]))
     }
@@ -501,7 +501,7 @@ pub(crate) mod test_utils {
     pub(crate) fn test_schema_flat_with_column_mapping() -> SchemaRef {
         Arc::new(StructType::new_unchecked([
             with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, false),
+                StructField::new("id", KernelDataType::LONG, true),
                 1,
                 "phys_id",
             ),
@@ -516,7 +516,7 @@ pub(crate) mod test_utils {
     /// Nested struct schema with array and map inside the struct
     pub(crate) fn test_schema_nested() -> SchemaRef {
         Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, false),
+            StructField::new("id", KernelDataType::LONG, true),
             StructField::nullable(
                 "info",
                 StructType::new_unchecked([
@@ -536,7 +536,7 @@ pub(crate) mod test_utils {
     pub(crate) fn test_schema_nested_with_column_mapping() -> SchemaRef {
         Arc::new(StructType::new_unchecked([
             with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, false),
+                StructField::new("id", KernelDataType::LONG, true),
                 1,
                 "phys_id",
             ),
@@ -585,7 +585,7 @@ pub(crate) mod test_utils {
             StructField::nullable("value", KernelDataType::INTEGER),
         ]);
         Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, false),
+            StructField::new("id", KernelDataType::LONG, true),
             StructField::nullable(
                 "entries",
                 MapType::new(
@@ -614,7 +614,7 @@ pub(crate) mod test_utils {
         ]);
         Arc::new(StructType::new_unchecked([
             with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, false),
+                StructField::new("id", KernelDataType::LONG, true),
                 1,
                 "phys_id",
             ),
@@ -645,7 +645,7 @@ pub(crate) mod test_utils {
             StructField::nullable("count", KernelDataType::INTEGER),
         ]);
         Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, false),
+            StructField::new("id", KernelDataType::LONG, true),
             StructField::nullable(
                 "items",
                 ArrayType::new(KernelDataType::Struct(Box::new(item_struct)), true),
@@ -670,7 +670,7 @@ pub(crate) mod test_utils {
         ]);
         Arc::new(StructType::new_unchecked([
             with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, false),
+                StructField::new("id", KernelDataType::LONG, true),
                 1,
                 "phys_id",
             ),
