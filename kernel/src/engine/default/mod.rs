@@ -20,6 +20,7 @@ use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::metrics::MetricsReporter;
+use crate::object_store::path::Path;
 use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
@@ -175,6 +176,7 @@ pub struct DefaultEngineBuilder<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
     metrics_reporter: Option<Arc<dyn MetricsReporter>>,
+    url_path_prefix: Path,
 }
 
 impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
@@ -184,6 +186,7 @@ impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
             object_store,
             task_executor: Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
             metrics_reporter: None,
+            url_path_prefix: Path::from(""),
         }
     }
 }
@@ -192,6 +195,18 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
     /// Set the metrics reporter for the engine.
     pub fn with_metrics_reporter(mut self, reporter: Arc<dyn MetricsReporter>) -> Self {
         self.metrics_reporter = Some(reporter);
+        self
+    }
+
+    /// Set the URL path prefix for converting URLs to store-relative paths.
+    ///
+    /// This is the prefix returned by [`storage::store_from_url`] or
+    /// [`storage::store_from_url_opts`]. For most URL schemes the prefix is empty, but for certain
+    /// HTTPS-style URLs (e.g. Azure Blob Storage, S3 path-style, Cloudflare R2) it contains
+    /// the bucket or container name that must be stripped from URL paths before passing them
+    /// to the object store.
+    pub fn with_url_path_prefix(mut self, prefix: Path) -> Self {
+        self.url_path_prefix = prefix;
         self
     }
 
@@ -206,12 +221,18 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
             object_store: self.object_store,
             task_executor,
             metrics_reporter: self.metrics_reporter,
+            url_path_prefix: self.url_path_prefix,
         }
     }
 
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.metrics_reporter)
+        DefaultEngine::new_with_opts(
+            self.object_store,
+            self.task_executor,
+            self.metrics_reporter,
+            self.url_path_prefix,
+        )
     }
 }
 
@@ -233,20 +254,30 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         object_store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
         metrics_reporter: Option<Arc<dyn MetricsReporter>>,
+        url_path_prefix: Path,
     ) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
                 metrics_reporter.clone(),
+                url_path_prefix.clone(),
             )),
             json: Arc::new(
-                DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
-                    .with_reporter(metrics_reporter.clone()),
+                DefaultJsonHandler::new(
+                    object_store.clone(),
+                    task_executor.clone(),
+                    url_path_prefix.clone(),
+                )
+                .with_reporter(metrics_reporter.clone()),
             ),
             parquet: Arc::new(
-                DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
-                    .with_reporter(metrics_reporter.clone()),
+                DefaultParquetHandler::new(
+                    object_store.clone(),
+                    task_executor.clone(),
+                    url_path_prefix,
+                )
+                .with_reporter(metrics_reporter.clone()),
             ),
             object_store,
             task_executor,

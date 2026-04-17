@@ -77,7 +77,10 @@ async fn try_main() -> DeltaResult<()> {
 
     // Get the engine for local filesystem
     use delta_kernel::engine::default::storage::store_from_url;
-    let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
+    let (store, url_path_prefix) = store_from_url(&url)?;
+    let engine = DefaultEngineBuilder::new(store)
+        .with_url_path_prefix(url_path_prefix)
+        .build();
 
     // Create or get the table
     let snapshot = create_or_get_base_snapshot(&url, &engine, &cli.schema).await?;

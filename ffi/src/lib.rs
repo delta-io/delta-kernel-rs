@@ -656,7 +656,7 @@ fn get_default_engine_impl(
     use delta_kernel::engine::default::storage::store_from_url_opts;
     use delta_kernel::engine::default::DefaultEngineBuilder;
 
-    let store = store_from_url_opts(&url, options)?;
+    let (store, url_path_prefix) = store_from_url_opts(&url, options)?;
 
     let engine: Arc<dyn Engine> = if let Some(config) = executor_config {
         let executor = TokioMultiThreadExecutor::new_owned_runtime(
@@ -665,11 +665,16 @@ fn get_default_engine_impl(
         )?;
         Arc::new(
             DefaultEngineBuilder::new(store)
+                .with_url_path_prefix(url_path_prefix)
                 .with_task_executor(Arc::new(executor))
                 .build(),
         )
     } else {
-        Arc::new(DefaultEngineBuilder::new(store).build())
+        Arc::new(
+            DefaultEngineBuilder::new(store)
+                .with_url_path_prefix(url_path_prefix)
+                .build(),
+        )
     };
 
     Ok(engine_to_handle(engine, allocate_error))

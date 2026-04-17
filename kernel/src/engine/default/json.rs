@@ -13,6 +13,7 @@ use super::executor::TaskExecutor;
 use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
+use super::storage::store_path_from_url;
 use crate::engine::arrow_utils::{
     build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
     to_json_bytes,
@@ -41,16 +42,26 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     batch_size: usize,
     /// Optional reporter for emitting [`MetricEvent::JsonReadCompleted`] events.
     reporter: Option<Arc<dyn MetricsReporter>>,
+    /// URL path prefix to strip when converting URLs to store-relative paths.
+    url_path_prefix: Path,
 }
 
 impl<E: TaskExecutor> DefaultJsonHandler<E> {
-    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    /// Create a new JSON handler backed by the given object store.
+    ///
+    /// The `url_path_prefix` is the prefix returned by [`storage::store_from_url`] that must
+    /// be stripped when converting URLs to store-relative paths. Pass an empty [`Path`] when
+    /// the URL scheme does not include a container prefix (S3, ABFSS, local filesystem).
+    ///
+    /// [`storage::store_from_url`]: super::storage::store_from_url
+    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>, url_path_prefix: Path) -> Self {
         Self {
             store,
             task_executor,
             buffer_size: super::DEFAULT_BUFFER_SIZE,
             batch_size: super::DEFAULT_BATCH_SIZE,
             reporter: None,
+            url_path_prefix,
         }
     }
 
@@ -97,6 +108,7 @@ async fn read_json_files_impl(
     _predicate: Option<PredicateRef>,
     batch_size: usize,
     buffer_size: usize,
+    url_path_prefix: Path,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
@@ -113,9 +125,11 @@ async fn read_json_files_impl(
         let store = store.clone();
         let json_arrow_schema = json_arrow_schema.clone();
         let reorder_indices = reorder_indices.clone();
+        let url_path_prefix = url_path_prefix.clone();
         async move {
             let file_path = file.location.to_string();
-            let batch_stream = open_json_file(store, json_arrow_schema, batch_size, file).await?;
+            let batch_stream =
+                open_json_file(store, json_arrow_schema, batch_size, file, url_path_prefix).await?;
             // Re-insert synthesized metadata columns (e.g. file path) at their schema positions.
             let tagged = batch_stream
                 .map(move |result| fixup_json_read(result?, &reorder_indices, &file_path))
@@ -140,6 +154,7 @@ async fn write_json_file_impl(
     path: Url,
     buffer: Vec<u8>,
     overwrite: bool,
+    url_path_prefix: Path,
 ) -> DeltaResult<()> {
     let put_mode = if overwrite {
         PutMode::Overwrite
@@ -147,7 +162,7 @@ async fn write_json_file_impl(
         PutMode::Create
     };
 
-    let path = Path::from_url_path(path.path())?;
+    let path = store_path_from_url(&path, &url_path_prefix)?;
     let result = store.put_opts(&path, buffer.into(), put_mode.into()).await;
     result.map_err(|e| match e {
         object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path.to_string()),
@@ -178,6 +193,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             predicate,
             self.batch_size,
             self.buffer_size,
+            self.url_path_prefix.clone(),
         );
         let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         if let Some(reporter) = &self.reporter {
@@ -210,6 +226,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             path.clone(),
             to_json_bytes(data)?,
             overwrite,
+            self.url_path_prefix.clone(),
         ))
     }
 }
@@ -220,8 +237,9 @@ async fn open_json_file(
     schema: ArrowSchemaRef,
     batch_size: usize,
     file_meta: FileMeta,
+    url_path_prefix: Path,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
-    let path = Path::from_url_path(file_meta.location.path())?;
+    let path = store_path_from_url(&file_meta.location, &url_path_prefix)?;
     let result = store.get(&path).await?;
     let builder = ReaderBuilder::new(schema)
         .with_batch_size(batch_size)
@@ -525,7 +543,11 @@ mod tests {
     #[test]
     fn test_parse_json() {
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Path::from(""),
+        );
 
         let json_strings = StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
@@ -549,7 +571,11 @@ mod tests {
     #[test]
     fn test_parse_json_coerce_operation_parameters() {
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Path::from(""),
+        );
 
         // JSON with operationParameters containing boolean and numeric primitives (not strings)
         let json_strings = StringArray::from(vec![
@@ -594,7 +620,11 @@ mod tests {
     #[test]
     fn test_parse_json_drop_field() {
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Path::from(""),
+        );
         let json_strings = StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2, "maxRowId": 3}}}"#,
         ]);
@@ -633,7 +663,11 @@ mod tests {
             size: meta.size,
         }];
 
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Path::from(""),
+        );
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, get_commit_schema().clone(), None)
             .unwrap()
@@ -856,6 +890,7 @@ mod tests {
                 Arc::new(TokioMultiThreadExecutor::new(
                     tokio::runtime::Handle::current(),
                 )),
+                Path::from(""),
             );
             let handler = handler.with_buffer_size(*buffer_size);
             let physical_schema = Arc::new(Schema::new_unchecked(vec![StructField::nullable(
@@ -925,7 +960,7 @@ mod tests {
     async fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = DefaultJsonHandler::new(store.clone(), executor);
+        let handler = DefaultJsonHandler::new(store.clone(), executor, Path::from(""));
         let path = Url::parse("memory:///test/data/00000000000000000001.json")?;
         let object_path = Path::from("/test/data/00000000000000000001.json");
 

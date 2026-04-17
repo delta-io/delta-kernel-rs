@@ -71,7 +71,12 @@ async fn create_storage(
     }
 
     let executor = Arc::new(TokioBackgroundExecutor::new());
-    let storage = Box::new(ObjectStoreStorageHandler::new(store, executor, None));
+    let storage = Box::new(ObjectStoreStorageHandler::new(
+        store,
+        executor,
+        None,
+        ObjectPath::from(""),
+    ));
     (storage, log_root)
 }
 
@@ -879,7 +884,12 @@ async fn create_storage_with_empty_files(
     }
 
     let executor = Arc::new(TokioBackgroundExecutor::new());
-    let storage = Box::new(ObjectStoreStorageHandler::new(store, executor, None));
+    let storage = Box::new(ObjectStoreStorageHandler::new(
+        store,
+        executor,
+        None,
+        ObjectPath::from(""),
+    ));
     (storage, log_root)
 }
 

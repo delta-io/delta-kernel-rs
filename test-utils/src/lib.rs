@@ -338,8 +338,12 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
 pub fn create_default_engine(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
-    let store = store_from_url(table_root)?;
-    Ok(Arc::new(DefaultEngineBuilder::new(store).build()))
+    let (store, url_path_prefix) = store_from_url(table_root)?;
+    Ok(Arc::new(
+        DefaultEngineBuilder::new(store)
+            .with_url_path_prefix(url_path_prefix)
+            .build(),
+    ))
 }
 
 /// Helper to create a DefaultEngine with the default executor for tests.
@@ -348,12 +352,13 @@ pub fn create_default_engine(
 pub fn create_default_engine_mt_executor(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioMultiThreadExecutor>>> {
-    let store = store_from_url(table_root)?;
+    let (store, url_path_prefix) = store_from_url(table_root)?;
     let task_executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
     Ok(Arc::new(
         DefaultEngineBuilder::new(store)
+            .with_url_path_prefix(url_path_prefix)
             .with_task_executor(task_executor)
             .build(),
     ))

@@ -65,11 +65,12 @@ async fn try_main() -> DeltaResult<()> {
     println!("Checkpointing Delta table at: {url}");
 
     use delta_kernel::engine::default::storage::store_from_url;
-    let store = store_from_url(&url)?;
+    let (store, url_path_prefix) = store_from_url(&url)?;
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
     let engine = DefaultEngineBuilder::new(store)
+        .with_url_path_prefix(url_path_prefix)
         .with_task_executor(executor)
         .build();
     let snapshot = Snapshot::builder_for(url).build(&engine)?;

@@ -111,7 +111,10 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// ]));
 ///
 /// let url = url::Url::parse("file:///tmp/my_table")?;
-/// let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
+/// let (store, url_path_prefix) = store_from_url(&url)?;
+/// let engine = DefaultEngineBuilder::new(store)
+///     .with_url_path_prefix(url_path_prefix)
+///     .build();
 ///
 /// let transaction = create_table("/tmp/my_table", schema, "MyApp/1.0")
 ///     .build(&engine, Box::new(FileSystemCommitter::new()))?;

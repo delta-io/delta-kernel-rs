@@ -114,8 +114,12 @@ async fn build_log_with_paths_and_checkpoint(
             .expect("Write _last_checkpoint");
     }
 
-    let storage =
-        ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), None);
+    let storage = ObjectStoreStorageHandler::new(
+        store,
+        Arc::new(TokioBackgroundExecutor::new()),
+        None,
+        Path::from(""),
+    );
 
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
@@ -2007,8 +2011,12 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
         .await
         .expect("put empty compaction");
 
-    let storage =
-        ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), None);
+    let storage = ObjectStoreStorageHandler::new(
+        store,
+        Arc::new(TokioBackgroundExecutor::new()),
+        None,
+        Path::from(""),
+    );
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
 

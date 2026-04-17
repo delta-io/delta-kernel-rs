@@ -8,6 +8,8 @@
 use std::fs::File;
 use std::sync::Arc;
 
+use crate::object_store::path::Path;
+
 use rstest::rstest;
 use tempfile::tempdir;
 use url::Url;
@@ -30,6 +32,7 @@ fn default_parquet_handler() -> Box<dyn ParquetHandler> {
     Box::new(DefaultParquetHandler::new(
         Arc::new(LocalFileSystem::new()),
         Arc::new(TokioBackgroundExecutor::new()),
+        Path::from(""),
     ))
 }
 
@@ -41,6 +44,7 @@ fn default_json_handler() -> Box<dyn JsonHandler> {
     Box::new(DefaultJsonHandler::new(
         Arc::new(LocalFileSystem::new()),
         Arc::new(TokioBackgroundExecutor::new()),
+        Path::from(""),
     ))
 }
 

@@ -10,7 +10,8 @@
 //! # let path = "./tests/data/table-with-cdf";
 //! let url = delta_kernel::try_parse_uri(path)?;
 //! # use delta_kernel::engine::default::storage::store_from_url;
-//! # let engine = std::sync::Arc::new(DefaultEngineBuilder::new(store_from_url(&url)?).build());
+//! # let (store, url_path_prefix) = store_from_url(&url)?;
+//! # let engine = std::sync::Arc::new(DefaultEngineBuilder::new(store).with_url_path_prefix(url_path_prefix).build());
 //! // Get the table changes (change data feed) between version 0 and 1
 //! let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1))?;
 //!
@@ -102,7 +103,8 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///  # use delta_kernel::table_changes::TableChanges;
 ///  # let path = "./tests/data/table-with-cdf";
 ///  let url = delta_kernel::try_parse_uri(path)?;
-///  # let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
+///  # let (store, url_path_prefix) = store_from_url(&url)?;
+///  # let engine = DefaultEngineBuilder::new(store).with_url_path_prefix(url_path_prefix).build();
 ///  let table_changes = TableChanges::try_new(url, &engine, 0, Some(1))?;
 ///  # Ok::<(), Error>(())
 ///  ````
