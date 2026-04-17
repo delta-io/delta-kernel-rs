@@ -532,6 +532,9 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
     Ok(())
 }
 
+/// Schema with a non-nullable partition column (`category`).
+const NON_NULLABLE_PARTITION_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"category","type":"string","nullable":false,"metadata":{}}]}"#;
+
 const WIDE_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"age","type":"long","nullable":true,"metadata":{}}]}"#;
 
 /// Regression test for https://github.com/delta-io/delta-kernel-rs/issues/2165
@@ -621,6 +624,92 @@ async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
         total_rows, 6,
         "all rows returned when data skipping cannot filter"
     );
+
+    Ok(())
+}
+
+/// Checkpoint creation succeeds for tables with non-nullable partition columns and
+/// writeStatsAsStruct=true. The `partitionValues_parsed` schema must force all partition fields
+/// nullable (values come from map lookups which can return null), regardless of what the table
+/// schema declares.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_non_nullable_partition_column() -> Result<(), Box<dyn std::error::Error>> {
+    let (store, table_root) = new_in_memory_store();
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(executor)
+            .build(),
+    );
+
+    // Version 0: protocol + metadata with non-nullable partition column, stats as struct
+    write_commit(
+        &store,
+        &build_commit(
+            NON_NULLABLE_PARTITION_SCHEMA,
+            &["category"],
+            true,
+            true,
+            true,
+        ),
+        0,
+    )
+    .await?;
+
+    // Version 1: write data for partition category=books
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", ArrowDataType::Int64, true),
+            Field::new("name", ArrowDataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+        ],
+    )?;
+    write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        batch,
+        HashMap::from([("category".to_string(), Scalar::String("books".into()))]),
+    )
+    .await?;
+
+    // Checkpoint with writeStatsAsStruct=true -- this would fail with
+    // Arrow(InvalidArgumentError("Found unmasked nulls for non-nullable StructArray field"))
+    // if partitionValues_parsed copied the non-nullable constraint from the table schema.
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref())?;
+
+    // Verify data round-trips correctly through a scan after the checkpoint
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+    let batches = read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+
+    let schema = batches[0].schema();
+    let merged = concat_batches(&schema, &batches)?;
+    let names: Vec<&str> = merged
+        .column_by_name("name")
+        .unwrap()
+        .as_string::<i32>()
+        .iter()
+        .map(|v| v.unwrap())
+        .collect();
+    assert_eq!(names, vec!["Alice", "Bob"]);
+
+    let categories: Vec<&str> = merged
+        .column_by_name("category")
+        .unwrap()
+        .as_string::<i32>()
+        .iter()
+        .map(|v| v.unwrap())
+        .collect();
+    assert_eq!(categories, vec!["books", "books"]);
 
     Ok(())
 }
