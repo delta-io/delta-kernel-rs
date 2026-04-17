@@ -54,12 +54,12 @@ use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::expressions::Scalar;
 use delta_kernel::{DeltaResult, Snapshot};
 
 // ===========================================================================
@@ -173,14 +173,14 @@ impl DataLayoutConfig {
         match self {
             DataLayoutConfig::Unpartitioned => vec![],
             DataLayoutConfig::AllTypes => vec![
-                "part_ts_ntz",
                 "part_bool",
-                "part_string",
-                "part_date",
                 "part_int",
                 "part_long",
-                "part_decimal",
+                "part_string",
+                "part_date",
                 "part_ts",
+                "part_ts_ntz",
+                "part_decimal",
             ],
         }
     }
@@ -445,8 +445,11 @@ async fn write_data_commit(
         let write_context = if partition_columns.is_empty() {
             txn.unpartitioned_write_context()?
         } else {
-            let partition_values =
-                generate_partition_values(logical_schema.as_ref(), partition_columns, version, file_idx);
+            let partition_values = generate_partition_values(
+                logical_schema.as_ref(),
+                partition_columns,
+                partition_seed,
+            );
             txn.partitioned_write_context(partition_values)?
         };
 
@@ -727,10 +730,8 @@ macro_rules! test_context {
 fn generate_partition_values(
     schema: &StructType,
     partition_columns: &[String],
-    version: u64,
-    file_idx: usize,
+    seed: usize,
 ) -> HashMap<String, Scalar> {
-    let seed = (version as usize) * 1000 + file_idx * 100;
     partition_columns
         .iter()
         .map(|col_name| {
