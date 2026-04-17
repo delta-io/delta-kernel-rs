@@ -1,4 +1,7 @@
+use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fs::File;
+use std::sync::{Arc, LazyLock};
 
 use super::*;
 use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
@@ -17,9 +20,6 @@ use crate::parquet::file::properties::WriterProperties;
 use crate::parquet::file::reader::FileReader;
 use crate::parquet::file::serialized_reader::SerializedFileReader;
 use crate::{DeltaResult, Predicate};
-use std::cmp::Ordering;
-use std::collections::HashSet;
-use std::sync::{Arc, LazyLock};
 
 /// Empty partition column set for tests that don't need partition columns.
 static NO_PARTITIONS: LazyLock<HashSet<String>> = LazyLock::new(HashSet::new);
@@ -457,62 +457,95 @@ fn test_get_stat_values() {
     );
 }
 
+/// Wraps an Int64 leaf array in nested StructArrays matching the given column path.
+///
+/// For `col_path = &["a", "b"]` and a leaf array `[10, 20]`, produces the Arrow structure:
+///   `a: Struct { b: Int64 }` with values `[{b: 10}, {b: 20}]`.
+///
+/// Returns the outermost `(field, array)` pair for embedding in a parent struct.
+fn wrap_in_nested_struct(
+    col_path: &[&str],
+    values: Arc<Int64Array>,
+) -> (Arc<Field>, Arc<dyn crate::arrow::array::Array>) {
+    assert!(!col_path.is_empty());
+    let mut field = Arc::new(Field::new(
+        *col_path.last().unwrap(),
+        ArrowDataType::Int64,
+        true,
+    ));
+    let mut array: Arc<dyn crate::arrow::array::Array> = values;
+    for &name in col_path[..col_path.len() - 1].iter().rev() {
+        let struct_array = StructArray::from(vec![(field.clone(), array)]);
+        field = Arc::new(Field::new(
+            name,
+            ArrowDataType::Struct(Fields::from(vec![field])),
+            true,
+        ));
+        array = Arc::new(struct_array);
+    }
+    (field, array)
+}
+
+/// Builds a `(field, array)` pair for a single stat type (e.g. `minValues.<col_path>`).
+fn build_stat_column(
+    stat_name: &str,
+    col_path: &[&str],
+    values: Arc<Int64Array>,
+) -> (Arc<Field>, Arc<dyn crate::arrow::array::Array>) {
+    let (col_field, col_array) = wrap_in_nested_struct(col_path, values);
+    let stat_struct = StructArray::from(vec![(col_field.clone(), col_array)]);
+    let stat_field = Arc::new(Field::new(
+        stat_name,
+        ArrowDataType::Struct(Fields::from(vec![col_field])),
+        true,
+    ));
+    (stat_field, Arc::new(stat_struct))
+}
+
 /// Writes a checkpoint-like parquet file with the given per-file statistics.
 ///
-/// Schema: `add.stats_parsed.{minValues,maxValues,nullCount}.<col_name>` (INT64)
+/// Schema: `add.stats_parsed.{minValues,maxValues,nullCount}.<col_path>` (INT64)
 ///         + optionally `add.partitionValues_parsed.part_col` (STRING)
 ///
+/// `col_path` supports nested columns (e.g. `&["a", "b"]` produces `...minValues.a.b`).
 /// Each array index represents one data file row. Use `None` to simulate missing statistics.
 /// When `part_values` is `Some`, a `partitionValues_parsed.part_col` column is included.
 fn write_checkpoint_parquet(
     min_values: &[Option<i64>],
     max_values: &[Option<i64>],
     null_counts: &[Option<i64>],
-    col_name: &str,
+    col_path: &[&str],
     part_values: Option<&[Option<&str>]>,
 ) -> tempfile::NamedTempFile {
-    let col_field = Arc::new(Field::new(col_name, ArrowDataType::Int64, true));
-    let min_values_field = Arc::new(Field::new(
+    let (min_f, min_a) = build_stat_column(
         "minValues",
-        ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
-        true,
-    ));
-    let max_values_field = Arc::new(Field::new(
+        col_path,
+        Arc::new(Int64Array::from(min_values.to_vec())),
+    );
+    let (max_f, max_a) = build_stat_column(
         "maxValues",
-        ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
-        true,
-    ));
-    let null_count_field = Arc::new(Field::new(
+        col_path,
+        Arc::new(Int64Array::from(max_values.to_vec())),
+    );
+    let (nc_f, nc_a) = build_stat_column(
         "nullCount",
-        ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
-        true,
-    ));
+        col_path,
+        Arc::new(Int64Array::from(null_counts.to_vec())),
+    );
+
+    let stats_struct = StructArray::from(vec![
+        (min_f.clone(), min_a),
+        (max_f.clone(), max_a),
+        (nc_f.clone(), nc_a),
+    ]);
     let stats_parsed_field = Arc::new(Field::new(
         "stats_parsed",
-        ArrowDataType::Struct(Fields::from(vec![
-            min_values_field.clone(),
-            max_values_field.clone(),
-            null_count_field.clone(),
-        ])),
+        ArrowDataType::Struct(Fields::from(vec![min_f, max_f, nc_f])),
         true,
     ));
 
-    // Build the add struct fields: always include stats_parsed, optionally partitionValues_parsed.
-    let mut add_children: Vec<(Arc<Field>, Arc<dyn crate::arrow::array::Array>)> = vec![];
-
-    let min_x = Arc::new(Int64Array::from(min_values.to_vec()));
-    let max_x = Arc::new(Int64Array::from(max_values.to_vec()));
-    let null_count_x = Arc::new(Int64Array::from(null_counts.to_vec()));
-
-    let min_struct = StructArray::from(vec![(col_field.clone(), min_x as _)]);
-    let max_struct = StructArray::from(vec![(col_field.clone(), max_x as _)]);
-    let nc_struct = StructArray::from(vec![(col_field.clone(), null_count_x as _)]);
-    let stats_struct = StructArray::from(vec![
-        (min_values_field.clone(), Arc::new(min_struct) as _),
-        (max_values_field.clone(), Arc::new(max_struct) as _),
-        (null_count_field.clone(), Arc::new(nc_struct) as _),
-    ]);
-    add_children.push((stats_parsed_field.clone(), Arc::new(stats_struct) as _));
+    let mut add_children: Vec<(Arc<Field>, Arc<dyn crate::arrow::array::Array>)> =
+        vec![(stats_parsed_field, Arc::new(stats_struct))];
 
     if let Some(part_values) = part_values {
         let part_col_field = Arc::new(Field::new("part_col", ArrowDataType::Utf8, true));
@@ -523,7 +556,7 @@ fn write_checkpoint_parquet(
         ));
         let part_col = Arc::new(StringArray::from(part_values.to_vec()));
         let pv_struct = StructArray::from(vec![(part_col_field.clone(), part_col as _)]);
-        add_children.push((pv_parsed_field.clone(), Arc::new(pv_struct) as _));
+        add_children.push((pv_parsed_field, Arc::new(pv_struct)));
     }
 
     let add_struct = StructArray::from(add_children.clone());
@@ -555,7 +588,7 @@ fn checkpoint_filter_returns_stats_when_no_nulls_in_stat_columns() {
         &[Some(10), Some(20)],
         &[Some(100), Some(200)],
         &[Some(2), Some(0)],
-        "x",
+        &["x"],
         Some(&[Some("a"), Some("b")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -590,7 +623,7 @@ fn checkpoint_filter_returns_none_when_stat_column_has_nulls() {
         &[Some(10), None, Some(20)],
         &[Some(100), None, Some(200)],
         &[Some(2), None, Some(0)],
-        "x",
+        &["x"],
         Some(&[Some("a"), Some("b"), Some("b")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -618,7 +651,7 @@ fn checkpoint_filter_partition_columns_always_available() {
         &[Some(10), None],
         &[Some(100), None],
         &[Some(2), None],
-        "x",
+        &["x"],
         Some(&[Some("a"), Some("b")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -656,7 +689,7 @@ fn checkpoint_filter_apply_keeps_row_group_with_missing_stats() {
         &[Some(10), None],
         &[Some(100), None],
         &[Some(0), None],
-        "x",
+        &["x"],
         Some(&[Some("a"), Some("b")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -678,7 +711,7 @@ fn checkpoint_filter_apply_prunes_row_group_with_all_stats_present() {
         &[Some(10), Some(20)],
         &[Some(100), Some(200)],
         &[Some(0), Some(0)],
-        "x",
+        &["x"],
         Some(&[Some("a"), Some("b")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -699,7 +732,7 @@ fn checkpoint_filter_is_null_with_all_stats_present() {
         &[Some(10), Some(20)],
         &[Some(100), Some(200)],
         &[Some(5), Some(0)],
-        "x",
+        &["x"],
         Some(&[Some("a"), Some("b")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -722,7 +755,7 @@ fn checkpoint_filter_is_null_all_zero_nullcounts() {
         &[Some(10), Some(20)],
         &[Some(100), Some(200)],
         &[Some(0), Some(0)],
-        "x",
+        &["x"],
         Some(&[Some("a"), Some("b")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -747,7 +780,7 @@ fn checkpoint_filter_is_not_null_never_prunes() {
         &[Some(10), Some(20)],
         &[Some(100), Some(200)],
         &[Some(5), Some(3)],
-        "x",
+        &["x"],
         Some(&[Some("a"), Some("b")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -770,7 +803,7 @@ fn checkpoint_filter_timestamp_max_widened() {
         &[Some(10), Some(20)],
         &[Some(100), Some(200)],
         &[Some(0), Some(0)],
-        "x",
+        &["x"],
         Some(&[Some("a"), Some("b")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -802,7 +835,7 @@ fn checkpoint_filter_unknown_column_returns_none() {
         &[Some(10)],
         &[Some(100)],
         &[Some(0)],
-        "x",
+        &["x"],
         Some(&[Some("a")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -832,7 +865,7 @@ fn checkpoint_filter_mixed_partition_and_data_predicate() {
         &[Some(10), None],
         &[Some(100), None],
         &[Some(0), None],
-        "x",
+        &["x"],
         Some(&[Some("a"), Some("b")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -917,7 +950,7 @@ fn checkpoint_filter_opaque_predicate_with_null_guarded_stats() {
         &[Some(10), Some(20)],
         &[Some(100), Some(200)],
         &[Some(0), Some(0)],
-        "x",
+        &["x"],
         Some(&[Some("a"), Some("b")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -954,7 +987,7 @@ fn checkpoint_filter_opaque_predicate_with_missing_stats() {
         &[Some(10), None],
         &[Some(100), None],
         &[Some(0), None],
-        "x",
+        &["x"],
         Some(&[Some("a"), Some("b")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -984,7 +1017,7 @@ fn checkpoint_filter_physical_column_names_for_column_mapping() {
         &[Some(10), Some(20)],
         &[Some(100), Some(200)],
         &[Some(0), Some(0)],
-        physical_name,
+        &[physical_name],
         None,
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -1031,7 +1064,7 @@ fn checkpoint_filter_partition_nullcount_is_null() {
         &[Some(10), Some(20)],
         &[Some(100), Some(200)],
         &[Some(0), Some(0)],
-        "x",
+        &["x"],
         Some(&[Some("a"), Some("b")]),
     );
     let metadata = checkpoint_row_group_metadata(&tmp);
@@ -1133,69 +1166,16 @@ fn checkpoint_filter_multi_row_group_skipping() {
 
 #[test]
 fn checkpoint_filter_nested_struct_column_stats() {
-    // Build schema: add.stats_parsed.{minValues,maxValues,nullCount}.a.b (INT64)
-    // This simulates a nested struct column `a` with field `b`.
-    let b_field = Arc::new(Field::new("b", ArrowDataType::Int64, true));
-    let a_field = Arc::new(Field::new(
-        "a",
-        ArrowDataType::Struct(Fields::from(vec![b_field.clone()])),
-        true,
-    ));
-    let min_field = Arc::new(Field::new(
-        "minValues",
-        ArrowDataType::Struct(Fields::from(vec![a_field.clone()])),
-        true,
-    ));
-    let max_field = Arc::new(Field::new(
-        "maxValues",
-        ArrowDataType::Struct(Fields::from(vec![a_field.clone()])),
-        true,
-    ));
-    let nc_field = Arc::new(Field::new(
-        "nullCount",
-        ArrowDataType::Struct(Fields::from(vec![a_field.clone()])),
-        true,
-    ));
-    let stats_field = Arc::new(Field::new(
-        "stats_parsed",
-        ArrowDataType::Struct(Fields::from(vec![
-            min_field.clone(),
-            max_field.clone(),
-            nc_field.clone(),
-        ])),
-        true,
-    ));
-    let add_field = Arc::new(Field::new(
-        "add",
-        ArrowDataType::Struct(Fields::from(vec![stats_field.clone()])),
-        true,
-    ));
-    let schema = Arc::new(ArrowSchema::new(vec![add_field]));
-
-    let min_b = Arc::new(Int64Array::from(vec![Some(10), Some(20)]));
-    let max_b = Arc::new(Int64Array::from(vec![Some(100), Some(200)]));
-    let nc_b = Arc::new(Int64Array::from(vec![Some(0), Some(0)]));
-
-    let min_a = StructArray::from(vec![(b_field.clone(), min_b as _)]);
-    let max_a = StructArray::from(vec![(b_field.clone(), max_b as _)]);
-    let nc_a = StructArray::from(vec![(b_field.clone(), nc_b as _)]);
-    let min_s = StructArray::from(vec![(a_field.clone(), Arc::new(min_a) as _)]);
-    let max_s = StructArray::from(vec![(a_field.clone(), Arc::new(max_a) as _)]);
-    let nc_s = StructArray::from(vec![(a_field.clone(), Arc::new(nc_a) as _)]);
-    let stats_s = StructArray::from(vec![
-        (min_field.clone(), Arc::new(min_s) as _),
-        (max_field.clone(), Arc::new(max_s) as _),
-        (nc_field.clone(), Arc::new(nc_s) as _),
-    ]);
-    let add_s = StructArray::from(vec![(stats_field.clone(), Arc::new(stats_s) as _)]);
-    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(add_s)]).unwrap();
-
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let file = tmp.as_file().try_clone().unwrap();
-    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-
+    // Per-file statistics mirror the data schema structure (Delta protocol spec, "Per-file
+    // Statistics" section). For a nested column `a.b`, stats are stored as:
+    //   add.stats_parsed.{minValues,maxValues,nullCount}.a.b (INT64)
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), Some(20)],
+        &[Some(100), Some(200)],
+        &[Some(0), Some(0)],
+        &["a", "b"],
+        None,
+    );
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
