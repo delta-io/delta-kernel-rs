@@ -20,7 +20,10 @@ use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
 use crate::schema::validation::validate_schema_for_create;
 use crate::schema::variant_utils::schema_contains_variant_type;
-use crate::schema::{normalize_column_names_to_schema_casing, DataType, SchemaRef, StructType};
+use crate::schema::{
+    normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
+    StructType,
+};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -69,6 +72,11 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::ChangeDataFeed,
     TableFeature::TypeWidening,
     TableFeature::RowTracking,
+    // Invariants is auto-enabled by `maybe_enable_invariants` when the schema has non-null
+    // fields. Allowing explicit `delta.feature.invariants=supported` lets users pre-enable
+    // the feature on an all-nullable table so a later ALTER TABLE ADD COLUMN NOT NULL does
+    // not need a protocol upgrade.
+    TableFeature::Invariants,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
@@ -369,6 +377,27 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Conditionally adds the `invariants` writer feature to the protocol when the schema contains
+/// any user-controlled non-null field (`nullable: false`) anywhere in the tree.
+///
+/// Delta-Spark treats `nullable: false` as an implicit column invariant and requires the
+/// `invariants` writer feature to be listed in the protocol's `writerFeatures` to read/write
+/// such tables. Auto-enabling ensures kernel-created tables with non-null columns are
+/// compatible with Spark readers/writers.
+///
+/// Explicit `delta.invariants` metadata annotations are rejected by
+/// `validate_schema_for_create`, so this only flips on the feature for nullability-driven
+/// invariants -- which kernel can handle (the Arrow writer enforces non-null at write time).
+fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_contains_non_null_fields(schema) {
+        add_feature_to_lists(
+            TableFeature::Invariants,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -722,9 +751,12 @@ impl CreateTableTransactionBuilder {
     /// - Checks that the table path is valid
     /// - Verifies the table doesn't already exist
     /// - Validates the schema is non-empty
-    /// - Rejects non-null columns unless `invariants` writer feature is enabled
+    /// - Rejects schemas with `delta.invariants` metadata annotations (unsupported by kernel)
     /// - Validates the data layout is valid
     /// - Validates table properties against the allow list
+    ///
+    /// Non-null columns (`nullable: false`) are allowed. The `invariants` writer feature is
+    /// auto-added to the protocol when the schema has any non-null user-controlled field.
     ///
     /// # Arguments
     ///
@@ -737,7 +769,7 @@ impl CreateTableTransactionBuilder {
     /// - The table path is invalid
     /// - A table already exists at the given path
     /// - The schema is empty
-    /// - The schema has non-null columns without the `invariants` writer feature
+    /// - The schema has `delta.invariants` metadata on any column
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
     pub fn build(
@@ -763,14 +795,8 @@ impl CreateTableTransactionBuilder {
         let (effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
 
-        // Validate schema (non-empty, column names, duplicates)
-        validate_schema_for_create(
-            &effective_schema,
-            column_mapping_mode,
-            validated
-                .writer_features
-                .contains(&TableFeature::Invariants),
-        )?;
+        // Validate schema (non-empty, column names, duplicates, no `delta.invariants` metadata)
+        validate_schema_for_create(&effective_schema, column_mapping_mode)?;
 
         // Validate data layout and resolve column names (physical for clustering, logical
         // for partitioning). Adds required table features for clustering.
@@ -781,9 +807,10 @@ impl CreateTableTransactionBuilder {
             &mut validated,
         )?;
 
-        // Schema-driven auto-enablement: detect types that require a feature
+        // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+        maybe_enable_invariants(&effective_schema, &mut validated);
 
         // Property-driven auto-enablement: check enablement properties
         maybe_auto_enable_property_driven_features(&mut validated);
@@ -1211,6 +1238,62 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::all_nullable(
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, true),
+            StructField::new("name", DataType::STRING, true),
+        ])),
+        false,
+    )]
+    #[case::top_level_non_null(
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ])),
+        true,
+    )]
+    #[case::nested_non_null(
+        Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "parent",
+            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                "child",
+                DataType::INTEGER,
+                false,
+            )]))),
+            true,
+        )])),
+        true,
+    )]
+    #[case::variant_only(
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, true),
+            StructField::new("v", DataType::unshredded_variant(), true),
+        ])),
+        false,
+    )]
+    fn test_maybe_enable_invariants(#[case] schema: SchemaRef, #[case] expect_invariants: bool) {
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+
+        maybe_enable_invariants(&schema, &mut validated);
+
+        assert_eq!(
+            validated
+                .writer_features
+                .contains(&TableFeature::Invariants),
+            expect_invariants,
+            "Expected Invariants feature presence = {expect_invariants}"
+        );
+        assert!(
+            validated.reader_features.is_empty(),
+            "Invariants is writer-only; reader_features should be empty"
+        );
+    }
+
+    #[rstest::rstest]
     #[case::property_true(&[("delta.enableInCommitTimestamps", "true")], true, true)]
     #[case::property_false(&[("delta.enableInCommitTimestamps", "false")], false, true)]
     #[case::property_absent(&[], false, false)]
@@ -1257,6 +1340,7 @@ mod tests {
     #[case::change_data_feed(TableFeature::ChangeDataFeed, "changeDataFeed")]
     #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
     #[case::catalog_managed(TableFeature::CatalogManaged, "catalogManaged")]
+    #[case::invariants(TableFeature::Invariants, "invariants")]
     fn test_feature_signal_accepted(#[case] feature: TableFeature, #[case] feature_name: &str) {
         let key = format!("delta.feature.{feature_name}");
         let properties = HashMap::from([(key, "supported".to_string())]);

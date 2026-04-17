@@ -1291,6 +1291,44 @@ pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
     checker.0
 }
 
+/// Visitor that reports whether any non-null (`nullable: false`) field exists in a schema.
+///
+/// Walks the full schema tree including nested struct, array element, and map value structs.
+/// The `Variant` data type is skipped because its internal `metadata` and `value` fields are
+/// protocol-defined, always non-null, and not user-controlled.
+struct NonNullFieldChecker(bool);
+
+impl<'a> SchemaTransform<'a> for NonNullFieldChecker {
+    /// The default `transform_variant` recurses into the variant's struct fields
+    /// (metadata, value) via `recurse_into_struct`. Those fields are protocol-defined
+    /// and must be non-null -- they are not user-controlled schema columns. We override
+    /// to return the variant struct unchanged, skipping recursion so the non-null check
+    /// in `transform_struct_field` does not treat these fixed internal fields as a
+    /// user-declared non-null column.
+    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+        Some(Cow::Borrowed(stype))
+    }
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        if !field.is_nullable() {
+            self.0 = true;
+        } else if !self.0 {
+            let _ = self.recurse_into_struct_field(field);
+        }
+        Some(Cow::Borrowed(field))
+    }
+}
+
+/// Checks if any user-controlled column in the schema (including nested columns) is declared
+/// non-null (`nullable: false`).
+///
+/// Skips `Variant` internal struct fields, which are protocol-defined and always non-null.
+pub(crate) fn schema_contains_non_null_fields(schema: &Schema) -> bool {
+    let mut checker = NonNullFieldChecker(false);
+    let _ = checker.transform_struct(schema);
+    checker.0
+}
+
 /// Normalizes column name field names to match the casing in the schema.
 ///
 /// Walks each field name through the schema's struct hierarchy, replacing user-provided
@@ -2731,6 +2769,63 @@ mod tests {
             map_field,
         ]);
         assert!(schema_has_invariants(&schema));
+    }
+
+    #[test]
+    fn test_schema_contains_non_null_fields() {
+        // All-nullable schema: no non-null fields.
+        let schema = StructType::new_unchecked([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+        ]);
+        assert!(!schema_contains_non_null_fields(&schema));
+
+        // Top-level non-null.
+        let schema = StructType::new_unchecked([
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable("name", DataType::STRING),
+        ]);
+        assert!(schema_contains_non_null_fields(&schema));
+
+        // Nested non-null inside a nullable parent struct.
+        let nested_field = StructField::nullable(
+            "parent",
+            DataType::try_struct_type([StructField::not_null("child", DataType::INTEGER)]).unwrap(),
+        );
+        let schema =
+            StructType::new_unchecked([StructField::nullable("a", DataType::STRING), nested_field]);
+        assert!(schema_contains_non_null_fields(&schema));
+
+        // Non-null inside an array element struct.
+        let array_field = StructField::nullable(
+            "arr",
+            ArrayType::new(
+                DataType::try_struct_type([StructField::not_null("child", DataType::INTEGER)])
+                    .unwrap(),
+                true,
+            ),
+        );
+        let schema = StructType::new_unchecked([array_field]);
+        assert!(schema_contains_non_null_fields(&schema));
+
+        // Non-null inside a map value struct.
+        let map_field = StructField::nullable(
+            "map",
+            MapType::new(
+                DataType::STRING,
+                DataType::try_struct_type([StructField::not_null("child", DataType::INTEGER)])
+                    .unwrap(),
+                true,
+            ),
+        );
+        let schema = StructType::new_unchecked([map_field]);
+        assert!(schema_contains_non_null_fields(&schema));
+
+        // Variant internal fields (metadata, value) are protocol-defined non-null but
+        // must NOT be counted as user-controlled non-null fields.
+        let schema =
+            StructType::new_unchecked([StructField::nullable("v", DataType::unshredded_variant())]);
+        assert!(!schema_contains_non_null_fields(&schema));
     }
 
     #[test]
