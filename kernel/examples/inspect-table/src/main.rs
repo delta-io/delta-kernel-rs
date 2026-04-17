@@ -158,7 +158,7 @@ impl RowVisitor for LogVisitor {
 }
 
 // This is the callback that will be called for each valid scan row
-fn print_scan_file(_: &mut (), file: ScanFile) {
+fn print_scan_file(_: &mut (), file: ScanFile) -> bool {
     let num_record_str = if let Some(s) = file.stats {
         format!("{}", s.num_records)
     } else {
@@ -183,6 +183,7 @@ fn print_scan_file(_: &mut (), file: ScanFile) {
         file.transform,
         file.partition_values,
     );
+    true
 }
 
 fn try_main() -> DeltaResult<()> {
