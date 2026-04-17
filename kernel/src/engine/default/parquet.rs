@@ -361,13 +361,14 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     ) -> DeltaResult<()> {
         let store = self.store.clone();
 
+        // Get first batch to initialize writer with schema, this is done outside of the loop to
+        // avoid needing to nest a blocking iteration here
+        let first_batch = data.next().ok_or_else(|| {
+            Error::generic("Cannot write parquet file with empty data iterator")
+        })??;
+
         self.task_executor.block_on(async move {
             let path = Path::from_url_path(location.path())?;
-
-            // Get first batch to initialize writer with schema
-            let first_batch = data.next().ok_or_else(|| {
-                Error::generic("Cannot write parquet file with empty data iterator")
-            })??;
             let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
             let first_record_batch: RecordBatch = (*first_arrow).into();
 
