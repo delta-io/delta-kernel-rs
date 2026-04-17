@@ -12,7 +12,7 @@ use url::Url;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::{is_set_txn_expired, SetTransactionScanner};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
-use crate::checkpoint::{CheckpointActionStats, CheckpointWriter};
+use crate::checkpoint::{CheckpointSummary, CheckpointWriter};
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 #[cfg(any(test, feature = "test-utils"))]
@@ -533,12 +533,19 @@ impl Snapshot {
 
         let file_meta = engine.storage_handler().head(&checkpoint_path)?;
 
-        // Build checkpoint stats from the iterator state, then finalize(writes `_last_checkpoint`).
+        // Build checkpoint summary from the iterator state, then finalize(writes `_last_checkpoint`).
         let state = Arc::into_inner(state).ok_or_else(|| {
             Error::internal_error("ActionReconciliationIteratorState Arc has other references")
         })?;
-        let action_stats = CheckpointActionStats::from_reconciliation_state(state)?;
-        writer.finalize(engine, &file_meta, &action_stats)?;
+        let size_in_bytes = i64::try_from(file_meta.size).map_err(|e| {
+            Error::CheckpointWrite(format!(
+                "Failed to convert checkpoint size in bytes from u64 {} to i64: {e}",
+                file_meta.size
+            ))
+        })?;
+        let checkpoint_summary =
+            CheckpointSummary::from_reconciliation_state(self.version(), size_in_bytes, state, 0)?;
+        writer.finalize(engine, &checkpoint_summary)?;
 
         let checkpoint_log_path = ParsedLogPath::try_from(file_meta)?.ok_or_else(|| {
             Error::internal_error("Checkpoint path could not be parsed as a log path")
