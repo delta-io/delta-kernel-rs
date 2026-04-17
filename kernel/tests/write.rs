@@ -2,60 +2,52 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::Error as KernelError;
-use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
-use url::Url;
-use uuid::Uuid;
-
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::arrow::array::{Array, ArrayRef, BinaryArray, Int64Array, StructArray};
-use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
+use delta_kernel::arrow::array::{
+    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray, StructArray,
+    TimestampMicrosecondArray,
+};
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
-
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
-use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::engine_data::FilteredEngineData;
+use delta_kernel::expressions::{column_expr, ColumnName, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
-use delta_kernel::transaction::create_table::create_table as create_table_txn;
-use delta_kernel::transaction::CommitResult;
-use tempfile::TempDir;
-
-use test_utils::set_json_value;
-
-use itertools::Itertools;
-use serde_json::json;
-use serde_json::Deserializer;
-use tempfile::tempdir;
-
-use delta_kernel::expressions::{column_expr, ColumnName, Scalar};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
-use delta_kernel::FileMeta;
-use delta_kernel::{Expression as Expr, Predicate as Pred};
-
-use test_utils::create_default_engine_mt_executor;
+use delta_kernel::transaction::create_table::create_table as create_table_txn;
+use delta_kernel::transaction::CommitResult;
+use delta_kernel::{
+    DeltaResult, Engine, Error as KernelError, Expression as Expr, FileMeta, Predicate as Pred,
+    Snapshot, Version,
+};
+use itertools::Itertools;
+use serde_json::{json, Deserializer};
+use tempfile::{tempdir, TempDir};
 use test_utils::{
     assert_partition_values, assert_result_error_with_message, assert_schema_has_field,
-    copy_directory, create_add_files_metadata, create_default_engine, create_table,
-    create_table_and_load_snapshot, engine_store_setup, nested_batches, nested_schema,
-    read_actions_from_commit, read_add_infos, remove_all_and_get_remove_actions, resolve_field,
-    setup_test_tables, test_read, test_table_setup, write_batch_to_table,
+    copy_directory, create_add_files_metadata, create_default_engine,
+    create_default_engine_mt_executor, create_table, create_table_and_load_snapshot,
+    engine_store_setup, nested_batches, nested_schema, read_actions_from_commit, read_add_infos,
+    remove_all_and_get_remove_actions, resolve_field, set_json_value, setup_test_tables, test_read,
+    test_table_setup, write_batch_to_table,
 };
+use url::Url;
+use uuid::Uuid;
 
 mod common;
 
@@ -490,8 +482,8 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
 /// - The written JSON is correctly wrapped in a top-level `"commitInfo"` key.
 /// - Engine-only fields (not in `CommitInfo::to_schema()`) pass through to the log unchanged.
 /// - Fields that overlap with kernel-managed CommitInfo fields are overridden by kernel values,
-/// - All kernel-managed fields (`timestamp`, `kernelVersion`, `txnId`, `operationParameters`)
-///   are present with correct values.
+/// - All kernel-managed fields (`timestamp`, `kernelVersion`, `txnId`, `operationParameters`) are
+///   present with correct values.
 #[tokio::test]
 async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -598,8 +590,8 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
         let size =
             get_and_check_all_parquet_sizes(store.clone(), format!("/{table_name}/").as_str())
                 .await;
-        // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
-        // before we clear them for comparison
+        // check that the timestamps in commit_info and add actions are within 10s of
+        // SystemTime::now() before we clear them for comparison
         check_action_timestamps(parsed_commits.iter())?;
         // check that the txn_id is valid before we clear it for comparison
         validate_txn_id(&parsed_commits[0]["commitInfo"]);
@@ -804,8 +796,8 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         let size =
             get_and_check_all_parquet_sizes(store.clone(), format!("/{table_name}/").as_str())
                 .await;
-        // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
-        // before we clear them for comparison
+        // check that the timestamps in commit_info and add actions are within 10s of
+        // SystemTime::now() before we clear them for comparison
         check_action_timestamps(parsed_commits.iter())?;
         // check that the txn_id is valid before we clear it for comparison
         validate_txn_id(&parsed_commits[0]["commitInfo"]);
@@ -2157,10 +2149,11 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::error::Error>> {
-    // This test verifies that Remove actions generated from scan metadata contain all expected fields
-    // from the Remove struct (defined in kernel/src/actions/mod.rs).
+    // This test verifies that Remove actions generated from scan metadata contain all expected
+    // fields from the Remove struct (defined in kernel/src/actions/mod.rs).
     //
-    // This test uses the table-with-dv-small dataset which contains files with tags and deletion vectors.
+    // This test uses the table-with-dv-small dataset which contains files with tags and deletion
+    // vectors.
     //
     // Not populated in the dataset are (covered by row_tracking tests):
     // baseRowId (optional i64)
@@ -2327,7 +2320,8 @@ async fn test_update_deletion_vectors_adds_expected_entries(
     // This test verifies that deletion vector updates write proper Remove and Add actions
     // to the transaction log.
     //
-    // NOTE: Additional unit tests for update_deletion_vectors exist in kernel/src/transaction/mod.rs
+    // NOTE: Additional unit tests for update_deletion_vectors exist in
+    // kernel/src/transaction/mod.rs
     //
     // The test validates:
     // 1. Transaction setup for DV updates
@@ -3006,13 +3000,13 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
 ///
 /// Both predicate and non-predicate scans are tested because `remove_files` should behave
 /// identically regardless. Cases also vary the checkpoint format:
-/// - `use_struct_stats_checkpoint=false`: `stats` is non-null (raw JSON from the Add action).
-///   The remove action's `stats` comes from passthrough.
-/// - `use_struct_stats_checkpoint=true`: a checkpoint is written with
-///   `writeStatsAsJson=false, writeStatsAsStruct=true`, so the checkpoint stores `stats_parsed`
-///   but omits the raw `stats` JSON string. Scan rows from that checkpoint have `stats=null` but
-///   `stats_parsed` non-null. The remove action's `stats` is produced via
-///   `coalesce(null, to_json(stats_parsed))`, which exercises the coalesce path in the fix.
+/// - `use_struct_stats_checkpoint=false`: `stats` is non-null (raw JSON from the Add action). The
+///   remove action's `stats` comes from passthrough.
+/// - `use_struct_stats_checkpoint=true`: a checkpoint is written with `writeStatsAsJson=false,
+///   writeStatsAsStruct=true`, so the checkpoint stores `stats_parsed` but omits the raw `stats`
+///   JSON string. Scan rows from that checkpoint have `stats=null` but `stats_parsed` non-null. The
+///   remove action's `stats` is produced via `coalesce(null, to_json(stats_parsed))`, which
+///   exercises the coalesce path in the fix.
 #[rstest::rstest]
 #[case(false, false)]
 #[case(false, true)]
@@ -3289,7 +3283,8 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
 
 #[tokio::test]
 async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std::error::Error>> {
-    // This test verifies that mixed add+remove transactions fail with helpful error when dataChange=true
+    // This test verifies that mixed add+remove transactions fail with helpful error when
+    // dataChange=true
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = get_simple_int_schema();
@@ -4143,7 +4138,7 @@ async fn test_clustered_table_write_has_stats_parsed(
 // === Path format tests ===
 
 fn get_simple_schema() -> SchemaRef {
-    Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap())
+    Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap())
 }
 
 fn simple_id_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {

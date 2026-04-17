@@ -304,8 +304,9 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 /// Paths in the returned Add action metadata are stored relative to the table root.
 ///
 /// This is the public API for building Add action metadata from file write results. Custom
-/// Arrow-based engines that write parquet files themselves (bypassing [`DefaultEngine::write_parquet`])
-/// should call this to produce the Add action metadata for [`Transaction::add_files`].
+/// Arrow-based engines that write parquet files themselves (bypassing
+/// [`DefaultEngine::write_parquet`]) should call this to produce the Add action metadata for
+/// [`Transaction::add_files`].
 ///
 /// [`DataFileMetadata`]: parquet::DataFileMetadata
 /// [`Transaction::add_files`]: crate::transaction::Transaction::add_files
@@ -347,7 +348,8 @@ trait UrlExt {
 
 impl UrlExt for Url {
     fn is_presigned(&self) -> bool {
-        // We search a URL query string for these keys to see if we should consider it a presigned URL:
+        // We search a URL query string for these keys to see if we should consider it a presigned
+        // URL:
         // - AWS: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
         // - Cloudflare R2: https://developers.cloudflare.com/r2/api/s3/presigned-urls/
         // - Azure Blob (SAS): https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas#version-2020-12-06-and-later

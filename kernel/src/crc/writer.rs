@@ -29,9 +29,8 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::*;
     use crate::actions::{DomainMetadata, Protocol, SetTransaction};

@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
 use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
@@ -20,7 +21,6 @@ use crate::log_segment::LogSegment;
 use crate::scan::COMMIT_READ_SCHEMA;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta};
-use delta_kernel_derive::internal_api;
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -141,8 +141,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     ///
     /// # Returns
     /// - `Done`: All processing done sequentially - no parallel phase needed
-    /// - `Parallel`: Parallel phase needed. The resulting files may be processed
-    ///   in parallel.
+    /// - `Parallel`: Parallel phase needed. The resulting files may be processed in parallel.
     ///
     /// # Errors
     /// Returns an error if called before iterator exhaustion.
@@ -340,8 +339,8 @@ mod tests {
     fn test_sequential_checkpoint_no_commits() -> DeltaResult<()> {
         verify_sequential_processing(
             "with_checkpoint_no_last_checkpoint",
-            &["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"], // Add from commit 3
-            &[],                                                                      // No sidecars
+            &["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"], /* Add from commit 3 */
+            &[], // No sidecars
         )
     }
 }

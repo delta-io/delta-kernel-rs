@@ -203,10 +203,11 @@ fn format_binary(bytes: &[u8]) -> DeltaResult<String> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::expressions::{ArrayData, MapData, Scalar, StructData};
     use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField};
-    use rstest::rstest;
 
     // ============================================================================
     // Spark reference: null and empty values

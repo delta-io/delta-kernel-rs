@@ -4,10 +4,9 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+use super::{CommitClient, GetCommitsClient};
 use crate::error::{Error, Result};
 use crate::models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
-
-use super::{CommitClient, GetCommitsClient};
 
 // ============================================================================
 // TableData

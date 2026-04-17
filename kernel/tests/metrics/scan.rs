@@ -4,10 +4,11 @@
 //! through `DefaultParquetHandler::read_parquet_files` and the JSON log replay that
 //! `scan.execute()` performs internally to collect Add/Remove scan metadata.
 
-use super::{measuring_engine, LogState, TestTableBuilder};
 use std::sync::Arc;
 
 use delta_kernel::{DeltaResult, Engine, Snapshot};
+
+use super::{measuring_engine, LogState, TestTableBuilder};
 
 // ============================================================================
 // scan.execute() contributes parquet data-file reads

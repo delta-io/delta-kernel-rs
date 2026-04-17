@@ -12,8 +12,7 @@ use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::{ChecksumWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::FileStats;
-use delta_kernel::{DeltaResult, Engine};
+use delta_kernel::{DeltaResult, Engine, FileStats};
 use rstest::rstest;
 use test_utils::{add_commit, insert_data, test_table_setup};
 
@@ -45,7 +44,7 @@ async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new("value", DataType::STRING, true),
     ])?);
 

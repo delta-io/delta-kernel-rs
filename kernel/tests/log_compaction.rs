@@ -7,7 +7,6 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::Snapshot;
 use test_utils::{create_table, engine_store_setup};
-
 use url::Url;
 
 /// Convert a URL to a `delta_kernel::object_store::Path`

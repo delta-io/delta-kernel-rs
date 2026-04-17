@@ -1,8 +1,5 @@
 //! FFI hooks that enable constructing a CommitClient.
 
-use crate::error::{ExternResult, IntoExternResult as _};
-use crate::{error::AllocateErrorFn, transaction::MutableCommitter};
-use crate::{ExclusiveRustString, NullableCvoid};
 use std::sync::Arc;
 
 use delta_kernel::committer::Committer;
@@ -11,17 +8,18 @@ use delta_kernel::engine::default::executor::tokio::{
 };
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::DeltaResult;
-use delta_kernel_ffi::{
-    handle::Handle, kernel_string_slice, KernelStringSlice, OptionalValue, TryFromStringSlice,
-};
+use delta_kernel_ffi::handle::Handle;
+use delta_kernel_ffi::{kernel_string_slice, KernelStringSlice, OptionalValue, TryFromStringSlice};
 use delta_kernel_ffi_macros::handle_descriptor;
 use delta_kernel_unity_catalog::UCCommitter;
-
+use tracing::debug;
 use unity_catalog_delta_client_api::{
     CommitClient, CommitRequest as ClientCommitRequest, Result as ApiResult,
 };
 
-use tracing::debug;
+use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult as _};
+use crate::transaction::MutableCommitter;
+use crate::{ExclusiveRustString, NullableCvoid};
 
 /// Data representing a commit.
 #[repr(C)]
@@ -240,13 +238,15 @@ pub unsafe extern "C" fn free_uc_committer(commit_client: Handle<MutableCommitte
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
-    use crate::{allocate_kernel_string, kernel_string_slice, OptionalValue};
     use std::ffi::c_void;
     use std::ptr::NonNull;
     use std::sync::Arc;
+
     use unity_catalog_delta_client_api::{Commit as ClientCommit, Error as ApiError};
+
+    use super::*;
+    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
+    use crate::{allocate_kernel_string, kernel_string_slice, OptionalValue};
 
     pub(crate) struct TestContext {
         pub(crate) commit_called: bool,

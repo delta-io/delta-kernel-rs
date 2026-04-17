@@ -10,12 +10,10 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
-use crate::scan::PhysicalPredicate;
-use crate::scan::StatsOutputMode;
+use crate::scan::{PhysicalPredicate, StatsOutputMode};
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::get_any_level_column_physical_name;
-use crate::table_features::ColumnMappingMode;
+use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use crate::{DeltaResult, Error, PredicateRef, StructField};
 
 /// All the state needed to process a scan.
@@ -47,13 +45,13 @@ pub(crate) struct StateInfo {
 struct MetadataInfo<'a> {
     /// What are the names of the requested metadata fields
     metadata_field_names: HashSet<&'a String>,
-    /// The name of the column that's selecting row indexes if that's been requested or None if they
-    /// are not requested. We remember this if it's been requested explicitly. this is so we can
-    /// reference this column and not re-add it as a requested column if we're _also_ requesting
-    /// row-ids.
+    /// The name of the column that's selecting row indexes if that's been requested or None if
+    /// they are not requested. We remember this if it's been requested explicitly. this is so
+    /// we can reference this column and not re-add it as a requested column if we're _also_
+    /// requesting row-ids.
     selected_row_index_col_name: Option<&'a String>,
-    /// the materializedRowIdColumnName extracted from the table config if row ids are requested, or
-    /// None if they are not requested
+    /// the materializedRowIdColumnName extracted from the table config if row ids are requested,
+    /// or None if they are not requested
     materialized_row_id_column_name: Option<&'a String>,
 }
 
@@ -287,8 +285,9 @@ impl StateInfo {
                     Some(MetadataColumnSpec::RowIndex)
                     | Some(MetadataColumnSpec::FilePath)
                     | None => {
-                        // note that RowIndex and FilePath are handled in the parquet reader so we just add them as
-                        // if they're normal physical columns
+                        // note that RowIndex and FilePath are handled in the parquet reader so we
+                        // just add them as if they're normal physical
+                        // columns
                         let physical_field = logical_field.make_physical(column_mapping_mode)?;
                         debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                         let physical_name = physical_field.name.clone();
@@ -396,17 +395,17 @@ impl StateInfo {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     use url::Url;
 
+    use super::*;
     use crate::actions::{Metadata, Protocol};
     use crate::expressions::{column_expr, column_name, Expression as Expr};
     use crate::schema::{ColumnMetadataKey, MetadataValue};
     use crate::table_features::{FeatureType, TableFeature};
     use crate::utils::test_utils::assert_result_error_with_message;
-
-    use super::*;
 
     // get a state info with no predicate or extra metadata
     pub(crate) fn get_simple_state_info(
@@ -744,7 +743,8 @@ pub(crate) mod tests {
     #[test]
     fn request_row_ids_conflicting_row_index_col_name() {
         let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "row_indexes_for_row_id_0", // this will conflict with the first generated name for row indexes
+            "row_indexes_for_row_id_0", /* this will conflict with the first generated name for
+                                         * row indexes */
             DataType::STRING,
         )]));
 

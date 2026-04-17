@@ -1,11 +1,14 @@
-use std::sync::Arc;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
 use rstest::rstest;
+use test_utils::{
+    compacted_log_path_for_versions, delta_path_for_version, staged_commit_path_for_version,
+};
 use url::Url;
 
-use crate::actions::visitors::AddVisitor;
+use super::*;
+use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
     get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, DOMAIN_METADATA_NAME,
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
@@ -18,12 +21,13 @@ use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::ColumnName;
-use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::last_checkpoint_hint::LastCheckpointHintSummary;
+use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointHintSummary};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
-use crate::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
+use crate::object_store::memory::InMemory;
+use crate::object_store::path::Path;
+use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::ArrowWriter;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
@@ -31,20 +35,13 @@ use crate::scan::test_utils::{
     sidecar_batch_with_given_paths_and_sizes,
 };
 use crate::schema::{DataType, StructField, StructType};
-use crate::utils::test_utils::string_array_to_engine_data;
-use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
+use crate::utils::test_utils::{
+    assert_batch_matches, assert_result_error_with_message, string_array_to_engine_data, Action,
+};
 use crate::{
-    DeltaResult, Engine as _, EngineData, Expression, FileMeta, JsonHandler, Predicate,
+    DeltaResult, EngineData, Expression, FileMeta, JsonHandler, ParquetHandler, Predicate,
     PredicateRef, RowVisitor, StorageHandler,
 };
-use test_utils::{
-    compacted_log_path_for_versions, delta_path_for_version, staged_commit_path_for_version,
-};
-
-use super::*;
-
-use crate::actions::visitors::SidecarVisitor;
-use crate::ParquetHandler;
 
 /// Processes sidecar files for the given checkpoint batch.
 ///
@@ -80,7 +77,8 @@ fn process_sidecars(
     )?))
 }
 
-// get an ObjectStore path for a checkpoint file, based on version, part number, and total number of parts
+// get an ObjectStore path for a checkpoint file, based on version, part number, and total number of
+// parts
 fn delta_path_for_multipart_checkpoint(version: u64, part_num: u32, num_parts: u32) -> Path {
     let path =
         format!("_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet");
@@ -1177,7 +1175,8 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     let engine = DefaultEngineBuilder::new(store.clone()).build();
     add_checkpoint_to_store(
         &store,
-        // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
+        // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are
+        // not read.
         sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_commit_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
     )
@@ -2698,7 +2697,8 @@ fn test_log_segment_contiguous_commit_files() {
     );
 }
 
-/// Test that last_checkpoint_metadata from _last_checkpoint hint is properly propagated to LogSegment
+/// Test that last_checkpoint_metadata from _last_checkpoint hint is properly propagated to
+/// LogSegment
 #[tokio::test]
 async fn test_checkpoint_schema_propagation_from_hint() {
     use crate::schema::{StructField, StructType};
@@ -2806,7 +2806,8 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
         );
     }
 
-    // Verify that get_file_actions_schema_and_sidecars returns appropriate schema based on hint version
+    // Verify that get_file_actions_schema_and_sidecars returns appropriate schema based on hint
+    // version
     let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
     let schema = schema.expect("V1 checkpoint should yield a file actions schema");
     if expect_hint_schema_used {

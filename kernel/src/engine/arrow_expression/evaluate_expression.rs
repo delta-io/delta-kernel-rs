@@ -28,8 +28,7 @@ use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
-use crate::engine::arrow_utils::parse_json_impl;
-use crate::engine::arrow_utils::prim_array_cmp;
+use crate::engine::arrow_utils::{parse_json_impl, prim_array_cmp};
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
@@ -129,7 +128,8 @@ fn evaluate_struct_expression(
             ArrowField::new(
                 output_field.name(),
                 output_col.data_type().clone(),
-                output_field.nullable, // Use schema's nullability; Arrow will validate any mismatch
+                output_field.nullable, /* Use schema's nullability; Arrow will validate any
+                                        * mismatch */
             )
         })
         .collect();
@@ -456,8 +456,9 @@ fn cast_list_elements(
     Ok(cast(vals, &container)?)
 }
 
-/// This function converts ArrowView types to their non-view type equivalents. This is used for [`evaluate_predicate`] conversion,  
-/// currently does not support nested conversion. This only supports limited conversions (see code for exactly which).
+/// This function converts ArrowView types to their non-view type equivalents. This is used for
+/// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
+/// supports limited conversions (see code for exactly which).
 fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
@@ -472,8 +473,9 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn A
     }
 }
 
-/// This function converts  Arrow types to their Arrow view type equivalents. This is used for [`evaluate_predicate`] conversion,  
-/// currently does not support nested conversion. This only supports limited conversions (see code for exactly which).  
+/// This function converts  Arrow types to their Arrow view type equivalents. This is used for
+/// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
+/// supports limited conversions (see code for exactly which).
 fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToView),
@@ -607,8 +609,9 @@ pub fn evaluate_predicate(
             let right = evaluate_expression(right, batch, None)?;
 
             // If the types differ (e.g. one side is a view type and the other is not),
-            // normalize both to view types since benchamrking results show that casting from non-view to view type is faster
-            // than casting from view type to non-view type.
+            // normalize both to view types since benchamrking results show that casting from
+            // non-view to view type is faster than casting from view type to non-view
+            // type.
             let (left, right) = if left.data_type() == right.data_type() {
                 (left, right)
             } else {
@@ -720,7 +723,8 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
 /// are null for a given row, the result will be null for that row.
 ///
 /// # Parameters
-/// - `arrays`: Slice of Arrow arrays to coalesce. Must not be empty and all arrays must have the same data type.
+/// - `arrays`: Slice of Arrow arrays to coalesce. Must not be empty and all arrays must have the
+///   same data type.
 /// - `result_type`: Optional expected result type. If provided, must match the arrays' data type.
 ///
 /// # Returns
@@ -914,6 +918,10 @@ fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaRes
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use rstest::rstest;
+
     use super::*;
     use crate::arrow::array::{
         ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray, StructArray,
@@ -921,12 +929,11 @@ mod tests {
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
-    use crate::expressions::column_expr;
-    use crate::expressions::{column_expr_ref, BinaryExpressionOp, Expression as Expr, Transform};
+    use crate::expressions::{
+        column_expr, column_expr_ref, BinaryExpressionOp, Expression as Expr, Transform,
+    };
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
-    use rstest::rstest;
-    use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {
         let schema = ArrowSchema::new(vec![

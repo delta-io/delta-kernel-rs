@@ -20,14 +20,16 @@ const INVALID_PARQUET_CHARS: &[char] = &[' ', ',', ';', '{', '}', '(', ')', '\n'
 /// 1. Schema is non-empty
 /// 2. No duplicate column names (case-insensitive, including nested fields)
 /// 3. Column names contain only valid characters
+/// 4. Rejects non-null columns when the `invariants` writer feature is not enabled
 pub(crate) fn validate_schema_for_create(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
+    invariants_enabled: bool,
 ) -> DeltaResult<()> {
     if schema.num_fields() == 0 {
         return Err(Error::generic("Schema cannot be empty"));
     }
-    let mut validator = SchemaValidator::new(column_mapping_mode);
+    let mut validator = SchemaValidator::new(column_mapping_mode, invariants_enabled);
     // We reuse the SchemaTransform trait for its recursive traversal machinery.
     // The validator never transforms the schema -- it only inspects fields and
     // collects errors. The return value is intentionally discarded.
@@ -46,15 +48,17 @@ pub(crate) fn validate_schema_for_create(
 /// built with `new_unchecked`.
 struct SchemaValidator {
     cm_enabled: bool,
+    invariants_enabled: bool,
     seen_paths: HashSet<String>,
     current_path: Vec<String>,
     errors: Vec<String>,
 }
 
 impl SchemaValidator {
-    fn new(column_mapping_mode: ColumnMappingMode) -> Self {
+    fn new(column_mapping_mode: ColumnMappingMode, invariants_enabled: bool) -> Self {
         Self {
             cm_enabled: !matches!(column_mapping_mode, ColumnMappingMode::None),
+            invariants_enabled,
             seen_paths: HashSet::new(),
             current_path: Vec::new(),
             errors: Vec::new(),
@@ -74,6 +78,15 @@ impl SchemaValidator {
 }
 
 impl<'a> SchemaTransform<'a> for SchemaValidator {
+    /// The default `transform_variant` recurses into the variant's struct fields
+    /// (metadata, value) via `recurse_into_struct`. Those fields are protocol-defined
+    /// and must be non-null -- they are not user-controlled schema columns. We override
+    /// to return the variant struct unchanged, skipping recursion so the non-null check
+    /// in `transform_struct_field` does not reject these fixed internal fields.
+    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+        Some(Cow::Borrowed(stype))
+    }
+
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         if let Err(e) = validate_field_name(field.name(), self.cm_enabled) {
             self.errors.push(e.to_string());
@@ -84,6 +97,13 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
         // separator would make column "a.b" indistinguishable from nested field b in
         // struct a. Null bytes cannot appear in column names, so they are safe to use.
         self.current_path.push(field.name().to_ascii_lowercase());
+        if !self.invariants_enabled && !field.is_nullable() {
+            self.errors.push(format!(
+                "Non-null column '{}' is not supported during CREATE TABLE unless \
+                 writer feature 'invariants' is enabled",
+                self.current_path.join(".")
+            ));
+        }
         let key = self.current_path.join("\0");
         if !self.seen_paths.insert(key) {
             self.errors.push(format!(
@@ -131,9 +151,10 @@ fn validate_field_name(name: &str, cm_enabled: bool) -> DeltaResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
-    use rstest::rstest;
 
     // === Schema builders for test cases ===
 
@@ -273,6 +294,57 @@ mod tests {
         ])
     }
 
+    fn schema_all_nullable() -> StructType {
+        StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, true),
+            StructField::new("name", DataType::STRING, true),
+        ])
+    }
+
+    fn schema_top_level_non_null() -> StructType {
+        StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ])
+    }
+
+    fn schema_nested_non_null() -> StructType {
+        let nested =
+            StructType::new_unchecked(vec![StructField::new("child", DataType::INTEGER, false)]);
+        StructType::new_unchecked(vec![StructField::new(
+            "parent",
+            DataType::Struct(Box::new(nested)),
+            true,
+        )])
+    }
+
+    fn schema_array_nested_non_null() -> StructType {
+        let nested =
+            StructType::new_unchecked(vec![StructField::new("child", DataType::INTEGER, false)]);
+        StructType::new_unchecked(vec![StructField::new(
+            "arr",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Struct(Box::new(nested)),
+                true,
+            ))),
+            true,
+        )])
+    }
+
+    fn schema_map_nested_non_null() -> StructType {
+        let nested =
+            StructType::new_unchecked(vec![StructField::new("child", DataType::INTEGER, false)]);
+        StructType::new_unchecked(vec![StructField::new(
+            "map",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::Struct(Box::new(nested)),
+                true,
+            ))),
+            true,
+        )])
+    }
+
     // === Valid schemas ===
 
     #[rstest]
@@ -282,7 +354,7 @@ mod tests {
     #[case::dot_in_name_with_cm(schema_with_dot(), ColumnMappingMode::Name)]
     #[case::different_struct_children(schema_different_struct_children(), ColumnMappingMode::None)]
     fn valid_schema_accepted(#[case] schema: StructType, #[case] cm: ColumnMappingMode) {
-        assert!(validate_schema_for_create(&schema, cm).is_ok());
+        assert!(validate_schema_for_create(&schema, cm, true).is_ok());
     }
 
     // === Invalid schemas ===
@@ -304,7 +376,7 @@ mod tests {
         #[case] cm: ColumnMappingMode,
         #[case] expected_errs: &[&str],
     ) {
-        let result = validate_schema_for_create(&schema, cm);
+        let result = validate_schema_for_create(&schema, cm, true);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         for expected in expected_errs {
@@ -313,5 +385,65 @@ mod tests {
                 "Expected '{expected}' in error, got: {err}"
             );
         }
+    }
+
+    #[rstest]
+    #[case::all_nullable_invariants_disabled(schema_all_nullable(), false, true, None)]
+    #[case::top_level_non_null_invariants_disabled(
+        schema_top_level_non_null(),
+        false,
+        false,
+        Some("id")
+    )]
+    #[case::nested_non_null_invariants_disabled(
+        schema_nested_non_null(),
+        false,
+        false,
+        Some("parent.child")
+    )]
+    #[case::array_nested_non_null_invariants_disabled(
+        schema_array_nested_non_null(),
+        false,
+        false,
+        Some("arr.child")
+    )]
+    #[case::map_nested_non_null_invariants_disabled(
+        schema_map_nested_non_null(),
+        false,
+        false,
+        Some("map.child")
+    )]
+    #[case::top_level_non_null_invariants_enabled(schema_top_level_non_null(), true, true, None)]
+    #[case::nested_non_null_invariants_enabled(schema_nested_non_null(), true, true, None)]
+    fn non_null_columns_require_invariants_feature(
+        #[case] schema: StructType,
+        #[case] invariants_enabled: bool,
+        #[case] expect_ok: bool,
+        #[case] expected_path: Option<&str>,
+    ) {
+        let result =
+            validate_schema_for_create(&schema, ColumnMappingMode::None, invariants_enabled);
+
+        if expect_ok {
+            assert!(result.is_ok(), "expected success, got {result:?}");
+            return;
+        }
+
+        let err = result.expect_err("expected non-null validation error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Non-null column"),
+            "Expected non-null validation error, got: {msg}"
+        );
+        if let Some(path) = expected_path {
+            assert!(
+                msg.contains(path),
+                "Expected path '{path}' in error message, got: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("writer feature 'invariants'"),
+            "Expected invariants guidance in error message, got: {msg}"
+        );
     }
 }

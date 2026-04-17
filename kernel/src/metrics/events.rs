@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::time::Duration;
+
 use uuid::Uuid;
 
 /// Unique identifier for a metrics operation.

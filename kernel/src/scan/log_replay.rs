@@ -22,8 +22,9 @@ use crate::log_replay::{
 use crate::log_segment::CheckpointReadInfo;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::scan::Scalar;
-use crate::schema::ToSchema as _;
-use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
+use crate::schema::{
+    ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
+};
 use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
@@ -79,23 +80,26 @@ pub struct SerializableScanState {
     pub(crate) checkpoint_info: CheckpointReadInfo,
 }
 
-/// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a table scan.
+/// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a
+/// table scan.
 ///
 /// During a table scan, the processor reads batches of log actions (in reverse chronological order)
 /// and performs the following steps:
 ///
 /// - Data Skipping: Applies a predicate-based filter (via [`DataSkippingFilter`]) to quickly skip
-///   files that are irrelevant for the query. This includes both data column stats (min/max/nullCount)
-///   and partition value filtering in a single columnar pass. A secondary row-level partition filter
-///   catches remaining files the columnar pass cannot prune (e.g. null partition values where
-///   null-safety conservatively keeps them).
-/// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique file
-///   (identified by its path and deletion vector unique ID), only the latest valid Add action is processed.
-/// - Transformation: Applies a built-in transformation (`log_transform` or `checkpoint_transform`) to convert selected Add actions
-///   into [`ScanMetadata`], the intermediate format passed to the engine.
-/// - Row Transform Passthrough: Any user-provided row-level transformation expressions (e.g. those derived
-///   from projection or filters) are preserved and passed through to the engine, which applies them as part
-///   of its scan execution logic.
+///   files that are irrelevant for the query. This includes both data column stats
+///   (min/max/nullCount) and partition value filtering in a single columnar pass. A secondary
+///   row-level partition filter catches remaining files the columnar pass cannot prune (e.g. null
+///   partition values where null-safety conservatively keeps them).
+/// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique
+///   file (identified by its path and deletion vector unique ID), only the latest valid Add action
+///   is processed.
+/// - Transformation: Applies a built-in transformation (`log_transform` or `checkpoint_transform`)
+///   to convert selected Add actions into [`ScanMetadata`], the intermediate format passed to the
+///   engine.
+/// - Row Transform Passthrough: Any user-provided row-level transformation expressions (e.g. those
+///   derived from projection or filters) are preserved and passed through to the engine, which
+///   applies them as part of its scan execution logic.
 ///
 /// As an implementation of [`LogReplayProcessor`], [`ScanLogReplayProcessor`] provides the
 /// `process_actions_batch` method, which applies these steps to each batch of log actions and
@@ -328,11 +332,11 @@ impl ScanLogReplayProcessor {
     ///
     /// # Parameters
     /// - `engine`: Engine for creating evaluators and filters
-    /// - `state`: The serialized state containing predicate, internal state blob, and seen file keys
+    /// - `state`: The serialized state containing predicate, internal state blob, and seen file
+    ///   keys
     ///
     /// # Returns
     /// A new `ScanLogReplayProcessor` wrapped in an Arc.
-    ///
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn from_serializable_state(
@@ -407,12 +411,14 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
     /// is not an Add action, or the file has already been seen previously.
     fn is_valid_add<'b>(&mut self, i: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<bool> {
-        // When processing file actions, we extract path and deletion vector information based on action type:
+        // When processing file actions, we extract path and deletion vector information based on
+        // action type:
         // - For Add actions: path is at index 0, followed by DV fields at indexes 2-4
-        // - For Remove actions (in log batches only): path is at index 5, followed by DV fields at indexes 6-8
-        // The file extraction logic selects the appropriate indexes based on whether we found a valid path.
-        // Remove getters are not included when visiting a non-log batch (checkpoint batch), so do
-        // not try to extract remove actions in that case.
+        // - For Remove actions (in log batches only): path is at index 5, followed by DV fields at
+        //   indexes 6-8
+        // The file extraction logic selects the appropriate indexes based on whether we found a
+        // valid path. Remove getters are not included when visiting a non-log batch
+        // (checkpoint batch), so do not try to extract remove actions in that case.
         let Some((file_key, is_add)) = self.deduplicator.extract_file_action(
             i,
             getters,
@@ -556,7 +562,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
             MapType::new(
                 DataType::STRING,
                 DataType::STRING,
-                /*valueContainsNull*/ true,
+                /* valueContainsNull */ true,
             ),
         ),
         StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
@@ -610,7 +616,8 @@ fn scan_row_schema_with_parsed_columns(
 ///   raw stats JSON string from checkpoint parquet files.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
 ///   value parsing is not needed.
-/// - `has_partition_values_parsed`: Whether checkpoint has pre-parsed partitionValues_parsed column.
+/// - `has_partition_values_parsed`: Whether checkpoint has pre-parsed partitionValues_parsed
+///   column.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_schema` is Some,
 /// and `partitionValues_parsed` only when `partition_schema` is Some.
@@ -859,8 +866,8 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 ///    [`FilteredEngineData`] and transforms that must be applied to correctly read the data).
 /// 2. An `Arc<ScanMetrics>` containing metrics collected during log replay.
 ///
-/// Each row that is selected in the returned `engine_data` _must_ be processed to complete the scan.
-/// Non-selected rows _must_ be ignored.
+/// Each row that is selected in the returned `engine_data` _must_ be processed to complete the
+/// scan. Non-selected rows _must_ be ignored.
 ///
 /// When `skip_stats` is true, file statistics are not read from checkpoint parquet files and
 /// columnar data skipping is disabled (no stats-based or partition-value-based pruning), but
@@ -890,6 +897,9 @@ mod tests {
 
     use rstest::rstest;
 
+    use super::{
+        scan_action_iter, InternalScanState, ScanLogReplayProcessor, SerializableScanState,
+    };
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
@@ -912,17 +922,10 @@ mod tests {
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
     use crate::scan::PhysicalPredicate;
-    use crate::schema::MetadataColumnSpec;
-    use crate::schema::{DataType, SchemaRef, StructField, StructType};
+    use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
-    use crate::DeltaResult;
-    use crate::Expression as Expr;
-    use crate::ExpressionRef;
-
-    use super::{
-        scan_action_iter, InternalScanState, ScanLogReplayProcessor, SerializableScanState,
-    };
+    use crate::{DeltaResult, Expression as Expr, ExpressionRef};
 
     fn test_checkpoint_info() -> CheckpointReadInfo {
         CheckpointReadInfo::without_stats_parsed()

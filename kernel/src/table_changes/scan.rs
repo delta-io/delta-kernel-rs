@@ -5,19 +5,17 @@ use std::sync::Arc;
 use itertools::Itertools;
 use url::Url;
 
-use crate::actions::deletion_vector::split_vector;
-use crate::scan::field_classifiers::CdfTransformFieldClassifier;
-use crate::scan::state_info::StateInfo;
-use crate::scan::PhysicalPredicate;
-use crate::scan::StatsOutputMode;
-use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
-
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::TableChanges;
+use crate::actions::deletion_vector::split_vector;
+use crate::scan::field_classifiers::CdfTransformFieldClassifier;
+use crate::scan::state_info::StateInfo;
+use crate::scan::{PhysicalPredicate, StatsOutputMode};
+use crate::schema::SchemaRef;
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
@@ -31,9 +29,9 @@ pub struct TableChangesScan {
 
 /// This builder constructs a [`TableChangesScan`] that can be used to read the [`TableChanges`]
 /// of a table. [`TableChangesScanBuilder`] allows you to specify a schema to project the columns
-/// or specify a predicate to filter rows in the Change Data Feed. Note that predicates containing Change
-/// Data Feed columns `_change_type`, `_commit_version`, and `_commit_timestamp` are not currently
-/// allowed. See issue [#525](https://github.com/delta-io/delta-kernel-rs/issues/525).
+/// or specify a predicate to filter rows in the Change Data Feed. Note that predicates containing
+/// Change Data Feed columns `_change_type`, `_commit_version`, and `_commit_timestamp` are not
+/// currently allowed. See issue [#525](https://github.com/delta-io/delta-kernel-rs/issues/525).
 ///
 /// Note: There is a lot of shared functionality between [`TableChangesScanBuilder`] and
 /// [`ScanBuilder`].
@@ -105,8 +103,8 @@ impl TableChangesScanBuilder {
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
     /// provided schema make sense, and to prepare some metadata that the scan will need.  The
-    /// [`TableChangesScan`] type itself can be used to fetch the files and associated metadata required to
-    /// perform actual data reads.
+    /// [`TableChangesScan`] type itself can be used to fetch the files and associated metadata
+    /// required to perform actual data reads.
     pub fn build(self) -> DeltaResult<TableChangesScan> {
         // if no schema is provided, use `TableChanges`'s entire (logical) schema (e.g. SELECT *)
         let logical_schema = self
@@ -313,8 +311,8 @@ fn read_scan_file(
         // vector becomes `[1, 0, 1, 1]`.
         //
         // # Case 3
-        // These scan files are either simple adds, removes, or cdc files. This case is a noop because
-        // the selection vector is `None`.
+        // These scan files are either simple adds, removes, or cdc files. This case is a noop
+        // because the selection vector is `None`.
         let extend = Some(!is_dv_resolved_pair);
         let rest = split_vector(sv.as_mut(), len, extend);
         let result = match sv {
@@ -336,8 +334,7 @@ mod tests {
     use crate::scan::transform_spec::FieldTransformSpec;
     use crate::scan::PhysicalPredicate;
     use crate::schema::{DataType, StructField, StructType};
-    use crate::table_changes::TableChanges;
-    use crate::table_changes::COMMIT_VERSION_COL_NAME;
+    use crate::table_changes::{TableChanges, COMMIT_VERSION_COL_NAME};
     use crate::Predicate;
 
     #[test]
@@ -353,7 +350,8 @@ mod tests {
 
         // Check that StateInfo has been properly created with correct transforms
         // Note that this table is not partitioned. `part` is a regular field
-        // Schema: part (idx 0), id (idx 1), _change_type (idx 2), _commit_version (idx 3), _commit_timestamp (idx 4)
+        // Schema: part (idx 0), id (idx 1), _change_type (idx 2), _commit_version (idx 3),
+        // _commit_timestamp (idx 4)
         assert!(scan.state_info.transform_spec.is_some());
         let transform_spec = scan.state_info.transform_spec.as_ref().unwrap();
 

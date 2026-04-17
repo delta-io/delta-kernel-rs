@@ -18,6 +18,7 @@ use crate::clustering::{create_clustering_domain_metadata, validate_clustering_c
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
+use crate::schema::validation::validate_schema_for_create;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{normalize_column_names_to_schema_casing, DataType, SchemaRef, StructType};
 use crate::snapshot::Snapshot;
@@ -236,8 +237,8 @@ struct DataLayoutResult {
 /// 1. Top-level columns (nested paths are not supported)
 /// 2. Present in the schema
 /// 3. Not duplicated
-/// 4. Of a primitive type (Struct, Array, Map are rejected because partition values
-///    must be representable as directory-path strings)
+/// 4. Of a primitive type (Struct, Array, Map are rejected because partition values must be
+///    representable as directory-path strings)
 /// 5. A strict subset of the schema columns (at least one non-partition column required)
 fn validate_partition_columns(
     schema: &StructType,
@@ -292,8 +293,8 @@ fn validate_partition_columns(
 /// - **None**: Returns defaults (no domain metadata, no clustering/partition columns).
 /// - **Clustered**: Validates clustering columns, resolves to physical names, adds the
 ///   `DomainMetadata` and `ClusteredTable` features, creates clustering domain metadata.
-/// - **Partitioned**: Validates partition columns and stores logical names. No domain
-///   metadata or special features are needed (partitioning is a core Delta feature).
+/// - **Partitioned**: Validates partition columns and stores logical names. No domain metadata or
+///   special features are needed (partitioning is a core Delta feature).
 fn apply_data_layout(
     data_layout: &DataLayout,
     effective_schema: &SchemaRef,
@@ -648,7 +649,7 @@ impl CreateTableTransactionBuilder {
     /// # use delta_kernel::schema::{StructType, DataType, StructField};
     /// # use std::sync::Arc;
     /// # fn example() -> delta_kernel::DeltaResult<()> {
-    /// # let schema = Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)])?);
+    /// # let schema = Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)])?);
     /// let builder = create_table("/path/to/table", schema, "MyApp/1.0")
     ///     .with_table_properties([
     ///         ("myapp.version", "1.0"),
@@ -676,8 +677,8 @@ impl CreateTableTransactionBuilder {
     ///
     /// - [`DataLayout::None`]: No special organization (default)
     /// - [`DataLayout::Clustered`]: Data files are optimized for queries on clustering columns
-    /// - [`DataLayout::Partitioned`]: Data files are organized into directories by partition
-    ///   column values
+    /// - [`DataLayout::Partitioned`]: Data files are organized into directories by partition column
+    ///   values
     ///
     /// Partitioning and clustering are mutually exclusive.
     ///
@@ -693,8 +694,8 @@ impl CreateTableTransactionBuilder {
     /// # use std::sync::Arc;
     /// # fn example() -> delta_kernel::DeltaResult<()> {
     /// # let schema = Arc::new(StructType::try_new(vec![
-    /// #     StructField::new("id", DataType::INTEGER, false),
-    /// #     StructField::new("date", DataType::STRING, false),
+    /// #     StructField::new("id", DataType::INTEGER, true),
+    /// #     StructField::new("date", DataType::STRING, true),
     /// # ])?);
     /// // Clustered layout:
     /// let builder = create_table("/path/to/table", schema.clone(), "MyApp/1.0")
@@ -721,6 +722,7 @@ impl CreateTableTransactionBuilder {
     /// - Checks that the table path is valid
     /// - Verifies the table doesn't already exist
     /// - Validates the schema is non-empty
+    /// - Rejects non-null columns unless `invariants` writer feature is enabled
     /// - Validates the data layout is valid
     /// - Validates table properties against the allow list
     ///
@@ -735,6 +737,7 @@ impl CreateTableTransactionBuilder {
     /// - The table path is invalid
     /// - A table already exists at the given path
     /// - The schema is empty
+    /// - The schema has non-null columns without the `invariants` writer feature
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
     pub fn build(
@@ -761,9 +764,12 @@ impl CreateTableTransactionBuilder {
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
 
         // Validate schema (non-empty, column names, duplicates)
-        crate::schema::validation::validate_schema_for_create(
+        validate_schema_for_create(
             &effective_schema,
             column_mapping_mode,
+            validated
+                .writer_features
+                .contains(&TableFeature::Invariants),
         )?;
 
         // Validate data layout and resolve column names (physical for clustering, logical

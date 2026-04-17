@@ -12,6 +12,7 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 
+use super::handle::Handle;
 #[cfg(feature = "default-engine-base")]
 use crate::engine_data::ArrowFFIData;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
@@ -23,8 +24,6 @@ use crate::{
     NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, SharedSnapshot,
     TryFromStringSlice,
 };
-
-use super::handle::Handle;
 
 #[handle_descriptor(target=Scan, mutable=false, sized=true)]
 pub struct SharedScan;
@@ -345,9 +344,9 @@ pub struct ScanMetadataIterator {
     // Item = DeltaResult<ScanMetadata>
     data: Mutex<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>> + Send>>,
 
-    // Also keep a reference to the external engine for its error allocator. The default Parquet and
-    // Json handlers don't hold any reference to the tokio reactor they rely on, so the iterator
-    // terminates early if the last engine goes out of scope.
+    // Also keep a reference to the external engine for its error allocator. The default Parquet
+    // and Json handlers don't hold any reference to the tokio reactor they rely on, so the
+    // iterator terminates early if the last engine goes out of scope.
     engine: Arc<dyn ExternEngine>,
 }
 
@@ -389,10 +388,10 @@ fn scan_metadata_iter_init_impl(
     Ok(Arc::new(data).into())
 }
 
-/// Call the provided `engine_visitor` on the next scan metadata item. The visitor will be provided with
-/// a [`SharedScanMetadata`], which contains the actual scan files and the associated selection vector. It is the
-/// responsibility of the _engine_ to free the associated resources after use by calling
-/// [`free_engine_data`] and [`free_bool_slice`] respectively.
+/// Call the provided `engine_visitor` on the next scan metadata item. The visitor will be provided
+/// with a [`SharedScanMetadata`], which contains the actual scan files and the associated selection
+/// vector. It is the responsibility of the _engine_ to free the associated resources after use by
+/// calling [`free_engine_data`] and [`free_bool_slice`] respectively.
 ///
 /// # Safety
 ///
@@ -472,7 +471,8 @@ pub struct CDvInfo<'a> {
 /// This callback will be invoked for each valid file that needs to be read for a scan.
 ///
 /// The arguments to the callback are:
-/// * `context`: a `void*` context this can be anything that engine needs to pass through to each call
+/// * `context`: a `void*` context this can be anything that engine needs to pass through to each
+///   call
 /// * `path`: a `KernelStringSlice` which is the path to the file
 /// * `size`: an `i64` which is the size of the file
 /// * `mod_time`: an `i64` which is the time the file was created, as milliseconds since the epoch
@@ -675,8 +675,8 @@ struct ContextWrapper {
     callback: CScanCallback,
 }
 
-/// Shim for ffi to call visit_scan_metadata. This will generally be called when iterating through scan
-/// data which provides the [`SharedScanMetadata`] as each element in the iterator.
+/// Shim for ffi to call visit_scan_metadata. This will generally be called when iterating through
+/// scan data which provides the [`SharedScanMetadata`] as each element in the iterator.
 ///
 /// # Safety
 /// engine is responsible for passing a valid [`SharedScanMetadata`].
@@ -728,8 +728,8 @@ pub struct ScanMetadataArrowResult {
 /// Get the next scan metadata batch as Arrow via the C Data Interface.
 ///
 /// Advances the iterator by one batch and returns a [`ScanMetadataArrowResult`] containing:
-/// - An Arrow RecordBatch with scan row schema columns (path, size, modificationTime,
-///   stats, deletionVector, fileConstantValues)
+/// - An Arrow RecordBatch with scan row schema columns (path, size, modificationTime, stats,
+///   deletionVector, fileConstantValues)
 /// - A boolean selection vector indicating active rows (true = selected)
 /// - Per-row transformation expressions (use [`get_transform_for_row`] to access)
 ///
@@ -815,6 +815,11 @@ mod scan_builder_tests {
 
     use test_utils::{actions_to_string, TestAction};
 
+    use super::{
+        free_scan, free_scan_builder, scan_builder, scan_builder_build,
+        scan_builder_with_predicate, scan_builder_with_schema, scan_logical_schema,
+        EnginePredicate, EngineSchema,
+    };
     use crate::error::KernelError;
     use crate::expressions::kernel_visitor::{
         visit_expression_column, visit_expression_literal_int, visit_predicate_lt,
@@ -825,12 +830,6 @@ mod scan_builder_tests {
         visit_field_integer, visit_field_struct, KernelSchemaVisitorState,
     };
     use crate::{free_engine, free_schema, free_snapshot, kernel_string_slice, ExternResult};
-
-    use super::{
-        free_scan, free_scan_builder, scan_builder, scan_builder_build,
-        scan_builder_with_predicate, scan_builder_with_schema, scan_logical_schema,
-        EnginePredicate, EngineSchema,
-    };
 
     /// Schema visitor that produces `{id: integer (nullable)}` -- a single-column projection of
     /// the standard test table schema.
@@ -1096,15 +1095,14 @@ mod scan_metadata_arrow_tests {
     use delta_kernel::arrow::array::{RecordBatch, StructArray};
     use test_utils::{actions_to_string, TestAction};
 
-    use crate::engine_data::ArrowFFIData;
-    use crate::ffi_test_utils::{ok_or_panic, setup_snapshot};
-    use crate::{free_engine, free_snapshot};
-
     use super::{
         free_scan, free_scan_metadata_arrow_result, free_scan_metadata_iter, get_transform_for_row,
         scan_builder, scan_builder_build, scan_metadata_iter_init, scan_metadata_next_arrow_impl,
         CTransforms, ScanMetadataArrowResult, SharedScan, SharedScanMetadataIterator,
     };
+    use crate::engine_data::ArrowFFIData;
+    use crate::ffi_test_utils::{ok_or_panic, setup_snapshot};
+    use crate::{free_engine, free_snapshot};
 
     /// Sets up engine, snapshot, scan, and scan metadata iterator from the given test actions.
     async fn setup_scan_iter(
@@ -1342,7 +1340,8 @@ mod scan_metadata_arrow_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, ptr::NonNull};
+    use std::collections::HashMap;
+    use std::ptr::NonNull;
 
     use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
