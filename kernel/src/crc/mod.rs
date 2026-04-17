@@ -16,6 +16,8 @@ mod lazy;
 mod reader;
 mod writer;
 
+use std::collections::HashMap;
+
 #[allow(unused)]
 pub(crate) use delta::CrcDelta;
 pub use file_size_histogram::FileSizeHistogram;
@@ -24,14 +26,11 @@ pub use file_stats::FileStats;
 pub(crate) use file_stats::FileStatsDelta;
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
-#[allow(unused)]
-pub(crate) use writer::try_write_crc_file;
-
-use std::collections::HashMap;
-
 use serde::de::Deserializer;
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
+#[allow(unused)]
+pub(crate) use writer::try_write_crc_file;
 
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 

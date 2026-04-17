@@ -14,11 +14,11 @@ use std::collections::HashMap;
 use std::num::NonZero;
 use std::time::Duration;
 
+use strum::EnumString;
+
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
 use crate::{Error, Version};
-
-use strum::EnumString;
 
 mod deserialize;
 pub use deserialize::ParseIntervalError;
@@ -89,7 +89,8 @@ pub struct TableProperties {
     /// E.g. if checkpoint interval = 10, then a checkpoint should be written every 10 commits.
     pub checkpoint_interval: Option<NonZero<u64>>,
 
-    /// true for Delta Lake to write file statistics in checkpoints in JSON format for the stats column.
+    /// true for Delta Lake to write file statistics in checkpoints in JSON format for the stats
+    /// column.
     pub checkpoint_write_stats_as_json: Option<bool>,
 
     /// true for Delta Lake to write file statistics to checkpoints in struct format for the
@@ -104,8 +105,8 @@ pub struct TableProperties {
     /// A value of -1 means to collect statistics for all columns. Updating this property does
     /// not automatically collect statistics again; instead, it redefines the statistics schema
     /// of the Delta table. Specifically, it changes the behavior of future statistics collection
-    /// (such as during appends and optimizations) as well as data skipping (such as ignoring column
-    /// statistics beyond this number, even when such statistics exist).
+    /// (such as during appends and optimizations) as well as data skipping (such as ignoring
+    /// column statistics beyond this number, even when such statistics exist).
     pub data_skipping_num_indexed_cols: Option<DataSkippingNumIndexedCols>,
 
     /// A comma-separated list of column names on which Delta Lake collects statistics to enhance
@@ -114,8 +115,8 @@ pub struct TableProperties {
     pub data_skipping_stats_columns: Option<Vec<ColumnName>>,
 
     /// The shortest duration for Delta Lake to keep logically deleted data files before deleting
-    /// them physically. This is to prevent failures in stale readers after compactions or partition
-    /// overwrites.
+    /// them physically. This is to prevent failures in stale readers after compactions or
+    /// partition overwrites.
     ///
     /// This value should be large enough to ensure that:
     ///
@@ -162,7 +163,8 @@ pub struct TableProperties {
     /// Whether to clean up expired checkpoints/commits in the delta log.
     pub enable_expired_log_cleanup: Option<bool>,
 
-    /// true for Delta to generate a random prefix for a file path instead of partition information.
+    /// true for Delta to generate a random prefix for a file path instead of partition
+    /// information.
     ///
     /// For example, this may improve Amazon S3 performance when Delta Lake needs to send very high
     /// volumes of Amazon S3 calls to better partition across S3 servers.
@@ -223,8 +225,8 @@ pub struct TableProperties {
     /// The version of the table at which in-commit timestamps were enabled.
     pub in_commit_timestamp_enablement_version: Option<Version>,
 
-    /// The timestamp of the table at which in-commit timestamps were enabled. This must be the same
-    /// as the inCommitTimestamp of the commit when this feature was enabled.
+    /// The timestamp of the table at which in-commit timestamps were enabled. This must be the
+    /// same as the inCommitTimestamp of the commit when this feature was enabled.
     pub in_commit_timestamp_enablement_timestamp: Option<i64>,
 
     /// any unrecognized properties are passed through and ignored by the parser
@@ -308,9 +310,9 @@ pub enum IsolationLevel {
     WriteSerializable,
 
     /// SnapshotIsolation is a guarantee that all reads made in a transaction will see a consistent
-    /// snapshot of the database (in practice it reads the last committed values that existed at the
-    /// time it started), and the transaction itself will successfully commit only if no updates
-    /// it has made conflict with any concurrent updates made since that snapshot.
+    /// snapshot of the database (in practice it reads the last committed values that existed at
+    /// the time it started), and the transaction itself will successfully commit only if no
+    /// updates it has made conflict with any concurrent updates made since that snapshot.
     SnapshotIsolation,
 }
 
@@ -347,11 +349,11 @@ pub enum CheckpointPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashMap;
 
+    use super::*;
     use crate::expressions::column_name;
     use rstest::rstest;
-    use std::collections::HashMap;
 
     #[test]
     fn test_property_key_constants() {

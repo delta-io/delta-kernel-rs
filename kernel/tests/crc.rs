@@ -12,8 +12,7 @@ use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::{ChecksumWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::FileStats;
-use delta_kernel::{DeltaResult, Engine};
+use delta_kernel::{DeltaResult, Engine, FileStats};
 use rstest::rstest;
 use test_utils::{add_commit, insert_data, test_table_setup};
 
@@ -45,7 +44,7 @@ async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new("value", DataType::STRING, true),
     ])?);
 
@@ -1045,11 +1044,12 @@ fn assert_histogram_totals(
 /// The first non-zero default histogram bin boundary (8KB).
 const FIRST_BIN_BOUNDARY: i64 = 8192;
 
-/// Approximate bytes per row for `(int32, 100-char padded string)` parquet data.
+/// Approximate bytes per row for `(int32, 100-char high-entropy string)` parquet data.
+/// High-entropy strings compress poorly, so this approximates post-compression row size.
 const APPROX_BYTES_PER_ROW: i64 = 104;
 
 /// Row count guaranteed to produce a parquet file exceeding [`FIRST_BIN_BOUNDARY`].
-/// Uses 2x the boundary divided by per-row size as a generous margin.
+/// Uses 2x the boundary divided by per-row size as a safety margin.
 const LARGE_FILE_ROW_COUNT: i32 = (FIRST_BIN_BOUNDARY * 2 / APPROX_BYTES_PER_ROW) as i32;
 
 /// Verifies that the in-memory CRC histogram correctly tracks file adds and removes across
@@ -1097,9 +1097,19 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
     assert_eq!(hist.sorted_bin_boundaries().len(), 95);
 
     // ===== v2: insert large file (>= 8KB -> bin 1+) =====
+    // Use LCG-derived strings to produce high-entropy data that resists compression.
     let n = LARGE_FILE_ROW_COUNT;
     let ids: ArrayRef = Arc::new(Int32Array::from((0..n).collect::<Vec<_>>()));
-    let strings: Vec<String> = (0..n).map(|i| format!("{i:0>100}")).collect();
+    let strings: Vec<String> = (0..n)
+        .map(|i| {
+            // Two steps of Knuth's multiplicative LCG produce four varied 20-digit numbers.
+            let a = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let b = a.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let c = b.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let d = c.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            format!("{a:020}{b:020}{c:020}{d:020}{i:020}")
+        })
+        .collect();
     let data: ArrayRef = Arc::new(StringArray::from(strings));
     let committed = insert_data(snapshot.clone(), &engine, vec![ids, data])
         .await?

@@ -88,7 +88,7 @@ fn test_create_table_no_timestamp_ntz_no_feature() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new("name", DataType::STRING, true),
     ])?);
 
@@ -114,7 +114,7 @@ fn test_create_table_timestamp_ntz_and_variant() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new("ts", DataType::TIMESTAMP_NTZ, true),
         StructField::new("v", DataType::unshredded_variant(), true),
     ]));

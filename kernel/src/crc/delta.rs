@@ -6,19 +6,18 @@
 //!
 //! A CRC tracks two categories of fields, updated differently:
 //! - **Metadata fields** (protocol, metadata, domain metadata, set transactions, in-commit
-//!   timestamp): always kept up-to-date -- every `apply` unconditionally merges these from
-//!   the delta.
+//!   timestamp): always kept up-to-date -- every `apply` unconditionally merges these from the
+//!   delta.
 //! - **File stats** (`num_files`, `table_size_bytes`): only updated when the current
-//!   [`FileStatsValidity`] is not terminal and the commit's operation is incremental-safe.
-//!   Once validity degrades (e.g. a non-incremental operation like ANALYZE STATS, or a
-//!   missing file size), file stats stop updating for the lifetime of that CRC.
+//!   [`FileStatsValidity`] is not terminal and the commit's operation is incremental-safe. Once
+//!   validity degrades (e.g. a non-incremental operation like ANALYZE STATS, or a missing file
+//!   size), file stats stop updating for the lifetime of that CRC.
 
 use tracing::warn;
 
-use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
-
 use super::file_stats::FileStatsDelta;
 use super::{Crc, FileStatsValidity};
+use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 
 /// The CRC-relevant changes ("delta") from a single commit. Produced either by reading a
 /// `.json` commit file during log replay, or from in-memory transaction state during writes.

@@ -40,7 +40,7 @@ fn clustering_test_schema() -> DeltaResult<Arc<StructType>> {
         true,
     )])?;
     Ok(Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new("name", DataType::STRING, true),
         StructField::new("address", DataType::Struct(Box::new(address)), true),
         StructField::new("l1", DataType::Struct(Box::new(l1)), true),
@@ -102,7 +102,8 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Delta
     Ok(())
 }
 
-/// Test that combining explicit feature signals with auto-enabled features doesn't create duplicates.
+/// Test that combining explicit feature signals with auto-enabled features doesn't create
+/// duplicates.
 ///
 /// This tests the edge case where a user provides `delta.feature.domainMetadata=supported`
 /// AND uses `DataLayout::Clustered`. Both would try to add DomainMetadata, but we should

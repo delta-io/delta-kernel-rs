@@ -40,11 +40,11 @@ pub(super) struct SharedWriteState {
 /// (serialized partition values with physical column names as keys). How you use a
 /// `WriteContext` depends on your engine:
 ///
-/// - **`DefaultEngine` consumers**: pass this to [`DefaultEngine::write_parquet`], which
-///   handles everything (transform, write, partition metadata).
-/// - **Arrow-based custom engines**: write parquet yourself, then call
-///   [`build_add_file_metadata`] with the resulting `DataFileMetadata` and this
-///   `WriteContext` to produce the Add action `EngineData` for [`Transaction::add_files`].
+/// - **`DefaultEngine` consumers**: pass this to [`DefaultEngine::write_parquet`], which handles
+///   everything (transform, write, partition metadata).
+/// - **Arrow-based custom engines**: write parquet yourself, then call [`build_add_file_metadata`]
+///   with the resulting `DataFileMetadata` and this `WriteContext` to produce the Add action
+///   `EngineData` for [`Transaction::add_files`].
 /// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
 ///   `partitionValues` map in Add actions directly.
 ///
@@ -214,10 +214,9 @@ impl WriteContext {
     ///
     /// # Arguments
     ///
-    /// * `random_prefix` - A random prefix to use for the deletion vector file name.
-    ///   Making this non-empty can help distributed load on object storage when writing/reading
-    ///   to avoid throttling.  Typically a random string of 2-4 characters is sufficient
-    ///   for this purpose.
+    /// * `random_prefix` - A random prefix to use for the deletion vector file name. Making this
+    ///   non-empty can help distributed load on object storage when writing/reading to avoid
+    ///   throttling.  Typically a random string of 2-4 characters is sufficient for this purpose.
     ///
     /// # Examples
     ///
@@ -246,13 +245,13 @@ fn random_alphanumeric_prefix() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::expressions::Expression;
     use std::collections::HashSet;
     use std::sync::Arc;
 
     use rstest::rstest;
 
+    use super::*;
+    use crate::expressions::Expression;
     use crate::schema::{DataType, StructField, StructType};
 
     fn make_write_context(
@@ -277,6 +276,27 @@ mod tests {
         WriteContext {
             shared,
             physical_partition_values: partition_values,
+        }
+    }
+
+    fn make_write_context_with_path_mode(path_mode: PathMode) -> WriteContext {
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "value",
+            DataType::INTEGER,
+        )]));
+        let shared = Arc::new(SharedWriteState {
+            table_root: Url::parse("s3://bucket/table/").unwrap(),
+            logical_schema: schema.clone(),
+            physical_schema: schema.clone(),
+            logical_to_physical: Arc::new(Expression::literal(true)),
+            column_mapping_mode: ColumnMappingMode::None,
+            stats_columns: vec![],
+            logical_partition_columns: vec![],
+            path_mode,
+        });
+        WriteContext {
+            shared,
+            physical_partition_values: HashMap::new(),
         }
     }
 
@@ -380,27 +400,6 @@ mod tests {
     }
 
     // === resolve_file_path tests ===
-
-    fn make_write_context_with_path_mode(path_mode: PathMode) -> WriteContext {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
-        let shared = Arc::new(SharedWriteState {
-            table_root: Url::parse("s3://bucket/table/").unwrap(),
-            logical_schema: schema.clone(),
-            physical_schema: schema.clone(),
-            logical_to_physical: Arc::new(Expression::literal(true)),
-            column_mapping_mode: ColumnMappingMode::None,
-            stats_columns: vec![],
-            logical_partition_columns: vec![],
-            path_mode,
-        });
-        WriteContext {
-            shared,
-            physical_partition_values: HashMap::new(),
-        }
-    }
 
     #[rstest]
     #[case::relative_bare_file(

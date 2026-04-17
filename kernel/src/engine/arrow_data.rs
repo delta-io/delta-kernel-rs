@@ -18,14 +18,14 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
 };
 use crate::engine::arrow_conversion::TryIntoArrow as _;
+pub use crate::engine::arrow_utils::fix_nested_null_masks;
 use crate::engine_data::{EngineData, GetData, RowVisitor, StringArrayAccessor};
 use crate::expressions::ArrayData;
 use crate::schema::{ColumnName, DataType, PrimitiveType, SchemaRef};
 use crate::{DeltaResult, Error};
 
-pub use crate::engine::arrow_utils::fix_nested_null_masks;
-
-/// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract from it.
+/// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract
+/// from it.
 ///
 /// WARNING: Row visitors require that all leaf columns of the record batch have correctly computed
 /// NULL masks. The arrow parquet reader is known to produce incomplete NULL masks, for
@@ -367,9 +367,9 @@ impl ArrowEngineData {
         Ok(())
     }
 
-    /// Helper function to extract a column, supporting both direct arrays and REE-encoded (RunEndEncoded) arrays.
-    /// This reduces boilerplate by handling the common pattern of trying direct access first,
-    /// then falling back to RunArray if the column is REE-encoded.
+    /// Helper function to extract a column, supporting both direct arrays and REE-encoded
+    /// (RunEndEncoded) arrays. This reduces boilerplate by handling the common pattern of
+    /// trying direct access first, then falling back to RunArray if the column is REE-encoded.
     fn try_extract_with_ree<'a>(col: &'a dyn Array) -> Option<&'a dyn GetData<'a>> {
         match col.data_type() {
             ArrowDataType::RunEndEncoded(_, _) => col
@@ -525,6 +525,9 @@ impl ArrowEngineData {
 mod tests {
     use std::sync::{Arc, LazyLock};
 
+    use rstest::rstest;
+
+    use super::{extract_record_batch, ArrowEngineData};
     use crate::actions::{get_commit_schema, Metadata, Protocol};
     use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
@@ -543,9 +546,6 @@ mod tests {
     use crate::table_features::TableFeature;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
-    use rstest::rstest;
-
-    use super::{extract_record_batch, ArrowEngineData};
 
     #[test]
     fn test_md_extract() -> DeltaResult<()> {
@@ -1508,7 +1508,8 @@ mod tests {
 
     #[test]
     fn test_materialize_null_map() -> DeltaResult<()> {
-        // Create MapArray with 3 elements: 2 entries in first, 1 entry in second (null), 1 entry in third
+        // Create MapArray with 3 elements: 2 entries in first, 1 entry in second (null), 1 entry in
+        // third
         let keys_array = Arc::new(StringArray::from(vec![
             Some("a"),
             Some("b"), // First element (2 entries)

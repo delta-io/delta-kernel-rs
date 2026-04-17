@@ -1,10 +1,5 @@
 use std::sync::Arc;
 
-use itertools::Itertools;
-use serde_json::{Deserializer, Value};
-use tempfile::{tempdir, TempDir};
-use url::Url;
-
 use delta_kernel::arrow::array::{Array, AsArray, Int32Array, Int64Array, StringArray};
 use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch;
@@ -13,17 +8,19 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-
 use delta_kernel::engine::to_json_bytes;
-use delta_kernel::object_store::{path::Path, DynObjectStore, ObjectStoreExt};
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
-
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Error, Snapshot};
-
+use itertools::Itertools;
+use serde_json::{Deserializer, Value};
+use tempfile::{tempdir, TempDir};
 use test_utils::{
     create_default_engine_mt_executor, create_table, engine_store_setup, read_scan, test_read,
 };
+use url::Url;
 
 /// Helper function to create a simple table with row tracking enabled.
 async fn create_row_tracking_table(
@@ -365,7 +362,8 @@ async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
     .await?;
 
     // Second transaction: write one batch with 2 records
-    // This should read the existing row tracking domain metadata and assign base row IDs starting from 6
+    // This should read the existing row tracking domain metadata and assign base row IDs starting
+    // from 6
     let data_2 = generate_data(schema.clone(), [vec![int32_array(vec![7, 8])]])?;
     assert!(write_data_to_table(&table_url, engine.clone(), data_2)
         .await?
@@ -551,10 +549,10 @@ async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
         .is_committed());
 
     // Verify the commit was written correctly
-    // NB: The expected high water mark is a bit unintuitive here, as we are appending empty batches.
-    // Appending empty batches means that we assign the same base row ID multiple times and that the
-    // high water mark is lower than the last assigned base row ID (because that base row ID has no
-    // actual row attached to it).
+    // NB: The expected high water mark is a bit unintuitive here, as we are appending empty
+    // batches. Appending empty batches means that we assign the same base row ID multiple times
+    // and that the high water mark is lower than the last assigned base row ID (because that
+    // base row ID has no actual row attached to it).
     verify_row_tracking_in_commit(
         &store,
         &table_url,
@@ -596,7 +594,8 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
         .try_collect()?;
 
     // Verify that there only is a commit info action
-    // NOTE: We specifically test that we don't write domain metadata for commits without actual data
+    // NOTE: We specifically test that we don't write domain metadata for commits without actual
+    // data
     assert_eq!(parsed_actions.len(), 1, "Expected only one action");
     assert!(parsed_actions[0].get("commitInfo").is_some());
 
@@ -1137,7 +1136,8 @@ async fn test_read_row_ids_after_log_compaction() -> DeltaResult<()> {
         .await
         .map_err(|e| Error::generic(e.to_string()))?;
 
-    // Load a fresh snapshot -- it should read Protocol and Metadata and file list from the compaction file.
+    // Load a fresh snapshot -- it should read Protocol and Metadata and file list from the
+    // compaction file.
     let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let scan_batches = read_row_id_scan(fresh_snapshot, engine)?;
 

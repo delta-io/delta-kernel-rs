@@ -569,8 +569,9 @@ pub(crate) fn default_schema() -> SchemaRef {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rstest::rstest;
+
+    use super::*;
 
     #[test]
     fn test_basic_build() -> DeltaResult<()> {

@@ -20,7 +20,6 @@ use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::PathMode;
 use delta_kernel::Snapshot;
 use rstest::rstest;
 use test_utils::{read_scan, test_table_setup_mt};
@@ -30,19 +29,17 @@ use url::Url;
 // Helpers
 // ==============================================================================
 
-async fn write_batch_with_path_mode(
+async fn write_batch(
     snapshot: &Arc<Snapshot>,
     engine: &DefaultEngine<TokioMultiThreadExecutor>,
     data: RecordBatch,
     partition_values: HashMap<String, Scalar>,
-    path_mode: PathMode,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("test")
-        .with_data_change(true)
-        .with_path_mode(path_mode);
+        .with_data_change(true);
     let write_context = txn.partitioned_write_context(partition_values)?;
     let add_meta = engine
         .write_parquet(&ArrowEngineData::new(data), &write_context)
@@ -65,7 +62,6 @@ async fn write_batch_with_path_mode(
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_partitioned_normal_values_roundtrip(
     #[case] cm_mode: ColumnMappingMode,
-    #[values(PathMode::Relative, PathMode::Absolute)] path_mode: PathMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ===== Step 1: Create table and write one row with normal partition values. =====
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -75,12 +71,11 @@ async fn test_write_partitioned_normal_values_roundtrip(
     assert_eq!(snapshot.table_configuration().partition_columns().len(), 13);
 
     let batch = RecordBatch::try_new(arrow_schema, normal_arrow_columns())?;
-    let snapshot = write_batch_with_path_mode(
+    let snapshot = write_batch(
         &snapshot,
         engine.as_ref(),
         batch,
         normal_partition_values()?,
-        path_mode,
     )
     .await?;
 
@@ -90,17 +85,10 @@ async fn test_write_partitioned_normal_values_roundtrip(
     let add = &adds[0];
     let raw_path = add["path"].as_str().unwrap();
 
-    // Verify the raw path format matches the requested PathMode.
-    match path_mode {
-        PathMode::Relative => assert!(
-            !raw_path.contains("://"),
-            "Relative mode should produce relative paths, got: {raw_path}"
-        ),
-        PathMode::Absolute => assert!(
-            raw_path.contains("://"),
-            "Absolute mode should produce absolute URLs, got: {raw_path}"
-        ),
-    }
+    assert!(
+        !raw_path.contains("://"),
+        "should produce relative paths, got: {raw_path}"
+    );
 
     let rel_path = strip_table_root(raw_path, snapshot.table_root());
 
@@ -184,7 +172,6 @@ async fn test_write_partitioned_normal_values_roundtrip(
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_partitioned_null_values_roundtrip(
     #[case] cm_mode: ColumnMappingMode,
-    #[values(PathMode::Relative, PathMode::Absolute)] path_mode: PathMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ===== Step 1: Create table and write one row with all-null partition values. =====
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -193,14 +180,7 @@ async fn test_write_partitioned_null_values_roundtrip(
     let snapshot = create_all_types_table(&table_path, engine.as_ref(), cm_mode)?;
 
     let batch = RecordBatch::try_new(arrow_schema, null_arrow_columns())?;
-    let snapshot = write_batch_with_path_mode(
-        &snapshot,
-        engine.as_ref(),
-        batch,
-        null_partition_values()?,
-        path_mode,
-    )
-    .await?;
+    let snapshot = write_batch(&snapshot, engine.as_ref(), batch, null_partition_values()?).await?;
 
     // ===== Step 2: Validate add.path structure in the commit log JSON. =====
     let adds = read_add_actions_json(&table_path, 1)?;
@@ -208,16 +188,10 @@ async fn test_write_partitioned_null_values_roundtrip(
     let add = &adds[0];
     let raw_path = add["path"].as_str().unwrap();
 
-    match path_mode {
-        PathMode::Relative => assert!(
-            !raw_path.contains("://"),
-            "Relative mode should produce relative paths, got: {raw_path}"
-        ),
-        PathMode::Absolute => assert!(
-            raw_path.contains("://"),
-            "Absolute mode should produce absolute URLs, got: {raw_path}"
-        ),
-    }
+    assert!(
+        !raw_path.contains("://"),
+        "should produce relative paths, got: {raw_path}"
+    );
 
     let rel_path = strip_table_root(raw_path, snapshot.table_root());
 
@@ -568,13 +542,9 @@ fn decimal_array(value: i128, precision: u8, scale: i8) -> ArrayRef {
 // JSON commit log helpers
 // ==============================================================================
 
-/// Returns the relative path from an add.path. If the path is absolute (starts with the
-/// table root URL), the prefix is stripped. If the path is already relative, it is returned
-/// as-is.
-fn strip_table_root(path: &str, table_root: &Url) -> String {
-    path.strip_prefix(table_root.as_str())
-        .unwrap_or(path)
-        .to_string()
+/// Returns the relative path portion from an add.path, which is always relative.
+fn strip_table_root(path: &str, _table_root: &Url) -> String {
+    path.to_string()
 }
 
 /// Builds an unescaped Hive-style path prefix like `col1=val/col2=val/`.

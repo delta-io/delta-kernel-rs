@@ -1,16 +1,14 @@
 use std::sync::Arc;
 
-use url::Url;
-
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::Snapshot;
-
 use test_utils::{
     actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
     create_log_path, delta_path_for_version, TestAction,
 };
+use url::Url;
 
 fn setup_test() -> (
     Arc<InMemory>,

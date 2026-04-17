@@ -85,11 +85,13 @@
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
 // Future extensions:
-// - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
-//   multi-file support, but the current implementation only supports single-file checkpoints.
+// - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be
+//   extensible for future multi-file support, but the current implementation only supports
+//   single-file checkpoints.
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use tracing::info;
+use url::Url;
 
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
@@ -112,8 +114,6 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
-
-use url::Url;
 
 mod checkpoint_transform;
 #[allow(unused)]
@@ -193,8 +193,8 @@ static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// supports the `v2Checkpoints` reader/writer feature.
 ///
 /// # Warning
-/// The checkpoint data must be fully written to storage before calling [`CheckpointWriter::finalize`].
-/// Failing to do so may result in data loss or corruption.
+/// The checkpoint data must be fully written to storage before calling
+/// [`CheckpointWriter::finalize`]. Failing to do so may result in data loss or corruption.
 ///
 /// # See Also
 /// See the [module-level documentation](self) for the complete checkpoint workflow

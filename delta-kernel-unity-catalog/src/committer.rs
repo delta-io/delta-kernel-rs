@@ -42,8 +42,8 @@ pub struct UCCommitter<C: CommitClient> {
 }
 
 impl<C: CommitClient> UCCommitter<C> {
-    /// Create a new [UCCommitter] to commit via the `commits_client` to the specific table with the given
-    /// `table_id`.
+    /// Create a new [UCCommitter] to commit via the `commits_client` to the specific table with the
+    /// given `table_id`.
     pub fn new(commits_client: Arc<C>, table_id: impl Into<String>) -> Self {
         UCCommitter {
             commits_client,
@@ -271,7 +271,6 @@ impl<C: CommitClient + 'static> Committer for UCCommitter<C> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
     use std::fs;
 
@@ -280,6 +279,8 @@ mod tests {
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::Version;
     use unity_catalog_delta_client_api::error::Result;
+
+    use super::*;
 
     struct MockCommitsClient;
 

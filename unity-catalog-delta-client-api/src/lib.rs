@@ -25,9 +25,8 @@ pub mod error;
 pub mod models;
 
 pub use clients::{CommitClient, GetCommitsClient};
+#[cfg(any(test, feature = "test-utils"))]
+pub use clients::{InMemoryCommitsClient, TableData};
 pub use credentials::{AwsTempCredentials, Operation, TemporaryTableCredentials};
 pub use error::{Error, Result};
 pub use models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
-
-#[cfg(any(test, feature = "test-utils"))]
-pub use clients::{InMemoryCommitsClient, TableData};
