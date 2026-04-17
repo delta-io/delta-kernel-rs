@@ -95,7 +95,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone(), Path::from("")).build());
 
     let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected.clone(), expected];
@@ -154,7 +154,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let engine = DefaultEngineBuilder::new(storage.clone()).build();
+    let engine = DefaultEngineBuilder::new(storage.clone(), Path::from("")).build();
 
     let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected.clone(), expected];
@@ -218,7 +218,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let engine = DefaultEngineBuilder::new(storage.clone()).build();
+    let engine = DefaultEngineBuilder::new(storage.clone(), Path::from("")).build();
 
     let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected];
@@ -302,7 +302,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone(), Path::from("")).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
@@ -1024,7 +1024,7 @@ async fn partition_pruning_with_column_mapping(
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone(), Path::from("")).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     // Predicates use logical column names -- kernel must map to physical names
@@ -1365,7 +1365,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone(), Path::from("")).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     let predicate = Pred::eq(column_expr!("id"), Expr::literal(2));
@@ -1423,7 +1423,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone(), Path::from("")).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     let predicate = Pred::eq(column_expr!("val"), Expr::literal("g"));
@@ -1703,7 +1703,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
             .await?;
     }
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone(), Path::from("")).build());
 
     // Create a schema that includes a row index metadata column
     let schema = Arc::new(StructType::try_new([
@@ -1796,7 +1796,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
             .await?;
     }
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone(), Path::from("")).build());
 
     // Create a schema that includes the file path metadata column
     let schema = Arc::new(StructType::try_new([
@@ -1889,7 +1889,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone(), Path::from("")).build());
 
     // Test that unsupported metadata columns fail with appropriate errors
     let test_cases = [
@@ -1956,7 +1956,7 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
         )
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone(), Path::from("")).build());
 
     let invalid_files = [
         "_delta_log/0.zip",
@@ -2195,7 +2195,7 @@ async fn timestamp_max_stat_truncation_does_not_over_prune(
         .put(&Path::from("file3.parquet"), file3_bytes.into())
         .await?;
 
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone(), Path::from("")).build());
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     let row_count = |predicate_us: i64| -> Result<usize, Box<dyn std::error::Error>> {

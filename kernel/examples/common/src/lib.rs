@@ -6,11 +6,11 @@ use std::sync::Arc;
 use clap::{Args, CommandFactory, FromArgMatches};
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::storage::store_from_url_opts;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::aws::AmazonS3Builder;
 use delta_kernel::object_store::azure::MicrosoftAzureBuilder;
 use delta_kernel::object_store::gcp::GoogleCloudStorageBuilder;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreScheme};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::MetadataColumnSpec;
@@ -158,16 +158,13 @@ pub fn get_engine(
                 )));
             }
         };
-        Ok(DefaultEngineBuilder::new(Arc::new(store)).build())
+        Ok(DefaultEngineBuilder::new(Arc::new(store), Path::from("")).build())
     } else if !args.option.is_empty() {
         let opts = args.option.iter().map(|option| {
             let parts: Vec<&str> = option.split("=").collect();
             (parts[0].to_ascii_lowercase(), parts[1])
         });
-        let (store, url_path_prefix) = store_from_url_opts(url, opts)?;
-        Ok(DefaultEngineBuilder::new(store)
-            .with_url_path_prefix(url_path_prefix)
-            .build())
+        Ok(DefaultEngineBuilder::from_url_opts(url, opts)?.build())
     } else {
         let mut options = if let Some(ref region) = args.region {
             HashMap::from([("region", region.clone())])
@@ -177,10 +174,7 @@ pub fn get_engine(
         if args.public {
             options.insert("skip_signature", "true".to_string());
         }
-        let (store, url_path_prefix) = store_from_url_opts(url, options)?;
-        Ok(DefaultEngineBuilder::new(store)
-            .with_url_path_prefix(url_path_prefix)
-            .build())
+        Ok(DefaultEngineBuilder::from_url_opts(url, options)?.build())
     }
 }
 

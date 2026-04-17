@@ -14,6 +14,7 @@ use crate::actions::{CommitInfo, Format, Metadata, Protocol};
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use crate::object_store::memory::InMemory;
+use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
 use crate::Snapshot;
 
@@ -248,7 +249,7 @@ impl CrcReadTest {
     async fn build(self) -> BuiltCrcTest {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///").unwrap();
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = DefaultEngineBuilder::new(store.clone(), Path::from("")).build();
 
         for op in self.ops {
             match op {

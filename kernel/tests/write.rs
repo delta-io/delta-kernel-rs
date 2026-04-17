@@ -3478,7 +3478,7 @@ async fn test_column_mapping_write(
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(store.clone(), Path::from(""))
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
                 tokio::runtime::Handle::current(),
             )))
@@ -3748,7 +3748,7 @@ async fn test_column_mapping_partitioned_write(
     let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(store.clone(), Path::from(""))
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
                 tokio::runtime::Handle::current(),
             )))
@@ -3831,7 +3831,7 @@ async fn test_checkpoint_non_kernel_written_table() {
         ),
     );
     let engine: Arc<delta_kernel::engine::default::DefaultEngine<_>> = Arc::new(
-        delta_kernel::engine::default::DefaultEngineBuilder::new(store)
+        delta_kernel::engine::default::DefaultEngineBuilder::new(store, Path::from(""))
             .with_task_executor(executor)
             .build(),
     );

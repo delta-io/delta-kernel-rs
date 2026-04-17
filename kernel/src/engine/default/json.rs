@@ -10,10 +10,10 @@ use futures::{ready, StreamExt, TryStreamExt};
 use url::Url;
 
 use super::executor::TaskExecutor;
+use super::storage::store_path_from_url;
 use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
-use super::storage::store_path_from_url;
 use crate::engine::arrow_utils::{
     build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
     to_json_bytes,
@@ -775,7 +775,8 @@ mod tests {
         let (_temp_file2, file_url2) = make_invalid_named_temp();
         let field = StructField::nullable("name", crate::schema::DataType::BOOLEAN);
         let schema = Arc::new(StructType::try_new(vec![field]).unwrap());
-        let default_engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build();
+        let default_engine =
+            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()), Path::from("")).build();
 
         // Helper to check that we get expected number of errors then stream ends
         let check_errors = |file_urls: Vec<_>, expected_errors: usize| {

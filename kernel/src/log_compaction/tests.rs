@@ -255,7 +255,7 @@ async fn test_no_compaction_staged_commits() {
 
     // Set up in-memory store
     let store = Arc::new(InMemory::new());
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = DefaultEngineBuilder::new(store.clone(), Path::from("")).build();
 
     // Create basic commits with proper metadata and protocol
     use crate::actions::{Metadata, Protocol};

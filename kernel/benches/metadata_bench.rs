@@ -40,9 +40,7 @@ fn setup() -> (TempDir, Url, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
     // TODO: use multi-threaded executor
     use delta_kernel::engine::default::storage::store_from_url;
     let (store, url_path_prefix) = store_from_url(&url).expect("Failed to create store");
-    let engine = DefaultEngineBuilder::new(store)
-        .with_url_path_prefix(url_path_prefix)
-        .build();
+    let engine = DefaultEngineBuilder::new(store, url_path_prefix).build();
 
     (tempdir, url, Arc::new(engine))
 }

@@ -154,9 +154,10 @@ async fn list_from_impl(
 ) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
     let start = Instant::now();
 
-    // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
-    // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
-    // because it strips trailing /, so we're reduced to manually checking the original URL.
+    // The offset is used for list-after; the prefix is used to restrict the listing to a specific
+    // directory. Unfortunately, `Path` provides no easy way to check whether a name is
+    // directory-like, because it strips trailing /, so we're reduced to manually checking the
+    // original URL.
     let offset = store_path_from_url(&path, &url_path_prefix)?;
     let prefix = if path.path().ends_with('/') {
         offset.clone()
@@ -527,7 +528,7 @@ mod tests {
         store.put(&name, data.clone().into()).await.unwrap();
 
         let table_root = Url::parse("memory:///").expect("valid url");
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = DefaultEngineBuilder::new(store, Path::from("")).build();
         let files: Vec<_> = engine
             .storage_handler()
             .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
@@ -557,7 +558,7 @@ mod tests {
 
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = DefaultEngineBuilder::new(store, Path::from("")).build();
         let files = engine
             .storage_handler()
             .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())

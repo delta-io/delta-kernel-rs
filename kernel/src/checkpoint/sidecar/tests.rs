@@ -97,7 +97,7 @@ fn new_multi_thread_engine(store: Arc<InMemory>) -> impl Engine {
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
-    DefaultEngineBuilder::new(store)
+    DefaultEngineBuilder::new(store, Path::from(""))
         .with_task_executor(executor)
         .build()
 }

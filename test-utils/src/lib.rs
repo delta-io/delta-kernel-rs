@@ -22,7 +22,6 @@ use delta_kernel::engine::default::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
 use delta_kernel::engine::default::executor::TaskExecutor;
-use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -338,11 +337,8 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
 pub fn create_default_engine(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
-    let (store, url_path_prefix) = store_from_url(table_root)?;
     Ok(Arc::new(
-        DefaultEngineBuilder::new(store)
-            .with_url_path_prefix(url_path_prefix)
-            .build(),
+        DefaultEngineBuilder::from_url(table_root)?.build(),
     ))
 }
 
@@ -352,13 +348,11 @@ pub fn create_default_engine(
 pub fn create_default_engine_mt_executor(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioMultiThreadExecutor>>> {
-    let (store, url_path_prefix) = store_from_url(table_root)?;
     let task_executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
     Ok(Arc::new(
-        DefaultEngineBuilder::new(store)
-            .with_url_path_prefix(url_path_prefix)
+        DefaultEngineBuilder::from_url(table_root)?
             .with_task_executor(task_executor)
             .build(),
     ))
@@ -434,7 +428,7 @@ pub fn engine_store_setup(
             Url::parse(format!("{dir}{table_name}/").as_str()).expect("valid url"),
         ),
     };
-    let engine = DefaultEngineBuilder::new(Arc::clone(&storage)).build();
+    let engine = DefaultEngineBuilder::new(Arc::clone(&storage), Path::from("")).build();
 
     (storage, engine, url)
 }

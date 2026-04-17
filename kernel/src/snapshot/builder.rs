@@ -374,7 +374,7 @@ mod tests {
     ) {
         let table_root = String::from("memory:///");
         let store = Arc::new(InMemory::new());
-        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+        let engine = Arc::new(DefaultEngineBuilder::new(store.clone(), Path::from("")).build());
         (engine, store, table_root)
     }
 
@@ -481,7 +481,7 @@ mod tests {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let reporter = Arc::new(CapturingReporter::default());
         let engine = Arc::new(
-            DefaultEngineBuilder::new(store.clone())
+            DefaultEngineBuilder::new(store.clone(), Path::from(""))
                 .with_metrics_reporter(reporter.clone())
                 .build(),
         );

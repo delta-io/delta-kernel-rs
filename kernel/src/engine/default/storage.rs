@@ -5,8 +5,7 @@ use url::Url;
 
 use crate::object_store::path::Path;
 use crate::object_store::{self, Error, ObjectStore};
-use crate::DeltaResult;
-use crate::Error as DeltaError;
+use crate::{DeltaResult, Error as DeltaError};
 
 /// Alias for convenience
 type ClosureReturn = Result<(Box<dyn ObjectStore>, Path), Error>;
@@ -70,8 +69,10 @@ pub fn insert_url_handler(
 /// `https://account.blob.core.windows.net/container/...`) the prefix is the container name,
 /// because the store is scoped to the container but `url.path()` includes it.
 ///
-/// Pass the returned prefix to [`crate::engine::default::DefaultEngineBuilder::with_url_path_prefix`]
-/// so that all handlers convert URLs to store paths correctly.
+/// Pass both the store and the returned prefix to
+/// [`crate::engine::default::DefaultEngineBuilder::new`], or prefer
+/// [`crate::engine::default::DefaultEngineBuilder::from_url`] / `from_url_opts` to handle
+/// both in one step.
 ///
 /// This function checks for custom URL handlers registered via [`insert_url_handler`]
 /// before falling back to [`object_store`]'s default behavior.
@@ -217,13 +218,13 @@ fn compute_url_path_prefix(url_with_prefix: &Url, path_without_prefix: &Path) ->
 #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::object_store::memory::InMemory;
-    use crate::object_store::{self, path::Path};
-
     use hdfs_native_object_store::HdfsObjectStoreBuilder;
     use rstest::rstest;
+
+    use super::*;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::{self};
 
     type TestHandler = fn(&Url, HashMap<String, String>) -> ClosureReturn;
 

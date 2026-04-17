@@ -53,6 +53,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
@@ -260,7 +261,7 @@ impl TestTableBuilder {
     async fn build_async(self) -> DeltaResult<TestTable> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+        let engine = Arc::new(DefaultEngineBuilder::new(store.clone(), Path::from("")).build());
         let schema = self.schema;
 
         // Version 0: CreateTable
@@ -463,10 +464,10 @@ impl TestTable {
     /// Create a `DefaultEngine` backed by this table's store.
     ///
     /// Returns the engine from `test_utils`'s `delta_kernel`. For unit tests inside
-    /// `kernel/src/`, use `DefaultEngineBuilder::new(table.store().clone()).build()`
-    /// instead to get the correct crate-local engine type.
+    /// `kernel/src/`, use `DefaultEngineBuilder::new(table.store().clone(),
+    /// Path::from("")).build()` instead to get the correct crate-local engine type.
     pub fn engine(&self) -> DefaultEngine<TokioBackgroundExecutor> {
-        DefaultEngineBuilder::new(self.store.clone()).build()
+        DefaultEngineBuilder::new(self.store.clone(), Path::from("")).build()
     }
 }
 
@@ -537,7 +538,11 @@ macro_rules! build_snapshot {
 macro_rules! test_context {
     ($log_state:expr, $feature_set:expr, $version_target:expr) => {{
         let table = $crate::table_builder::test_table($log_state, $feature_set);
-        let engine = DefaultEngineBuilder::new(table.store().clone()).build();
+        let engine = DefaultEngineBuilder::new(
+            table.store().clone(),
+            delta_kernel::object_store::path::Path::from(""),
+        )
+        .build();
         let snap = $crate::build_snapshot!($version_target, table.table_root(), &engine);
         (engine, snap, table)
     }};
@@ -620,7 +625,7 @@ mod tests {
             .with_data(2, 5)
             .build()?;
         let engine: Arc<dyn delta_kernel::Engine> =
-            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+            Arc::new(DefaultEngineBuilder::new(table.store().clone(), Path::from("")).build());
         let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
         let scan = snap.scan_builder().build()?;
         let batches = crate::read_scan(&scan, engine)?;
