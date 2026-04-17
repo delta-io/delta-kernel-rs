@@ -100,6 +100,7 @@ impl From<bool> for MetadataValue {
 pub enum ColumnMetadataKey {
     ColumnMappingId,
     ColumnMappingPhysicalName,
+    CurrentDefault,
     ParquetFieldId,
     GenerationExpression,
     IdentityStart,
@@ -116,6 +117,9 @@ impl AsRef<str> for ColumnMetadataKey {
         match self {
             Self::ColumnMappingId => "delta.columnMapping.id",
             Self::ColumnMappingPhysicalName => "delta.columnMapping.physicalName",
+            // "CURRENT_DEFAULT" is defined by the Delta protocol's "Default Columns" feature.
+            // Note that, unlike most other metadata keys, it is NOT prefixed with "delta.".
+            Self::CurrentDefault => "CURRENT_DEFAULT",
             // "parquet.field.id" is not defined by the Delta protocol, but follows the convention
             // established by delta-spark and other Delta ecosystem implementations for storing
             // Parquet field IDs in StructField metadata.
@@ -339,6 +343,28 @@ impl StructField {
     pub fn column_mapping_id(&self) -> Option<i64> {
         match self.get_config_value(&ColumnMetadataKey::ColumnMappingId)? {
             MetadataValue::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Returns the raw `CURRENT_DEFAULT` metadata value for this field, if any.
+    ///
+    /// The value is a SQL expression string as defined by the Delta protocol's
+    /// [Default Columns](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#default-columns)
+    /// feature. Connectors that want to evaluate the expression themselves (e.g. via their
+    /// own SQL engine) can read the raw string here. Connectors that want kernel to fill
+    /// in the default for them should instead pass the column name to
+    /// [`Transaction::with_default_filled_columns`].
+    ///
+    /// Returns `None` if the field has no default value.
+    ///
+    /// [`Transaction::with_default_filled_columns`]: crate::transaction::Transaction::with_default_filled_columns
+    pub fn raw_default_value(&self) -> Option<&str> {
+        match self
+            .metadata
+            .get(ColumnMetadataKey::CurrentDefault.as_ref())?
+        {
+            MetadataValue::String(s) => Some(s.as_str()),
             _ => None,
         }
     }

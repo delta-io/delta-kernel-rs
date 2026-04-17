@@ -102,6 +102,8 @@ pub(crate) enum TableFeature {
     GeneratedColumns,
     /// ID Columns
     IdentityColumns,
+    /// Column default values (`CURRENT_DEFAULT` metadata on StructFields). Writer-only.
+    AllowColumnDefaults,
     /// Monotonically increasing timestamps in the CommitInfo
     InCommitTimestamp,
     /// Row tracking on tables
@@ -331,6 +333,22 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 6)),
     feature_requirements: &[],
     kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+// Column Default values (`CURRENT_DEFAULT` metadata on StructFields). See
+// https://github.com/delta-io/delta/blob/master/PROTOCOL.md#default-columns.
+//
+// Kernel marks this as `Supported` at the protocol-check level because connectors can always
+// evaluate default-expression SQL themselves (reading `StructField::raw_default_value()`) and
+// supply fully-materialized columns. When a connector wants kernel to fill defaults via
+// `Transaction::with_default_filled_columns`, the per-column default expression is parsed
+// on-demand during write-context creation; parseability is validated there, not here.
+static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -604,6 +622,7 @@ impl TableFeature {
             | TableFeature::VariantTypePreview
             | TableFeature::VariantShreddingPreview => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
+            | TableFeature::AllowColumnDefaults
             | TableFeature::DomainMetadata
             | TableFeature::Invariants
             | TableFeature::RowTracking
@@ -644,6 +663,7 @@ impl TableFeature {
             TableFeature::ChangeDataFeed => &CHANGE_DATA_FEED_INFO,
             TableFeature::GeneratedColumns => &GENERATED_COLUMNS_INFO,
             TableFeature::IdentityColumns => &IDENTITY_COLUMNS_INFO,
+            TableFeature::AllowColumnDefaults => &ALLOW_COLUMN_DEFAULTS_INFO,
             TableFeature::InCommitTimestamp => &IN_COMMIT_TIMESTAMP_INFO,
             TableFeature::RowTracking => &ROW_TRACKING_INFO,
             TableFeature::DomainMetadata => &DOMAIN_METADATA_INFO,
@@ -783,6 +803,7 @@ mod tests {
                 TableFeature::ChangeDataFeed => "changeDataFeed",
                 TableFeature::GeneratedColumns => "generatedColumns",
                 TableFeature::IdentityColumns => "identityColumns",
+                TableFeature::AllowColumnDefaults => "allowColumnDefaults",
                 TableFeature::InCommitTimestamp => "inCommitTimestamp",
                 TableFeature::RowTracking => "rowTracking",
                 TableFeature::DomainMetadata => "domainMetadata",

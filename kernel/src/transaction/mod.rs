@@ -57,6 +57,7 @@ pub(crate) mod data_layout;
 
 pub(crate) mod alter_table;
 pub use alter_table::AlterTableTransaction;
+pub(crate) mod column_defaults;
 mod commit_info;
 mod domain_metadata;
 pub(crate) mod schema_evolution;
@@ -265,6 +266,12 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
+    // Columns whose values the connector has delegated to kernel to fill from the column's
+    // `CURRENT_DEFAULT` metadata. For each column listed here, the write path wraps the
+    // connector-supplied column with `Coalesce(col, Literal(default))` so that NULL rows
+    // pick up the default expression's result. Validated and the defaults are parsed when
+    // `partitioned_write_context` / `unpartitioned_write_context` is first called.
+    default_filled_columns: HashSet<String>,
     // See `shared_write_state()` method.
     shared_write_state: OnceLock<Arc<SharedWriteState>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
@@ -500,6 +507,65 @@ impl<S> Transaction<S> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Declares a set of columns whose values kernel should fill from each column's
+    /// `CURRENT_DEFAULT` metadata. This is kernel's built-in support for the Delta
+    /// [Default Columns](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#default-columns)
+    /// writer feature.
+    ///
+    /// # Semantics
+    ///
+    /// For every listed column, kernel wraps the connector-supplied column with
+    /// `Coalesce(col, Literal(default))` in the `logical_to_physical` expression: wherever
+    /// the connector writes `NULL`, kernel substitutes the result of the default expression;
+    /// wherever the connector writes a concrete value, that value is preserved. This matches
+    /// the protocol rule that a default is applied when a row "lacks any explicit value
+    /// (including `NULL`)".
+    ///
+    /// # Scope (prototype)
+    ///
+    /// - Only **literal** SQL expressions are supported in this prototype. Non-literal
+    ///   defaults (e.g. `current_timestamp()`) cause
+    ///   [`partitioned_write_context`]/[`unpartitioned_write_context`] to return an error.
+    ///   Connectors that need richer expressions can read [`StructField::raw_default_value`]
+    ///   and evaluate the SQL themselves instead of calling this method.
+    /// - Only top-level columns may be named.
+    ///
+    /// # Errors (deferred)
+    ///
+    /// Validation happens when the write context is first built, not here. An error is
+    /// raised if any named column does not exist, is a partition column, lacks a
+    /// `CURRENT_DEFAULT` metadata entry, or has a default the built-in literal parser
+    /// cannot handle.
+    ///
+    /// [`StructField::raw_default_value`]: crate::schema::StructField::raw_default_value
+    /// [`partitioned_write_context`]: Transaction::partitioned_write_context
+    /// [`unpartitioned_write_context`]: Transaction::unpartitioned_write_context
+    pub fn with_default_filled_columns(
+        mut self,
+        columns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.default_filled_columns = columns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Returns the top-level columns of the table that carry a `CURRENT_DEFAULT` metadata
+    /// entry, as `(logical_column_name, raw_default_sql)` pairs.
+    ///
+    /// Connectors use this to decide, per column, whether to evaluate the default expression
+    /// themselves (Mode A -- supply the column with concrete values) or to delegate to
+    /// kernel via [`Transaction::with_default_filled_columns`] (Mode B -- supply the column
+    /// with `NULL` wherever the default should apply).
+    pub fn columns_with_defaults(&self) -> Vec<(String, String)> {
+        self.effective_table_config
+            .logical_schema()
+            .fields()
+            .filter_map(|f| {
+                f.raw_default_value()
+                    .map(|v| (f.name.clone(), v.to_string()))
+            })
+            .collect()
     }
 
     /// Set the data change flag.
@@ -831,21 +897,64 @@ impl<S: SupportsDataFiles> Transaction<S> {
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
-    fn generate_logical_to_physical(&self) -> Expression {
-        let partition_cols = self.effective_table_config.partition_columns().to_vec();
-        // Check if materializePartitionColumns feature is enabled
-        let materialize_partition_columns = self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
-        // Build a Transform expression that drops partition columns from the input
-        // (unless materializePartitionColumns is enabled).
+    //
+    // Composes two independent operations on top-level fields:
+    //   1. Drop partition columns (unless `materializePartitionColumns` is enabled).
+    //   2. Replace each column listed in `default_filled_columns` with
+    //      `Coalesce(col, Literal(default))` so NULLs in that column are filled from the
+    //      column's parsed `CURRENT_DEFAULT` expression.
+    //
+    // Default-fill validation happens here: a missing column, a column without a
+    // `CURRENT_DEFAULT`, an overlap with partition columns, or a default expression the
+    // built-in literal parser cannot handle all produce an error.
+    fn generate_logical_to_physical(&self) -> DeltaResult<Expression> {
+        let table_config = &self.effective_table_config;
+        let partition_cols = table_config.partition_columns();
+        let materialize_partition_columns =
+            table_config.is_feature_enabled(&TableFeature::MaterializePartitionColumns);
+
         let mut transform = Transform::new_top_level();
+
+        // === Partition-column dropping ===
         if !materialize_partition_columns {
-            for col in &partition_cols {
+            for col in partition_cols {
                 transform = transform.with_dropped_field_if_exists(col);
             }
         }
-        Expression::transform(transform)
+
+        // === Default-filled columns ===
+        if !self.default_filled_columns.is_empty() {
+            let schema = table_config.logical_schema();
+            let parser = column_defaults::LiteralDefaultExpressionParser;
+            for col_name in &self.default_filled_columns {
+                let field = schema.field(col_name).ok_or_else(|| {
+                    Error::generic(format!(
+                        "default-filled column {col_name:?} not found in table schema"
+                    ))
+                })?;
+                require!(
+                    !partition_cols.iter().any(|p| p == col_name),
+                    Error::generic(format!(
+                        "default-filled column {col_name:?} is a partition column; \
+                         partition columns cannot use column defaults"
+                    ))
+                );
+                let raw = field.raw_default_value().ok_or_else(|| {
+                    Error::generic(format!(
+                        "default-filled column {col_name:?} has no CURRENT_DEFAULT metadata"
+                    ))
+                })?;
+                let default_expr = {
+                    use column_defaults::DefaultExpressionParser;
+                    parser.parse(raw, field.data_type())?
+                };
+                let coalesce =
+                    Expression::coalesce([Expression::column([col_name.as_str()]), default_expr]);
+                transform = transform.with_replaced_field(col_name.clone(), Arc::new(coalesce));
+            }
+        }
+
+        Ok(Expression::transform(transform))
     }
 
     /// Returns the logical partition column names for this table.
@@ -853,20 +962,27 @@ impl<S: SupportsDataFiles> Transaction<S> {
         self.effective_table_config.partition_columns()
     }
 
-    /// Lazily builds and caches the [`SharedWriteState`] for this transaction.
-    fn shared_write_state(&self) -> &Arc<SharedWriteState> {
-        self.shared_write_state.get_or_init(|| {
-            let table_config = &self.effective_table_config;
-            Arc::new(SharedWriteState {
-                table_root: table_config.table_root().clone(),
-                logical_schema: table_config.logical_schema(),
-                physical_schema: table_config.physical_write_schema(),
-                logical_to_physical: Arc::new(self.generate_logical_to_physical()),
-                column_mapping_mode: table_config.column_mapping_mode(),
-                stats_columns: self.stats_columns(),
-                logical_partition_columns: table_config.partition_columns().to_vec(),
-            })
-        })
+    /// Lazily builds and caches the [`SharedWriteState`] for this transaction. Fallible
+    /// because [`generate_logical_to_physical`] validates default-filled column metadata
+    /// lazily; first call may surface a parse error.
+    fn shared_write_state(&self) -> DeltaResult<&Arc<SharedWriteState>> {
+        if let Some(state) = self.shared_write_state.get() {
+            return Ok(state);
+        }
+        let table_config = &self.effective_table_config;
+        let logical_to_physical = Arc::new(self.generate_logical_to_physical()?);
+        let new_state = Arc::new(SharedWriteState {
+            table_root: table_config.table_root().clone(),
+            logical_schema: table_config.logical_schema(),
+            physical_schema: table_config.physical_write_schema(),
+            logical_to_physical,
+            column_mapping_mode: table_config.column_mapping_mode(),
+            stats_columns: self.stats_columns(),
+            logical_partition_columns: table_config.partition_columns().to_vec(),
+        });
+        // `get_or_init` races safely: if another thread won, we discard `new_state` and
+        // return the winner. Both values are equivalent since construction is pure.
+        Ok(self.shared_write_state.get_or_init(|| new_state))
     }
 
     /// Creates a write context for writing data to a specific partition.
@@ -906,7 +1022,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         &self,
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
-        let shared = self.shared_write_state();
+        let shared = self.shared_write_state()?;
         require!(
             !shared.logical_partition_columns.is_empty(),
             Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
@@ -953,7 +1069,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// Returns an error if the table has partition columns (use
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
-        let shared = self.shared_write_state();
+        let shared = self.shared_write_state()?;
         require!(
             shared.logical_partition_columns.is_empty(),
             Error::generic("table is partitioned; use partitioned_write_context() instead")
@@ -1534,7 +1650,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
-    use crate::schema::MapType;
+    use crate::schema::{ColumnMetadataKey, MapType};
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{
@@ -2674,6 +2790,197 @@ mod tests {
             future_ict + 1,
             "CommitMetadata.in_commit_timestamp should be the computed ICT (prev_ict + 1), \
              not the wall-clock time"
+        );
+        Ok(())
+    }
+
+    // =========================================================================
+    // === Column defaults (allowColumnDefaults writer feature)               ===
+    // =========================================================================
+
+    /// Builds an in-memory table snapshot whose schema carries the provided fields
+    /// and whose protocol advertises the `allowColumnDefaults` writer feature.
+    fn column_defaults_snapshot(fields: Vec<StructField>) -> Arc<Snapshot> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = Url::parse("memory:///").unwrap();
+        let engine = crate::engine::default::DefaultEngineBuilder::new(storage.clone()).build();
+
+        let schema = StructType::new_unchecked(fields);
+        let schema_json = serde_json::to_string(&schema).unwrap();
+        let metadata = format!(
+            r#"{{"metaData":{{"id":"test-id","format":{{"provider":"parquet","options":{{}}}},"schemaString":{},"partitionColumns":[],"configuration":{{}},"createdTime":1}}}}"#,
+            serde_json::to_string(&schema_json).unwrap(),
+        );
+        let actions = [
+            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["allowColumnDefaults"]}}"#,
+            metadata.as_str(),
+        ]
+        .join("\n");
+
+        let commit_path = Path::from("_delta_log/00000000000000000000.json");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(storage.put(&commit_path, actions.into()))
+            .unwrap();
+
+        Snapshot::builder_for(table_root).build(&engine).unwrap()
+    }
+
+    fn field_with_default(name: &str, dt: DataType, default: &str) -> StructField {
+        StructField::nullable(name, dt)
+            .add_metadata([(ColumnMetadataKey::CurrentDefault.as_ref(), default)])
+    }
+
+    #[test]
+    fn columns_with_defaults_lists_defaulted_columns() {
+        let snap = column_defaults_snapshot(vec![
+            StructField::nullable("plain", DataType::INTEGER),
+            field_with_default("greet", DataType::STRING, "'hello'"),
+            field_with_default("answer", DataType::INTEGER, "42"),
+        ]);
+        let txn = snap
+            .transaction(Box::new(FileSystemCommitter::new()), &SyncEngine::new())
+            .unwrap();
+
+        let mut defaults = txn.columns_with_defaults();
+        defaults.sort();
+        assert_eq!(
+            defaults,
+            vec![
+                ("answer".to_string(), "42".to_string()),
+                ("greet".to_string(), "'hello'".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn mode_a_default_column_not_opted_in_uses_identity_transform() {
+        // Table has a default but the caller does NOT opt into kernel-side fill.
+        // The write context should succeed and produce an identity-shaped
+        // logical_to_physical (no Coalesce injected).
+        let snap = column_defaults_snapshot(vec![
+            StructField::nullable("plain", DataType::INTEGER),
+            field_with_default("greet", DataType::STRING, "current_timestamp()"),
+        ]);
+        let txn = snap
+            .transaction(Box::new(FileSystemCommitter::new()), &SyncEngine::new())
+            .unwrap();
+        // Should succeed even though the default isn't a literal: kernel is not asked to parse it.
+        let wc = txn
+            .unpartitioned_write_context()
+            .expect("Mode A should succeed");
+        let expr_str = format!("{}", wc.logical_to_physical());
+        assert!(
+            !expr_str.contains("COALESCE"),
+            "Mode A should not inject COALESCE; got: {expr_str}"
+        );
+    }
+
+    #[test]
+    fn mode_b_injects_coalesce_for_opted_in_column() {
+        let snap = column_defaults_snapshot(vec![
+            StructField::nullable("plain", DataType::INTEGER),
+            field_with_default("answer", DataType::INTEGER, "42"),
+        ]);
+        let txn = snap
+            .transaction(Box::new(FileSystemCommitter::new()), &SyncEngine::new())
+            .unwrap()
+            .with_default_filled_columns(["answer"]);
+        let wc = txn.unpartitioned_write_context().unwrap();
+        let expr_str = format!("{}", wc.logical_to_physical());
+        assert!(
+            expr_str.contains("COALESCE"),
+            "Mode B should inject COALESCE; got: {expr_str}"
+        );
+        assert!(
+            expr_str.contains("answer"),
+            "COALESCE should reference the answer column; got: {expr_str}"
+        );
+    }
+
+    #[test]
+    fn mode_b_rejects_non_literal_default() {
+        let snap = column_defaults_snapshot(vec![field_with_default(
+            "greet",
+            DataType::STRING,
+            "current_timestamp()",
+        )]);
+        let err = snap
+            .transaction(Box::new(FileSystemCommitter::new()), &SyncEngine::new())
+            .unwrap()
+            .with_default_filled_columns(["greet"])
+            .unpartitioned_write_context()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("current_timestamp"),
+            "error should mention the unparseable expression; got: {err}"
+        );
+    }
+
+    #[test]
+    fn mode_b_rejects_column_without_default() {
+        let snap =
+            column_defaults_snapshot(vec![StructField::nullable("plain", DataType::INTEGER)]);
+        let err = snap
+            .transaction(Box::new(FileSystemCommitter::new()), &SyncEngine::new())
+            .unwrap()
+            .with_default_filled_columns(["plain"])
+            .unpartitioned_write_context()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no CURRENT_DEFAULT metadata"),
+            "expected missing-default error; got: {err}"
+        );
+    }
+
+    #[test]
+    fn mode_b_rejects_unknown_column() {
+        let snap =
+            column_defaults_snapshot(vec![StructField::nullable("plain", DataType::INTEGER)]);
+        let err = snap
+            .transaction(Box::new(FileSystemCommitter::new()), &SyncEngine::new())
+            .unwrap()
+            .with_default_filled_columns(["ghost"])
+            .unpartitioned_write_context()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not found in table schema"),
+            "expected missing-column error; got: {err}"
+        );
+    }
+
+    #[test]
+    fn mode_b_end_to_end_per_row_default_fill() -> Result<(), Box<dyn std::error::Error>> {
+        // Build a table where `greet` has a literal default and `id` does not.
+        let snap = column_defaults_snapshot(vec![
+            StructField::nullable("id", DataType::INTEGER),
+            field_with_default("greet", DataType::STRING, "'hello'"),
+        ]);
+        let txn = snap
+            .transaction(Box::new(FileSystemCommitter::new()), &SyncEngine::new())?
+            .with_default_filled_columns(["greet"]);
+        let wc = txn.unpartitioned_write_context()?;
+
+        // Connector supplies a batch with mixed NULL / concrete values for `greet`.
+        let logical: ArrowSchema = wc.logical_schema().as_ref().try_into_arrow()?;
+        let id = Arc::new(crate::arrow::array::Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef;
+        let greet = Arc::new(StringArray::from(vec![None, Some("a"), None, Some("b")])) as ArrayRef;
+        let batch = RecordBatch::try_new(Arc::new(logical), vec![id, greet])?;
+
+        let output = eval_logical_to_physical(&wc, batch)?;
+        let greet_out = output
+            .column_by_name("greet")
+            .expect("greet column present")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("greet should be a string array");
+        let values: Vec<Option<&str>> = greet_out.iter().collect();
+        assert_eq!(
+            values,
+            vec![Some("hello"), Some("a"), Some("hello"), Some("b")],
+            "NULL inputs should be replaced with the default literal"
         );
         Ok(())
     }

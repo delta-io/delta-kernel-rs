@@ -31,6 +31,7 @@
 // and for tests. Also allow dead_code since these are used by integration tests.
 #![allow(unreachable_pub, dead_code)]
 
+use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::sync::OnceLock;
 
@@ -171,6 +172,7 @@ impl CreateTableTransaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
+            default_filled_columns: HashSet::new(),
             shared_write_state: OnceLock::new(),
             _state: PhantomData,
         })
