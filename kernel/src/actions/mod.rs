@@ -242,9 +242,7 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns an error if there are any metadata columns in the schema.
-    // TODO: remove allow(dead_code) after we use this API in CREATE TABLE, etc.
     #[internal_api]
-    #[allow(dead_code)]
     pub(crate) fn try_new(
         name: Option<String>,
         description: Option<String>,
