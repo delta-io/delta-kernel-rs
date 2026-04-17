@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock, OnceLock};
 
+use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
 
 use crate::actions::{
@@ -16,29 +17,26 @@ use crate::committer::{
 use crate::crc::{CrcDelta, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
-use crate::expressions::ColumnName;
-use crate::expressions::Scalar;
-use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
-use crate::partition::{
-    serialization::serialize_partition_value, validation::validate_partition_values,
-};
+use crate::expressions::UnaryExpressionOp::ToJson;
+use crate::expressions::{ArrayData, ColumnName, Scalar, Transform};
+use crate::partition::serialization::serialize_partition_value;
+use crate::partition::validation::validate_partition_values;
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
-    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
+    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
+    STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::utils::require;
-use crate::FileMeta;
 use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, IntoEngineData, RowVisitor, Version,
-    PRE_COMMIT_VERSION,
+    DataType, DeltaResult, Engine, EngineData, Expression, FileMeta, IntoEngineData, RowVisitor,
+    Version, PRE_COMMIT_VERSION,
 };
-use delta_kernel_derive::internal_api;
 
 #[cfg(feature = "internal-api")]
 pub mod builder;
@@ -69,7 +67,8 @@ pub use write_context::WriteContext;
 pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
 
-/// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange column.
+/// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
+/// column.
 pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked(vec![
         StructField::not_null("path", DataType::STRING),
@@ -210,8 +209,8 @@ pub struct Transaction<S = ExistingTable> {
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
-    // would make error messaging unnecessarily difficult. Thus, we keep Vec here and deduplicate in
-    // the commit method.
+    // would make error messaging unnecessarily difficult. Thus, we keep Vec here and deduplicate
+    // in the commit method.
     set_transactions: Vec<SetTransaction>,
     // commit-wide timestamp (in milliseconds since epoch) - used in ICT, `txn` action, etc. to
     // keep all timestamps within the same commit consistent.
@@ -407,7 +406,8 @@ impl<S> Transaction<S> {
             (None, None, None, None)
         };
 
-        // Step 4: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
+        // Step 4: Generate add actions and get data for domain metadata actions (e.g. row tracking
+        // high watermark)
         let commit_version = self.get_commit_version();
         let (add_actions, row_tracking_domain_metadata) =
             self.generate_adds(engine, commit_version)?;
@@ -424,8 +424,9 @@ impl<S> Transaction<S> {
             self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
 
         // Build the action chain
-        // For create-table: CommitInfo -> Protocol -> Metadata -> adds -> txns -> domain_metadata -> removes
-        // For existing table: CommitInfo -> adds -> txns -> domain_metadata -> removes
+        // For create-table: CommitInfo -> Protocol -> Metadata -> adds -> txns -> domain_metadata
+        // -> removes For existing table: CommitInfo -> adds -> txns -> domain_metadata ->
+        // removes
         let actions = iter::once(commit_info_action)
             .chain(protocol_action.map(Ok))
             .chain(metadata_action.map(Ok))
@@ -484,8 +485,9 @@ impl<S> Transaction<S> {
     ///
     /// Data change might be set to false in the following scenarios:
     /// 1. Operations that only change metadata (e.g. backfilling statistics)
-    /// 2. Operations that make no logical changes to the contents of the table (i.e. rows are only moved
-    ///    from old files to new ones.  OPTIMIZE commands is one example of this type of optimizaton).
+    /// 2. Operations that make no logical changes to the contents of the table (i.e. rows are only
+    ///    moved from old files to new ones.  OPTIMIZE commands is one example of this type of
+    ///    optimizaton).
     pub fn with_data_change(mut self, data_change: bool) -> Self {
         self.data_change = data_change;
         self
@@ -505,9 +507,10 @@ impl<S> Transaction<S> {
         self
     }
 
-    /// Set the content of the commitInfo action for this transaction. Note that kernel will _always_ write a commitInfo,
-    /// this function simply allows engines to add their own data into that action if they wish.
-    /// Note that the following fields in `engine_commit_info` will be overridden by kernel if they are set (meaning you should not set them):
+    /// Set the content of the commitInfo action for this transaction. Note that kernel will
+    /// _always_ write a commitInfo, this function simply allows engines to add their own data
+    /// into that action if they wish. Note that the following fields in `engine_commit_info`
+    /// will be overridden by kernel if they are set (meaning you should not set them):
     /// - timestamp
     /// - inCommitTimestamp
     /// - operation
@@ -716,13 +719,13 @@ impl<S> Transaction<S> {
         self.read_snapshot.version().wrapping_add(1)
     }
 
-    /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
-    /// a Parquet write operation back to Kernel.
+    /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting
+    /// information about a Parquet write operation back to Kernel.
     ///
-    /// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is the base
-    /// for constructing an add_file. Each row represents metadata about a
-    /// file to be added to the table. Kernel takes this information and extends it to the full add_file
-    /// action schema, adding internal fields (e.g., baseRowID) as necessary.
+    /// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is
+    /// the base for constructing an add_file. Each row represents metadata about a
+    /// file to be added to the table. Kernel takes this information and extends it to the full
+    /// add_file action schema, adding internal fields (e.g., baseRowID) as necessary.
     ///
     /// The `stats` field contains file-level statistics. The schema returned here shows the base
     /// structure; the actual stats written by [`DefaultEngine::write_parquet`] include dynamically
@@ -820,74 +823,46 @@ impl<S> Transaction<S> {
     }
 
     /// Lazily builds and caches the [`SharedWriteState`] for this transaction.
-    ///
-    /// Resolves partition column names (logical to physical) once and caches the result.
-    /// Returns an error if a partition column is not found in the table schema.
-    // TODO: replace with `get_or_try_init` when stable (rust#109737). That avoids the
-    // early-return + fallible compute + `get_or_init` dance, and prevents a concurrent
-    // caller from redundantly recomputing the state when the first caller is still running.
-    fn shared_write_state(&self) -> DeltaResult<&Arc<SharedWriteState>> {
-        if let Some(state) = self.shared_write_state.get() {
-            return Ok(state);
-        }
-        let table_config = self.read_snapshot.table_configuration();
-        let logical_schema = self.read_snapshot.schema();
-        let cm_mode = table_config.column_mapping_mode();
-        let logical_and_physical_partition_columns: Vec<(String, String)> = table_config
-            .partition_columns()
-            .iter()
-            .map(|logical_name| {
-                let physical_name = logical_schema
-                    .field(logical_name)
-                    .ok_or_else(|| {
-                        Error::internal_error(format!(
-                            "partition column '{logical_name}' not found in table schema"
-                        ))
-                    })?
-                    .physical_name(cm_mode)
-                    .to_string();
-                Ok((logical_name.clone(), physical_name))
+    fn shared_write_state(&self) -> &Arc<SharedWriteState> {
+        self.shared_write_state.get_or_init(|| {
+            let table_config = self.read_snapshot.table_configuration();
+            Arc::new(SharedWriteState {
+                table_root: self.read_snapshot.table_root().clone(),
+                logical_schema: self.read_snapshot.schema(),
+                physical_schema: table_config.physical_write_schema(),
+                logical_to_physical: Arc::new(self.generate_logical_to_physical()),
+                column_mapping_mode: table_config.column_mapping_mode(),
+                stats_columns: self.stats_columns(),
+                logical_partition_columns: table_config.partition_columns().to_vec(),
             })
-            .collect::<DeltaResult<_>>()?;
-        let state = Arc::new(SharedWriteState {
-            table_root: self.read_snapshot.table_root().clone(),
-            logical_schema,
-            physical_schema: table_config.physical_write_schema(),
-            logical_to_physical: Arc::new(self.generate_logical_to_physical()),
-            column_mapping_mode: cm_mode,
-            stats_columns: self.stats_columns(),
-            logical_and_physical_partition_columns,
-        });
-        Ok(self.shared_write_state.get_or_init(|| state))
+        })
     }
 
     /// Creates a write context for writing data to a specific partition.
     ///
     /// Performs the following validations and transformations:
     ///
-    /// - **Key completeness**: ensures all partition columns are present and no extra keys
-    ///   exist. For example, if the table has partition columns `["year", "region"]` and you
-    ///   pass `{"year": Scalar::Integer(2024)}`, this returns an error for missing "region".
+    /// - **Key completeness**: ensures all partition columns are present and no extra keys exist.
+    ///   For example, if the table has partition columns `["year", "region"]` and you pass
+    ///   `{"year": Scalar::Integer(2024)}`, this returns an error for missing "region".
     ///
-    /// - **Case normalization**: matches keys case-insensitively against the schema and
-    ///   normalizes to schema case. For example, passing `"YEAR"` for a column named `"year"`
-    ///   is accepted and normalized.
+    /// - **Case normalization**: matches keys case-insensitively against the schema and normalizes
+    ///   to schema case. For example, passing `"YEAR"` for a column named `"year"` is accepted and
+    ///   normalized.
     ///
-    /// - **Type checking**: rejects non-primitive partition column types (struct, array, map)
-    ///   and validates that each non-null `Scalar`'s type matches the partition column's
-    ///   schema type. For example, passing `Scalar::String("2024")` for an `INTEGER` column
-    ///   returns an error. Null scalars skip the value type check (null is valid for any
-    ///   primitive partition column).
+    /// - **Type checking**: rejects non-primitive partition column types (struct, array, map) and
+    ///   validates that each non-null `Scalar`'s type matches the partition column's schema type.
+    ///   For example, passing `Scalar::String("2024")` for an `INTEGER` column returns an error.
+    ///   Null scalars skip the value type check (null is valid for any primitive partition column).
     ///
-    /// - **Value serialization**: serializes each `Scalar` to a protocol-compliant string per
-    ///   the Delta protocol's "Partition Value Serialization" rules.
-    ///   `Scalar::Null(...)` becomes `None` in `add.partitionValues` (JSON null).
-    ///   `Scalar::String("")` also becomes `None` (empty string equals null for all types).
-    ///   `Scalar::Date(19723)` becomes `Some("2024-01-01")`.
+    /// - **Value serialization**: serializes each `Scalar` to a protocol-compliant string per the
+    ///   Delta protocol's "Partition Value Serialization" rules. `Scalar::Null(...)` becomes `None`
+    ///   in `add.partitionValues` (JSON null). `Scalar::String("")` also becomes `None` (empty
+    ///   string equals null for all types). `Scalar::Date(19723)` becomes `Some("2024-01-01")`.
     ///
-    /// - **Key translation**: translates logical column names to physical names using the
-    ///   table's column mapping mode. For example, under `ColumnMappingMode::Name`, logical
-    ///   `"year"` might become physical `"col-abc-123"` in the `partitionValues` map.
+    /// - **Key translation**: translates logical column names to physical names using the table's
+    ///   column mapping mode. For example, under `ColumnMappingMode::Name`, logical `"year"` might
+    ///   become physical `"col-abc-123"` in the `partitionValues` map.
     ///
     /// The returned [`WriteContext`] also provides a [`write_dir`] that returns the correct
     /// target directory (Hive-style paths when column mapping is off, random prefix when on).
@@ -900,37 +875,46 @@ impl<S> Transaction<S> {
         &self,
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
-        let shared = self.shared_write_state()?;
+        let shared = self.shared_write_state();
         require!(
-            !shared.logical_and_physical_partition_columns.is_empty(),
+            !shared.logical_partition_columns.is_empty(),
             Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
         );
 
         // Validate keys (completeness, case normalization) and value types, then return
         // the map re-keyed to schema case.
-        let logical_names: Vec<String> = shared
-            .logical_and_physical_partition_columns
-            .iter()
-            .map(|(logical, _)| logical.clone())
-            .collect();
-        let normalized =
-            validate_partition_values(&logical_names, &shared.logical_schema, partition_values)?;
+        let normalized = validate_partition_values(
+            &shared.logical_partition_columns,
+            &shared.logical_schema,
+            partition_values,
+        )?;
 
-        // Serialize values using the pre-resolved (logical, physical) pairs from shared
-        // state. WriteContext::new derives the logical partition path from these pairs.
-        let mut physical_partition_values =
-            HashMap::with_capacity(shared.logical_and_physical_partition_columns.len());
-        for (logical_name, physical_name) in &shared.logical_and_physical_partition_columns {
+        // Serialize values and translate keys from logical to physical names.
+        let mut serialized = HashMap::with_capacity(normalized.len());
+        for logical_name in &shared.logical_partition_columns {
             let scalar = normalized.get(logical_name).ok_or_else(|| {
                 Error::internal_error(format!(
                     "partition column '{logical_name}' missing after validation"
                 ))
             })?;
             let value = serialize_partition_value(scalar)?;
-            physical_partition_values.insert(physical_name.clone(), value);
+            let physical_name = shared
+                .logical_schema
+                .field(logical_name)
+                .ok_or_else(|| {
+                    Error::internal_error(format!(
+                        "partition column '{logical_name}' not found in schema after validation"
+                    ))
+                })?
+                .physical_name(shared.column_mapping_mode)
+                .to_string();
+            serialized.insert(physical_name, value);
         }
 
-        Ok(WriteContext::new(shared.clone(), physical_partition_values))
+        Ok(WriteContext {
+            shared: shared.clone(),
+            physical_partition_values: serialized,
+        })
     }
 
     /// Creates a write context for writing data to an unpartitioned table.
@@ -938,12 +922,15 @@ impl<S> Transaction<S> {
     /// Returns an error if the table has partition columns (use
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
-        let shared = self.shared_write_state()?;
+        let shared = self.shared_write_state();
         require!(
-            shared.logical_and_physical_partition_columns.is_empty(),
+            shared.logical_partition_columns.is_empty(),
             Error::generic("table is partitioned; use partitioned_write_context() instead")
         );
-        Ok(WriteContext::new(shared.clone(), HashMap::new()))
+        Ok(WriteContext {
+            shared: shared.clone(),
+            physical_partition_values: HashMap::new(),
+        })
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
@@ -1185,9 +1172,9 @@ impl<S> Transaction<S> {
     ///
     /// - `engine`: The engine used for expression evaluation
     /// - `remove_files_metadata`: Iterator over scan file metadata to transform into Remove actions
-    /// - `columns_to_drop`: Column names to drop from the scan metadata before transformation.
-    ///   This is used to remove temporary columns like the intermediate deletion vector column
-    ///   added during DV updates.
+    /// - `columns_to_drop`: Column names to drop from the scan metadata before transformation. This
+    ///   is used to remove temporary columns like the intermediate deletion vector column added
+    ///   during DV updates.
     ///
     /// # Returns
     ///
@@ -1214,61 +1201,111 @@ impl<S> Transaction<S> {
         let target_schema = schema_with_all_fields_nullable(get_log_remove_schema())?;
         let evaluation_handler = engine.evaluation_handler();
 
-        // Create the transform expression once, since it only contains literals and column references
-        let mut transform = Transform::new_top_level()
-            // deletionTimestamp
-            .with_inserted_field(
-                Some("path"),
-                Expression::literal(self.commit_timestamp).into(),
+        let make_eval = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {
+            let transform = build_remove_transform(
+                self.commit_timestamp,
+                self.data_change,
+                columns_to_drop,
+                coalesce_stats_with_parsed,
+            );
+            let expr = Arc::new(Expression::struct_from([Expression::transform(transform)]));
+            evaluation_handler.new_expression_evaluator(
+                input_schema.clone(),
+                expr,
+                target_schema.clone().into(),
             )
-            // dataChange
-            .with_inserted_field(Some("path"), Expression::literal(self.data_change).into())
-            .with_inserted_field(
-                // extended_file_metadata
-                Some("path"),
-                Expression::literal(true).into(),
-            )
-            .with_inserted_field(
-                Some("path"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
-            )
-            // tags
-            .with_inserted_field(
-                Some("stats"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
-            )
-            .with_inserted_field(
-                Some("deletionVector"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
-            )
-            .with_inserted_field(
-                Some("deletionVector"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME])
-                    .into(),
-            )
-            .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-            .with_dropped_field("modificationTime");
+        };
 
-        // Drop any additional columns specified in columns_to_drop
-        for column_to_drop in columns_to_drop {
-            transform = transform.with_dropped_field(*column_to_drop);
-        }
-
-        let expr = Arc::new(Expression::struct_from([Expression::transform(transform)]));
-        let file_action_eval = Arc::new(evaluation_handler.new_expression_evaluator(
-            input_schema.clone(),
-            expr.clone(),
-            target_schema.into(),
-        )?);
+        // Build two evaluators: one for the common case where scan files do not include a
+        // stats_parsed column, and one for predicate-based scans that include stats_parsed.
+        // The stats_parsed evaluator coalesces stats with ToJson(stats_parsed) to handle the
+        // case where stats is null (e.g., when skip_stats=true was used) and then drops the
+        // stats_parsed column.
+        let base_eval = Arc::new(make_eval(false)?);
+        let stats_parsed_eval = Arc::new(make_eval(true)?);
+        let stats_parsed_col = ColumnName::new([STATS_PARSED_NAME]);
 
         Ok(remove_files_metadata.map(move |file_metadata_batch| {
-            let updated_engine_data = file_action_eval.evaluate(file_metadata_batch.data())?;
+            let data = file_metadata_batch.data();
+            let evaluator = if data.has_field(&stats_parsed_col) {
+                &stats_parsed_eval
+            } else {
+                &base_eval
+            };
+            let updated_engine_data = evaluator.evaluate(data)?;
             FilteredEngineData::try_new(
                 updated_engine_data,
                 file_metadata_batch.selection_vector().to_vec(),
             )
         }))
     }
+}
+
+/// Builds the transform expression for converting scan row metadata into a Remove action.
+///
+/// When `coalesce_stats_with_parsed` is true, the `stats` field is replaced with
+/// `COALESCE(stats, TO_JSON(stats_parsed))` and `stats_parsed` is dropped. This handles
+/// scan files produced by predicate-based scans that include a `stats_parsed` column: if
+/// `stats` is null (e.g., because `skip_stats=true` was used), the stats are reconstructed
+/// from the parsed representation before writing the remove action.
+fn build_remove_transform(
+    commit_timestamp: i64,
+    data_change: bool,
+    columns_to_drop: &[&str],
+    coalesce_stats_with_parsed: bool,
+) -> Transform {
+    let mut transform = Transform::new_top_level()
+        // deletionTimestamp
+        .with_inserted_field(Some("path"), Expression::literal(commit_timestamp).into())
+        // dataChange
+        .with_inserted_field(Some("path"), Expression::literal(data_change).into())
+        // extended_file_metadata
+        .with_inserted_field(Some("path"), Expression::literal(true).into())
+        .with_inserted_field(
+            Some("path"),
+            Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
+        );
+
+    if coalesce_stats_with_parsed {
+        // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)), then insert tags after.
+        // Both expressions are registered on the "stats" field_transform (is_replace=true),
+        // so the evaluator emits [coalesced_stats, tags] in place of the original stats field.
+        let coalesce_stats = Expression::coalesce([
+            Expression::column(["stats"]),
+            Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
+        ]);
+        transform = transform
+            .with_replaced_field("stats", coalesce_stats.into())
+            .with_inserted_field(
+                Some("stats"),
+                Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+            )
+            .with_dropped_field_if_exists(STATS_PARSED_NAME);
+    } else {
+        // tags inserted after stats; stats passes through unchanged
+        transform = transform.with_inserted_field(
+            Some("stats"),
+            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+        );
+    }
+
+    transform = transform
+        .with_inserted_field(
+            Some("deletionVector"),
+            Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
+        )
+        .with_inserted_field(
+            Some("deletionVector"),
+            Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into(),
+        )
+        .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
+        .with_dropped_field("modificationTime");
+
+    for column_to_drop in columns_to_drop {
+        transform = transform.with_dropped_field(*column_to_drop);
+    }
+
+    transform
 }
 
 /// Kernel exposes information about the state of the table that engines might want to use to
@@ -1278,9 +1315,9 @@ pub struct PostCommitStats {
     /// The number of commits since this table has been checkpointed. Note that commit 0 is
     /// considered a checkpoint for the purposes of this computation.
     pub commits_since_checkpoint: u64,
-    /// The number of commits since the log has been compacted on this table. Note that a checkpoint
-    /// is considered a compaction for the purposes of this computation. Thus this is really the
-    /// number of commits since a compaction OR a checkpoint.
+    /// The number of commits since the log has been compacted on this table. Note that a
+    /// checkpoint is considered a compaction for the purposes of this computation. Thus this
+    /// is really the number of commits since a compaction OR a checkpoint.
     pub commits_since_log_compaction: u64,
 }
 
@@ -1289,8 +1326,8 @@ pub struct PostCommitStats {
 /// error occurred, the result is Err(Error).
 ///
 /// The commit result can be one of the following:
-/// - [CommittedTransaction]: the transaction was successfully committed. [PostCommitStats] and
-///   in the future a post-commit snapshot can be obtained from the committed transaction.
+/// - [CommittedTransaction]: the transaction was successfully committed. [PostCommitStats] and in
+///   the future a post-commit snapshot can be obtained from the committed transaction.
 /// - [ConflictedTransaction]: the transaction conflicted with an existing version. This transcation
 ///   must be rebased before retrying. (currently no rebase APIs exist, caller must create new txn)
 /// - [RetryableTransaction]: an IO (retryable) error occurred during the commit. This transaction
@@ -1331,7 +1368,8 @@ impl<S: std::fmt::Debug> CommitResult<S> {
 }
 
 /// This is the result of a successfully committed [Transaction]. One can retrieve the
-/// [post_commit_stats], [commit version], and optionally the [post-commit snapshot] from this struct.
+/// [post_commit_stats], [commit version], and optionally the [post-commit snapshot] from this
+/// struct.
 ///
 /// [post_commit_stats]: Self::post_commit_stats
 /// [commit version]: Self::commit_version
@@ -1399,7 +1437,11 @@ pub struct RetryableTransaction<S = ExistingTable> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Mutex;
+
+    use rstest::rstest;
+    use url::Url;
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -1411,7 +1453,6 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
-    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{MapData, Scalar, StructData};
     use crate::object_store::local::LocalFileSystem;
@@ -1425,11 +1466,7 @@ mod tests {
         load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
         test_schema_with_array, test_schema_with_map,
     };
-    use crate::EvaluationHandler;
-    use crate::Snapshot;
-    use rstest::rstest;
-    use std::path::PathBuf;
-    use url::Url;
+    use crate::{EvaluationHandler, Snapshot};
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -1511,7 +1548,8 @@ mod tests {
         (engine, snapshot)
     }
 
-    /// Creates a test deletion vector descriptor with default values (the DV might not exist on disk)
+    /// Creates a test deletion vector descriptor with default values (the DV might not exist on
+    /// disk)
     fn create_test_dv_descriptor(path_suffix: &str) -> DeletionVectorDescriptor {
         use crate::actions::deletion_vector::{
             DeletionVectorDescriptor, DeletionVectorStorageType,
@@ -1813,44 +1851,6 @@ mod tests {
             "expected '{expected_msg}' in error, got: {err}"
         );
         Ok(())
-    }
-
-    #[test]
-    fn test_write_context_partition_col_not_in_schema_returns_error() {
-        let storage = Arc::new(InMemory::new());
-        let table_root = Url::parse("memory:///").unwrap();
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-
-        // Schema has only "id", but metadata claims "ghost" is a partition column.
-        let actions = [
-            r#"{"commitInfo":{"timestamp":1587968586154}}"#,
-            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
-            concat!(
-                r#"{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"#,
-                r#""schemaString":"{\"type\":\"struct\",\"fields\":"#,
-                r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","#,
-                r#""partitionColumns":["ghost"],"configuration":{},"createdTime":1587968585495}}"#,
-            ),
-        ]
-        .join("\n");
-
-        let commit_path = Path::from("_delta_log/00000000000000000000.json");
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(storage.put(&commit_path, actions.into()))
-            .unwrap();
-
-        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
-            .unwrap();
-        let err = txn
-            .partitioned_write_context(HashMap::from([("ghost".into(), Scalar::Integer(1))]))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.starts_with("Internal error partition column 'ghost' not found in table schema."),
-            "unexpected error: {err}"
-        );
     }
 
     /// Tests that update_deletion_vectors validates table protocol requirements.
@@ -2159,9 +2159,10 @@ mod tests {
         ArrowEvaluationHandler.create_many(schema, &[&[1i64.into(), info1], &[2i64.into(), info2]])
     }
 
-    /// Validates that [`WriteContext::logical_to_physical`] correctly renames fields at all nesting levels.
-    /// Builds a RecordBatch with logical names, evaluates the transform, and checks that the
-    /// output uses physical names from the physical schema — including nested struct children.
+    /// Validates that [`WriteContext::logical_to_physical`] correctly renames fields at all nesting
+    /// levels. Builds a RecordBatch with logical names, evaluates the transform, and checks
+    /// that the output uses physical names from the physical schema — including nested struct
+    /// children.
     fn validate_logical_to_physical_transform(mode: ColumnMappingMode) -> DeltaResult<()> {
         let schema = test_schema_nested();
         let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
@@ -2468,7 +2469,7 @@ mod tests {
 
         // Create a non-catalog-managed table using a catalog committer
         let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![
-            crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, false),
+            crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, true),
         ]));
         let committer = Box::new(MockCatalogCommitter);
         let err = create_table("memory:///", schema, "test-engine")

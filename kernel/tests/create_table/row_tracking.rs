@@ -62,8 +62,8 @@ fn assert_row_tracking_protocol(snapshot: &Snapshot) {
 /// Key behavioral differences by case:
 /// - Activation path: `delta.enableRowTracking=true` sets materialized column name properties;
 ///   feature-signal-only does not.
-/// - Table shape: empty tables get `rowIdHighWaterMark = -1` with no add actions; CTAS
-///   assigns `baseRowId = 0` and `defaultRowCommitVersion = 0` and sets `rowIdHighWaterMark = 4`.
+/// - Table shape: empty tables get `rowIdHighWaterMark = -1` with no add actions; CTAS assigns
+///   `baseRowId = 0` and `defaultRowCommitVersion = 0` and sets `rowIdHighWaterMark = 4`.
 #[rstest]
 #[tokio::test]
 async fn test_create_table_with_row_tracking(
@@ -397,10 +397,10 @@ async fn test_create_table_with_row_tracking_and_clustering_and_data() -> DeltaR
     Ok(())
 }
 
-/// Verifies that a table created with the feature signal only (`delta.feature.rowTracking=supported`,
-/// no `delta.enableRowTracking=true`) correctly handles a subsequent data append. The initial
-/// create writes `rowIdHighWaterMark = -1`; the append must read that and assign `baseRowId = 0`
-/// to the first file.
+/// Verifies that a table created with the feature signal only
+/// (`delta.feature.rowTracking=supported`, no `delta.enableRowTracking=true`) correctly handles a
+/// subsequent data append. The initial create writes `rowIdHighWaterMark = -1`; the append must
+/// read that and assign `baseRowId = 0` to the first file.
 #[tokio::test]
 async fn test_feature_signal_create_then_append_assigns_correct_base_row_id() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;

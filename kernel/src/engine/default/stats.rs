@@ -33,7 +33,8 @@ const STRING_EXPANSION_LIMIT: usize = STRING_PREFIX_LENGTH * 2;
 /// ASCII DEL character (0x7F) - used as tie-breaker for max values when truncated char is ASCII.
 const ASCII_MAX_CHAR: char = '\x7F';
 
-/// Maximum Unicode code point - used as tie-breaker for max values when truncated char is non-ASCII.
+/// Maximum Unicode code point - used as tie-breaker for max values when truncated char is
+/// non-ASCII.
 const UTF8_MAX_CHAR: char = '\u{10FFFF}';
 
 // ============================================================================
@@ -490,8 +491,8 @@ impl StatsAccumulator {
 ///
 /// # Arguments
 /// * `batch` - The RecordBatch to collect statistics from
-/// * `stats_columns` - Column names that should have statistics collected (allowlist).
-///   Only these columns will appear in nullCount/minValues/maxValues.
+/// * `stats_columns` - Column names that should have statistics collected (allowlist). Only these
+///   columns will appear in nullCount/minValues/maxValues.
 #[internal_api]
 pub(crate) fn collect_stats(
     batch: &RecordBatch,
@@ -549,8 +550,7 @@ mod tests {
     use crate::arrow::array::{Array, AsArray, Int32Array, Int64Array, StringArray};
     use crate::arrow::buffer::NullBuffer;
     use crate::arrow::compute::concat_batches;
-    use crate::arrow::datatypes::{Fields, Schema};
-    use crate::arrow::datatypes::{Int32Type, Int64Type};
+    use crate::arrow::datatypes::{Fields, Int32Type, Int64Type, Schema};
     use crate::engine::arrow_expression::evaluate_expression::to_json;
     use crate::expressions::column_name;
     use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -1246,7 +1246,8 @@ mod tests {
         //
         // Expected behavior (struct nulls propagate to children):
         // - a: visible values are [2, 3], nullCount = 2 (rows 0, 3 are struct-null)
-        // - b: visible values are [20, None], nullCount = 3 (rows 0, 3 struct-null + row 2 field-null)
+        // - b: visible values are [20, None], nullCount = 3 (rows 0, 3 struct-null + row 2
+        //   field-null)
         // - a: min=2, max=3
         // - b: min=20, max=20
 

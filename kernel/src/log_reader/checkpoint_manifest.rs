@@ -6,8 +6,7 @@ use itertools::Itertools;
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{Add, Remove, Sidecar, ADD_NAME};
-use crate::actions::{REMOVE_NAME, SIDECAR_NAME};
+use crate::actions::{Add, Remove, Sidecar, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType, ToSchema};
@@ -118,14 +117,15 @@ impl Iterator for CheckpointManifestReader {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use itertools::Itertools;
+
     use super::*;
     use crate::arrow::array::{Array, StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::utils::test_utils::{assert_result_error_with_message, load_test_table};
     use crate::SnapshotRef;
-
-    use itertools::Itertools;
-    use std::sync::Arc;
 
     /// Helper function to test manifest phase with expected add paths and sidecars
     fn verify_manifest_phase(

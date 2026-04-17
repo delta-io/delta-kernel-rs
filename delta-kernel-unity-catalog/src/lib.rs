@@ -1,21 +1,19 @@
-//! UCKernelClient implements a high-level interface for interacting with Delta Tables in Unity Catalog.
+//! UCKernelClient implements a high-level interface for interacting with Delta Tables in Unity
+//! Catalog.
 
 mod committer;
 mod constants;
 mod errors;
 mod utils;
-pub use committer::UCCommitter;
-pub use utils::{get_final_required_properties_for_uc, get_required_properties_for_disk};
-
 use std::sync::Arc;
 
+pub use committer::UCCommitter;
 use delta_kernel::{Engine, LogPath, Snapshot, Version};
-
-use unity_catalog_delta_client_api::{CommitsRequest, GetCommitsClient};
-
 use itertools::Itertools;
 use tracing::debug;
+use unity_catalog_delta_client_api::{CommitsRequest, GetCommitsClient};
 use url::Url;
+pub use utils::{get_final_required_properties_for_uc, get_required_properties_for_disk};
 
 /// The [UCKernelClient] provides a high-level interface to interact with Delta Tables stored in
 /// Unity Catalog. It is a lightweight wrapper around a [GetCommitsClient].
@@ -130,7 +128,6 @@ mod tests {
     use delta_kernel::object_store;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::transaction::CommitResult;
-
     use tracing::info;
     use unity_catalog_delta_client_api::{Commit, InMemoryCommitsClient, Operation, TableData};
     use unity_catalog_delta_rest_client::{UCClient, UCCommitsRestClient};

@@ -3,14 +3,14 @@
 use std::slice;
 use std::str::FromStr;
 
+use delta_kernel_derive::internal_api;
+use url::Url;
+use uuid::Uuid;
+
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, Version};
-use delta_kernel_derive::internal_api;
-
-use url::Url;
-use uuid::Uuid;
 
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;
@@ -107,7 +107,8 @@ fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> 
 }
 
 impl<Location: AsUrl> ParsedLogPath<Location> {
-    // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is local.
+    // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is
+    // local.
     #[internal_api]
     pub(crate) fn try_from(location: Location) -> DeltaResult<Option<ParsedLogPath<Location>>> {
         let url = location.as_url();
@@ -146,7 +147,8 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             None => return Ok(None),
         };
 
-        // this check determines if we're in the delta log dir, or in the staged commits dir. The check is:
+        // this check determines if we're in the delta log dir, or in the staged commits dir. The
+        // check is:
         // 1. If the dir is named _staged_commits, check if the parent dir is _delta_log, and ensure
         //    no higher level directories are _also_ named _delta_log. If those checks pass we're in
         //    the staged_commits dir
@@ -462,12 +464,13 @@ pub(crate) mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use test_utils::add_commit;
+
     use super::*;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::utils::test_utils::assert_result_error_with_message;
-    use test_utils::add_commit;
 
     impl ParsedLogPath<FileMeta> {
         pub(crate) fn create_parsed_published_commit(table_root: &Url, version: Version) -> Self {

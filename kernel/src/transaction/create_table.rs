@@ -15,7 +15,7 @@
 //! # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
 //!
 //! let schema = Arc::new(StructType::try_new(vec![
-//!     StructField::new("id", DataType::INTEGER, false),
+//!     StructField::new("id", DataType::INTEGER, true),
 //! ])?);
 //!
 //! let result = create_table("/path/to/table", schema, "MyApp/1.0")
@@ -34,6 +34,8 @@
 use std::marker::PhantomData;
 use std::sync::OnceLock;
 
+// Re-export the builder so callers can still access it from this module path.
+pub use super::builder::create_table::CreateTableTransactionBuilder;
 use crate::actions::DomainMetadata;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
@@ -43,9 +45,6 @@ use crate::transaction::{CreateTable, Transaction};
 use crate::utils::current_time_ms;
 use crate::DeltaResult;
 
-// Re-export the builder so callers can still access it from this module path.
-pub use super::builder::create_table::CreateTableTransactionBuilder;
-
 /// A type alias for create-table transactions.
 ///
 /// This provides a restricted API surface that only exposes operations valid during table
@@ -54,8 +53,8 @@ pub use super::builder::create_table::CreateTableTransactionBuilder;
 ///
 /// # Operations NOT available on create-table transactions
 ///
-/// - **`with_domain_metadata_removed()`** — Cannot remove domain metadata from a table
-///   that doesn't exist yet.
+/// - **`with_domain_metadata_removed()`** — Cannot remove domain metadata from a table that doesn't
+///   exist yet.
 /// - **`remove_files()`** — Cannot remove files from a table that has no files.
 /// - **`with_blind_append()`** — Blind append semantics don't apply to table creation.
 /// - **`update_deletion_vectors()`** — Deletion vectors require an existing table.
@@ -73,7 +72,7 @@ pub use super::builder::create_table::CreateTableTransactionBuilder;
 /// # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
 ///
 /// let schema = Arc::new(StructType::try_new(vec![
-///     StructField::new("id", DataType::INTEGER, false),
+///     StructField::new("id", DataType::INTEGER, true),
 /// ])?);
 ///
 /// let result = create_table("/path/to/table", schema, "MyApp/1.0")
@@ -107,7 +106,7 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 ///
 /// # fn main() -> delta_kernel::DeltaResult<()> {
 /// let schema = Arc::new(StructType::new_unchecked(vec![
-///     StructField::new("id", DataType::INTEGER, false),
+///     StructField::new("id", DataType::INTEGER, true),
 ///     StructField::new("name", DataType::STRING, true),
 /// ]));
 ///

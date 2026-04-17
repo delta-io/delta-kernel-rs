@@ -14,14 +14,15 @@ use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred, Scalar,
 };
 use delta_kernel::log_segment::LogSegment;
-use delta_kernel::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
 use delta_kernel::{Engine, FileMeta, Snapshot};
-
 use itertools::Itertools;
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
@@ -271,7 +272,11 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         ]),
     )
     .await?;
-    // storage.add_commit(1, &format!("{}\n", r#"{{"add":{{"path":"doesnotexist","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 0}},\"maxValues\":{{\"id\":2}}}}"}}}}"#));
+    // storage.add_commit(1, &format!("{}\n",
+    // r#"{{"add":{{"path":"doesnotexist","partitionValues":{{}},"size":262,"modificationTime":
+    // 1587968586000,"dataChange":true,
+    // "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\":
+    // 0}},\"maxValues\":{{\"id\":2}}}}"}}}}"#));
     add_commit(
         table_root,
         storage.as_ref(),
@@ -828,9 +833,9 @@ fn partition_pruning_with_checkpoint_parsed_values(
     Ok(())
 }
 
-/// Test mixed predicates (partition + data stats) on a checkpoint with both `partitionValues_parsed`
-/// and `stats_parsed`. This exercises the unified columnar data skipping pass that evaluates
-/// both partition values and data column statistics together.
+/// Test mixed predicates (partition + data stats) on a checkpoint with both
+/// `partitionValues_parsed` and `stats_parsed`. This exercises the unified columnar data skipping
+/// pass that evaluates both partition values and data column statistics together.
 ///
 /// Table: app-txn-checkpoint (checkpoint at v1, partition column: `modified` (string))
 ///   - 2 files: modified=2021-02-02 -- 3 rows each, value in [1, 3]

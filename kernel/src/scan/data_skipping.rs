@@ -68,8 +68,8 @@ fn as_sql_data_skipping_predicate(
 pub(crate) struct DataSkippingFilter {
     /// Evaluator that extracts file-level statistics from the input batch. The caller provides
     /// the expression at construction time, which determines where stats come from:
-    /// - Scan path: `column_expr!("stats_parsed")` reads the already-parsed struct from
-    ///   a transformed batch (where `add.*` fields are flattened to top-level columns).
+    /// - Scan path: `column_expr!("stats_parsed")` reads the already-parsed struct from a
+    ///   transformed batch (where `add.*` fields are flattened to top-level columns).
     /// - Table changes path: `Expression::parse_json(column_expr!("add.stats"), schema)` parses
     ///   JSON from a raw action batch (where stats are nested under `add.stats`).
     stats_evaluator: Arc<dyn ExpressionEvaluator>,
@@ -89,8 +89,8 @@ impl DataSkippingFilter {
     /// # Parameters
     /// - `engine`: Engine for creating evaluators
     /// - `predicate`: Optional predicate for data skipping
-    /// - `stats_schema`: The data stats schema (numRecords, nullCount, minValues, maxValues).
-    ///   Pass `None` if no data stats are available.
+    /// - `stats_schema`: The data stats schema (numRecords, nullCount, minValues, maxValues). Pass
+    ///   `None` if no data stats are available.
     /// - `stats_expr`: Expression to extract data stats from the batch, producing output matching
     ///   `stats_schema`. For example, `column_expr!("stats_parsed")` for pre-parsed stats, or
     ///   `Expression::parse_json(column_expr!("add.stats"), stats_schema)` for JSON parsing.
@@ -148,16 +148,16 @@ impl DataSkippingFilter {
         // Skipping happens in several steps:
         //
         // 1. The stats evaluator extracts file-level statistics from the batch (the expression
-        //    provided by the caller determines how: reading a pre-parsed column, parsing JSON, etc.)
+        //    provided by the caller determines how: reading a pre-parsed column, parsing JSON,
+        //    etc.)
         //
         // 2. The predicate (skipping evaluator) produces false for any file whose stats prove we
         //    can safely skip it. A value of true means the stats say we must keep the file, and
         //    null means we could not determine whether the file is safe to skip, because its stats
         //    were missing/null.
         //
-        // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true
-        //    (= keep) when the predicate is true/null and false (= skip) when the predicate
-        //    is false.
+        // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true (=
+        //    keep) when the predicate is true/null and false (= skip) when the predicate is false.
         let skipping_evaluator = engine
             .evaluation_handler()
             .new_predicate_evaluator(

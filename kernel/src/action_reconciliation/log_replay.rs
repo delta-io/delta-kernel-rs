@@ -8,28 +8,31 @@
 //!
 //! This processor applies several filtering and deduplication steps to each batch of log actions:
 //!
-//! 1. **Protocol and Metadata**: Retains exactly one of each - keeping only the latest protocol
-//!    and metadata actions.
-//! 2. **Txn Actions**: Keeps exactly one `txn` action for each unique app ID, always selecting
-//!    the latest one encountered.
-//! 3. **File Actions**: Resolves file actions to produce the latest state of the table, keeping
-//!    the most recent valid add actions and unexpired remove actions (tombstones) that are newer
-//!    than `minimum_file_retention_timestamp`.
+//! 1. **Protocol and Metadata**: Retains exactly one of each - keeping only the latest protocol and
+//!    metadata actions.
+//! 2. **Txn Actions**: Keeps exactly one `txn` action for each unique app ID, always selecting the
+//!    latest one encountered.
+//! 3. **File Actions**: Resolves file actions to produce the latest state of the table, keeping the
+//!    most recent valid add actions and unexpired remove actions (tombstones) that are newer than
+//!    `minimum_file_retention_timestamp`.
 //!
 //! ## Architecture
 //!
-//! - [`ActionReconciliationVisitor`]: Implements [`RowVisitor`] to examine each action in a batch and
-//!   determine if it should be included. It maintains state for deduplication across multiple actions
-//!   in a batch and efficiently handles all filtering rules.
+//! - [`ActionReconciliationVisitor`]: Implements [`RowVisitor`] to examine each action in a batch
+//!   and determine if it should be included. It maintains state for deduplication across multiple
+//!   actions in a batch and efficiently handles all filtering rules.
 //!
-//! - [`ActionReconciliationProcessor`]: Implements the [`LogReplayProcessor`] trait and orchestrates
-//!   the overall process. For each batch of log actions, it:
+//! - [`ActionReconciliationProcessor`]: Implements the [`LogReplayProcessor`] trait and
+//!   orchestrates the overall process. For each batch of log actions, it:
 //!   1. Creates a visitor with the current deduplication state
 //!   2. Applies the visitor to filter actions in the batch
 //!   3. Tracks state for deduplication across batches
-//!   4. Produces a [`ActionReconciliationBatch`] result which includes both the filtered data and counts of
-//!      actions selected
-//!
+//!   4. Produces a [`ActionReconciliationBatch`] result which includes both the filtered data and
+//!      counts of actions selected
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, LazyLock};
+
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::deduplicator::Deduplicator as _;
 use crate::log_replay::{
@@ -39,10 +42,6 @@ use crate::scan::data_skipping::DataSkippingFilter;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
-
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, LazyLock};
 
 /// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions.
@@ -185,9 +184,9 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
     /// and returns a [`ActionReconciliationBatch`], which contains the filtered actions,
     /// along with statistics about the included actions.
     ///
-    /// This method delegates the filtering logic to the [`ActionReconciliationVisitor`], which implements
-    /// the deduplication rules described in the module documentation. The method tracks
-    /// statistics about processed actions (total count, add actions count) and maintains
+    /// This method delegates the filtering logic to the [`ActionReconciliationVisitor`], which
+    /// implements the deduplication rules described in the module documentation. The method
+    /// tracks statistics about processed actions (total count, add actions count) and maintains
     /// state for cross-batch deduplication.
     fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
@@ -223,7 +222,8 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
         })
     }
 
-    /// We never do data skipping for action reconciliation log replay (entire table state is always reproduced)
+    /// We never do data skipping for action reconciliation log replay (entire table state is always
+    /// reproduced)
     fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
         None
     }
@@ -255,9 +255,8 @@ impl ActionReconciliationProcessor {
 /// # File Action Filtering Rules:
 ///   Kept Actions:
 /// - The first (newest) add action for each unique (path, dvId) pair
-/// - The first (newest) remove action for each unique (path, dvId) pair, but only if
-///   its deletionTimestamp > minimumFileRetentionTimestamp
-///   Omitted Actions:
+/// - The first (newest) remove action for each unique (path, dvId) pair, but only if its
+///   deletionTimestamp > minimumFileRetentionTimestamp Omitted Actions:
 /// - Any file action (add/remove) with the same (path, dvId) as a previously processed action
 /// - All remove actions with deletionTimestamp ≤ minimumFileRetentionTimestamp
 /// - All remove actions with missing deletionTimestamp (defaults to 0)
@@ -272,12 +271,12 @@ impl ActionReconciliationProcessor {
 /// - Keeps only the first domainMetadata action for each unique domain name
 ///
 /// # Excluded Actions
-/// - CommitInfo, CDC, and CheckpointMetadata actions should not appear in the action
-///   batches processed by this visitor, as they are excluded by the schema used to
-///   read the log files upstream. If present, they will be ignored by the visitor.
-/// - Sidecar actions should also be excluded—when encountered in the log, the
-///   corresponding sidecar files are read to extract the referenced file actions,
-///   which are then included directly in the action stream instead of the sidecar actions themselves.
+/// - CommitInfo, CDC, and CheckpointMetadata actions should not appear in the action batches
+///   processed by this visitor, as they are excluded by the schema used to read the log files
+///   upstream. If present, they will be ignored by the visitor.
+/// - Sidecar actions should also be excluded—when encountered in the log, the corresponding sidecar
+///   files are read to extract the referenced file actions, which are then included directly in the
+///   action stream instead of the sidecar actions themselves.
 /// - The CheckpointMetadata action is included down the wire when writing a V2 spec checkpoint.
 ///
 /// # Memory Usage
@@ -290,7 +289,8 @@ impl ActionReconciliationProcessor {
 pub(crate) struct ActionReconciliationVisitor<'seen> {
     // Deduplicates file actions (applies logic to filter Adds with corresponding Removes,
     // and keep unexpired Removes). This deduplicator builds a set of seen file actions.
-    // This set has O(M) memory usage where M = number of file actions with unique (path, dvId) pairs
+    // This set has O(M) memory usage where M = number of file actions with unique (path, dvId)
+    // pairs
     deduplicator: FileActionDeduplicator<'seen>,
     // Tracks which rows to include in the final output
     selection_vector: Vec<bool>,
@@ -310,7 +310,8 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     // This set has O(N) memory usage where N = number of txn actions with unique appIds
     seen_txns: &'seen mut HashSet<String>,
     // Set of domain names to deduplicate domainMetadata by domain
-    // This set has O(D) memory usage where D = number of domainMetadata actions with unique domains
+    // This set has O(D) memory usage where D = number of domainMetadata actions with unique
+    // domains
     seen_domains: &'seen mut HashSet<String>,
     /// Transaction expiration timestamp for filtering old transactions
     txn_expiration_timestamp: Option<i64>,
@@ -396,9 +397,9 @@ impl ActionReconciliationVisitor<'_> {
 
     /// Determines if a remove action tombstone has expired and should be excluded.
     ///
-    /// A remove action includes a deletion_timestamp indicating when the deletion occurred. Physical
-    /// files are deleted lazily after a user-defined expiration time. Remove actions are kept to allow
-    /// concurrent readers to read snapshots at older versions.
+    /// A remove action includes a deletion_timestamp indicating when the deletion occurred.
+    /// Physical files are deleted lazily after a user-defined expiration time. Remove actions
+    /// are kept to allow concurrent readers to read snapshots at older versions.
     ///
     /// Tombstone expiration rules:
     /// - If deletion_timestamp <= minimum_file_retention_timestamp: Expired (exclude)
@@ -418,9 +419,10 @@ impl ActionReconciliationVisitor<'_> {
     /// Processes a potential file action to determine if it should be included.
     ///
     /// Returns `Ok(Some(true))` if the row contains a valid file action to be included.
-    /// Returns `Ok(Some(false))` if the row contains a file action but it's suppressed (duplicate/expired).
-    /// Returns `Ok(None)` if the row doesn't contain a file action (continue checking other action types).
-    /// Returns `Err(...)` if there was an error processing the action.
+    /// Returns `Ok(Some(false))` if the row contains a file action but it's suppressed
+    /// (duplicate/expired). Returns `Ok(None)` if the row doesn't contain a file action
+    /// (continue checking other action types). Returns `Err(...)` if there was an error
+    /// processing the action.
     ///
     /// Note: This function handles both add and remove actions, applying deduplication logic and
     /// tombstone expiration rules as needed.
@@ -451,16 +453,18 @@ impl ActionReconciliationVisitor<'_> {
     /// Processes a potential protocol action to determine if it should be included.
     ///
     /// Returns `Ok(Some(true))` if the row contains a valid protocol action.
-    /// Returns `Ok(Some(false))` if the row contains a protocol action but it's suppressed (duplicate).
-    /// Returns `Ok(None)` if the row doesn't contain a protocol action (continue checking other action types).
-    /// Returns `Err(...)` if there was an error processing the action.
+    /// Returns `Ok(Some(false))` if the row contains a protocol action but it's suppressed
+    /// (duplicate). Returns `Ok(None)` if the row doesn't contain a protocol action (continue
+    /// checking other action types). Returns `Err(...)` if there was an error processing the
+    /// action.
     fn check_protocol_action<'a>(
         &mut self,
         i: usize,
         getter: &'a dyn GetData<'a>,
     ) -> DeltaResult<Option<bool>> {
-        // minReaderVersion is a required field, so we check for its presence to determine if this is a protocol action.
-        // Only return the first (newest) protocol action we see, ignoring other types
+        // minReaderVersion is a required field, so we check for its presence to determine if this
+        // is a protocol action. Only return the first (newest) protocol action we see,
+        // ignoring other types
         let result = getter
             .get_int(i, Self::PROTOCOL_MIN_READER_VERSION.name)?
             .is_some()
@@ -471,16 +475,18 @@ impl ActionReconciliationVisitor<'_> {
     /// Processes a potential metadata action to determine if it should be included.
     ///
     /// Returns `Ok(Some(true))` if the row contains a valid metadata action.
-    /// Returns `Ok(Some(false))` if the row contains a metadata action but it's suppressed (duplicate).
-    /// Returns `Ok(None)` if the row doesn't contain a metadata action (continue checking other action types).
-    /// Returns `Err(...)` if there was an error processing the action.
+    /// Returns `Ok(Some(false))` if the row contains a metadata action but it's suppressed
+    /// (duplicate). Returns `Ok(None)` if the row doesn't contain a metadata action (continue
+    /// checking other action types). Returns `Err(...)` if there was an error processing the
+    /// action.
     fn check_metadata_action<'a>(
         &mut self,
         i: usize,
         getter: &'a dyn GetData<'a>,
     ) -> DeltaResult<Option<bool>> {
-        // id is a required field, so we check for its presence to determine if this is a metadata action.
-        // Only return the first (newest) metadata action we see, ignoring other types
+        // id is a required field, so we check for its presence to determine if this is a metadata
+        // action. Only return the first (newest) metadata action we see, ignoring other
+        // types
         let result = getter
             .get_str(i, Self::METADATA_ID.name)?
             .is_some()
@@ -491,9 +497,10 @@ impl ActionReconciliationVisitor<'_> {
     /// Processes a potential txn action to determine if it should be included.
     ///
     /// Returns `Ok(Some(true))` if the row contains a valid txn action.
-    /// Returns `Ok(Some(false))` if the row contains a txn action but it's suppressed (duplicate/expired).
-    /// Returns `Ok(None)` if the row doesn't contain a txn action (continue checking other action types).
-    /// Returns `Err(...)` if there was an error processing the action.
+    /// Returns `Ok(Some(false))` if the row contains a txn action but it's suppressed
+    /// (duplicate/expired). Returns `Ok(None)` if the row doesn't contain a txn action
+    /// (continue checking other action types). Returns `Err(...)` if there was an error
+    /// processing the action.
     fn check_txn_action<'a>(
         &mut self,
         i: usize,
@@ -528,8 +535,8 @@ impl ActionReconciliationVisitor<'_> {
     /// Returns `Ok(Some(true))` if the row contains a valid domainMetadata action.
     /// Returns `Ok(Some(false))` if the row contains a domainMetadata action but it's suppressed
     ///         (duplicate or tombstone with removed=true).
-    /// Returns `Ok(None)` if the row doesn't contain a domainMetadata action (continue checking other action types).
-    /// Returns `Err(...)` if there was an error processing the action.
+    /// Returns `Ok(None)` if the row doesn't contain a domainMetadata action (continue checking
+    /// other action types). Returns `Err(...)` if there was an error processing the action.
     fn check_domain_metadata_action<'a>(
         &mut self,
         i: usize,
@@ -658,12 +665,12 @@ impl RowVisitor for ActionReconciliationVisitor<'_> {
 mod tests {
     use std::collections::HashSet;
 
+    use itertools::Itertools;
+
     use super::*;
     use crate::arrow::array::StringArray;
     use crate::utils::test_utils::{action_batch, parse_json_batch};
     use crate::Error;
-
-    use itertools::Itertools;
 
     /// Helper function to create test batches from JSON strings
     fn create_batch(json_strings: Vec<&str>) -> DeltaResult<ActionsBatch> {
@@ -732,7 +739,8 @@ mod tests {
 
     /// Tests the boundary conditions for tombstone expiration logic.
     /// Specifically checks:
-    /// - Remove actions with deletionTimestamp == minimumFileRetentionTimestamp (should be excluded)
+    /// - Remove actions with deletionTimestamp == minimumFileRetentionTimestamp (should be
+    ///   excluded)
     /// - Remove actions with deletionTimestamp < minimumFileRetentionTimestamp (should be excluded)
     /// - Remove actions with deletionTimestamp > minimumFileRetentionTimestamp (should be included)
     /// - Remove actions with missing deletionTimestamp (defaults to 0, should be excluded)
@@ -1373,8 +1381,8 @@ mod tests {
         let batch = ActionsBatch::new(actions, true);
 
         // Create a processor and try to process the batch
-        // We can't easily trigger an error in the normal flow since parse_json_batch creates valid data
-        // But this test ensures the error propagation path exists and is tested
+        // We can't easily trigger an error in the normal flow since parse_json_batch creates valid
+        // data But this test ensures the error propagation path exists and is tested
         let mut processor = ActionReconciliationProcessor::new(0, None);
         let result = processor.process_actions_batch(batch);
 

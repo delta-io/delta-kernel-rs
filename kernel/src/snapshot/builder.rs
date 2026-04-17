@@ -9,8 +9,7 @@ use crate::log_segment::LogSegment;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
-use crate::utils::require;
-use crate::utils::try_parse_uri;
+use crate::utils::{require, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
 /// Builder for creating [`Snapshot`] instances.
@@ -355,19 +354,18 @@ impl SnapshotBuilder {
 mod tests {
     use std::sync::Arc;
 
-    use crate::engine::default::{
-        executor::tokio::TokioBackgroundExecutor, DefaultEngine, DefaultEngineBuilder,
-    };
-    use crate::metrics::MetricEvent;
-    use crate::object_store::memory::InMemory;
-    use crate::object_store::path::Path;
-    use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-    use crate::utils::test_utils::CapturingReporter;
     use itertools::Itertools;
     use serde_json::json;
     use test_utils::{actions_to_string, add_commit, TestAction};
 
     use super::*;
+    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+    use crate::metrics::MetricEvent;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
+    use crate::utils::test_utils::CapturingReporter;
 
     fn setup_test() -> (
         Arc<DefaultEngine<TokioBackgroundExecutor>>,
@@ -663,13 +661,12 @@ mod tests {
     }
 
     mod catalog_managed_tests {
-        use super::*;
-
         use test_utils::{
             actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
             TestAction,
         };
 
+        use super::*;
         use crate::log_path::LogPath;
         use crate::utils::try_parse_uri;
         use crate::FileMeta;

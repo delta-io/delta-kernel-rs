@@ -7,13 +7,11 @@ use std::collections::{HashMap, HashSet};
 
 use tracing::instrument;
 
-use crate::actions::get_log_domain_metadata_schema;
+use super::LogSegment;
 use crate::actions::visitors::DomainMetadataVisitor;
-use crate::actions::DomainMetadata;
+use crate::actions::{get_log_domain_metadata_schema, DomainMetadata};
 use crate::log_replay::ActionsBatch;
 use crate::{DeltaResult, Engine, RowVisitor as _};
-
-use super::LogSegment;
 
 pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 

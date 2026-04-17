@@ -16,7 +16,6 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use rstest::rstest;
-
 use test_utils::{
     generate_batch, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table, IntoArray,
 };
@@ -35,7 +34,7 @@ async fn test_clustered_table_write_and_checkpoint(
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = Arc::new(
         StructType::try_new(vec![
-            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("id", DataType::INTEGER, true),
             StructField::new("name", DataType::STRING, true),
             StructField::new("city", DataType::STRING, true),
         ])
@@ -150,7 +149,7 @@ async fn test_clustered_table_write_all_null_clustering_column() {
     let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
     let schema = Arc::new(
         StructType::try_new(vec![
-            StructField::new("category", DataType::STRING, false),
+            StructField::new("category", DataType::STRING, true),
             StructField::new("region_id", DataType::INTEGER, true),
         ])
         .unwrap(),

@@ -7,12 +7,13 @@
 //   cargo test --features integration-test --test hdfs
 #![cfg(all(feature = "integration-test", not(target_os = "windows")))]
 
-use delta_kernel::Snapshot;
-use hdfs_native::{Client, WriteOptions};
-use hdfs_native_object_store::minidfs::MiniDfs;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+
+use delta_kernel::Snapshot;
+use hdfs_native::{Client, WriteOptions};
+use hdfs_native_object_store::minidfs::MiniDfs;
 extern crate walkdir;
 use walkdir::WalkDir;
 

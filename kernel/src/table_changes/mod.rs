@@ -41,8 +41,7 @@ use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::Operation;
-use crate::table_features::TableFeature;
+use crate::table_features::{Operation, TableFeature};
 use crate::{DeltaResult, Engine, Error, Version};
 
 mod log_replay;
@@ -64,8 +63,9 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
     ]
 });
 
-/// Represents a call to read the Change Data Feed (CDF) between two versions of a table. The schema of
-/// `TableChanges` will be the schema of the table at the end version with three additional columns:
+/// Represents a call to read the Change Data Feed (CDF) between two versions of a table. The schema
+/// of `TableChanges` will be the schema of the table at the end version with three additional
+/// columns:
 /// - `_change_type`: String representing the type of change that for that commit. This may be one
 ///   of `delete`, `insert`, `update_preimage`, or `update_postimage`.
 /// - `_commit_version`: Long representing the commit the change occurred in.
@@ -79,13 +79,16 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///
 ///
 /// Three properties must hold for the entire CDF range:
-/// - Reading must be supported for every commit in the range. Currently the only read feature allowed
-///   is deletion vectors. This will be expanded in the future to support more delta table features.
-///   Because only deletion vectors are supported, reader version 2 will not be allowed. That is
-//    because version 2 requires that column mapping is enabled. Reader versions 1 and 3 are allowed.
+/// - Reading must be supported for every commit in the range. Currently the only read feature
+///   allowed is deletion vectors. This will be expanded in the future to support more delta table
+///   features. Because only deletion vectors are supported, reader version 2 will not be allowed.
+///   That is
+//    because version 2 requires that column mapping is enabled. Reader versions 1 and 3 are
+// allowed.
 /// - Change Data Feed must be enabled for the entire range with the `delta.enableChangeDataFeed`
 ///   table property set to `true`. Performing change data feed on  tables with column mapping is
-///   currently disallowed. We check that column mapping is disabled, or the column mapping mode is `None`.
+///   currently disallowed. We check that column mapping is disabled, or the column mapping mode is
+///   `None`.
 /// - The schema for each commit must be compatible with the end schema. This means that all the
 ///   same fields and their nullability are the same. Schema compatibility will be expanded in the
 ///   future to allow compatible schemas that are not the exact same.
@@ -120,7 +123,8 @@ impl TableChanges {
     /// Creates a new [`TableChanges`] instance for the given version range. This function checks
     /// these properties:
     /// - The change data feed table feature must be enabled in both the start or end versions.
-    /// - Other than the deletion vector reader feature, no other reader features are enabled for the table.
+    /// - Other than the deletion vector reader feature, no other reader features are enabled for
+    ///   the table.
     /// - The schemas at the start and end versions are the same.
     ///
     /// Note that this does not check that change data feed is enabled for every commit in the
@@ -241,13 +245,13 @@ impl TableChanges {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use itertools::assert_equal;
 
+    use super::*;
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField};
     use crate::table_changes::CDF_FIELDS;
     use crate::Error;
-    use itertools::assert_equal;
 
     #[test]
     fn table_changes_checks_enable_cdf_flag() {

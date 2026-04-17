@@ -10,7 +10,7 @@ env:
 # enforce the committed Cargo.lock. This prevents CI from silently resolving a newer
 # (potentially compromised) dependency version. If Cargo.lock is out of sync with
 # Cargo.toml, the build fails immediately. Any dependency change must be an explicit,
-# reviewable update to Cargo.lock in the PR. Commands that skip --locked: cargo fmt
+# reviewable update to Cargo.lock in the PR. Commands that skip --locked: cargo +nightly fmt
 # (no dep resolution), cargo msrv verify/show (wrapper tool), cargo miri setup (tooling).
 #
 # Swatinem/rust-cache caches the cargo registry and target directory (~450MB per job).
@@ -41,13 +41,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: Install minimal stable with rustfmt
+      - name: Install nightly with rustfmt
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
+          toolchain: nightly
           components: rustfmt
       - name: format
-        run: cargo fmt -- --check
+        run: cargo +nightly fmt -- --check
 
   msrv:
     runs-on: ubuntu-latest
@@ -97,6 +98,7 @@ jobs:
           pushd kernel
           echo "Testing with $(cargo msrv show --output-format minimal)"
           cargo +$(cargo msrv show --output-format minimal) nextest run --locked
+          cargo +$(cargo msrv show --output-format minimal) test --doc
   docs:
     runs-on: ubuntu-latest
     env:

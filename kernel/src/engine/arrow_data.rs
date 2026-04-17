@@ -18,14 +18,14 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
 };
 use crate::engine::arrow_conversion::TryIntoArrow as _;
+pub use crate::engine::arrow_utils::fix_nested_null_masks;
 use crate::engine_data::{EngineData, GetData, RowVisitor, StringArrayAccessor};
 use crate::expressions::ArrayData;
 use crate::schema::{ColumnName, DataType, PrimitiveType, SchemaRef};
 use crate::{DeltaResult, Error};
 
-pub use crate::engine::arrow_utils::fix_nested_null_masks;
-
-/// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract from it.
+/// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract
+/// from it.
 ///
 /// WARNING: Row visitors require that all leaf columns of the record batch have correctly computed
 /// NULL masks. The arrow parquet reader is known to produce incomplete NULL masks, for
@@ -296,6 +296,28 @@ impl EngineData for ArrowEngineData {
         let filtered = filter_record_batch(&self.data, &selection_vector.into())?;
         Ok(Box::new(Self::new(filtered)))
     }
+
+    fn has_field(&self, name: &ColumnName) -> bool {
+        let mut path = name.path();
+        let Some((first, rest)) = path.split_first() else {
+            return false;
+        };
+        let Some((_, mut field)) = self.data.schema_ref().fields().find(first.as_str()) else {
+            return false;
+        };
+        path = rest;
+        while let Some((component, rest)) = path.split_first() {
+            let ArrowDataType::Struct(nested) = field.data_type() else {
+                return false;
+            };
+            let Some((_, next)) = nested.find(component.as_str()) else {
+                return false;
+            };
+            field = next;
+            path = rest;
+        }
+        true
+    }
 }
 
 impl ArrowEngineData {
@@ -345,9 +367,9 @@ impl ArrowEngineData {
         Ok(())
     }
 
-    /// Helper function to extract a column, supporting both direct arrays and REE-encoded (RunEndEncoded) arrays.
-    /// This reduces boilerplate by handling the common pattern of trying direct access first,
-    /// then falling back to RunArray if the column is REE-encoded.
+    /// Helper function to extract a column, supporting both direct arrays and REE-encoded
+    /// (RunEndEncoded) arrays. This reduces boilerplate by handling the common pattern of
+    /// trying direct access first, then falling back to RunArray if the column is REE-encoded.
     fn try_extract_with_ree<'a>(col: &'a dyn Array) -> Option<&'a dyn GetData<'a>> {
         match col.data_type() {
             ArrowDataType::RunEndEncoded(_, _) => col
@@ -503,6 +525,9 @@ impl ArrowEngineData {
 mod tests {
     use std::sync::{Arc, LazyLock};
 
+    use rstest::rstest;
+
+    use super::{extract_record_batch, ArrowEngineData};
     use crate::actions::{get_commit_schema, Metadata, Protocol};
     use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
@@ -521,9 +546,6 @@ mod tests {
     use crate::table_features::TableFeature;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
-    use rstest::rstest;
-
-    use super::{extract_record_batch, ArrowEngineData};
 
     #[test]
     fn test_md_extract() -> DeltaResult<()> {
@@ -1486,7 +1508,8 @@ mod tests {
 
     #[test]
     fn test_materialize_null_map() -> DeltaResult<()> {
-        // Create MapArray with 3 elements: 2 entries in first, 1 entry in second (null), 1 entry in third
+        // Create MapArray with 3 elements: 2 entries in first, 1 entry in second (null), 1 entry in
+        // third
         let keys_array = Arc::new(StringArray::from(vec![
             Some("a"),
             Some("b"), // First element (2 entries)
@@ -1554,6 +1577,35 @@ mod tests {
         assert_eq!(result2.get("d"), Some(&"4".to_string()));
 
         Ok(())
+    }
+
+    fn make_nested_batch() -> ArrowEngineData {
+        let inner = ArrowField::new(
+            "inner",
+            ArrowDataType::Struct(vec![ArrowField::new("leaf", ArrowDataType::Int32, true)].into()),
+            true,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("top", ArrowDataType::Utf8, true),
+            ArrowField::new("nested", ArrowDataType::Struct(vec![inner].into()), true),
+        ]));
+        ArrowEngineData::new(RecordBatch::new_empty(schema))
+    }
+
+    #[rstest::rstest]
+    #[case::top_level_present(["top"].as_slice(), true)]
+    #[case::top_level_absent(["missing"].as_slice(), false)]
+    #[case::nested_present(["nested", "inner"].as_slice(), true)]
+    #[case::deeply_nested_present(["nested", "inner", "leaf"].as_slice(), true)]
+    #[case::deeply_nested_absent(["nested", "inner", "nope"].as_slice(), false)]
+    // "top" is Utf8, not a struct -- cannot descend further
+    #[case::non_struct_intermediate(["top", "child"].as_slice(), false)]
+    fn has_field(#[case] path: &[&str], #[case] expected: bool) {
+        let data = make_nested_batch();
+        assert_eq!(
+            data.has_field(&ColumnName::new(path.iter().copied())),
+            expected
+        );
     }
 
     /// visit_rows must accept all Arrow string representations (Utf8/StringArray,

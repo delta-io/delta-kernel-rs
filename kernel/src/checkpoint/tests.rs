@@ -1,14 +1,18 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{from_slice, json, Value};
+use tempfile::tempdir;
+use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
+use url::Url;
 
 use crate::action_reconciliation::{
     deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
-use crate::arrow::datatypes::DataType;
-use crate::arrow::{
-    array::{create_array, Array, AsArray, RecordBatch, StructArray},
-    datatypes::{Field, Schema},
-};
+use crate::arrow::array::{create_array, Array, AsArray, RecordBatch, StructArray};
+use crate::arrow::datatypes::{DataType, Field, Schema};
 use crate::checkpoint::{create_last_checkpoint_data, CHECKPOINT_ACTIONS_SCHEMA_V2};
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
@@ -16,16 +20,14 @@ use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngineBuilder;
 use crate::log_replay::HasSelectionVector;
 use crate::object_store::local::LocalFileSystem;
-use crate::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
+use crate::object_store::memory::InMemory;
+use crate::object_store::path::Path;
+use crate::object_store::ObjectStoreExt as _;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
 use crate::transaction::create_table::create_table;
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
-use serde_json::{from_slice, json, Value};
-use tempfile::tempdir;
-use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
-use url::Url;
 
 #[rstest::rstest]
 #[case::default_retention(
@@ -944,8 +946,8 @@ fn verify_checkpoint_schema_with_partitions(
 /// For each combination (json1, struct1, json2, struct2):
 /// 1. Writes checkpoint 1 to parquet with (json1, struct1) settings
 /// 2. Changes config to (json2, struct2)
-/// 3. Reads from checkpoint 1 to produce checkpoint 2 data, exercising COALESCE paths
-///    (e.g., recovering stats from stats_parsed via ToJson, or vice versa)
+/// 3. Reads from checkpoint 1 to produce checkpoint 2 data, exercising COALESCE paths (e.g.,
+///    recovering stats from stats_parsed via ToJson, or vice versa)
 /// 4. Verifies checkpoint 2 schema matches (json2, struct2)
 #[rstest::rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,22 +1,18 @@
 //! TableChanges related ffi code
 
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use delta_kernel::arrow::array::{Array, ArrayData, StructArray};
 use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::EngineData;
-use delta_kernel::Error;
-use delta_kernel::{DeltaResult, Version};
+use delta_kernel::{DeltaResult, EngineData, Error, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
-
-use super::handle::Handle;
 use url::Url;
 
+use super::handle::Handle;
 use crate::engine_data::ArrowFFIData;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::scan::EnginePredicate;
@@ -33,8 +29,8 @@ pub struct ExclusiveTableChanges;
 ///
 /// - `table_root`: url pointing at the table root (where `_delta_log` folder is located)
 /// - `engine`: Implementation of `Engine` apis.
-/// - `start_version`: The start version of the change data feed
-///   End version will be the newest table version.
+/// - `start_version`: The start version of the change data feed End version will be the newest
+///   table version.
 ///
 /// # Safety
 ///
@@ -154,8 +150,8 @@ pub unsafe extern "C" fn table_changes_end_version(
 pub struct SharedTableChangesScan;
 
 /// Get a [`TableChangesScan`] over the table specified by the passed table changes.
-/// It is the responsibility of the _engine_ to free this scan when complete by calling [`free_table_changes_scan`].
-/// Consumes TableChanges.
+/// It is the responsibility of the _engine_ to free this scan when complete by calling
+/// [`free_table_changes_scan`]. Consumes TableChanges.
 ///
 /// # Safety
 ///
@@ -332,9 +328,7 @@ fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::ffi_test_utils::{allocate_err, allocate_str, ok_or_panic, recover_string};
-    use crate::{engine_to_handle, free_engine, free_schema, kernel_string_slice};
+    use std::sync::Arc;
 
     use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
     use delta_kernel::arrow::datatypes::{Field, Schema};
@@ -344,18 +338,23 @@ mod tests {
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::engine::default::DefaultEngineBuilder;
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::DynObjectStore;
     #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
     use delta_kernel::object_store::ObjectStoreExt as _;
-    use delta_kernel::object_store::{memory::InMemory, path::Path, DynObjectStore};
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::Engine;
     use delta_kernel_ffi::engine_data::get_engine_data;
     use itertools::Itertools;
-    use std::sync::Arc;
     use test_utils::{
         actions_to_string_with_metadata, add_commit, generate_batch, record_batch_to_bytes,
         IntoArray as _, TestAction,
     };
+
+    use super::*;
+    use crate::ffi_test_utils::{allocate_err, allocate_str, ok_or_panic, recover_string};
+    use crate::{engine_to_handle, free_engine, free_schema, kernel_string_slice};
 
     const PARQUET_FILE1: &str =
         "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";

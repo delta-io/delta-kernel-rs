@@ -165,6 +165,10 @@ fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> DeltaResult<Dat
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use rstest::rstest;
+
     use super::*;
     use crate::arrow::array::{
         new_null_array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
@@ -175,9 +179,6 @@ mod tests {
     use crate::engine::arrow_conversion::TryFromArrow as _;
     use crate::partition::serialization::serialize_partition_value;
     use crate::schema::PrimitiveType;
-
-    use rstest::rstest;
-    use std::sync::Arc;
 
     // ============================================================================
     // extract_primitive_scalar: non-null values for each supported type

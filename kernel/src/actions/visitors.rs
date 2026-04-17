@@ -7,15 +7,14 @@ use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 
-use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, Schema, StructField};
-use crate::utils::require;
-use crate::{DeltaResult, Error};
-
 use super::deletion_vector::DeletionVectorDescriptor;
 use super::set_transaction::is_set_txn_expired;
 use super::*;
+use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_segment::DomainMetadataMap;
+use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, Schema, StructField};
+use crate::utils::require;
+use crate::{DeltaResult, Error};
 
 #[derive(Default)]
 #[internal_api]
@@ -302,7 +301,6 @@ pub(crate) type SetTransactionMap = HashMap<String, SetTransaction>;
 /// `application_id` can be set. This bounds the memory required for the
 /// visitor to at most one entry and reduces the amount of processing
 /// required.
-///
 #[derive(Default, Debug)]
 #[internal_api]
 pub(crate) struct SetTransactionVisitor {
@@ -440,7 +438,8 @@ pub(crate) struct DomainMetadataVisitor {
 
 impl DomainMetadataVisitor {
     /// Create a new visitor. When domain_filter is set then we only retain domain metadata for
-    /// domains in the provided set, enabling early termination once all requested domains are found.
+    /// domains in the provided set, enabling early termination once all requested domains are
+    /// found.
     pub(crate) fn new(domain_filter: Option<HashSet<String>>) -> Self {
         DomainMetadataVisitor {
             domain_filter,
@@ -479,7 +478,8 @@ impl DomainMetadataVisitor {
     }
 
     pub(crate) fn into_domain_metadatas(mut self) -> DomainMetadataMap {
-        // note that the resulting visitor.domain_metadatas includes removed domains, so we need to filter
+        // note that the resulting visitor.domain_metadatas includes removed domains, so we need to
+        // filter
         self.domain_metadatas.retain(|_, dm| !dm.removed);
         self.domain_metadatas
     }
@@ -694,12 +694,10 @@ impl RowVisitor for InCommitTimestampVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::arrow::array::{BooleanArray, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
-
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr_ref, Expression};
     use crate::table_features::TableFeature;
@@ -841,7 +839,7 @@ mod tests {
         };
         let expected = vec![add1, add2, add3];
         assert_eq!(add_visitor.adds.len(), expected.len());
-        for (add, expected) in add_visitor.adds.into_iter().zip(expected.into_iter()) {
+        for (add, expected) in add_visitor.adds.into_iter().zip(expected) {
             assert_eq!(add, expected);
         }
     }
@@ -1246,9 +1244,9 @@ mod tests {
         assert!(visitor.into_domain_metadatas().is_empty());
     }
 
-    /*************************************
-     *  In-commit timestamp visitor tests *
-     **************************************/
+    // ------------------------------------------------------------
+    //  In-commit timestamp visitor tests
+    // ------------------------------------------------------------
 
     fn add_action() -> &'static str {
         r#"{"add":{"path":"file1","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#

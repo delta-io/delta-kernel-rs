@@ -30,7 +30,7 @@ cargo nextest run -p delta_kernel --lib --all-features test_name_here
 cargo nextest run --workspace --all-features test_name_here
 
 # Format, lint, and doc check (always run after code changes)
-cargo fmt \
+cargo +nightly fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
   && cargo doc --workspace --all-features --no-deps
 
@@ -39,7 +39,7 @@ cargo clippy --workspace --no-default-features --features arrow \
   --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
 
 # Quick pre-push check (mimics CI)
-cargo fmt \
+cargo +nightly fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
   && cargo doc --workspace --all-features --no-deps \
   && cargo nextest run --workspace --all-features
@@ -121,6 +121,10 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   merged into it as a new `#[case]`. A common pattern is toggling a feature (e.g.
   column mapping on/off) and asserting success vs. error.
 - Reuse helpers from `test_utils` instead of writing custom ones when possible.
+- **Committing in tests:** Use `txn.commit(engine)?.unwrap_committed()` to assert a
+  successful commit and get the `CommittedTransaction`. Do NOT use `match` + `panic!`
+  for this -- `unwrap_committed()` provides a clear error message on failure. Available
+  under `#[cfg(test)]` and the `test-utils` feature.
 - **Prefer snapshot/public API assertions over reading raw commit JSON.** Only read raw
   commit JSON when the data is inaccessible via public API (e.g., system domain metadata
   is blocked by `get_domain_metadata`). For commit JSON reads, use `read_actions_from_commit`
@@ -222,7 +226,7 @@ and data flow. Keep it concise.
 a newer (potentially compromised) transitive dependency. If `Cargo.lock` is out of sync with
 `Cargo.toml`, the build fails immediately, forcing dependency changes to be explicit and
 reviewable. See the top-level comment in `build.yml` for full rationale. Commands exempt from
-`--locked`: `cargo fmt` (no dep resolution), `cargo msrv verify/show` (wrapper tool),
+`--locked`: `cargo +nightly fmt` (no dep resolution), `cargo msrv verify/show` (wrapper tool),
 `cargo miri setup` (tooling setup).
 
 Ensure that when writing any github action you are considering safety including thinking of

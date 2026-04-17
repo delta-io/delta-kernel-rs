@@ -31,8 +31,8 @@
 //! that predicates are well-formed. Consider the predicate `double_col > 3.14`:
 //!
 //! 1) Synthesize the LHS `double_col`. The schema lookup determines the type is `Double`.
-//! 2) Synthesize the RHS `3.14`. The type is ambiguous (`Float` or `Double`), so synthesis
-//!    returns `None`.
+//! 2) Synthesize the RHS `3.14`. The type is ambiguous (`Float` or `Double`), so synthesis returns
+//!    `None`.
 //! 3) Since LHS has a concrete type (`Double`) and RHS is ambiguous, use `Double` as the target.
 //! 4) Type check both sides against `Double`, producing `Column("double_col")` on the LHS and
 //!    `Scalar::Double(3.14)` on the RHS.
@@ -435,10 +435,12 @@ fn between_to_pred(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use delta_kernel::expressions::{column_name, Scalar::*};
+    use delta_kernel::expressions::column_name;
+    use delta_kernel::expressions::Scalar::*;
     use delta_kernel::schema::{MapType, Schema, StructField, StructType};
     use rstest::rstest;
+
+    use super::*;
 
     /// Test schema with columns for all test cases.
     fn test_schema() -> Schema {
