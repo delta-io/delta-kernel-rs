@@ -55,8 +55,10 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+pub(crate) mod alter_table;
 mod commit_info;
 mod domain_metadata;
+pub(crate) mod schema_evolution;
 mod stats_verifier;
 mod update;
 mod write_context;
@@ -177,6 +179,22 @@ pub struct ExistingTable;
 /// invalid for table creation (e.g. file removal, domain metadata removal) are not available.
 #[derive(Debug)]
 pub struct CreateTable;
+
+/// Marker type for alter-table (schema evolution) transactions.
+///
+/// Transactions in this state perform metadata-only commits. Data file operations are not
+/// available at compile time because `AlterTable` does not implement [`SupportsDataFiles`].
+#[derive(Debug)]
+pub struct AlterTable;
+
+/// Marker trait for transaction states that support data file operations.
+///
+/// Only transaction types that implement this trait can access methods for adding, removing, or
+/// updating data files. This prevents compile-time misuse by states like `AlterTable` that
+/// only perform metadata-only commits.
+pub trait SupportsDataFiles {}
+impl SupportsDataFiles for ExistingTable {}
+impl SupportsDataFiles for CreateTable {}
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
@@ -656,6 +674,12 @@ impl<S> Transaction<S> {
                 "Blind append is not supported for create-table transactions",
             )
         );
+        // Metadata-only commits (e.g. ALTER TABLE) set isBlindAppend=true because they only
+        // add metadata, satisfying the blind append definition in the Delta protocol. The data
+        // file and data_change checks below only apply to data-writing transactions.
+        if self.add_files_metadata.is_empty() && !self.data_change {
+            return Ok(());
+        }
         require!(
             !self.add_files_metadata.is_empty(),
             Error::invalid_transaction_state("Blind append requires at least one added data file")
@@ -756,7 +780,12 @@ impl<S> Transaction<S> {
     pub fn add_files_schema(&self) -> &'static SchemaRef {
         &BASE_ADD_FILES_SCHEMA
     }
+}
 
+// =============================================================================
+// Data file methods -- only available on transaction types that support data files
+// =============================================================================
+impl<S: SupportsDataFiles> Transaction<S> {
     /// Returns the expected schema for file statistics.
     ///
     /// The schema structure is derived from table configuration:
@@ -948,7 +977,12 @@ impl<S> Transaction<S> {
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
     }
+}
 
+// =============================================================================
+// Internal methods available on ALL transaction types (used by commit path)
+// =============================================================================
+impl<S> Transaction<S> {
     /// Validate that add files have required statistics for clustering columns.
     ///
     /// Per the Delta protocol, writers MUST collect per-file statistics for clustering columns
@@ -1946,7 +1980,7 @@ mod tests {
     // ============================================================================
     // validate_blind_append tests
     // ============================================================================
-    fn add_dummy_file<S>(txn: &mut Transaction<S>) {
+    fn add_dummy_file<S: SupportsDataFiles>(txn: &mut Transaction<S>) {
         let data = string_array_to_engine_data(StringArray::from(vec!["dummy"]));
         txn.add_files(data);
     }
