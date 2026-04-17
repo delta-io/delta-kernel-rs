@@ -1,5 +1,20 @@
 //! This module provides functions for performing timestamp queries over the Delta Log, translating
 //! between timestamps and Delta versions.
+//!
+//! # Usage
+//!
+//! Use this module to:
+//! - Convert timestamps or timestamp ranges into Delta versions or version ranges
+//! - Perform time travel queries
+//! - Execute timestamp-based change data feed queries
+//!
+//! The history_manager module works with tables regardless of whether they have In-Commit
+//! Timestamps enabled.
+//!
+//! # Limitations
+//!
+//!  All timestamp queries are limited to the state captured in the [`Snapshot`]
+//! provided during construction.
 
 use tracing::info;
 
@@ -11,7 +26,8 @@ use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
-use crate::{Engine, Version};
+use crate::utils::require;
+use crate::{DeltaResult, Engine, Error as DeltaError, Version};
 
 pub(crate) mod search;
 
@@ -221,6 +237,163 @@ pub(crate) fn timestamp_to_version(
             }
         }
     }
+}
+
+/// Gets the latest version that occurs before or at the given `timestamp`.
+///
+/// This finds the version whose timestamp is less than or equal to `timestamp`.
+/// If no such version exists, returns [`LogHistoryError::TimestampOutOfRange`].
+///
+/// # Examples
+/// ```ignore
+/// use delta_kernel::snapshot::Snapshot;
+/// use delta_kernel::engine::default::DefaultEngine;
+/// use delta_kernel::history_manager::latest_version_as_of;
+///
+/// let engine = DefaultEngine::try_new(...)?;
+/// let snapshot = Snapshot::builder_for(table_uri).build(&engine)?;
+///
+/// // Get the latest version as of January 1, 2023
+/// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
+/// let version = latest_version_as_of(&snapshot, &engine, timestamp)?;
+/// ```
+#[tracing::instrument(skip(snapshot, engine), fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+pub fn latest_version_as_of(
+    snapshot: &Snapshot,
+    engine: &dyn Engine,
+    timestamp: Timestamp,
+) -> DeltaResult<Version> {
+    Ok(timestamp_to_version(
+        snapshot,
+        engine,
+        timestamp,
+        Bound::GreatestLower,
+    )?)
+}
+
+/// Gets the first version that occurs after the given `timestamp` (inclusive).
+///
+/// This finds the version whose timestamp is greater than or equal to `timestamp`.
+/// If no such version exists, returns [`LogHistoryError::TimestampOutOfRange`].
+///
+/// # Examples
+/// ```ignore
+/// use delta_kernel::snapshot::Snapshot;
+/// use delta_kernel::engine::default::DefaultEngine;
+/// use delta_kernel::history_manager::first_version_after;
+///
+/// let engine = DefaultEngine::try_new(...)?;
+/// let snapshot = Snapshot::builder_for(table_uri).build(&engine)?;
+///
+/// // Find the first version that occurred after January 1, 2023
+/// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
+/// let version = first_version_after(&snapshot, &engine, timestamp)?;
+/// ```
+#[tracing::instrument(skip(snapshot, engine), fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+pub fn first_version_after(
+    snapshot: &Snapshot,
+    engine: &dyn Engine,
+    timestamp: Timestamp,
+) -> DeltaResult<Version> {
+    Ok(timestamp_to_version(
+        snapshot,
+        engine,
+        timestamp,
+        Bound::LeastUpper,
+    )?)
+}
+
+/// Converts a timestamp range to a corresponding version range.
+///
+/// This function finds the version range that corresponds to the given timestamp range.
+/// The returned tuple contains:
+/// - The first (earliest) version with a timestamp greater than or equal to `start_timestamp`
+/// - If `end_timestamp` is provided, the version with a timestamp less than or equal to
+///   `end_timestamp`.
+///
+/// # Arguments
+/// * `engine` - The engine used to access version history
+/// * `start_timestamp` - The lower bound timestamp (inclusive)
+/// * `end_timestamp` - The optional upper bound timestamp (inclusive), or `None` to indicate no
+///   upper bound
+///
+/// # Returns
+/// A tuple containing the start version and optional end version (inclusive)
+///
+/// # Errors
+/// Returns [`LogHistoryError::TimestampOutOfRange`] if:
+/// - No version exists at or after `start_timestamp`
+/// - `end_timestamp` is provided and no version exists at or before it
+///
+/// Returns [`LogHistoryError::EmptyTimestampRange`] if the entire range falls between two commits.
+///
+/// # Examples
+/// ```ignore
+/// use delta_kernel::snapshot::Snapshot;
+/// use delta_kernel::engine::default::DefaultEngine;
+/// use delta_kernel::history_manager::timestamp_range_to_versions;
+///
+/// let engine = DefaultEngine::try_new(...)?;
+/// let snapshot = Snapshot::builder_for(table_uri).build(&engine)?;
+///
+/// // Find versions between January 1, 2023 and March 1, 2023
+/// let start_timestamp = 1672531200000; // Jan 1, 2023 (milliseconds since epoch)
+/// let end_timestamp = 1677628800000;   // Mar 1, 2023 (milliseconds since epoch)
+///
+/// let (start_version, end_version) =
+///     timestamp_range_to_versions(&snapshot, &engine, start_timestamp, Some(end_timestamp))?;
+/// ```
+#[tracing::instrument(skip(snapshot, engine), fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+pub fn timestamp_range_to_versions(
+    snapshot: &Snapshot,
+    engine: &dyn Engine,
+    start_timestamp: Timestamp,
+    end_timestamp: Option<Timestamp>,
+) -> DeltaResult<(Version, Option<Version>)> {
+    if let Some(end_timestamp) = end_timestamp {
+        // The `start_timestamp` must be no greater than the `end_timestamp`.
+        require!(
+            start_timestamp <= end_timestamp,
+            LogHistoryError::InvalidTimestampRange {
+                start_timestamp,
+                end_timestamp
+            }
+            .into()
+        );
+    }
+
+    // Convert the start timestamp to version
+    let start_version = first_version_after(snapshot, engine, start_timestamp)?;
+
+    // If the end timestamp is present, convert it to an end version
+    let end_version = end_timestamp
+        .map(|end| {
+            let end_version = latest_version_as_of(snapshot, engine, end)?;
+
+            // Verify that the start version is no greater than the end version. This can
+            // happen in the case that the entire timestamp range falls between two commits.
+            // Consider the following history:
+            // |-------------|--------------------|---------------|
+            // v4       start_timestamp      end_timestamp       v5
+            //
+            // The latest version as of the end_timestamp is 4. The first version after the
+            // start_timestamp is 5. Thus in the case where end_version < start_version, we
+            // return an [`LogHistoryError::EmptyTimestampRange`].
+            require!(
+                start_version <= end_version,
+                DeltaError::from(LogHistoryError::EmptyTimestampRange {
+                    end_timestamp: end,
+                    start_timestamp,
+                    between_left: end_version,
+                    between_right: start_version
+                })
+            );
+
+            Ok(end_version)
+        })
+        .transpose()?;
+
+    Ok((start_version, end_version))
 }
 
 #[cfg(test)]
@@ -613,5 +786,96 @@ mod tests {
         assert!(matches!(res, Ok(3)), "{res:?}");
         res = timestamp_to_version(&snapshot, &engine, 301, Bound::LeastUpper);
         assert!(matches!(res, Ok(4)), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn test_latest_version_as_of() {
+        let mock_table = mock_table().await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(mock_table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        // Timestamp matches exactly
+        let res = super::latest_version_as_of(&snapshot, &engine, 50);
+        assert!(matches!(res, Ok(0)), "{res:?}");
+
+        // Timestamp between commits
+        let res = super::latest_version_as_of(&snapshot, &engine, 100);
+        assert!(matches!(res, Ok(0)), "{res:?}");
+
+        // Timestamp after all commits
+        let res = super::latest_version_as_of(&snapshot, &engine, 1000);
+        assert!(matches!(res, Ok(4)), "{res:?}");
+
+        // Timestamp before all commits returns error
+        let res = super::latest_version_as_of(&snapshot, &engine, 0);
+        assert!(res.is_err(), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn test_first_version_after() {
+        let mock_table = mock_table().await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(mock_table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        // Timestamp matches exactly
+        let res = super::first_version_after(&snapshot, &engine, 50);
+        assert!(matches!(res, Ok(0)), "{res:?}");
+
+        // Timestamp between commits
+        let res = super::first_version_after(&snapshot, &engine, 100);
+        assert!(matches!(res, Ok(1)), "{res:?}");
+
+        // Timestamp before all commits
+        let res = super::first_version_after(&snapshot, &engine, 0);
+        assert!(matches!(res, Ok(0)), "{res:?}");
+
+        // Timestamp after all commits returns error
+        let res = super::first_version_after(&snapshot, &engine, 1000);
+        assert!(res.is_err(), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_range_to_versions() {
+        let mock_table = mock_table().await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(mock_table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        // Basic range spanning multiple versions
+        let res = super::timestamp_range_to_versions(&snapshot, &engine, 50, Some(300));
+        assert!(matches!(res, Ok((0, Some(3)))), "{res:?}");
+
+        // Range with no end timestamp
+        let res = super::timestamp_range_to_versions(&snapshot, &engine, 100, None);
+        assert!(matches!(res, Ok((1, None))), "{res:?}");
+
+        // Start equals end timestamp
+        let res = super::timestamp_range_to_versions(&snapshot, &engine, 150, Some(150));
+        assert!(matches!(res, Ok((1, Some(1)))), "{res:?}");
+
+        // Invalid range: start > end
+        let res = super::timestamp_range_to_versions(&snapshot, &engine, 300, Some(100));
+        assert!(
+            matches!(
+                res,
+                Err(crate::Error::LogHistory(ref e))
+                    if matches!(**e, LogHistoryError::InvalidTimestampRange { .. })
+            ),
+            "{res:?}"
+        );
+
+        // Empty range: entire range falls between two commits
+        // Timestamps 51-149 fall between v0 (ts=50) and v1 (ts=150)
+        let res = super::timestamp_range_to_versions(&snapshot, &engine, 51, Some(149));
+        assert!(
+            matches!(
+                res,
+                Err(crate::Error::LogHistory(ref e))
+                    if matches!(**e, LogHistoryError::EmptyTimestampRange { .. })
+            ),
+            "{res:?}"
+        );
     }
 }
