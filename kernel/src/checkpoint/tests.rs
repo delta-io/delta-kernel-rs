@@ -15,8 +15,7 @@ use crate::actions::{Add, Metadata, Protocol, Remove};
 use crate::arrow::array::{create_array, Array, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{DataType, Field, Schema};
 use crate::checkpoint::{
-    create_last_checkpoint_data, CheckpointActionStats, CheckpointWriter,
-    CHECKPOINT_ACTIONS_SCHEMA_V2,
+    create_last_checkpoint_data, CheckpointSummary, CheckpointWriter, CHECKPOINT_ACTIONS_SCHEMA_V2,
 };
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
@@ -257,11 +256,14 @@ fn try_finalize_checkpoint(
     metadata: &FileMeta,
     data_iter: ActionReconciliationIterator,
 ) -> DeltaResult<()> {
+    let version = writer.snapshot.version();
     let state = data_iter.state();
     drop(data_iter);
     let state = Arc::into_inner(state).expect("no other Arc references");
-    let stats = CheckpointActionStats::from_reconciliation_state(state)?;
-    writer.finalize(engine, metadata, &stats)
+    let size_in_bytes = i64::try_from(metadata.size).expect("size fits in i64");
+    let checkpoint_summary =
+        CheckpointSummary::from_reconciliation_state(version, size_in_bytes, state, 0)?;
+    writer.finalize(engine, &checkpoint_summary)
 }
 
 /// Helper to verify the contents of the `_last_checkpoint` file
@@ -459,11 +461,11 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
 
     /* The returned data iterator has batches that we do not consume */
 
-    // Attempting to build CheckpointActionStats from a non-exhausted state should fail
+    // Attempting to build CheckpointSummary from a non-exhausted state should fail
     let state = data_iter.state();
     drop(data_iter);
     let state = Arc::into_inner(state).expect("no other Arc references");
-    let err = CheckpointActionStats::from_reconciliation_state(state)
+    let err = CheckpointSummary::from_reconciliation_state(0, 0, state, 0)
         .expect_err("from_reconciliation_state should fail on non-exhausted iterator");
     assert!(err
         .to_string()
