@@ -26,7 +26,42 @@
 
 use std::borrow::Cow;
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
+/// Characters encoded by [`uri_encode_path`]: `%`, space, and ASCII chars illegal in a
+/// URI path, plus all ASCII controls via [`CONTROLS`]. Non-ASCII UTF-8 bytes pass through
+/// because [`AsciiSet`] is ASCII-only by construction.
+const HADOOP_URI_PATH_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+/// URI percent-encodes a Hive-escaped path to produce the string that belongs in
+/// `add.path`. After the Hive layer turns a partition value like `"a:b"` into `"a%3Ab"`,
+/// this turns that into `"a%253Ab"` — a valid URI whose single RFC 2396 decode yields the
+/// literal filesystem directory name `"a%3Ab"`.
+///
+/// Matches Hadoop `Path.toUri().toString()` for the ASCII Hive-escaped inputs produced by
+/// [`build_partition_path`], as used by kernel-java and Delta-Spark. Returns
+/// [`Cow::Borrowed`] when no encoding is needed (zero allocation fast path).
+/// See the module-level documentation in [`super`] for the full pipeline.
+pub(crate) fn uri_encode_path(hive_escaped: &str) -> Cow<'_, str> {
+    utf8_percent_encode(hive_escaped, HADOOP_URI_PATH_ENCODE_SET).into()
+}
 
 /// Placeholder for missing partition values in Hive-style directory paths.
 ///
@@ -567,5 +602,77 @@ mod tests {
             ]),
             "year=2025/region=__HIVE_DEFAULT_PARTITION__/country=US/"
         );
+    }
+
+    // ============================================================================
+    // uri_encode_path
+    // ============================================================================
+
+    /// Every ASCII byte: chars in `HADOOP_URI_PATH_ENCODE_SET` (space, `"`, `#`, `%`, `<`,
+    /// `>`, `?`, `[`, `\`, `]`, `^`, backtick, `{`, `|`, `}`) plus all controls encode to
+    /// `%XX`; everything else passes through unchanged.
+    #[test]
+    fn test_uri_encode_path_every_ascii_byte() {
+        let must_encode: &[u8] = b" \"#%<>?[\\]^`{|}";
+        for byte in 0x00..=0x7Fu8 {
+            let input = String::from(byte as char);
+            let result = uri_encode_path(&input);
+            let is_control = byte <= 0x1F || byte == 0x7F;
+            if must_encode.contains(&byte) || is_control {
+                assert_eq!(result, format!("%{:02X}", byte), "byte 0x{byte:02X}");
+            } else {
+                assert_eq!(result, input, "byte 0x{byte:02X}");
+            }
+        }
+    }
+
+    /// Multi-char contexts for URI-only chars, pinning that surrounding unreserved chars
+    /// pass through while the target gets encoded. Per-byte encoding decisions are covered
+    /// exhaustively by `test_uri_encode_path_every_ascii_byte`; this guards against a
+    /// refactor that only fails at character boundaries.
+    #[rstest]
+    #[case::backtick("a`b", "a%60b")]
+    #[case::right_brace("a}b", "a%7Db")]
+    #[case::double_quote("a\"b", "a%22b")]
+    #[case::space("hello world", "hello%20world")]
+    #[case::less_than("a<b", "a%3Cb")]
+    #[case::greater_than("a>b", "a%3Eb")]
+    #[case::pipe("a|b", "a%7Cb")]
+    fn test_uri_encode_path_encodes_uri_only_set(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(uri_encode_path(input), expected);
+    }
+
+    /// Composing Hive then URI encoding produces the `add.path` form. Pins the full
+    /// pipeline end-to-end, including mixed cases where a string contains both Hive- and
+    /// URI-encoded bytes after each step.
+    #[rstest]
+    #[case::colon("a:b", "a%3Ab", "a%253Ab")]
+    #[case::slash("US/East", "US%2FEast", "US%252FEast")]
+    #[case::percent("100%", "100%25", "100%2525")]
+    #[case::slash_percent("Serbia/srb%", "Serbia%2Fsrb%25", "Serbia%252Fsrb%2525")]
+    fn test_uri_encode_path_composes_with_hive(
+        #[case] raw: &str,
+        #[case] hive: &str,
+        #[case] add_path: &str,
+    ) {
+        let hive_escaped = escape_partition_value(raw);
+        assert_eq!(hive_escaped, hive);
+        assert_eq!(uri_encode_path(&hive_escaped), add_path);
+    }
+
+    /// Unreserved strings pass through byte-identical AND via the `Cow::Borrowed` fast
+    /// path, so no allocation occurs on the common partition-path input (dates, integers,
+    /// short alnum strings, the Hive null-partition placeholder).
+    #[rstest]
+    #[case::empty("")]
+    #[case::alnum("hello")]
+    #[case::partition_path("p=abc/q=def/")]
+    #[case::hive_default_partition("__HIVE_DEFAULT_PARTITION__")]
+    #[case::alnum_unreserved("A-Za-z0-9_.~")]
+    #[case::date("2024-01-15")]
+    fn test_uri_encode_path_unreserved_borrows_and_passes_through(#[case] input: &str) {
+        let result = uri_encode_path(input);
+        assert_eq!(result, input);
+        assert!(matches!(result, Cow::Borrowed(_)));
     }
 }
