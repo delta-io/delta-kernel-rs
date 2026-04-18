@@ -533,19 +533,13 @@ impl Snapshot {
 
         let file_meta = engine.storage_handler().head(&checkpoint_path)?;
 
-        // Build checkpoint summary from the iterator state, then finalize(writes
-        // `_last_checkpoint`).
+        // Build last-checkpoint stats from the iterator state, then finalize
+        // (writes `_last_checkpoint`).
         let state = Arc::into_inner(state).ok_or_else(|| {
             Error::internal_error("ActionReconciliationIteratorState Arc has other references")
         })?;
-        let size_in_bytes = i64::try_from(file_meta.size).map_err(|e| {
-            Error::CheckpointWrite(format!(
-                "Failed to convert checkpoint size in bytes from u64 {} to i64: {e}",
-                file_meta.size
-            ))
-        })?;
         let last_checkpoint_stats =
-            LastCheckpointHintStats::from_reconciliation_state(size_in_bytes, state, 0)?;
+            LastCheckpointHintStats::from_reconciliation_state(file_meta.size, state, 0)?;
         writer.finalize(engine, &last_checkpoint_stats)?;
 
         let checkpoint_log_path = ParsedLogPath::try_from(file_meta)?.ok_or_else(|| {

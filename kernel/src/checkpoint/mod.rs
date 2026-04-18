@@ -69,12 +69,9 @@
 //! // Build the [`LastCheckpointHintStats`] from the exhausted iterator state
 //! let state = std::sync::Arc::into_inner(state)
 //!     .ok_or(Error::internal_error("checkpoint state Arc still has other references"))?;
-//! // Convert u64 -> i64 for the `_last_checkpoint` hint format.
-//! let size_in_bytes = i64::try_from(metadata.size)
-//!     .map_err(|e| Error::generic(format!("size_in_bytes overflow: {e}")))?;
 //! let last_checkpoint_stats =
 //!     delta_kernel::checkpoint::LastCheckpointHintStats::from_reconciliation_state(
-//!         size_in_bytes,
+//!         metadata.size,
 //!         state,
 //!         0,
 //!     )?;
@@ -176,9 +173,11 @@ impl LastCheckpointHintStats {
     ///
     /// # Errors
     /// - If the reconciliation iterator has not been fully exhausted.
+    /// - If `size_in_bytes` exceeds `i64::MAX`.
+    /// - If `extra_actions_count` exceeds `i64::MAX`.
     /// - If `state.actions_count() + extra_actions_count` overflows `i64`.
     pub fn from_reconciliation_state(
-        size_in_bytes: i64,
+        size_in_bytes: u64,
         state: ActionReconciliationIteratorState,
         extra_actions_count: u64,
     ) -> DeltaResult<Self> {
@@ -188,6 +187,9 @@ impl LastCheckpointHintStats {
                  consumed and all data written to storage before finalizing",
             ));
         }
+        let size_in_bytes = i64::try_from(size_in_bytes).map_err(|e| {
+            Error::checkpoint_write(format!("size_in_bytes {size_in_bytes} exceeds i64: {e}"))
+        })?;
         let extra = i64::try_from(extra_actions_count).map_err(|e| {
             Error::checkpoint_write(format!(
                 "extra_actions_count {extra_actions_count} exceeds i64: {e}"
