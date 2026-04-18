@@ -7,7 +7,7 @@
 //! - [`LogState`] -- what log files exist on disk (commits, checkpoints, CRC)
 //! - [`FeatureSet`] -- which Delta table features are enabled
 //! - [`VersionTarget`] -- how the snapshot is loaded (latest, time travel, incremental)
-//! - [`DataLayoutConfig`] -- data layout (unpartitioned, partitioned by type)
+//! - [`DataLayoutConfig`] -- data layout (unpartitioned, partitioned, clustered)
 //!
 //! # Quick start
 //!
@@ -160,29 +160,49 @@ impl fmt::Display for FeatureSet {
 /// [`FeatureSet`].
 #[derive(Clone, Debug)]
 pub enum DataLayoutConfig {
-    /// No partition columns (default schema).
+    /// No special data layout (default schema).
     Unpartitioned,
-    /// Partition by every valid primitive type: ts_ntz, bool, string, date, int, long,
-    /// decimal, timestamp. Uses [`partitioned_schema`] with all columns as partition columns.
-    AllTypes,
+    /// Partition by every valid primitive type. Uses [`partitioned_schema`] with all columns
+    /// as partition columns.
+    PartitionedAllTypes,
+    /// Cluster by every stats-eligible primitive type. Uses [`clustered_schema`] with all
+    /// clustering-eligible columns. Boolean and Binary are excluded (not stats-eligible).
+    ClusteredAllTypes,
 }
 
 impl DataLayoutConfig {
-    /// The partition column names for this config, referencing [`partitioned_schema`] columns.
-    pub fn columns(&self) -> Vec<&'static str> {
+    /// The layout column names (partition or clustering) for this config. Returns all
+    /// schema columns except the `"value"` data column.
+    pub fn columns(&self) -> Vec<String> {
+        let schema = match self {
+            DataLayoutConfig::Unpartitioned => return vec![],
+            DataLayoutConfig::PartitionedAllTypes => partitioned_schema(),
+            DataLayoutConfig::ClusteredAllTypes => clustered_schema(),
+        };
+        schema
+            .fields()
+            .filter(|f| f.name() != "value")
+            .map(|f| f.name().to_string())
+            .collect()
+    }
+
+    /// The schema for this config.
+    pub fn schema(&self) -> SchemaRef {
         match self {
-            DataLayoutConfig::Unpartitioned => vec![],
-            DataLayoutConfig::AllTypes => vec![
-                "part_bool",
-                "part_int",
-                "part_long",
-                "part_string",
-                "part_date",
-                "part_ts",
-                "part_ts_ntz",
-                "part_decimal",
-            ],
+            DataLayoutConfig::Unpartitioned => default_schema(),
+            DataLayoutConfig::PartitionedAllTypes => partitioned_schema(),
+            DataLayoutConfig::ClusteredAllTypes => clustered_schema(),
         }
+    }
+
+    /// Whether this config uses partitioning.
+    pub fn is_partitioned(&self) -> bool {
+        matches!(self, DataLayoutConfig::PartitionedAllTypes)
+    }
+
+    /// Whether this config uses clustering.
+    pub fn is_clustered(&self) -> bool {
+        matches!(self, DataLayoutConfig::ClusteredAllTypes)
     }
 }
 
@@ -190,7 +210,8 @@ impl fmt::Display for DataLayoutConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DataLayoutConfig::Unpartitioned => write!(f, "unpartitioned"),
-            DataLayoutConfig::AllTypes => write!(f, "partitioned(all_types)"),
+            DataLayoutConfig::PartitionedAllTypes => write!(f, "partitioned(all_types)"),
+            DataLayoutConfig::ClusteredAllTypes => write!(f, "clustered(all_types)"),
         }
     }
 }
@@ -200,16 +221,43 @@ impl fmt::Display for DataLayoutConfig {
 /// `timestampNtz` table feature.
 pub fn partitioned_schema() -> SchemaRef {
     Arc::new(StructType::new_unchecked(vec![
-        // Partition-candidate columns (all valid partition types)
+        // Partition-candidate columns (all valid partition types, matches write_partitioned.rs)
         StructField::new("part_bool", DataType::BOOLEAN, true),
+        StructField::new("part_byte", DataType::BYTE, true),
+        StructField::new("part_short", DataType::SHORT, true),
         StructField::new("part_int", DataType::INTEGER, true),
         StructField::new("part_long", DataType::LONG, true),
+        StructField::new("part_float", DataType::FLOAT, true),
+        StructField::new("part_double", DataType::DOUBLE, true),
         StructField::new("part_string", DataType::STRING, true),
+        StructField::new("part_binary", DataType::BINARY, true),
         StructField::new("part_date", DataType::DATE, true),
         StructField::new("part_ts", DataType::TIMESTAMP, true),
         StructField::new("part_ts_ntz", DataType::TIMESTAMP_NTZ, true),
         StructField::new("part_decimal", DataType::decimal(10, 2).unwrap(), true),
         // Non-partition data column (required: at least one non-partition column)
+        StructField::new("value", DataType::INTEGER, true),
+    ]))
+}
+
+/// Schema with all stats-eligible primitive types for clustering. Boolean and Binary are
+/// excluded (not stats-eligible). Includes `TimestampNtz` which auto-enables the
+/// `timestampNtz` table feature.
+pub fn clustered_schema() -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        // Clustering-eligible columns (stats-eligible primitive types)
+        StructField::new("clust_byte", DataType::BYTE, true),
+        StructField::new("clust_short", DataType::SHORT, true),
+        StructField::new("clust_int", DataType::INTEGER, true),
+        StructField::new("clust_long", DataType::LONG, true),
+        StructField::new("clust_float", DataType::FLOAT, true),
+        StructField::new("clust_double", DataType::DOUBLE, true),
+        StructField::new("clust_string", DataType::STRING, true),
+        StructField::new("clust_date", DataType::DATE, true),
+        StructField::new("clust_ts", DataType::TIMESTAMP, true),
+        StructField::new("clust_ts_ntz", DataType::TIMESTAMP_NTZ, true),
+        StructField::new("clust_decimal", DataType::decimal(10, 2).unwrap(), true),
+        // Non-clustering data column
         StructField::new("value", DataType::INTEGER, true),
     ]))
 }
@@ -258,6 +306,7 @@ pub struct TestTableBuilder {
     features: FeatureSet,
     schema: SchemaRef,
     partition_columns: Vec<String>,
+    clustering_columns: Vec<String>,
     num_data_files: usize,
     rows_per_file: usize,
 }
@@ -277,6 +326,7 @@ impl TestTableBuilder {
             features: FeatureSet::empty(),
             schema: default_schema(),
             partition_columns: Vec::new(),
+            clustering_columns: Vec::new(),
             num_data_files: 1,
             rows_per_file: 10,
         }
@@ -310,23 +360,42 @@ impl TestTableBuilder {
 
     /// Set partition columns by logical name. The columns must exist in the schema.
     /// Each data file gets deterministic partition values derived from version and file index.
+    /// Clears any previously set clustering columns (partitioning and clustering are mutually
+    /// exclusive).
     pub fn with_partition_columns(
         mut self,
         cols: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         self.partition_columns = cols.into_iter().map(Into::into).collect();
+        self.clustering_columns.clear();
         self
     }
 
-    /// Apply a [`DataLayoutConfig`], setting the schema and partition columns accordingly.
+    /// Set clustering columns by logical name. The columns must exist in the schema and
+    /// have stats-eligible types. Clears any previously set partition columns (partitioning
+    /// and clustering are mutually exclusive).
+    pub fn with_clustering_columns(
+        mut self,
+        cols: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.clustering_columns = cols.into_iter().map(Into::into).collect();
+        self.partition_columns.clear();
+        self
+    }
+
+    /// Apply a [`DataLayoutConfig`], setting the schema and layout columns accordingly.
     /// For [`DataLayoutConfig::Unpartitioned`], leaves the schema and columns unchanged.
     pub fn with_data_layout(self, config: DataLayoutConfig) -> Self {
         let cols = config.columns();
         if cols.is_empty() {
             return self;
         }
-        self.with_schema(partitioned_schema())
-            .with_partition_columns(cols)
+        let builder = self.with_schema(config.schema());
+        if config.is_clustered() {
+            builder.with_clustering_columns(cols)
+        } else {
+            builder.with_partition_columns(cols)
+        }
     }
 
     /// Build the table and return a [`TestTable`] handle to the store.
@@ -364,6 +433,10 @@ impl TestTableBuilder {
         if !self.partition_columns.is_empty() {
             builder = builder.with_data_layout(DataLayout::partitioned(
                 self.partition_columns.iter().map(|s| s.as_str()),
+            ));
+        } else if !self.clustering_columns.is_empty() {
+            builder = builder.with_data_layout(DataLayout::clustered(
+                self.clustering_columns.iter().map(|s| s.as_str()),
             ));
         }
         let committed = builder
@@ -404,9 +477,10 @@ impl TestTableBuilder {
 // ===========================================================================
 
 /// Write a data commit using kernel's transaction + write_parquet path.
-/// Produces `num_files` parquet files with `rows_per_file` rows each. For partition
-/// columns, all rows in a file share the same value (matching the declared partition
-/// values); non-partition columns get varying data.
+/// Produces `num_files` parquet files with `rows_per_file` rows each. For partitioned
+/// tables, all rows in a file share the same partition values; for unpartitioned or
+/// clustered tables, uses `unpartitioned_write_context`. Non-partition columns get
+/// varying data derived from version and file index.
 async fn write_data_commit(
     snapshot: Arc<Snapshot>,
     engine: &DefaultEngine<TokioBackgroundExecutor>,
@@ -866,16 +940,22 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_partitioned_table() -> DeltaResult<()> {
-        let data_layout_config = DataLayoutConfig::AllTypes;
+    #[rstest::rstest]
+    #[case::partitioned(DataLayoutConfig::PartitionedAllTypes, partitioned_schema())]
+    #[case::clustered(DataLayoutConfig::ClusteredAllTypes, clustered_schema())]
+    fn test_data_layout_table(
+        #[case] config: DataLayoutConfig,
+        #[case] expected_schema: SchemaRef,
+    ) -> DeltaResult<()> {
+        // 2 versions means v0 (create_table) + v1 (1 data commit with 10 rows)
         let table = TestTableBuilder::new()
             .with_log_state(LogState::with_commits(2))
-            .with_data_layout(data_layout_config)
+            .with_data_layout(config)
             .build()?;
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
         assert_eq!(snap.version(), 1);
+        assert_eq!(snap.schema(), expected_schema);
         let scan = snap.scan_builder().build()?;
         let engine_arc: Arc<dyn delta_kernel::Engine> =
             Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
@@ -883,6 +963,54 @@ mod tests {
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 10);
         Ok(())
+    }
+
+    #[test]
+    fn test_clustered_table_multiple_versions() -> DeltaResult<()> {
+        // v0=create, v1-v3=data commits, 10 rows each
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_commits(4))
+            .with_data_layout(DataLayoutConfig::ClusteredAllTypes)
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 3);
+        let scan = snap.scan_builder().build()?;
+        let engine_arc: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let batches = crate::read_scan(&scan, engine_arc)?;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 30);
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_clustering_columns_directly() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_commits(2))
+            .with_schema(clustered_schema())
+            .with_clustering_columns(["clust_int", "clust_string"])
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 1);
+        assert_eq!(snap.schema(), clustered_schema());
+        Ok(())
+    }
+
+    #[test]
+    fn test_layout_columns_are_mutually_exclusive() {
+        let builder = TestTableBuilder::new()
+            .with_partition_columns(["col_a"])
+            .with_clustering_columns(["col_b"]);
+        assert!(builder.partition_columns.is_empty());
+        assert_eq!(builder.clustering_columns, vec!["col_b"]);
+
+        let builder = TestTableBuilder::new()
+            .with_clustering_columns(["col_a"])
+            .with_partition_columns(["col_b"]);
+        assert!(builder.clustering_columns.is_empty());
+        assert_eq!(builder.partition_columns, vec!["col_b"]);
     }
 
     #[test]
