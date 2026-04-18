@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::action_reconciliation::{
     deleted_file_retention_timestamp_with_time, ActionReconciliationIterator,
-    DEFAULT_RETENTION_SECS,
+    ActionReconciliationIteratorState, DEFAULT_RETENTION_SECS,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
 use crate::arrow::array::{create_array, Array, AsArray, RecordBatch, StructArray};
@@ -260,9 +260,8 @@ fn try_finalize_checkpoint(
     let state = data_iter.state();
     drop(data_iter);
     let state = Arc::into_inner(state).expect("no other Arc references");
-    let size_in_bytes = i64::try_from(metadata.size).expect("size fits in i64");
     let last_checkpoint_stats =
-        LastCheckpointHintStats::from_reconciliation_state(size_in_bytes, state, 0)?;
+        LastCheckpointHintStats::from_reconciliation_state(metadata.size, state, 0)?;
     writer.finalize(engine, &last_checkpoint_stats)
 }
 
@@ -472,6 +471,58 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
         .contains("reconciliation iterator must be fully consumed"));
 
     Ok(())
+}
+
+#[test]
+fn test_last_checkpoint_hint_stats_with_nonzero_extra_actions() -> DeltaResult<()> {
+    let state = ActionReconciliationIteratorState::new_exhausted(5, 2);
+    let stats = LastCheckpointHintStats::from_reconciliation_state(100, state, 3)?;
+    assert_eq!(stats.size, 8); // 5 reconciled + 3 extra
+    assert_eq!(stats.size_in_bytes, 100);
+    assert_eq!(stats.num_of_add_files, 2); // extras do not bump this
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::extra_actions_exceeds_i64(
+    0,
+    0,
+    0,
+    u64::MAX,
+    "extra_actions_count 18446744073709551615 exceeds i64"
+)]
+#[case::actions_count_overflow(
+    i64::MAX,
+    0,
+    0,
+    1,
+    "checkpoint action count overflowed i64: 9223372036854775807 + 1"
+)]
+#[case::size_in_bytes_exceeds_i64(
+    0,
+    0,
+    u64::MAX,
+    0,
+    "size_in_bytes 18446744073709551615 exceeds i64"
+)]
+fn test_last_checkpoint_hint_stats_rejects_invalid_input(
+    #[case] actions_count: i64,
+    #[case] add_actions_count: i64,
+    #[case] size_in_bytes: u64,
+    #[case] extra_actions_count: u64,
+    #[case] expected_err_substring: &str,
+) {
+    let state = ActionReconciliationIteratorState::new_exhausted(actions_count, add_actions_count);
+    let err = LastCheckpointHintStats::from_reconciliation_state(
+        size_in_bytes,
+        state,
+        extra_actions_count,
+    )
+    .expect_err("invalid input must error");
+    assert!(
+        err.to_string().contains(expected_err_substring),
+        "error should mention {expected_err_substring}, got: {err}"
+    );
 }
 
 /// Tests the `checkpoint()` API with:

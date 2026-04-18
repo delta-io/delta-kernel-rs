@@ -112,6 +112,16 @@ impl ActionReconciliationIteratorState {
     pub fn is_exhausted(&self) -> bool {
         self.is_exhausted.load(Ordering::Acquire)
     }
+
+    /// Test helper that produces a state with the given counts and marked exhausted.
+    #[cfg(test)]
+    pub(crate) fn new_exhausted(actions_count: i64, add_actions_count: i64) -> Self {
+        Self {
+            actions_count: AtomicI64::new(actions_count),
+            add_actions_count: AtomicI64::new(add_actions_count),
+            is_exhausted: AtomicBool::new(true),
+        }
+    }
 }
 
 /// Iterator over action reconciliation data.
