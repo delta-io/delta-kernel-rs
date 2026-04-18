@@ -142,12 +142,15 @@ mod tests;
 /// Information about a freshly-written checkpoint. Pass it to
 /// [`CheckpointWriter::finalize`] to produce the `_last_checkpoint` hint file.
 ///
-/// Unlike [`LastCheckpointHint`] (which models what a reader parses from disk, where
-/// some fields may be missing in older hint files), every field here is required and
-/// populated at write time. Note this is a kernel requirement; the Delta protocol itself
-/// marks some of these fields as optional in the `_last_checkpoint` hint.
+/// Unlike [`LastCheckpointHint`], which is used on the read path and has many optional
+/// fields, this struct focuses on the write path and all fields are required. Note this
+/// is a kernel requirement; the Delta protocol itself marks some of these fields as
+/// optional in the `_last_checkpoint` hint. See the [Last Checkpoint File Schema] for
+/// more details.
 ///
 /// Construct via [`LastCheckpointHintStats::from_reconciliation_state`].
+///
+/// [Last Checkpoint File Schema]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#last-checkpoint-file-schema
 #[derive(Debug)]
 pub struct LastCheckpointHintStats {
     /// The total number of actions stored in the checkpoint (including actions created
@@ -481,10 +484,10 @@ impl CheckpointWriter {
     ///
     /// # Parameters
     /// - `engine`: Implementation of [`Engine`] APIs.
-    /// - `last_checkpoint_stats`: The [`LastCheckpointHintStats`] containing all fields needed to
-    ///   write the `_last_checkpoint` file.
+    /// - `last_checkpoint_stats`: The [`LastCheckpointHintStats`] containing fields needed to write
+    ///   the `_last_checkpoint` file.
     ///
-    /// # Returns: `Ok` if the checkpoint was successfully finalized.
+    /// # Returns: `Ok` if the checkpoint was successfully finalized
     // Internally, this method:
     // 1. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
     // 2. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the delta log

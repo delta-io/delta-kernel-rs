@@ -525,8 +525,13 @@ impl Snapshot {
         let state = Arc::into_inner(state).ok_or_else(|| {
             Error::internal_error("ActionReconciliationIteratorState Arc has other references")
         })?;
-        let last_checkpoint_stats =
-            LastCheckpointHintStats::from_reconciliation_state(file_meta.size, state, 0)?;
+        // As we are not writing sidecars, all actions go through the reconciliation
+        // iterator, so no extras are needed.
+        let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
+            file_meta.size,
+            state,
+            0, /* extra_actions_count */
+        )?;
         writer.finalize(engine, &last_checkpoint_stats)?;
 
         let checkpoint_log_path = ParsedLogPath::try_from(file_meta)?.ok_or_else(|| {
