@@ -24,10 +24,11 @@
 //!
 //! 1. Create a [`CheckpointWriter`] using [`Snapshot::create_checkpoint_writer`]
 //! 2. Get the checkpoint path from [`CheckpointWriter::checkpoint_path`]
-//! 2. Get the checkpoint data from [`CheckpointWriter::checkpoint_data`]
-//! 3. Write the data to the path in object storage (engine-specific)
-//! 4. Collect metadata ([`FileMeta`]) from the write operation
-//! 5. Pass the metadata and exhausted data iterator to [`CheckpointWriter::finalize`]
+//! 3. Get the checkpoint data from [`CheckpointWriter::checkpoint_data`]
+//! 4. Write the data to the path in object storage (engine-specific)
+//! 5. Collect metadata ([`FileMeta`]) from the write operation
+//! 6. Build a [`LastCheckpointHintStats`] from the exhausted iterator state
+//! 7. Pass the [`LastCheckpointHintStats`] to [`CheckpointWriter::finalize`]
 //!
 //! ```no_run
 //! # use std::sync::Arc;
@@ -40,7 +41,7 @@
 //! # use delta_kernel::Error;
 //! # use delta_kernel::FileMeta;
 //! # use url::Url;
-//! fn write_checkpoint_file(path: Url, data: &mut ActionReconciliationIterator) -> DeltaResult<FileMeta> {
+//! fn write_checkpoint_file(path: Url, data: ActionReconciliationIterator) -> DeltaResult<FileMeta> {
 //!     todo!() /* engine-specific logic to write data to object storage*/
 //! }
 //!
@@ -51,22 +52,32 @@
 //! let snapshot = Snapshot::builder_for(url).build(engine)?;
 //!
 //! // Create a checkpoint writer from the snapshot
-//! let mut writer = snapshot.create_checkpoint_writer()?;
+//! let writer = snapshot.create_checkpoint_writer()?;
 //!
 //! // Get the checkpoint path and data
 //! let checkpoint_path = writer.checkpoint_path()?;
 //! let checkpoint_data = writer.checkpoint_data(engine)?;
 //!
-//! // Get the iterator state
+//! // Get the iterator state before consuming the data
 //! let state = checkpoint_data.state();
 //!
 //! // Write the checkpoint data to the object store and collect metadata
-//! let metadata: FileMeta = write_checkpoint_file(checkpoint_path, &mut checkpoint_data)?;
-//!
+//! // The write function consumes the iterator, dropping its Arc reference to the state.
+//! let metadata: FileMeta = write_checkpoint_file(checkpoint_path, checkpoint_data)?;
 //! /* IMPORTANT: All data must be written before finalizing the checkpoint */
 //!
-//! // Finalize the checkpoint by passing the metadata and state handle
-//! writer.finalize(engine, &metadata, &state)?;
+//! // Build the [`LastCheckpointHintStats`] from the exhausted iterator state
+//! let state = std::sync::Arc::into_inner(state)
+//!     .ok_or(Error::internal_error("checkpoint state Arc still has other references"))?;
+//! let last_checkpoint_stats =
+//!     delta_kernel::checkpoint::LastCheckpointHintStats::from_reconciliation_state(
+//!         metadata.size,
+//!         state,
+//!         0,
+//!     )?;
+//!
+//! // Finalize the checkpoint by passing the stats
+//! writer.finalize(engine, &last_checkpoint_stats)?;
 //!
 //! # Ok::<_, Error>(())
 //! ```
@@ -82,6 +93,7 @@
 //! in the future, we can revisit this decision.
 //!
 //! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
+//! [`FileMeta`]: crate::FileMeta
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
 // Future extensions:
@@ -113,7 +125,7 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _}
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
+use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension};
 
 mod checkpoint_transform;
 #[allow(unused)]
@@ -126,6 +138,79 @@ use checkpoint_transform::{
 };
 #[cfg(test)]
 mod tests;
+
+/// Information about a freshly-written checkpoint. Pass it to
+/// [`CheckpointWriter::finalize`] to produce the `_last_checkpoint` hint file.
+///
+/// Unlike [`LastCheckpointHint`], which is used on the read path and has many optional
+/// fields, this struct focuses on the write path and all fields are required. Note this
+/// is a kernel requirement; the Delta protocol itself marks some of these fields as
+/// optional in the `_last_checkpoint` hint. See the [Last Checkpoint File Schema] for
+/// more details.
+///
+/// Construct via [`LastCheckpointHintStats::from_reconciliation_state`].
+///
+/// [Last Checkpoint File Schema]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#last-checkpoint-file-schema
+#[derive(Debug)]
+pub struct LastCheckpointHintStats {
+    /// The total number of actions stored in the checkpoint (including actions created
+    /// outside the reconciliation iterator, e.g. sidecar actions).
+    size: i64,
+    /// The total size in bytes of the checkpoint. For V2 checkpoint with sidecars,
+    /// this is the sum of the main checkpoint file size and all sidecar file sizes.
+    size_in_bytes: i64,
+    /// The number of Add-file actions in the checkpoint.
+    num_of_add_files: i64,
+}
+
+impl LastCheckpointHintStats {
+    /// Constructs a `LastCheckpointHintStats` from the fully-exhausted reconciliation state.
+    ///
+    /// # Parameters
+    /// - `size_in_bytes`: total byte size of the checkpoint. For V2 checkpoints with sidecars, the
+    ///   caller should include the main checkpoint file size plus all sidecar file sizes.
+    /// - `state`: fully-exhausted reconciliation iterator state. All data must have been written to
+    ///   storage before calling this.
+    /// - `extra_actions_count`: count of actions created outside the reconciliation iterator (e.g.
+    ///   sidecar actions). Use `0` for checkpoints with no such extra actions.
+    ///
+    /// # Errors
+    /// - If the reconciliation iterator has not been fully exhausted.
+    /// - If `size_in_bytes` exceeds `i64::MAX`.
+    /// - If `extra_actions_count` exceeds `i64::MAX`.
+    /// - If `state.actions_count() + extra_actions_count` overflows `i64`.
+    pub fn from_reconciliation_state(
+        size_in_bytes: u64,
+        state: ActionReconciliationIteratorState,
+        extra_actions_count: u64,
+    ) -> DeltaResult<Self> {
+        if !state.is_exhausted() {
+            return Err(Error::checkpoint_write(
+                "Cannot build LastCheckpointHintStats: the reconciliation iterator must be fully \
+                 consumed and all data written to storage before finalizing",
+            ));
+        }
+        let size_in_bytes = i64::try_from(size_in_bytes).map_err(|e| {
+            Error::checkpoint_write(format!("size_in_bytes {size_in_bytes} exceeds i64: {e}"))
+        })?;
+        let extra = i64::try_from(extra_actions_count).map_err(|e| {
+            Error::checkpoint_write(format!(
+                "extra_actions_count {extra_actions_count} exceeds i64: {e}"
+            ))
+        })?;
+        let size = state.actions_count().checked_add(extra).ok_or_else(|| {
+            Error::checkpoint_write(format!(
+                "checkpoint action count overflowed i64: {} + {extra_actions_count}",
+                state.actions_count()
+            ))
+        })?;
+        Ok(Self {
+            size,
+            size_in_bytes,
+            num_of_add_files: state.add_actions_count(),
+        })
+    }
+}
 
 /// Schemas and configs needed for building the checkpoint read/output schemas.
 struct CheckpointSchemaContext {
@@ -285,7 +370,7 @@ impl CheckpointWriter {
     ///
     /// The returned [`ActionReconciliationIterator`] yields [`FilteredEngineData`] batches with
     /// stats transforms already applied. Use [`ActionReconciliationIterator::state`] to get the
-    /// shared state for passing to [`CheckpointWriter::finalize`].
+    /// shared state for building a [`LastCheckpointHintStats`] after the iterator is exhausted.
     ///
     /// # Engine Usage
     ///
@@ -296,7 +381,12 @@ impl CheckpointWriter {
     ///     let data = batch?.apply_selection_vector()?;
     ///     parquet_writer.write(&data).await?;
     /// }
-    /// writer.finalize(&engine, &metadata, &state)?;
+    /// drop(checkpoint_data);
+    /// let state = Arc::into_inner(state)
+    ///     .ok_or(Error::internal_error("checkpoint state Arc still has other references"))?;
+    /// let last_checkpoint_stats =
+    ///     LastCheckpointHintStats::from_reconciliation_state(size_in_bytes, state, 0)?;
+    /// writer.finalize(&engine, &last_checkpoint_stats)?;
     /// ```
     // Implementation overview:
     // 1. Determines whether to write a V1 or V2 checkpoint based on `v2Checkpoints` feature
@@ -393,28 +483,19 @@ impl CheckpointWriter {
     /// 2. All data has been successfully written to object storage
     ///
     /// # Parameters
-    /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `metadata`: The metadata of the written checkpoint file
-    /// - `checkpoint_iter_state`: The state of the checkpoint data iterator
+    /// - `engine`: Implementation of [`Engine`] APIs.
+    /// - `last_checkpoint_stats`: The [`LastCheckpointHintStats`] containing fields needed to write
+    ///   the `_last_checkpoint` file.
     ///
     /// # Returns: `Ok` if the checkpoint was successfully finalized
     // Internally, this method:
-    // 1. Validates that the checkpoint data iterator is fully exhausted
-    // 2. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
-    // 3. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the delta log
+    // 1. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
+    // 2. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the delta log
     pub fn finalize(
         self,
         engine: &dyn Engine,
-        metadata: &FileMeta,
-        checkpoint_iter_state: &ActionReconciliationIteratorState,
+        last_checkpoint_stats: &LastCheckpointHintStats,
     ) -> DeltaResult<()> {
-        // Ensure the checkpoint data iterator is fully exhausted
-        if !checkpoint_iter_state.is_exhausted() {
-            return Err(Error::checkpoint_write(
-                "The checkpoint data iterator must be fully consumed and written to storage before calling finalize"
-            ));
-        }
-
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
         // checkpoint, to avoid regressing the hint.
         let checkpoint_version = self.snapshot.version();
@@ -429,19 +510,12 @@ impl CheckpointWriter {
             }
         }
 
-        let size_in_bytes = i64::try_from(metadata.size).map_err(|e| {
-            Error::CheckpointWrite(format!(
-                "Failed to convert checkpoint size in bytes from u64 {} to i64: {}, when writing _last_checkpoint",
-                metadata.size, e
-            ))
-        })?;
-
         let data = create_last_checkpoint_data(
             engine,
             self.version,
-            checkpoint_iter_state.actions_count(),
-            checkpoint_iter_state.add_actions_count(),
-            size_in_bytes,
+            last_checkpoint_stats.size,
+            last_checkpoint_stats.num_of_add_files,
+            last_checkpoint_stats.size_in_bytes,
         );
 
         let last_checkpoint_path = LastCheckpointHint::path(&self.snapshot.log_segment().log_root)?;
