@@ -1,0 +1,270 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    },
+    "timestamp_ntz": {
+      "type": "struct",
+      "fields": [{"name": "ts", "type": "timestamp_ntz", "nullable": true, "metadata": {}}]
+    },
+    "timestamp_ntz_array": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "ts",
+          "type": {"type": "array", "elementType": "timestamp_ntz", "containsNull": true},
+          "nullable": true,
+          "metadata": {}
+        }
+      ]
+    },
+    "timestamp_ntz_widened_from_date": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "ts",
+          "type": "timestamp_ntz",
+          "nullable": true,
+          "metadata": {"delta.typeChanges": [{"fromType": "date", "toType": "timestamp_ntz"}]}
+        }
+      ]
+    }
+  },
+  "$protocols": {
+    "ntz_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["timestampNtz"],
+      "writerFeatures": ["timestampNtz"]
+    },
+    "ntz_and_type_widening_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["timestampNtz", "typeWidening"],
+      "writerFeatures": ["timestampNtz", "typeWidening"]
+    },
+    "type_widening_only_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["typeWidening"],
+      "writerFeatures": ["typeWidening"]
+    },
+    "modern_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    },
+    "legacy_1_2": {"minReaderVersion": 1, "minWriterVersion": 2}
+  },
+  "$notes": {
+    "ntz_schema_requires_feature": "The spec requires timestampNtz to be listed in both readerFeatures and writerFeatures when the schema contains timestamp_ntz columns. A timestamp_ntz schema without the feature listed is an explicitly invalid table state; failure is spec-grounded rather than errata."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "timestamp_ntz_create_table_3_7_feature_listed_succeeds",
+      "feature": "timestampNtz",
+      "description": "Creating a (3,7)+[timestampNtz] table with a timestamp_ntz column succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.ntz_3_7",
+        "metadata": {"schemaString": "$schemas.timestamp_ntz"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "timestamp_ntz_create_table_1_2_with_ntz_schema_fails",
+      "feature": "timestampNtz",
+      "flavor": "insufficient_protocol",
+      "description": "Creating a (1,2) table with a timestamp_ntz column fails; timestampNtz requires minReaderVersion=3, minWriterVersion=7, and the feature in both feature lists.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_2",
+        "metadata": {"schemaString": "$schemas.timestamp_ntz"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 3,
+      "name": "timestamp_ntz_create_table_3_7_no_feature_listed_with_schema_fails",
+      "feature": "timestampNtz",
+      "flavor": "orphan",
+      "description": "Creating a (3,7) table with a timestamp_ntz column but timestampNtz absent from both feature lists fails.",
+      "note": "$notes.ntz_schema_requires_feature",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7",
+        "metadata": {"schemaString": "$schemas.timestamp_ntz"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 4,
+      "name": "timestamp_ntz_read_snapshot_3_7_feature_listed_succeeds",
+      "feature": "timestampNtz",
+      "description": "Reading a (3,7)+[timestampNtz] table with a timestamp_ntz column succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.ntz_3_7"},
+          {"metaData": {"schemaString": "$schemas.timestamp_ntz"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "timestamp_ntz_read_snapshot_3_7_nested_in_array_succeeds",
+      "feature": "timestampNtz",
+      "description": "Reading a (3,7)+[timestampNtz] table with a timestamp_ntz array element column succeeds; the feature requirement applies regardless of nesting depth.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.ntz_3_7"},
+          {"metaData": {"schemaString": "$schemas.timestamp_ntz_array"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "timestamp_ntz_supported_not_active_read_snapshot_succeeds",
+      "feature": "timestampNtz",
+      "flavor": "supported_not_active",
+      "description": "Reading a (3,7)+[timestampNtz] table with no timestamp_ntz columns in the schema succeeds.",
+      "note": "timestampNtz is active only when the schema contains at least one timestamp_ntz column.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.ntz_3_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "timestamp_ntz_read_snapshot_3_7_no_feature_listed_with_schema_fails",
+      "feature": "timestampNtz",
+      "flavor": "orphan",
+      "description": "Reading a (3,7) table with a timestamp_ntz column but timestampNtz absent from both feature lists fails.",
+      "note": "$notes.ntz_schema_requires_feature",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {"metaData": {"schemaString": "$schemas.timestamp_ntz"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 8,
+      "name": "timestamp_ntz_read_snapshot_1_2_with_ntz_schema_fails",
+      "feature": "timestampNtz",
+      "flavor": "insufficient_protocol",
+      "description": "Reading a (1,2) table with a timestamp_ntz column fails; the protocol is insufficient to support timestampNtz.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_2"},
+          {"metaData": {"schemaString": "$schemas.timestamp_ntz"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 9,
+      "name": "timestamp_ntz_empty_commit_3_7_feature_listed_succeeds",
+      "feature": "timestampNtz",
+      "description": "Appending to a (3,7)+[timestampNtz] table with a timestamp_ntz column succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.ntz_3_7"},
+          {"metaData": {"schemaString": "$schemas.timestamp_ntz"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 10,
+      "name": "timestamp_ntz_empty_commit_supported_not_active_succeeds",
+      "feature": "timestampNtz",
+      "flavor": "supported_not_active",
+      "description": "Appending to a (3,7)+[timestampNtz] table with no timestamp_ntz columns in the schema succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.ntz_3_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 11,
+      "name": "timestamp_ntz_empty_commit_3_7_no_feature_listed_with_schema_fails",
+      "feature": "timestampNtz",
+      "flavor": "orphan",
+      "description": "Appending to a (3,7) table with a timestamp_ntz column but timestampNtz absent from both feature lists fails.",
+      "note": "$notes.ntz_schema_requires_feature",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {"metaData": {"schemaString": "$schemas.timestamp_ntz"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 12,
+      "name": "timestamp_ntz_empty_commit_1_2_with_ntz_schema_fails",
+      "feature": "timestampNtz",
+      "flavor": "insufficient_protocol",
+      "description": "Appending to a (1,2) table with a timestamp_ntz column fails; the protocol is insufficient to support timestampNtz.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_2"},
+          {"metaData": {"schemaString": "$schemas.timestamp_ntz"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 13,
+      "name": "timestamp_ntz_type_widening_date_to_ntz_both_features_read_snapshot_succeeds",
+      "feature": "timestampNtz",
+      "description": "Reading a (3,7)+[timestampNtz, typeWidening] table where a column was widened from date to timestamp_ntz succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.ntz_and_type_widening_3_7"},
+          {"metaData": {"schemaString": "$schemas.timestamp_ntz_widened_from_date"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 14,
+      "name": "timestamp_ntz_type_widening_date_to_ntz_missing_ntz_feature_read_snapshot_fails",
+      "feature": "timestampNtz",
+      "flavor": "orphan",
+      "description": "Reading a (3,7)+[typeWidening] table where a column was widened from date to timestamp_ntz but timestampNtz is absent from both feature lists fails; the resulting timestamp_ntz column independently requires the timestampNtz feature.",
+      "note": "$notes.ntz_schema_requires_feature",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.type_widening_only_3_7"},
+          {"metaData": {"schemaString": "$schemas.timestamp_ntz_widened_from_date"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    }
+  ]
+}

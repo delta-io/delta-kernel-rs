@@ -2,6 +2,7 @@
 members = [
     "acceptance",
     "benchmarks",
+    "compliance-suite",
     "derive-macros",
     "ffi",
     "kernel",

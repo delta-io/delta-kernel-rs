@@ -1,0 +1,342 @@
+{
+  "$schemas": {
+    "generated_columns_id_doubled": {
+      "type": "struct",
+      "fields": [
+        {"name": "id", "type": "integer", "nullable": true, "metadata": {}},
+        {
+          "name": "id_doubled",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.generationExpression": "id * 2"}
+        }
+      ]
+    },
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    },
+    "generated_columns_bad_ref": {
+      "type": "struct",
+      "fields": [
+        {"name": "id", "type": "integer", "nullable": true, "metadata": {}},
+        {
+          "name": "bad_generated",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.generationExpression": "nonexistent_col * 2"}
+        }
+      ]
+    },
+    "cm_generated_columns_id_doubled": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "col-1"}
+        },
+        {
+          "name": "id_doubled",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {
+            "delta.columnMapping.id": 2,
+            "delta.columnMapping.physicalName": "col-2",
+            "delta.generationExpression": "id * 2"
+          }
+        }
+      ]
+    }
+  },
+  "$protocols": {
+    "legacy_1_3": {"minReaderVersion": 1, "minWriterVersion": 3},
+    "legacy_1_4": {"minReaderVersion": 1, "minWriterVersion": 4},
+    "modern_3_7_generated_columns": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["generatedColumns"]
+    },
+    "modern_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    },
+    "modern_3_7_generated_check_constraints": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["generatedColumns", "checkConstraints"]
+    },
+    "modern_3_7_cm_generated_columns": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["columnMapping"],
+      "writerFeatures": ["columnMapping", "generatedColumns"]
+    }
+  },
+  "$notes": {
+    "orphan_writer_feature": "At (3,7), the spec requires activation properties to be paired with the corresponding feature in writerFeatures. Writing an activation property for a feature absent from writerFeatures is invalid committed state."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "generated_columns_create_table_1_3_fails",
+      "flavor": "insufficient_protocol",
+      "feature": "generatedColumns",
+      "description": "Creating a (1,3) table with a delta.generationExpression column fails: generatedColumns requires minWriterVersion>=4.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_3",
+        "metadata": {"schemaString": "$schemas.generated_columns_id_doubled"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 2,
+      "name": "generated_columns_create_table_3_7_no_feature_listed_with_schema_fails",
+      "flavor": "orphan",
+      "feature": "generatedColumns",
+      "description": "Creating a (3,7) table with a delta.generationExpression column but generatedColumns absent from writerFeatures fails.",
+      "note": "$notes.orphan_writer_feature",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7",
+        "metadata": {"schemaString": "$schemas.generated_columns_id_doubled"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 3,
+      "name": "generated_columns_empty_commit_3_7_no_feature_listed_with_schema_fails",
+      "flavor": "orphan",
+      "feature": "generatedColumns",
+      "description": "Appending to a (3,7) table with a delta.generationExpression column but generatedColumns absent from writerFeatures fails.",
+      "note": "$notes.orphan_writer_feature",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {"metaData": {"schemaString": "$schemas.generated_columns_id_doubled"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 4,
+      "name": "generated_columns_create_table_1_4_with_schema",
+      "flavor": "legacy",
+      "feature": "generatedColumns",
+      "description": "Creating a (1,4) table with a delta.generationExpression column metadata succeeds: generatedColumns are always supported at writer version 4.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_4",
+        "metadata": {"schemaString": "$schemas.generated_columns_id_doubled"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "generated_columns_read_snapshot_3_7_no_feature_listed_with_schema",
+      "flavor": "orphan",
+      "feature": "generatedColumns",
+      "description": "Reading a (3,7) table with a delta.generationExpression column but generatedColumns absent from writerFeatures succeeds; generatedColumns is writer-only.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {"metaData": {"schemaString": "$schemas.generated_columns_id_doubled"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "generated_columns_supported_not_active_empty_commit_succeeds",
+      "flavor": "supported_not_active",
+      "feature": "generatedColumns",
+      "description": "Appending to a (3,7)+[generatedColumns] table without any delta.generationExpression column succeeds: the feature is supported but not active.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_generated_columns"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "generated_columns_supported_active_empty_commit_succeeds",
+      "feature": "generatedColumns",
+      "description": "Appending to a (3,7)+[generatedColumns] table with a delta.generationExpression column succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_generated_columns"},
+          {"metaData": {"schemaString": "$schemas.generated_columns_id_doubled"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 8,
+      "name": "generated_columns_create_table_3_7_feature_listed_succeeds",
+      "feature": "generatedColumns",
+      "description": "Creating a (3,7)+[generatedColumns] table with a delta.generationExpression column succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_generated_columns",
+        "metadata": {"schemaString": "$schemas.generated_columns_id_doubled"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 9,
+      "name": "generated_columns_read_snapshot_1_4_with_schema_succeeds",
+      "flavor": "legacy",
+      "feature": "generatedColumns",
+      "description": "Reading a (1,4) table with a delta.generationExpression column succeeds: generatedColumns is writer-only.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_4"},
+          {"metaData": {"schemaString": "$schemas.generated_columns_id_doubled"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 10,
+      "name": "generated_columns_read_snapshot_3_7_feature_listed_succeeds",
+      "feature": "generatedColumns",
+      "description": "Reading a (3,7)+[generatedColumns] table with a delta.generationExpression column succeeds: generatedColumns is writer-only.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_generated_columns"},
+          {"metaData": {"schemaString": "$schemas.generated_columns_id_doubled"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 11,
+      "name": "generated_columns_supported_not_active_read_snapshot_succeeds",
+      "flavor": "supported_not_active",
+      "feature": "generatedColumns",
+      "description": "Reading a (3,7)+[generatedColumns] table without any delta.generationExpression column succeeds: the feature is supported but not active.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_generated_columns"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "generated_columns_empty_commit_1_4_with_schema_succeeds",
+      "flavor": "legacy",
+      "feature": "generatedColumns",
+      "description": "Appending to a (1,4) table with a delta.generationExpression column succeeds: generatedColumns are always supported at writer version 4.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_4"},
+          {"metaData": {"schemaString": "$schemas.generated_columns_id_doubled"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 13,
+      "name": "generated_columns_create_table_3_7_nonexistent_column_fails",
+      "feature": "generatedColumns",
+      "description": "Creating a (3,7)+[generatedColumns] table with a generation expression referencing a column not in the schema fails.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_generated_columns",
+        "metadata": {"schemaString": "$schemas.generated_columns_bad_ref"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 14,
+      "name": "generated_columns_create_table_3_7_partition_column_succeeds",
+      "feature": "generatedColumns",
+      "description": "Creating a (3,7)+[generatedColumns] table with a generated column listed as a partition column succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_generated_columns",
+        "metadata": {
+          "schemaString": "$schemas.generated_columns_id_doubled",
+          "partitionColumns": ["id_doubled"]
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 15,
+      "name": "generated_columns_cm_create_table_3_7_both_features_listed_succeeds",
+      "feature": "generatedColumns",
+      "description": "Creating a (3,7)+[columnMapping,generatedColumns] table with CM-annotated columns and a generation expression using the logical column name succeeds.",
+      "note": "$errata.sql_expression_cm_name_resolution",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_cm_generated_columns",
+        "metadata": {
+          "schemaString": "$schemas.cm_generated_columns_id_doubled",
+          "configuration": {
+            "delta.columnMapping.mode": "id",
+            "delta.columnMapping.maxColumnId": "2"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 16,
+      "name": "generated_columns_cm_empty_commit_3_7_both_features_listed_succeeds",
+      "feature": "generatedColumns",
+      "description": "Appending to a (3,7)+[columnMapping,generatedColumns] table with CM-annotated columns and a generation expression using the logical column name succeeds.",
+      "note": "$errata.sql_expression_cm_name_resolution",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_cm_generated_columns"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.cm_generated_columns_id_doubled",
+              "configuration": {
+                "delta.columnMapping.mode": "id",
+                "delta.columnMapping.maxColumnId": "2"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 17,
+      "name": "generated_columns_check_constraints_create_table_3_7_both_features_listed_succeeds",
+      "feature": "generatedColumns",
+      "description": "Creating a (3,7)+[generatedColumns,checkConstraints] table with both a generation expression and a check constraint succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_generated_check_constraints",
+        "metadata": {
+          "schemaString": "$schemas.generated_columns_id_doubled",
+          "configuration": {"delta.constraints.doubled_positive": "id_doubled > 0"}
+        }
+      },
+      "expected_outcome": "success"
+    }
+  ]
+}

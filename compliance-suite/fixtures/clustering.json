@@ -1,0 +1,181 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    },
+    "simple_int_with_part": {
+      "type": "struct",
+      "fields": [
+        {"name": "id", "type": "integer", "nullable": true, "metadata": {}},
+        {"name": "part", "type": "string", "nullable": true, "metadata": {}}
+      ]
+    }
+  },
+  "$protocols": {
+    "clustering_1_7": {
+      "minReaderVersion": 1,
+      "minWriterVersion": 7,
+      "writerFeatures": ["clustering", "domainMetadata"]
+    },
+    "clustering_no_domain_1_7": {
+      "minReaderVersion": 1,
+      "minWriterVersion": 7,
+      "writerFeatures": ["clustering"]
+    }
+  },
+  "$notes": {
+    "activation": "clustering is activated solely by its presence in writerFeatures; there is no corresponding table property.",
+    "domain_metadata_required": "The spec requires domainMetadata to be co-listed in writerFeatures; clustering stores clustering column names in a domainMetadata action with domain delta.clustering.",
+    "no_partition_constraint": "The spec forbids defining a clustered and partitioned table at the same time (Writer Requirements for Clustered Table).",
+    "clustering_not_mandatory": "The spec does not require writers to cluster files on every commit; the feature flag only requires that clustering metadata semantics be understood."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "clustering_create_table_1_7_feature_and_domain_metadata_listed_succeeds",
+      "feature": "clustering",
+      "description": "Creating a (1,7)+[clustering,domainMetadata] table succeeds.",
+      "note": "$notes.activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.clustering_1_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "clustering_create_table_1_7_feature_listed_missing_domain_metadata_fails",
+      "feature": "clustering",
+      "flavor": "missing_dependency",
+      "description": "Creating a (1,7)+[clustering] table without the required domainMetadata in writerFeatures fails.",
+      "note": "$notes.domain_metadata_required",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.clustering_no_domain_1_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 3,
+      "name": "clustering_create_table_1_7_with_partition_columns_fails",
+      "feature": "clustering",
+      "description": "Creating a (1,7)+[clustering,domainMetadata] table with partition columns fails.",
+      "note": "$notes.no_partition_constraint",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.clustering_1_7",
+        "metadata": {"schemaString": "$schemas.simple_int_with_part", "partitionColumns": ["part"]}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 4,
+      "name": "clustering_read_snapshot_1_7_feature_and_domain_metadata_listed_succeeds",
+      "feature": "clustering",
+      "description": "Reading a (1,7)+[clustering,domainMetadata] table succeeds.",
+      "note": "$errata.clustering_missing_domain_metadata_action",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.clustering_1_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "clustering_read_snapshot_1_7_with_delta_clustering_domain_metadata_succeeds",
+      "feature": "clustering",
+      "description": "Reading a (1,7)+[clustering,domainMetadata] table whose log contains a delta.clustering domainMetadata action succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.clustering_1_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}},
+          {
+            "domainMetadata": {
+              "domain": "delta.clustering",
+              "configuration": "{\"clusteringColumns\":[[\"id\"]]}"
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "clustering_read_snapshot_1_7_with_partition_columns_fails",
+      "feature": "clustering",
+      "description": "Reading a (1,7)+[clustering,domainMetadata] table with partition columns fails.",
+      "note": "$errata.invalid_table_state_reader_rejection",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.clustering_1_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int_with_part",
+              "partitionColumns": ["part"]
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 7,
+      "name": "clustering_read_snapshot_1_7_clustering_without_domain_metadata_in_protocol_fails",
+      "feature": "clustering",
+      "flavor": "missing_dependency",
+      "description": "Reading a (1,7)+[clustering] table with domainMetadata absent from writerFeatures fails.",
+      "note": "$errata.invalid_table_state_reader_rejection",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.clustering_no_domain_1_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 8,
+      "name": "clustering_empty_commit_1_7_feature_and_domain_metadata_listed_succeeds",
+      "feature": "clustering",
+      "description": "Appending to a (1,7)+[clustering,domainMetadata] table succeeds.",
+      "note": "$notes.clustering_not_mandatory",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.clustering_1_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 9,
+      "name": "clustering_empty_commit_1_7_with_partition_columns_fails",
+      "feature": "clustering",
+      "description": "Appending to a (1,7)+[clustering,domainMetadata] table with partition columns fails.",
+      "note": "$notes.no_partition_constraint",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.clustering_1_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int_with_part",
+              "partitionColumns": ["part"]
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    }
+  ]
+}
