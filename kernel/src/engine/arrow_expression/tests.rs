@@ -1,7 +1,8 @@
 use std::ops::{Add, Div, Mul, Sub};
 
 use rstest::rstest;
-use {Expression as Expr, Predicate as Pred};
+use Expression as Expr;
+use Predicate as Pred;
 
 use super::apply_schema::apply_schema;
 use super::*;
