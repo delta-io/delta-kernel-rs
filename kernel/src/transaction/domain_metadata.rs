@@ -28,8 +28,7 @@ impl<S> Transaction<S> {
         }
 
         if !self
-            .read_snapshot
-            .table_configuration()
+            .effective_table_config
             .is_feature_supported(&TableFeature::DomainMetadata)
         {
             return Err(Error::unsupported(
@@ -114,7 +113,7 @@ impl<S> Transaction<S> {
     /// This prevents arbitrary `delta.*` domains from being added during table creation.
     /// Each known system domain must have its corresponding feature enabled in the protocol.
     fn validate_system_domain_feature(&self, domain: &str) -> DeltaResult<()> {
-        let table_config = self.read_snapshot.table_configuration();
+        let table_config = &self.effective_table_config;
 
         // Map domain to its required feature
         let required_feature = match domain {
@@ -162,7 +161,7 @@ impl<S> Transaction<S> {
             .map(String::as_str)
             .collect();
         let existing_domains = self
-            .read_snapshot
+            .read_snapshot()?
             .get_domain_metadatas_internal(engine, Some(&domains))?;
 
         // Create removal tombstones with pre-image configurations
