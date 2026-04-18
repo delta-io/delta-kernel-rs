@@ -119,7 +119,8 @@ all returned batches -- the engine may split a single file across multiple batch
 - `kernel/src/snapshot/` -- `Snapshot`, `SnapshotBuilder`, entry point for reads/writes
 - `kernel/src/scan/` -- `Scan`, `ScanBuilder`, log replay, data skipping
 - `kernel/src/transaction/` -- `Transaction`, `WriteContext`, `create_table` builder
-- `kernel/src/partition/` -- partition value validation, serialization, Hive-style path encoding
+- `kernel/src/partition/` -- partition value validation, serialization, Hive-style path
+   encoding, URI encoding for `add.path`
 - `kernel/src/committer/` -- `Committer` trait, `FileSystemCommitter`
 - `kernel/src/log_segment/` -- log file discovery, Protocol/Metadata replay
 - `kernel/src/log_replay.rs` -- file-action deduplication, `LogReplayProcessor` trait
