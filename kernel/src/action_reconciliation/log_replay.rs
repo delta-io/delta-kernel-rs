@@ -548,7 +548,15 @@ impl ActionReconciliationVisitor<'_> {
             return Ok(None); // Not a domainMetadata action, continue checking other types
         };
 
-        // Exclude tombstones (removed=true) from checkpoint per protocol spec
+        // Record the domain as seen first so older versions are deduplicated
+        // even when a newer version is a tombstone. Log replay walks newest-to-oldest,
+        // so a tombstone at a later version must still mask earlier versions of the
+        // same domain in the checkpoint.
+        if !self.seen_domains.insert(domain.to_string()) {
+            return Ok(Some(false)); // duplicate - older version of a domain we've already seen
+        }
+
+        // Exclude tombstones (removed=true) from the checkpoint per protocol spec.
         let removed: bool = getters[Self::DOMAIN_METADATA_REMOVED.index]
             .get_opt(i, Self::DOMAIN_METADATA_REMOVED.name)?
             .unwrap_or(false);
@@ -556,9 +564,7 @@ impl ActionReconciliationVisitor<'_> {
             return Ok(Some(false));
         }
 
-        // If the domain already exists in the set, the insertion will return false,
-        // indicating that this is a duplicate.
-        Ok(Some(self.seen_domains.insert(domain.to_string())))
+        Ok(Some(true))
     }
 
     /// Determines if a row in the batch should be included.
