@@ -7,15 +7,16 @@ use tempfile::tempdir;
 use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
 use url::Url;
 
-use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::action_reconciliation::{
-    deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
+    deleted_file_retention_timestamp_with_time, ActionReconciliationIterator,
+    DEFAULT_RETENTION_SECS,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
 use crate::arrow::array::{create_array, Array, AsArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{DataType, Field, Schema};
 use crate::checkpoint::{
-    create_last_checkpoint_data, CheckpointSummary, CheckpointWriter, CHECKPOINT_ACTIONS_SCHEMA_V2,
+    create_last_checkpoint_data, CheckpointWriter, LastCheckpointHintStats,
+    CHECKPOINT_ACTIONS_SCHEMA_V2,
 };
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
@@ -256,14 +257,13 @@ fn try_finalize_checkpoint(
     metadata: &FileMeta,
     data_iter: ActionReconciliationIterator,
 ) -> DeltaResult<()> {
-    let version = writer.snapshot.version();
     let state = data_iter.state();
     drop(data_iter);
     let state = Arc::into_inner(state).expect("no other Arc references");
     let size_in_bytes = i64::try_from(metadata.size).expect("size fits in i64");
-    let checkpoint_summary =
-        CheckpointSummary::from_reconciliation_state(version, size_in_bytes, state, 0)?;
-    writer.finalize(engine, &checkpoint_summary)
+    let last_checkpoint_stats =
+        LastCheckpointHintStats::from_reconciliation_state(size_in_bytes, state, 0)?;
+    writer.finalize(engine, &last_checkpoint_stats)
 }
 
 /// Helper to verify the contents of the `_last_checkpoint` file
@@ -461,15 +461,15 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
 
     /* The returned data iterator has batches that we do not consume */
 
-    // Attempting to build CheckpointSummary from a non-exhausted state should fail
+    // Attempting to build LastCheckpointHintStats from a non-exhausted state should fail
     let state = data_iter.state();
     drop(data_iter);
     let state = Arc::into_inner(state).expect("no other Arc references");
-    let err = CheckpointSummary::from_reconciliation_state(0, 0, state, 0)
+    let err = LastCheckpointHintStats::from_reconciliation_state(0, state, 0)
         .expect_err("from_reconciliation_state should fail on non-exhausted iterator");
     assert!(err
         .to_string()
-        .contains("the reconciliation iterator has not been fully exhausted"),);
+        .contains("reconciliation iterator must be fully consumed"));
 
     Ok(())
 }
