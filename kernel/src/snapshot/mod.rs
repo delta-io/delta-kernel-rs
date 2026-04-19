@@ -556,19 +556,18 @@ impl Snapshot {
     ///
     /// # Parameters
     /// - `engine`: Engine for data processing and I/O
-    /// - `spec`: Checkpoint format specification. `None` uses the default checkpoint
-    ///   settings (auto-detecting V1/V2 from table features). For V2 checkpoints, the
-    ///   default is to not write sidecar files.
+    /// - `spec`: Checkpoint format specification. `None` uses the default checkpoint settings
+    ///   (auto-detecting V1/V2 from table features). For V2 checkpoints, the default is to not
+    ///   write sidecar files.
     ///
     /// # Errors
-    /// - If `CheckpointSpec::V2` is used but the table does not support the `v2Checkpoint`
-    ///   feature.
+    /// - If `CheckpointSpec::V2` is used but the table does not support the `v2Checkpoint` feature.
     /// - If `CheckpointSpec::V1` is used but the table supports `v2Checkpoint` feature.
     /// - If `file_actions_per_sidecar_hint` is `Some(0)`.
     ///
     /// [`CheckpointSpec`]: crate::checkpoint::CheckpointSpec
-    /// This method is for review only, and will be merged into snapshot::checkpoint() in the next PR:
-    /// https://github.com/delta-io/delta-kernel-rs/pull/2333
+    /// This method is for review only, and will be merged into snapshot::checkpoint() in the next
+    /// PR: https://github.com/delta-io/delta-kernel-rs/pull/2333
     #[instrument(parent = &self.span, name = "snap.checkpoint_placeholder", skip_all, err)]
     pub fn snapshot_checkpoint_placeholder(
         self: Arc<Self>,

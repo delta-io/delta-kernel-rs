@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch};
-use delta_kernel::arrow::array::{StringArray, StructArray};
+use delta_kernel::arrow::array::{
+    Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+};
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
@@ -676,12 +677,20 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     let last_ckpt = read_last_checkpoint(&table_path);
     let ckpt_file = load_checkpoint_path(&table_path, version as _);
     let ckpt_file_size = std::fs::metadata(&ckpt_file).unwrap().len() as i64;
+    let sidecars_dir_for_size = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
+    let sidecars_total_size: i64 = list_sidecar_parquet_files(&sidecars_dir_for_size)
+        .iter()
+        .map(|e| e.metadata().unwrap().len() as i64)
+        .sum();
 
     assert_eq!(last_ckpt["version"], version);
     // size = 1 protocol + 1 metadata + 8 adds + 8 removes + 3 domain metadata
     //       + 1 checkpointMetadata + 5 sidecar references = 27
     assert_eq!(last_ckpt["size"].as_i64().unwrap(), 27);
-    assert_eq!(last_ckpt["sizeInBytes"].as_i64().unwrap(), ckpt_file_size);
+    assert_eq!(
+        last_ckpt["sizeInBytes"].as_i64().unwrap(),
+        ckpt_file_size + sidecars_total_size
+    );
     assert_eq!(last_ckpt["numOfAddFiles"], 8);
 
     // === Read raw checkpoint parquet and validate fields ===
@@ -831,7 +840,7 @@ async fn create_partitioned_stats_table<
     engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::not_null("id", DataType::LONG),
+        StructField::nullable("id", DataType::LONG),
         StructField::nullable("name", DataType::STRING),
         StructField::nullable("part_key", DataType::STRING),
     ])?);
@@ -846,7 +855,7 @@ async fn create_partitioned_stats_table<
         .commit(engine.as_ref())?;
 
     let data_schema = StructType::try_new(vec![
-        StructField::not_null("id", DataType::LONG),
+        StructField::nullable("id", DataType::LONG),
         StructField::nullable("name", DataType::STRING),
     ])?;
     let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(&data_schema)?);

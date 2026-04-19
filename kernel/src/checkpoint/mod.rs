@@ -131,12 +131,11 @@ use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, 
 mod checkpoint_transform;
 mod sidecar;
 
-use sidecar::{SidecarSplitter, SingleSidecarDataIterator};
-
 use checkpoint_transform::{
     build_checkpoint_output_schema, build_checkpoint_read_schema, build_checkpoint_transform,
     StatsTransformConfig,
 };
+use sidecar::{SidecarSplitter, SingleSidecarDataIterator};
 #[cfg(test)]
 mod tests;
 
@@ -628,8 +627,8 @@ impl CheckpointWriter {
                     uuid::Uuid::new_v4()
                 );
                 // Per the protocol, sidecar path should be URI-encoded.
-                // All characters in the filename here are Unreserved Characters, so we can just retain them.
-                // Ref: https://www.ietf.org/rfc/rfc2396.txt
+                // All characters in the filename here are Unreserved Characters, so we can just
+                // retain them. Ref: https://www.ietf.org/rfc/rfc2396.txt
                 let sidecar_url = sidecars_base.join(&filename)?;
                 engine
                     .parquet_handler()
@@ -829,7 +828,8 @@ impl CheckpointWriter {
     ///
     /// # Parameters
     /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `checkpoint_data_schema`: The output checkpoint schema (must contain a `sidecar` struct field)
+    /// - `checkpoint_data_schema`: The output checkpoint schema (must contain a `sidecar` struct
+    ///   field)
     /// - `sidecar_metas`: Pairs of (relative sidecar filename, FileMeta) for each sidecar file
     fn create_sidecar_action_batches(
         &self,
@@ -872,7 +872,8 @@ impl CheckpointWriter {
                     "path" => Ok(Scalar::from(filename.clone())),
                     "sizeInBytes" => Ok(Scalar::from(size_in_bytes)),
                     "modificationTime" => Ok(Scalar::from(meta.last_modified)),
-                    // Sidecar tags are protocol details, can expose them if there is a need in the future.
+                    // Sidecar tags are protocol details, can expose them if there is a need in the
+                    // future.
                     "tags" => Ok(Scalar::Null(field.data_type().clone())),
                     other => Err(Error::CheckpointWrite(format!(
                         "Unexpected sidecar field: {other}"
