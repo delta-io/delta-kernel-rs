@@ -22,6 +22,7 @@ pub enum Bound {
 
 /// Represents the errors that can occur when performing binary search using
 /// [`binary_search_by_key_with_bounds`].
+#[allow(unused)]
 #[derive(Debug)]
 pub(crate) enum SearchError<T: Error> {
     /// Error that occurs when a search goes out of range. The meaning of "out of range" depends on
@@ -129,6 +130,7 @@ pub(crate) enum SearchError<T: Error> {
 /// );
 /// assert!(matches!(result, Err(SearchError::KeyFunctionError(_))));
 /// ```
+#[allow(unused)]
 pub(crate) fn binary_search_by_key_with_bounds<'a, T, K: Ord + Debug, E: Error>(
     values: &'a [T],
     key: K,

@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 
 use error::LogHistoryError;
 use search::{binary_search_by_key_with_bounds, Bound, SearchError};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
@@ -23,14 +23,21 @@ pub(crate) mod error;
 
 type Timestamp = i64;
 
+/// Determines the search strategy for timestamp-to-version conversion based on ICT enablement.
 #[allow(unused)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum TimestampSearchBounds {
+    /// The timestamp exactly matches the ICT enablement timestamp.
     ExactMatch(Version),
+    /// Search over In-Commit Timestamps starting from the given index.
     ICTSearchStartingFrom(usize),
+    /// Search over file modification timestamps (ICT not enabled).
     FileModificationSearch,
+    /// Search over file modification timestamps up to the ICT enablement point.
     FileModificationSearchUntil {
+        /// The index in the commit list where ICT begins.
         index: usize,
+        /// The version at which ICT was enabled.
         ict_enablement_version: Version,
     },
 }
@@ -105,6 +112,63 @@ fn get_timestamp_search_bounds(
     Ok(result)
 }
 
+/// Performs a linear search over file modification timestamps with monotonization.
+///
+/// File modification timestamps are not guaranteed to be monotonically increasing due to clock
+/// skew or filesystem limitations. This function ensures correctness by monotonizing timestamps
+/// as it scans: if a commit's timestamp is less than or equal to the previous commit's timestamp,
+/// it is adjusted to `previous_timestamp + 1`.
+///
+/// # Arguments
+/// * `commits` - Slice of commits to search, ordered by version (ascending)
+/// * `timestamp` - The target timestamp to search for
+/// * `bound` - The type of bound to find (GreatestLower or LeastUpper)
+///
+/// # Returns
+/// The version matching the bound criteria, or an error if no match exists.
+#[allow(unused)]
+fn linear_search_file_mod_timestamps(
+    commits: &[ParsedLogPath],
+    timestamp: Timestamp,
+    bound: Bound,
+) -> Result<Version, LogHistoryError> {
+    if commits.is_empty() {
+        return Err(LogHistoryError::TimestampOutOfRange { timestamp, bound });
+    }
+
+    let lo_version = commits[0].version;
+    let hi_version = commits[commits.len() - 1].version;
+    info!(lo_version, hi_version, "File modification linear search");
+
+    let mut result: Option<Version> = None;
+    let mut prev_monotonic_ts = i64::MIN;
+
+    for commit in commits {
+        let raw_ts = commit.location.last_modified;
+        // Monotonize: ensure each timestamp is strictly greater than the previous
+        let monotonic_ts = raw_ts.max(prev_monotonic_ts + 1);
+        if monotonic_ts != raw_ts {
+            warn!(
+                version = commit.version,
+                raw_ts, monotonic_ts, "Adjusted non-monotonic timestamp"
+            );
+        }
+
+        match bound {
+            // GreatestLower: update result until we surpass `timestamp`
+            Bound::GreatestLower if monotonic_ts <= timestamp => result = Some(commit.version),
+            Bound::GreatestLower => break,
+            // LeastUpper: return version upon first match
+            Bound::LeastUpper if monotonic_ts >= timestamp => return Ok(commit.version),
+            Bound::LeastUpper => {}
+        }
+
+        prev_monotonic_ts = monotonic_ts;
+    }
+
+    result.ok_or(LogHistoryError::TimestampOutOfRange { timestamp, bound })
+}
+
 /// Converts a timestamp to a version based on the specified bound type.
 ///
 /// This function finds the appropriate commit version that corresponds to the given timestamp
@@ -162,63 +226,68 @@ pub(crate) fn timestamp_to_version(
     // Determine the type of timestamp search. The search may either be over file modification
     // timestamps or over In-Commit Timestamps.
     let search_bounds = get_timestamp_search_bounds(snapshot, &log_segment, timestamp)?;
-    let (lo, hi, read_ict) = match search_bounds {
-        TimestampSearchBounds::ExactMatch(version) => return Ok(version),
-        TimestampSearchBounds::ICTSearchStartingFrom(lo) => (lo, len, true),
-        TimestampSearchBounds::FileModificationSearch => (0, len, false),
-        TimestampSearchBounds::FileModificationSearchUntil { index: hi, .. } => (0, hi, false),
-    };
 
-    // If the search range is empty (lo >= hi), the timestamp is out of range. This can happen
-    // when the log has been trimmed and the query timestamp falls before the available commits.
-    if lo >= hi {
-        return Err(LogHistoryError::TimestampOutOfRange { timestamp, bound });
-    }
-    debug_assert!(lo < len, "lo index {} should be less than len {}", lo, len);
-    debug_assert!(hi <= len, "hi index {} should be at most len {}", hi, len);
+    match search_bounds {
+        TimestampSearchBounds::ExactMatch(version) => Ok(version),
 
-    let lo_version = log_segment.listed.ascending_commit_files[lo].version;
-    let hi_version = log_segment.listed.ascending_commit_files[hi - 1].version;
-    info!(lo_version, hi_version, "Searching version range");
+        // ICT search: use binary search (ICT timestamps are guaranteed monotonic by protocol)
+        TimestampSearchBounds::ICTSearchStartingFrom(lo) => {
+            let commit_range = &log_segment.listed.ascending_commit_files[lo..];
+            if commit_range.is_empty() {
+                return Err(LogHistoryError::TimestampOutOfRange { timestamp, bound });
+            }
 
-    // We only search in the range [lo..hi).
-    let commit_range = &log_segment.listed.ascending_commit_files[lo..hi];
+            let lo_version = commit_range.first().map(|c| c.version).unwrap_or(0);
+            let hi_version = commit_range.last().map(|c| c.version).unwrap_or(0);
+            info!(
+                lo_version,
+                hi_version, "ICT binary search over version range"
+            );
 
-    // Key function that extracts the timestamp from a commit.
-    let commit_to_ts = |commit: &ParsedLogPath| -> Result<Timestamp, LogHistoryError> {
-        if read_ict {
-            info!(version = commit.version, "Reading in-commit timestamp");
-            commit
-                .read_in_commit_timestamp(engine)
-                .map_err(|e| LogHistoryError::internal("failed to read in-commit timestamp", e))
-        } else {
-            Ok(commit.location.last_modified)
+            let commit_to_ict = |commit: &ParsedLogPath| -> Result<Timestamp, LogHistoryError> {
+                commit
+                    .read_in_commit_timestamp(engine)
+                    .map_err(|e| LogHistoryError::internal("failed to read in-commit timestamp", e))
+            };
+
+            let search_result =
+                binary_search_by_key_with_bounds(commit_range, timestamp, commit_to_ict, bound);
+
+            match search_result {
+                Ok(relative_idx) => {
+                    let idx = lo + relative_idx;
+                    debug_assert!(idx < len, "Index should be valid");
+                    Ok(log_segment.listed.ascending_commit_files[idx].version)
+                }
+                Err(SearchError::KeyFunctionError(error)) => Err(error),
+                Err(SearchError::OutOfRange) => {
+                    Err(LogHistoryError::TimestampOutOfRange { timestamp, bound })
+                }
+            }
         }
-    };
 
-    let search_result =
-        binary_search_by_key_with_bounds(commit_range, timestamp, commit_to_ts, bound);
-
-    match search_result {
-        Ok(relative_idx) => {
-            // `relative_idx` is for range [lo..hi]. Add back `lo` to get absolute index.
-            let idx = lo + relative_idx;
-            debug_assert!(idx < len, "Relative index should become a valid index");
-            Ok(log_segment.listed.ascending_commit_files[idx].version)
+        // File modification search: use linear scan with monotonization
+        // (file mod timestamps are NOT guaranteed monotonic due to clock skew)
+        TimestampSearchBounds::FileModificationSearch => {
+            let commits = &log_segment.listed.ascending_commit_files[..];
+            linear_search_file_mod_timestamps(commits, timestamp, bound)
         }
-        Err(SearchError::KeyFunctionError(error)) => Err(error),
-        // Special case: For LeastUpper search over file modification timestamps, the ICT
-        // enablement version serves as the upper bound when no version was found in range.
-        Err(SearchError::OutOfRange) => match (&search_bounds, bound) {
-            (
-                TimestampSearchBounds::FileModificationSearchUntil {
-                    ict_enablement_version,
-                    ..
-                },
-                Bound::LeastUpper,
-            ) => Ok(*ict_enablement_version),
-            _ => Err(LogHistoryError::TimestampOutOfRange { timestamp, bound }),
-        },
+
+        // File modification search up to ICT enablement point
+        TimestampSearchBounds::FileModificationSearchUntil {
+            index,
+            ict_enablement_version,
+        } => {
+            let commits = &log_segment.listed.ascending_commit_files[..index];
+            linear_search_file_mod_timestamps(commits, timestamp, bound).or_else(|e| {
+                // For LeastUpper, if no version found, the ICT enablement version is the answer
+                if bound == Bound::LeastUpper {
+                    Ok(ict_enablement_version)
+                } else {
+                    Err(e)
+                }
+            })
+        }
     }
 }
 
@@ -241,7 +310,6 @@ mod tests {
     use crate::utils::test_utils::{Action, LocalMockTable};
     use crate::Version;
 
-    // Helper to create test schema
     fn get_test_schema() -> SchemaRef {
         Arc::new(StructType::new_unchecked([StructField::nullable(
             "value",
@@ -249,125 +317,118 @@ mod tests {
         )]))
     }
 
-    // Helper to set the file modification timestamp of a file
-    fn set_mod_time(mock_table: &LocalMockTable, commit_version: Version, timestamp: Timestamp) {
-        let file_name = delta_path_for_version(commit_version, "json")
+    fn set_mod_time(mock_table: &LocalMockTable, version: Version, timestamp: Timestamp) {
+        let file_name = delta_path_for_version(version, "json")
             .filename()
             .unwrap()
             .to_string();
         let path = mock_table.table_root().join("_delta_log/").join(file_name);
         let file = OpenOptions::new().write(true).open(path).unwrap();
-
         let time = SystemTime::UNIX_EPOCH + Duration::from_millis(timestamp.try_into().unwrap());
         file.set_modified(time).unwrap();
     }
 
-    async fn mock_table() -> LocalMockTable {
+    /// Creates a test table with specified timestamps.
+    ///
+    /// # Arguments
+    /// * `timestamps` - List of `(file_mod_ts, Option<ict_ts>)` for each version
+    /// * `ict_enablement_version` - Version where ICT is enabled:
+    ///   - `None`: ICT never enabled (file mod only)
+    ///   - `Some(0)`: ICT enabled from creation
+    ///   - `Some(n)`: ICT enabled at version n
+    async fn mock_table_with_timestamps(
+        timestamps: &[(Timestamp, Option<Timestamp>)],
+        ict_enablement_version: Option<Version>,
+    ) -> LocalMockTable {
         let mut mock_table = LocalMockTable::new();
 
-        // 0: Has file modification timestamp 50
-        mock_table
-            .commit([
-                Action::Metadata(
-                    Metadata::try_new(None, None, get_test_schema(), vec![], 0, HashMap::new())
-                        .unwrap(),
-                ),
-                Action::Protocol(
-                    Protocol::try_new(
-                        3,
-                        7,
-                        Some(Vec::<String>::new()),
-                        Some(vec![TableFeature::InCommitTimestamp]),
-                    )
-                    .unwrap(),
-                ),
-            ])
-            .await;
-        set_mod_time(&mock_table, 0, 50);
+        for (version, (file_mod_ts, ict_ts)) in timestamps.iter().enumerate() {
+            let version = version as Version;
+            let is_first = version == 0;
+            let is_ict_enablement = ict_enablement_version == Some(version);
+            let ict_from_creation = ict_enablement_version == Some(0) && is_first;
 
-        // 1: Has file modification timestamp 150
-        mock_table
-            .commit([Action::CommitInfo(CommitInfo {
-                ..Default::default()
-            })])
-            .await;
-        set_mod_time(&mock_table, 1, 150);
+            let mut actions: Vec<Action> = vec![];
 
-        // 2: Has file modification timestamp 250
-        mock_table
-            .commit([Action::CommitInfo(CommitInfo {
-                ..Default::default()
-            })])
-            .await;
-        set_mod_time(&mock_table, 2, 250);
-
-        // 3: Has in-commit timestamp 300, file modification timestamp 350
-        mock_table
-            .commit([
-                Action::CommitInfo(CommitInfo {
-                    in_commit_timestamp: Some(300),
+            // CommitInfo with optional ICT (must be first when ICT is present)
+            if ict_ts.is_some() {
+                actions.push(Action::CommitInfo(CommitInfo {
+                    in_commit_timestamp: *ict_ts,
                     ..Default::default()
-                }),
-                Action::Metadata(
-                    Metadata::try_new(
-                        None,
-                        None,
-                        get_test_schema(),
-                        vec![],
-                        0,
-                        HashMap::from_iter([
-                            (
-                                "delta.enableInCommitTimestamps".to_string(),
-                                "true".to_string(),
-                            ),
-                            (
-                                "delta.inCommitTimestampEnablementVersion".to_string(),
-                                "3".to_string(),
-                            ),
-                            (
-                                "delta.inCommitTimestampEnablementTimestamp".to_string(),
-                                "300".to_string(),
-                            ),
-                        ]),
-                    )
-                    .unwrap(),
-                ),
-                Action::Protocol(
-                    Protocol::try_new(
-                        3,
-                        7,
-                        Some(Vec::<String>::new()),
-                        Some(vec![TableFeature::InCommitTimestamp]),
-                    )
-                    .unwrap(),
-                ),
-            ])
-            .await;
-        set_mod_time(&mock_table, 3, 350);
+                }));
+            }
 
-        // 4: Has in-commit timestamp 400, file modification timestamp 450
+            // Metadata: on first commit, or when enabling ICT
+            if is_first || is_ict_enablement {
+                let config = if ict_from_creation {
+                    // ICT enabled from creation: no enablement version/timestamp
+                    HashMap::from_iter([(
+                        "delta.enableInCommitTimestamps".to_string(),
+                        "true".to_string(),
+                    )])
+                } else if is_ict_enablement {
+                    // ICT enabled at this version
+                    HashMap::from_iter([
+                        (
+                            "delta.enableInCommitTimestamps".to_string(),
+                            "true".to_string(),
+                        ),
+                        (
+                            "delta.inCommitTimestampEnablementVersion".to_string(),
+                            version.to_string(),
+                        ),
+                        (
+                            "delta.inCommitTimestampEnablementTimestamp".to_string(),
+                            ict_ts.unwrap().to_string(),
+                        ),
+                    ])
+                } else {
+                    HashMap::new()
+                };
+                actions.push(Action::Metadata(
+                    Metadata::try_new(None, None, get_test_schema(), vec![], 0, config).unwrap(),
+                ));
+            }
+
+            // Protocol on first commit
+            if is_first {
+                let writer_features: Option<Vec<TableFeature>> = if ict_enablement_version.is_some()
+                {
+                    Some(vec![TableFeature::InCommitTimestamp])
+                } else {
+                    Some(vec![])
+                };
+                actions.push(Action::Protocol(
+                    Protocol::try_new(3, 7, Some(Vec::<String>::new()), writer_features).unwrap(),
+                ));
+            }
+
+            // If no actions yet (non-first commit without ICT), add empty CommitInfo
+            if actions.is_empty() {
+                actions.push(Action::CommitInfo(CommitInfo::default()));
+            }
+
+            mock_table.commit(actions).await;
+            set_mod_time(&mock_table, version, *file_mod_ts);
+        }
+
         mock_table
-            .commit([Action::CommitInfo(CommitInfo {
-                in_commit_timestamp: Some(400),
-                ..Default::default()
-            })])
-            .await;
-        set_mod_time(&mock_table, 4, 450);
-
-        mock_table
     }
 
-    #[tokio::test]
-    async fn test_timestamp_search_bounds_no_ict() {
-        let mock_table = mock_table().await;
+    /// Helper to build snapshot and log segment
+    async fn build_test_snapshot(
+        timestamps: &[(Timestamp, Option<Timestamp>)],
+        ict_enablement: Option<Version>,
+        at_version: Option<Version>,
+    ) -> (LocalMockTable, SyncEngine, Arc<Snapshot>, LogSegment) {
+        let table = mock_table_with_timestamps(timestamps, ict_enablement).await;
         let engine = SyncEngine::new();
-        let path = Url::from_directory_path(mock_table.table_root()).unwrap();
-
-        // Set the end version to a time before In-commit timestamps were enabled
-        let snapshot = Snapshot::builder_for(path)
-            .at_version(2)
-            .build(&engine)
-            .unwrap();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let mut builder = Snapshot::builder_for(path);
+        if let Some(v) = at_version {
+            builder = builder.at_version(v);
+        }
+        let snapshot = builder.build(&engine).unwrap();
         let log_segment = LogSegment::for_timestamp_conversion(
             engine.storage_handler().as_ref(),
             snapshot.log_segment().log_root.clone(),
@@ -375,242 +436,298 @@ mod tests {
             None,
         )
         .unwrap();
-
-        // Before all commits
-        let mut res = get_timestamp_search_bounds(&snapshot, &log_segment, 0);
-        assert!(matches!(
-            res,
-            Ok(TimestampSearchBounds::FileModificationSearch)
-        ));
-
-        // Within the timestamp range
-        res = get_timestamp_search_bounds(&snapshot, &log_segment, 100);
-        assert!(matches!(
-            res,
-            Ok(TimestampSearchBounds::FileModificationSearch)
-        ));
-
-        // After all commits
-        res = get_timestamp_search_bounds(&snapshot, &log_segment, 1000);
-        assert!(matches!(
-            res,
-            Ok(TimestampSearchBounds::FileModificationSearch)
-        ));
+        (table, engine, snapshot, log_segment)
     }
 
+    // Table: v0=50, v1=150, v2=250 (file mod only), snapshot at v2 (no ICT)
+    #[rstest::rstest]
+    #[case::before_all(0)]
+    #[case::within_range(100)]
+    #[case::after_all(1000)]
     #[tokio::test]
-    async fn test_timestamp_search_bounds_with_ict_range() {
-        let mock_table = mock_table().await;
-        let engine = SyncEngine::new();
-        let path = Url::from_directory_path(mock_table.table_root()).unwrap();
-        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
-        let log_segment = LogSegment::for_timestamp_conversion(
-            engine.storage_handler().as_ref(),
-            snapshot.log_segment().log_root.clone(),
-            snapshot.version(),
-            None,
-        )
-        .unwrap();
+    async fn test_search_bounds_no_ict(#[case] timestamp: Timestamp) {
+        let timestamps = [
+            (50, None),
+            (150, None),
+            (250, None),
+            (350, Some(300)),
+            (450, Some(400)),
+        ];
+        let (_table, _engine, snapshot, log_segment) =
+            build_test_snapshot(&timestamps, Some(3), Some(2)).await;
 
-        // Exact match only applies to in-commit timestamp enablement version
-        let mut res = get_timestamp_search_bounds(&snapshot, &log_segment, 50);
+        let res = get_timestamp_search_bounds(&snapshot, &log_segment, timestamp).unwrap();
         assert!(
-            matches!(
-                res,
-                Ok(TimestampSearchBounds::FileModificationSearchUntil {
-                    index: 3,
-                    ict_enablement_version: 3
-                })
-            ),
-            "{res:?}"
-        );
-
-        // Not exact match, file modification time range
-        res = get_timestamp_search_bounds(&snapshot, &log_segment, 60);
-        assert!(
-            matches!(
-                res,
-                Ok(TimestampSearchBounds::FileModificationSearchUntil {
-                    index: 3,
-                    ict_enablement_version: 3
-                })
-            ),
-            "{res:?}"
-        );
-
-        // Edge case: The last timestamp that is file modification time
-        res = get_timestamp_search_bounds(&snapshot, &log_segment, 299);
-        assert!(
-            matches!(
-                res,
-                Ok(TimestampSearchBounds::FileModificationSearchUntil {
-                    index: 3,
-                    ict_enablement_version: 3
-                })
-            ),
-            "{res:?}"
-        );
-
-        // Edge case: Timestamp is the enablement timestamp
-        res = get_timestamp_search_bounds(&snapshot, &log_segment, 300);
-        assert!(
-            matches!(res, Ok(TimestampSearchBounds::ExactMatch(3))),
-            "{res:?}"
-        );
-
-        // Edge case: The timestamp is 1 + enablement_timestamp. This returns the beginning of the
-        // in-commit timestamp index range.
-        res = get_timestamp_search_bounds(&snapshot, &log_segment, 301);
-        assert!(
-            matches!(res, Ok(TimestampSearchBounds::ICTSearchStartingFrom(3))),
-            "{res:?}"
-        );
-
-        // Timestamp is much larger than the last in-commit timestamp
-        res = get_timestamp_search_bounds(&snapshot, &log_segment, 1000);
-        assert!(
-            matches!(res, Ok(TimestampSearchBounds::ICTSearchStartingFrom(3))),
+            matches!(res, TimestampSearchBounds::FileModificationSearch),
             "{res:?}"
         );
     }
 
+    // Table: v0=50, v1=150, v2=250 (file mod), v3=300, v4=400 (ICT enabled at v3)
+    #[rstest::rstest]
+    #[case::file_mod_region(50, TimestampSearchBounds::FileModificationSearchUntil { index: 3, ict_enablement_version: 3 })]
+    #[case::file_mod_between(60, TimestampSearchBounds::FileModificationSearchUntil { index: 3, ict_enablement_version: 3 })]
+    #[case::file_mod_last(299, TimestampSearchBounds::FileModificationSearchUntil { index: 3, ict_enablement_version: 3 })]
+    #[case::exact_enablement(300, TimestampSearchBounds::ExactMatch(3))]
+    #[case::ict_after_enablement(301, TimestampSearchBounds::ICTSearchStartingFrom(3))]
+    #[case::ict_far_future(1000, TimestampSearchBounds::ICTSearchStartingFrom(3))]
     #[tokio::test]
-    async fn test_reading_in_commit_timestamp() {
-        let mock_table = mock_table().await;
-        let engine = SyncEngine::new();
-        let path = Url::from_directory_path(mock_table.table_root()).unwrap();
-        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
-        let log_segment = LogSegment::for_timestamp_conversion(
-            engine.storage_handler().as_ref(),
-            snapshot.log_segment().log_root.clone(),
-            snapshot.version(),
-            None,
-        )
-        .unwrap();
-        let commits = log_segment.listed.ascending_commit_files;
+    async fn test_search_bounds_with_ict(
+        #[case] timestamp: Timestamp,
+        #[case] expected: TimestampSearchBounds,
+    ) {
+        let timestamps = [
+            (50, None),
+            (150, None),
+            (250, None),
+            (350, Some(300)),
+            (450, Some(400)),
+        ];
+        let (_table, _engine, snapshot, log_segment) =
+            build_test_snapshot(&timestamps, Some(3), None).await;
 
-        // File that has no In-commit timestamps
-        let mut res = commits[0].read_in_commit_timestamp(&engine);
+        let res = get_timestamp_search_bounds(&snapshot, &log_segment, timestamp).unwrap();
+        assert_eq!(res, expected);
+    }
+
+    // Table: v0=100, v1=200, v2=300 (ICT from creation)
+    #[rstest::rstest]
+    #[case::before_all(50)]
+    #[case::at_v0(100)]
+    #[case::between_v0_v1(150)]
+    #[case::after_all(1000)]
+    #[tokio::test]
+    async fn test_search_bounds_ict_from_creation(#[case] timestamp: Timestamp) {
+        let timestamps = [(0, Some(100)), (0, Some(200)), (0, Some(300))];
+        let (_table, _engine, snapshot, log_segment) =
+            build_test_snapshot(&timestamps, Some(0), None).await;
+
+        let res = get_timestamp_search_bounds(&snapshot, &log_segment, timestamp).unwrap();
+        assert!(
+            matches!(res, TimestampSearchBounds::ICTSearchStartingFrom(0)),
+            "{res:?}"
+        );
+    }
+
+    /// Tests reading timestamps from commits - both file modification and ICT.
+    #[tokio::test]
+    async fn test_reading_commit_timestamps() {
+        // Table: v0=50, v1=150, v2=250 (file mod), v3=300, v4=400 (ICT at v3)
+        let timestamps = [
+            (50, None),
+            (150, None),
+            (250, None),
+            (350, Some(300)),
+            (450, Some(400)),
+        ];
+        let (_table, engine, _snapshot, log_segment) =
+            build_test_snapshot(&timestamps, Some(3), None).await;
+        let commits = &log_segment.listed.ascending_commit_files;
+
+        // File modification timestamps are set correctly
+        assert_eq!(commits[0].location.last_modified, 50);
+        assert_eq!(commits[1].location.last_modified, 150);
+        assert_eq!(commits[2].location.last_modified, 250);
+
+        // Reading ICT from file without ICT returns error
+        let res = commits[0].read_in_commit_timestamp(&engine);
         assert!(res.is_err(), "Expected error for file without ICT: {res:?}");
 
-        // File that doesn't exist
+        // Reading ICT from non-existent file returns error
         let mut fake_log_path = commits[0].clone();
-
         let failing_path = if cfg!(windows) {
             "C:\\phony\\path"
         } else {
             "/phony/path"
         };
-
         fake_log_path.location.location = Url::from_file_path(failing_path).unwrap();
-        res = fake_log_path.read_in_commit_timestamp(&engine);
+        let res = fake_log_path.read_in_commit_timestamp(&engine);
         assert!(
             res.is_err(),
             "Expected error for non-existent file: {res:?}"
         );
 
-        // Files with In-commit timestamps
-        res = commits[3].read_in_commit_timestamp(&engine);
-        assert!(matches!(res, Ok(300)), "{res:?}");
-        res = commits[4].read_in_commit_timestamp(&engine);
-        assert!(matches!(res, Ok(400)), "{res:?}");
+        // In-commit timestamps read correctly
+        assert_eq!(commits[3].read_in_commit_timestamp(&engine).unwrap(), 300);
+        assert_eq!(commits[4].read_in_commit_timestamp(&engine).unwrap(), 400);
     }
 
+    // Table: v0=50, v1=150, v2=250 (file mod), v3=300, v4=400 (ICT at v3)
+    #[rstest::rstest]
+    #[case::before_all_lub(0, Bound::LeastUpper, Some(0))]
+    #[case::before_all_glb(0, Bound::GreatestLower, None)]
+    #[case::negative_lub(-1, Bound::LeastUpper, Some(0))]
+    #[case::after_all_lub(1000, Bound::LeastUpper, None)]
+    #[case::after_all_glb(1000, Bound::GreatestLower, Some(4))]
+    #[case::exact_v0_lub(50, Bound::LeastUpper, Some(0))]
+    #[case::exact_v0_glb(50, Bound::GreatestLower, Some(0))]
+    #[case::exact_v1_lub(150, Bound::LeastUpper, Some(1))]
+    #[case::exact_v1_glb(150, Bound::GreatestLower, Some(1))]
+    #[case::exact_v3_ict_lub(300, Bound::LeastUpper, Some(3))]
+    #[case::exact_v3_ict_glb(300, Bound::GreatestLower, Some(3))]
+    #[case::between_v0_v1_lub(100, Bound::LeastUpper, Some(1))]
+    #[case::between_v0_v1_glb(100, Bound::GreatestLower, Some(0))]
+    #[case::just_after_last_file_mod_lub(251, Bound::LeastUpper, Some(3))]
+    #[case::just_after_last_file_mod_glb(251, Bound::GreatestLower, Some(2))]
+    #[case::just_before_ict_lub(299, Bound::LeastUpper, Some(3))]
+    #[case::just_before_ict_glb(299, Bound::GreatestLower, Some(2))]
+    #[case::just_after_ict_glb(301, Bound::GreatestLower, Some(3))]
+    #[case::just_after_ict_lub(301, Bound::LeastUpper, Some(4))]
     #[tokio::test]
-    async fn test_file_modification_conversion() {
-        let mock_table = mock_table().await;
+    async fn test_timestamp_to_version_standard_table(
+        #[case] timestamp: Timestamp,
+        #[case] bound: Bound,
+        #[case] expected: Option<Version>,
+    ) {
+        let timestamps = [
+            (50, None),
+            (150, None),
+            (250, None),
+            (350, Some(300)),
+            (450, Some(400)),
+        ];
+        let (_table, engine, snapshot, _log_segment) =
+            build_test_snapshot(&timestamps, Some(3), None).await;
+
+        let res = timestamp_to_version(&snapshot, &engine, timestamp, bound);
+        match expected {
+            Some(v) => assert_eq!(res.unwrap(), v),
+            None => assert!(
+                matches!(res, Err(LogHistoryError::TimestampOutOfRange { .. })),
+                "{res:?}"
+            ),
+        }
+    }
+
+    // Table: v0=100, v1=200, v2=300 (ICT from creation)
+    #[rstest::rstest]
+    #[case::exact_v0_glb(100, Bound::GreatestLower, Some(0))]
+    #[case::exact_v0_lub(100, Bound::LeastUpper, Some(0))]
+    #[case::between_v0_v1_glb(150, Bound::GreatestLower, Some(0))]
+    #[case::between_v0_v1_lub(150, Bound::LeastUpper, Some(1))]
+    #[case::between_v1_v2_glb(250, Bound::GreatestLower, Some(1))]
+    #[case::between_v1_v2_lub(250, Bound::LeastUpper, Some(2))]
+    #[case::before_all_glb(50, Bound::GreatestLower, None)]
+    #[case::before_all_lub(50, Bound::LeastUpper, Some(0))]
+    #[tokio::test]
+    async fn test_ict_from_creation(
+        #[case] timestamp: Timestamp,
+        #[case] bound: Bound,
+        #[case] expected: Option<Version>,
+    ) {
+        let mock_table =
+            mock_table_with_timestamps(&[(0, Some(100)), (0, Some(200)), (0, Some(300))], Some(0))
+                .await;
         let engine = SyncEngine::new();
         let path = Url::from_directory_path(mock_table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
-        let log_segment = LogSegment::for_timestamp_conversion(
-            engine.storage_handler().as_ref(),
-            snapshot.log_segment().log_root.clone(),
-            snapshot.version(),
+
+        let res = timestamp_to_version(&snapshot, &engine, timestamp, bound);
+        match expected {
+            Some(v) => assert_eq!(res.unwrap(), v),
+            None => assert!(
+                matches!(res, Err(LogHistoryError::TimestampOutOfRange { .. })),
+                "{res:?}"
+            ),
+        }
+    }
+
+    /// Single commit table: v0=100 (file mod only)
+    #[rstest::rstest]
+    #[case::exact_glb(100, Bound::GreatestLower, Some(0))]
+    #[case::exact_lub(100, Bound::LeastUpper, Some(0))]
+    #[case::before_glb(50, Bound::GreatestLower, None)]
+    #[case::before_lub(50, Bound::LeastUpper, Some(0))]
+    #[case::after_glb(150, Bound::GreatestLower, Some(0))]
+    #[case::after_lub(150, Bound::LeastUpper, None)]
+    #[tokio::test]
+    async fn test_single_commit(
+        #[case] timestamp: Timestamp,
+        #[case] bound: Bound,
+        #[case] expected: Option<Version>,
+    ) {
+        let mock_table = mock_table_with_timestamps(&[(100, None)], None).await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(mock_table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let res = timestamp_to_version(&snapshot, &engine, timestamp, bound);
+        match expected {
+            Some(v) => assert_eq!(res.unwrap(), v),
+            None => assert!(
+                matches!(res, Err(LogHistoryError::TimestampOutOfRange { .. })),
+                "{res:?}"
+            ),
+        }
+    }
+
+    /// Non-monotonic file mod timestamps (clock skew):
+    /// Raw: v0=100, v1=200, v2=150, v3=180, v4=300
+    /// Monotonized: v0=100, v1=200, v2=201, v3=202, v4=300
+    #[rstest::rstest]
+    #[case::exact_v0_glb(100, Bound::GreatestLower, Some(0))]
+    #[case::exact_v1_glb(200, Bound::GreatestLower, Some(1))]
+    #[case::monotonized_v2_glb(201, Bound::GreatestLower, Some(2))]
+    #[case::monotonized_v3_glb(202, Bound::GreatestLower, Some(3))]
+    #[case::between_v3_v4_glb(250, Bound::GreatestLower, Some(3))]
+    #[case::exact_v4_glb(300, Bound::GreatestLower, Some(4))]
+    #[case::raw_v2_maps_to_v1_lub(150, Bound::LeastUpper, Some(1))]
+    #[case::monotonized_v2_lub(201, Bound::LeastUpper, Some(2))]
+    #[case::after_v3_monotonized_lub(203, Bound::LeastUpper, Some(4))]
+    #[tokio::test]
+    async fn test_non_monotonic_timestamps(
+        #[case] timestamp: Timestamp,
+        #[case] bound: Bound,
+        #[case] expected: Option<Version>,
+    ) {
+        let mock_table = mock_table_with_timestamps(
+            &[
+                (100, None),
+                (200, None),
+                (150, None),
+                (180, None),
+                (300, None),
+            ],
             None,
         )
-        .unwrap();
-        let commits = log_segment.listed.ascending_commit_files;
-
-        // Read the file modification timestamps
-        let ts: Result<Timestamp, LogHistoryError> = Ok(commits[0].location.last_modified);
-        assert!(matches!(ts, Ok(50)));
-
-        let ts: Result<Timestamp, LogHistoryError> = Ok(commits[1].location.last_modified);
-        assert!(matches!(ts, Ok(150)));
-
-        let ts: Result<Timestamp, LogHistoryError> = Ok(commits[2].location.last_modified);
-        assert!(matches!(ts, Ok(250)));
-
-        // Read the in-commit timestamps
-        let ts = commits[3].read_in_commit_timestamp(&engine);
-        assert!(matches!(ts, Ok(300)));
-        let ts = commits[4].read_in_commit_timestamp(&engine);
-        assert!(matches!(ts, Ok(400)));
-    }
-
-    #[tokio::test]
-    async fn test_convert_timestamp_to_version() {
-        let mock_table = mock_table().await;
+        .await;
         let engine = SyncEngine::new();
         let path = Url::from_directory_path(mock_table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
-        // Less than the lowest ICT
-        let mut res = timestamp_to_version(&snapshot, &engine, 0, Bound::LeastUpper);
-        assert!(matches!(res, Ok(0)), "{res:?}");
-
-        // Negative timestamps are allowed:
-        res = timestamp_to_version(&snapshot, &engine, -1, Bound::LeastUpper);
-        assert!(matches!(res, Ok(0)), "{res:?}");
-
-        // GreatestLower Bound on timestamp that is less than all commits fails
-        res = timestamp_to_version(&snapshot, &engine, 0, Bound::GreatestLower);
-        assert!(
-            matches!(
-                res,
-                Err(LogHistoryError::TimestampOutOfRange {
-                    timestamp: 0,
-                    bound: Bound::GreatestLower,
-                })
+        let res = timestamp_to_version(&snapshot, &engine, timestamp, bound);
+        match expected {
+            Some(v) => assert_eq!(res.unwrap(), v),
+            None => assert!(
+                matches!(res, Err(LogHistoryError::TimestampOutOfRange { .. })),
+                "{res:?}"
             ),
-            "{res:?}"
-        );
+        }
+    }
 
-        // GreatestLower bound on timestamp that is greater than all commits succeeds
-        res = timestamp_to_version(&snapshot, &engine, 1000, Bound::GreatestLower);
-        assert!(matches!(res, Ok(4)), "{res:?}");
+    /// ICT enabled at v3 but v4 is missing its ICT timestamp (error case).
+    /// Table: v0=50, v1=150, v2=250 (file mod), v3=300 (ICT), v4=450 (missing ICT)
+    #[tokio::test]
+    async fn test_missing_ict_after_enablement() {
+        // Create table where v4 is after ICT enablement but doesn't have an ICT
+        let timestamps = [
+            (50, None),
+            (150, None),
+            (250, None),
+            (350, Some(300)), // ICT enabled at v3
+            (450, None),      // v4 missing ICT (bug in writer!)
+        ];
+        let table = mock_table_with_timestamps(&timestamps, Some(3)).await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
-        // LeastUpper Bound on timestamp that is greater than all commits fails
-        res = timestamp_to_version(&snapshot, &engine, 1000, Bound::LeastUpper);
+        // Search for timestamp 350 which would need to search in ICT range (v3+)
+        // The search will try to read ICT from v4 which is missing
+        let res = timestamp_to_version(&snapshot, &engine, 350, Bound::LeastUpper);
         assert!(
-            matches!(
-                res,
-                Err(LogHistoryError::TimestampOutOfRange {
-                    timestamp: 1000,
-                    bound: Bound::LeastUpper,
-                })
-            ),
-            "{res:?}"
+            matches!(res, Err(LogHistoryError::Internal { .. })),
+            "Expected internal error for missing ICT: {res:?}"
         );
-
-        // Edge cases: timestamp is between file modification time and in-commit timestamp
-
-        // Right after last file modification timestamp
-        res = timestamp_to_version(&snapshot, &engine, 251, Bound::LeastUpper);
-        assert!(matches!(res, Ok(3)), "{res:?}");
-        res = timestamp_to_version(&snapshot, &engine, 251, Bound::GreatestLower);
-        assert!(matches!(res, Ok(2)), "{res:?}");
-
-        // Right before first in-commit timestamp
-        res = timestamp_to_version(&snapshot, &engine, 299, Bound::LeastUpper);
-        assert!(matches!(res, Ok(3)), "{res:?}");
-        res = timestamp_to_version(&snapshot, &engine, 299, Bound::GreatestLower);
-        assert!(matches!(res, Ok(2)), "{res:?}");
-
-        // Right after first in-commit timestamp
-        res = timestamp_to_version(&snapshot, &engine, 301, Bound::GreatestLower);
-        assert!(matches!(res, Ok(3)), "{res:?}");
-        res = timestamp_to_version(&snapshot, &engine, 301, Bound::LeastUpper);
-        assert!(matches!(res, Ok(4)), "{res:?}");
     }
 }

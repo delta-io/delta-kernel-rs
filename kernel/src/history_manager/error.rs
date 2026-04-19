@@ -55,6 +55,7 @@ pub enum LogHistoryError {
 
 impl LogHistoryError {
     /// Creates an internal error with context describing the failed operation.
+    #[allow(unused)]
     pub(crate) fn internal(context: &'static str, source: crate::Error) -> Self {
         Self::Internal {
             context,
