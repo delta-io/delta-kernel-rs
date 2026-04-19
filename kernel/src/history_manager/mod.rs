@@ -40,6 +40,7 @@ enum TimestampSearchBounds {
 ///     1) A range of commits whose timestamp is the file modification timestamp
 ///     2) A range of commits whose timestamp is an in-commit timestamp.
 #[allow(unused)]
+#[tracing::instrument(skip(snapshot, log_segment), ret)]
 fn get_timestamp_search_bounds(
     snapshot: &Snapshot,
     log_segment: &LogSegment,
@@ -173,13 +174,12 @@ pub(crate) fn timestamp_to_version(
     if lo >= hi {
         return Err(LogHistoryError::TimestampOutOfRange { timestamp, bound });
     }
+    debug_assert!(lo < len, "lo index {} should be less than len {}", lo, len);
+    debug_assert!(hi <= len, "hi index {} should be at most len {}", hi, len);
 
     let lo_version = log_segment.listed.ascending_commit_files[lo].version;
     let hi_version = log_segment.listed.ascending_commit_files[hi - 1].version;
-    info!(
-        ?search_bounds,
-        lo_version, hi_version, "Timestamp search bounds"
-    );
+    info!(lo_version, hi_version, "Searching version range");
 
     // We only search in the range [lo..hi).
     let commit_range = &log_segment.listed.ascending_commit_files[lo..hi];
