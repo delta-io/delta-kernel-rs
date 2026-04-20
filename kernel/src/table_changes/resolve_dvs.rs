@@ -13,8 +13,8 @@ pub(crate) struct ResolvedCdfScanFile {
     pub(crate) scan_file: CdfScanFile,
     /// Optional vector of bools. If `selection_vector[i] = true`, then that row must be included
     /// in the CDF output. Otherwise the row must be filtered out. The vector may be shorter than
-    /// the data file. In this case, all the remaining rows are *not* selected. If `selection_vector`
-    /// is `None`, then all rows are selected.
+    /// the data file. In this case, all the remaining rows are *not* selected. If
+    /// `selection_vector` is `None`, then all rows are selected.
     pub(crate) selection_vector: Option<Vec<bool>>,
 }
 
@@ -22,10 +22,11 @@ pub(crate) struct ResolvedCdfScanFile {
 /// types of `CdfScanFile`s:
 /// 1. The first case is a [`CdfScanFile`] paired with a remove deletion vector. The `scan_type`
 ///    must be [`CdfScanFileType::Add`]. In this case, both the add and remove deletion vectors are
-///    read if they exist. Then, we find the set of rows that have been added and rows that
-///    have been removed. The set of removed rows (if any) will be represented by a
+///    read if they exist. Then, we find the set of rows that have been added and rows that have
+///    been removed. The set of removed rows (if any) will be represented by a
 ///    [`ResolvedCdfScanFile`] with `scan_type` = [`CdfScanFileType::Remove`]. The set of added rows
-///    (if any) will be  represented by a [`ResolvedCdfScanFile`] with `scan_type` = [`CdfScanFileType::Add`].
+///    (if any) will be  represented by a [`ResolvedCdfScanFile`] with `scan_type` =
+///    [`CdfScanFileType::Add`].
 ///
 ///    Note: We allow the possibility for there to be both added rows and removed rows for a
 ///    single add/remove pair.
@@ -57,18 +58,18 @@ pub(crate) fn resolve_scan_file_dv(
         (add_dv, Some(rm_dv), CdfScanFileType::Add) => {
             let add_dv = add_dv.unwrap_or_else(Default::default);
             let rm_dv = rm_dv.unwrap_or_else(Default::default);
-            // Here we show how deletion vectors are resolved. Note that logically the `rm_dv` is the
-            // beginning state of the commit, and `add_dv` is the final state of the commit. In
-            // other words the dv went from being `rm_dv` to `add_dv`.
+            // Here we show how deletion vectors are resolved. Note that logically the `rm_dv` is
+            // the beginning state of the commit, and `add_dv` is the final state of the
+            // commit. In other words the dv went from being `rm_dv` to `add_dv`.
             //
             // ===== IMPORTANT =====
             // Both `rm_dv` and `add_dv` are deletion treemaps. We define two types of treemaps:
-            //   - _Deletion_ treemaps  (denoted `Treemap_d`) store the indices of deleted rows.
-            //     For instance, `Treemap_d(0, 2)` means that rows 0 and 2 are _deleted_. When
-            //     converted to a vector of bools, it is equivalent to a deletion vector [1, 0, 1].
+            //   - _Deletion_ treemaps  (denoted `Treemap_d`) store the indices of deleted rows. For
+            //     instance, `Treemap_d(0, 2)` means that rows 0 and 2 are _deleted_. When converted
+            //     to a vector of bools, it is equivalent to a deletion vector [1, 0, 1].
             //   - _Selection_ treemaps (denoted `Treemap_s`) store the indices of selected rows.
-            //     `Treemap_s(0, 1)` means that rows 0 and 1 are _selected_. This is equivalent
-            //     to the selection vector [1, 1, 0] when converted into a boolean vector.
+            //     `Treemap_s(0, 1)` means that rows 0 and 1 are _selected_. This is equivalent to
+            //     the selection vector [1, 1, 0] when converted into a boolean vector.
             // In ordinary scans, only deletion treemaps are used. However in the case of deletion
             // vector pairs, we generate selection treemaps.
             //
@@ -98,11 +99,11 @@ pub(crate) fn resolve_scan_file_dv(
             //  The selection treemap shows that row 0 was inserted
             //
             //  # Deletion Selection Treemap
-            //  The selection vector of deleted rows is calculated using `add_dv - rm_dv`. These rows went
-            //  from unset (present) in `rm_dv` to set (deleted) in the `add_dv`. Once again, all
-            //  other rows are either cancelled in set subtraction, or were not set in either treemap.
-            //  Applying this to our deletion vectors:
-            //  add_dv - rm_dv =
+            //  The selection vector of deleted rows is calculated using `add_dv - rm_dv`. These
+            // rows went  from unset (present) in `rm_dv` to set (deleted) in the
+            // `add_dv`. Once again, all  other rows are either cancelled in set
+            // subtraction, or were not set in either treemap.  Applying this to our
+            // deletion vectors:  add_dv - rm_dv =
             //      Treemap_d(1, 2)
             //    - Treemap_d(0, 1)
             //    = Treemap_s(2)
@@ -153,21 +154,20 @@ pub(crate) fn resolve_scan_file_dv(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, io::Write, path::PathBuf};
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::path::PathBuf;
 
     use bytes::BufMut;
     use itertools::Itertools;
     use roaring::RoaringTreemap;
 
-    use crate::{
-        actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType},
-        engine::sync::SyncEngine,
-        scan::state::DvInfo,
-        table_changes::scan_file::{CdfScanFile, CdfScanFileType},
-        Error,
-    };
-
     use super::resolve_scan_file_dv;
+    use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+    use crate::engine::sync::SyncEngine;
+    use crate::scan::state::DvInfo;
+    use crate::table_changes::scan_file::{CdfScanFile, CdfScanFileType};
+    use crate::Error;
 
     fn treemap_to_dv_descriptor(map: RoaringTreemap) -> DeletionVectorDescriptor {
         let buf = Vec::new();

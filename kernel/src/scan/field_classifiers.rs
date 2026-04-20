@@ -13,7 +13,8 @@ use crate::table_changes::{
 pub(crate) trait TransformFieldClassifier {
     /// Classify a field and return its transform spec.
     /// Returns None if the field is physical (should be read from parquet).
-    /// Returns Some(spec) if the field needs transformation (partition, metadata-derived, or dynamic).
+    /// Returns Some(spec) if the field needs transformation (partition, metadata-derived, or
+    /// dynamic).
     fn classify_field(
         &self,
         field: &StructField,

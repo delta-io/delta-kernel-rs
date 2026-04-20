@@ -6,12 +6,10 @@
 //! a separate thread pool, provided by the [`TaskExecutor`] trait. Read more in
 //! the [executor] module.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt as _};
-use itertools::Itertools as _;
 use url::Url;
 
 use self::executor::TaskExecutor;
@@ -26,8 +24,7 @@ use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler, ParquetHandler,
-    StorageHandler,
+    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
 
 pub mod executor;
@@ -86,6 +83,63 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
+
+/// Wraps a [`FileDataReadResultIterator`] to emit a [`MetricEvent`] exactly once when the iterator
+/// is either exhausted or dropped. Used by JSON and Parquet handlers to report the number of files
+/// and bytes requested per `read_*_files` call.
+pub(super) struct ReadMetricsIterator {
+    inner: crate::FileDataReadResultIterator,
+    reporter: Arc<dyn crate::metrics::MetricsReporter>,
+    num_files: u64,
+    bytes_read: u64,
+    emitted: bool,
+    make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
+}
+
+impl ReadMetricsIterator {
+    pub(super) fn new(
+        inner: crate::FileDataReadResultIterator,
+        reporter: Arc<dyn crate::metrics::MetricsReporter>,
+        num_files: u64,
+        bytes_read: u64,
+        make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
+    ) -> Self {
+        Self {
+            inner,
+            reporter,
+            num_files,
+            bytes_read,
+            emitted: false,
+            make_event,
+        }
+    }
+
+    fn emit_once(&mut self) {
+        if !self.emitted {
+            self.emitted = true;
+            self.reporter
+                .report((self.make_event)(self.num_files, self.bytes_read));
+        }
+    }
+}
+
+impl Iterator for ReadMetricsIterator {
+    type Item = crate::DeltaResult<Box<dyn crate::EngineData>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.inner.next();
+        if item.is_none() {
+            self.emit_once();
+        }
+        item
+    }
+}
+
+impl Drop for ReadMetricsIterator {
+    fn drop(&mut self) {
+        self.emit_once();
+    }
+}
 
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
@@ -184,16 +238,16 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
-                None,
+                metrics_reporter.clone(),
             )),
-            json: Arc::new(DefaultJsonHandler::new(
-                object_store.clone(),
-                task_executor.clone(),
-            )),
-            parquet: Arc::new(DefaultParquetHandler::new(
-                object_store.clone(),
-                task_executor.clone(),
-            )),
+            json: Arc::new(
+                DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
+                    .with_reporter(metrics_reporter.clone()),
+            ),
+            parquet: Arc::new(
+                DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
+                    .with_reporter(metrics_reporter.clone()),
+            ),
             object_store,
             task_executor,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
@@ -218,34 +272,17 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 
     /// Write `data` as a parquet file using the provided `write_context`.
     ///
-    /// The `partition_values` keys should use **logical** column names. They will be
-    /// automatically translated to physical names using the column mapping mode from
-    /// `write_context`.
+    /// The `write_context` must be created by [`Transaction::partitioned_write_context`] or
+    /// [`Transaction::unpartitioned_write_context`], which handle partition value validation,
+    /// serialization, and logical-to-physical key translation.
+    ///
+    /// [`Transaction::partitioned_write_context`]: crate::transaction::Transaction::partitioned_write_context
+    /// [`Transaction::unpartitioned_write_context`]: crate::transaction::Transaction::unpartitioned_write_context
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,
         write_context: &WriteContext,
-        partition_values: HashMap<String, String>,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        // Validate partition columns exist in the schema and translate logical names to physical names.
-        let physical_partition_values: HashMap<String, String> = partition_values
-            .into_iter()
-            .map(|(logical_name, value)| -> DeltaResult<(String, String)> {
-                let field = write_context
-                    .logical_schema()
-                    .field(&logical_name)
-                    .ok_or_else(|| {
-                        Error::generic(format!(
-                            "Partition column '{logical_name}' not found in table schema"
-                        ))
-                    })?;
-                let physical_name = field
-                    .physical_name(write_context.column_mapping_mode())
-                    .to_string();
-                Ok((physical_name, value))
-            })
-            .try_collect()?;
-
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
         let output_schema = write_context.physical_schema();
@@ -256,14 +293,29 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
         self.parquet
-            .write_parquet_file(
-                write_context.target_dir(),
-                physical_data,
-                physical_partition_values,
-                Some(write_context.stats_columns()),
-            )
+            .write_parquet_file(physical_data, write_context)
             .await
     }
+}
+
+/// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values and
+/// table root from the provided [`WriteContext`].
+///
+/// Paths in the returned Add action metadata are stored relative to the table root.
+///
+/// This is the public API for building Add action metadata from file write results. Custom
+/// Arrow-based engines that write parquet files themselves (bypassing
+/// [`DefaultEngine::write_parquet`]) should call this to produce the Add action metadata for
+/// [`Transaction::add_files`].
+///
+/// [`DataFileMetadata`]: parquet::DataFileMetadata
+/// [`Transaction::add_files`]: crate::transaction::Transaction::add_files
+pub fn build_add_file_metadata(
+    file_metadata: parquet::DataFileMetadata,
+    write_context: &WriteContext,
+) -> DeltaResult<Box<dyn EngineData>> {
+    let add_path = write_context.resolve_file_path(file_metadata.location())?;
+    file_metadata.as_record_batch(write_context.physical_partition_values(), &add_path)
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
@@ -296,24 +348,25 @@ trait UrlExt {
 
 impl UrlExt for Url {
     fn is_presigned(&self) -> bool {
+        // We search a URL query string for these keys to see if we should consider it a presigned
+        // URL:
+        // - AWS: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+        // - Cloudflare R2: https://developers.cloudflare.com/r2/api/s3/presigned-urls/
+        // - Azure Blob (SAS): https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas#version-2020-12-06-and-later
+        // - Google Cloud Storage: https://cloud.google.com/storage/docs/authentication/signatures
+        // - Alibaba Cloud OSS: https://www.alibabacloud.com/help/en/oss/user-guide/upload-files-using-presigned-urls
+        // - Databricks presigned URLs
+        const PRESIGNED_KEYS: &[&str] = &[
+            "X-Amz-Signature",
+            "sp",
+            "X-Goog-Credential",
+            "X-OSS-Credential",
+            "X-Databricks-Signature",
+        ];
         matches!(self.scheme(), "http" | "https")
-            && (
-                // https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
-                // https://developers.cloudflare.com/r2/api/s3/presigned-urls/
-                self
+            && self
                 .query_pairs()
-                .any(|(k, _)| k.eq_ignore_ascii_case("X-Amz-Signature")) ||
-                // https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas#version-2020-12-06-and-later
-                // note signed permission (sp) must always be present
-                self
-                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("sp")) ||
-                // https://cloud.google.com/storage/docs/authentication/signatures
-                self
-                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("X-Goog-Credential")) ||
-                // https://www.alibabacloud.com/help/en/oss/user-guide/upload-files-using-presigned-urls
-                self
-                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("X-OSS-Credential"))
-            )
+                .any(|(k, _)| PRESIGNED_KEYS.iter().any(|p| k.eq_ignore_ascii_case(p)))
     }
 }
 
@@ -416,6 +469,11 @@ mod tests {
         assert!(url.is_presigned());
 
         let url = Url::parse("https://example.com?X-OSS-Credential=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url =
+            Url::parse("https://example.com?X-Databricks-TTL=3599545&X-Databricks-Signature=bar")
+                .unwrap();
         assert!(url.is_presigned());
 
         // assert that query keys are case insensitive

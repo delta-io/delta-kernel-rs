@@ -15,7 +15,6 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::Snapshot;
-
 use serde_json::json;
 use tempfile::tempdir;
 use url::Url;
@@ -43,13 +42,6 @@ fn write_large_parquet_to(path: &Path) -> Result<(), Box<dyn std::error::Error>>
     // read to show file sizes
     let metadata = std::fs::metadata(&path)?;
     let file_size = metadata.len();
-    #[cfg(all(feature = "arrow-56", not(feature = "arrow-57")))]
-    let total_row_group_size: i64 = parquet_metadata
-        .row_groups
-        .iter()
-        .map(|rg| rg.total_byte_size)
-        .sum();
-    #[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
     let total_row_group_size: i64 = parquet_metadata
         .row_groups()
         .iter()

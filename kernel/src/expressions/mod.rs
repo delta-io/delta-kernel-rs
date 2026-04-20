@@ -453,7 +453,8 @@ pub enum Expression {
     /// A predicate treated as a boolean expression
     Predicate(Box<Predicate>), // should this be Arc?
     /// A struct computed from a Vec of expressions.
-    /// The optional nullability predicate, if provided and evaluates to false/null, makes the entire struct null.
+    /// The optional nullability predicate, if provided and evaluates to false/null, makes the
+    /// entire struct null.
     Struct(Vec<ExpressionRef>, Option<ExpressionRef>),
     /// A sparse transformation of a struct schema. More efficient than `Struct` for wide schemas
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
@@ -513,13 +514,13 @@ pub enum Predicate {
     #[serde(deserialize_with = "fail_deserialize_opaque_predicate")]
     Opaque(OpaquePredicate),
     /// An unknown predicate (i.e. one that neither kernel nor engine attempts to evaluate). For
-    /// data skipping purposes, kernel treats unknown predicates as if they were literal NULL values
-    /// (which may disable skipping if it "poisons" the predicate), but engines MUST NOT attempt to
-    /// interpret them as NULL when evaluating query filters because it could produce incorrect
-    /// results. For example, converting `WHERE <fancy-udf-invocation>` to `WHERE NULL` is
-    /// equivalent to `WHERE FALSE` and would filter out all rows -- almost certainly NOT what the
-    /// query author intended. Use `Predicate::Opaque` for predicates kernel doesn't understand
-    /// but which engine can still evaluate.
+    /// data skipping purposes, kernel treats unknown predicates as if they were literal NULL
+    /// values (which may disable skipping if it "poisons" the predicate), but engines MUST NOT
+    /// attempt to interpret them as NULL when evaluating query filters because it could
+    /// produce incorrect results. For example, converting `WHERE <fancy-udf-invocation>` to
+    /// `WHERE NULL` is equivalent to `WHERE FALSE` and would filter out all rows -- almost
+    /// certainly NOT what the query author intended. Use `Predicate::Opaque` for predicates
+    /// kernel doesn't understand but which engine can still evaluate.
     Unknown(String),
 }
 
@@ -928,8 +929,8 @@ impl Predicate {
 
     /// Creates a new junction predicate OP(preds...). Normalizes degenerate cases:
     ///
-    /// - Empty junction returns the identity element (the value that has no effect when
-    ///   combined with other predicates under the same operator):
+    /// - Empty junction returns the identity element (the value that has no effect when combined
+    ///   with other predicates under the same operator):
     ///   - `AND()` -> `true`, because `true AND p` == `p` for any predicate `p`.
     ///   - `OR()` -> `false`, because `false OR p` == `p` for any predicate `p`.
     /// - Single-element junction unwraps the element: `AND(p)` / `OR(p)` -> `p`.
@@ -1264,6 +1265,7 @@ mod tests {
     mod serde_tests {
         use std::sync::Arc;
 
+        use super::assert_roundtrip;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
             column_expr, column_name, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
@@ -1271,8 +1273,6 @@ mod tests {
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::utils::test_utils::assert_result_error_with_message;
-
-        use super::assert_roundtrip;
 
         // ==================== Expression::Literal Tests ====================
 

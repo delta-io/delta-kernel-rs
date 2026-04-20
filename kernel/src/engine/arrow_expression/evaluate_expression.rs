@@ -16,7 +16,7 @@ use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
-use crate::arrow::compute::{and_kleene, is_not_null, is_null, not, or_kleene};
+use crate::arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
     Schema as ArrowSchema, TimeUnit,
@@ -28,9 +28,8 @@ use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
-use crate::engine::arrow_utils::parse_json_impl;
-use crate::engine::arrow_utils::prim_array_cmp;
-use crate::engine::ensure_data_types::ensure_data_types;
+use crate::engine::arrow_utils::{parse_json_impl, prim_array_cmp};
+use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
@@ -129,7 +128,8 @@ fn evaluate_struct_expression(
             ArrowField::new(
                 output_field.name(),
                 output_col.data_type().clone(),
-                output_field.nullable, // Use schema's nullability; Arrow will validate any mismatch
+                output_field.nullable, /* Use schema's nullability; Arrow will validate any
+                                        * mismatch */
             )
         })
         .collect();
@@ -265,7 +265,15 @@ pub fn evaluate_expression(
         (Literal(scalar), _) => {
             validate_array_type(scalar.to_array(batch.num_rows())?, result_type)
         }
-        (Column(name), _) => validate_array_type(extract_column(batch, name)?, result_type),
+        (Column(name), _) => {
+            // Column extraction uses ordinal-based struct validation because column mapping
+            // can cause physical/logical name mismatches. apply_schema handles renaming.
+            let arr = extract_column(batch, name)?;
+            if let Some(expected) = result_type {
+                ensure_data_types(expected, arr.data_type(), ValidationMode::TypesOnly)?;
+            }
+            Ok(arr)
+        }
         (Struct(fields, nullability), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_expression(fields, batch, output_schema, nullability.as_ref())
         }
@@ -381,6 +389,109 @@ pub fn evaluate_expression(
     }
 }
 
+/// Direction for casting between Arrow view and non-view string/binary types.
+#[derive(Clone, Copy)]
+enum ViewCast {
+    ToView,
+    ToNonView,
+}
+
+/// Casts list element types between view and non-view string/binary variants.
+///
+/// When [`ViewCast::ToView`], non-view string/binary element types are converted to their view
+/// equivalents (e.g. `List<Utf8>` -> `List<Utf8View>`). View container types (`ListView`,
+/// `LargeListView`) are preserved.
+///
+/// When [`ViewCast::ToNonView`], view element types are converted to their non-view equivalents
+/// (e.g. `List<Utf8View>` -> `List<Utf8>`). Additionally, view container types are always
+/// converted to their non-view equivalents (e.g. `ListView<Int32>` -> `List<Int32>`), even
+/// when the element type does not change.
+///
+/// Nested type conversion is not supported.
+fn cast_list_elements(
+    vals: &Arc<dyn Array>,
+    field: &Arc<ArrowField>,
+    dir: ViewCast,
+) -> DeltaResult<Arc<dyn Array>> {
+    let to_type = match dir {
+        ViewCast::ToView => match field.data_type() {
+            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => ArrowDataType::Utf8View,
+            ArrowDataType::Binary | ArrowDataType::LargeBinary => ArrowDataType::BinaryView,
+            _ => return Ok(vals.clone()),
+        },
+        ViewCast::ToNonView => match field.data_type() {
+            ArrowDataType::Utf8View => ArrowDataType::Utf8,
+            ArrowDataType::BinaryView => ArrowDataType::Binary,
+            other => {
+                if !matches!(
+                    vals.data_type(),
+                    ArrowDataType::ListView(_) | ArrowDataType::LargeListView(_)
+                ) {
+                    return Ok(vals.clone());
+                }
+                // Container is a view type but element is not -- preserve element type,
+                // cast only the container (ListView -> List, LargeListView -> LargeList).
+                other.clone()
+            }
+        },
+    };
+    let new_field = Arc::new(field.as_ref().clone().with_data_type(to_type));
+    let container = match (vals.data_type(), dir) {
+        (ArrowDataType::List(_), _) => ArrowDataType::List(new_field),
+        (ArrowDataType::LargeList(_), _) => ArrowDataType::LargeList(new_field),
+        (ArrowDataType::ListView(_), ViewCast::ToView) => ArrowDataType::ListView(new_field),
+        (ArrowDataType::ListView(_), ViewCast::ToNonView) => ArrowDataType::List(new_field),
+        (ArrowDataType::LargeListView(_), ViewCast::ToView) => {
+            ArrowDataType::LargeListView(new_field)
+        }
+        (ArrowDataType::LargeListView(_), ViewCast::ToNonView) => {
+            ArrowDataType::LargeList(new_field)
+        }
+        (dt, _) => {
+            return Err(Error::generic(format!(
+                "cast_list_elements: expected a list type, got {dt:?}"
+            )))
+        }
+    };
+    Ok(cast(vals, &container)?)
+}
+
+/// This function converts ArrowView types to their non-view type equivalents. This is used for
+/// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
+/// supports limited conversions (see code for exactly which).
+fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
+    match vals.data_type() {
+        ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
+        ArrowDataType::LargeList(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
+        ArrowDataType::ListView(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
+        ArrowDataType::LargeListView(field) => {
+            cast_list_elements(&vals, field, ViewCast::ToNonView)
+        }
+        ArrowDataType::Utf8View => Ok(cast(&vals, &ArrowDataType::Utf8)?),
+        ArrowDataType::BinaryView => Ok(cast(&vals, &ArrowDataType::Binary)?),
+        _ => Ok(vals),
+    }
+}
+
+/// This function converts  Arrow types to their Arrow view type equivalents. This is used for
+/// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
+/// supports limited conversions (see code for exactly which).
+fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
+    match vals.data_type() {
+        ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToView),
+        ArrowDataType::LargeList(field) => cast_list_elements(&vals, field, ViewCast::ToView),
+        ArrowDataType::ListView(field) => cast_list_elements(&vals, field, ViewCast::ToView),
+        ArrowDataType::LargeListView(field) => cast_list_elements(&vals, field, ViewCast::ToView),
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => {
+            Ok(cast(&vals, &ArrowDataType::Utf8View)?)
+        }
+        ArrowDataType::Binary | ArrowDataType::LargeBinary => {
+            Ok(cast(&vals, &ArrowDataType::BinaryView)?)
+        }
+        _ => Ok(vals),
+    }
+}
+
 /// Evaluates a (possibly inverted) kernel predicate over a record batch
 pub fn evaluate_predicate(
     predicate: &Predicate,
@@ -425,11 +536,16 @@ pub fn evaluate_predicate(
             let eval_in = || match (left, right) {
                 (Expression::Literal(_), Expression::Column(_)) => {
                     let left = evaluate_expression(left, batch, None)?;
+                    let left = arrow_convert_to_non_view_type(left)?;
+
                     let right = evaluate_expression(right, batch, None)?;
+                    let right = arrow_convert_to_non_view_type(right)?;
                     if let Some(string_arr) = left.as_string_opt::<i32>() {
                         if let Some(list_arr) = right.as_list_opt::<i32>() {
-                            let result = in_list_utf8(string_arr, list_arr)?;
-                            return Ok(result);
+                            if list_arr.value_type() == ArrowDataType::Utf8 {
+                                let result = in_list_utf8(string_arr, list_arr)?;
+                                return Ok(result);
+                            }
                         }
                     }
 
@@ -491,6 +607,19 @@ pub fn evaluate_predicate(
 
             let left = evaluate_expression(left, batch, None)?;
             let right = evaluate_expression(right, batch, None)?;
+
+            // If the types differ (e.g. one side is a view type and the other is not),
+            // normalize both to view types since benchamrking results show that casting from
+            // non-view to view type is faster than casting from view type to non-view
+            // type.
+            let (left, right) = if left.data_type() == right.data_type() {
+                (left, right)
+            } else {
+                (
+                    arrow_convert_to_view_type(left)?,
+                    arrow_convert_to_view_type(right)?,
+                )
+            };
             Ok(eval_fn(&left, &right)?)
         }
         Junction(JunctionPredicate { op, preds }) => {
@@ -594,7 +723,8 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
 /// are null for a given row, the result will be null for that row.
 ///
 /// # Parameters
-/// - `arrays`: Slice of Arrow arrays to coalesce. Must not be empty and all arrays must have the same data type.
+/// - `arrays`: Slice of Arrow arrays to coalesce. Must not be empty and all arrays must have the
+///   same data type.
 /// - `result_type`: Optional expected result type. If provided, must match the arrays' data type.
 ///
 /// # Returns
@@ -781,13 +911,17 @@ fn evaluate_map_to_struct(
 
 fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaResult<ArrayRef> {
     if let Some(expected) = expected {
-        ensure_data_types(expected, array.data_type(), false)?;
+        ensure_data_types(expected, array.data_type(), ValidationMode::TypesAndNames)?;
     }
     Ok(array)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use rstest::rstest;
+
     use super::*;
     use crate::arrow::array::{
         ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray, StructArray,
@@ -795,12 +929,11 @@ mod tests {
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
-    use crate::expressions::column_expr;
-    use crate::expressions::{column_expr_ref, BinaryExpressionOp, Expression as Expr, Transform};
+    use crate::expressions::{
+        column_expr, column_expr_ref, BinaryExpressionOp, Expression as Expr, Transform,
+    };
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
-    use rstest::rstest;
-    use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {
         let schema = ArrowSchema::new(vec![
@@ -2153,5 +2286,212 @@ mod tests {
         let expr = Expr::struct_from([column_expr_ref!("a")]);
         let result = evaluate_expression(&expr, &batch, None);
         assert!(result.is_err());
+    }
+
+    /// Helper to build a batch with a single struct column named "stats".
+    fn make_struct_batch(arrow_fields: Vec<ArrowField>, arrays: Vec<ArrayRef>) -> RecordBatch {
+        let stats_type = ArrowDataType::Struct(arrow_fields.clone().into());
+        let schema = ArrowSchema::new(vec![ArrowField::new("stats", stats_type, true)]);
+        let stats_array = StructArray::try_new(arrow_fields.into(), arrays, None).unwrap();
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(stats_array)]).unwrap()
+    }
+
+    #[test]
+    fn column_extract_struct_with_mismatched_field_names() {
+        let batch = make_struct_batch(
+            vec![
+                ArrowField::new("col-abc-001", ArrowDataType::Int64, true),
+                ArrowField::new("col-abc-002", ArrowDataType::Int64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(2)])),
+                Arc::new(Int64Array::from(vec![Some(10), Some(20)])),
+            ],
+        );
+
+        // Logical names differ from physical names due to column mapping
+        let logical_type = DataType::try_struct_type([
+            StructField::nullable("my_column", DataType::LONG),
+            StructField::nullable("other_column", DataType::LONG),
+        ])
+        .unwrap();
+
+        let expr = column_expr!("stats");
+        let result = evaluate_expression(&expr, &batch, Some(&logical_type));
+
+        // Ordinal-based validation passes: same field count and types by position.
+        // The downstream apply_schema transformation handles renaming.
+        let arr = result.expect("should succeed with mismatched names but matching types");
+        let struct_arr = arr.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(struct_arr.num_columns(), 2);
+        assert_eq!(struct_arr.len(), 2);
+    }
+
+    #[test]
+    fn column_extract_struct_rejects_mismatched_field_count() {
+        let batch = make_struct_batch(
+            vec![ArrowField::new("col-abc-001", ArrowDataType::Int64, true)],
+            vec![Arc::new(Int64Array::from(vec![Some(1), Some(2)]))],
+        );
+
+        let logical_type = DataType::try_struct_type([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::LONG),
+        ])
+        .unwrap();
+
+        let expr = column_expr!("stats");
+        let result = evaluate_expression(&expr, &batch, Some(&logical_type));
+        assert_result_error_with_message(result, "Struct field count mismatch");
+    }
+
+    #[test]
+    fn column_extract_struct_rejects_mismatched_child_types() {
+        let batch = make_struct_batch(
+            vec![
+                ArrowField::new("col-abc-001", ArrowDataType::Int64, true),
+                ArrowField::new("col-abc-002", ArrowDataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1)])),
+                Arc::new(StringArray::from(vec![Some("x")])),
+            ],
+        );
+
+        // Expect two LONG columns, but the second arrow field is Utf8
+        let logical_type = DataType::try_struct_type([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::LONG),
+        ])
+        .unwrap();
+
+        let expr = column_expr!("stats");
+        let result = evaluate_expression(&expr, &batch, Some(&logical_type));
+        assert_result_error_with_message(result, "Incorrect datatype");
+    }
+
+    #[test]
+    fn column_extract_struct_with_matching_names_still_works() {
+        let batch = make_struct_batch(
+            vec![
+                ArrowField::new("a", ArrowDataType::Int64, true),
+                ArrowField::new("b", ArrowDataType::Int64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1)])),
+                Arc::new(Int64Array::from(vec![Some(2)])),
+            ],
+        );
+
+        let logical_type = DataType::try_struct_type([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::LONG),
+        ])
+        .unwrap();
+
+        let expr = column_expr!("stats");
+        let result = evaluate_expression(&expr, &batch, Some(&logical_type));
+        assert!(result.is_ok());
+    }
+
+    /// Exercises the exact code path from `get_add_transform_expr` where a `struct_from`
+    /// expression wraps `column_expr!("add.stats_parsed")`. When the checkpoint parquet has
+    /// stats_parsed with physical column names (e.g. `col-abc-001`) but the output schema
+    /// uses logical names (e.g. `id`), `evaluate_struct_expression` calls
+    /// `evaluate_expression(Column, struct_result_type)` with mismatched field names.
+    /// Without ordinal-based validation this fails with a name mismatch error.
+    #[test]
+    fn struct_from_with_column_tolerates_nested_name_mismatch() {
+        // Build a batch mimicking checkpoint data: add.stats_parsed uses physical names
+        let stats_fields: Vec<ArrowField> = vec![
+            ArrowField::new("col-abc-001", ArrowDataType::Int64, true),
+            ArrowField::new("col-abc-002", ArrowDataType::Int64, true),
+        ];
+        let stats_array = StructArray::try_new(
+            stats_fields.clone().into(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1)])),
+                Arc::new(Int64Array::from(vec![Some(10)])),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let add_fields: Vec<ArrowField> = vec![
+            ArrowField::new("path", ArrowDataType::Utf8, true),
+            ArrowField::new(
+                "stats_parsed",
+                ArrowDataType::Struct(stats_fields.into()),
+                true,
+            ),
+        ];
+        let add_struct = StructArray::try_new(
+            add_fields.clone().into(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("file.parquet")])),
+                Arc::new(stats_array),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "add",
+            ArrowDataType::Struct(add_fields.into()),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(add_struct)]).unwrap();
+
+        // struct_from mimicking get_add_transform_expr: wraps a Column referencing stats_parsed
+        let expr = Expr::struct_from([
+            column_expr_ref!("add.path"),
+            column_expr_ref!("add.stats_parsed"),
+        ]);
+
+        // Output schema uses logical names (differs from physical names in the batch)
+        let output_type = DataType::try_struct_type([
+            StructField::nullable("path", DataType::STRING),
+            StructField::nullable(
+                "stats_parsed",
+                DataType::struct_type_unchecked([
+                    StructField::nullable("id", DataType::LONG),
+                    StructField::nullable("value", DataType::LONG),
+                ]),
+            ),
+        ])
+        .unwrap();
+
+        let result = evaluate_expression(&expr, &batch, Some(&output_type));
+        result.expect("struct_from with Column sub-expression should tolerate field name mismatch");
+    }
+
+    #[test]
+    fn column_extract_nested_struct_with_mismatched_names() {
+        let inner_fields = vec![ArrowField::new("phys-inner", ArrowDataType::Int64, true)];
+        let inner_struct = ArrowDataType::Struct(inner_fields.clone().into());
+        let batch = make_struct_batch(
+            vec![ArrowField::new("phys-outer", inner_struct, true)],
+            vec![Arc::new(
+                StructArray::try_new(
+                    inner_fields.into(),
+                    vec![Arc::new(Int64Array::from(vec![Some(42)]))],
+                    None,
+                )
+                .unwrap(),
+            )],
+        );
+
+        let logical_type = DataType::try_struct_type([StructField::nullable(
+            "logical_outer",
+            DataType::struct_type_unchecked([StructField::nullable(
+                "logical_inner",
+                DataType::LONG,
+            )]),
+        )])
+        .unwrap();
+
+        let expr = column_expr!("stats");
+        let result = evaluate_expression(&expr, &batch, Some(&logical_type));
+        assert!(result.is_ok());
     }
 }

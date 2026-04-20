@@ -1,9 +1,9 @@
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
-use syn::parse_macro_input;
 use syn::spanned::Spanned;
 use syn::{
-    Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments, Type, Visibility,
+    parse_macro_input, Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments,
+    Type, Visibility,
 };
 
 /// Parses a dot-delimited column name into an array of field names. See
@@ -82,6 +82,26 @@ fn get_schema_name(name: &Ident) -> Ident {
     Ident::new(&ret, name.span())
 }
 
+/// Check if a path segment is `Option<HashMap<K, V>>`.
+fn is_option_of_hashmap(seg: &syn::PathSegment) -> bool {
+    if seg.ident != "Option" {
+        return false;
+    }
+    let PathArguments::AngleBracketed(angle_args) = &seg.arguments else {
+        return false;
+    };
+    // Option has exactly one type argument
+    let Some(syn::GenericArgument::Type(Type::Path(inner_type))) = angle_args.args.first() else {
+        return false;
+    };
+    // Check if the inner type's last segment is HashMap
+    inner_type
+        .path
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident == "HashMap")
+}
+
 fn gen_schema_fields(data: &Data) -> TokenStream {
     let fields = match data {
         Data::Struct(DataStruct {
@@ -119,11 +139,13 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
                     }
                 });
                 if have_schema_null {
-                    if let Some(last_ident) = type_path.path.segments.last().map(|seg| &seg.ident) {
-                        if last_ident != "HashMap" {
-                           return Error::new(
-                                last_ident.span(),
-                                format!("Can only use allow_null_container_values on HashMap fields, not {last_ident}")
+                    if let Some(last_seg) = type_path.path.segments.last() {
+                        let is_valid =
+                            last_seg.ident == "HashMap" || is_option_of_hashmap(last_seg);
+                        if !is_valid {
+                            return Error::new(
+                                last_seg.ident.span(),
+                                format!("Can only use allow_null_container_values on HashMap or Option<HashMap> fields, not {}", last_seg.ident)
                             ).to_compile_error()
                         }
                     }

@@ -5,15 +5,15 @@ mod column_filter;
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use column_filter::StatsColumnFilter;
+pub(crate) use column_filter::StatsConfig;
+
 use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
     StructType,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::DeltaResult;
-
-use column_filter::StatsColumnFilter;
-pub(crate) use column_filter::StatsConfig;
 
 /// Generates the expected schema for file statistics.
 ///
@@ -48,11 +48,11 @@ pub(crate) use column_filter::StatsConfig;
 ///   entry in `minValues`/`maxValues`. The `nullCount` entry is still present and equals
 ///   `numRecords`.
 /// - String min/max values must be truncated to a prefix no longer than 32 characters. For min
-///   values, simple prefix truncation is valid (the truncated value is always <= the original).
-///   For max values, a tie-breaker character must be appended after truncation to ensure the
-///   result is >= all actual values: ASCII DEL (0x7F) when the truncated character is ASCII,
-///   or U+10FFFF otherwise. If a valid truncation point cannot be found within 64 characters,
-///   the max value is omitted (returning `None`).
+///   values, simple prefix truncation is valid (the truncated value is always <= the original). For
+///   max values, a tie-breaker character must be appended after truncation to ensure the result is
+///   greater than or equal to all actual values: ASCII DEL (0x7F) when the truncated character is
+///   ASCII, or U+10FFFF otherwise. If a valid truncation point cannot be found within 64
+///   characters, the max value is omitted (returning `None`).
 /// - Binary min/max values are not collected (Binary is not eligible for data skipping).
 /// - Boolean values are not eligible for min/max statistics but do have `nullCount`.
 ///
@@ -124,11 +124,10 @@ pub(crate) use column_filter::StatsConfig;
 ///
 /// - `data_schema`: The table's data schema (partition columns excluded).
 /// - `config`: Stats configuration controlling which columns are included.
-/// - `required_columns`: Columns that must always be included in statistics (write path).
-///   Per the Delta protocol, clustering columns must have statistics regardless of table
-///   property settings.
-/// - `requested_columns`: Filter output to only these columns (read path). If specified,
-///   only columns that also pass the `config` filtering will be included.
+/// - `required_columns`: Columns that must always be included in statistics (write path). Per the
+///   Delta protocol, clustering columns must have statistics regardless of table property settings.
+/// - `requested_columns`: Filter output to only these columns (read path). If specified, only
+///   columns that also pass the `config` filtering will be included.
 #[allow(unused)]
 pub(crate) fn expected_stats_schema(
     data_schema: &Schema,
@@ -302,8 +301,8 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
 /// Transforms a table schema into a base stats schema.
 ///
 /// Base stats schema in this case refers the subsets of fields in the table schema
-/// that may be considered for stats collection. Depending on the type of stats - min/max/nullcount/... -
-/// additional transformations may be applied.
+/// that may be considered for stats collection. Depending on the type of stats -
+/// min/max/nullcount/... - additional transformations may be applied.
 ///
 /// All fields in the output are nullable. Clustering columns are always included per
 /// the Delta protocol.
@@ -417,10 +416,9 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::schema::ArrayType;
     use crate::table_properties::TableProperties;
-
-    use super::*;
 
     fn stats_config_from_table_properties(properties: &TableProperties) -> StatsConfig<'_> {
         StatsConfig {
@@ -663,7 +661,8 @@ mod tests {
     fn test_stats_schema_nested_different_fields_in_null_vs_minmax() {
         let properties: TableProperties = [("key", "value")].into();
 
-        // Create a nested schema where some nested fields are eligible for min/max and others aren't
+        // Create a nested schema where some nested fields are eligible for min/max and others
+        // aren't
         let user_struct = StructType::new_unchecked([
             StructField::nullable("name", DataType::STRING), // eligible for min/max
             StructField::nullable("is_admin", DataType::BOOLEAN), // NOT eligible for min/max

@@ -1,20 +1,17 @@
 //! Definitions of errors that the delta kernel can encounter
 
-use std::{
-    backtrace::{Backtrace, BacktraceStatus},
-    convert::Infallible,
-    num::ParseIntError,
-    str::Utf8Error,
-};
-
-use crate::schema::{DataType, StructType};
-use crate::table_properties::ParseIntervalError;
-use crate::Version;
+use std::backtrace::{Backtrace, BacktraceStatus};
+use std::convert::Infallible;
+use std::num::ParseIntError;
+use std::str::Utf8Error;
 
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
 use crate::object_store;
+use crate::schema::{DataType, StructType};
+use crate::table_properties::ParseIntervalError;
+use crate::Version;
 
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
@@ -96,6 +93,11 @@ pub enum Error {
     /// A column was requested, but not found
     #[error("{0}")]
     MissingColumn(String),
+
+    /// The connector-provided partition values are invalid (missing/extra/duplicate keys,
+    /// or a value type does not match the schema column type).
+    #[error("Invalid partition values: {0}")]
+    InvalidPartitionValues(String),
 
     /// A column was specified with a specific type, but it is not of that type
     #[error("Expected column type: {0}")]
@@ -247,6 +249,9 @@ impl Error {
     }
     pub fn unexpected_column_type(name: impl ToString) -> Self {
         Self::UnexpectedColumnType(name.to_string())
+    }
+    pub fn invalid_partition_values(msg: impl ToString) -> Self {
+        Self::InvalidPartitionValues(msg.to_string())
     }
     pub fn missing_data(name: impl ToString) -> Self {
         Self::MissingData(name.to_string())

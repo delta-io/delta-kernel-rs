@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
+use super::Transaction;
 use crate::actions::{get_log_commit_info_schema, CommitInfo, COMMIT_INFO_NAME};
 use crate::expressions::{MapData, Scalar, Transform};
 use crate::schema::{MapType, StructField, StructType, ToSchema};
 use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef, IntoEngineData};
-
-use super::Transaction;
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
 /// field. Field names match the camelCase schema names produced by the `ToSchema` derive macro.
@@ -176,9 +175,6 @@ mod tests {
         columns: Vec<ArrayRef>,
     ) -> (Box<dyn EngineData>, SchemaRef) {
         let arrow_schema = ArrowSchema::new(arrow_fields);
-        #[cfg(all(feature = "arrow-56", not(feature = "arrow-57")))]
-        let kernel_schema: Schema = (&arrow_schema).try_into_kernel().unwrap();
-        #[cfg(any(not(feature = "arrow-56"), feature = "arrow-57"))]
         let kernel_schema: Schema = arrow_schema.as_ref().try_into_kernel().unwrap();
         let batch =
             RecordBatch::try_new(Arc::new(arrow_schema), columns).expect("valid RecordBatch");
@@ -382,7 +378,8 @@ mod tests {
     }
 
     /// engine schema has partial overlap -- overlapping fields are replaced, engine-only
-    /// fields pass through, and remaining CommitInfo fields are appended after the last engine field.
+    /// fields pass through, and remaining CommitInfo fields are appended after the last engine
+    /// field.
     #[test]
     fn test_build_commit_info_partial_overlap() -> DeltaResult<()> {
         let (data, schema) = make_engine_commit_info(

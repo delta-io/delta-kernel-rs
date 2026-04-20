@@ -10,26 +10,27 @@
 #![allow(unreachable_pub)]
 
 mod delta;
+mod file_size_histogram;
 mod file_stats;
 mod lazy;
 mod reader;
 mod writer;
 
+use std::collections::HashMap;
+
 #[allow(unused)]
 pub(crate) use delta::CrcDelta;
-pub(crate) use file_stats::FileStats;
+pub use file_size_histogram::FileSizeHistogram;
+pub use file_stats::FileStats;
 #[allow(unused)]
 pub(crate) use file_stats::FileStatsDelta;
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
-#[allow(unused)]
-pub(crate) use writer::try_write_crc_file;
-
-use std::collections::HashMap;
-
 use serde::de::Deserializer;
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
+#[allow(unused)]
+pub(crate) use writer::try_write_crc_file;
 
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 
@@ -132,7 +133,11 @@ pub struct Crc {
     )]
     pub domain_metadata: Option<HashMap<String, DomainMetadata>>,
     /// Size distribution information of files remaining after action reconciliation.
-    #[serde(skip)]
+    #[serde(
+        default,
+        deserialize_with = "de_validated_file_size_histogram",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub file_size_histogram: Option<FileSizeHistogram>,
     /// All live [`Add`] file actions at this version.
     #[serde(skip)]
@@ -159,6 +164,7 @@ impl Crc {
             FileStatsValidity::Valid => Some(FileStats {
                 num_files: self.num_files,
                 table_size_bytes: self.table_size_bytes,
+                file_size_histogram: self.file_size_histogram.clone(),
             }),
             _ => None,
         }
@@ -198,6 +204,30 @@ where
     }))
 }
 
+/// Deserializes an `Option<FileSizeHistogram>` from a CRC JSON file with validation.
+///
+/// After serde deserializes the raw JSON fields, this validates the histogram invariants
+/// (sorted boundaries, matching array lengths, etc.) via [`FileSizeHistogram::try_new`],
+/// ensuring malformed CRC files are rejected rather than causing panics later.
+fn de_validated_file_size_histogram<'de, D>(
+    deserializer: D,
+) -> Result<Option<FileSizeHistogram>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<FileSizeHistogram> = Option::deserialize(deserializer)?;
+    match opt {
+        Some(hist) => FileSizeHistogram::try_new(
+            hist.sorted_bin_boundaries,
+            hist.file_counts,
+            hist.total_bytes,
+        )
+        .map(Some)
+        .map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
+
 /// Serialize `Option<HashMap<String, T>>` back to `Option<Vec<T>>` so the CRC JSON format
 /// uses an array (matching the Delta protocol spec).
 fn ser_opt_map_to_opt_vec<S, T>(
@@ -212,22 +242,6 @@ where
         None => serializer.serialize_none(),
         Some(m) => m.values().collect::<Vec<_>>().serialize(serializer),
     }
-}
-
-/// The [FileSizeHistogram] object represents a histogram tracking file counts and total bytes
-/// across different size ranges.
-///
-/// [FileSizeHistogram]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#file-size-histogram-schema
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileSizeHistogram {
-    /// A sorted array of bin boundaries where each element represents the start of a bin
-    /// (inclusive) and the next element represents the end of the bin (exclusive). The first
-    /// element must be 0.
-    pub(crate) sorted_bin_boundaries: Vec<i64>,
-    /// Count of files in each bin. Length must match `sorted_bin_boundaries`.
-    pub(crate) file_counts: Vec<i64>,
-    /// Total bytes of files in each bin. Length must match `sorted_bin_boundaries`.
-    pub(crate) total_bytes: Vec<i64>,
 }
 
 /// The [DeletedRecordCountsHistogram] object represents a histogram tracking the distribution of
@@ -488,5 +502,65 @@ mod tests {
 
         // Verify the original and deserialized are equal
         assert_eq!(crc, deserialized);
+    }
+
+    // ===== File size histogram validation =====
+
+    /// Minimal CRC JSON with a file size histogram field spliced in.
+    fn crc_json_with_histogram(histogram_json: &str) -> String {
+        format!(
+            r#"{{
+                "tableSizeBytes": 0,
+                "numFiles": 0,
+                "numMetadata": 1,
+                "numProtocol": 1,
+                "metadata": {{
+                    "id": "test",
+                    "format": {{"provider": "parquet", "options": {{}}}},
+                    "schemaString": "{{\"type\":\"struct\",\"fields\":[]}}",
+                    "partitionColumns": [],
+                    "configuration": {{}},
+                    "createdTime": 0
+                }},
+                "protocol": {{"minReaderVersion": 1, "minWriterVersion": 1}},
+                "fileSizeHistogram": {histogram_json}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn de_valid_file_size_histogram_succeeds() {
+        let json = crc_json_with_histogram(
+            r#"{"sortedBinBoundaries": [0, 100, 200], "fileCounts": [1, 2, 3], "totalBytes": [10, 200, 300]}"#,
+        );
+        let crc: Crc = serde_json::from_str(&json).unwrap();
+        assert!(crc.file_size_histogram.is_some());
+    }
+
+    #[test]
+    fn de_null_file_size_histogram_deserializes_to_none() {
+        let json = crc_json_with_histogram("null");
+        let crc: Crc = serde_json::from_str(&json).unwrap();
+        assert!(crc.file_size_histogram.is_none());
+    }
+
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::unsorted_boundaries(
+        r#"{"sortedBinBoundaries": [0, 200, 100], "fileCounts": [0, 0, 0], "totalBytes": [0, 0, 0]}"#
+    )]
+    #[case::nonzero_first_boundary(
+        r#"{"sortedBinBoundaries": [1, 100], "fileCounts": [0, 0], "totalBytes": [0, 0]}"#
+    )]
+    #[case::mismatched_lengths(
+        r#"{"sortedBinBoundaries": [0, 100], "fileCounts": [0], "totalBytes": [0, 0]}"#
+    )]
+    #[case::single_boundary(
+        r#"{"sortedBinBoundaries": [0], "fileCounts": [0], "totalBytes": [0]}"#
+    )]
+    fn de_malformed_file_size_histogram_returns_error(#[case] histogram_json: &str) {
+        let json = crc_json_with_histogram(histogram_json);
+        assert!(serde_json::from_str::<Crc>(&json).is_err());
     }
 }

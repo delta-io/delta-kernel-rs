@@ -29,14 +29,13 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::*;
     use crate::actions::{DomainMetadata, Protocol, SetTransaction};
     use crate::crc::reader::try_read_crc_file;
-    use crate::crc::FileStatsValidity;
+    use crate::crc::{FileSizeHistogram, FileStatsValidity};
     use crate::engine::default::DefaultEngineBuilder;
     use crate::object_store::memory::InMemory;
     use crate::path::{AsUrl, ParsedLogPath};
@@ -68,6 +67,11 @@ mod tests {
         let app_id = "testAppId".to_string();
         let set_transactions =
             HashMap::from([(app_id.clone(), SetTransaction::new(app_id, 1, Some(ict)))]);
+        // Build a histogram with 5 files totaling 1024 bytes, all in the first bin (< 8KB).
+        let mut histogram = FileSizeHistogram::create_default();
+        for size in [100, 200, 300, 150, 274] {
+            histogram.insert(size).unwrap(); // 5 files, 1024 bytes total
+        }
         Crc {
             table_size_bytes: 1024,
             num_files: 5,
@@ -78,6 +82,7 @@ mod tests {
             in_commit_timestamp_opt: Some(ict),
             set_transactions: Some(set_transactions),
             domain_metadata: Some(domain_metadata),
+            file_size_histogram: Some(histogram),
             ..Default::default()
         }
     }
@@ -112,7 +117,9 @@ mod tests {
         let crc = test_crc();
         let actual: serde_json::Value = serde_json::to_value(&crc).unwrap();
 
-        let expected = serde_json::json!({
+        // Verify non-histogram fields match exactly.
+        let actual_obj = actual.as_object().unwrap();
+        let expected_non_hist = serde_json::json!({
             "tableSizeBytes": 1024,
             "numFiles": 5,
             "numMetadata": 1,
@@ -157,8 +164,25 @@ mod tests {
                 }
             ]
         });
+        for (key, expected_val) in expected_non_hist.as_object().unwrap() {
+            assert_eq!(
+                actual_obj.get(key).unwrap(),
+                expected_val,
+                "Mismatch for key: {key}"
+            );
+        }
 
-        assert_eq!(actual, expected);
+        // Verify the histogram is present with correct camelCase keys and values.
+        let hist = actual_obj.get("fileSizeHistogram").unwrap();
+        let boundaries = hist.get("sortedBinBoundaries").unwrap().as_array().unwrap();
+        let counts = hist.get("fileCounts").unwrap().as_array().unwrap();
+        let bytes = hist.get("totalBytes").unwrap().as_array().unwrap();
+        assert_eq!(boundaries.len(), 95);
+        assert_eq!(counts.len(), 95);
+        assert_eq!(bytes.len(), 95);
+        // All 5 files are in bin 0 (< 8KB)
+        assert_eq!(counts[0].as_i64().unwrap(), 5);
+        assert_eq!(bytes[0].as_i64().unwrap(), 1024); // 100+200+300+150+274
     }
 
     #[test]

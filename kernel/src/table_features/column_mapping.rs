@@ -3,22 +3,21 @@
 //! This module provides:
 //! - Read-side: Mode detection and schema validation
 //! - Write-side: Schema transformation for assigning IDs and physical names
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+use strum::EnumString;
+use uuid::Uuid;
+
 use super::TableFeature;
 use crate::actions::Protocol;
 use crate::schema::{
     ArrayType, ColumnMetadataKey, ColumnName, DataType, MapType, MetadataValue, Schema,
     StructField, StructType,
 };
-
 use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Error};
-
-use std::collections::HashMap;
-
-use serde::{Deserialize, Serialize};
-use strum::EnumString;
-use uuid::Uuid;
 
 /// Modes of column mapping a table can be in
 #[derive(Debug, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
@@ -242,8 +241,8 @@ pub(crate) fn get_column_mapping_mode_from_properties(
 /// # Arguments
 ///
 /// * `schema` - The schema to transform
-/// * `max_id` - Tracks the highest column ID assigned. Updated in place. Should be initialized
-///   to 0 for a new table.
+/// * `max_id` - Tracks the highest column ID assigned. Updated in place. Should be initialized to 0
+///   for a new table.
 ///
 /// # Returns
 ///
@@ -378,15 +377,30 @@ pub(crate) fn get_any_level_column_physical_name(
     Ok(ColumnName::new(physical_path))
 }
 
+/// Convert a physical column name to a logical column name by walking the schema.
+///
+/// For each path component in the physical column, finds the field in the schema whose
+/// `physical_name(mode)` matches, and returns the field's logical name instead.
+pub(crate) fn physical_to_logical_column_name(
+    logical_schema: &StructType,
+    physical_col: &ColumnName,
+    column_mapping_mode: ColumnMappingMode,
+) -> DeltaResult<ColumnName> {
+    let fields = logical_schema.walk_column_fields_by(physical_col, |s, phys_name| {
+        s.fields()
+            .find(|f| f.physical_name(column_mapping_mode) == phys_name)
+    })?;
+    Ok(ColumnName::new(fields.iter().map(|f| f.name.clone())))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::expressions::ColumnName;
-    use crate::schema::{DataType, StructType};
-    use crate::utils::test_utils::make_test_tc;
     use std::collections::{HashMap, HashSet};
 
-    use crate::utils::test_utils::test_deep_nested_schema_missing_leaf_cm;
+    use super::*;
+    use crate::expressions::ColumnName;
+    use crate::schema::{DataType, MetadataValue, StructField, StructType};
+    use crate::utils::test_utils::{make_test_tc, test_deep_nested_schema_missing_leaf_cm};
 
     #[test]
     fn test_column_mapping_mode() {
@@ -461,7 +475,8 @@ mod tests {
         assert_eq!(tc.column_mapping_mode(), ColumnMappingMode::None);
     }
 
-    // Creates optional schema field annotations for column mapping id and physical name, as a string.
+    // Creates optional schema field annotations for column mapping id and physical name, as a
+    // string.
     fn create_annotations<'a>(
         id: impl Into<Option<&'a str>>,
         name: impl Into<Option<&'a str>>,
@@ -476,7 +491,8 @@ mod tests {
         annotations.join(", ")
     }
 
-    // Creates a generic schema with optional field annotations for column mapping id and physical name.
+    // Creates a generic schema with optional field annotations for column mapping id and physical
+    // name.
     fn create_schema<'a>(
         inner_id: impl Into<Option<&'a str>>,
         inner_name: impl Into<Option<&'a str>>,
@@ -1203,5 +1219,83 @@ mod tests {
             err.contains("top.`<array element>`.mid_field.`<map value>`.leaf"),
             "Expected full nested path in error, got: {err}"
         );
+    }
+
+    #[test]
+    fn physical_to_logical_no_mapping() {
+        let schema = StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ]);
+        let physical_col = ColumnName::new(["id"]);
+        let result =
+            physical_to_logical_column_name(&schema, &physical_col, ColumnMappingMode::None)
+                .unwrap();
+        assert_eq!(result, ColumnName::new(["id"]));
+    }
+
+    #[test]
+    fn physical_to_logical_with_name_mapping() {
+        let field = StructField::new("user_id", DataType::INTEGER, false).with_metadata([(
+            "delta.columnMapping.physicalName".to_string(),
+            MetadataValue::String("col-abc-123".to_string()),
+        )]);
+        let schema = StructType::new_unchecked(vec![field]);
+
+        let physical_col = ColumnName::new(["col-abc-123"]);
+        let result =
+            physical_to_logical_column_name(&schema, &physical_col, ColumnMappingMode::Name)
+                .unwrap();
+        assert_eq!(result, ColumnName::new(["user_id"]));
+    }
+
+    #[test]
+    fn physical_to_logical_not_found() {
+        let schema =
+            StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
+        let physical_col = ColumnName::new(["nonexistent"]);
+        let result =
+            physical_to_logical_column_name(&schema, &physical_col, ColumnMappingMode::None);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not found in schema"));
+    }
+
+    #[test]
+    fn physical_to_logical_nested_struct_with_mapping() {
+        let inner_field = StructField::new("city", DataType::STRING, true).with_metadata([(
+            "delta.columnMapping.physicalName".to_string(),
+            MetadataValue::String("col-inner-456".to_string()),
+        )]);
+        let inner_struct = StructType::new_unchecked(vec![inner_field]);
+        let outer_field =
+            StructField::new("address", DataType::Struct(Box::new(inner_struct)), true)
+                .with_metadata([(
+                    "delta.columnMapping.physicalName".to_string(),
+                    MetadataValue::String("col-outer-123".to_string()),
+                )]);
+        let schema = StructType::new_unchecked(vec![outer_field]);
+
+        let physical_col = ColumnName::new(["col-outer-123", "col-inner-456"]);
+        let result =
+            physical_to_logical_column_name(&schema, &physical_col, ColumnMappingMode::Name)
+                .unwrap();
+        assert_eq!(result, ColumnName::new(["address", "city"]));
+    }
+
+    #[test]
+    fn physical_to_logical_non_struct_intermediate_errors() {
+        let schema =
+            StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
+        let physical_col = ColumnName::new(["id", "nested"]);
+        let result =
+            physical_to_logical_column_name(&schema, &physical_col, ColumnMappingMode::None);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("is not a struct type"));
     }
 }

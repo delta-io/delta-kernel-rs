@@ -4,20 +4,6 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use delta_kernel_derive::internal_api;
-
-use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
-use crate::arrow::datatypes::{DataType, Field, Schema};
-use crate::object_store::path::Path;
-use crate::object_store::{DynObjectStore, ObjectStore};
-use crate::parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-};
-use crate::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
-use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use crate::parquet::arrow::async_writer::AsyncArrowWriter;
-use crate::parquet::arrow::async_writer::ParquetObjectWriter;
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
@@ -25,6 +11,9 @@ use uuid::Uuid;
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use super::stats::collect_stats;
 use super::UrlExt;
+use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
+use crate::arrow::datatypes::{DataType, Field, Schema};
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
@@ -33,34 +22,29 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::engine::{reader_options, writer_options};
 use crate::expressions::ColumnName;
+use crate::metrics::{MetricEvent, MetricsReporter};
+use crate::object_store::path::Path;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
+use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use crate::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
 use crate::schema::{SchemaRef, StructType};
+use crate::transaction::WriteContext;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
     ParquetHandler, PredicateRef,
 };
-
-/// Returns the standard [`ArrowReaderOptions`] for all kernel parquet reads.
-///
-/// Skipping the embedded Arrow IPC schema avoids dependence on Arrow-specific metadata and
-/// ensures that type resolution is driven by the kernel schema rather than the file's schema.
-pub(in crate::engine) fn reader_options() -> ArrowReaderOptions {
-    ArrowReaderOptions::new().with_skip_arrow_metadata(true)
-}
-
-/// Returns the standard [`ArrowWriterOptions`] for all kernel parquet writes.
-///
-/// Omitting the Arrow IPC schema from the file metadata keeps Delta files interoperable with
-/// non-Arrow readers and avoids encoding Arrow-specific type information.
-pub(in crate::engine) fn writer_options() -> ArrowWriterOptions {
-    ArrowWriterOptions::new().with_skip_arrow_metadata(true)
-}
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
     readahead: usize,
+    /// Optional reporter for emitting [`MetricEvent::ParquetReadCompleted`] events.
+    reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 /// Metadata of a data file (typically a parquet file).
@@ -76,27 +60,28 @@ impl DataFileMetadata {
         Self { file_meta, stats }
     }
 
-    /// Convert DataFileMetadata into a record batch which matches the schema returned by
-    /// [`add_files_schema`].
+    /// Returns the absolute URL of the written file.
+    pub fn location(&self) -> &url::Url {
+        &self.file_meta.location
+    }
+
+    /// Converts this `DataFileMetadata` into an [`EngineData`] record batch matching the schema
+    /// returned by [`Transaction::add_files_schema`].
     ///
-    /// [`add_files_schema`]: crate::transaction::Transaction::add_files_schema
-    #[internal_api]
+    /// The `partition_values` map uses physical column names as keys and protocol-serialized
+    /// strings as values. `None` represents a null partition value. The serialization layer
+    /// converts nulls and empty strings to `None` before reaching this method, so `Some("")`
+    /// is not expected in normal usage.
+    ///
+    /// The `log_path` is the path string written to the Delta log's `add.path` field.
+    ///
+    /// [`Transaction::add_files_schema`]: crate::transaction::Transaction::add_files_schema
     pub(crate) fn as_record_batch(
         &self,
-        partition_values: &HashMap<String, String>,
+        partition_values: &HashMap<String, Option<String>>,
+        log_path: &str,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let DataFileMetadata {
-            file_meta:
-                FileMeta {
-                    location,
-                    last_modified,
-                    size,
-                },
-            stats,
-            ..
-        } = self;
-        // create the record batch of the write metadata
-        let path = Arc::new(StringArray::from(vec![location.to_string()]));
+        let path = Arc::new(StringArray::from(vec![log_path]));
         let key_builder = StringBuilder::new();
         let val_builder = StringBuilder::new();
         let names = MapFieldNames {
@@ -107,25 +92,28 @@ impl DataFileMetadata {
         let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
         for (k, v) in partition_values {
             builder.keys().append_value(k);
-            if v.is_empty() {
-                // convert empty string to null as per the Delta Spec
-                builder.values().append_null();
-            } else {
-                builder.values().append_value(v);
+            match v.as_deref() {
+                // The serialization layer already converts empty strings to None, so
+                // Some("") should not occur. The empty check is purely defensive.
+                Some(val) if !val.is_empty() => builder.values().append_value(val),
+                _ => builder.values().append_null(),
             }
         }
         builder.append(true)?;
         let partitions = Arc::new(builder.finish());
         // this means max size we can write is i64::MAX (~8EB)
-        let size: i64 = (*size)
+        let size: i64 = self
+            .file_meta
+            .size
             .try_into()
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to i64"))?;
         let size = Arc::new(Int64Array::from(vec![size]));
-        let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
+        let modification_time = Arc::new(Int64Array::from(vec![self.file_meta.last_modified]));
 
-        let stats_array = Arc::new(stats.clone());
+        let stats_array = Arc::new(self.stats.clone());
 
-        // Build schema dynamically based on stats (stats schema varies based on collected statistics)
+        // Build schema dynamically based on stats (stats schema varies based on collected
+        // statistics)
         let key_value_struct = DataType::Struct(
             vec![
                 Field::new("key", DataType::Utf8, false),
@@ -161,6 +149,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             store,
             task_executor,
             readahead: 10,
+            reporter: None,
         }
     }
 
@@ -169,6 +158,12 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// Defaults to 10.
     pub fn with_readahead(mut self, readahead: usize) -> Self {
         self.readahead = readahead;
+        self
+    }
+
+    /// Set a metrics reporter to receive [`MetricEvent::ParquetReadCompleted`] events.
+    pub fn with_reporter(mut self, reporter: Option<Arc<dyn MetricsReporter>>) -> Self {
+        self.reporter = reporter;
         self
     }
 
@@ -228,25 +223,27 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         Ok(DataFileMetadata::new(file_meta, stats))
     }
 
-    /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
-    /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
-    /// is a generated UUIDv4).
+    /// Write `data` to a new parquet file under the [`WriteContext::write_dir`] and return
+    /// Add action metadata ready for [`Transaction::add_files`].
     ///
-    /// Note that the schema does not contain the dataChange column. In order to set `data_change` flag,
-    /// use [`crate::transaction::Transaction::with_data_change`].
+    /// Note that the schema does not contain the dataChange column. In order to set `data_change`
+    /// flag, use [`crate::transaction::Transaction::with_data_change`].
     ///
-    /// [add file metadata]: crate::transaction::Transaction::add_files_schema
+    /// [`WriteContext::write_dir`]: crate::transaction::WriteContext::write_dir
+    /// [`Transaction::add_files`]: crate::transaction::Transaction::add_files
     pub async fn write_parquet_file(
         &self,
-        path: &url::Url,
         data: Box<dyn EngineData>,
-        partition_values: HashMap<String, String>,
-        stats_columns: Option<&[ColumnName]>,
+        write_context: &WriteContext,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let parquet_metadata = self
-            .write_parquet(path, data, stats_columns.unwrap_or(&[]))
+        let file_metadata = self
+            .write_parquet(
+                &write_context.write_dir(),
+                data,
+                write_context.stats_columns(),
+            )
             .await?;
-        parquet_metadata.as_record_batch(&partition_values)
+        super::build_add_file_metadata(file_metadata, write_context)
     }
 }
 
@@ -324,7 +321,23 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             physical_schema,
             predicate,
         );
-        super::stream_future_to_iter(self.task_executor.clone(), future)
+        let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        if let Some(reporter) = &self.reporter {
+            let num_files = files.len() as u64;
+            let bytes_read = files.iter().map(|f| f.size).sum();
+            Ok(Box::new(super::ReadMetricsIterator::new(
+                inner,
+                reporter.clone(),
+                num_files,
+                bytes_read,
+                |num_files, bytes_read| MetricEvent::ParquetReadCompleted {
+                    num_files,
+                    bytes_read,
+                },
+            )))
+        } else {
+            Ok(inner)
+        }
     }
 
     /// Writes engine data to a Parquet file at the specified location.
@@ -334,8 +347,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     ///
     /// # Parameters
     ///
-    /// - `location` - The full URL path where the Parquet file should be written
-    ///   (e.g., `s3://bucket/path/file.parquet`, `file:///path/to/file.parquet`).
+    /// - `location` - The full URL path where the Parquet file should be written (e.g., `s3://bucket/path/file.parquet`,
+    ///   `file:///path/to/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
     ///
     /// # Returns
@@ -585,6 +598,10 @@ mod tests {
     use std::path::PathBuf;
     use std::slice;
 
+    use itertools::Itertools;
+    use url::Url;
+
+    use super::*;
     use crate::arrow::array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
         Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
@@ -595,18 +612,13 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DEFAULT_BATCH_SIZE;
-    use crate::object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
     use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use crate::schema::ColumnMetadataKey;
-    use crate::EngineData;
-
-    use itertools::Itertools;
-    use url::Url;
-
     use crate::utils::current_time_ms;
     use crate::utils::test_utils::assert_result_error_with_message;
-
-    use super::*;
+    use crate::EngineData;
 
     fn into_record_batch(
         engine_data: DeltaResult<Box<dyn EngineData>>,
@@ -716,7 +728,9 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn test_as_record_batch(#[values(true, false)] test_empty_str: bool) {
+    fn test_as_record_batch(
+        #[values(None, Some("a".to_string()))] partition_value: Option<String>,
+    ) {
         let location = Url::parse("file:///test_url").unwrap();
         let size = 1_000_000;
         let last_modified = 10000000000;
@@ -736,14 +750,9 @@ mod tests {
         )
         .unwrap();
         let data_file_metadata = DataFileMetadata::new(file_metadata, stats.clone());
-        let partition_value = if test_empty_str {
-            "".to_string()
-        } else {
-            "a".to_string()
-        };
-        let partition_values = HashMap::from([("partition1".to_string(), partition_value)]);
+        let partition_values = HashMap::from([("partition1".to_string(), partition_value.clone())]);
         let actual = data_file_metadata
-            .as_record_batch(&partition_values)
+            .as_record_batch(&partition_values, "test_url")
             .unwrap();
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
@@ -758,10 +767,9 @@ mod tests {
         );
 
         partition_values_builder.keys().append_value("partition1");
-        if test_empty_str {
-            partition_values_builder.values().append_null(); // empty string should go to null
-        } else {
-            partition_values_builder.values().append_value("a");
+        match &partition_value {
+            None => partition_values_builder.values().append_null(),
+            Some(v) => partition_values_builder.values().append_value(v),
         }
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
@@ -796,7 +804,7 @@ mod tests {
         let expected = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec![location.to_string()])),
+                Arc::new(StringArray::from(vec!["test_url"])),
                 Arc::new(partition_values),
                 Arc::new(Int64Array::from(vec![size as i64])),
                 Arc::new(Int64Array::from(vec![last_modified])),
@@ -1255,8 +1263,8 @@ mod tests {
 
     /// Test that field IDs are accessible via ColumnMetadataKey::ParquetFieldId as documented.
     ///
-    /// Per trait definitions in lib.rs, field IDs should be accessible via StructField::get_config_value
-    /// with ColumnMetadataKey::ParquetFieldId.
+    /// Per trait definitions in lib.rs, field IDs should be accessible via
+    /// StructField::get_config_value with ColumnMetadataKey::ParquetFieldId.
     #[test]
     fn test_parquet_footer_read_with_field_id() {
         // Write parquet file with field ID
@@ -1441,5 +1449,56 @@ mod tests {
             !has,
             "Parquet file should not contain embedded Arrow schema metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn write_parquet_file_creates_parent_directories() {
+        // GIVEN a file path whose parent directories do not exist
+        let temp_dir = tempfile::tempdir().unwrap();
+        let nested_path = temp_dir.path().join("a/b/c/output.parquet");
+        assert!(!nested_path.parent().unwrap().exists());
+
+        let store = Arc::new(LocalFileSystem::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "x",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data)));
+
+        // WHEN we write a parquet file to that path
+        let file_url = Url::from_file_path(&nested_path).unwrap();
+        parquet_handler
+            .write_parquet_file(file_url.clone(), data_iter)
+            .unwrap();
+
+        // THEN the file is created and contains the expected data
+        assert!(nested_path.exists());
+
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let batches: Vec<RecordBatch> = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .build()
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(col.values(), &[1, 2, 3]);
     }
 }

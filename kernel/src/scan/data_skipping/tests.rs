@@ -1,9 +1,10 @@
-use super::*;
+use std::collections::HashMap;
 
+use rstest::rstest;
+
+use super::*;
 use crate::expressions::column_name;
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, UnimplementedColumnResolver};
-use rstest::rstest;
-use std::collections::HashMap;
 
 const TRUE: Option<bool> = Some(true);
 const FALSE: Option<bool> = Some(false);
@@ -361,10 +362,8 @@ fn test_sql_where() {
     do_test(ALL_NULL, pred, MISSING, None, None);
 }
 
-// TODO(#1002): we currently don't support file skipping on timestamp columns' max stat since they
-// are truncated to milliseconds in add.stats.
 #[test]
-fn test_timestamp_skipping_disabled() {
+fn test_timestamp_stats_enabled() {
     let empty = HashSet::new();
     let creator = DataSkippingPredicateCreator {
         partition_columns: &empty,
@@ -373,23 +372,52 @@ fn test_timestamp_skipping_disabled() {
 
     assert!(
         creator.get_min_stat(col, &DataType::TIMESTAMP).is_some(),
-        "get_min_stat should return Some: allow data skipping on timestamp minValues"
+        "get_min_stat should return Some for timestamp minValues"
     );
-    assert_eq!(
-        creator.get_max_stat(col, &DataType::TIMESTAMP),
-        None,
-        "get_max_stat should return None: no data skipping on timestamp maxValues"
+    assert!(
+        creator.get_max_stat(col, &DataType::TIMESTAMP).is_some(),
+        "get_max_stat should return Some for timestamp maxValues"
     );
     assert!(
         creator
             .get_min_stat(col, &DataType::TIMESTAMP_NTZ)
             .is_some(),
-        "get_min_stat should return Some: allow data skipping on timestamp_ntz minValues"
+        "get_min_stat should return Some for timestamp_ntz minValues"
     );
+    assert!(
+        creator
+            .get_max_stat(col, &DataType::TIMESTAMP_NTZ)
+            .is_some(),
+        "get_max_stat should return Some for timestamp_ntz maxValues"
+    );
+}
+
+#[test]
+fn test_adjust_scalar_for_max_stat_truncation() {
+    // Timestamp: subtracts 999us
     assert_eq!(
-        creator.get_max_stat(col, &DataType::TIMESTAMP_NTZ),
-        None,
-        "get_max_stat should return None: no data skipping on timestamp_ntz maxValues"
+        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(1_000_000)),
+        Scalar::Timestamp(999_001)
+    );
+    // TimestampNtz: subtracts 999us
+    assert_eq!(
+        adjust_scalar_for_max_stat_truncation(&Scalar::TimestampNtz(1_000_000)),
+        Scalar::TimestampNtz(999_001)
+    );
+    // Non-timestamp: unchanged
+    assert_eq!(
+        adjust_scalar_for_max_stat_truncation(&Scalar::from(42i64)),
+        Scalar::from(42i64)
+    );
+    // Saturating at i64::MIN
+    assert_eq!(
+        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(i64::MIN)),
+        Scalar::Timestamp(i64::MIN)
+    );
+    // Near-zero: goes negative
+    assert_eq!(
+        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(500)),
+        Scalar::Timestamp(-499)
     );
 }
 
@@ -430,14 +458,14 @@ fn test_checkpoint_skipping_null_guard_vs_regular() {
     expect_eq!(
         filter.eval(&guarded),
         TRUE,
-        "guarded pred with null stats → TRUE (keep)"
+        "guarded pred with null stats -> TRUE (keep)"
     );
 
     let regular = as_data_skipping_predicate(&pred).unwrap();
     expect_eq!(
         filter.eval(&regular),
         NULL,
-        "regular pred with null stats → NULL (unknown)"
+        "regular pred with null stats -> NULL (unknown)"
     );
 }
 
@@ -458,7 +486,7 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
     );
     let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
 
-    // Both stats present and both allow pruning → skip
+    // Both stats present and both allow pruning -> skip
     let resolver = HashMap::from_iter([
         (column_name!("maxValues.col_a"), Scalar::from(50)),
         (column_name!("minValues.col_b"), Scalar::from(60)),
@@ -467,10 +495,10 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
     expect_eq!(
         filter.eval(&skipping_pred),
         FALSE,
-        "both cols prunable → skip"
+        "both cols prunable -> skip"
     );
 
-    // col_a stats null, but col_b stats alone are enough to prune → still skip
+    // col_a stats null, but col_b stats alone are enough to prune -> still skip
     let resolver = HashMap::from_iter([
         (
             column_name!("maxValues.col_a"),
@@ -482,10 +510,10 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
     expect_eq!(
         filter.eval(&skipping_pred),
         FALSE,
-        "col_a null but col_b prunable → still skip"
+        "col_a null but col_b prunable -> still skip"
     );
 
-    // col_a stats null and col_b doesn't allow pruning → keep
+    // col_a stats null and col_b doesn't allow pruning -> keep
     let resolver = HashMap::from_iter([
         (
             column_name!("maxValues.col_a"),
@@ -497,46 +525,100 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
     expect_eq!(
         filter.eval(&skipping_pred),
         TRUE,
-        "col_a null and col_b not prunable → keep"
+        "col_a null and col_b not prunable -> keep"
     );
 }
 
-// TODO(#1002): we currently don't support file skipping on timestamp columns' max stat since they
-// are truncated to milliseconds in add.stats.
-#[test]
-fn test_timestamp_predicates_dont_data_skip() {
+// Verifies the null-guarded checkpoint skipping path also applies the 999us timestamp
+// truncation adjustment to max stat comparisons.
+#[rstest]
+fn test_checkpoint_skipping_timestamp_adjustment(
+    #[values(Scalar::Timestamp(1_000_000), Scalar::TimestampNtz(1_000_000))] timestamp: Scalar,
+) {
     let col = &column_expr!("ts_col");
-    for timestamp in [&Scalar::Timestamp(1000000), &Scalar::TimestampNtz(1000000)] {
-        // LT will do minValues -> OK
-        let pred = Pred::lt(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert_eq!(
-            skipping_pred.unwrap().to_string(),
-            "Column(stats_parsed.minValues.ts_col) < 1000000"
-        );
 
-        // GT will do maxValues -> BLOCKED
-        let pred = Pred::gt(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert!(
-            skipping_pred.is_none(),
-            "Expected no data skipping for timestamp predicate: {pred:#?}, got {skipping_pred:#?}"
-        );
+    // GT: should produce OR(maxValues.ts_col IS NULL, maxValues.ts_col > 999001)
+    let pred = Pred::gt(col.clone(), timestamp.clone());
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
+    assert_eq!(
+        skipping_pred.to_string(),
+        "OR(Column(maxValues.ts_col) IS NULL, Column(maxValues.ts_col) > 999001)"
+    );
 
-        let pred = Pred::eq(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert_eq!(
-            skipping_pred.unwrap().to_string(),
-            "AND(NOT(Column(stats_parsed.minValues.ts_col) > 1000000), null)"
-        );
+    // EQ: max stat leg should use adjusted literal
+    let pred = Pred::eq(col.clone(), timestamp.clone());
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
+    assert_eq!(
+        skipping_pred.to_string(),
+        "AND(OR(Column(minValues.ts_col) IS NULL, NOT(Column(minValues.ts_col) > 1000000)), \
+         OR(Column(maxValues.ts_col) IS NULL, NOT(Column(maxValues.ts_col) < 999001)))"
+    );
+}
 
-        let pred = Pred::ne(col.clone(), timestamp.clone());
-        let skipping_pred = as_data_skipping_predicate(&pred);
-        assert_eq!(
-            skipping_pred.unwrap().to_string(),
-            "OR(NOT(Column(stats_parsed.minValues.ts_col) = 1000000), null)"
-        );
-    }
+// Timestamp predicates use max stats with a 999us adjustment to account for millisecond
+// truncation in Delta JSON stats.
+#[rstest]
+fn test_timestamp_predicates_use_adjusted_max_stats(
+    #[values(Scalar::Timestamp(1_000_000), Scalar::TimestampNtz(1_000_000))] timestamp: Scalar,
+) {
+    let col = &column_expr!("ts_col");
+
+    // LT uses minValues (no adjustment needed for min stats)
+    let pred = Pred::lt(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "Column(stats_parsed.minValues.ts_col) < 1000000"
+    );
+
+    // GT uses maxValues with adjusted literal (1000000 - 999 = 999001)
+    let pred = Pred::gt(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "Column(stats_parsed.maxValues.ts_col) > 999001"
+    );
+
+    // EQ uses both min (unadjusted) and max (adjusted)
+    let pred = Pred::eq(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "AND(NOT(Column(stats_parsed.minValues.ts_col) > 1000000), \
+         NOT(Column(stats_parsed.maxValues.ts_col) < 999001))"
+    );
+
+    // NE uses both min (unadjusted) and max (adjusted)
+    let pred = Pred::ne(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "OR(NOT(Column(stats_parsed.minValues.ts_col) = 1000000), \
+         NOT(Column(stats_parsed.maxValues.ts_col) = 999001))"
+    );
+
+    // GE (col >= val) uses maxValues with adjusted literal
+    let pred = Pred::ge(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "NOT(Column(stats_parsed.maxValues.ts_col) < 999001)"
+    );
+
+    // LE (col <= val) uses minValues only (no adjustment needed)
+    let pred = Pred::le(col.clone(), timestamp.clone());
+    assert_eq!(
+        as_data_skipping_predicate(&pred).unwrap().to_string(),
+        "NOT(Column(stats_parsed.minValues.ts_col) > 1000000)"
+    );
+}
+
+// Partition timestamp columns use exact values (not truncated), so no adjustment is applied.
+#[test]
+fn test_partition_timestamp_column_no_adjustment() {
+    let partition_columns: HashSet<String> = ["ts_part".to_string()].into();
+    let pred = Pred::gt(column_expr!("ts_part"), Scalar::Timestamp(1_000_000));
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, &partition_columns).unwrap();
+    assert_eq!(
+        skipping_pred.to_string(),
+        "OR(NOT(Column(is_add)), Column(partitionValues_parsed.ts_part) > 1000000)"
+    );
 }
 
 // Tests for partition-aware data skipping
@@ -1183,44 +1265,97 @@ fn parsed_stats_skipping() {
     assert_eq!(count_selected(STATS_TABLE, pred), 2);
 }
 
-// -- Unsupported predicate handling (parsed-stats table) ----------------------
-// Timestamp GT uses max stats which is unsupported for checkpoint skipping due to
-// millisecond truncation. Timestamp LT uses min stats (supported).
+// -- Timestamp predicate skipping (parsed-stats table) ------------------------
+// Timestamp predicates now use max stats with a 999us adjustment for truncation.
+// Table has 6 files with ts_col ranges: [1M,2M], [3M,4M], [5M,6M], [7M,8M], [9M,10M], [11M,12M]
 
 #[rstest]
-#[case::bare_ts_gt_returns_all(
+#[case::bare_ts_gt_keeps_all(
+    // ts_col > 2M -> adjusted: max > 1,999,001 -> all 6 files have max >= 2M -> 6
     Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
     6
 )]
 #[case::bare_ts_lt_skips(
+    // ts_col < 3M -> min < 3M -> file 1 (min=1M) -> 1
     Pred::lt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(3_000_000))),
     1
 )]
-#[case::and_mixed_supported_unsupported(
+#[case::and_mixed_id_and_ts(
+    // id > 400 keeps files 5-6; ts_col > 2M keeps all 6; AND -> 2
     Pred::and(
         Pred::gt(column_expr!("id"), Expr::literal(400i64)),
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
     ),
     2
 )]
-#[case::or_mixed_supported_unsupported(
+#[case::or_mixed_id_and_ts(
+    // id > 400 keeps 5-6; ts_col > 2M keeps 1-6; OR -> 6
     Pred::or(
         Pred::gt(column_expr!("id"), Expr::literal(400i64)),
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
     ),
     6
 )]
-#[case::and_all_unsupported(
+#[case::and_two_ts_predicates(
+    // ts_col > 2M (adjusted max > 1,999,001 -> all) AND ts_col > 5M (adjusted max > 4,999,001
+    // -> files 3-6) -> 4
     Pred::and(
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
+        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
+    ),
+    4
+)]
+#[case::or_two_ts_predicates(
+    // ts_col > 2M keeps all; ts_col > 5M keeps files 3-6; OR -> 6
+    Pred::or(
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
         Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
     ),
     6
 )]
-#[case::or_all_unsupported(
+fn timestamp_predicate_skipping(#[case] pred: Pred, #[case] expected: usize) {
+    assert_eq!(count_selected(STATS_TABLE, Arc::new(pred)), expected);
+}
+
+// -- Unsupported predicate handling (parsed-stats table) ----------------------
+// Column-column comparisons are unsupported for data skipping (no literal to infer type).
+// Verifies that junctions degrade gracefully when one or both legs can't be evaluated.
+
+#[rstest]
+#[case::bare_unsupported_returns_all(
+    // col > col is unsupported -> None -> keep all files
+    Pred::gt(column_expr!("id"), column_expr!("salary")),
+    6
+)]
+#[case::and_supported_with_unsupported(
+    // id > 400 keeps files 5-6; id > salary is unsupported; AND -> 2
+    Pred::and(
+        Pred::gt(column_expr!("id"), Expr::literal(400i64)),
+        Pred::gt(column_expr!("id"), column_expr!("salary")),
+    ),
+    2
+)]
+#[case::or_supported_with_unsupported(
+    // id > 400 keeps 5-6; id > salary is unsupported; OR -> all 6
     Pred::or(
-        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(2_000_000))),
-        Pred::gt(column_expr!("ts_col"), Expr::literal(Scalar::Timestamp(5_000_000))),
+        Pred::gt(column_expr!("id"), Expr::literal(400i64)),
+        Pred::gt(column_expr!("id"), column_expr!("salary")),
+    ),
+    6
+)]
+#[case::and_all_unsupported(
+    // Both legs unsupported -> None -> keep all 6
+    Pred::and(
+        Pred::gt(column_expr!("id"), column_expr!("salary")),
+        Pred::gt(column_expr!("id"), column_expr!("age")),
+    ),
+    6
+)]
+#[case::or_all_unsupported(
+    // Both legs unsupported -> None -> keep all 6
+    Pred::or(
+        Pred::gt(column_expr!("id"), column_expr!("salary")),
+        Pred::gt(column_expr!("id"), column_expr!("age")),
     ),
     6
 )]

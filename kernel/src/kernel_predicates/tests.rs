@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use super::*;
 use crate::expressions::{
     column_expr, column_name, column_pred, ArrayData, Expression as Expr, OpaqueExpressionOp,
@@ -6,10 +8,7 @@ use crate::expressions::{
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::scan::data_skipping::as_data_skipping_predicate;
 use crate::schema::ArrayType;
-use crate::DataType;
-use crate::DeltaResult;
-
-use std::collections::HashMap;
+use crate::{DataType, DeltaResult};
 
 /// Helper trait to allow expect_eq! to work with both Option<Scalar> and Option<bool>
 trait LogicalEq {
@@ -377,7 +376,8 @@ fn test_eval_binary_scalars() {
     }
 }
 
-// NOTE: We're testing routing here -- the actual comparisons are already validated by test_eval_binary_scalars.
+// NOTE: We're testing routing here -- the actual comparisons are already validated by
+// test_eval_binary_scalars.
 #[test]
 fn test_eval_binary_columns() {
     let columns = HashMap::from_iter(vec![
@@ -713,8 +713,8 @@ impl OpaquePredicateOp for OpaqueLessThanOp {
             _ => return None,
         };
 
-        // NOTE: `evaluator.partial_cmp_min`_stat returns `Pred::Binary`. That's fine, because we have
-        // separate testing for the `eval_pred_scalar` path.
+        // NOTE: `evaluator.partial_cmp_min`_stat returns `Pred::Binary`. That's fine, because we
+        // have separate testing for the `eval_pred_scalar` path.
         evaluator.partial_cmp_min_stat(col, val, ord, inverted)
     }
 }
@@ -734,8 +734,8 @@ impl ParquetStatsProvider for MinStatsValue {
         Some(0)
     }
 
-    fn get_parquet_rowcount_stat(&self) -> i64 {
-        1
+    fn get_parquet_rowcount_stat(&self) -> Option<i64> {
+        Some(1)
     }
 }
 
@@ -839,8 +839,8 @@ impl ParquetStatsProvider for OneStatsValue {
         Some(nullcount)
     }
 
-    fn get_parquet_rowcount_stat(&self) -> i64 {
-        1
+    fn get_parquet_rowcount_stat(&self) -> Option<i64> {
+        Some(1)
     }
 }
 

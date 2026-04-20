@@ -10,16 +10,16 @@ use delta_kernel::actions::deletion_vector_writer::{
 };
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine_data::FilteredEngineData;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
+use itertools::Itertools;
 use tempfile::tempdir;
 use test_utils::{
     create_add_files_metadata, create_table, engine_store_setup, generate_batch, into_record_batch,
     record_batch_to_bytes, IntoArray,
 };
-
-use itertools::Itertools;
 
 /// Helper to write a parquet file with the given data to the table.
 /// Returns the file path (relative to table root) that was written.
@@ -92,7 +92,7 @@ fn get_write_context(
 ) -> Result<delta_kernel::transaction::WriteContext, Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine)?;
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)?;
-    Ok(txn.get_write_context())
+    Ok(txn.unpartitioned_write_context()?)
 }
 
 /// Helper to write a deletion vector to object store and return its descriptor.

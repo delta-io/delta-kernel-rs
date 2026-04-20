@@ -7,6 +7,7 @@ use std::iter::{DoubleEndedIterator, FusedIterator};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::internal_api;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -15,12 +16,10 @@ use tracing::warn;
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
-use crate::table_features::get_field_column_mapping_info;
-use crate::table_features::ColumnMappingMode;
+use crate::table_features::{get_field_column_mapping_info, ColumnMappingMode};
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
-use delta_kernel_derive::internal_api;
 
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
@@ -30,6 +29,7 @@ pub(crate) mod diff;
 pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
+pub(crate) mod validation;
 pub(crate) mod variant_utils;
 
 pub type Schema = StructType;
@@ -213,7 +213,8 @@ pub struct StructField {
 impl StructField {
     /// The name of the default row index metadata column.
     ///
-    /// Note that the dot does not indicate a nested field, it is just a separator for the metadata column name.
+    /// Note that the dot does not indicate a nested field, it is just a separator for the metadata
+    /// column name.
     const DEFAULT_ROW_INDEX_COLUMN_NAME: &'static str = "_metadata.row_index";
 
     /////////////////
@@ -546,8 +547,8 @@ pub struct StructType {
     // for each field by name would be potentially quite expensive for large schemas.
     fields: IndexMap<String, StructField>,
     /// The metadata columns in this struct
-    // We use a dedicated map for metadata columns to allow for fast lookup without having to iterate
-    // over all fields.
+    // We use a dedicated map for metadata columns to allow for fast lookup without having to
+    // iterate over all fields.
     metadata_columns: HashMap<MetadataColumnSpec, usize>,
 }
 
@@ -617,7 +618,8 @@ impl StructType {
                 }
             }
 
-            // Delta column names are case-insensitive; reject schemas with duplicates that differ only by case.
+            // Delta column names are case-insensitive; reject schemas with duplicates that differ
+            // only by case.
             let key = field.name.to_lowercase();
             if !seen_lowercase_names.insert(key) {
                 return Err(Error::schema(format!(
@@ -744,10 +746,27 @@ impl StructType {
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate
     /// field is not a struct type.
+    #[internal_api]
     pub(crate) fn walk_column_fields<'a>(
         &'a self,
         col: &ColumnName,
     ) -> DeltaResult<Vec<&'a StructField>> {
+        self.walk_column_fields_by(col, |s, name| s.field(name))
+    }
+
+    /// Helper to walk through nested columns. For each path component in `col`, calls
+    ///                                                                                             
+    /// `find_field(current_struct, component)` to locate the matching field, then descends
+    ///                                                                                             
+    /// into the next nested struct. Returns references to all [`StructField`]s along the path.
+    pub(crate) fn walk_column_fields_by<'a, F>(
+        &'a self,
+        col: &ColumnName,
+        find_field: F,
+    ) -> DeltaResult<Vec<&'a StructField>>
+    where
+        F: for<'b> Fn(&'b StructType, &str) -> Option<&'b StructField>,
+    {
         let path = col.path();
         if path.is_empty() {
             return Err(Error::generic("Column path cannot be empty"));
@@ -755,7 +774,7 @@ impl StructType {
         let mut current_struct = self;
         let mut fields = Vec::with_capacity(path.len());
         for (i, field_name) in path.iter().enumerate() {
-            let field = current_struct.field(field_name).ok_or_else(|| {
+            let field = find_field(current_struct, field_name).ok_or_else(|| {
                 Error::generic(format!(
                     "Could not resolve column '{col}': field '{field_name}' not found in schema"
                 ))
@@ -916,7 +935,8 @@ impl StructType {
                     Self::ensure_no_metadata_columns(&mut struct_type.fields())?;
                 }
             }
-            // Primitive types cannot contain nested metadata columns and variant types are validated at creation
+            // Primitive types cannot contain nested metadata columns and variant types are
+            // validated at creation
             DataType::Primitive(_) | DataType::Variant(_) => {}
         };
 
@@ -1268,6 +1288,51 @@ pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
     InvariantChecker.transform_struct(schema).is_err()
 }
 
+/// Normalizes column name field names to match the casing in the schema.
+///
+/// Walks each field name through the schema's struct hierarchy, replacing user-provided
+/// casing with the schema's canonical casing. If a field name isn't found
+/// case-insensitively, keeps the original (subsequent validation catches it).
+///
+/// For example, given schema `{ Id: int, Name: string }` and user-provided columns
+/// `["id", "name"]`, returns `["Id", "Name"]` -- matching the schema's canonical casing.
+///
+/// Note: Must be called before validation (`validate_partition_columns` or
+/// `validate_clustering_columns`) so that case-normalized names match the schema.
+pub(crate) fn normalize_column_names_to_schema_casing(
+    schema: &StructType,
+    columns: &[ColumnName],
+) -> Vec<ColumnName> {
+    columns
+        .iter()
+        .map(|col| {
+            let path = col.path();
+            let mut normalized: Vec<String> = Vec::with_capacity(path.len());
+            let mut current_schema = schema;
+            for (i, field_name) in path.iter().enumerate() {
+                match current_schema
+                    .fields()
+                    .find(|f| f.name().eq_ignore_ascii_case(field_name))
+                {
+                    Some(f) => {
+                        normalized.push(f.name().to_string());
+                        if let DataType::Struct(inner) = f.data_type() {
+                            current_schema = inner;
+                        }
+                    }
+                    None => {
+                        // Field name not found at this level -- keep remaining path
+                        // unchanged so validation reports the user's original input.
+                        normalized.extend(path[i..].iter().cloned());
+                        break;
+                    }
+                }
+            }
+            ColumnName::new(normalized.iter().map(|s| s.as_str()))
+        })
+        .collect()
+}
+
 /// Helper for RowVisitor implementations
 #[internal_api]
 #[derive(Clone, Default)]
@@ -1391,7 +1456,8 @@ impl MapType {
         self.value_contains_null
     }
 
-    /// Create a schema assuming the map is stored as a struct with the specified key and value field names
+    /// Create a schema assuming the map is stored as a struct with the specified key and value
+    /// field names
     pub fn as_struct_schema(&self, key_name: String, val_name: String) -> Schema {
         StructType::new_unchecked([
             StructField::not_null(key_name, self.key_type.clone()),
@@ -1476,9 +1542,10 @@ impl PrimitiveType {
     /// Widening rules:
     /// - Integer widening: byte -> short -> int -> long (Delta protocol type widening)
     /// - Float widening: float -> double (Delta protocol type widening)
-    /// - Timestamp interchangeability: Timestamp <-> TimestampNtz (both are i64 microseconds
-    ///   since epoch, differing only in timezone semantics; this is a physical read
-    ///   accommodation, not a Delta protocol type widening rule)
+    /// - Timestamp interchangeability: Timestamp <-> TimestampNtz (both are i64 microseconds since
+    ///   epoch, differing only in timezone semantics; this is a physical read accommodation, not a
+    ///   Delta protocol type widening rule)
+    #[internal_api]
     pub(crate) fn can_widen_to(&self, target: &Self) -> bool {
         use PrimitiveType::*;
         matches!(
@@ -1966,14 +2033,14 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+    use serde_json;
+
+    use super::*;
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_deep_nested_schema_missing_leaf_cm,
     };
-
-    use super::*;
-    use rstest::rstest;
-    use serde_json;
 
     fn example_schema_metadata() -> &'static str {
         r#"
@@ -3780,5 +3847,44 @@ mod tests {
         let schema = walk_test_schema();
         let result = schema.walk_column_fields(&ColumnName::new(col_path.iter().copied()));
         assert_result_error_with_message(result, expected_error);
+    }
+
+    #[test]
+    fn test_normalize_column_names_to_schema_casing() {
+        let inner =
+            StructType::new_unchecked(vec![StructField::new("City", DataType::STRING, false)]);
+        let schema = StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("EventDate", DataType::DATE, false),
+            StructField::new("Address", DataType::Struct(Box::new(inner)), false),
+        ]);
+
+        // Mismatched casing -> normalized to schema
+        let cols = vec![ColumnName::new(["eventdate"])];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["EventDate"]
+        );
+
+        // Nested path -> each field name normalized
+        let cols = vec![ColumnName::new(["address", "city"])];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["Address", "City"]
+        );
+
+        // Already matching -> unchanged
+        let cols = vec![ColumnName::new(["id"])];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["id"]
+        );
+
+        // Unrecognized -> keeps original
+        let cols = vec![ColumnName::new(["nonexistent"])];
+        assert_eq!(
+            normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
+            ["nonexistent"]
+        );
     }
 }

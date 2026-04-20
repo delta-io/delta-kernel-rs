@@ -3,11 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStore;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::Snapshot;
 use test_utils::{create_table, engine_store_setup};
-
 use url::Url;
 
 /// Convert a URL to a `delta_kernel::object_store::Path`
@@ -22,6 +21,7 @@ fn url_to_object_store_path(url: &Url) -> Result<Path, Box<dyn std::error::Error
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -195,6 +195,7 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
 
 /// Test log compaction behavior with expired tombstones.
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 

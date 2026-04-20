@@ -1,11 +1,14 @@
-use std::sync::Arc;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
 use rstest::rstest;
+use test_utils::{
+    compacted_log_path_for_versions, delta_path_for_version, staged_commit_path_for_version,
+};
 use url::Url;
 
-use crate::actions::visitors::AddVisitor;
+use super::*;
+use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
     get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, DOMAIN_METADATA_NAME,
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
@@ -18,11 +21,13 @@ use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::ColumnName;
-use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointHintSummary};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
-use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
+use crate::object_store::memory::InMemory;
+use crate::object_store::path::Path;
+use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::ArrowWriter;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
@@ -30,20 +35,13 @@ use crate::scan::test_utils::{
     sidecar_batch_with_given_paths_and_sizes,
 };
 use crate::schema::{DataType, StructField, StructType};
-use crate::utils::test_utils::string_array_to_engine_data;
-use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
+use crate::utils::test_utils::{
+    assert_batch_matches, assert_result_error_with_message, string_array_to_engine_data, Action,
+};
 use crate::{
-    DeltaResult, Engine as _, EngineData, Expression, FileMeta, JsonHandler, Predicate,
+    DeltaResult, EngineData, Expression, FileMeta, JsonHandler, ParquetHandler, Predicate,
     PredicateRef, RowVisitor, StorageHandler,
 };
-use test_utils::{
-    compacted_log_path_for_versions, delta_path_for_version, staged_commit_path_for_version,
-};
-
-use super::*;
-
-use crate::actions::visitors::SidecarVisitor;
-use crate::ParquetHandler;
 
 /// Processes sidecar files for the given checkpoint batch.
 ///
@@ -79,7 +77,8 @@ fn process_sidecars(
     )?))
 }
 
-// get an ObjectStore path for a checkpoint file, based on version, part number, and total number of parts
+// get an ObjectStore path for a checkpoint file, based on version, part number, and total number of
+// parts
 fn delta_path_for_multipart_checkpoint(version: u64, part_num: u32, num_parts: u32) -> Path {
     let path =
         format!("_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet");
@@ -829,6 +828,62 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     assert_eq!(log_segment.listed.ascending_commit_files[0].version, 4);
 }
 
+#[rstest::rstest]
+#[case::no_hint(None)]
+#[case::stale_hint(Some(LastCheckpointHint {
+    version: 10, // stale: 10 > end_version 5, so it is discarded
+    size: 10,
+    parts: None,
+    size_in_bytes: None,
+    num_of_add_files: None,
+    checkpoint_schema: None,
+    checksum: None,
+    tags: None,
+}))]
+#[tokio::test]
+async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
+    #[case] hint: Option<LastCheckpointHint>,
+) {
+    let paths: Vec<Path> = (0..=5).map(|v| delta_path_for_version(v, "json")).collect();
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5)).unwrap();
+
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
+
+    assert_eq!(checkpoint_parts.len(), 0);
+    let versions = commit_files.into_iter().map(|x| x.version).collect_vec();
+    assert_eq!(versions, vec![0, 1, 2, 3, 4, 5]);
+}
+
+#[tokio::test]
+async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+        ],
+        None,
+    )
+    .await;
+
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5)).unwrap();
+
+    let commit_files = log_segment.listed.ascending_commit_files;
+    let checkpoint_parts = log_segment.listed.checkpoint_parts;
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(checkpoint_parts[0].version, 5);
+    assert_eq!(commit_files.len(), 0);
+}
+
 #[tokio::test]
 async fn build_table_changes_with_commit_versions() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -1120,7 +1175,8 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     let engine = DefaultEngineBuilder::new(store.clone()).build();
     add_checkpoint_to_store(
         &store,
-        // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
+        // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are
+        // not read.
         sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_commit_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
     )
@@ -1194,6 +1250,9 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     )
     .await?;
 
+    let cp1_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_1}")).await;
+    let cp2_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_2}")).await;
+
     let checkpoint_one_file = log_root.join(checkpoint_part_1)?.to_string();
     let checkpoint_two_file = log_root.join(checkpoint_part_2)?.to_string();
 
@@ -1202,8 +1261,8 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![
-                create_log_path(&checkpoint_one_file),
-                create_log_path(&checkpoint_two_file),
+                create_log_path_with_size(&checkpoint_one_file, cp1_size),
+                create_log_path_with_size(&checkpoint_two_file, cp2_size),
             ],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
@@ -1514,7 +1573,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
             ParsedLogPath::try_from(FileMeta {
                 location: table_root.join(path.as_ref()).unwrap(),
                 last_modified: 0,
-                size: 0,
+                size: 100,
             })
             .unwrap()
             .unwrap()
@@ -1626,6 +1685,7 @@ async fn test_compaction_listing(
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_compaction_simple() {
     test_compaction_listing(
         &[0, 1, 2],
@@ -1637,6 +1697,7 @@ async fn test_compaction_simple() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_compaction_in_version_range() {
     test_compaction_listing(
         &[0, 1, 2, 3],
@@ -1648,6 +1709,7 @@ async fn test_compaction_in_version_range() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_compaction_out_of_version_range() {
     test_compaction_listing(
         &[0, 1, 2, 3, 4],
@@ -1659,6 +1721,7 @@ async fn test_compaction_out_of_version_range() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_multi_compaction() {
     test_compaction_listing(
         &[0, 1, 2, 3, 4, 5],
@@ -1670,6 +1733,7 @@ async fn test_multi_compaction() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_multi_compaction_one_out_of_range() {
     test_compaction_listing(
         &[0, 1, 2, 3, 4, 5],
@@ -1681,6 +1745,7 @@ async fn test_multi_compaction_one_out_of_range() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_compaction_with_checkpoint() {
     test_compaction_listing(
         &[0, 1, 2, 4, 5],
@@ -1692,6 +1757,7 @@ async fn test_compaction_with_checkpoint() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_compaction_to_early_with_checkpoint() {
     test_compaction_listing(
         &[0, 1, 2, 4, 5],
@@ -1703,6 +1769,7 @@ async fn test_compaction_to_early_with_checkpoint() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_compaction_starts_at_checkpoint() {
     test_compaction_listing(
         &[0, 1, 2, 4, 5],
@@ -1753,6 +1820,7 @@ async fn test_commit_cover(
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_one_compaction() {
     test_commit_cover(
         &[0, 1, 2],
@@ -1765,6 +1833,7 @@ async fn test_commit_cover_one_compaction() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_in_version_range() {
     test_commit_cover(
         &[0, 1, 2, 3],
@@ -1793,6 +1862,7 @@ async fn test_commit_cover_out_of_version_range() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_multi_compaction() {
     test_commit_cover(
         &[0, 1, 2, 3, 4, 5],
@@ -1809,6 +1879,7 @@ async fn test_commit_cover_multi_compaction() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_multi_compaction_one_out_of_range() {
     test_commit_cover(
         &[0, 1, 2, 3, 4, 5],
@@ -1826,6 +1897,7 @@ async fn test_commit_cover_multi_compaction_one_out_of_range() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_compaction_with_checkpoint() {
     test_commit_cover(
         &[0, 1, 2, 4, 5],
@@ -1838,6 +1910,7 @@ async fn test_commit_cover_compaction_with_checkpoint() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_too_early_with_checkpoint() {
     test_commit_cover(
         &[0, 1, 2, 4, 5],
@@ -1850,6 +1923,7 @@ async fn test_commit_cover_too_early_with_checkpoint() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_starts_at_checkpoint() {
     test_commit_cover(
         &[0, 1, 2, 4, 5],
@@ -1862,6 +1936,7 @@ async fn test_commit_cover_starts_at_checkpoint() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_wider_range() {
     test_commit_cover(
         &Vec::from_iter(0..20),
@@ -1896,6 +1971,7 @@ async fn test_commit_cover_no_compactions() {
 }
 
 #[tokio::test]
+#[ignore = "log compaction disabled (#2337)"]
 async fn test_commit_cover_minimal_overlap() {
     test_commit_cover(
         &Vec::from_iter(0..6),
@@ -1912,7 +1988,52 @@ async fn test_commit_cover_minimal_overlap() {
     .await;
 }
 
+#[tokio::test]
+async fn test_commit_cover_zero_byte_compaction_uses_commits() {
+    let store = Arc::new(InMemory::new());
+
+    let commit_data = bytes::Bytes::from("kernel-data");
+    for v in 0..=4u64 {
+        let path = delta_path_for_version(v, "json");
+        store
+            .put(&path, commit_data.clone().into())
+            .await
+            .expect("put commit");
+    }
+    // Write a 0-byte compaction file covering v0-v4
+    let compaction_path = compacted_log_path_for_versions(0, 4, "json");
+    store
+        .put(&compaction_path, bytes::Bytes::new().into())
+        .await
+        .expect("put empty compaction");
+
+    let storage =
+        ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), None);
+    let table_root = Url::parse("memory:///").expect("valid url");
+    let log_root = table_root.join("_delta_log/").unwrap();
+
+    let log_segment =
+        LogSegment::for_snapshot_impl(&storage, log_root.clone(), vec![], None, None).unwrap();
+
+    assert_eq!(
+        log_segment.listed.ascending_compaction_files.len(),
+        0,
+        "0-byte compaction should have been filtered at listing time"
+    );
+
+    let cover = log_segment.find_commit_cover();
+    assert_eq!(cover.len(), 5);
+    for (i, file) in cover.iter().enumerate() {
+        let expected_version = 4 - i as u64;
+        let expected_url = log_root
+            .join(&format!("{expected_version:020}.json"))
+            .unwrap();
+        assert_eq!(file.location, expected_url);
+    }
+}
+
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_validate_listed_log_file_in_order_compaction_files() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
@@ -1938,6 +2059,7 @@ fn test_validate_listed_log_file_in_order_compaction_files() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_validate_listed_log_file_out_of_order_compaction_files() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
@@ -2097,6 +2219,7 @@ fn test_validate_listed_log_file_commit_files_contains_non_commit() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_validate_listed_log_file_compaction_files_contains_non_compaction() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
@@ -2117,6 +2240,7 @@ fn test_validate_listed_log_file_compaction_files_contains_non_compaction() {
 }
 
 #[test]
+#[ignore = "log compaction disabled (#2337)"]
 fn test_validate_listed_log_file_compaction_start_exceeds_end() {
     // A compaction file where the start version is greater than the end version
     let log_root = Url::parse("file:///_delta_log/").unwrap();
@@ -2148,6 +2272,10 @@ async fn commits_since() {
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 4);
 
+    // TODO(#2337): restore original expected values when log compaction is re-enabled.
+    // Compaction files are currently skipped during listing, so
+    // commits_since_log_compaction_or_checkpoint() equals commits_since_checkpoint().
+
     // with compaction, no checkpoint
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &Vec::from_iter(0..=4),
@@ -2156,7 +2284,7 @@ async fn commits_since() {
     })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
-    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 4);
 
     // checkpoint, no compaction
     let log_segment = create_segment_for(LogSegmentConfig {
@@ -2188,7 +2316,7 @@ async fn commits_since() {
     })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
-    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 4);
 
     // multiple compactions
     let log_segment = create_segment_for(LogSegmentConfig {
@@ -2198,7 +2326,7 @@ async fn commits_since() {
     })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 6);
-    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 6);
 
     // multiple compactions, out of order
     let log_segment = create_segment_for(LogSegmentConfig {
@@ -2208,7 +2336,7 @@ async fn commits_since() {
     })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 10);
-    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 1);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 10);
 }
 
 #[tokio::test]
@@ -2569,7 +2697,8 @@ fn test_log_segment_contiguous_commit_files() {
     );
 }
 
-/// Test that checkpoint_schema from _last_checkpoint hint is properly propagated to LogSegment
+/// Test that last_checkpoint_metadata from _last_checkpoint hint is properly propagated to
+/// LogSegment
 #[tokio::test]
 async fn test_checkpoint_schema_propagation_from_hint() {
     use crate::schema::{StructField, StructType};
@@ -2611,21 +2740,25 @@ async fn test_checkpoint_schema_propagation_from_hint() {
     )
     .unwrap();
 
-    // Verify checkpoint_schema is propagated
-    assert!(log_segment.checkpoint_schema.is_some());
-    assert_eq!(log_segment.checkpoint_schema.unwrap(), sample_schema);
+    assert_eq!(log_segment.last_checkpoint_version(), Some(5));
+    assert_eq!(log_segment.checkpoint_schema().unwrap(), sample_schema);
 }
 
-/// Test get_file_actions_schema_and_sidecars with V1 parquet checkpoint using hint schema
-/// This verifies the optimization path where hint schema is used directly (avoiding footer read)
+/// Checkpoint schema resolution uses the `_last_checkpoint` schema only when the hint's version
+/// matches [`LogSegment::checkpoint_version`]. Otherwise the parquet footer is read.
+#[rstest]
+#[case::hint_matches_checkpoint(1, true)]
+#[case::hint_newer_than_checkpoint(99, false)]
+#[case::hint_older_than_checkpoint(0, false)]
 #[tokio::test]
-async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> {
-    use crate::schema::{StructField, StructType};
-
+async fn test_get_file_actions_schema_v1_parquet_with_hint(
+    #[case] hint_version: u64,
+    #[case] expect_hint_schema_used: bool,
+) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngineBuilder::new(store.clone()).build();
 
-    // Create a V1 checkpoint (without sidecar column)
+    // Build a checkpoint with an initial v1 schema
     let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
     add_checkpoint_to_store(
         &store,
@@ -2634,36 +2767,146 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     )
     .await?;
 
-    let checkpoint_file = log_root
-        .join("00000000000000000001.checkpoint.parquet")?
-        .to_string();
+    let checkpoint_rel = "00000000000000000001.checkpoint.parquet";
+    let checkpoint_file = log_root.join(checkpoint_rel)?.to_string();
+    let cp_size = get_file_size(&store, &format!("_delta_log/{checkpoint_rel}")).await;
 
-    // Create a hint schema without sidecar field (indicates V1)
-    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable("add", StructType::new_unchecked([])),
-        StructField::nullable("remove", StructType::new_unchecked([])),
+    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "metadata",
+        StructType::new_unchecked([]),
+    )]));
+
+    // Build a commit that uses v1 checkpoint and a hint that describes a different schema
+    let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
+    let commit_v2 = create_log_path(&commit_v2_path);
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, cp_size)],
+            ascending_commit_files: vec![commit_v2.clone()],
+            latest_commit_file: Some(commit_v2),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(LastCheckpointHintSummary {
+            version: hint_version,
+            schema: Some(hint_schema.clone()),
+        }),
+    )?;
+
+    // Verify that checkpoint_schema only returns schema if it is valid
+    assert_eq!(log_segment.checkpoint_version, Some(1));
+    assert_eq!(log_segment.end_version, 2);
+    if expect_hint_schema_used {
+        assert_eq!(log_segment.checkpoint_schema().as_ref(), Some(&hint_schema));
+    } else {
+        assert!(
+            log_segment.checkpoint_schema().is_none(),
+            "hint should not have been returned since version does not match checkpoint_version"
+        );
+    }
+
+    // Verify that get_file_actions_schema_and_sidecars returns appropriate schema based on hint
+    // version
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    let schema = schema.expect("V1 checkpoint should yield a file actions schema");
+    if expect_hint_schema_used {
+        assert_eq!(schema, hint_schema, "should use hint when versions match");
+    } else {
+        assert_eq!(
+            schema, v1_schema,
+            "should read schema from parquet footer when versions mismatch"
+        );
+    }
+    assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
+
+    Ok(())
+}
+
+// Multi-part V1 checkpoint returns file_actions_schema with stats_parsed from hint or footer.
+#[rstest]
+#[case::with_hint(true)]
+#[case::without_hint(false)]
+#[tokio::test]
+async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+    let checkpoint_part_1 = "00000000000000000001.checkpoint.0000000001.0000000002.parquet";
+    let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
+
+    // Build a V1 checkpoint schema with stats_parsed containing an integer column.
+    let stats_parsed = StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(
+            "minValues",
+            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
+        ),
+        StructField::nullable(
+            "maxValues",
+            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
+        ),
+    ]);
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", stats_parsed),
+    ]);
+    let remove_schema =
+        StructType::new_unchecked([StructField::nullable("path", DataType::STRING)]);
+    let v1_schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable(ADD_NAME, add_schema),
+        StructField::nullable(REMOVE_NAME, remove_schema),
     ]));
+
+    add_checkpoint_to_store(
+        &store,
+        add_batch_simple(v1_schema.clone()),
+        checkpoint_part_1,
+    )
+    .await?;
+    add_checkpoint_to_store(
+        &store,
+        add_batch_simple(v1_schema.clone()),
+        checkpoint_part_2,
+    )
+    .await?;
+
+    let cp1_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_1}")).await;
+    let cp2_size = get_file_size(&store, &format!("_delta_log/{checkpoint_part_2}")).await;
+
+    let cp1_file = log_root.join(checkpoint_part_1)?.to_string();
+    let cp2_file = log_root.join(checkpoint_part_2)?.to_string();
 
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
-            checkpoint_parts: vec![create_log_path(&checkpoint_file)],
+            checkpoint_parts: vec![
+                create_log_path_with_size(&cp1_file, cp1_size),
+                create_log_path_with_size(&cp2_file, cp2_size),
+            ],
             latest_commit_file: Some(create_log_path("file:///00000000000000000002.json")),
             ..Default::default()
         },
         log_root,
         None,
-        Some(hint_schema.clone()), // V1 hint schema (no sidecar field)
+        use_hint.then(|| LastCheckpointHintSummary {
+            version: 1,
+            schema: Some(v1_schema.clone()),
+        }),
     )?;
 
-    // With V1 hint, should use hint schema and avoid footer read
     let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
-    assert!(schema.is_some(), "Should return hint schema for V1");
-    assert_eq!(
-        schema.unwrap(),
-        hint_schema,
-        "Should use hint schema directly"
+    let schema = schema.expect("Multi-part V1 should return file actions schema");
+
+    // Verify stats_parsed is detectable in the returned schema.
+    let add_field = schema.field(ADD_NAME).expect("should have add field");
+    let DataType::Struct(add_struct) = add_field.data_type() else {
+        panic!("add field should be a struct type");
+    };
+    assert!(
+        add_struct.field("stats_parsed").is_some(),
+        "Returned schema should include stats_parsed for data skipping"
     );
-    assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
+    assert!(sidecars.is_empty(), "Multi-part V1 should have no sidecars");
 
     Ok(())
 }
@@ -3734,6 +3977,137 @@ async fn test_new_with_commit_not_end_version_plus_one() {
 }
 
 // ============================================================================
+// try_new_with_checkpoint tests
+// ============================================================================
+
+#[rstest]
+#[case::non_checkpoint_file(
+    "file:///_delta_log/00000000000000000002.json",
+    "Path is not a single-file checkpoint"
+)]
+#[case::multi_part_checkpoint(
+    "file:///_delta_log/00000000000000000002.checkpoint.0000000001.0000000002.parquet",
+    "Path is not a single-file checkpoint"
+)]
+#[case::wrong_version(
+    "file:///_delta_log/00000000000000000005.checkpoint.parquet",
+    "Checkpoint version (5) does not equal LogSegment end_version (2)"
+)]
+#[tokio::test]
+async fn test_try_new_with_checkpoint_rejects_invalid_path(
+    #[case] path: &str,
+    #[case] expected_error: &str,
+) {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        ..Default::default()
+    })
+    .await;
+    let result = log_segment.try_new_with_checkpoint(create_log_path(path));
+    assert_result_error_with_message(result, expected_error);
+}
+
+#[rstest]
+#[case::classic_parquet("file:///_delta_log/00000000000000000002.checkpoint.parquet")]
+#[case::v2_uuid(
+    "file:///_delta_log/00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet"
+)]
+#[tokio::test]
+async fn test_try_new_with_checkpoint_sets_checkpoint_and_clears_commits(#[case] path: &str) {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        compaction_versions: &[(0, 2)],
+        ..Default::default()
+    })
+    .await;
+    assert!(!log_segment.listed.ascending_commit_files.is_empty());
+    // TODO(#2337): restore to assert !is_empty() when log compaction is re-enabled
+    assert!(log_segment.listed.ascending_compaction_files.is_empty());
+
+    let ckpt_path = create_log_path(path);
+    let result = log_segment.try_new_with_checkpoint(ckpt_path).unwrap();
+
+    assert_eq!(result.checkpoint_version, Some(2));
+    assert_eq!(result.listed.checkpoint_parts.len(), 1);
+    assert_eq!(result.listed.checkpoint_parts[0].version, 2);
+    assert!(result.listed.ascending_commit_files.is_empty());
+    assert!(result.listed.ascending_compaction_files.is_empty());
+    assert!(result.last_checkpoint_hint_summary().is_none());
+
+    // latest_commit_file is preserved for ICT access even though commits are cleared
+    assert_eq!(
+        result.listed.latest_commit_file.as_ref().map(|f| f.version),
+        log_segment
+            .listed
+            .latest_commit_file
+            .as_ref()
+            .map(|f| f.version)
+    );
+
+    // Structural fields are preserved
+    assert_eq!(result.end_version, log_segment.end_version);
+    assert_eq!(result.log_root, log_segment.log_root);
+}
+
+// ============================================================================
+// try_new_with_crc_file tests
+// ============================================================================
+
+#[rstest]
+#[case::non_crc_file(
+    "file:///_delta_log/00000000000000000002.json",
+    "Path is not a CRC file"
+)]
+#[case::wrong_version(
+    "file:///_delta_log/00000000000000000005.crc",
+    "CRC version (5) does not equal LogSegment end_version (2)"
+)]
+#[tokio::test]
+async fn test_try_new_with_crc_file_rejects_invalid_path(
+    #[case] path: &str,
+    #[case] expected_error: &str,
+) {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        ..Default::default()
+    })
+    .await;
+    let url = Url::parse(path).unwrap();
+    let crc_path = ParsedLogPath::try_from(url).unwrap().unwrap();
+    let result = log_segment.try_new_with_crc_file(crc_path);
+    assert_result_error_with_message(result, expected_error);
+}
+
+#[tokio::test]
+async fn test_try_new_with_crc_file_sets_crc_and_preserves_other_fields() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        checkpoint_version: Some(1),
+        ..Default::default()
+    })
+    .await;
+    let url = Url::parse("file:///_delta_log/00000000000000000002.crc").unwrap();
+    let crc_path = ParsedLogPath::try_from(url).unwrap().unwrap();
+    let result = log_segment.try_new_with_crc_file(crc_path).unwrap();
+
+    let crc_file = result.listed.latest_crc_file.as_ref().unwrap();
+    assert_eq!(crc_file.version, 2);
+
+    // Everything else is preserved
+    assert_eq!(result.end_version, log_segment.end_version);
+    assert_eq!(result.checkpoint_version, log_segment.checkpoint_version);
+    assert_eq!(
+        result.listed.ascending_commit_files.len(),
+        log_segment.listed.ascending_commit_files.len()
+    );
+    assert_eq!(
+        result.listed.checkpoint_parts.len(),
+        log_segment.listed.checkpoint_parts.len()
+    );
+    assert_eq!(result.log_root, log_segment.log_root);
+}
+
+// ============================================================================
 // get_unpublished_catalog_commits tests
 // ============================================================================
 
@@ -3831,7 +4205,7 @@ struct CrcPruningCase {
     checkpoint: None,
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
-    after_compactions: &[(5, 7)],
+    after_compactions: &[], // TODO(#2337): restore to &[(5, 7)] when re-enabled
     through_commits: &[0, 1, 2, 3, 4],
     through_compactions: &[],
 })]
@@ -3867,7 +4241,7 @@ struct CrcPruningCase {
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
     through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[(0, 2)],
+    through_compactions: &[], // TODO(#2337): restore to &[(0, 2)] when re-enabled
 })]
 #[tokio::test]
 async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
@@ -3958,4 +4332,182 @@ fn test_schema_to_is_not_null_predicate(
     #[case] expected: Option<PredicateRef>,
 ) {
     assert_eq!(schema_to_is_not_null_predicate(&schema), expected);
+}
+
+/// Verify that `read_actions` correctly handles null values in map fields across all
+/// action types. The Delta protocol allows null values in `partitionValues` maps (a null
+/// partition value means the partition column is null for that file) and in `tags` maps.
+///
+/// Spark defaults all `Map[String, String]` types to `valueContainsNull = true`, and
+/// checkpoint writing calls `schema.asNullable` which forces all maps nullable. The
+/// schema must match this behavior.
+///
+/// This test reads JSON actions through `DefaultEngine` + `InMemory` store +
+/// `log_segment.read_actions()`, then re-validates the resulting Arrow `StructArray` with
+/// `StructArray::try_new`. Without the fix, non-nullable map value fields cause:
+///   "Found unmasked nulls for non-nullable StructArray field 'value'"
+#[rstest]
+// remove.partitionValues.month: null
+#[case::remove_partition_values(
+    "remove",
+    "partitionValues",
+    r#"{"remove":{"path":"file.parquet","deletionTimestamp":1000,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{"year":"2024","month":null},"size":100}}"#
+)]
+// remove.tags.key2: null
+#[case::remove_tags(
+    "remove",
+    "tags",
+    r#"{"remove":{"path":"file.parquet","deletionTimestamp":1000,"dataChange":true,"tags":{"key1":"val1","key2":null}}}"#
+)]
+// add.partitionValues.month: null
+#[case::add_partition_values(
+    "add",
+    "partitionValues",
+    r#"{"add":{"path":"file.parquet","partitionValues":{"year":"2024","month":null},"size":100,"modificationTime":1000,"dataChange":true}}"#
+)]
+// add.tags.key2: null
+#[case::add_tags(
+    "add",
+    "tags",
+    r#"{"add":{"path":"file.parquet","partitionValues":{},"size":100,"modificationTime":1000,"dataChange":true,"tags":{"key1":"val1","key2":null}}}"#
+)]
+// cdc.partitionValues.month: null
+#[case::cdc_partition_values(
+    "cdc",
+    "partitionValues",
+    r#"{"cdc":{"path":"file.parquet","partitionValues":{"year":"2024","month":null},"size":100,"dataChange":false}}"#
+)]
+// cdc.tags.key2: null
+#[case::cdc_tags(
+    "cdc",
+    "tags",
+    r#"{"cdc":{"path":"file.parquet","partitionValues":{},"size":100,"dataChange":false,"tags":{"key1":"val1","key2":null}}}"#
+)]
+// sidecar.tags.key2: null
+#[case::sidecar_tags(
+    "sidecar",
+    "tags",
+    r#"{"sidecar":{"path":"sidecar.parquet","sizeInBytes":100,"modificationTime":1000,"tags":{"key1":"val1","key2":null}}}"#
+)]
+// checkpointMetadata.tags.key2: null
+#[case::checkpoint_metadata_tags(
+    "checkpointMetadata",
+    "tags",
+    r#"{"checkpointMetadata":{"version":0,"tags":{"key1":"val1","key2":null}}}"#
+)]
+// Known issues: these map fields don't yet have #[allow_null_container_values].
+// commitInfo.operationParameters.description: null
+#[should_panic(expected = "StructArray re-validation failed")]
+#[case::commit_info_operation_parameters_known_issue(
+    "commitInfo",
+    "operationParameters",
+    r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","description":null}}}"#
+)]
+// metaData.configuration.key2: null
+#[should_panic(expected = "StructArray re-validation failed")]
+#[case::metadata_configuration_known_issue(
+    "metaData",
+    "configuration",
+    r#"{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"key1":"val1","key2":null},"createdTime":1000}}"#
+)]
+#[tokio::test]
+async fn read_actions_with_null_map_values(
+    #[case] action_name: &str,
+    #[case] map_field: &str,
+    #[case] json_action: &str,
+) {
+    use crate::arrow::array::{Array, AsArray, MapArray, StructArray};
+
+    let store = Arc::new(InMemory::new());
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+
+    // Write a single commit file with the action containing null map values.
+    store
+        .put(
+            &delta_path_for_version(0, "json"),
+            json_action.to_string().into(),
+        )
+        .await
+        .unwrap();
+
+    // Build engine and read actions -- same as DeltaActionExtractor::get_actions.
+    let engine = DefaultEngineBuilder::new(store).build();
+    let log_segment =
+        LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, Some(0))
+            .unwrap();
+
+    // Use all_actions_schema to cover sidecar and checkpointMetadata (checkpoint-only actions).
+    let action_schema = get_all_actions_schema().clone();
+    let action_batches = log_segment
+        .read_actions(&engine, action_schema)
+        .expect("read_actions should succeed");
+
+    // Iterate batches and verify the map value field is nullable.
+    let mut found = false;
+    for batch_result in action_batches {
+        let actions_batch = batch_result.expect("Iterating action batches should succeed");
+
+        let data_any = actions_batch.actions.into_any();
+        let arrow_data = data_any
+            .downcast_ref::<ArrowEngineData>()
+            .expect("ArrowEngineData");
+        let rb = arrow_data.record_batch();
+
+        let Some(action_col) = rb.column_by_name(action_name) else {
+            continue;
+        };
+        let action_struct = action_col
+            .as_struct_opt()
+            .unwrap_or_else(|| panic!("{action_name} column should be a struct"));
+        let map_col = action_struct
+            .column_by_name(map_field)
+            .unwrap_or_else(|| panic!("{action_name}.{map_field} not found"));
+        let map_array = map_col
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap_or_else(|| panic!("{action_name}.{map_field} should be a MapArray"));
+        // Re-validate the entries StructArray with its own schema, same as what Arrow's
+        // IPC deserializer does. Without the fix, this fails with:
+        // "Found unmasked nulls for non-nullable StructArray field 'value'"
+        let entries = map_array.entries();
+        StructArray::try_new(
+            entries.fields().clone(),
+            entries.columns().to_vec(),
+            entries.nulls().cloned(),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "{action_name}.{map_field} entries StructArray re-validation failed: {e}. \
+                 This means the schema has non-nullable value field but the data has nulls."
+            )
+        });
+        found = true;
+    }
+    assert!(found, "Should have found a {action_name} action batch");
+}
+
+#[test]
+fn new_for_version_zero_creates_valid_log_segment() {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let commit_path = create_log_path("memory:///_delta_log/00000000000000000000.json");
+    let segment = super::LogSegment::new_for_version_zero(log_root.clone(), commit_path).unwrap();
+    assert_eq!(segment.end_version, 0);
+    assert_eq!(segment.log_root, log_root);
+}
+
+#[test]
+fn new_for_version_zero_rejects_non_zero_version() {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let commit_path = create_log_path("memory:///_delta_log/00000000000000000001.json");
+    let err = super::LogSegment::new_for_version_zero(log_root, commit_path).unwrap_err();
+    assert!(err.to_string().contains("version"));
+}
+
+#[test]
+fn new_for_version_zero_rejects_non_commit_file() {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let checkpoint_path =
+        create_log_path("memory:///_delta_log/00000000000000000000.checkpoint.parquet");
+    let err = super::LogSegment::new_for_version_zero(log_root, checkpoint_path).unwrap_err();
+    assert!(err.to_string().contains("non-commit"));
 }

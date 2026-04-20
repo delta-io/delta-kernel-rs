@@ -6,48 +6,77 @@ on:
     types: [created, edited]
 name: Benchmarking PR performance
 jobs:
-  runBenchmark:
+  run-benchmark:
     name: Run benchmarks
     if: >
       github.event.issue.pull_request &&
       (github.event.comment.body == '/bench' || startsWith(github.event.comment.body, '/bench '))
     runs-on: ubuntu-latest
     permissions:
-      pull-requests: write
+      contents: read
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
     steps:
-      - name: Parse benchmark tags
-        env:
-          COMMENT: ${{ github.event.comment.body }}
-        run: |
-          if [[ "$COMMENT" == "/bench" ]]; then
-            TAGS="base"
-          else
-            TAGS="${COMMENT#/bench }"
-            TAGS=$(echo "$TAGS" | tr -d '[:space:]')
-          fi
-          echo "BENCH_TAGS=$TAGS" >> "$GITHUB_ENV"
-          echo "Parsed tags: $TAGS"
-      - name: Get PR HEAD sha
+      - name: Get PR metadata
         id: pr
-        run: |
-          PR_DATA=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.issue.number }})
-          echo "head_sha=$(echo "$PR_DATA" | jq -r .head.sha)" >> "$GITHUB_OUTPUT"
-          echo "base_ref=$(echo "$PR_DATA" | jq -r .base.ref)" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/checkout@v4
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          PR_DATA=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
+          HEAD_SHA=$(echo "$PR_DATA" | jq -r .head.sha)
+          BASE_REF=$(echo "$PR_DATA" | jq -r .base.ref)
+          [[ "$HEAD_SHA" == *$'\n'* || "$BASE_REF" == *$'\n'* ]] && { echo "Unexpected newline in API response" >&2; exit 1; }
+          [[ "$BASE_REF" =~ ^[a-zA-Z0-9/_.-]+$ ]] || { echo "Invalid BASE_REF: $BASE_REF" >&2; exit 1; }
+          printf 'head_sha=%s\n' "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          printf 'base_ref=%s\n'  "$BASE_REF"  >> "$GITHUB_OUTPUT"
+          printf 'pr_number=%s\n' "$PR_NUMBER"  >> "$GITHUB_OUTPUT"
+      - name: Install critcmp
+        # Installed before checkout so the PR's .cargo/config.toml cannot
+        # redirect the registry to a malicious source. The runner's
+        # pre-installed Rust is sufficient -- no toolchain setup needed here.
+        # --locked is omitted for cargo install (same exemption as cargo miri
+        # setup); --version pins the top-level crate.
+        run: cargo install critcmp --version 0.1.8
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ steps.pr.outputs.head_sha }}
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
       # See build.yml top-level comment for why save-if is restricted to main.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - uses: boa-dev/criterion-compare-action@v3
+      - name: Run benchmarks
+        # The comment is posted in the post-comment job after this job completes.
+        env:
+          COMMENT:  ${{ github.event.comment.body }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: bash benchmarks/ci/run-benchmarks.sh
+      - name: Upload benchmark comment
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          branchName: ${{ steps.pr.outputs.base_ref }}
-          cwd: benchmarks
-          benchName: workload_bench
+          name: bench-comment
+          path: /tmp/bench-comment.md
+
+  post-comment:
+    name: Post benchmark results
+    needs: run-benchmark
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download benchmark comment
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bench-comment
+          path: /tmp/
+      - name: Post results as PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.run-benchmark.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/bench-comment.md

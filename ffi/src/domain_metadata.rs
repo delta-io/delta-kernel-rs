@@ -1,13 +1,15 @@
+use delta_kernel::snapshot::Snapshot;
+use delta_kernel::DeltaResult;
+
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::{
     kernel_string_slice, AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid,
     SharedExternEngine, SharedSnapshot, TryFromStringSlice,
 };
-use delta_kernel::snapshot::Snapshot;
-use delta_kernel::DeltaResult;
 
-/// Get the domain metadata as an optional string allocated by `AllocatedStringFn` for a specific domain in this snapshot
+/// Get the domain metadata as an optional string allocated by `AllocatedStringFn` for a specific
+/// domain in this snapshot
 ///
 /// # Safety
 ///
@@ -37,7 +39,8 @@ fn get_domain_metadata_impl(
         .and_then(|config: String| allocate_fn(kernel_string_slice!(config))))
 }
 
-/// Get the domain metadata as an optional string allocated by `AllocatedStringFn` for a specific domain in this snapshot
+/// Get the domain metadata as an optional string allocated by `AllocatedStringFn` for a specific
+/// domain in this snapshot
 ///
 /// # Safety
 ///
@@ -86,21 +89,23 @@ fn visit_domain_metadata_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::error::KernelError;
-    use crate::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
-        recover_string,
-    };
-    use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice, snapshot};
+    use std::collections::HashMap;
+    use std::ptr::NonNull;
+    use std::sync::Arc;
+
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::DeltaResult;
     use serde_json::json;
-    use std::collections::HashMap;
-    use std::ptr::NonNull;
-    use std::sync::Arc;
     use test_utils::add_commit;
+
+    use super::*;
+    use crate::error::KernelError;
+    use crate::ffi_test_utils::{
+        allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
+        ok_or_panic, recover_string,
+    };
+    use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice};
 
     #[tokio::test]
     async fn test_domain_metadata() -> DeltaResult<()> {
@@ -186,12 +191,8 @@ mod tests {
             .await
             .unwrap();
 
-        let snapshot = unsafe {
-            ok_or_panic(snapshot(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
         let get_domain_metadata_helper = |domain: &str| unsafe {
             get_domain_metadata(
@@ -214,7 +215,7 @@ mod tests {
 
         let domain3 = "delta.domain3";
         let res = get_domain_metadata_helper(domain3);
-        assert_extern_result_error_with_message(res, KernelError::GenericError, "Generic delta kernel error: User DomainMetadata are not allowed to use system-controlled 'delta.*' domain");
+        assert_extern_result_error_with_message(res, KernelError::GenericError, Some("Generic delta kernel error: User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
 
         // Secondly, we visit the entire domain metadata
 

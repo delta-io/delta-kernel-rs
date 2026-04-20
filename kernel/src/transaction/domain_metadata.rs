@@ -1,12 +1,11 @@
 use std::collections::HashSet;
 
+use super::{EngineDataResultIterator, Transaction};
 use crate::actions::{get_log_domain_metadata_schema, DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::error::Error;
 use crate::row_tracking::{RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME};
 use crate::table_features::TableFeature;
 use crate::{DeltaResult, Engine, IntoEngineData};
-
-use super::{EngineDataResultIterator, Transaction};
 
 impl<S> Transaction<S> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
@@ -29,8 +28,7 @@ impl<S> Transaction<S> {
         }
 
         if !self
-            .read_snapshot
-            .table_configuration()
+            .effective_table_config
             .is_feature_supported(&TableFeature::DomainMetadata)
         {
             return Err(Error::unsupported(
@@ -109,12 +107,13 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
-    /// Validate that a system domain corresponds to a known feature and that the feature is supported.
+    /// Validate that a system domain corresponds to a known feature and that the feature is
+    /// supported.
     ///
     /// This prevents arbitrary `delta.*` domains from being added during table creation.
     /// Each known system domain must have its corresponding feature enabled in the protocol.
     fn validate_system_domain_feature(&self, domain: &str) -> DeltaResult<()> {
-        let table_config = self.read_snapshot.table_configuration();
+        let table_config = &self.effective_table_config;
 
         // Map domain to its required feature
         let required_feature = match domain {
@@ -162,7 +161,7 @@ impl<S> Transaction<S> {
             .map(String::as_str)
             .collect();
         let existing_domains = self
-            .read_snapshot
+            .read_snapshot()?
             .get_domain_metadatas_internal(engine, Some(&domains))?;
 
         // Create removal tombstones with pre-image configurations
@@ -182,13 +181,13 @@ impl<S> Transaction<S> {
     ///
     /// Returns a tuple of `(action_iter, domain_metadata_vec)`.
     /// - The action iterator contains EngineData to be written to the commit file (`00N.json`).
-    /// - The `Vec<DomainMetadata>` is used to construct a [`CrcDelta`](crate::crc::CrcDelta),
-    ///   which feeds the post-commit snapshot with the domain metadata written in this transaction
-    ///   and powers CRC file writes.
+    /// - The `Vec<DomainMetadata>` is used to construct a [`CrcDelta`](crate::crc::CrcDelta), which
+    ///   feeds the post-commit snapshot with the domain metadata written in this transaction and
+    ///   powers CRC file writes.
     ///
-    /// This function may perform an expensive log replay operation if there are any domain removals.
-    /// The log replay is required to fetch the previous configuration value for the domain to preserve
-    /// in removal tombstones as mandated by the Delta spec.
+    /// This function may perform an expensive log replay operation if there are any domain
+    /// removals. The log replay is required to fetch the previous configuration value for the
+    /// domain to preserve in removal tombstones as mandated by the Delta spec.
     pub(super) fn generate_domain_metadata_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,
@@ -199,14 +198,7 @@ impl<S> Transaction<S> {
         // Validate domain operations (includes feature validation)
         self.validate_domain_metadata_operations()?;
 
-        // TODO(sanuj) Create-table must not have row tracking or removals
-        // Defensive. Needs to be updated when row tracking support is added.
         if is_create {
-            if row_tracking_high_watermark.is_some() {
-                return Err(Error::internal_error(
-                    "CREATE TABLE cannot have row tracking domain metadata",
-                ));
-            }
             // user_domain_removals already validated above, but be explicit
             debug_assert!(self.user_domain_removals.is_empty());
         }
@@ -214,7 +206,7 @@ impl<S> Transaction<S> {
         // Generate removal actions (empty for create-table due to validation above)
         let removal_actions = self.generate_user_domain_removal_actions(engine)?;
 
-        // Generate row tracking domain action (None for create-table)
+        // Generate row tracking domain action.
         let row_tracking_domain_action = row_tracking_high_watermark
             .map(DomainMetadata::try_from)
             .transpose()?

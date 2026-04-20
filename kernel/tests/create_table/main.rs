@@ -5,6 +5,7 @@ mod column_mapping;
 mod ctas;
 mod ict;
 mod partitioned;
+mod row_tracking;
 mod timestamp_ntz;
 mod variant;
 
@@ -19,6 +20,7 @@ use delta_kernel::table_features::{
 use delta_kernel::table_properties::TableProperties;
 use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
 use delta_kernel::DeltaResult;
+use rstest::rstest;
 use serde_json::Value;
 use test_utils::{assert_result_error_with_message, test_table_setup};
 
@@ -26,7 +28,7 @@ use test_utils::{assert_result_error_with_message, test_table_setup};
 /// Shared with sub-modules.
 pub(crate) fn simple_schema() -> DeltaResult<Arc<StructType>> {
     Ok(Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new("value", DataType::STRING, true),
     ])?))
 }
@@ -35,7 +37,7 @@ pub(crate) fn simple_schema() -> DeltaResult<Arc<StructType>> {
 /// Shared with sub-modules.
 pub(crate) fn partition_test_schema() -> DeltaResult<Arc<StructType>> {
     Ok(Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new("date", DataType::DATE, true),
         StructField::new("value", DataType::STRING, true),
     ])?))
@@ -47,10 +49,10 @@ async fn test_create_simple_table() -> DeltaResult<()> {
 
     // Create schema for an events table
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("event_id", DataType::LONG, false),
-        StructField::new("user_id", DataType::LONG, false),
-        StructField::new("event_type", DataType::STRING, false),
-        StructField::new("timestamp", DataType::TIMESTAMP, false),
+        StructField::new("event_id", DataType::LONG, true),
+        StructField::new("user_id", DataType::LONG, true),
+        StructField::new("event_type", DataType::STRING, true),
+        StructField::new("timestamp", DataType::TIMESTAMP, true),
         StructField::new("properties", DataType::STRING, true),
     ])?);
 
@@ -155,11 +157,11 @@ async fn test_create_table_already_exists() -> DeltaResult<()> {
 
     // Create schema for a user profiles table
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("user_id", DataType::LONG, false),
-        StructField::new("username", DataType::STRING, false),
-        StructField::new("email", DataType::STRING, false),
-        StructField::new("created_at", DataType::TIMESTAMP, false),
-        StructField::new("is_active", DataType::BOOLEAN, false),
+        StructField::new("user_id", DataType::LONG, true),
+        StructField::new("username", DataType::STRING, true),
+        StructField::new("email", DataType::STRING, true),
+        StructField::new("created_at", DataType::TIMESTAMP, true),
+        StructField::new("is_active", DataType::BOOLEAN, true),
     ])?);
 
     // Create table first time
@@ -192,14 +194,53 @@ async fn test_create_table_empty_schema_not_supported() -> DeltaResult<()> {
     Ok(())
 }
 
+fn top_level_non_null_schema() -> Arc<StructType> {
+    Arc::new(
+        StructType::try_new(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("value", DataType::STRING, true),
+        ])
+        .expect("non-null top-level schema should be valid"),
+    )
+}
+
+fn nested_non_null_schema() -> Arc<StructType> {
+    let nested = StructType::try_new(vec![StructField::new("child", DataType::INTEGER, false)])
+        .expect("nested non-null schema should be valid");
+    Arc::new(
+        StructType::try_new(vec![StructField::new(
+            "nested",
+            DataType::Struct(Box::new(nested)),
+            true,
+        )])
+        .expect("top-level nested schema should be valid"),
+    )
+}
+
+#[rstest]
+#[case::top_level_non_null(top_level_non_null_schema())]
+#[case::nested_non_null(nested_non_null_schema())]
+fn test_create_table_non_null_columns_require_invariants_feature(
+    #[case] schema: Arc<StructType>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let result = create_table(&table_path, schema, "InvalidApp/0.1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert_result_error_with_message(result, "Non-null column");
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_create_table_log_actions() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("user_id", DataType::LONG, false),
-        StructField::new("action", DataType::STRING, false),
+        StructField::new("user_id", DataType::LONG, true),
+        StructField::new("action", DataType::STRING, true),
     ])?);
 
     let engine_info = "AuditService/2.1.0";
@@ -340,12 +381,28 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn test_create_table_with_vacuum_protocol_check() -> DeltaResult<()> {
+#[rstest]
+// ReaderWriter features (AlwaysIfSupported)
+#[case("vacuumProtocolCheck", TableFeature::VacuumProtocolCheck, true, true)]
+#[case("v2Checkpoint", TableFeature::V2Checkpoint, true, true)]
+// ReaderWriter features (EnabledIf -- feature signal alone does not enable)
+#[case("deletionVectors", TableFeature::DeletionVectors, true, false)]
+#[case("typeWidening", TableFeature::TypeWidening, true, false)]
+// WriterOnly features (EnabledIf -- feature signal alone does not enable)
+#[case("appendOnly", TableFeature::AppendOnly, false, false)]
+#[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false)]
+#[case("rowTracking", TableFeature::RowTracking, false, false)]
+fn test_create_table_with_feature_signal(
+    #[case] feature_name: &str,
+    #[case] feature: TableFeature,
+    #[case] is_reader_writer: bool,
+    #[case] enabled_when_supported: bool,
+) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
+    let property_key = format!("delta.feature.{feature_name}");
     let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
-        .with_table_properties([("delta.feature.vacuumProtocolCheck", "supported")])
+        .with_table_properties([(property_key.as_str(), "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
@@ -353,26 +410,158 @@ fn test_create_table_with_vacuum_protocol_check() -> DeltaResult<()> {
     let table_config = snapshot.table_configuration();
 
     assert!(
-        table_config.is_feature_supported(&TableFeature::VacuumProtocolCheck),
-        "vacuumProtocolCheck should be supported"
+        table_config.is_feature_supported(&feature),
+        "{feature_name} should be supported"
     );
-    assert!(
-        table_config.is_feature_enabled(&TableFeature::VacuumProtocolCheck),
-        "vacuumProtocolCheck should be enabled (AlwaysIfSupported)"
+    assert_eq!(
+        table_config.is_feature_enabled(&feature),
+        enabled_when_supported,
+        "{feature_name}: is_feature_enabled should be {enabled_when_supported}"
     );
     let protocol = table_config.protocol();
     assert!(
         protocol
             .writer_features()
-            .is_some_and(|f| f.contains(&TableFeature::VacuumProtocolCheck)),
-        "vacuumProtocolCheck should be in writer features"
+            .is_some_and(|f| f.contains(&feature)),
+        "{feature_name} should be in writer features"
     );
-    assert!(
+    if is_reader_writer {
+        assert!(
+            protocol
+                .reader_features()
+                .is_some_and(|f| f.contains(&feature)),
+            "{feature_name} should be in reader features"
+        );
+    }
+
+    Ok(())
+}
+
+#[rstest]
+fn test_create_table_with_checkpoint_stats_properties(
+    #[values(true, false)] write_stats_as_json: bool,
+    #[values(true, false)] write_stats_as_struct: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let json_val = write_stats_as_json.to_string();
+    let struct_val = write_stats_as_struct.to_string();
+
+    let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
+        .with_table_properties([
+            ("delta.checkpoint.writeStatsAsJson", json_val.as_str()),
+            ("delta.checkpoint.writeStatsAsStruct", struct_val.as_str()),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let tp = snapshot.table_properties();
+    assert_eq!(tp.checkpoint_write_stats_as_json, Some(write_stats_as_json));
+    assert_eq!(
+        tp.checkpoint_write_stats_as_struct,
+        Some(write_stats_as_struct)
+    );
+
+    Ok(())
+}
+
+#[rstest]
+// ReaderWriter features
+#[case("delta.enableDeletionVectors", TableFeature::DeletionVectors, true)]
+#[case("delta.enableTypeWidening", TableFeature::TypeWidening, true)]
+// WriterOnly features
+#[case("delta.enableChangeDataFeed", TableFeature::ChangeDataFeed, false)]
+#[case("delta.appendOnly", TableFeature::AppendOnly, false)]
+#[case("delta.enableRowTracking", TableFeature::RowTracking, false)]
+fn test_create_table_with_enablement_property(
+    #[case] property: &str,
+    #[case] feature: TableFeature,
+    #[case] is_reader_writer: bool,
+    #[values(true, false)] expect_enabled: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let value = expect_enabled.to_string();
+
+    let _ = create_table(&table_path, simple_schema()?, "Test/1.0")
+        .with_table_properties([(property, value.as_str())])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let table_config = snapshot.table_configuration();
+
+    assert_eq!(
+        table_config.is_feature_supported(&feature),
+        expect_enabled,
+        "{property}={value}: feature supported should be {expect_enabled}"
+    );
+    assert_eq!(
+        table_config.is_feature_enabled(&feature),
+        expect_enabled,
+        "{property}={value}: feature enabled should be {expect_enabled}"
+    );
+    let protocol = table_config.protocol();
+    assert_eq!(
         protocol
-            .reader_features()
-            .is_some_and(|f| f.contains(&TableFeature::VacuumProtocolCheck)),
-        "vacuumProtocolCheck should be in reader features"
+            .writer_features()
+            .is_some_and(|f| f.contains(&feature)),
+        expect_enabled,
+        "{property}={value}: in writer features should be {expect_enabled}"
     );
+    if is_reader_writer {
+        assert_eq!(
+            protocol
+                .reader_features()
+                .is_some_and(|f| f.contains(&feature)),
+            expect_enabled,
+            "{property}={value}: in reader features should be {expect_enabled}"
+        );
+    }
+
+    Ok(())
+}
+
+#[rstest]
+#[case::without_cm(false)]
+#[case::with_cm(true)]
+fn test_create_table_special_char_column_name(#[case] cm_enabled: bool) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::new("valid_col", DataType::INTEGER, true),
+        StructField::new("bad column", DataType::STRING, true),
+    ])?);
+
+    let mut builder = create_table(&table_path, schema, "Test/1.0");
+    if cm_enabled {
+        builder = builder.with_table_properties([("delta.columnMapping.mode", "name")]);
+    }
+    let result = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    if cm_enabled {
+        let txn = result?;
+        let _ = txn.commit(engine.as_ref())?;
+
+        let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+        assert_eq!(snapshot.version(), 0);
+        let field_names: Vec<_> = snapshot
+            .schema()
+            .fields()
+            .map(|f| f.name().clone())
+            .collect();
+        assert!(
+            field_names.contains(&"bad column".to_string()),
+            "Schema should contain field 'bad column', got: {field_names:?}"
+        );
+    } else {
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid character"),
+            "Expected invalid character error, got: {err}"
+        );
+    }
 
     Ok(())
 }

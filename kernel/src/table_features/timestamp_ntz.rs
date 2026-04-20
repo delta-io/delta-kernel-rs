@@ -1,5 +1,7 @@
 //! Validation for TIMESTAMP_NTZ feature support
 
+use std::borrow::Cow;
+
 use super::TableFeature;
 use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;

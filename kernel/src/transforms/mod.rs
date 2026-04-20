@@ -5,11 +5,11 @@ mod carrier;
 mod expression;
 mod schema;
 
-pub use self::expression::{ExpressionDepthChecker, ExpressionTransform};
-pub use self::schema::{SchemaDepthChecker, SchemaTransform};
-
 pub use carrier::Carrier;
 pub(crate) use carrier::{carrier_into_inner_opt, carrier_try_none};
+
+pub use self::expression::{ExpressionDepthChecker, ExpressionTransform};
+pub use self::schema::{SchemaDepthChecker, SchemaTransform};
 
 /// Defines a transform's `Output` and `Residual` associated types.
 ///
@@ -102,9 +102,9 @@ where
 
 /// Rebuilds a two-child parent from transformed children only when needed.
 ///
-/// If either child is filtered out (`None`), filter out the parent by returning `None`. If both children survive as
-/// borrowed values, this returns a borrowed parent. Otherwise, it uses the provided `map_owned` function to rebuild and return an owned
-/// parent.
+/// If either child is filtered out (`None`), filter out the parent by returning `None`. If both
+/// children survive as borrowed values, this returns a borrowed parent. Otherwise, it uses the
+/// provided `map_owned` function to rebuild and return an owned parent.
 pub(crate) fn map_owned_pair_or_else<'a, Parent, Child, ChildCarrier, ParentCarrier, R>(
     parent: &'a Parent,
     left: ChildCarrier,

@@ -6,13 +6,14 @@
 //!
 //! ## Log Replay for Action Reconciliation
 //!
-//! The [`log_replay`] module provides specialized log replay functionality for action reconciliation,
-//! including checkpoint creation. It processes log files in reverse chronological order and selects
-//! the appropriate actions to include based on deduplication and retention rules.
+//! The [`log_replay`] module provides specialized log replay functionality for action
+//! reconciliation, including checkpoint creation. It processes log files in reverse chronological
+//! order and selects the appropriate actions to include based on deduplication and retention rules.
 //!
 //! ## Retention and Cleanup
 //!
-//! This module provides utilities for calculating retention timestamps used during action reconciliation:
+//! This module provides utilities for calculating retention timestamps used during action
+//! reconciliation:
 //!
 //! - **Deleted File Retention**: Determines when `remove` actions can be excluded from checkpoints
 //! - **Transaction Retention**: Calculates when expired app ids can be cleaned up
@@ -87,8 +88,8 @@ pub(crate) trait RetentionCalculator {
 /// # Parameters
 /// - `retention_duration`: The duration to retain deleted files. The table property
 ///   `deleted_file_retention_duration` is passed here. If `None`, defaults to 7 days.
-/// - `now_duration`: The current time as a [`Duration`]. This allows for testing with
-///   a specific time instead of using `SystemTime::now()`.
+/// - `now_duration`: The current time as a [`Duration`]. This allows for testing with a specific
+///   time instead of using `SystemTime::now()`.
 ///
 /// # Returns: The timestamp in milliseconds since epoch
 pub(crate) fn deleted_file_retention_timestamp_with_time(
@@ -130,8 +131,9 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     #[test]
     fn test_deleted_file_retention_timestamp_with_time() -> DeltaResult<()> {

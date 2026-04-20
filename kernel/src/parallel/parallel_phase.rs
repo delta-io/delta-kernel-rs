@@ -9,15 +9,12 @@
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
+use itertools::Itertools;
 
-use crate::log_replay::ActionsBatch;
-use crate::log_replay::ParallelLogReplayProcessor;
+use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
-use crate::EngineData;
-use crate::{DeltaResult, Engine, FileMeta};
-
-use itertools::Itertools;
+use crate::{DeltaResult, Engine, EngineData, FileMeta};
 
 /// Processes checkpoint leaf files in parallel using a shared processor.
 ///
@@ -124,6 +121,12 @@ impl<P: ParallelLogReplayProcessor> Iterator for ParallelPhase<P> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::thread;
+
+    use url::Url;
+
     use super::*;
     use crate::actions::get_log_add_schema;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -132,9 +135,10 @@ mod tests {
     use crate::log_segment::CheckpointReadInfo;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::object_store::ObjectStore;
-    use crate::parallel::parallel_scan_metadata::AfterSequentialScanMetadata;
-    use crate::parallel::parallel_scan_metadata::{ParallelScanMetadata, ParallelState};
+    use crate::object_store::ObjectStoreExt as _;
+    use crate::parallel::parallel_scan_metadata::{
+        AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState,
+    };
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state::ScanFile;
@@ -142,10 +146,6 @@ mod tests {
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::{load_test_table, parse_json_batch};
     use crate::{PredicateRef, SnapshotRef};
-    use std::collections::HashSet;
-    use std::sync::Arc;
-    use std::thread;
-    use url::Url;
 
     // ============================================================
     // Test helpers for focused ParallelPhase tests
@@ -494,10 +494,11 @@ mod tests {
             panic!("Failed to find {} in logs", metric_name);
         };
         let after = &logs[pos + metric_name.len() + 1..];
-        let Some(space_pos) = after.find(char::is_whitespace) else {
-            panic!("Failed to find end of {} value", metric_name);
-        };
-        let value_str = &after[..space_pos];
+        // Find the end of the value (whitespace, comma, or closing paren)
+        let end_pos = after
+            .find(|c: char| c.is_whitespace() || c == ',' || c == ')')
+            .unwrap_or_else(|| panic!("Failed to find end of {} value", metric_name));
+        let value_str = &after[..end_pos];
         value_str
             .parse()
             .unwrap_or_else(|_| panic!("Failed to parse {} value: {}", metric_name, value_str))
@@ -527,19 +528,23 @@ mod tests {
         sequential_expected: &ExpectedMetrics,
         parallel_expected: Option<&ExpectedMetrics>,
     ) {
-        // Verify Sequential metrics were logged
-        assert!(
-            logs.contains("Sequential scan metadata completed"),
-            "Expected Sequential completion log for table '{}'",
-            table_name
-        );
+        // Find the Sequential scan log line and extract metrics from it
+        let sequential_pos = logs
+            .find("Sequential scan metadata completed")
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected Sequential completion log for table '{}'",
+                    table_name
+                )
+            });
+        let sequential_logs = &logs[sequential_pos..];
 
-        // Extract and verify counter values from Phase 1
-        let add_files_seen = extract_metric(logs, "add_files_seen");
-        let active_add_files = extract_metric(logs, "active_add_files");
-        let remove_files_seen = extract_metric(logs, "remove_files_seen");
-        let non_file_actions = extract_metric(logs, "non_file_actions");
-        let predicate_filtered = extract_metric(logs, "predicate_filtered");
+        // Extract and verify counter values from Phase 1 (sequential log line)
+        let add_files_seen = extract_metric(sequential_logs, "add_files_seen");
+        let active_add_files = extract_metric(sequential_logs, "active_add_files");
+        let remove_files_seen = extract_metric(sequential_logs, "remove_files_seen");
+        let non_file_actions = extract_metric(sequential_logs, "non_file_actions");
+        let predicate_filtered = extract_metric(sequential_logs, "predicate_filtered");
 
         assert_eq!(
             add_files_seen, sequential_expected.add_files_seen,
@@ -563,8 +568,8 @@ mod tests {
         );
 
         // Verify timing metrics are present and parseable (values may be 0 for fast operations)
-        let _dedup_time = extract_metric(logs, "dedup_visitor_time_ms");
-        let _predicate_eval_time = extract_metric(logs, "predicate_eval_time_ms");
+        let _dedup_time = extract_metric(sequential_logs, "dedup_visitor_time_ms");
+        let _predicate_eval_time = extract_metric(sequential_logs, "predicate_eval_time_ms");
 
         // Verify Parallel metrics if expected
         if let Some(expected) = parallel_expected {

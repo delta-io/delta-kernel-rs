@@ -20,7 +20,8 @@ use test_utils::{create_table_and_load_snapshot, test_table_setup};
 
 use super::simple_schema;
 
-/// Helper to strip column mapping metadata (IDs and physical names) from all StructFields recursively.
+/// Helper to strip column mapping metadata (IDs and physical names) from all StructFields
+/// recursively.
 pub(super) fn strip_column_mapping_metadata(schema: &StructType) -> StructType {
     let cm_id = ColumnMetadataKey::ColumnMappingId.as_ref();
     let cm_name = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
@@ -151,7 +152,7 @@ fn test_create_table_with_column_mapping_name_mode() -> DeltaResult<()> {
 
     let id_field = read_schema.field("id").expect("id field should exist");
     assert_eq!(id_field.data_type(), &DataType::INTEGER);
-    assert!(!id_field.is_nullable());
+    assert!(id_field.is_nullable());
 
     let value_field = read_schema
         .field("value")
@@ -169,7 +170,7 @@ fn test_create_table_with_column_mapping_id_mode() -> DeltaResult<()> {
     let schema = Arc::new(StructType::try_new(vec![StructField::new(
         "id",
         DataType::INTEGER,
-        false,
+        true,
     )])?);
 
     // Create table and load snapshot (validates column mapping on read)
@@ -187,7 +188,7 @@ fn test_create_table_with_column_mapping_id_mode() -> DeltaResult<()> {
     assert_eq!(read_schema.fields().count(), 1);
     let id_field = read_schema.field("id").expect("id field should exist");
     assert_eq!(id_field.data_type(), &DataType::INTEGER);
-    assert!(!id_field.is_nullable());
+    assert!(id_field.is_nullable());
 
     Ok(())
 }
@@ -258,7 +259,7 @@ fn test_column_mapping_invalid_mode_rejected() {
     let (_temp_dir, table_path, engine) = test_table_setup().unwrap();
 
     let schema = Arc::new(
-        StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap(),
+        StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap(),
     );
 
     // Try to create table with invalid column mapping mode
@@ -307,7 +308,7 @@ fn test_create_clustered_table_with_column_mapping(
     assert!(table_config.is_feature_supported(&TableFeature::DomainMetadata));
 
     // Verify clustering domain metadata exists and uses physical column names
-    let clustering_columns = snapshot.get_clustering_columns_physical(engine.as_ref())?;
+    let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
     let columns = clustering_columns.expect("Clustering columns should be present");
     assert_eq!(
         columns.len(),
@@ -342,7 +343,7 @@ fn test_column_mapping_nested_schema() -> DeltaResult<()> {
     ])?;
 
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new("address", DataType::Struct(Box::new(address_type)), true),
     ])?);
 
@@ -364,7 +365,7 @@ fn test_column_mapping_nested_schema() -> DeltaResult<()> {
     // Verify top-level fields
     let id_field = read_schema.field("id").expect("id field should exist");
     assert_eq!(id_field.data_type(), &DataType::INTEGER);
-    assert!(!id_field.is_nullable());
+    assert!(id_field.is_nullable());
 
     let address_field = read_schema
         .field("address")
@@ -416,7 +417,7 @@ fn test_column_mapping_schema_with_maps_and_arrays() -> DeltaResult<()> {
     )])?;
 
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new(
             "tags",
             DataType::from(MapType::new(DataType::STRING, DataType::STRING, true)),
@@ -476,7 +477,7 @@ fn clustering_cm_test_schema() -> DeltaResult<Arc<StructType>> {
         true,
     )])?;
     Ok(Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new("name", DataType::STRING, true),
         StructField::new("address", DataType::Struct(Box::new(address)), true),
         StructField::new("l1", DataType::Struct(Box::new(l1)), true),
@@ -535,7 +536,7 @@ fn test_create_clustered_table_nested_with_column_mapping(
     };
     assert_column_mapping_config(&snapshot, expected_cm_mode);
 
-    let clustering_columns = snapshot.get_clustering_columns_physical(engine.as_ref())?;
+    let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
     let columns = clustering_columns.expect("Clustering columns should be present");
     assert_eq!(columns.len(), expected_cols.len());
 
@@ -609,7 +610,7 @@ fn test_partitioned_table_stores_logical_column_names_with_column_mapping(
         );
     }
 
-    let clustering = snapshot.get_clustering_columns_physical(engine.as_ref())?;
+    let clustering = snapshot.get_physical_clustering_columns(engine.as_ref())?;
     assert!(
         clustering.is_none(),
         "Partitioned table should not have clustering columns"
