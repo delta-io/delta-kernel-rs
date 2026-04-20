@@ -1,8 +1,11 @@
 //! A number of utilities useful for testing that we want to use in multiple crates
 
+pub mod counting_reporter;
+pub mod table_builder;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+pub use counting_reporter::{CountingReporter, RelaxedCounter};
 use delta_kernel::actions::get_log_add_schema;
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
@@ -21,19 +24,19 @@ use delta_kernel::engine::default::executor::tokio::{
 use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::expressions::Scalar;
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
-
+use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot};
 use itertools::Itertools;
-use object_store::local::LocalFileSystem;
-use object_store::memory::InMemory;
-use object_store::{path::Path, ObjectStore};
 use serde_json::{json, to_vec, Deserializer};
-use std::sync::Mutex;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use url::Url;
@@ -100,12 +103,38 @@ pub const METADATA_WITH_PARTITION_COLS: &str = r#"{"commitInfo":{"timestamp":158
 {"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
 {"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["val"],"configuration":{},"createdTime":1587968585495}}"#;
 
+/// Like [`METADATA`] but with non-empty table properties including `delta.appendOnly` and
+/// `custom.key`.
+pub const METADATA_WITH_TABLE_PROPERTIES: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
+{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.appendOnly":"true","custom.key":"custom_value"},"createdTime":1587968585495}}"#;
+
+/// Like [`METADATA`] but with table-features protocol (v3/v7) including columnMapping (reader)
+/// and columnMapping + rowTracking (writer). Metadata includes a table name and column mapping
+/// configuration.
+pub const METADATA_WITH_FEATURES: &str = concat!(
+    r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{},"isBlindAppend":true}}"#,
+    "\n",
+    r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping","domainMetadata","rowTracking"]}}"#,
+    "\n",
+    r#"{"metaData":{"id":"deadbeef-1234-5678-abcd-000000000000","name":"test_table","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.rowTracking.enabled":"true","delta.rowTracking.materializedRowIdColumnName":"_row_id","delta.rowTracking.materializedRowCommitVersionColumnName":"_row_commit_version"},"createdTime":1234567890000}}"#,
+);
+
+/// Like [`METADATA`] but with protocol v3/7 and the `catalogManaged` table feature enabled.
+/// Per the Delta protocol, `catalogManaged` depends on `inCommitTimestamp`, and commitInfo must
+/// include a `txnId`.
+pub const CATALOG_MANAGED_METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true,"txnId":"test-txn-0","inCommitTimestamp":1587968586154}}
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["catalogManaged"],"writerFeatures":["catalogManaged","inCommitTimestamp"]}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true"},"createdTime":1587968585495}}"#;
+
 pub enum TestAction {
     Add(String),
     Remove(String),
     Metadata,
     // TODO: This is a temporary fix to make the test compatible with the file size requirement.
-    // In the future, we can create an AddCommit/RemoveCommit struct type with DefaultAddCommit/DefaultRemoveCommit value to store the commit info in the enum for Add/Remove.
+    // In the future, we can create an AddCommit/RemoveCommit struct type with
+    // DefaultAddCommit/DefaultRemoveCommit value to store the commit info in the enum for
+    // Add/Remove.
     AddWithSize(String, u64),
     RemoveWithSize(String, u64),
 }
@@ -117,7 +146,13 @@ pub fn actions_to_string(actions: Vec<TestAction>) -> String {
     actions_to_string_with_metadata(actions, METADATA)
 }
 
-/// Convert a vector of actions into a newline delimited json string, with metadata including a partition column
+/// Convert a vector of actions into a newline delimited json string, with catalog-managed metadata
+pub fn actions_to_string_catalog_managed(actions: Vec<TestAction>) -> String {
+    actions_to_string_with_metadata(actions, CATALOG_MANAGED_METADATA)
+}
+
+/// Convert a vector of actions into a newline delimited json string, with metadata including a
+/// partition column
 pub fn actions_to_string_partitioned(actions: Vec<TestAction>) -> String {
     actions_to_string_with_metadata(actions, METADATA_WITH_PARTITION_COLS)
 }
@@ -209,6 +244,19 @@ pub fn delta_path_for_version(version: u64, suffix: &str) -> Path {
     Path::from(path.as_str())
 }
 
+/// Create a [`LogPath`] from a table root URL string and an object-store commit path. Useful for
+/// building log tails in tests.
+pub fn create_log_path(table_root: impl AsRef<str>, commit_path: Path) -> LogPath {
+    let table_url = try_parse_uri(table_root.as_ref()).expect("Failed to parse table root as URL");
+    let commit_url = table_url.join(commit_path.as_ref()).unwrap();
+    let file_meta = FileMeta {
+        location: commit_url,
+        last_modified: 123,
+        size: 100,
+    };
+    LogPath::try_new(file_meta).expect("Failed to create LogPath")
+}
+
 pub fn staged_commit_path_for_version(version: u64) -> Path {
     let uuid = uuid::Uuid::new_v4();
     let path = format!("_delta_log/_staged_commits/{version:020}.{uuid}.json");
@@ -221,26 +269,59 @@ pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suf
     Path::from(path.as_str())
 }
 
-// TODO (#1990): make this function take in the path of the delta table (currently only can commit to tables at the root directory).
-/// put a commit file into the specified object store.
+// Resolve a table from a root and relative path
+fn resolve_table_path(table_root: impl AsRef<str>, relative: &Path) -> DeltaResult<Path> {
+    let url = try_parse_uri(table_root)?;
+    Ok(Path::from_url_path(url.join(relative.as_ref())?.path())?)
+}
+
+/// Write a Delta commit JSON file at the given version into `store`.
+///
+/// The commit is written to `_delta_log/{version:020}.json` under `table_root`. The caller is
+/// responsible for ensuring that `data` contains valid Delta actions (e.g. built via
+/// [`actions_to_string`]) and that no commit already exists at `version`.
+///
+/// # Parameters
+/// - `table_root` - Root URL of the Delta table (e.g. `"memory:///"` or `"file:///tmp/table"`).
+/// - `store` - Object store that backs the table.
+/// - `version` - Commit version number (determines the log file name).
+/// - `data` - JSON-serialized Delta actions to write as the commit body.
 pub async fn add_commit(
-    store: &dyn ObjectStore,
+    table_root: impl AsRef<str>,
+    store: &DynObjectStore,
     version: u64,
     data: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = delta_path_for_version(version, "json");
-    store.put(&path, data.into()).await?;
+    let relative_path = delta_path_for_version(version, "json");
+    let table_path = resolve_table_path(table_root, &relative_path)?;
+    store.put(&table_path, data.into()).await?;
     Ok(())
 }
 
+/// Write a staged (uncommitted) Delta commit JSON file at the given version into `store`.
+///
+/// The file is written to `_delta_log/_staged_commits/{version}.{uuid}.json` under
+/// `table_root`. Multiple staged commits may exist for the same version (each gets a unique
+/// UUID). The caller is responsible for ensuring that `data` contains valid Delta actions.
+///
+/// Returns the object-store [`Path`] of the written file so callers can reference it in a
+/// log tail or assertions.
+///
+/// # Parameters
+/// - `table_root` - Root URL of the Delta table (e.g. `"memory:///"` or `"file:///tmp/table"`).
+/// - `store` - Object store that backs the table.
+/// - `version` - Target commit version number (determines the staged file name prefix).
+/// - `data` - JSON-serialized Delta actions to write as the staged commit body.
 pub async fn add_staged_commit(
-    store: &dyn ObjectStore,
+    table_root: impl AsRef<str>,
+    store: &DynObjectStore,
     version: u64,
     data: String,
 ) -> Result<Path, Box<dyn std::error::Error>> {
-    let path = staged_commit_path_for_version(version);
-    store.put(&path, data.into()).await?;
-    Ok(path)
+    let relative_path = staged_commit_path_for_version(version);
+    let table_path = resolve_table_path(table_root, &relative_path)?;
+    store.put(&table_path, data.into()).await?;
+    Ok(table_path)
 }
 
 /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
@@ -328,16 +409,17 @@ pub fn test_table_setup_mt() -> DeltaResult<(
     Ok((temp_dir, table_path, engine))
 }
 
-// setup default engine with in-memory (local_directory=None) or local fs (local_directory=Some(Url))
+// setup default engine with in-memory (local_directory=None) or local fs
+// (local_directory=Some(Url))
 pub fn engine_store_setup(
     table_name: &str,
     local_directory: Option<&Url>,
 ) -> (
-    Arc<dyn ObjectStore>,
+    Arc<DynObjectStore>,
     DefaultEngine<TokioBackgroundExecutor>,
     Url,
 ) {
-    let (storage, url): (Arc<dyn ObjectStore>, Url) = match local_directory {
+    let (storage, url): (Arc<DynObjectStore>, Url) = match local_directory {
         None => (
             Arc::new(InMemory::new()),
             Url::parse(format!("memory:///{table_name}/").as_str()).expect("valid url"),
@@ -356,7 +438,7 @@ pub fn engine_store_setup(
 // this will just create an empty table with the given schema. (just protocol + metadata actions)
 #[allow(clippy::too_many_arguments)]
 pub async fn create_table(
-    store: Arc<dyn ObjectStore>,
+    store: Arc<DynObjectStore>,
     table_path: Url,
     schema: SchemaRef,
     partition_columns: &[&str],
@@ -392,12 +474,13 @@ pub async fn create_table(
             config.insert("delta.columnMapping.mode".to_string(), json!("name"));
         }
         if writer_features.contains(&"rowTracking") {
+            config.insert("delta.enableRowTracking".to_string(), json!("true"));
             config.insert(
-                "delta.materializedRowIdColumnName".to_string(),
+                "delta.rowTracking.materializedRowIdColumnName".to_string(),
                 json!("some_dummy_column_name"),
             );
             config.insert(
-                "delta.materializedRowCommitVersionColumnName".to_string(),
+                "delta.rowTracking.materializedRowCommitVersionColumnName".to_string(),
                 json!("another_dummy_column_name"),
             );
         }
@@ -414,6 +497,9 @@ pub async fn create_table(
         }
         if writer_features.contains(&"changeDataFeed") {
             config.insert("delta.enableChangeDataFeed".to_string(), json!("true"));
+        }
+        if reader_features.contains(&"catalogManaged") {
+            config.insert("io.unitycatalog.tableId".to_string(), json!(table_id));
         }
 
         config
@@ -489,7 +575,7 @@ pub async fn setup_test_tables(
     Vec<(
         Url,
         DefaultEngine<TokioBackgroundExecutor>,
-        Arc<dyn ObjectStore>,
+        Arc<DynObjectStore>,
         &'static str,
     )>,
     Box<dyn std::error::Error>,
@@ -587,9 +673,9 @@ pub async fn insert_data<E: TaskExecutor>(
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
-    let write_context = txn.get_write_context();
+    let write_context = txn.unpartitioned_write_context()?;
     let add_files_metadata = engine
-        .write_parquet(&ArrowEngineData::new(batch), &write_context, HashMap::new())
+        .write_parquet(&ArrowEngineData::new(batch), &write_context)
         .await?;
     txn.add_files(add_files_metadata);
 
@@ -612,16 +698,17 @@ pub fn set_json_value(
 }
 
 /// Returns a nested schema with 6 top-level fields including a nested struct:
-/// `[row_number: long, name: string, score: double, address: {street: string, city: string}, tag: string, value: int]`
+/// `[row_number: long, name: string, score: double, address: {street: string, city: string}, tag:
+/// string, value: int]`
 pub fn nested_schema() -> Result<SchemaRef, Box<dyn std::error::Error>> {
     Ok(Arc::new(StructType::try_new(vec![
-        StructField::not_null("row_number", DataType::LONG),
+        StructField::nullable("row_number", DataType::LONG),
         StructField::nullable("name", DataType::STRING),
         StructField::nullable("score", DataType::DOUBLE),
         StructField::nullable(
             "address",
             StructType::try_new(vec![
-                StructField::not_null("street", DataType::STRING),
+                StructField::nullable("street", DataType::STRING),
                 StructField::nullable("city", DataType::STRING),
             ])?,
         ),
@@ -691,6 +778,75 @@ pub fn nested_batches() -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> 
             vec![Some(40), None, Some(60)],
         )?,
     ])
+}
+
+// ---------------------------------------------------------------------------
+// Schema helpers for feature auto-enablement tests (TimestampNTZ, Variant)
+// ---------------------------------------------------------------------------
+
+/// Schema with one column of the given type: `(id INT, col <dtype>)`.
+pub fn schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, true),
+        StructField::new("col", dtype, true),
+    ]))
+}
+
+/// Schema with the given type nested inside a struct:
+/// `(id INT, nested STRUCT<inner <dtype>>)`.
+pub fn nested_schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, true),
+        StructField::new(
+            "nested",
+            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                "inner", dtype, true,
+            )]))),
+            true,
+        ),
+    ]))
+}
+
+/// Schema with two columns of the given type: `(id INT, col1 <dtype>, col2 <dtype>)`.
+pub fn multi_schema_with_type(dtype: DataType) -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        StructField::new("id", DataType::INTEGER, true),
+        StructField::new("col1", dtype.clone(), true),
+        StructField::new("col2", dtype, true),
+    ]))
+}
+
+pub fn top_level_ntz_schema() -> SchemaRef {
+    schema_with_type(DataType::TIMESTAMP_NTZ)
+}
+
+pub fn nested_ntz_schema() -> SchemaRef {
+    nested_schema_with_type(DataType::TIMESTAMP_NTZ)
+}
+
+pub fn multiple_ntz_schema() -> SchemaRef {
+    multi_schema_with_type(DataType::TIMESTAMP_NTZ)
+}
+
+pub fn top_level_variant_schema() -> SchemaRef {
+    schema_with_type(DataType::unshredded_variant())
+}
+
+pub fn nested_variant_schema() -> SchemaRef {
+    nested_schema_with_type(DataType::unshredded_variant())
+}
+
+pub fn multiple_variant_schema() -> SchemaRef {
+    multi_schema_with_type(DataType::unshredded_variant())
+}
+
+/// Returns column mapping table properties for the given mode, or empty for `"none"`.
+pub fn cm_properties(mode: &str) -> Vec<(&str, &str)> {
+    if mode == "none" {
+        vec![]
+    } else {
+        vec![("delta.columnMapping.mode", mode)]
+    }
 }
 
 /// Resolves a nested field in a [`StructType`] schema by path. Returns an error if any
@@ -853,20 +1009,24 @@ pub async fn write_batch_to_table(
     snapshot: &Arc<Snapshot>,
     engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
     data: RecordBatch,
-    partition_values: std::collections::HashMap<String, String>,
+    partition_values: HashMap<String, Scalar>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
-    let write_context = txn.get_write_context();
+    let write_context = if txn.logical_partition_columns().is_empty() {
+        assert!(
+            partition_values.is_empty(),
+            "partition_values should be empty for unpartitioned tables"
+        );
+        txn.unpartitioned_write_context()?
+    } else {
+        txn.partitioned_write_context(partition_values)?
+    };
     let add_meta = engine
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            &write_context,
-            partition_values,
-        )
+        .write_parquet(&ArrowEngineData::new(data), &write_context)
         .await?;
     txn.add_files(add_meta);
     match txn.commit(engine)? {
@@ -1009,7 +1169,7 @@ pub fn read_actions_from_commit(
     action_type: &str,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let table_path = table_url.to_file_path().expect("should be a file URL");
-    let commit_path = table_path.join(format!("_delta_log/{:020}.json", version));
+    let commit_path = table_path.join(format!("_delta_log/{version:020}.json"));
     let content = std::fs::read_to_string(commit_path)?;
     let parsed: Vec<serde_json::Value> = Deserializer::from_str(&content)
         .into_iter::<serde_json::Value>()
@@ -1018,6 +1178,63 @@ pub fn read_actions_from_commit(
         .into_iter()
         .filter_map(|v| v.get(action_type).cloned())
         .collect())
+}
+
+/// Row tracking fields extracted from a single add action in a commit.
+pub struct AddActionRowTracking {
+    /// The base row ID assigned to the first row in the file.
+    pub base_row_id: Option<i64>,
+    /// The version of the commit in which this file was first written.
+    pub default_row_commit_version: Option<i64>,
+}
+
+/// Reads all add actions from a commit and returns their row tracking fields, sorted by
+/// `baseRowId` for deterministic ordering.
+pub fn get_row_tracking_add_actions(
+    table_url: &Url,
+    version: u64,
+) -> Result<Vec<AddActionRowTracking>, Box<dyn std::error::Error>> {
+    let mut actions: Vec<AddActionRowTracking> =
+        read_actions_from_commit(table_url, version, "add")?
+            .into_iter()
+            .map(|a| AddActionRowTracking {
+                base_row_id: a["baseRowId"].as_i64(),
+                default_row_commit_version: a["defaultRowCommitVersion"].as_i64(),
+            })
+            .collect();
+    actions.sort_by_key(|a| a.base_row_id);
+    Ok(actions)
+}
+
+/// Materialized row tracking column name properties extracted from a commit's metadata action.
+pub struct MaterializedRowTrackingColumnNames {
+    /// Value of `delta.rowTracking.materializedRowIdColumnName`, or `None` if not set.
+    pub row_id_column_name: Option<String>,
+    /// Value of `delta.rowTracking.materializedRowCommitVersionColumnName`, or `None` if not set.
+    pub row_commit_version_column_name: Option<String>,
+}
+
+/// Reads the materialized row tracking column name properties from a commit's metadata action.
+/// These properties are table properties stored in the metadata `configuration` map.
+pub fn get_materialized_row_tracking_column_names(
+    table_url: &Url,
+    version: u64,
+) -> Result<MaterializedRowTrackingColumnNames, Box<dyn std::error::Error>> {
+    let metadata_actions = read_actions_from_commit(table_url, version, "metaData")?;
+    let config = metadata_actions
+        .first()
+        .and_then(|m| m.get("configuration"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    Ok(MaterializedRowTrackingColumnNames {
+        row_id_column_name: config["delta.rowTracking.materializedRowIdColumnName"]
+            .as_str()
+            .map(str::to_owned),
+        row_commit_version_column_name: config
+            ["delta.rowTracking.materializedRowCommitVersionColumnName"]
+            .as_str()
+            .map(str::to_owned),
+    })
 }
 
 /// Removes all scan files from the snapshot, commits the transaction, and returns

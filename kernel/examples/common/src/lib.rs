@@ -1,19 +1,20 @@
 //! Common code to be shared between all examples. Mostly argument parsing, and a few other
 //! utilities
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use clap::{Args, CommandFactory, FromArgMatches};
-use delta_kernel::{
-    arrow::array::RecordBatch, engine::default::executor::tokio::TokioBackgroundExecutor,
-    engine::default::storage::store_from_url_opts, engine::default::DefaultEngine,
-    engine::default::DefaultEngineBuilder, scan::Scan, schema::MetadataColumnSpec, DeltaResult,
-    SnapshotRef,
-};
-
-use object_store::{
-    aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
-    DynObjectStore, ObjectStoreScheme,
-};
+use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::storage::store_from_url_opts;
+use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::object_store::aws::AmazonS3Builder;
+use delta_kernel::object_store::azure::MicrosoftAzureBuilder;
+use delta_kernel::object_store::gcp::GoogleCloudStorageBuilder;
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreScheme};
+use delta_kernel::scan::Scan;
+use delta_kernel::schema::MetadataColumnSpec;
+use delta_kernel::{DeltaResult, SnapshotRef};
 use url::Url;
 
 #[derive(Args)]
@@ -44,8 +45,8 @@ pub struct LocationArgs {
     pub env_creds: bool,
 
     /// Specify that the table is "public" (i.e. no cloud credentials are needed). This is required
-    /// for things like s3 public buckets, otherwise the kernel will try and authenticate by talking
-    /// to the aws metadata server, which will fail unless you're on an ec2 instance.
+    /// for things like s3 public buckets, otherwise the kernel will try and authenticate by
+    /// talking to the aws metadata server, which will fail unless you're on an ec2 instance.
     #[arg(long)]
     pub public: bool,
 }
@@ -129,7 +130,7 @@ pub fn get_engine(
 ) -> DeltaResult<DefaultEngine<TokioBackgroundExecutor>> {
     if args.env_creds {
         let (scheme, _path) = ObjectStoreScheme::parse(url).map_err(|e| {
-            delta_kernel::Error::Generic(format!("Object store could not parse url: {}", e))
+            delta_kernel::Error::Generic(format!("Object store could not parse url: {e}"))
         })?;
         use ObjectStoreScheme::*;
         let url_str = url.to_string();

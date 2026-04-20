@@ -1,17 +1,17 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
 use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
-use futures::future::{BoxFuture, FutureExt};
-use parquet::arrow::async_writer::AsyncFileWriter;
-use parquet::arrow::AsyncArrowWriter;
-
+use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::parquet::arrow::async_writer::AsyncFileWriter;
+use delta_kernel::parquet::arrow::AsyncArrowWriter;
+use delta_kernel::parquet::errors::Result as ParquetResult;
 use delta_kernel::{ActionReconciliationIterator, DeltaResult, Error, Snapshot};
+use futures::future::{BoxFuture, FutureExt};
 
 /// An example program that checkpoints a table.
 /// !!!WARNING!!!: This doesn't use put-if-absent, or a catalog based commit, so it is UNSAFE.
@@ -25,9 +25,9 @@ struct Cli {
     #[command(flatten)]
     location_args: LocationArgs,
 
-    /// This program doesn't use put-if-absent, or a catalog based commit, so it is UNSAFE.  As such
-    /// you need to pass --unsafe-i-know-what-im-doing as an argument to get this to actually write
-    /// the checkpoint
+    /// This program doesn't use put-if-absent, or a catalog based commit, so it is UNSAFE.  As
+    /// such you need to pass --unsafe-i-know-what-im-doing as an argument to get this to
+    /// actually write the checkpoint
     #[arg(long)]
     unsafe_i_know_what_im_doing: bool,
 }
@@ -92,12 +92,12 @@ async fn try_main() -> DeltaResult<()> {
         let Some(first) = first else {
             return Err(Error::generic("No batches in checkpoint data"));
         };
-        // Note that with `FilteredEngineData` it's important to `apply_selection_vector` to remove any
-        // filtered out rows. It's also possible to use `into_parts` to get the unfiltered batch and the
-        // selection vector individually, such that an engine could write only the selected rows out
-        // without having to allocate a new engine data.
-        // NB: Unselected rows MUST NOT be written to the checkpoint! Doing so will create an invalid
-        // checkpoint
+        // Note that with `FilteredEngineData` it's important to `apply_selection_vector` to remove
+        // any filtered out rows. It's also possible to use `into_parts` to get the
+        // unfiltered batch and the selection vector individually, such that an engine could
+        // write only the selected rows out without having to allocate a new engine data.
+        // NB: Unselected rows MUST NOT be written to the checkpoint! Doing so will create an
+        // invalid checkpoint
         let first_data = first?.apply_selection_vector()?;
         let first_batch = first_data.try_into_record_batch()?;
 
@@ -126,12 +126,12 @@ pub struct BlackholeWriter {
 }
 
 impl AsyncFileWriter for BlackholeWriter {
-    fn write(&mut self, bs: bytes::Bytes) -> BoxFuture<'_, parquet::errors::Result<()>> {
+    fn write(&mut self, bs: bytes::Bytes) -> BoxFuture<'_, ParquetResult<()>> {
         self.len += bs.len() as u64;
         async move { Ok(()) }.boxed()
     }
 
-    fn complete(&mut self) -> BoxFuture<'_, parquet::errors::Result<()>> {
+    fn complete(&mut self) -> BoxFuture<'_, ParquetResult<()>> {
         async move { Ok(()) }.boxed()
     }
 }

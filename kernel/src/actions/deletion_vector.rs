@@ -5,12 +5,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use crc::{Crc, CRC_32_ISO_HDLC};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
 use delta_kernel_derive::ToSchema;
 use roaring::RoaringTreemap;
 use url::Url;
-
-use crc::{Crc, CRC_32_ISO_HDLC};
 
 use crate::schema::DataType;
 use crate::utils::require;
@@ -46,8 +45,7 @@ impl FromStr for DeletionVectorStorageType {
             "i" => Ok(Self::Inline),
             "p" => Ok(Self::PersistedAbsolute),
             _ => Err(Error::internal_error(format!(
-                "Unsupported deletion vector format option: {}",
-                s
+                "Unsupported deletion vector format option: {s}"
             ))),
         }
     }
@@ -137,23 +135,23 @@ pub struct DeletionVectorDescriptor {
     pub storage_type: DeletionVectorStorageType,
 
     /// Three format options are currently proposed:
-    /// - If `storageType = 'u'` then `<random prefix - optional><base85 encoded uuid>`:
-    ///   The deletion vector is stored in a file with a path relative to the data
-    ///   directory of this Delta table, and the file name can be reconstructed from
-    ///   the UUID. See Derived Fields for how to reconstruct the file name. The random
-    ///   prefix is recovered as the extra characters before the (20 characters fixed length) uuid.
-    /// - If `storageType = 'i'` then `<base85 encoded bytes>`: The deletion vector
-    ///   is stored inline in the log. The format used is the `RoaringBitmapArray`
-    ///   format also used when the DV is stored on disk and described in [Deletion Vector Format].
+    /// - If `storageType = 'u'` then `<random prefix - optional><base85 encoded uuid>`: The
+    ///   deletion vector is stored in a file with a path relative to the data directory of this
+    ///   Delta table, and the file name can be reconstructed from the UUID. See Derived Fields for
+    ///   how to reconstruct the file name. The random prefix is recovered as the extra characters
+    ///   before the (20 characters fixed length) uuid.
+    /// - If `storageType = 'i'` then `<base85 encoded bytes>`: The deletion vector is stored
+    ///   inline in the log. The format used is the `RoaringBitmapArray` format also used when the
+    ///   DV is stored on disk and described in [Deletion Vector Format].
     /// - If `storageType = 'p'` then `<absolute path>`: The DV is stored in a file with an
-    ///   absolute path given by this path, which has the same format as the `path` field
-    ///   in the `add`/`remove` actions.
+    ///   absolute path given by this path, which has the same format as the `path` field in the
+    ///   `add`/`remove` actions.
     ///
     /// [Deletion Vector Format]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Deletion-Vector-Format
     pub path_or_inline_dv: String,
 
-    /// Start of the data for this DV in number of bytes from the beginning of the file it is stored in.
-    /// Always None (absent in JSON) when `storageType = 'i'`.
+    /// Start of the data for this DV in number of bytes from the beginning of the file it is
+    /// stored in. Always None (absent in JSON) when `storageType = 'i'`.
     pub offset: Option<i32>,
 
     /// Size of the serialized DV in bytes (raw data size, i.e. before base85 encoding, if inline).
@@ -294,8 +292,8 @@ impl DeletionVectorDescriptor {
                 // bitmap_start = this_dv_start + 4 (dv_size field) + 4 (magic field)
                 let bitmap_start = this_dv_start + 8;
                 // crc_start = this_dv_start + 4 (dv_size field) + dv_size (magic field + bitmap)
-                // Safety: size_in_bytes is checked to fit in u32 which for all known platforms should
-                // fix in usize range.
+                // Safety: size_in_bytes is checked to fit in u32 which for all known platforms
+                // should fix in usize range.
                 let crc_start = this_dv_start + 4 + (size_in_bytes as usize);
                 require!(
                     this_dv_start < dv_data_len,
@@ -475,10 +473,9 @@ mod tests {
 
     use roaring::RoaringTreemap;
 
-    use crate::{engine::sync::SyncEngine, Engine};
-
-    use super::DeletionVectorDescriptor;
-    use super::*;
+    use super::{DeletionVectorDescriptor, *};
+    use crate::engine::sync::SyncEngine;
+    use crate::Engine;
 
     fn dv_relative() -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {
@@ -619,8 +616,9 @@ mod tests {
         assert_eq!(found, expected)
     }
 
-    // this test is ignored by default as it's expensive to allocate such big vecs full of `true`. you can run it via:
-    // cargo test actions::deletion_vector::tests::test_dv_to_bools -- --ignored
+    // this test is ignored by default as it's expensive to allocate such big vecs full of `true`.
+    // you can run it via: cargo test actions::deletion_vector::tests::test_dv_to_bools --
+    // --ignored
     #[test]
     #[ignore]
     fn test_dv_to_bools() {
@@ -642,9 +640,9 @@ mod tests {
         assert_eq!(bools, expected);
     }
 
-    // Unlike [`test_dv_to_bools`], this test is not ignored because the large zero-initialized selection vector is fast to allocate.
-    // It just gets a bunch of empty pages from the OS. [`tet_dv_to_bools`] is slow because we must
-    // set every element to `true`.
+    // Unlike [`test_dv_to_bools`], this test is not ignored because the large zero-initialized
+    // selection vector is fast to allocate. It just gets a bunch of empty pages from the OS.
+    // [`tet_dv_to_bools`] is slow because we must set every element to `true`.
     #[test]
     fn test_sv_to_bools() {
         let mut rb = RoaringTreemap::new();
@@ -790,7 +788,8 @@ mod tests {
             "file:///tmp/test_table/dv/deletion_vector_550e8400-e29b-41d4-a716-446655440000.bin";
         assert_eq!(abs_path.as_str(), expected_path);
 
-        // Verify the encoded_relative_path is exactly as expected (prefix + z85 encoded UUID: 20 chars)
+        // Verify the encoded_relative_path is exactly as expected (prefix + z85 encoded UUID: 20
+        // chars)
         let encoded = dv_path.encoded_relative_path();
         assert_eq!(encoded, "dvrsTVZ&*Sl-RXRWjryu/!");
     }

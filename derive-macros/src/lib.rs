@@ -1,9 +1,9 @@
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
-use syn::parse_macro_input;
 use syn::spanned::Spanned;
 use syn::{
-    Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments, Type, Visibility,
+    parse_macro_input, Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments,
+    Type, Visibility,
 };
 
 /// Parses a dot-delimited column name into an array of field names. See
@@ -82,6 +82,26 @@ fn get_schema_name(name: &Ident) -> Ident {
     Ident::new(&ret, name.span())
 }
 
+/// Check if a path segment is `Option<HashMap<K, V>>`.
+fn is_option_of_hashmap(seg: &syn::PathSegment) -> bool {
+    if seg.ident != "Option" {
+        return false;
+    }
+    let PathArguments::AngleBracketed(angle_args) = &seg.arguments else {
+        return false;
+    };
+    // Option has exactly one type argument
+    let Some(syn::GenericArgument::Type(Type::Path(inner_type))) = angle_args.args.first() else {
+        return false;
+    };
+    // Check if the inner type's last segment is HashMap
+    inner_type
+        .path
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident == "HashMap")
+}
+
 fn gen_schema_fields(data: &Data) -> TokenStream {
     let fields = match data {
         Data::Struct(DataStruct {
@@ -119,11 +139,13 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
                     }
                 });
                 if have_schema_null {
-                    if let Some(last_ident) = type_path.path.segments.last().map(|seg| &seg.ident) {
-                        if last_ident != "HashMap" {
-                           return Error::new(
-                                last_ident.span(),
-                                format!("Can only use allow_null_container_values on HashMap fields, not {last_ident}")
+                    if let Some(last_seg) = type_path.path.segments.last() {
+                        let is_valid =
+                            last_seg.ident == "HashMap" || is_option_of_hashmap(last_seg);
+                        if !is_valid {
+                            return Error::new(
+                                last_seg.ident.span(),
+                                format!("Can only use allow_null_container_values on HashMap or Option<HashMap> fields, not {}", last_seg.ident)
                             ).to_compile_error()
                         }
                     }
@@ -219,27 +241,39 @@ pub fn internal_api(
 }
 
 fn make_public(mut item: Item) -> Item {
-    fn set_pub(vis: &mut Visibility) -> Result<(), syn::Error> {
+    /// Transforms the passed visibility to be `pub`. We pass the original span that the visibility
+    /// came from, and attach it to the newly created pub token. This means that the compiler treats
+    /// it as user-written code and normal lints apply. We want this because it allows us to catch
+    /// "private_in_public" violations that are tricky to notice when just slapping
+    /// `#[internal_api]` on something.
+    fn set_pub(vis: &mut Visibility, span: Span) -> Result<(), syn::Error> {
         if matches!(vis, Visibility::Public(_)) {
             return Err(Error::new(
                 vis.span(),
                 "ineligible for #[internal_api]: item is already public",
             ));
         }
-        *vis = syn::parse_quote!(pub);
+        *vis = Visibility::Public(syn::token::Pub { span });
         Ok(())
     }
 
+    macro_rules! set_vis {
+        ($item:ident) => {{
+            let vis_span = $item.vis.span();
+            set_pub(&mut $item.vis, vis_span)
+        }};
+    }
+
     let result = match &mut item {
-        Item::Fn(f) => set_pub(&mut f.vis),
-        Item::Struct(s) => set_pub(&mut s.vis),
-        Item::Enum(e) => set_pub(&mut e.vis),
-        Item::Trait(t) => set_pub(&mut t.vis),
-        Item::Type(t) => set_pub(&mut t.vis),
-        Item::Use(m) => set_pub(&mut m.vis),
-        Item::Static(s) => set_pub(&mut s.vis),
-        Item::Const(c) => set_pub(&mut c.vis),
-        Item::Union(u) => set_pub(&mut u.vis),
+        Item::Fn(f) => set_vis!(f),
+        Item::Struct(s) => set_vis!(s),
+        Item::Enum(e) => set_vis!(e),
+        Item::Trait(t) => set_vis!(t),
+        Item::Type(t) => set_vis!(t),
+        Item::Use(u) => set_vis!(u),
+        Item::Static(s) => set_vis!(s),
+        Item::Const(c) => set_vis!(c),
+        Item::Union(u) => set_vis!(u),
         // foreign mod, impl block, and all others not handled
         _ => Err(Error::new(
             item.span(),

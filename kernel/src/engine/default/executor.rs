@@ -10,7 +10,8 @@
 //! A generic trait [TaskExecutor] can be implemented with your preferred async
 //! runtime. Behind the `tokio` feature flag, we provide a both a single-threaded
 //! and multi-threaded executor based on Tokio.
-use futures::{future::BoxFuture, Future};
+use futures::future::BoxFuture;
+use futures::Future;
 
 use crate::DeltaResult;
 
@@ -51,21 +52,42 @@ pub trait TaskExecutor: Send + Sync + 'static {
 
 #[cfg(any(feature = "tokio", test))]
 pub mod tokio {
-    use super::TaskExecutor;
-    use futures::TryFutureExt;
-    use futures::{future::BoxFuture, Future};
+    use std::mem::ManuallyDrop;
     use std::sync::mpsc::channel;
+
+    use futures::future::BoxFuture;
+    use futures::{Future, TryFutureExt};
     use tokio::runtime::{EnterGuard, Handle, RuntimeFlavor};
 
+    use super::TaskExecutor;
     use crate::{DeltaResult, Error};
 
     /// A [`TaskExecutor`] that uses the tokio single-threaded runtime in a
     /// background thread to service tasks.
+    ///
+    /// On drop, the background thread is joined to ensure the runtime is fully
+    /// shut down before the executor is destroyed.
     #[derive(Debug)]
     pub struct TokioBackgroundExecutor {
-        sender: tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>,
+        sender: ManuallyDrop<tokio::sync::mpsc::Sender<BoxFuture<'static, ()>>>,
         handle: Handle,
-        _thread: std::thread::JoinHandle<()>,
+        /// `Option` because `join` takes ownership; we `take` it in `Drop` to move the
+        /// handle out. Never `None` outside of `Drop`.
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for TokioBackgroundExecutor {
+        fn drop(&mut self) {
+            // SAFETY: The inner `Sender` has not been dropped yet because this is
+            // the only drop site and `Drop::drop` runs exactly once.
+            // Drop sender first to close the channel, signaling the background
+            // thread to exit its recv loop.
+            unsafe { ManuallyDrop::drop(&mut self.sender) };
+            // Join the thread so that runtime shutdown completes before we return.
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
     }
 
     impl Default for TokioBackgroundExecutor {
@@ -93,9 +115,9 @@ pub mod tokio {
             });
             let handle = handle_receiver.recv().unwrap();
             Self {
-                sender,
+                sender: ManuallyDrop::new(sender),
                 handle,
-                _thread: thread,
+                thread: Some(thread),
             }
         }
     }
@@ -199,10 +221,10 @@ pub mod tokio {
         /// Create a new executor that owns its own multi-threaded Tokio runtime.
         ///
         /// # Parameters
-        /// - `worker_threads`: Number of worker threads. If `None`, uses Tokio's default.
-        ///   See [`tokio::runtime::Builder::worker_threads`].
-        /// - `max_blocking_threads`: Maximum number of threads for blocking operations.
-        ///   If `None`, uses Tokio's default. See [`tokio::runtime::Builder::max_blocking_threads`].
+        /// - `worker_threads`: Number of worker threads. If `None`, uses Tokio's default. See
+        ///   [`tokio::runtime::Builder::worker_threads`].
+        /// - `max_blocking_threads`: Maximum number of threads for blocking operations. If `None`,
+        ///   uses Tokio's default. See [`tokio::runtime::Builder::max_blocking_threads`].
         ///
         /// # Errors
         /// Returns an error if the runtime cannot be created.
@@ -235,8 +257,8 @@ pub mod tokio {
     impl TaskExecutor for TokioMultiThreadExecutor {
         type Guard<'a> = EnterGuard<'a>;
 
-        // `block_on` uses `block_in_place`; If concurrent `block_on` calls exceed Tokio's `max_blocking_threads`, this can deadlock
-        // See:
+        // `block_on` uses `block_in_place`; If concurrent `block_on` calls exceed Tokio's
+        // `max_blocking_threads`, this can deadlock See:
         // https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.max_blocking_threads
         fn block_on<T>(&self, task: T) -> T::Output
         where
@@ -421,7 +443,8 @@ pub mod tokio {
                 tx.send(result).ok();
             });
 
-            // With 1 worker thread, 1 blocking thread and 4 nested block_on calls, this should deadlock
+            // With 1 worker thread, 1 blocking thread and 4 nested block_on calls, this should
+            // deadlock
             let timeout = Duration::from_millis(500);
             let result = rx.recv_timeout(timeout);
 

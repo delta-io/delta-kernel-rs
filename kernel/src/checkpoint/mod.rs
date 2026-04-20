@@ -85,9 +85,13 @@
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
 // Future extensions:
-// - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
-//   multi-file support, but the current implementation only supports single-file checkpoints.
-use std::sync::{Arc, LazyLock};
+// - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be
+//   extensible for future multi-file support, but the current implementation only supports
+//   single-file checkpoints.
+use std::sync::{Arc, LazyLock, OnceLock};
+
+use tracing::info;
+use url::Url;
 
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
@@ -107,21 +111,32 @@ use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{get_any_level_columns_logical_names, TableFeature};
+use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 
-use url::Url;
-
 mod checkpoint_transform;
+#[allow(unused)]
+// Used once sidecar checkpoint writing is enabled
+mod sidecar;
 
 use checkpoint_transform::{
     build_checkpoint_output_schema, build_checkpoint_read_schema, build_checkpoint_transform,
     StatsTransformConfig,
 };
-
 #[cfg(test)]
 mod tests;
+
+/// Schemas and configs needed for building the checkpoint read/output schemas.
+struct CheckpointSchemaContext {
+    stats_config: StatsTransformConfig,
+    /// The checkpoint schema before table-specific fields like
+    /// `stats_parsed` and `partitionValues_parsed` are injected.
+    checkpoint_base_schema: SchemaRef,
+    stats_schema: SchemaRef,
+    partition_schema: Option<SchemaRef>,
+    is_v2: bool,
+}
 
 /// Schema of the `_last_checkpoint` file
 /// We cannot use `LastCheckpointInfo::to_schema()` as it would include the 'checkpoint_schema'
@@ -178,8 +193,8 @@ static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// supports the `v2Checkpoints` reader/writer feature.
 ///
 /// # Warning
-/// The checkpoint data must be fully written to storage before calling [`CheckpointWriter::finalize`].
-/// Failing to do so may result in data loss or corruption.
+/// The checkpoint data must be fully written to storage before calling
+/// [`CheckpointWriter::finalize`]. Failing to do so may result in data loss or corruption.
 ///
 /// # See Also
 /// See the [module-level documentation](self) for the complete checkpoint workflow
@@ -192,6 +207,9 @@ pub struct CheckpointWriter {
     /// Note: Although the version is stored as a u64 in the snapshot, it is stored as an i64
     /// field here to avoid multiple type conversions.
     version: i64,
+
+    /// Cached checkpoint output schema.
+    checkpoint_output_schema: OnceLock<SchemaRef>,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -215,8 +233,31 @@ impl CheckpointWriter {
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;
 
-        Ok(Self { snapshot, version })
+        Ok(Self {
+            snapshot,
+            version,
+            checkpoint_output_schema: OnceLock::new(),
+        })
     }
+    /// Returns the cached output schema, initializing it with `f` on first call.
+    ///
+    /// `OnceLock::get_or_try_init` is unstable, so we use a custom implementation.
+    /// (tracking issue: <https://github.com/rust-lang/rust/issues/109737>).
+    fn get_or_init_output_schema(
+        &self,
+        f: impl FnOnce() -> DeltaResult<SchemaRef>,
+    ) -> DeltaResult<SchemaRef> {
+        if let Some(schema) = self.checkpoint_output_schema.get() {
+            return Ok(schema.clone());
+        }
+        let schema = f()?;
+        let _ = self.checkpoint_output_schema.set(schema);
+        self.checkpoint_output_schema
+            .get()
+            .cloned()
+            .ok_or_else(|| Error::internal_error("OnceLock should be initialized"))
+    }
+
     /// Returns the URL where the checkpoint file should be written.
     ///
     /// This method generates the checkpoint path based on the table's root and the version
@@ -234,6 +275,7 @@ impl CheckpointWriter {
         )
         .map(|parsed| parsed.location)
     }
+
     /// Returns the checkpoint data to be written to the checkpoint file.
     ///
     /// This method reads actions from the log segment, processes them for checkpoint creation,
@@ -266,47 +308,7 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
-        let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
-
-        // Get clustering columns so they are always included in stats per the Delta protocol.
-        // Translate from physical to logical since build_expected_stats_schemas operates on
-        // the logical data schema.
-        let tc = self.snapshot.table_configuration();
-        let clustering_columns_physical = self.snapshot.get_clustering_columns_physical(engine)?;
-        let clustering_columns_logical = clustering_columns_physical
-            .as_deref()
-            .map(|cols| {
-                get_any_level_columns_logical_names(
-                    &tc.logical_schema(),
-                    cols,
-                    tc.column_mapping_mode(),
-                )
-            })
-            .transpose()?;
-
-        // Get stats schema from table configuration.
-        // This already excludes partition columns and applies column mapping.
-        let stats_schema = tc
-            .build_expected_stats_schemas(clustering_columns_logical.as_deref(), None)?
-            .physical;
-
-        // Select schema based on V2 checkpoint support
-        let is_v2_checkpoints_supported = self
-            .snapshot
-            .table_configuration()
-            .is_feature_supported(&TableFeature::V2Checkpoint);
-
-        let base_schema = if is_v2_checkpoints_supported {
-            &CHECKPOINT_ACTIONS_SCHEMA_V2
-        } else {
-            &CHECKPOINT_ACTIONS_SCHEMA_V1
-        };
-
-        // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
-        let partition_schema = self
-            .snapshot
-            .table_configuration()
-            .build_partition_values_parsed_schema();
+        let schema_context = self.checkpoint_schema_context(engine)?;
 
         // The read schema and output schema differ because the transform needs access to
         // both stats formats as input, but may only write one format as output.
@@ -318,8 +320,11 @@ impl CheckpointWriter {
         //
         // output_schema: Only includes the stats fields that the table config requests
         // (e.g., only `stats` if writeStatsAsJson=true and writeStatsAsStruct=false).
-        let read_schema =
-            build_checkpoint_read_schema(base_schema, &stats_schema, partition_schema.as_deref())?;
+        let read_schema = build_checkpoint_read_schema(
+            &schema_context.checkpoint_base_schema,
+            &schema_context.stats_schema,
+            schema_context.partition_schema.as_deref(),
+        )?;
 
         // Read actions from log segment
         let actions = self
@@ -334,17 +339,22 @@ impl CheckpointWriter {
         )
         .process_actions_iter(actions);
 
-        let output_schema = build_checkpoint_output_schema(
-            &config,
-            base_schema,
-            &stats_schema,
-            partition_schema.as_deref(),
-        )?;
+        let output_schema = self.get_or_init_output_schema(|| {
+            build_checkpoint_output_schema(
+                &schema_context.stats_config,
+                &schema_context.checkpoint_base_schema,
+                &schema_context.stats_schema,
+                schema_context.partition_schema.as_deref(),
+            )
+        })?;
 
         // Build transform expression and create expression evaluator.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
-        let transform_expr =
-            build_checkpoint_transform(&config, &stats_schema, partition_schema.as_ref());
+        let transform_expr = build_checkpoint_transform(
+            &schema_context.stats_config,
+            &schema_context.stats_schema,
+            schema_context.partition_schema.as_ref(),
+        );
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             read_schema,
             transform_expr,
@@ -366,7 +376,8 @@ impl CheckpointWriter {
         // For V2 checkpoints, chain the checkpoint metadata batch after the transformed
         // action stream. The metadata batch is created with the output schema directly,
         // bypassing the stats transform (it has no add actions to transform).
-        let checkpoint_metadata = is_v2_checkpoints_supported
+        let checkpoint_metadata = schema_context
+            .is_v2
             .then(|| self.create_checkpoint_metadata_batch(engine, &output_schema));
 
         Ok(ActionReconciliationIterator::new(Box::new(
@@ -402,6 +413,20 @@ impl CheckpointWriter {
             return Err(Error::checkpoint_write(
                 "The checkpoint data iterator must be fully consumed and written to storage before calling finalize"
             ));
+        }
+
+        // Skip writing `_last_checkpoint` if the existing hint already points to a newer
+        // checkpoint, to avoid regressing the hint.
+        let checkpoint_version = self.snapshot.version();
+        if let Some(hint_version) = self.snapshot.log_segment().last_checkpoint_version() {
+            if hint_version > checkpoint_version {
+                info!(
+                    hint_version,
+                    checkpoint_version,
+                    "Skipping _last_checkpoint write: existing hint is newer than checkpoint"
+                );
+                return Ok(());
+            }
         }
 
         let size_in_bytes = i64::try_from(metadata.size).map_err(|e| {
@@ -486,6 +511,42 @@ impl CheckpointWriter {
             filtered_data,
             actions_count: 1,
             add_actions_count: 0,
+        })
+    }
+
+    /// Helper for computing the checkpoint schema context from the snapshot and engine.
+    fn checkpoint_schema_context(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<CheckpointSchemaContext> {
+        let tc = self.snapshot.table_configuration();
+        let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
+
+        // Select schema based on V2 checkpoint support
+        let is_v2 = tc.is_feature_supported(&TableFeature::V2Checkpoint);
+        let base_schema = if is_v2 {
+            CHECKPOINT_ACTIONS_SCHEMA_V2.clone()
+        } else {
+            CHECKPOINT_ACTIONS_SCHEMA_V1.clone()
+        };
+
+        // Get clustering columns so they are always included in stats per the Delta protocol.
+        let physical_clustering_columns = self.snapshot.get_physical_clustering_columns(engine)?;
+
+        // Get stats schema from table configuration.
+        // This already excludes partition columns and applies column mapping.
+        let stats_schema = tc
+            .build_expected_stats_schemas(physical_clustering_columns.as_deref(), None)?
+            .physical;
+
+        // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
+        let partition_schema = tc.build_partition_values_parsed_schema();
+        Ok(CheckpointSchemaContext {
+            stats_config: config,
+            checkpoint_base_schema: base_schema,
+            stats_schema,
+            partition_schema,
+            is_v2,
         })
     }
 }

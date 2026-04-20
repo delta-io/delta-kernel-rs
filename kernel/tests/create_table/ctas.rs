@@ -13,6 +13,11 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::ColumnName;
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::DynObjectStore;
+#[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     get_any_level_column_physical_name, ColumnMappingMode, TableFeature,
@@ -21,14 +26,11 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Engine, FileMeta};
-use object_store::path::Path;
-use object_store::ObjectStore;
-use url::Url;
-
 use test_utils::{
     assert_schema_has_field, nested_batches, nested_schema, read_add_infos, test_table_setup,
     write_batch_to_table,
 };
+use url::Url;
 
 const VERIFIED_PATHS: &[&[&str]] = &[&["row_number"], &["address", "street"]];
 
@@ -42,7 +44,7 @@ const VERIFIED_PATHS: &[&[&str]] = &[&["row_number"], &["address", "street"]];
 async fn verify_column_names_in_metadata(
     snapshot: &Snapshot,
     engine: &impl Engine,
-    store: &dyn ObjectStore,
+    store: &DynObjectStore,
     table_url: &Url,
     cm_mode: ColumnMappingMode,
     clustered: bool,
@@ -101,7 +103,7 @@ fn verify_column_names_in_clustering_metadata(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = snapshot.schema();
     let clustering_columns = snapshot
-        .get_clustering_columns_physical(engine)?
+        .get_physical_clustering_columns(engine)?
         .expect("Clustering columns should be present");
 
     assert_eq!(
@@ -141,7 +143,7 @@ fn verify_column_names_in_clustering_metadata(
 async fn verify_column_names_in_parquet_footer(
     snapshot: &Snapshot,
     engine: &impl Engine,
-    store: &dyn ObjectStore,
+    store: &DynObjectStore,
     table_url: &Url,
     cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -188,8 +190,8 @@ fn cm_mode_property(mode: ColumnMappingMode) -> Option<&'static str> {
 /// 3. Scan all data from the source table
 /// 4. Create target table and write scanned data in a single CTAS transaction
 /// 5. Verify target version, feature flags, and column naming consistency
-/// 6. Verify data integrity: scan target and check row count, row_number
-///    values, and nested address.street values all match the source
+/// 6. Verify data integrity: scan target and check row count, row_number values, and nested
+///    address.street values all match the source
 async fn run_ctas_test(
     src_cm: ColumnMappingMode,
     src_clustered: bool,
@@ -201,7 +203,7 @@ async fn run_ctas_test(
 
     let (_src_tmp, src_table_path, _) = test_table_setup()?;
     let src_url = Url::from_directory_path(&src_table_path).unwrap();
-    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
         DefaultEngineBuilder::new(store.clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
@@ -259,13 +261,9 @@ async fn run_ctas_test(
     }
     let mut tgt_txn = tgt_builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-    let write_context = Arc::new(tgt_txn.get_write_context());
+    let write_context = Arc::new(tgt_txn.unpartitioned_write_context()?);
     let add_meta = engine
-        .write_parquet(
-            &ArrowEngineData::new(source_data),
-            write_context.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(source_data), write_context.as_ref())
         .await?;
     tgt_txn.add_files(add_meta);
 
@@ -303,8 +301,8 @@ async fn run_ctas_test(
     )
     .await?;
 
-    // 6. Verify data integrity: scan target and check row count, row_number
-    //    values, and nested address.street values all match the source
+    // 6. Verify data integrity: scan target and check row count, row_number values, and nested
+    //    address.street values all match the source
     let tgt_snapshot_for_scan = Snapshot::builder_for(tgt_url.clone()).build(engine.as_ref())?;
     let tgt_scan = tgt_snapshot_for_scan.scan_builder().build()?;
     let tgt_batches = test_utils::read_scan(&tgt_scan, engine.clone())?;

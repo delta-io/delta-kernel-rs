@@ -2,25 +2,28 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::array::{AsArray as _, RecordBatch};
+use delta_kernel::arrow::array::{AsArray as _, RecordBatch, TimestampMicrosecondArray};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
-use delta_kernel::arrow::datatypes::{Field as ArrowField, Int64Type, Schema as ArrowSchema};
+use delta_kernel::arrow::datatypes::{
+    Field as ArrowField, Int64Type, Schema as ArrowSchema, TimeUnit,
+};
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{
-    column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
+    column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred, Scalar,
 };
 use delta_kernel::log_segment::LogSegment;
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
 use delta_kernel::{Engine, FileMeta, Snapshot};
-
 use itertools::Itertools;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
     load_test_data, read_scan, record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray,
@@ -33,6 +36,19 @@ mod common;
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
 const PARQUET_FILE3: &str = "part-00002-c506e79a-0bf8-4e2b-a42b-9731b2e490ff-c000.snappy.parquet";
+
+#[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+/// Bridge the new `Path::join` method that deprecates `Path::child` in object_store 0.13.
+trait PathExt {
+    fn join(&self, other: &str) -> Self;
+}
+
+#[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+impl PathExt for Path {
+    fn join(&self, other: &str) -> Self {
+        self.child(other)
+    }
+}
 
 /// Convert all top-level fields in a RecordBatch to nullable, matching Delta table schema
 /// conventions where the table metadata declares columns as nullable.
@@ -52,9 +68,11 @@ fn make_top_level_fields_nullable(batch: &RecordBatch) -> RecordBatch {
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     let parquet_bytes = record_batch_to_bytes(&batch);
     let file_size = parquet_bytes.len() as u64;
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -77,13 +95,12 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         )
         .await?;
 
-    let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected.clone(), expected];
 
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
 
     let mut files = 0;
@@ -101,9 +118,11 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
 async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     let parquet_bytes = record_batch_to_bytes(&batch);
     let file_size = parquet_bytes.len() as u64;
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -113,6 +132,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     add_commit(
+        table_root,
         storage.as_ref(),
         1,
         actions_to_string(vec![TestAction::AddWithSize(
@@ -134,13 +154,12 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let location = Url::parse("memory:///").unwrap();
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
     let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected.clone(), expected];
 
-    let snapshot = Snapshot::builder_for(location).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
 
     let mut files = 0;
@@ -159,9 +178,11 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
 async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     let parquet_bytes = record_batch_to_bytes(&batch);
     let file_size = parquet_bytes.len() as u64;
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -171,6 +192,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     add_commit(
+        table_root,
         storage.as_ref(),
         1,
         actions_to_string(vec![TestAction::AddWithSize(
@@ -180,6 +202,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     add_commit(
+        table_root,
         storage.as_ref(),
         2,
         actions_to_string(vec![TestAction::RemoveWithSize(
@@ -195,13 +218,12 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let location = Url::parse("memory:///").unwrap();
     let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
     let expected = make_top_level_fields_nullable(&batch);
     let expected_data = vec![expected];
 
-    let snapshot = Snapshot::builder_for(location).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
 
     let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
@@ -238,8 +260,10 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     let file_size1 = record_batch_to_bytes(&batch1).len() as u64;
     let file_size2 = record_batch_to_bytes(&batch2).len() as u64;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     // valid commit with min/max (0, 2)
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -248,8 +272,13 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         ]),
     )
     .await?;
-    // storage.add_commit(1, &format!("{}\n", r#"{{"add":{{"path":"doesnotexist","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 0}},\"maxValues\":{{\"id\":2}}}}"}}}}"#));
+    // storage.add_commit(1, &format!("{}\n",
+    // r#"{{"add":{{"path":"doesnotexist","partitionValues":{{}},"size":262,"modificationTime":
+    // 1587968586000,"dataChange":true,
+    // "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\":
+    // 0}},\"maxValues\":{{\"id\":2}}}}"}}}}"#));
     add_commit(
+        table_root,
         storage.as_ref(),
         1,
         generate_commit2(vec![TestAction::AddWithSize(
@@ -273,9 +302,8 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let location = Url::parse("memory:///").unwrap();
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
@@ -678,18 +706,18 @@ fn predicate_on_letter(
 }
 
 #[rstest::rstest]
-#[case::or_no_pruning(
+#[case::or_with_pruning(
     Pred::or(
-        // No pruning power
         column_expr!("letter").gt(Expr::literal("a")),
         column_expr!("number").gt(Expr::literal(3i64)),
     ),
+    // Unified data skipping evaluates partition + data predicates in a single pass.
+    // File a/1 (letter='a', max(number)=1): OR('a'>'a', 1>3) = FALSE -> pruned
     vec![
         "+--------+--------+",
         "| letter | number |",
         "+--------+--------+",
         "|        | 6      |",
-        "| a      | 1      |",
         "| a      | 4      |",
         "| b      | 2      |",
         "| c      | 3      |",
@@ -711,25 +739,314 @@ fn predicate_on_letter(
     Pred::and(
         column_expr!("letter").gt(Expr::literal("a")), // numbers 2, 3, 5
         Pred::or(
-            // No pruning power
             column_expr!("letter").eq(Expr::literal("c")),
             column_expr!("number").eq(Expr::literal(3i64)),
         ),
     ),
-    table_for_letters(&['b', 'c', 'e'])
+    // Unified data skipping evaluates the full expression:
+    // b/2: AND(TRUE, OR(FALSE, FALSE)) = FALSE -> pruned
+    // c/3: AND(TRUE, OR(TRUE, TRUE)) = TRUE -> kept
+    // e/5: AND(TRUE, OR(FALSE, FALSE)) = FALSE -> pruned
+    table_for_letters(&['c'])
 )]
 fn predicate_on_letter_and_number(
     #[case] pred: Pred,
     #[case] expected: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Partition skipping and file skipping are currently implemented separately. Mixing them in an
-    // AND clause will evaulate each separately, but mixing them in an OR clause disables both.
+    // Unified data skipping evaluates partition + data predicates together in a single
+    // columnar pass, enabling pruning for mixed predicates including OR expressions.
     read_table_data(
         "./tests/data/basic_partitioned",
         Some(&["letter", "number"]),
         Some(pred),
         expected,
     )?;
+    Ok(())
+}
+
+/// Test partition pruning on a table with a checkpoint containing `partitionValues_parsed`.
+/// This exercises the checkpoint code path where typed partition values are read directly
+/// from the parquet column rather than parsed from the string map via `MapToStruct`.
+///
+/// Table: app-txn-checkpoint (checkpoint at v1, partition column: `modified` (string))
+///   - 2 files with modified=2021-02-01 (value 4-11, 8 rows each)
+///   - 2 files with modified=2021-02-02 (value 1-3, 3 rows each)
+#[rstest::rstest]
+#[case::partition_only_prunes_one_partition(
+    // Partition-only predicate: modified = '2021-02-02' should prune 2021-02-01 files
+    column_expr!("modified").eq(Expr::literal("2021-02-02")),
+    vec![
+        "+----+------------+-------+",
+        "| id | modified   | value |",
+        "+----+------------+-------+",
+        "| A  | 2021-02-02 | 1     |",
+        "| A  | 2021-02-02 | 1     |",
+        "| A  | 2021-02-02 | 3     |",
+        "| A  | 2021-02-02 | 3     |",
+        "| B  | 2021-02-02 | 2     |",
+        "| B  | 2021-02-02 | 2     |",
+        "+----+------------+-------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+#[case::partition_prunes_other_partition(
+    // modified = '2021-02-01' should prune 2021-02-02 files, keeping all 2021-02-01 rows
+    column_expr!("modified").eq(Expr::literal("2021-02-01")),
+    vec![
+        "+----+------------+-------+",
+        "| id | modified   | value |",
+        "+----+------------+-------+",
+        "| A  | 2021-02-01 | 10    |",
+        "| A  | 2021-02-01 | 10    |",
+        "| A  | 2021-02-01 | 11    |",
+        "| A  | 2021-02-01 | 11    |",
+        "| A  | 2021-02-01 | 5     |",
+        "| A  | 2021-02-01 | 5     |",
+        "| A  | 2021-02-01 | 6     |",
+        "| A  | 2021-02-01 | 6     |",
+        "| A  | 2021-02-01 | 7     |",
+        "| A  | 2021-02-01 | 7     |",
+        "| B  | 2021-02-01 | 4     |",
+        "| B  | 2021-02-01 | 4     |",
+        "| B  | 2021-02-01 | 8     |",
+        "| B  | 2021-02-01 | 8     |",
+        "| B  | 2021-02-01 | 9     |",
+        "| B  | 2021-02-01 | 9     |",
+        "+----+------------+-------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+fn partition_pruning_with_checkpoint_parsed_values(
+    #[case] pred: Pred,
+    #[case] expected: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data(
+        "./tests/data/app-txn-checkpoint",
+        Some(&["id", "modified", "value"]),
+        Some(pred),
+        expected,
+    )?;
+    Ok(())
+}
+
+/// Test mixed predicates (partition + data stats) on a checkpoint with both
+/// `partitionValues_parsed` and `stats_parsed`. This exercises the unified columnar data skipping
+/// pass that evaluates both partition values and data column statistics together.
+///
+/// Table: app-txn-checkpoint (checkpoint at v1, partition column: `modified` (string))
+///   - 2 files: modified=2021-02-02 -- 3 rows each, value in [1, 3]
+///   - 2 files: modified=2021-02-01 -- 8 rows each, value in [4, 11]
+#[rstest::rstest]
+#[case::and_keeps_partition_matched_files(
+    // Data skipping keeps 2021-02-01 files (partition matches, max(value)=11 > 9) and
+    // prunes 2021-02-02 files (partition mismatch). All rows from kept files are returned
+    // since kernel does not apply row-level predicate filtering.
+    Pred::and(
+        column_expr!("modified").eq(Expr::literal("2021-02-01")),
+        column_expr!("value").gt(Expr::literal(9i32)),
+    ),
+    vec![
+        "+----+------------+-------+",
+        "| id | modified   | value |",
+        "+----+------------+-------+",
+        "| A  | 2021-02-01 | 10    |",
+        "| A  | 2021-02-01 | 10    |",
+        "| A  | 2021-02-01 | 11    |",
+        "| A  | 2021-02-01 | 11    |",
+        "| A  | 2021-02-01 | 5     |",
+        "| A  | 2021-02-01 | 5     |",
+        "| A  | 2021-02-01 | 6     |",
+        "| A  | 2021-02-01 | 6     |",
+        "| A  | 2021-02-01 | 7     |",
+        "| A  | 2021-02-01 | 7     |",
+        "| B  | 2021-02-01 | 4     |",
+        "| B  | 2021-02-01 | 4     |",
+        "| B  | 2021-02-01 | 8     |",
+        "| B  | 2021-02-01 | 8     |",
+        "| B  | 2021-02-01 | 9     |",
+        "| B  | 2021-02-01 | 9     |",
+        "+----+------------+-------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+#[case::and_prunes_all_files(
+    // 2021-02-02: partition matches but data stats fail (max value=3, NOT > 3).
+    // 2021-02-01: partition mismatch. All 4 files pruned.
+    Pred::and(
+        column_expr!("modified").eq(Expr::literal("2021-02-02")),
+        column_expr!("value").gt(Expr::literal(3i32)),
+    ),
+    vec![]
+)]
+#[case::or_prunes_by_both_partition_and_stats(
+    // 2021-02-01 pruned: partition mismatch AND max(value)=11 NOT > 11.
+    // 2021-02-02 kept by partition match. Only 2021-02-02 rows returned.
+    Pred::or(
+        column_expr!("modified").eq(Expr::literal("2021-02-02")),
+        column_expr!("value").gt(Expr::literal(11i32)),
+    ),
+    vec![
+        "+----+------------+-------+",
+        "| id | modified   | value |",
+        "+----+------------+-------+",
+        "| A  | 2021-02-02 | 1     |",
+        "| A  | 2021-02-02 | 1     |",
+        "| A  | 2021-02-02 | 3     |",
+        "| A  | 2021-02-02 | 3     |",
+        "| B  | 2021-02-02 | 2     |",
+        "| B  | 2021-02-02 | 2     |",
+        "+----+------------+-------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+#[case::or_keeps_all_files(
+    // 2021-02-02 kept by partition match, 2021-02-01 kept by data stats (max=11 > 9).
+    // All rows from all 4 files are returned.
+    Pred::or(
+        column_expr!("modified").eq(Expr::literal("2021-02-02")),
+        column_expr!("value").gt(Expr::literal(9i32)),
+    ),
+    vec![
+        "+----+------------+-------+",
+        "| id | modified   | value |",
+        "+----+------------+-------+",
+        "| A  | 2021-02-01 | 10    |",
+        "| A  | 2021-02-01 | 10    |",
+        "| A  | 2021-02-01 | 11    |",
+        "| A  | 2021-02-01 | 11    |",
+        "| A  | 2021-02-01 | 5     |",
+        "| A  | 2021-02-01 | 5     |",
+        "| A  | 2021-02-01 | 6     |",
+        "| A  | 2021-02-01 | 6     |",
+        "| A  | 2021-02-01 | 7     |",
+        "| A  | 2021-02-01 | 7     |",
+        "| A  | 2021-02-02 | 1     |",
+        "| A  | 2021-02-02 | 1     |",
+        "| A  | 2021-02-02 | 3     |",
+        "| A  | 2021-02-02 | 3     |",
+        "| B  | 2021-02-01 | 4     |",
+        "| B  | 2021-02-01 | 4     |",
+        "| B  | 2021-02-01 | 8     |",
+        "| B  | 2021-02-01 | 8     |",
+        "| B  | 2021-02-01 | 9     |",
+        "| B  | 2021-02-01 | 9     |",
+        "| B  | 2021-02-02 | 2     |",
+        "| B  | 2021-02-02 | 2     |",
+        "+----+------------+-------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+)]
+fn mixed_predicate_with_checkpoint_parsed_columns(
+    #[case] pred: Pred,
+    #[case] expected: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Exercises the unified data skipping path that reads both `partitionValues_parsed` and
+    // `stats_parsed` from the checkpoint parquet file in a single columnar pass.
+    read_table_data(
+        "./tests/data/app-txn-checkpoint",
+        Some(&["id", "modified", "value"]),
+        Some(pred),
+        expected,
+    )?;
+    Ok(())
+}
+
+/// Test partition pruning on a table with column mapping (name mode). The logical partition
+/// column "category" has physical name "phys_category". With column mapping, `partitionValues`
+/// in the log uses physical column names, and the partition schema + predicate must also use
+/// physical names for `MapToStruct` extraction and data skipping to work correctly.
+#[rstest::rstest]
+#[case::partition_only(
+    // Partition-only predicate: category = 'A' prunes the category=B file
+    Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
+    1
+)]
+#[case::mixed_partition_and_data(
+    // Mixed predicate: category = 'A' OR val > 'z'. Category=A kept by partition match.
+    // Category=B: partition mismatch, but max(val)='z' NOT > 'z', so data skipping prunes it.
+    Arc::new(Pred::or(
+        Pred::eq(column_expr!("category"), Expr::literal("A")),
+        Pred::gt(column_expr!("val"), Expr::literal("z")),
+    )),
+    1
+)]
+#[tokio::test]
+async fn partition_pruning_with_column_mapping(
+    #[case] predicate: Arc<Pred>,
+    #[case] expected_files: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let batch = generate_batch(vec![("phys_val", vec!["x", "y", "z"].into_array())])?;
+
+    let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
+
+    // Column mapping name mode: logical "category" -> physical "phys_category",
+    // logical "val" -> physical "phys_val"
+    let schema_str = r#"{"type":"struct","fields":[{"name":"category","type":"string","nullable":true,"metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"phys_category"}},{"name":"val","type":"string","nullable":true,"metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"phys_val"}}]}"#;
+
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}"#.to_string(),
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","isBlindAppend":true}}"#.to_string(),
+        format!(
+            r#"{{"metaData":{{"id":"test-cm","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{schema}","partitionColumns":["category"],"configuration":{{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"2"}},"createdTime":1587968585495}}}}"#,
+            schema = schema_str.replace('"', r#"\""#),
+        ),
+        // partitionValues uses physical column name when column mapping is enabled
+        format!(
+            r#"{{"add":{{"path":"phys_category=A/{PARQUET_FILE1}","partitionValues":{{"phys_category":"A"}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":3,\"nullCount\":{{\"phys_val\":0}},\"minValues\":{{\"phys_val\":\"x\"}},\"maxValues\":{{\"phys_val\":\"z\"}}}}" }}}}"#
+        ),
+        format!(
+            r#"{{"add":{{"path":"phys_category=B/{PARQUET_FILE2}","partitionValues":{{"phys_category":"B"}},"size":0,"modificationTime":1587968586000,"dataChange":true,"stats":"{{\"numRecords\":3,\"nullCount\":{{\"phys_val\":0}},\"minValues\":{{\"phys_val\":\"x\"}},\"maxValues\":{{\"phys_val\":\"z\"}}}}" }}}}"#
+        ),
+    ];
+
+    add_commit(table_root, storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    storage
+        .put(
+            &Path::from("phys_category=A").join(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+    storage
+        .put(
+            &Path::from("phys_category=B").join(PARQUET_FILE2),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+
+    // Predicates use logical column names -- kernel must map to physical names
+    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+
+    let stream = scan.execute(engine)?;
+    let mut files_scanned = 0;
+    for engine_data in stream {
+        let result_batch = into_record_batch(engine_data?);
+        // The "category" partition column should be filled with "A"
+        let category_idx = result_batch.schema().index_of("category")?;
+        let category_col = result_batch.column(category_idx).as_string::<i32>();
+        for i in 0..result_batch.num_rows() {
+            assert_eq!(category_col.value(i), "A");
+        }
+        files_scanned += 1;
+    }
+    assert_eq!(
+        expected_files, files_scanned,
+        "Expected partition pruning to return {expected_files} file(s)"
+    );
+
     Ok(())
 }
 
@@ -1025,6 +1342,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
     let batch = generate_batch(vec![("val", vec!["a", "b", "c"].into_array())])?;
 
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     let actions = [
         r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
         r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[\"id\"]"},"isBlindAppend":true}}"#.to_string(),
@@ -1033,24 +1351,22 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
         format!(r#"{{"add":{{"path":"id=2/{PARQUET_FILE2}","partitionValues":{{"id":"2"}},"size":0,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":3,\"nullCount\":{{\"val\":0}},\"minValues\":{{\"val\":\"a\"}},\"maxValues\":{{\"val\":\"c\"}}}}"}}}}"#),
     ];
 
-    add_commit(storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    add_commit(table_root, storage.as_ref(), 0, actions.iter().join("\n")).await?;
     storage
         .put(
-            &Path::from("id=1").child(PARQUET_FILE1),
+            &Path::from("id=1").join(PARQUET_FILE1),
             record_batch_to_bytes(&batch).into(),
         )
         .await?;
     storage
         .put(
-            &Path::from("id=2").child(PARQUET_FILE2),
+            &Path::from("id=2").join(PARQUET_FILE2),
             record_batch_to_bytes(&batch).into(),
         )
         .await?;
-
-    let location = Url::parse("memory:///")?;
 
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     let predicate = Pred::eq(column_expr!("id"), Expr::literal(2));
     let scan = snapshot
@@ -1078,6 +1394,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
     let batch_2 = generate_batch(vec![("val", vec!["d", "e", "f"].into_array())])?;
 
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     let actions = [
         r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
         r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}"#.to_string(),
@@ -1092,7 +1409,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
         .set_statistics_enabled(EnabledStatistics::None)
         .build();
 
-    add_commit(storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    add_commit(table_root, storage.as_ref(), 0, actions.iter().join("\n")).await?;
     storage
         .put(
             &Path::from(PARQUET_FILE1),
@@ -1106,10 +1423,8 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
         )
         .await?;
 
-    let location = Url::parse("memory:///")?;
-
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
 
     let predicate = Pred::eq(column_expr!("val"), Expr::literal("g"));
     let scan = snapshot
@@ -1361,7 +1676,9 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
     let file_size2 = record_batch_to_bytes(&batch2).len() as u64;
     let file_size3 = record_batch_to_bytes(&batch3).len() as u64;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -1386,7 +1703,6 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
             .await?;
     }
 
-    let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     // Create a schema that includes a row index metadata column
@@ -1396,7 +1712,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
         StructField::nullable("value", DataType::STRING),
     ])?);
 
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().with_schema(schema).build()?;
 
     let mut file_count = 0;
@@ -1458,7 +1774,9 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
     let file_size1 = record_batch_to_bytes(&batch1).len() as u64;
     let file_size2 = record_batch_to_bytes(&batch2).len() as u64;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -1478,7 +1796,6 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
             .await?;
     }
 
-    let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     // Create a schema that includes the file path metadata column
@@ -1488,7 +1805,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
         StructField::nullable("value", DataType::STRING),
     ])?);
 
-    let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().with_schema(schema).build()?;
 
     let mut file_count = 0;
@@ -1520,7 +1837,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
         // Verify the file path column contains the expected file name
         let file_path_array = batch.column(1);
         let expected_file_name = expected_files[file_count];
-        let expected_path = format!("{}{}", location, expected_file_name);
+        let expected_path = format!("{table_root}{expected_file_name}");
 
         // The file path array should be a plain StringArray with the path repeated for each row.
         let string_array = file_path_array
@@ -1539,8 +1856,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
             string_array
                 .iter()
                 .all(|v| v == Some(expected_path.as_str())),
-            "All rows should contain file path '{}'",
-            expected_path
+            "All rows should contain file path '{expected_path}'"
         );
 
         file_count += 1;
@@ -1555,7 +1871,9 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
     // Prepare an in-memory table with some data
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -1571,7 +1889,6 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         )
         .await?;
 
-    let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     // Test that unsupported metadata columns fail with appropriate errors
@@ -1589,7 +1906,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
     ];
 
     for (column_name, metadata_spec, error_text) in test_cases {
-        let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+        let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
         let schema = Arc::new(StructType::try_new([
             StructField::nullable("id", DataType::INTEGER),
             StructField::create_metadata_column(column_name, metadata_spec),
@@ -1614,7 +1931,9 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
 async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
     add_commit(
+        table_root,
         storage.as_ref(),
         0,
         actions_to_string(vec![
@@ -1637,7 +1956,6 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
         )
         .await?;
 
-    let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     let invalid_files = [
@@ -1701,7 +2019,7 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
     for invalid_file in invalid_files.iter() {
         let invalid_path = Path::from(*invalid_file);
         storage.put(&invalid_path, vec![1u8].into()).await?;
-        let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+        let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
         ensure_segment_does_not_contain(&invalid_files, snapshot.log_segment());
         storage.delete(&invalid_path).await?;
     }
@@ -1711,8 +2029,347 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
         let invalid_path = Path::from(*invalid_file);
         storage.put(&invalid_path, vec![1u8].into()).await?;
     }
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
     ensure_segment_does_not_contain(&invalid_files, snapshot.log_segment());
 
     Ok(())
+}
+
+// Verifies data skipping works via stats_parsed across all checkpoint types.
+// All tables have writeStatsAsStruct=true, writeStatsAsJson=false (struct stats only),
+// schema (id: long, value: string), 5 rows (id 1-5), checkpoint at v5.
+// Predicate id > 3 skips files where max(id) <= 3, returning only rows 4 and 5.
+#[rstest::rstest]
+#[test]
+fn checkpoint_stats_skipping(
+    #[values(
+        "v1-single-part",
+        "v1-multi-part",
+        "v2-parquet-sidecars",
+        "v2-json-sidecars",
+        "v2-classic-parquet"
+    )]
+    checkpoint_type: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_path = format!("./tests/data/{checkpoint_type}-struct-stats-only/");
+    let expected = vec![
+        "+----+---------+",
+        "| id | value   |",
+        "+----+---------+",
+        "| 4  | value_4 |",
+        "| 5  | value_5 |",
+        "+----+---------+",
+    ];
+    let predicate = column_expr!("id").gt(Expr::literal(3i64));
+    read_table_data_str(&table_path, None, Some(predicate), expected)?;
+    Ok(())
+}
+
+// Multi-part V1 checkpoint with partitionValues_parsed on a partitioned table.
+// Schema: (id: long, value: string, part: int) partitioned by part.
+// Each commit inserts one row with part = i % 3 (parts 0, 1, 2).
+#[test]
+fn partition_values_parsed_skipping() -> Result<(), Box<dyn std::error::Error>> {
+    // Predicate part = 0 should skip partitions 1 and 2, returning rows with part=0.
+    // i % 3 == 0: i=3 -> (3, "value_3", 0)
+    let expected = vec![
+        "+----+---------+------+",
+        "| id | value   | part |",
+        "+----+---------+------+",
+        "| 3  | value_3 | 0    |",
+        "+----+---------+------+",
+    ];
+    let predicate = column_expr!("part").eq(Expr::literal(0i32));
+    read_table_data_str(
+        "./tests/data/v1-multi-part-partitioned-struct-stats-only/",
+        None,
+        Some(predicate),
+        expected,
+    )?;
+    Ok(())
+}
+
+// In-memory test with crafted truncated JSON stats. Three files:
+//   file 1: ts_col [1s, 2s]           -- max at ms boundary
+//   file 2: ts_col [3s, 4.000500s]    -- JSON max truncated to 4.000s
+//   file 3: ts_col [7s, 8s]           -- max at ms boundary
+//
+// Predicate `ts_col > 4_000_400us`:
+//   file 1: max=2s << adjusted predicate (3_999_401) -> pruned (skipping works)
+//   file 2: truncated max=4s > adjusted predicate (3_999_401) -> kept (truncation safe)
+//   file 3: max=8s >> adjusted predicate -> kept
+#[tokio::test]
+async fn timestamp_max_stat_truncation_does_not_over_prune(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ts_metadata = "{\
+        \"id\":\"test-ts-table\",\
+        \"format\":{\"provider\":\"parquet\",\"options\":{}},\
+        \"schemaString\":\"{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[\
+            {\\\"name\\\":\\\"ts_col\\\",\\\"type\\\":\\\"timestamp\\\",\\\"nullable\\\":true,\\\"metadata\\\":{}}\
+        ]}\",\
+        \"partitionColumns\":[],\
+        \"configuration\":{},\
+        \"createdTime\":1700000000000\
+    }";
+
+    let ts_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "ts_col",
+        delta_kernel::arrow::datatypes::DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ),
+        true,
+    )]));
+
+    // file1: max at ms boundary, will be pruned
+    let file1_stats = r#"{"numRecords":2,"nullCount":{"ts_col":0},"minValues":{"ts_col":"1970-01-01T00:00:01.000Z"},"maxValues":{"ts_col":"1970-01-01T00:00:02.000Z"}}"#;
+    // file2: max truncated from 4.000500s to 4.000s -- truncation adjustment must keep this
+    let file2_stats = r#"{"numRecords":2,"nullCount":{"ts_col":0},"minValues":{"ts_col":"1970-01-01T00:00:03.000Z"},"maxValues":{"ts_col":"1970-01-01T00:00:04.000Z"}}"#;
+    // file3: max clearly above predicate
+    let file3_stats = r#"{"numRecords":2,"nullCount":{"ts_col":0},"minValues":{"ts_col":"1970-01-01T00:00:07.000Z"},"maxValues":{"ts_col":"1970-01-01T00:00:08.000Z"}}"#;
+
+    let batch1 = RecordBatch::try_new(
+        ts_schema.clone(),
+        vec![Arc::new(
+            TimestampMicrosecondArray::from(vec![1_000_000i64, 2_000_000]).with_timezone("UTC"),
+        )],
+    )?;
+    let batch2 = RecordBatch::try_new(
+        ts_schema.clone(),
+        vec![Arc::new(
+            TimestampMicrosecondArray::from(vec![3_000_000i64, 4_000_500]).with_timezone("UTC"),
+        )],
+    )?;
+    let batch3 = RecordBatch::try_new(
+        ts_schema,
+        vec![Arc::new(
+            TimestampMicrosecondArray::from(vec![7_000_000i64, 8_000_000]).with_timezone("UTC"),
+        )],
+    )?;
+
+    let file1_bytes = record_batch_to_bytes(&batch1);
+    let file2_bytes = record_batch_to_bytes(&batch2);
+    let file3_bytes = record_batch_to_bytes(&batch3);
+
+    let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
+
+    let make_add = |name: &str, size: usize, stats: &str| -> String {
+        format!(
+            "{{\"add\":{{\"path\":\"{name}\",\"partitionValues\":{{}},\"size\":{size},\
+             \"modificationTime\":1700000000000,\"dataChange\":true,\
+             \"stats\":\"{stats_escaped}\"}}}}",
+            stats_escaped = stats.replace('"', "\\\""),
+        )
+    };
+
+    let commit0 = format!(
+        "{{\"protocol\":{{\"minReaderVersion\":1,\"minWriterVersion\":2}}}}\n\
+         {{\"metaData\":{ts_metadata}}}\n\
+         {}",
+        make_add("file1.parquet", file1_bytes.len(), file1_stats)
+    );
+    add_commit(table_root, storage.as_ref(), 0, commit0).await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        make_add("file2.parquet", file2_bytes.len(), file2_stats),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        2,
+        make_add("file3.parquet", file3_bytes.len(), file3_stats),
+    )
+    .await?;
+
+    storage
+        .put(&Path::from("file1.parquet"), file1_bytes.into())
+        .await?;
+    storage
+        .put(&Path::from("file2.parquet"), file2_bytes.into())
+        .await?;
+    storage
+        .put(&Path::from("file3.parquet"), file3_bytes.into())
+        .await?;
+
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+
+    let row_count = |predicate_us: i64| -> Result<usize, Box<dyn std::error::Error>> {
+        let predicate = Arc::new(Pred::gt(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(predicate_us)),
+        ));
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(predicate)
+            .build()?;
+        let batches = read_scan(&scan, engine.clone())?;
+        Ok(batches.iter().map(|b| b.num_rows()).sum())
+    };
+
+    // Mid-ms value (4.000400s): adjusted to 3_999_401
+    //   file1 max=2s < 3_999_401 -> pruned; file2+3 kept (4 rows)
+    assert_eq!(row_count(4_000_400)?, 4, "mid-ms: file2+file3 kept");
+
+    // Exact ms boundary (4.000000s = truncated max of file2): adjusted to 3_999_001
+    //   file1 max=2s < 3_999_001 -> pruned; file2 max=4s > 3_999_001 -> kept (4 rows)
+    assert_eq!(
+        row_count(4_000_000)?,
+        4,
+        "exact ms boundary: file2+file3 kept"
+    );
+
+    // 1us above ms boundary (4.000001s): adjusted to 3_999_002
+    //   file1 pruned; file2 max=4s > 3_999_002 -> kept (4 rows)
+    assert_eq!(row_count(4_000_001)?, 4, "1us above ms: file2+file3 kept");
+
+    // 998us above ms boundary (4.000998s): adjusted to 3_999_999
+    //   file2 max=4s > 3_999_999 -> kept (just not prunable)
+    assert_eq!(
+        row_count(4_000_998)?,
+        4,
+        "just not prunable: file2+file3 kept"
+    );
+
+    // 999us above ms boundary (4.000999s): adjusted to 4_000_000
+    //   file2 max=4s == 4_000_000 -> NOT strictly greater -> pruned (just prunable)
+    assert_eq!(row_count(4_000_999)?, 2, "just prunable: only file3 kept");
+
+    // Next ms boundary (4.001000s): adjusted to 4_000_001
+    //   file2 max=4s < 4_000_001 -> pruned (2 rows)
+    assert_eq!(
+        row_count(4_001_000)?,
+        2,
+        "next ms boundary: only file3 kept"
+    );
+
+    Ok(())
+}
+
+// End-to-end tests using a Spark-written Delta table with real truncated JSON stats.
+// Table has three files:
+//   file 1: id=[1,2], ts_col=[1s, 2s]           -- max at ms boundary
+//   file 2: id=[3,4], ts_col=[3s, 4.000500s]    -- max truncated to 4.000s in JSON stats
+//   file 3: id=[5,6], ts_col=[7s, 8s]           -- max at ms boundary
+//
+// Predicate value 4.000400s sits between the truncated max (4.000s) and actual max
+// (4.000500s) of file 2, exercising the truncation adjustment.
+
+// GT: file1 pruned (max=2s < adjusted 3.999401s), file2+3 kept
+#[test]
+fn timestamp_truncation_real_table_gt() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::gt(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "| 5  | 1970-01-01T00:00:07Z        |",
+            "| 6  | 1970-01-01T00:00:08Z        |",
+            "+----+-----------------------------+",
+        ],
+    )
+}
+
+// GE: file1 pruned (max=2s < adjusted 3.999401s), file2+3 kept
+#[test]
+fn timestamp_truncation_real_table_ge() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::ge(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "| 5  | 1970-01-01T00:00:07Z        |",
+            "| 6  | 1970-01-01T00:00:08Z        |",
+            "+----+-----------------------------+",
+        ],
+    )
+}
+
+// LT: file3 pruned (min=7s > 4.000400s), file1+2 kept
+#[test]
+fn timestamp_truncation_real_table_lt() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::lt(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 1  | 1970-01-01T00:00:01Z        |",
+            "| 2  | 1970-01-01T00:00:02Z        |",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "+----+-----------------------------+",
+        ],
+    )
+}
+
+// LE: file3 pruned (min=7s > 4.000400s), file1+2 kept
+#[test]
+fn timestamp_truncation_real_table_le() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::le(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 1  | 1970-01-01T00:00:01Z        |",
+            "| 2  | 1970-01-01T00:00:02Z        |",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "+----+-----------------------------+",
+        ],
+    )
+}
+
+// EQ: file1 pruned (max=2s < adjusted 3.999401s), file3 pruned (min=7s > 4.000400s).
+// Only file2 kept (ids 3,4).
+#[test]
+fn timestamp_truncation_real_table_eq() -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str(
+        "./tests/data/timestamp-truncation-stats",
+        None,
+        Some(Pred::eq(
+            column_expr!("ts_col"),
+            Expr::literal(Scalar::Timestamp(4_000_400)),
+        )),
+        vec![
+            "+----+-----------------------------+",
+            "| id | ts_col                      |",
+            "+----+-----------------------------+",
+            "| 3  | 1970-01-01T00:00:03Z        |",
+            "| 4  | 1970-01-01T00:00:04.000500Z |",
+            "+----+-----------------------------+",
+        ],
+    )
 }

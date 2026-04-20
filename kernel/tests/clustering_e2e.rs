@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{DataType, StructField, StructType};
@@ -15,7 +16,6 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use rstest::rstest;
-
 use test_utils::{
     generate_batch, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table, IntoArray,
 };
@@ -34,7 +34,7 @@ async fn test_clustered_table_write_and_checkpoint(
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = Arc::new(
         StructType::try_new(vec![
-            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("id", DataType::INTEGER, true),
             StructField::new("name", DataType::STRING, true),
             StructField::new("city", DataType::STRING, true),
         ])
@@ -137,4 +137,77 @@ async fn test_clustered_table_write_and_checkpoint(
     }
 
     Ok(())
+}
+
+/// Regression test: writing a batch where a clustering column has ALL null values should succeed.
+///
+/// `collect_stats` emits null-valued min/max entries for all-null columns, allowing
+/// `StatsVerifier` to find the field and confirm `nullCount == numRecords`. The JSON serializer
+/// omits null fields on disk, matching Spark's `ignoreNullFields` behavior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_clustered_table_write_all_null_clustering_column() {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
+    let schema = Arc::new(
+        StructType::try_new(vec![
+            StructField::new("category", DataType::STRING, true),
+            StructField::new("region_id", DataType::INTEGER, true),
+        ])
+        .unwrap(),
+    );
+
+    // Create table clustered on "category" and "region_id"
+    let create_result = create_table(&table_path, schema, "Test/1.0")
+        .with_data_layout(DataLayout::Clustered {
+            columns: vec![
+                ColumnName::new(["category"]),
+                ColumnName::new(["region_id"]),
+            ],
+        })
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(engine.as_ref())
+        .unwrap();
+
+    let snapshot = create_result
+        .unwrap_committed()
+        .post_commit_snapshot()
+        .expect("post-commit snapshot should exist")
+        .clone();
+
+    // Write a batch where region_id is ALL nulls.
+    // This should succeed -- all-null clustering columns are valid.
+    let all_null_region: ArrayRef = Arc::new(Int32Array::from(vec![None, None, None]));
+    let batch = generate_batch(vec![
+        ("category", vec!["a", "b", "c"].into_array()),
+        ("region_id", all_null_region),
+    ])
+    .unwrap();
+
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.version(), 1);
+
+    // Verify data is readable
+    let scan = snapshot.clone().scan_builder().build().unwrap();
+    let batches = read_scan(&scan, engine.clone()).unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3);
+
+    // Verify stats: region_id should have nullCount=3. The JSON serializer omits null
+    // fields (matching Spark's ignoreNullFields), so minValues/maxValues should not
+    // contain region_id in the serialized JSON stats.
+    let add_infos = read_add_infos(&snapshot, engine.as_ref()).unwrap();
+    assert_eq!(add_infos.len(), 1);
+    let stats = add_infos[0].stats.as_ref().expect("should have stats");
+    assert_eq!(stats["numRecords"], 3);
+    assert_eq!(stats["nullCount"]["region_id"], 3);
+    assert!(
+        stats["minValues"].get("region_id").is_none(),
+        "JSON minValues should omit region_id when all values are null"
+    );
+    assert!(
+        stats["maxValues"].get("region_id").is_none(),
+        "JSON maxValues should omit region_id when all values are null"
+    );
 }

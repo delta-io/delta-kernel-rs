@@ -3,9 +3,9 @@
 /// Not intended for use by normal code.
 use std::collections::{HashMap, HashSet};
 
-use crate::schema::{ArrayType, DataType, MapType, StructField, ToSchema};
-
 use delta_kernel_derive::internal_api;
+
+use crate::schema::{ArrayType, DataType, MapType, StructField, ToSchema};
 
 /// Converts a type to a [`DataType`]. Implemented for the primitive types and automatically derived
 /// for all types that implement [`ToSchema`].
@@ -121,5 +121,12 @@ pub(crate) trait GetNullableContainerStructField {
 impl<T: ToNullableContainerType> GetNullableContainerStructField for T {
     fn get_nullable_container_struct_field(name: impl Into<String>) -> StructField {
         StructField::not_null(name, T::to_nullable_container_type())
+    }
+}
+
+// Optional container types produce nullable fields with nullable values.
+impl<T: ToNullableContainerType> GetNullableContainerStructField for Option<T> {
+    fn get_nullable_container_struct_field(name: impl Into<String>) -> StructField {
+        StructField::nullable(name, T::to_nullable_container_type())
     }
 }

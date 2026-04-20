@@ -52,14 +52,15 @@ pub trait DeletionVector: Sized {
     /// Serialize the deletion vector into bytes.
     ///
     /// This serializes the deletion vector in the format expected by the Delta Lake protocol.
-    /// it may be overridden for more efficient serialization if the implementation already has the data in a suitable format.
-    /// But generally, only do this if you fully understand the the format requirements.
+    /// it may be overridden for more efficient serialization if the implementation already has the
+    /// data in a suitable format. But generally, only do this if you fully understand the the
+    /// format requirements.
     fn serialize(self) -> DeltaResult<Bytes> {
         let treemap: RoaringTreemap = self.into_iter().collect();
         let mut serialized = Vec::new();
         treemap
             .serialize_into(&mut serialized)
-            .map_err(|e| Error::generic(format!("Failed to serialize deletion vector: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to serialize deletion vector: {e}")))?;
         Ok(Bytes::from(serialized))
     }
 }
@@ -85,7 +86,8 @@ pub struct DeletionVectorWriteResult {
 impl DeletionVectorWriteResult {
     /// Convert the write result to a deletion vector descriptor.
     ///
-    /// As an implementation detail, this method will always use the persisted relative storage type.
+    /// As an implementation detail, this method will always use the persisted relative storage
+    /// type.
     ///
     /// # Arguments
     ///
@@ -162,7 +164,7 @@ impl DeletionVector for KernelDeletionVector {
         let mut serialized = Vec::new();
         self.dv
             .serialize_into(&mut serialized)
-            .map_err(|e| Error::generic(format!("Failed to serialize deletion vector: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to serialize deletion vector: {e}")))?;
         Ok(Bytes::from(serialized))
     }
 
@@ -267,7 +269,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
             // Write header.
             self.writer
                 .write_all(&[1u8])
-                .map_err(|e| Error::generic(format!("Failed to write version byte: {}", e)))?;
+                .map_err(|e| Error::generic(format!("Failed to write version byte: {e}")))?;
             self.current_offset = 1;
         }
 
@@ -299,19 +301,19 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         let size_bytes = (dv_size as u32).to_be_bytes();
         self.writer
             .write_all(&size_bytes)
-            .map_err(|e| Error::generic(format!("Failed to write size: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to write size: {e}")))?;
 
         // Write magic number (little-endian)
         // This is the RoaringBitmapArray format magic
         let magic: u32 = 1681511377;
         self.writer
             .write_all(&magic.to_le_bytes())
-            .map_err(|e| Error::generic(format!("Failed to write magic: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to write magic: {e}")))?;
 
         // Write the serialized treemap
         self.writer
             .write_all(&serialized)
-            .map_err(|e| Error::generic(format!("Failed to write deletion vector data: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to write deletion vector data: {e}")))?;
 
         // Calculate and write CRC32 checksum (big-endian)
         // The CRC must include both the magic and the serialized data
@@ -322,7 +324,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         let checksum = digest.finalize();
         self.writer
             .write_all(&checksum.to_be_bytes())
-            .map_err(|e| Error::generic(format!("Failed to write CRC32 checksum: {}", e)))?;
+            .map_err(|e| Error::generic(format!("Failed to write CRC32 checksum: {e}")))?;
 
         // Update offset for next write (size_prefix + magic + data + crc)
         let bytes_written = 4 + dv_size + 4; // size + (magic + data) + crc
@@ -361,14 +363,15 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
 
         self.writer
             .flush()
-            .map_err(|e| Error::generic(format!("Failed to flush writer: {}", e)))
+            .map_err(|e| Error::generic(format!("Failed to flush writer: {e}")))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Cursor;
+
+    use super::*;
 
     #[test]
     fn test_kernel_deletion_vector_new() {
@@ -433,10 +436,12 @@ mod tests {
 
     #[test]
     fn test_streaming_writer_empty_dv() {
-        use crate::Engine;
         use std::fs::File;
+
         use tempfile::tempdir;
         use url::Url;
+
+        use crate::Engine;
 
         // Create a temporary directory and file
         let temp_dir = tempdir().unwrap();
@@ -567,10 +572,12 @@ mod tests {
 
     #[test]
     fn test_array_based_deletion_vector() {
-        use crate::Engine;
         use std::fs::File;
+
         use tempfile::tempdir;
         use url::Url;
+
+        use crate::Engine;
 
         // Custom DeletionVector implementation that wraps an array of u64
         struct ArrayDeletionVector {
@@ -722,10 +729,12 @@ mod tests {
 
     #[test]
     fn test_multiple_deletion_vectors_roundtrip_with_descriptor() {
-        use crate::Engine;
         use std::fs::File;
+
         use tempfile::tempdir;
         use url::Url;
+
+        use crate::Engine;
 
         // Create a temporary directory and file
         let temp_dir = tempdir().unwrap();
@@ -770,8 +779,8 @@ mod tests {
 
         // Now read back each deletion vector using the descriptors
         for (write_result, expected_indexes) in descriptors.iter().zip(&test_data) {
-            // Create a new DeletionVectorPath for each DV (they would have different UUIDs normally,
-            // but for this test we're writing multiple to the same file)
+            // Create a new DeletionVectorPath for each DV (they would have different UUIDs
+            // normally, but for this test we're writing multiple to the same file)
             let descriptor = write_result.clone().to_descriptor(&dv_path);
 
             // Read the deletion vector back using the descriptor
@@ -781,9 +790,7 @@ mod tests {
             assert_eq!(
                 treemap,
                 expected_indexes.iter().collect::<RoaringTreemap>(),
-                "read {:?} != expected {:?}",
-                treemap,
-                expected_indexes
+                "read {treemap:?} != expected {expected_indexes:?}"
             );
         }
     }

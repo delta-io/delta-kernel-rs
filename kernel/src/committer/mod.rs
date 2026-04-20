@@ -29,7 +29,8 @@ mod commit_types;
 mod filesystem;
 mod publish_types;
 
-pub use commit_types::{CommitMetadata, CommitResponse};
+pub(crate) use commit_types::CommitProtocolMetadata;
+pub use commit_types::{CommitMetadata, CommitResponse, CommitType};
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
@@ -56,7 +57,8 @@ pub trait Committer: Send {
     /// Commits actions to the table at the version specified in [`CommitMetadata`].
     ///
     /// Implementations must ensure that actions are committed atomically and either:
-    /// 1. Persisted directly to object storage as published deltas (for filesystem-based tables), or
+    /// 1. Persisted directly to object storage as published deltas (for filesystem-based tables),
+    ///    or
     /// 2. Persisted as per the managing catalog's semantics (for catalog-managed tables)
     fn commit(
         &self,
@@ -81,8 +83,8 @@ pub trait Committer: Send {
     /// # Benefits
     ///
     /// - Reduces the number of commits the catalog needs to store internally and serve to readers
-    /// - Enables table maintenance operations that must operate on published versions only, such
-    ///   as checkpointing and log compaction
+    /// - Enables table maintenance operations that must operate on published versions only, such as
+    ///   checkpointing and log compaction
     ///
     /// # Requirements
     ///

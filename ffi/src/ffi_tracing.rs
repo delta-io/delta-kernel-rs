@@ -1,17 +1,16 @@
 //! FFI functions to allow engines to receive log and tracing events from kernel
 
-use std::sync::LazyLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::{fmt, io};
 
 use delta_kernel::{DeltaResult, Error};
-use tracing::{error, warn};
-use tracing::{
-    field::{Field as TracingField, Visit},
-    Event as TracingEvent, Subscriber,
-};
+use tracing::field::{Field as TracingField, Visit};
+use tracing::{error, warn, Event as TracingEvent, Subscriber};
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::{filter::LevelFilter, layer::Context, registry::LookupSpan, Layer};
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::Layer;
 
 use crate::{kernel_string_slice, KernelStringSlice};
 
@@ -70,15 +69,16 @@ pub struct Event {
     target: KernelStringSlice,
     /// source file line number where the event occurred, or 0 (zero) if unknown
     line: u32,
-    /// file where the event occurred. If unknown the slice `ptr` will be null and the len will be 0
+    /// file where the event occurred. If unknown the slice `ptr` will be null and the len will be
+    /// 0
     file: KernelStringSlice,
 }
 
 pub type TracingEventFn = extern "C" fn(event: Event);
 
 /// Enable getting called back for tracing (logging) events in the kernel. `max_level` specifies
-/// that only events `<=` to the specified level should be reported.  More verbose Levels are "greater
-/// than" less verbose ones. So Level::ERROR is the lowest, and Level::TRACE the highest.
+/// that only events `<=` to the specified level should be reported.  More verbose Levels are
+/// "greater than" less verbose ones. So Level::ERROR is the lowest, and Level::TRACE the highest.
 ///
 /// Note that setting up such a call back can only be done ONCE. Calling any of
 /// `enable_event_tracing`, `enable_log_line_tracing`, or `enable_formatted_log_line_tracing` more
@@ -128,7 +128,8 @@ pub enum LogLineFormat {
     /// structured logs are consumed as JSON by analysis and viewing tools. The JSON output is not
     /// optimized for human readability.
     /// Example:
-    /// `{"timestamp":"2022-02-15T18:47:10.821315Z","level":"INFO","fields":{"message":"preparing to shave yaks","number_of_yaks":3},"target":"fmt_json"}`
+    /// `{"timestamp":"2022-02-15T18:47:10.821315Z","level":"INFO","fields":{"message":"preparing
+    /// to shave yaks","number_of_yaks":3},"target":"fmt_json"}`
     JSON,
 }
 
@@ -380,7 +381,8 @@ fn create_event_dispatch(
     tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>,
     Arc<Mutex<TracingEventFn>>,
 ) {
-    use tracing_subscriber::{layer::SubscriberExt, registry::Registry};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::registry::Registry;
 
     let callback_arc = Arc::new(Mutex::new(callback));
     let (filter_layer, reload_handle) =
@@ -485,7 +487,8 @@ fn create_log_line_dispatch(
     tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>,
     Arc<Mutex<TracingLogLineFn>>,
 ) {
-    use tracing_subscriber::{layer::SubscriberExt, registry::Registry};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::registry::Registry;
 
     let buffer = Arc::new(Mutex::new(vec![]));
     let writer = BufferedMessageWriter {
@@ -561,14 +564,11 @@ fn setup_log_line_subscriber(
 mod tests {
     use std::sync::LazyLock;
 
-    use tracing::debug;
-    use tracing::info;
-    use tracing::trace;
+    use tracing::{debug, info, trace};
     use tracing_subscriber::fmt::time::FormatTime;
 
-    use crate::TryFromStringSlice;
-
     use super::*;
+    use crate::TryFromStringSlice;
 
     // Because we have to access a global messages buffer, we have to force tests to run one at a
     // time
@@ -590,7 +590,8 @@ mod tests {
         }
     }
 
-    // Note: record callbacks must be extern "C". Thus we cannot construct test callback closures in runtime.
+    // Note: record callbacks must be extern "C". Thus we cannot construct test callback closures in
+    // runtime.
     extern "C" fn record_callback_with_filter_1(line: KernelStringSlice) {
         record_callback_with_filter(line, vec!["Testing 1\n", "Another line\n"])
     }
@@ -603,10 +604,14 @@ mod tests {
         *MESSAGES.lock().unwrap() = Some(vec![]);
     }
 
-    // get the string that we should ensure is in log messages for the time. If current time seconds
-    // is >= 50, return None because the minute might roll over before we actually log which would
-    // invalidate this check
-    fn get_time_test_str() -> Option<String> {
+    /// Format the current time as a string using the same formatter that tracing uses, trimmed
+    /// to hours, minutes, and seconds (e.g. `"2026-03-10T14:32:45"`). This is used by tests to
+    /// verify that log output contains a reasonable timestamp.
+    ///
+    /// Must be called both before and after logging to bracket the log's timestamp -- a context
+    /// switch between capturing and logging can cross a second boundary, so the test asserts
+    /// that at least one of the two captured timestamps appears in the output.
+    fn get_time_test_str() -> String {
         #[derive(Default)]
         struct W {
             s: String,
@@ -623,21 +628,22 @@ mod tests {
         let now = tracing_subscriber::fmt::time::SystemTime;
         now.format_time(&mut writer).unwrap();
         let tstr = w.s;
-        if tstr.len() < 19 {
-            return None;
-        }
-        let secs: u32 = tstr[17..19].parse().expect("Failed to parse secs");
-        if secs >= 50 {
-            // risk of roll-over, don't check
-            return None;
-        }
-        // Trim to just hours and minutes
-        Some(tstr[..19].to_string())
+        assert!(tstr.len() >= 19, "Unexpected time format: {tstr:?}");
+        // Trim to hours, minutes, and seconds
+        tstr[..19].to_string()
     }
 
+    /// Check that logged messages match the expected lines, level, and timestamp.
+    ///
+    /// Timestamps are captured before and after logging to handle second-boundary races: a
+    /// context switch between capturing the time and emitting the log line can cause the
+    /// seconds to differ. By bracketing with a range check (`time_before <= log_time <=
+    /// time_after`), we tolerate any amount of delay between capture and log emission. This
+    /// works because ISO 8601 timestamps sort lexicographically.
     fn check_messages(
         expected_lines: Vec<&str>,
-        expected_time_str: Option<String>,
+        time_before: &str,
+        time_after: &str,
         expected_level_str: &str,
     ) {
         let lock = MESSAGES.lock().unwrap();
@@ -649,10 +655,31 @@ mod tests {
             assert!(got.ends_with(expect));
             assert!(got.contains(expected_level_str));
             assert!(got.contains("delta_kernel_ffi::ffi_tracing::tests"));
-            if let Some(ref tstr) = expected_time_str {
-                assert!(got.contains(tstr));
-            }
+            assert_timestamp_in_range(got, time_before, time_after);
         }
+    }
+
+    /// Assert that the log line contains a timestamp within [time_before, time_after].
+    ///
+    /// Log lines may contain ANSI escape codes before the timestamp, so we locate the
+    /// timestamp by searching for the `time_before` prefix (up to the seconds). Once found,
+    /// we extract the full timestamp and do a lexicographic range check. ISO 8601 timestamps
+    /// are fixed-width and sort lexicographically.
+    fn assert_timestamp_in_range(log_line: &str, time_before: &str, time_after: &str) {
+        let len = time_before.len();
+        // Search for the date+hour+minute prefix (first 16 chars, e.g. "2026-03-10T14:32")
+        // to locate the timestamp start. We use 16 chars (excluding seconds) because the
+        // seconds may differ between time_before and the log line.
+        let prefix = &time_before[..16];
+        let ts_start = log_line
+            .find(prefix)
+            .unwrap_or_else(|| panic!("No timestamp found in log line: {log_line:?}"));
+        let log_time = &log_line[ts_start..ts_start + len];
+        assert!(
+            log_time >= time_before && log_time <= time_after,
+            "Timestamp {log_time:?} not in expected range [{time_before:?}, {time_after:?}], \
+             full log line: {log_line:?}"
+        );
     }
 
     // IMPORTANT: This is the only test that should call the actual `extern "C"` function, as we can
@@ -674,13 +701,14 @@ mod tests {
         ];
         // We registered record_callback_with_filter_1, which filters only the first two lines.
         let expected_lines = vec!["Testing 1\n", "Another line\n"];
-        let test_time_str = get_time_test_str();
+        let time_before = get_time_test_str();
         for line in &lines {
             // Remove final newline which will be added back by logging
             info!("{}", &line[..(line.len() - 1)]);
         }
+        let time_after = get_time_test_str();
 
-        check_messages(expected_lines, test_time_str, "INFO");
+        check_messages(expected_lines, &time_before, &time_after, "INFO");
         setup_messages();
 
         // Ensure we can setup again with a new callback and a new tracing level
@@ -690,13 +718,14 @@ mod tests {
         // Ensure both callback and tracing level are reloaded.
         // We registered record_callback_with_filter_2, which filters the other logging lines.
         let expected_lines = vec!["Testing 2\n", "Yet another line\n"];
-        let test_time_str = get_time_test_str();
+        let time_before = get_time_test_str();
         for line in &lines {
             debug!("{}", &line[..(line.len() - 1)]);
             // Trace must not be visible in messages, because we changed level to debug
             trace!("{}", &line[..(line.len() - 1)]);
         }
-        check_messages(expected_lines, test_time_str, "DEBUG");
+        let time_after = get_time_test_str();
+        check_messages(expected_lines, &time_before, &time_after, "DEBUG");
     }
 
     #[test]
@@ -714,11 +743,12 @@ mod tests {
         );
         tracing_core::dispatcher::with_default(&dispatch, || {
             let lines = ["Testing 1\n", "Another line\n"];
-            let test_time_str = get_time_test_str();
+            let time_before = get_time_test_str();
             for line in lines {
                 // remove final newline which will be added back by logging
                 info!("{}", &line[..(line.len() - 1)]);
             }
+            let time_after = get_time_test_str();
             let lock = MESSAGES.lock().unwrap();
             if let Some(ref msgs) = *lock {
                 assert_eq!(msgs.len(), lines.len());
@@ -726,9 +756,7 @@ mod tests {
                     assert!(got.ends_with(expect));
                     assert!(!got.contains("INFO"));
                     assert!(!got.contains("delta_kernel_ffi::ffi_tracing::tests"));
-                    if let Some(ref tstr) = test_time_str {
-                        assert!(got.contains(tstr));
-                    }
+                    assert_timestamp_in_range(got, &time_before, &time_after);
                 }
             } else {
                 panic!("Messages wasn't Some");
@@ -744,7 +772,7 @@ mod tests {
     fn events_to_string(events: Vec<(String, tracing::Level)>) -> String {
         let events_str = events
             .iter()
-            .map(|(s, lvl)| format!("{}:{}", s, lvl))
+            .map(|(s, lvl)| format!("{s}:{lvl}"))
             .collect::<Vec<_>>()
             .join(", ");
         events_str
@@ -767,7 +795,7 @@ mod tests {
 
         // file path will use \ on windows
         use std::path::MAIN_SEPARATOR;
-        let expected_file = format!("ffi{}src{}ffi_tracing.rs", MAIN_SEPARATOR, MAIN_SEPARATOR);
+        let expected_file = format!("ffi{MAIN_SEPARATOR}src{MAIN_SEPARATOR}ffi_tracing.rs");
 
         let ok = target == "delta_kernel_ffi::ffi_tracing::tests"
             && file == expected_file
@@ -825,7 +853,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // We cannot run this test if test_enable_log_line_tracing was run before - see comment there, however this test works if run individually.
+    #[ignore] // We cannot run this test if test_enable_log_line_tracing was run before - see comment there,
+              // however this test works if run individually.
     fn test_enable_event_tracing() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_events();

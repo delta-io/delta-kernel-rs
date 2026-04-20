@@ -33,8 +33,19 @@ the caller's memory space.
 ## Read Flow
 
 ```
-get_default_engine() -> snapshot() -> scan() -> scan_metadata() -> read + transform
+get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build() -> scan() -> scan_metadata() -> read + transform
 ```
+
+Snapshot builder API (`ffi/src/lib.rs`):
+- `get_snapshot_builder(path, engine)` -- fresh snapshot from a table path
+- `get_snapshot_builder_from(old_snapshot, engine)` -- incremental update reusing an existing snapshot (avoids re-reading the log)
+- `snapshot_builder_set_version(builder, version)` -- optional: pin to a specific version
+- `snapshot_builder_set_log_tail(builder, log_tail)` -- optional: set log tail (for catalog-managed tables)
+- `snapshot_builder_set_max_catalog_version(builder, version)` -- optional: set max catalog version (for catalog-managed tables)
+- `snapshot_builder_build(builder)` -- consume the builder and produce a `SharedSnapshot`
+- `free_snapshot_builder(builder)` -- discard without building (e.g. on error paths)
+
+The caller owns the returned builder handle and must call either `snapshot_builder_build` or `free_snapshot_builder`.
 
 ## Write Flow
 
@@ -49,4 +60,10 @@ cargo build -p delta_kernel_ffi --release
 # Headers written to target/ffi-headers/
 ```
 
-Feature flags: `default-engine-rustls` (default), `default-engine-native-tls`, `catalog-managed`, `tracing`.
+Feature flags:
+- `default-engine-rustls` (default)
+- `default-engine-native-tls`
+- `arrow` (default; currently maps to `arrow-58`)
+- `arrow-58`, `arrow-57`
+- `delta-kernel-unity-catalog`
+- `tracing`

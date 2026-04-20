@@ -1,5 +1,6 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -12,18 +13,18 @@ pub use self::column_names::{
     ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
-use self::transforms::{ExpressionTransform as _, GetColumnReferences};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
 use crate::schema::SchemaRef;
+use crate::transforms::ExpressionTransform;
 use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
+pub(crate) use literal_expression_transform::literal_expression_transform;
 mod scalars;
-pub mod transforms;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
@@ -284,7 +285,10 @@ where
 }
 
 impl OpaquePredicate {
-    fn new(op: OpaquePredicateOpRef, exprs: impl IntoIterator<Item = Expression>) -> Self {
+    pub(crate) fn new(
+        op: OpaquePredicateOpRef,
+        exprs: impl IntoIterator<Item = Expression>,
+    ) -> Self {
         let exprs = exprs.into_iter().collect();
         Self { op, exprs }
     }
@@ -303,7 +307,10 @@ pub struct OpaqueExpression {
 }
 
 impl OpaqueExpression {
-    fn new(op: OpaqueExpressionOpRef, exprs: impl IntoIterator<Item = Expression>) -> Self {
+    pub(crate) fn new(
+        op: OpaqueExpressionOpRef,
+        exprs: impl IntoIterator<Item = Expression>,
+    ) -> Self {
         let exprs = exprs.into_iter().collect();
         Self { op, exprs }
     }
@@ -447,7 +454,8 @@ pub enum Expression {
     /// A predicate treated as a boolean expression
     Predicate(Box<Predicate>), // should this be Arc?
     /// A struct computed from a Vec of expressions.
-    /// The optional nullability predicate, if provided and evaluates to false/null, makes the entire struct null.
+    /// The optional nullability predicate, if provided and evaluates to false/null, makes the
+    /// entire struct null.
     Struct(Vec<ExpressionRef>, Option<ExpressionRef>),
     /// A sparse transformation of a struct schema. More efficient than `Struct` for wide schemas
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
@@ -507,13 +515,13 @@ pub enum Predicate {
     #[serde(deserialize_with = "fail_deserialize_opaque_predicate")]
     Opaque(OpaquePredicate),
     /// An unknown predicate (i.e. one that neither kernel nor engine attempts to evaluate). For
-    /// data skipping purposes, kernel treats unknown predicates as if they were literal NULL values
-    /// (which may disable skipping if it "poisons" the predicate), but engines MUST NOT attempt to
-    /// interpret them as NULL when evaluating query filters because it could produce incorrect
-    /// results. For example, converting `WHERE <fancy-udf-invocation>` to `WHERE NULL` is
-    /// equivalent to `WHERE FALSE` and would filter out all rows -- almost certainly NOT what the
-    /// query author intended. Use `Predicate::Opaque` for predicates kernel doesn't understand
-    /// but which engine can still evaluate.
+    /// data skipping purposes, kernel treats unknown predicates as if they were literal NULL
+    /// values (which may disable skipping if it "poisons" the predicate), but engines MUST NOT
+    /// attempt to interpret them as NULL when evaluating query filters because it could
+    /// produce incorrect results. For example, converting `WHERE <fancy-udf-invocation>` to
+    /// `WHERE NULL` is equivalent to `WHERE FALSE` and would filter out all rows -- almost
+    /// certainly NOT what the query author intended. Use `Predicate::Opaque` for predicates
+    /// kernel doesn't understand but which engine can still evaluate.
     Unknown(String),
 }
 
@@ -543,21 +551,21 @@ impl JunctionPredicateOp {
 }
 
 impl UnaryExpression {
-    fn new(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
+    pub(crate) fn new(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
         Self { op, expr }
     }
 }
 
 impl UnaryPredicate {
-    fn new(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
+    pub(crate) fn new(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
         Self { op, expr }
     }
 }
 
 impl BinaryExpression {
-    fn new(
+    pub(crate) fn new(
         op: BinaryExpressionOp,
         left: impl Into<Expression>,
         right: impl Into<Expression>,
@@ -569,7 +577,7 @@ impl BinaryExpression {
 }
 
 impl BinaryPredicate {
-    fn new(
+    pub(crate) fn new(
         op: BinaryPredicateOp,
         left: impl Into<Expression>,
         right: impl Into<Expression>,
@@ -581,7 +589,7 @@ impl BinaryPredicate {
 }
 
 impl VariadicExpression {
-    fn new(
+    pub(crate) fn new(
         op: VariadicExpressionOp,
         exprs: impl IntoIterator<Item = impl Into<Expression>>,
     ) -> Self {
@@ -591,7 +599,7 @@ impl VariadicExpression {
 }
 
 impl ParseJsonExpression {
-    fn new(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
+    pub(crate) fn new(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self {
             json_expr: Box::new(json_expr.into()),
             output_schema,
@@ -617,7 +625,7 @@ pub struct MapToStructExpression {
 }
 
 impl MapToStructExpression {
-    fn new(map_expr: impl Into<Expression>) -> Self {
+    pub(crate) fn new(map_expr: impl Into<Expression>) -> Self {
         Self {
             map_expr: Box::new(map_expr.into()),
         }
@@ -625,7 +633,7 @@ impl MapToStructExpression {
 }
 
 impl JunctionPredicate {
-    fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
+    pub(crate) fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
         Self { op, preds }
     }
 }
@@ -635,7 +643,7 @@ impl Expression {
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
         let _ = references.transform_expr(self);
-        references.into_inner()
+        references.0
     }
 
     /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
@@ -800,7 +808,7 @@ impl Predicate {
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
         let _ = references.transform_pred(self);
-        references.into_inner()
+        references.0
     }
 
     /// Creates a new boolean column reference. See also [`Expression::column`].
@@ -889,12 +897,14 @@ impl Predicate {
         Self::or_from([a.into(), b.into()])
     }
 
-    /// Creates a new predicate AND(preds...)
+    /// Creates a new predicate AND(preds...). See [`Self::junction`] for normalization of
+    /// empty and single-element inputs.
     pub fn and_from(preds: impl IntoIterator<Item = Self>) -> Self {
         Self::junction(JunctionPredicateOp::And, preds)
     }
 
-    /// Creates a new predicate OR(preds...)
+    /// Creates a new predicate OR(preds...). See [`Self::junction`] for normalization of
+    /// empty and single-element inputs.
     pub fn or_from(preds: impl IntoIterator<Item = Self>) -> Self {
         Self::junction(JunctionPredicateOp::Or, preds)
     }
@@ -918,10 +928,24 @@ impl Predicate {
         })
     }
 
-    /// Creates a new junction predicate OP(preds...)
+    /// Creates a new junction predicate OP(preds...). Normalizes degenerate cases:
+    ///
+    /// - Empty junction returns the identity element (the value that has no effect when combined
+    ///   with other predicates under the same operator):
+    ///   - `AND()` -> `true`, because `true AND p` == `p` for any predicate `p`.
+    ///   - `OR()` -> `false`, because `false OR p` == `p` for any predicate `p`.
+    /// - Single-element junction unwraps the element: `AND(p)` / `OR(p)` -> `p`.
     pub fn junction(op: JunctionPredicateOp, preds: impl IntoIterator<Item = Self>) -> Self {
-        let preds = preds.into_iter().collect();
-        Self::Junction(JunctionPredicate { op, preds })
+        let mut preds: Vec<_> = preds.into_iter().collect();
+        match preds.len() {
+            0 => match op {
+                JunctionPredicateOp::And => Self::literal(true),
+                JunctionPredicateOp::Or => Self::literal(false),
+            },
+            // A junction of one predicate is just that predicate.
+            1 => preds.remove(0),
+            _ => Self::Junction(JunctionPredicate { op, preds }),
+        }
     }
 
     /// Creates a new opaque predicate
@@ -1146,6 +1170,17 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
     }
 }
 
+/// Retrieves the set of column names referenced by an expression.
+#[derive(Default)]
+struct GetColumnReferences<'a>(HashSet<&'a ColumnName>);
+
+impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        self.0.insert(name);
+        Some(Cow::Borrowed(name))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
@@ -1230,6 +1265,7 @@ mod tests {
     mod serde_tests {
         use std::sync::Arc;
 
+        use super::assert_roundtrip;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
             column_expr, column_name, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
@@ -1237,8 +1273,6 @@ mod tests {
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::utils::test_utils::assert_result_error_with_message;
-
-        use super::assert_roundtrip;
 
         // ==================== Expression::Literal Tests ====================
 
@@ -1684,5 +1718,40 @@ mod tests {
             let result = serde_json::to_string(&pred);
             assert_result_error_with_message(result, "Cannot serialize an Opaque Predicate");
         }
+    }
+
+    #[test]
+    fn single_element_and_from_returns_unwrapped_predicate() {
+        let inner = Pred::gt(column_expr!("x"), Expr::literal(0));
+        let result = Pred::and_from([inner.clone()]);
+        assert_eq!(result, inner);
+    }
+
+    #[test]
+    fn single_element_or_from_returns_unwrapped_predicate() {
+        let inner = Pred::gt(column_expr!("x"), Expr::literal(0));
+        let result = Pred::or_from([inner.clone()]);
+        assert_eq!(result, inner);
+    }
+
+    #[test]
+    fn multi_element_and_from_returns_junction() {
+        let p1 = Pred::gt(column_expr!("x"), Expr::literal(0));
+        let p2 = Pred::lt(column_expr!("x"), Expr::literal(100));
+        let result = Pred::and_from([p1.clone(), p2.clone()]);
+        assert!(matches!(result, Pred::Junction(ref j) if j.preds.len() == 2));
+        assert_eq!(result, Pred::and(p1, p2));
+    }
+
+    #[test]
+    fn empty_and_from_returns_identity_literal() {
+        let result = Pred::and_from(std::iter::empty());
+        assert_eq!(result, Pred::literal(true));
+    }
+
+    #[test]
+    fn empty_or_from_returns_identity_literal() {
+        let result = Pred::or_from(std::iter::empty());
+        assert_eq!(result, Pred::literal(false));
     }
 }

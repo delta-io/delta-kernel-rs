@@ -3,41 +3,48 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::debug;
+use tracing::{debug, info};
 use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
-use self::log_replay::get_scan_metadata_transform_expr;
+use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{get_commit_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
-use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
+use crate::kernel_predicates::{
+    DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
+};
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
+use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
-use crate::scan::log_replay::ScanLogReplayProcessor;
-use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
+use crate::scan::log_replay::{
+    ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
+    DEFAULT_ROW_COMMIT_VERSION_NAME,
+};
+use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-    StructType, ToSchema as _,
+    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
+    ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
+use crate::transforms::{ExpressionTransform, SchemaTransform};
+use crate::utils::IteratorExt;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
-
-use self::log_replay::scan_action_iter;
 
 pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
+pub(crate) mod metrics;
 pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;
@@ -161,9 +168,9 @@ impl ScanBuilder {
     /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
     /// have been filtered out but were kept).
     ///
-    /// This method can be combined with [`include_all_stats_columns`]. When both are used, the kernel
-    /// performs data skipping internally using the predicate AND outputs parsed statistics to the
-    /// engine via the `stats_parsed` column in scan metadata.
+    /// This method can be combined with [`include_all_stats_columns`]. When both are used, the
+    /// kernel performs data skipping internally using the predicate AND outputs parsed
+    /// statistics to the engine via the `stats_parsed` column in scan metadata.
     ///
     /// [`include_all_stats_columns`]: ScanBuilder::include_all_stats_columns
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
@@ -209,7 +216,8 @@ impl ScanBuilder {
     /// When enabled:
     /// - Parquet checkpoint reads use column projection to skip the stats column
     /// - The `stats` field in scan results will be `None`
-    /// - Data skipping is disabled (predicates still filter partitions, but not files)
+    /// - Columnar data skipping is disabled (no stats-based or partition-value-based pruning), but
+    ///   row-level partition filtering still applies
     ///
     /// If called after [`include_all_stats_columns`] or [`with_stats_columns`], the last call wins.
     ///
@@ -262,10 +270,10 @@ pub(crate) enum PhysicalPredicate {
 }
 
 impl PhysicalPredicate {
-    /// If we have a predicate, verify the columns it references and apply column mapping. First, get
-    /// the set of references; use that to filter the schema to only the columns of interest (and
-    /// verify that all referenced columns exist); then use the resulting logical/physical mappings
-    /// to rewrite the expression with physical column names.
+    /// If we have a predicate, verify the columns it references and apply column mapping. First,
+    /// get the set of references; use that to filter the schema to only the columns of interest
+    /// (and verify that all referenced columns exist); then use the resulting logical/physical
+    /// mappings to rewrite the expression with physical column names.
     ///
     /// NOTE: It is possible the predicate resolves to FALSE even ignoring column references,
     /// e.g. `col > 10 AND FALSE`. Such predicates can statically skip the whole query.
@@ -331,7 +339,6 @@ impl PhysicalPredicate {
 // the predicate allows to statically skip all files. Since this is direct evaluation (not an
 // expression rewrite), we use a `DefaultKernelPredicateEvaluator` with an empty column resolver.
 fn can_statically_skip_all_files(predicate: &Predicate) -> bool {
-    use crate::kernel_predicates::KernelPredicateEvaluator as _;
     let evaluator = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
     evaluator.eval_sql_where(predicate) == Some(false)
 }
@@ -420,8 +427,6 @@ impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
 }
 
 static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
-
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
     StructType::new_unchecked(vec![StructField::nullable(
         "add",
@@ -458,11 +463,12 @@ pub fn get_transform_for_row(
     transforms.get(row).cloned().flatten()
 }
 
-/// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
-/// and (2) a vector of transforms (one transform per scan file) that must be applied to the data read
-/// from those files.
+/// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be
+/// scanned and (2) a vector of transforms (one transform per scan file) that must be applied to the
+/// data read from those files.
 pub struct ScanMetadata {
-    /// Filtered engine data with one row per file to scan (and only selected rows should be scanned)
+    /// Filtered engine data with one row per file to scan (and only selected rows should be
+    /// scanned)
     pub scan_files: FilteredEngineData,
 
     /// Row-level transformations to apply to data read from files.
@@ -524,8 +530,8 @@ impl Scan {
     }
 
     /// The table's root URL. Any relative paths returned from `scan_data` (or in a callback from
-    /// [`ScanMetadata::visit_scan_files`]) must be resolved against this root to get the actual path to
-    /// the file.
+    /// [`ScanMetadata::visit_scan_files`]) must be resolved against this root to get the actual
+    /// path to the file.
     ///
     /// [`ScanMetadata::visit_scan_files`]: crate::scan::ScanMetadata::visit_scan_files
     // NOTE: this is obviously included in the snapshot, just re-exposed here for convenience.
@@ -566,37 +572,28 @@ impl Scan {
         }
     }
 
-    /// Get the logical schema for file statistics.
-    ///
-    /// When `stats_columns` is requested in a scan, the `stats_parsed` column in scan metadata
-    /// contains file statistics read using physical column names (to handle column mapping).
-    /// This method returns the corresponding logical schema that maps those physical column
-    /// names back to the table's logical column names, enabling engines to interpret the stats
-    /// correctly.
-    ///
-    /// Returns `None` if stats were not requested (i.e., `stats_columns` was not set in the scan).
-    #[internal_api]
-    #[allow(unused)]
-    pub(crate) fn logical_stats_schema(&self) -> Option<&SchemaRef> {
-        self.state_info.logical_stats_schema.as_ref()
-    }
-
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
+    ///
+    /// Reports metrics: [`MetricEvent::ScanMetadataCompleted`] when the returned iterator is
+    /// fully exhausted.
+    ///
+    /// [`MetricEvent::ScanMetadataCompleted`]: crate::metrics::MetricEvent::ScanMetadataCompleted
+    ///
     /// Each item in the returned iterator is a struct of:
     /// - `Box<dyn EngineData>`: Data in engine format, where each row represents a file to be
     ///   scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
     /// - `Vec<bool>`: A selection vector. If a row is at index `i` and this vector is `false` at
-    ///   index `i`, then that row should *not* be processed (i.e. it is filtered out). If the vector
-    ///   is `true` at index `i` the row *should* be processed. If the selection vector is *shorter*
-    ///   than the number of rows returned, missing elements are considered `true`, i.e. included in
-    ///   the query. NB: If you are using the default engine and plan to call arrow's
+    ///   index `i`, then that row should *not* be processed (i.e. it is filtered out). If the
+    ///   vector is `true` at index `i` the row *should* be processed. If the selection vector is
+    ///   *shorter* than the number of rows returned, missing elements are considered `true`, i.e.
+    ///   included in the query. NB: If you are using the default engine and plan to call arrow's
     ///   `filter_record_batch`, you _need_ to extend this vector to the full length of the batch or
     ///   arrow will drop the extra rows.
     /// - `Vec<Option<Expression>>`: Transformation expressions that need to be applied. For each
-    ///   row at index `i` in the above data, if an expression exists at index `i` in the `Vec`,
-    ///   the associated expression _must_ be applied to the data read from the file specified by
-    ///   the row. The resultant schema for this expression is guaranteed to be
+    ///   row at index `i` in the above data, if an expression exists at index `i` in the `Vec`, the
+    ///   associated expression _must_ be applied to the data read from the file specified by the
+    ///   row. The resultant schema for this expression is guaranteed to be
     ///   [`Self::logical_schema()`]. If the item at index `i` in this `Vec` is `None`, or if the
     ///   `Vec` contains fewer than `i` elements, no expression need be applied and the data read
     ///   from disk is already in the correct logical state.
@@ -608,16 +605,17 @@ impl Scan {
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
 
-    /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
+    /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of
+    /// [`EngineData`]s.
     ///
     /// The existing iterator is assumed to contain data from a previous call to `scan_metadata`.
     /// Engines may decide to cache the results of `scan_metadata` to avoid additional IO operations
     /// required to replay the log.
     ///
-    /// As such the new scan's predicate must "contain" the previous scan's predicate. That is, the new
-    /// scan's predicate MUST skip all files the previous scan's predicate skipped. The new scan's
-    /// predicate is also allowed to skip files the previous predicate kept. For example, if the previous
-    /// scan predicate was
+    /// As such the new scan's predicate must "contain" the previous scan's predicate. That is, the
+    /// new scan's predicate MUST skip all files the previous scan's predicate skipped. The new
+    /// scan's predicate is also allowed to skip files the previous predicate kept. For example,
+    /// if the previous scan predicate was
     /// ```sql
     /// WHERE a < 42 AND b = 10
     /// ```
@@ -765,17 +763,35 @@ impl Scan {
             impl Iterator<Item = DeltaResult<ActionsBatch>>,
         >,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
-            return Ok(None.into_iter().flatten());
-        }
-        let it = scan_action_iter(
-            engine,
-            actions_with_checkpoint_info.actions,
-            self.state_info.clone(),
-            actions_with_checkpoint_info.checkpoint_info,
-            self.skip_stats(),
-        )?;
-        Ok(Some(it).into_iter().flatten())
+        let start = Instant::now();
+        let reporter = engine.get_metrics_reporter();
+        let operation_id = MetricId::new();
+
+        let (iter, metrics) = match self.state_info.physical_predicate {
+            PhysicalPredicate::StaticSkipAll => {
+                info!("Predicate statically evaluated to false; skipping all files");
+                (None, Arc::new(ScanMetrics::default()))
+            }
+            _ => {
+                let (it, m) = scan_action_iter(
+                    engine,
+                    actions_with_checkpoint_info.actions,
+                    self.state_info.clone(),
+                    actions_with_checkpoint_info.checkpoint_info,
+                    self.skip_stats(),
+                )?;
+                (Some(it), m)
+            }
+        };
+
+        let on_complete = move || {
+            let event = metrics.to_event(operation_id, ScanType::Full, start.elapsed());
+            info!(%event);
+            if let Some(r) = reporter {
+                r.report(event);
+            }
+        };
+        Ok(iter.into_iter().flatten().on_complete(on_complete))
     }
 
     // Factored out to facilitate testing
@@ -823,6 +839,10 @@ impl Scan {
     /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
     /// values. Without them, row groups containing files with missing stats (null stat columns)
     /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
+    ///
+    /// Returns `None` if the scan has no predicate, no stats schema, or if the predicate is a
+    /// bare unsupported expression (e.g. column-column comparison). Junctions with unsupported
+    /// arms replace them with TRUE to conservatively prevent pruning.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
@@ -858,7 +878,7 @@ impl Scan {
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
     /// # use delta_kernel::engine::default::DefaultEngineBuilder;
-    /// # use object_store::local::LocalFileSystem;
+    /// # use delta_kernel::object_store::local::LocalFileSystem;
     /// # fn main() -> DeltaResult<()> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
     /// let table_root = Url::parse("file:///path/to/table")?;
@@ -922,7 +942,8 @@ impl Scan {
             checkpoint_info,
             self.skip_stats(),
         )?;
-        let sequential = SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine)?;
+        let sequential =
+            SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
 
         Ok(SequentialScanMetadata::new(sequential))
     }
@@ -986,6 +1007,21 @@ impl Scan {
                     physical_schema.clone(),
                     None,
                 )?;
+
+                let mut read_result_iter = read_result_iter.peekable();
+
+                // Only flag an empty iterator as a connector bug when stats are present and report
+                // a positive row count. When stats are absent we cannot distinguish a legitimate
+                // 0-row file from a buggy connector, so we conservatively allow it.
+                let expect_data = scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
+                if expect_data && read_result_iter.peek().is_none() {
+                    return Err(Error::internal_error(format!(
+                        "ParquetHandler returned no data for file '{}'. This is likely a connector \
+                         bug -- the handler's read_parquet_files must return at least one batch for \
+                         each requested file that contains rows.",
+                        scan_file.path
+                    )));
+                }
 
                 let engine = engine.clone(); // Arc clone
                 let physical_schema_inner = physical_schema.clone();

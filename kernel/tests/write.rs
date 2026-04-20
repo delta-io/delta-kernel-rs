@@ -1,58 +1,53 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-
-use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::Error as KernelError;
-use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
-use url::Url;
-use uuid::Uuid;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::arrow::array::{Array, ArrayRef, BinaryArray, Int64Array, StructArray};
-use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
+use delta_kernel::arrow::array::{
+    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray, StructArray,
+    TimestampMicrosecondArray,
+};
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
-
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
-use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::engine_data::FilteredEngineData;
-use delta_kernel::transaction::create_table::create_table as create_table_txn;
-use delta_kernel::transaction::CommitResult;
-use tempfile::TempDir;
-
-use test_utils::set_json_value;
-
-use itertools::Itertools;
-use object_store::path::Path;
-use object_store::ObjectStore;
-use serde_json::json;
-use serde_json::Deserializer;
-use tempfile::tempdir;
-
-use delta_kernel::expressions::ColumnName;
+use delta_kernel::expressions::{column_expr, ColumnName, Scalar};
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
-use delta_kernel::FileMeta;
-
-use test_utils::create_default_engine_mt_executor;
+use delta_kernel::transaction::create_table::create_table as create_table_txn;
+use delta_kernel::transaction::CommitResult;
+use delta_kernel::{
+    DeltaResult, Engine, Error as KernelError, Expression as Expr, FileMeta, Predicate as Pred,
+    Snapshot, Version,
+};
+use itertools::Itertools;
+use serde_json::{json, Deserializer};
+use tempfile::{tempdir, TempDir};
 use test_utils::{
     assert_partition_values, assert_result_error_with_message, assert_schema_has_field,
-    copy_directory, create_add_files_metadata, create_default_engine, create_table,
-    create_table_and_load_snapshot, engine_store_setup, nested_batches, nested_schema,
-    read_actions_from_commit, read_add_infos, remove_all_and_get_remove_actions, resolve_field,
-    setup_test_tables, test_read, test_table_setup, write_batch_to_table,
+    copy_directory, create_add_files_metadata, create_default_engine,
+    create_default_engine_mt_executor, create_table, create_table_and_load_snapshot,
+    engine_store_setup, nested_batches, nested_schema, read_actions_from_commit, read_add_infos,
+    remove_all_and_get_remove_actions, resolve_field, set_json_value, setup_test_tables, test_read,
+    test_table_setup, write_batch_to_table,
 };
+use url::Url;
+use uuid::Uuid;
 
 mod common;
 
@@ -90,6 +85,23 @@ fn validate_txn_id(commit_info: &serde_json::Value) {
     Uuid::parse_str(txn_id).expect("txnId should be valid UUID format");
 }
 
+fn validate_timestamp(commit_info: &serde_json::Value) {
+    let timestamp = commit_info["timestamp"]
+        .as_i64()
+        .expect("timestamp should be present in commitInfo");
+    let current_ts: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    let two_days_ms = Duration::from_secs(2 * 24 * 60 * 60).as_millis() as i64;
+    assert!(
+        (timestamp <= current_ts && timestamp > current_ts - two_days_ms),
+        "commit timestamp should be at most 2 days behind current system time: got {timestamp}, now {current_ts}"
+    );
+}
+
 const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Creates a table with deletion vector support and writes the specified files
@@ -99,7 +111,7 @@ async fn create_dv_table_with_files(
     file_paths: &[&str],
 ) -> Result<
     (
-        Arc<dyn ObjectStore>,
+        Arc<DynObjectStore>,
         Arc<dyn delta_kernel::Engine>,
         Url,
         Vec<String>,
@@ -340,7 +352,7 @@ fn check_action_timestamps<'a>(
 
 // list all the files at `path` and check that all parquet files have the same size, and return
 // that size
-async fn get_and_check_all_parquet_sizes(store: Arc<dyn ObjectStore>, path: &str) -> u64 {
+async fn get_and_check_all_parquet_sizes(store: Arc<DynObjectStore>, path: &str) -> u64 {
     use futures::stream::StreamExt;
     let files: Vec<_> = store.list(Some(&Path::from(path))).collect().await;
     let parquet_files = files
@@ -380,18 +392,14 @@ async fn write_data_and_check_result_and_stats(
     });
 
     // write data out by spawning async tasks to simulate executors
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
     let tasks = append_data.into_iter().map(|data| {
         // arc clones
         let engine = engine.clone();
         let write_context = write_context.clone();
         tokio::task::spawn(async move {
             engine
-                .write_parquet(
-                    data.as_ref().unwrap(),
-                    write_context.as_ref(),
-                    HashMap::new(),
-                )
+                .write_parquet(data.as_ref().unwrap(), write_context.as_ref())
                 .await
         })
     });
@@ -470,6 +478,90 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Verifies that when `engine_commit_info` is provided (the `Some` branch of `build_commit_info`):
+/// - The written JSON is correctly wrapped in a top-level `"commitInfo"` key.
+/// - Engine-only fields (not in `CommitInfo::to_schema()`) pass through to the log unchanged.
+/// - Fields that overlap with kernel-managed CommitInfo fields are overridden by kernel values,
+/// - All kernel-managed fields (`timestamp`, `kernelVersion`, `txnId`, `operationParameters`) are
+///   present with correct values.
+#[tokio::test]
+async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let schema = get_simple_int_schema();
+
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema, &[], None, "test_table").await?
+    {
+        // Build engine_commit_info with:
+        //   - "myApp"    : engine-only field, must pass through unchanged.
+        //   - "myVersion": engine-only field, must pass through unchanged.
+        //   - "operation": overlapping with CommitInfo; kernel must override with "WRITE".
+        let arrow_schema = Arc::new(delta_kernel::arrow::datatypes::Schema::new(vec![
+            Field::new("myApp", ArrowDataType::Utf8, false),
+            Field::new("myVersion", ArrowDataType::Utf8, false),
+            Field::new("operation", ArrowDataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["spark"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["3.5.0"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["STALE_OP"])) as ArrayRef,
+            ],
+        )?;
+        let engine_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::not_null("myApp", DataType::STRING),
+            StructField::not_null("myVersion", DataType::STRING),
+            StructField::nullable("operation", DataType::STRING),
+        ]));
+
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_operation("WRITE".to_string())
+            .with_commit_info(Box::new(ArrowEngineData::new(batch)), engine_schema);
+
+        let _ = txn.commit(&engine)?;
+
+        let commit = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+
+        let mut parsed_commits: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)
+            .into_iter::<serde_json::Value>()
+            .try_collect()?;
+
+        validate_txn_id(&parsed_commits[0]["commitInfo"]);
+        validate_timestamp(&parsed_commits[0]["commitInfo"]);
+
+        // Zero out non-deterministic fields for stable comparison.
+        set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
+
+        // Null-valued CommitInfo fields (inCommitTimestamp, isBlindAppend, engineInfo) are
+        // omitted from the JSON — consistent with how the Delta log serializes optional fields.
+        let expected_commits = vec![json!({
+            "commitInfo": {
+                // Engine-only fields pass through unchanged.
+                "myApp": "spark",
+                "myVersion": "3.5.0",
+                // Kernel overrides the engine's stale "STALE_OP" with the real operation.
+                "operation": "WRITE",
+                // Remaining kernel-managed non-null fields are appended.
+                "operationParameters": {},
+                "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
+                "txnId": ZERO_UUID,
+                "timestamp": 0,
+            }
+        })];
+
+        assert_eq!(parsed_commits, expected_commits);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -498,8 +590,8 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
         let size =
             get_and_check_all_parquet_sizes(store.clone(), format!("/{table_name}/").as_str())
                 .await;
-        // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
-        // before we clear them for comparison
+        // check that the timestamps in commit_info and add actions are within 10s of
+        // SystemTime::now() before we clear them for comparison
         check_action_timestamps(parsed_commits.iter())?;
         // check that the txn_id is valid before we clear it for comparison
         validate_txn_id(&parsed_commits[0]["commitInfo"]);
@@ -663,21 +755,22 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
         let tasks = append_data
             .into_iter()
             .zip(partition_vals)
             .map(|(data, partition_val)| {
+                let write_context = Arc::new(
+                    txn.partitioned_write_context(HashMap::from([(
+                        partition_col.to_string(),
+                        Scalar::String(partition_val.into()),
+                    )]))
+                    .unwrap(),
+                );
                 // arc clones
                 let engine = engine.clone();
-                let write_context = write_context.clone();
                 tokio::task::spawn(async move {
                     engine
-                        .write_parquet(
-                            data.as_ref().unwrap(),
-                            write_context.as_ref(),
-                            HashMap::from([(partition_col.to_string(), partition_val.to_string())]),
-                        )
+                        .write_parquet(data.as_ref().unwrap(), write_context.as_ref())
                         .await
                 })
             });
@@ -703,8 +796,8 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         let size =
             get_and_check_all_parquet_sizes(store.clone(), format!("/{table_name}/").as_str())
                 .await;
-        // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
-        // before we clear them for comparison
+        // check that the timestamps in commit_info and add actions are within 10s of
+        // SystemTime::now() before we clear them for comparison
         check_action_timestamps(parsed_commits.iter())?;
         // check that the txn_id is valid before we clear it for comparison
         validate_txn_id(&parsed_commits[0]["commitInfo"]);
@@ -772,6 +865,100 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Verify that materialized partition columns do not get stats collected. The partition column
+// is physically present in the parquet file, but its stats should be omitted because the
+// value is already in the Add action's `partitionValues`.
+#[tokio::test]
+async fn test_materialized_partition_columns_excluded_from_stats(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let partition_col = "partition";
+    let table_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("number", DataType::INTEGER),
+        StructField::nullable("partition", DataType::STRING),
+    ])?);
+
+    // Create a table with materializePartitionColumns writer feature
+    let (store, engine, table_location) = engine_store_setup("test_mat_part", None);
+    let table_url = create_table(
+        store.clone(),
+        table_location,
+        table_schema.clone(),
+        &[partition_col],
+        true, // use_37_protocol for writer features
+        vec![],
+        vec!["materializePartitionColumns"],
+    )
+    .await?;
+
+    let engine = Arc::new(engine);
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("default engine");
+
+    // With materializePartitionColumns, the data batch includes the partition column
+    let arrow_schema = Arc::new(table_schema.as_ref().try_into_arrow()?);
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "a", "a"])),
+        ],
+    )?;
+    let data = Box::new(ArrowEngineData::new(batch));
+
+    let write_context = txn.partitioned_write_context(HashMap::from([(
+        partition_col.to_string(),
+        Scalar::String("a".into()),
+    )]))?;
+    let result = engine.write_parquet(&data, &write_context).await?;
+    txn.add_files(result);
+    assert!(txn.commit(engine.as_ref())?.is_committed());
+
+    // Read the commit log and verify stats
+    let commit = store
+        .get(&Path::from(
+            "/test_mat_part/_delta_log/00000000000000000001.json",
+        ))
+        .await?;
+    let parsed: Vec<serde_json::Value> = Deserializer::from_slice(&commit.bytes().await?)
+        .into_iter::<serde_json::Value>()
+        .try_collect()?;
+
+    let add = parsed
+        .iter()
+        .find(|v| v.get("add").is_some())
+        .expect("should have an add action");
+    let stats: serde_json::Value =
+        serde_json::from_str(add["add"]["stats"].as_str().unwrap()).unwrap();
+
+    // Stats should contain the data column but NOT the partition column
+    assert!(
+        stats["minValues"].get("number").is_some(),
+        "Data column 'number' should have minValues"
+    );
+    assert!(
+        stats["maxValues"].get("number").is_some(),
+        "Data column 'number' should have maxValues"
+    );
+    assert!(
+        stats["minValues"].get("partition").is_none(),
+        "Partition column should not have minValues even when materialized"
+    );
+    assert!(
+        stats["maxValues"].get("partition").is_none(),
+        "Partition column should not have maxValues even when materialized"
+    );
+    assert!(
+        stats["nullCount"].get("partition").is_none(),
+        "Partition column should not have nullCount even when materialized"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -806,18 +993,14 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
+        let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
         let tasks = append_data.into_iter().map(|data| {
             // arc clones
             let engine = engine.clone();
             let write_context = write_context.clone();
             tokio::task::spawn(async move {
                 engine
-                    .write_parquet(
-                        data.as_ref().unwrap(),
-                        write_context.as_ref(),
-                        HashMap::new(),
-                    )
+                    .write_parquet(data.as_ref().unwrap(), write_context.as_ref())
                     .await
             })
         });
@@ -1007,14 +1190,10 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
     let add_files_metadata = engine
-        .write_parquet(
-            &ArrowEngineData::new(data.clone()),
-            write_context.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(data.clone()), write_context.as_ref())
         .await?;
 
     txn.add_files(add_files_metadata);
@@ -1198,19 +1377,14 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
     let add_files_metadata = (*engine)
         .parquet_handler()
         .as_any()
         .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
         .unwrap()
-        .write_parquet_file(
-            write_context.target_dir(),
-            Box::new(ArrowEngineData::new(data.clone())),
-            HashMap::new(),
-            Some(write_context.stats_columns()),
-        )
+        .write_parquet_file(Box::new(ArrowEngineData::new(data.clone())), &write_context)
         .await?;
 
     txn.add_files(add_files_metadata);
@@ -1372,19 +1546,14 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     .unwrap();
 
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
     let add_files_metadata = (*engine)
         .parquet_handler()
         .as_any()
         .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
         .unwrap()
-        .write_parquet_file(
-            write_context.target_dir(),
-            Box::new(ArrowEngineData::new(data.clone())),
-            HashMap::new(),
-            Some(write_context.stats_columns()),
-        )
+        .write_parquet_file(Box::new(ArrowEngineData::new(data.clone())), &write_context)
         .await?;
 
     txn.add_files(add_files_metadata);
@@ -1442,7 +1611,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
 
     // write context does not conflict with domain metadata
-    let _write_context = txn.get_write_context();
+    let _write_context = txn.unpartitioned_write_context().unwrap();
 
     // set multiple domain metadata
     let domain1 = "app.config";
@@ -1481,7 +1650,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
         match domain {
             d if d == domain1 => assert_eq!(config, config1),
             d if d == domain2 => assert_eq!(config, config2),
-            _ => panic!("Unexpected domain: {}", domain),
+            _ => panic!("Unexpected domain: {domain}"),
         }
     }
 
@@ -1808,11 +1977,11 @@ async fn test_domain_metadata_set_then_remove() -> Result<(), Box<dyn std::error
 }
 
 async fn get_ict_at_version(
-    store: Arc<dyn ObjectStore>,
+    store: Arc<DynObjectStore>,
     table_url: &Url,
     version: u64,
 ) -> Result<i64, Box<dyn std::error::Error>> {
-    let commit_path = table_url.join(&format!("_delta_log/{:020}.json", version))?;
+    let commit_path = table_url.join(&format!("_delta_log/{version:020}.json"))?;
     let commit = store.get(&Path::from_url_path(commit_path.path())?).await?;
     let commit_content = String::from_utf8(commit.bytes().await?.to_vec())?;
 
@@ -1824,8 +1993,7 @@ async fn get_ict_at_version(
         .collect();
     assert!(
         !lines.is_empty(),
-        "Commit log at version {} should not be empty",
-        version
+        "Commit log at version {version} should not be empty"
     );
 
     // First line should contain commitInfo with inCommitTimestamp
@@ -1854,13 +2022,9 @@ async fn generate_and_add_data_file(
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
     let file_meta = engine
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            write_context.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
         .await?;
     txn.add_files(file_meta);
     Ok(())
@@ -1932,8 +2096,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
 
     assert!(
         first_ict > 1612345678,
-        "First commit ICT ({}) should be greater than enablement timestamp (1612345678)",
-        first_ict
+        "First commit ICT ({first_ict}) should be greater than enablement timestamp (1612345678)"
     );
 
     // Second commit
@@ -1978,9 +2141,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     // Verify monotonic property: second_ict > first_ict
     assert!(
         second_ict > first_ict,
-        "Second ICT ({}) should be greater than first ICT ({})",
-        second_ict,
-        first_ict
+        "Second ICT ({second_ict}) should be greater than first ICT ({first_ict})"
     );
 
     Ok(())
@@ -1988,10 +2149,11 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::error::Error>> {
-    // This test verifies that Remove actions generated from scan metadata contain all expected fields
-    // from the Remove struct (defined in kernel/src/actions/mod.rs).
+    // This test verifies that Remove actions generated from scan metadata contain all expected
+    // fields from the Remove struct (defined in kernel/src/actions/mod.rs).
     //
-    // This test uses the table-with-dv-small dataset which contains files with tags and deletion vectors.
+    // This test uses the table-with-dv-small dataset which contains files with tags and deletion
+    // vectors.
     //
     // Not populated in the dataset are (covered by row_tracking tests):
     // baseRowId (optional i64)
@@ -2033,8 +2195,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
             let commit_version = committed.commit_version();
 
             // Read the commit log directly to verify remove actions
-            let commit_path =
-                tmp_table_path.join(format!("_delta_log/{:020}.json", commit_version));
+            let commit_path = tmp_table_path.join(format!("_delta_log/{commit_version:020}.json"));
             let commit_content = std::fs::read_to_string(commit_path)?;
 
             let parsed_commits: Vec<_> = Deserializer::from_str(&commit_content)
@@ -2159,7 +2320,8 @@ async fn test_update_deletion_vectors_adds_expected_entries(
     // This test verifies that deletion vector updates write proper Remove and Add actions
     // to the transaction log.
     //
-    // NOTE: Additional unit tests for update_deletion_vectors exist in kernel/src/transaction/mod.rs
+    // NOTE: Additional unit tests for update_deletion_vectors exist in
+    // kernel/src/transaction/mod.rs
     //
     // The test validates:
     // 1. Transaction setup for DV updates
@@ -2271,8 +2433,7 @@ async fn test_update_deletion_vectors_adds_expected_entries(
             let original_stats = original_add.get("stats");
 
             // Read the commit log directly
-            let commit_path =
-                tmp_table_path.join(format!("_delta_log/{:020}.json", commit_version));
+            let commit_path = tmp_table_path.join(format!("_delta_log/{commit_version:020}.json"));
             let commit_content = std::fs::read_to_string(commit_path)?;
 
             let parsed_commits: Vec<_> = Deserializer::from_str(&commit_content)
@@ -2509,7 +2670,7 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
     for (idx, file_path) in file_paths.iter().enumerate() {
         let descriptor = DeletionVectorDescriptor {
             storage_type: DeletionVectorStorageType::PersistedRelative,
-            path_or_inline_dv: format!("dv_file_{}.bin", idx),
+            path_or_inline_dv: format!("dv_file_{idx}.bin"),
             offset: Some(idx as i32 * 10),
             size_in_bytes: 40 + idx as i32,
             cardinality: idx as i64 + 1,
@@ -2528,7 +2689,7 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
 
             // Read the commit log directly from object store
             let final_commit_path =
-                table_url.join(&format!("_delta_log/{:020}.json", commit_version))?;
+                table_url.join(&format!("_delta_log/{commit_version:020}.json"))?;
             let commit_content = store
                 .get(&Path::from_url_path(final_commit_path.path())?)
                 .await?
@@ -2564,13 +2725,13 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
                 let remove_action = remove_actions
                     .iter()
                     .find(|action| action["remove"]["path"].as_str() == Some(file_path.as_str()))
-                    .unwrap_or_else(|| panic!("Should find remove action for {}", file_path));
+                    .unwrap_or_else(|| panic!("Should find remove action for {file_path}"));
 
                 // Find the add action for this file
                 let add_action = add_actions
                     .iter()
                     .find(|action| action["add"]["path"].as_str() == Some(file_path.as_str()))
-                    .unwrap_or_else(|| panic!("Should find add action for {}", file_path));
+                    .unwrap_or_else(|| panic!("Should find add action for {file_path}"));
 
                 // Verify remove action does NOT have a DV (since these were newly written files)
                 assert!(
@@ -2583,30 +2744,26 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
                     .as_object()
                     .expect("Add action should have deletionVector");
 
-                let expected_path = format!("dv_file_{}.bin", idx);
+                let expected_path = format!("dv_file_{idx}.bin");
                 assert_eq!(
                     add_dv.get("pathOrInlineDv").and_then(|v| v.as_str()),
                     Some(expected_path.as_str()),
-                    "DV path should match for file {}",
-                    file_path
+                    "DV path should match for file {file_path}"
                 );
                 assert_eq!(
                     add_dv.get("offset").and_then(|v| v.as_i64()),
                     Some(idx as i64 * 10),
-                    "DV offset should match for file {}",
-                    file_path
+                    "DV offset should match for file {file_path}"
                 );
                 assert_eq!(
                     add_dv.get("sizeInBytes").and_then(|v| v.as_i64()),
                     Some(40 + idx as i64),
-                    "DV size should match for file {}",
-                    file_path
+                    "DV size should match for file {file_path}"
                 );
                 assert_eq!(
                     add_dv.get("cardinality").and_then(|v| v.as_i64()),
                     Some(idx as i64 + 1),
-                    "DV cardinality should match for file {}",
-                    file_path
+                    "DV cardinality should match for file {file_path}"
                 );
             }
         }
@@ -2737,8 +2894,7 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
 
         assert!(
             initial_file_count >= 3,
-            "Need at least 3 files for this test, got {}",
-            initial_file_count
+            "Need at least 3 files for this test, got {initial_file_count}"
         );
 
         // Create a transaction to remove files in two batches
@@ -2835,6 +2991,131 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
     Ok(())
 }
 
+/// Regression test for https://github.com/delta-io/delta-kernel-rs/issues/2040
+///
+/// When `scan_metadata()` is called with a predicate, the scan row schema includes a
+/// `stats_parsed` column (7th column). Passing that scan metadata to `remove_files()` then
+/// `commit()` previously failed with "Too few fields in output schema" because the transform
+/// evaluator exhausted the output schema when it encountered the extra column.
+///
+/// Both predicate and non-predicate scans are tested because `remove_files` should behave
+/// identically regardless. Cases also vary the checkpoint format:
+/// - `use_struct_stats_checkpoint=false`: `stats` is non-null (raw JSON from the Add action). The
+///   remove action's `stats` comes from passthrough.
+/// - `use_struct_stats_checkpoint=true`: a checkpoint is written with `writeStatsAsJson=false,
+///   writeStatsAsStruct=true`, so the checkpoint stores `stats_parsed` but omits the raw `stats`
+///   JSON string. Scan rows from that checkpoint have `stats=null` but `stats_parsed` non-null. The
+///   remove action's `stats` is produced via `coalesce(null, to_json(stats_parsed))`, which
+///   exercises the coalesce path in the fix.
+#[rstest::rstest]
+#[case(false, false)]
+#[case(false, true)]
+#[case(true, false)]
+#[case(true, true)]
+// Multi-thread runtime required because the struct-stats checkpoint case calls
+// `Snapshot::checkpoint`, which makes nested `block_on` calls that deadlock
+// a single-threaded executor. `TokioMultiThreadExecutor` uses `block_in_place`
+// which avoids the deadlock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
+    #[case] use_struct_stats_checkpoint: bool,
+    #[case] use_predicate: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = get_simple_int_schema();
+
+    // Use a local directory so we can inspect the commit log for stats content.
+    let tmp_dir = tempdir()?;
+    let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+
+    for (table_url, engine, _store, _table_name) in
+        setup_test_tables(schema.clone(), &[], Some(&tmp_url), "test_table").await?
+    {
+        let engine = Arc::new(engine);
+
+        // Write data (two parquet files with numbers [1,2,3] and [4,5,6]).
+        write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
+            .await?;
+
+        // When use_struct_stats_checkpoint=true, update table properties so the checkpoint
+        // omits the stats JSON string (writeStatsAsJson=false) but stores stats as a struct
+        // (writeStatsAsStruct=true). After checkpointing, scan rows from the checkpoint have
+        // stats=null and stats_parsed=non-null, exercising the coalesce path in the fix.
+        let snapshot = if use_struct_stats_checkpoint {
+            let table_path = table_url.to_file_path().unwrap();
+            let snapshot_v2 = set_table_properties(
+                table_path.to_str().unwrap(),
+                &table_url,
+                engine.as_ref(),
+                1,
+                &[
+                    ("delta.checkpoint.writeStatsAsJson", "false"),
+                    ("delta.checkpoint.writeStatsAsStruct", "true"),
+                ],
+            )?;
+            // `Snapshot::checkpoint` makes nested `block_on` calls internally (it reads the
+            // log segment lazily while writing). This requires `TokioMultiThreadExecutor`,
+            // which uses `block_in_place` to avoid deadlocking a single-thread runtime.
+            let mt_engine = create_default_engine_mt_executor(&table_url)?;
+            snapshot_v2.checkpoint(mt_engine.as_ref())?;
+            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
+        } else {
+            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
+        };
+
+        // commit_version = 2 (no checkpoint) or 3 (properties commit + checkpoint bump)
+        let expected_commit_version = if use_struct_stats_checkpoint { 3 } else { 2 };
+
+        // Always request all stats columns so stats_parsed is present in scan metadata
+        // regardless of whether a predicate is used. This ensures remove_files can always
+        // reconstruct stats (including the coalesce path when writeStatsAsJson=false).
+        let mut scan_builder = snapshot.clone().scan_builder().include_all_stats_columns();
+        if use_predicate {
+            scan_builder = scan_builder.with_predicate(Arc::new(Pred::gt(
+                column_expr!("number"),
+                Expr::literal(0_i32),
+            )));
+        }
+        let scan = scan_builder.build()?;
+
+        let mut txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_data_change(true);
+
+        // Pass scan metadata (which contains stats_parsed) directly to remove_files.
+        // This previously failed with "Too few fields in output schema".
+        for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+            txn.remove_files(scan_metadata?.scan_files);
+        }
+
+        let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        assert_eq!(committed.commit_version(), expected_commit_version);
+
+        let remove_actions =
+            read_actions_from_commit(&table_url, expected_commit_version, "remove")?;
+        assert!(
+            !remove_actions.is_empty(),
+            "expected remove actions in commit"
+        );
+
+        // stats must be populated in every remove action: stats_parsed is always present
+        // (via include_all_stats_columns), so the coalesce path handles even checkpoints
+        // that omit the raw JSON stats string (writeStatsAsJson=false).
+        for remove in &remove_actions {
+            let stats_str = remove["stats"]
+                .as_str()
+                .expect("stats field should be a non-null JSON string");
+            let stats: serde_json::Value = serde_json::from_str(stats_str)?;
+            assert!(
+                stats["numRecords"].as_i64().unwrap_or(0) > 0,
+                "stats.numRecords should be populated, got: {stats}"
+            );
+        }
+    }
+    Ok(())
+}
+
 // Helper function to create a table with CDF enabled
 async fn create_cdf_table(
     table_name: &str,
@@ -2893,13 +3174,9 @@ async fn add_files_to_transaction(
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
     let add_files_metadata = engine
-        .write_parquet(
-            &ArrowEngineData::new(data),
-            write_context.as_ref(),
-            HashMap::new(),
-        )
+        .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
         .await?;
     txn.add_files(add_files_metadata);
     Ok(())
@@ -3006,7 +3283,8 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
 
 #[tokio::test]
 async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std::error::Error>> {
-    // This test verifies that mixed add+remove transactions fail with helpful error when dataChange=true
+    // This test verifies that mixed add+remove transactions fail with helpful error when
+    // dataChange=true
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = get_simple_int_schema();
@@ -3062,6 +3340,12 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
     let mut current_snapshot = match create_result {
         CommitResult::CommittedTransaction(committed) => {
             assert_eq!(committed.commit_version(), 0);
+            // CREATE TABLE is the first commit: 1 commit since last checkpoint/compaction
+            assert_eq!(committed.post_commit_stats().commits_since_checkpoint, 1);
+            assert_eq!(
+                committed.post_commit_stats().commits_since_log_compaction,
+                1
+            );
             let post_snapshot = committed
                 .post_commit_snapshot()
                 .expect("should have post_commit_snapshot");
@@ -3093,7 +3377,7 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
 
                 current_snapshot = post_snapshot.clone();
             }
-            _ => panic!("Commit {} should succeed", i),
+            _ => panic!("Commit {i} should succeed"),
         }
     }
 
@@ -3132,7 +3416,7 @@ async fn test_write_parquet_succeed_with_logical_partition_names(
             &snapshot,
             &engine,
             batch,
-            HashMap::from([("letter".to_string(), "a".to_string())]),
+            HashMap::from([("letter".to_string(), Scalar::String("a".into()))]),
         )
         .await;
         assert!(
@@ -3144,7 +3428,7 @@ async fn test_write_parquet_succeed_with_logical_partition_names(
 }
 
 #[tokio::test]
-async fn test_write_parquet_rejects_unknown_partition_column(
+async fn test_write_parquet_rejects_partitioned_write_context_on_unpartitioned_table(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_int_schema();
 
@@ -3152,24 +3436,21 @@ async fn test_write_parquet_rejects_unknown_partition_column(
         setup_test_tables(schema.clone(), &[], None, "test_partition_reject").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_engine_info("test");
 
-        let batch = RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
-            vec![Arc::new(Int32Array::from(vec![1, 2]))],
-        )?;
-
-        let result = write_batch_to_table(
-            &snapshot,
-            &engine,
-            batch,
-            HashMap::from([("nonexistent".to_string(), "val".to_string())]),
-        )
-        .await;
-        let err = result.expect_err("write_parquet should fail with unknown partition column");
+        let result = txn.partitioned_write_context(HashMap::from([(
+            "nonexistent".to_string(),
+            Scalar::String("val".into()),
+        )]));
+        let err =
+            result.expect_err("should fail with partitioned_write_context on unpartitioned table");
         let err_msg = err.to_string();
         assert!(
-            err_msg.contains("Partition column 'nonexistent' not found in table schema"),
-            "Error should mention the unknown column name, got: {err_msg}"
+            err_msg.contains("table is not partitioned"),
+            "Error should indicate table is not partitioned, got: {err_msg}"
         );
     }
     Ok(())
@@ -3195,7 +3476,7 @@ async fn test_column_mapping_write(
 
     let (_tmp_dir, table_path, _) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
-    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
         DefaultEngineBuilder::new(store.clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
@@ -3465,7 +3746,7 @@ async fn test_column_mapping_partitioned_write(
     let tmp_dir = tempdir()?;
     copy_directory(std::path::Path::new(table_dir), tmp_dir.path())?;
     let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
-    let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
         DefaultEngineBuilder::new(store.clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
@@ -3506,7 +3787,7 @@ async fn test_column_mapping_partitioned_write(
         Arc::new(data_schema.as_ref().try_into_arrow()?),
         vec![Arc::new(Int32Array::from(vec![1, 2]))],
     )?;
-    let partition_values = HashMap::from([("category".to_string(), "A".to_string())]);
+    let partition_values = HashMap::from([("category".to_string(), Scalar::String("A".into()))]);
     write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
 
     // Read commit log and verify add.partitionValues key uses physical name
@@ -3543,8 +3824,7 @@ async fn test_checkpoint_non_kernel_written_table() {
     test_utils::copy_directory(source_path, &table_path).unwrap();
 
     let url = Url::from_directory_path(&table_path).unwrap();
-    let store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::local::LocalFileSystem::new());
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let executor = Arc::new(
         delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),
@@ -3564,7 +3844,7 @@ async fn test_checkpoint_non_kernel_written_table() {
     let batches_before = test_utils::read_scan(&scan_before, engine.clone()).unwrap();
 
     // Create checkpoint via snapshot.checkpoint()
-    Arc::clone(&snapshot).checkpoint(engine.as_ref()).unwrap();
+    snapshot.checkpoint(engine.as_ref()).unwrap();
 
     // Read data after checkpoint
     let snapshot_after = Snapshot::builder_for(url.clone())
@@ -3857,6 +4137,175 @@ async fn test_clustered_table_write_has_stats_parsed(
     assert_eq!(stats_rows.len(), 2, "should have stats_parsed for 2 files");
     assert_eq!(stats_rows[0], (1, 3, "st1".to_string(), "st3".to_string()));
     assert_eq!(stats_rows[1], (4, 6, "st4".to_string(), "st6".to_string()));
+
+    Ok(())
+}
+
+// === Path format tests ===
+
+fn get_simple_schema() -> SchemaRef {
+    Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap())
+}
+
+fn simple_id_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow().unwrap()),
+        vec![Arc::new(Int32Array::from(values))],
+    )
+    .unwrap()
+}
+
+/// Helper to write a batch and return the post-commit snapshot.
+async fn write_batch_to_table_simple(
+    snapshot: &Arc<Snapshot>,
+    engine: &DefaultEngine<TokioBackgroundExecutor>,
+    data: RecordBatch,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .with_engine_info("test");
+    let write_context = txn.unpartitioned_write_context()?;
+    let add_meta = engine
+        .write_parquet(&ArrowEngineData::new(data), &write_context)
+        .await?;
+    txn.add_files(add_meta);
+    let committed = txn.commit(engine)?.unwrap_committed();
+    Ok(committed.post_commit_snapshot().unwrap().clone())
+}
+
+#[tokio::test]
+async fn test_write_uses_relative_paths_and_readback() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    let snapshot = write_batch_to_table_simple(
+        &snapshot,
+        engine.as_ref(),
+        simple_id_batch(&schema, vec![1, 2, 3]),
+    )
+    .await?;
+
+    // Verify paths in the log are relative (no scheme like "s3://")
+    let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
+    assert_eq!(add_infos.len(), 1);
+    let path = &add_infos[0].path;
+    assert!(
+        !path.contains("://"),
+        "should produce relative paths, got: {path}"
+    );
+
+    // Verify data is readable via scan
+    let scan = snapshot.scan_builder().build()?;
+    let engine_ref: Arc<dyn Engine> = engine;
+    let batches = test_utils::read_scan(&scan, engine_ref)?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 3);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_multiple_files_in_commit_all_use_relative_paths(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("test");
+    let write_context = txn.unpartitioned_write_context().unwrap();
+    for values in [vec![1, 2], vec![3, 4]] {
+        let add_meta = engine
+            .write_parquet(
+                &ArrowEngineData::new(simple_id_batch(&schema, values)),
+                &write_context,
+            )
+            .await?;
+        txn.add_files(add_meta);
+    }
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let snapshot = committed.post_commit_snapshot().unwrap().clone();
+
+    let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
+    assert_eq!(add_infos.len(), 2);
+    for info in &add_infos {
+        assert!(
+            !info.path.contains("://"),
+            "Expected relative path, got: {}",
+            info.path
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_multiple_commits_with_relative_paths_all_readable(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let mut snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    for values in [vec![1, 2], vec![3, 4], vec![5, 6]] {
+        snapshot = write_batch_to_table(
+            &snapshot,
+            engine.as_ref(),
+            simple_id_batch(&schema, values),
+            HashMap::new(),
+        )
+        .await?;
+    }
+
+    let scan = snapshot.scan_builder().build()?;
+    let engine_ref: Arc<dyn Engine> = engine;
+    let batches = test_utils::read_scan(&scan, engine_ref)?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 6);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_table_with_data_uses_relative_paths() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+
+    let mut txn = create_table_txn(table_url.as_str(), schema.clone(), "test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let write_context = txn.unpartitioned_write_context()?;
+    let add_meta = engine
+        .write_parquet(
+            &ArrowEngineData::new(simple_id_batch(&schema, vec![10, 20])),
+            &write_context,
+        )
+        .await?;
+    txn.add_files(add_meta);
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let snapshot = committed.post_commit_snapshot().unwrap().clone();
+
+    let add_infos = read_add_infos(&snapshot, engine.as_ref())?;
+    assert_eq!(add_infos.len(), 1);
+    let path = &add_infos[0].path;
+    assert!(
+        !path.contains("://"),
+        "should produce relative paths, got: {path}"
+    );
+
+    // Verify data is readable
+    let scan = snapshot.scan_builder().build()?;
+    let engine_ref: Arc<dyn Engine> = engine;
+    let batches = test_utils::read_scan(&scan, engine_ref)?;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
 
     Ok(())
 }

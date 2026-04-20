@@ -9,8 +9,8 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array, LargeStringArray,
-    PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
+    new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array,
+    LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
 };
 use crate::arrow::compute::kernels::aggregate::{max, max_string, min, min_string};
 use crate::arrow::datatypes::{
@@ -33,7 +33,8 @@ const STRING_EXPANSION_LIMIT: usize = STRING_PREFIX_LENGTH * 2;
 /// ASCII DEL character (0x7F) - used as tie-breaker for max values when truncated char is ASCII.
 const ASCII_MAX_CHAR: char = '\x7F';
 
-/// Maximum Unicode code point - used as tie-breaker for max values when truncated char is non-ASCII.
+/// Maximum Unicode code point - used as tie-breaker for max values when truncated char is
+/// non-ASCII.
 const UTF8_MAX_CHAR: char = '\u{10FFFF}';
 
 // ============================================================================
@@ -118,7 +119,7 @@ fn truncate_max_string(s: &str) -> Option<Cow<'_, str>> {
             UTF8_MAX_CHAR
         };
 
-        return Some(Cow::Owned(format!("{}{}", truncated, tie_breaker)));
+        return Some(Cow::Owned(format!("{truncated}{tie_breaker}")));
     }
 
     // Could not find a valid truncation point within expansion limit
@@ -427,10 +428,16 @@ fn compute_column_stats(
                 return Ok(ColumnStats::default());
             }
 
+            // When min/max is None (all nulls or unsupported type), emit a null-valued
+            // single-element array to keep the field present in the stats struct. This
+            // allows downstream consumers (like StatsVerifier) to find the column and
+            // check nullCount == numRecords. The JSON serializer omits null fields, so
+            // the on-disk format still matches Spark's ignoreNullFields behavior.
+            let null_fallback = || -> ArrayRef { Arc::new(new_null_array(column.data_type(), 1)) };
             Ok(ColumnStats {
                 null_count: Some(Arc::new(Int64Array::from(vec![column.null_count() as i64]))),
-                min_value: compute_leaf_agg(column, Agg::Min)?,
-                max_value: compute_leaf_agg(column, Agg::Max)?,
+                min_value: Some(compute_leaf_agg(column, Agg::Min)?.unwrap_or_else(&null_fallback)),
+                max_value: Some(compute_leaf_agg(column, Agg::Max)?.unwrap_or_else(null_fallback)),
             })
         }
     }
@@ -474,14 +481,18 @@ impl StatsAccumulator {
 /// Returns a StructArray with the following fields:
 /// - `numRecords`: total row count
 /// - `nullCount`: nested struct with null counts per column
-/// - `minValues`: nested struct with min values per column
-/// - `maxValues`: nested struct with max values per column
+/// - `minValues`: nested struct with min values per column (null when all values are null)
+/// - `maxValues`: nested struct with max values per column (null when all values are null)
 /// - `tightBounds`: always true for new file writes
+///
+/// String min/max values are truncated to a 32-character prefix with appropriate tie-breaker
+/// characters for max values. See the `stats_schema` module documentation for the full stats
+/// value rules.
 ///
 /// # Arguments
 /// * `batch` - The RecordBatch to collect statistics from
-/// * `stats_columns` - Column names that should have statistics collected (allowlist).
-///   Only these columns will appear in nullCount/minValues/maxValues.
+/// * `stats_columns` - Column names that should have statistics collected (allowlist). Only these
+///   columns will appear in nullCount/minValues/maxValues.
 #[internal_api]
 pub(crate) fn collect_stats(
     batch: &RecordBatch,
@@ -539,8 +550,7 @@ mod tests {
     use crate::arrow::array::{Array, AsArray, Int32Array, Int64Array, StringArray};
     use crate::arrow::buffer::NullBuffer;
     use crate::arrow::compute::concat_batches;
-    use crate::arrow::datatypes::{Fields, Schema};
-    use crate::arrow::datatypes::{Int32Type, Int64Type};
+    use crate::arrow::datatypes::{Fields, Int32Type, Int64Type, Schema};
     use crate::engine::arrow_expression::evaluate_expression::to_json;
     use crate::expressions::column_name;
     use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -756,11 +766,27 @@ mod tests {
             .unwrap();
         assert_eq!(value_null_count.value(0), 3);
 
-        // minValues/maxValues should not have "value" field (all nulls)
-        if let Some(min_values) = stats.column_by_name("minValues") {
-            let min_struct = min_values.as_any().downcast_ref::<StructArray>().unwrap();
-            assert!(min_struct.column_by_name("value").is_none());
-        }
+        // All-null columns are present in minValues/maxValues but with null values.
+        // The field must exist so that StatsVerifier can find it via visit_rows and
+        // check nullCount == numRecords. The JSON serializer omits null fields, so
+        // the on-disk format still matches Spark's ignoreNullFields behavior.
+        let min_values = stats
+            .column_by_name("minValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let min_col = min_values.column_by_name("value").unwrap();
+        assert!(min_col.is_null(0));
+
+        let max_values = stats
+            .column_by_name("maxValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let max_col = max_values.column_by_name("value").unwrap();
+        assert!(max_col.is_null(0));
     }
 
     #[test]
@@ -1220,7 +1246,8 @@ mod tests {
         //
         // Expected behavior (struct nulls propagate to children):
         // - a: visible values are [2, 3], nullCount = 2 (rows 0, 3 are struct-null)
-        // - b: visible values are [20, None], nullCount = 3 (rows 0, 3 struct-null + row 2 field-null)
+        // - b: visible values are [20, None], nullCount = 3 (rows 0, 3 struct-null + row 2
+        //   field-null)
         // - a: min=2, max=3
         // - b: min=20, max=20
 

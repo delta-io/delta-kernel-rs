@@ -3,14 +3,14 @@
 use std::slice;
 use std::str::FromStr;
 
+use delta_kernel_derive::internal_api;
+use url::Url;
+use uuid::Uuid;
+
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, Version};
-use delta_kernel_derive::internal_api;
-
-use url::Url;
-use uuid::Uuid;
 
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;
@@ -107,7 +107,8 @@ fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> 
 }
 
 impl<Location: AsUrl> ParsedLogPath<Location> {
-    // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is local.
+    // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is
+    // local.
     #[internal_api]
     pub(crate) fn try_from(location: Location) -> DeltaResult<Option<ParsedLogPath<Location>>> {
         let url = location.as_url();
@@ -146,7 +147,8 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             None => return Ok(None),
         };
 
-        // this check determines if we're in the delta log dir, or in the staged commits dir. The check is:
+        // this check determines if we're in the delta log dir, or in the staged commits dir. The
+        // check is:
         // 1. If the dir is named _staged_commits, check if the parent dir is _delta_log, and ensure
         //    no higher level directories are _also_ named _delta_log. If those checks pass we're in
         //    the staged_commits dir
@@ -340,7 +342,6 @@ impl ParsedLogPath<Url> {
     }
 
     /// Create a new ParsedCheckpointPath<Url> for a classic parquet checkpoint file
-    #[allow(dead_code)] // TODO: Remove this once we have a use case for it
     pub(crate) fn new_classic_parquet_checkpoint(
         table_root: &Url,
         version: Version,
@@ -371,7 +372,21 @@ impl ParsedLogPath<Url> {
         Ok(path)
     }
 
+    /// Create a new `ParsedLogPath<Url>` for a version checksum (CRC) file.
+    pub(crate) fn new_crc(table_root: &Url, version: Version) -> DeltaResult<Self> {
+        let filename = format!("{version:020}.crc");
+        let path = Self::create_path(table_root, filename)?;
+        if !matches!(path.file_type, LogPathFileType::Crc) {
+            return Err(Error::internal_error(
+                "ParsedLogPath::new_crc created a non-CRC path",
+            ));
+        }
+        Ok(path)
+    }
+
     /// Create a new ParsedLogPath<Url> for a log compaction file
+    // TODO(#2337): remove allow(dead_code) when log compaction is re-enabled
+    #[allow(dead_code)]
     pub(crate) fn new_log_compaction(
         table_root: &Url,
         start_version: Version,
@@ -431,7 +446,6 @@ impl LogRoot {
     }
 
     /// Create a new staged commit path (absolute path) for the given version.
-    #[allow(unused)] // TODO: Remove this once we remove catalog-managed feature
     pub(crate) fn new_staged_commit_path(
         &self,
         version: Version,
@@ -450,12 +464,13 @@ pub(crate) mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use test_utils::add_commit;
+
     use super::*;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::memory::InMemory;
     use crate::utils::test_utils::assert_result_error_with_message;
-    use object_store::memory::InMemory;
-    use test_utils::add_commit;
 
     impl ParsedLogPath<FileMeta> {
         pub(crate) fn create_parsed_published_commit(table_root: &Url, version: Version) -> Self {
@@ -465,7 +480,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::Commit);
@@ -482,7 +497,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::StagedCommit);
@@ -496,7 +511,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::Crc);
@@ -1027,11 +1042,12 @@ pub(crate) mod tests {
     async fn test_read_in_commit_timestamp_success() {
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
-        let table_url = url::Url::parse("memory://test/").unwrap();
+        let table_root = "memory://test/";
+        let table_url = url::Url::parse(table_root).unwrap();
 
         // Create a commit file with ICT using add_commit
         let commit_content = r#"{"commitInfo":{"timestamp":1000,"inCommitTimestamp":2000},"protocol":{"minReaderVersion":3,"minWriterVersion":7,"writerFeatures":["inCommitTimestamp"]},"metaData":{"id":"test","schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true}]}"}}"#;
-        add_commit(store.as_ref(), 0, commit_content.to_string())
+        add_commit(table_root, store.as_ref(), 0, commit_content.to_string())
             .await
             .unwrap();
 
@@ -1056,11 +1072,12 @@ pub(crate) mod tests {
     async fn test_read_in_commit_timestamp_missing_ict() {
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store.clone()).build();
-        let table_url = url::Url::parse("memory://test/").unwrap();
+        let table_root = "memory://test/";
+        let table_url = url::Url::parse(table_root).unwrap();
 
         // Create a commit file without ICT
         let commit_content = r#"{"commitInfo":{"timestamp":1000},"protocol":{"minReaderVersion":3,"minWriterVersion":7},"metaData":{"id":"test","schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true}]}"}}"#;
-        add_commit(store.as_ref(), 0, commit_content.to_string())
+        add_commit(table_root, store.as_ref(), 0, commit_content.to_string())
             .await
             .unwrap();
 

@@ -1,5 +1,8 @@
 //! # Log Compaction
 //!
+//! **NOTE:** Log compaction is currently disabled on both reads and writes due to
+//! insufficient integration test coverage. See issue #2337 for re-enablement tracking.
+//!
 //! This module provides an API for writing log compaction files that aggregate
 //! multiple commit JSON files into single compacted files. This improves performance
 //! by reducing the number of individual log files that need to be processed during
@@ -7,18 +10,19 @@
 //!
 //! ## Overview
 //!
-//! Log compaction creates files with the naming pattern `{start_version}.{end_version}.compacted.json`
-//! that contain the reconciled actions from all commit files in the specified version range.
-//! Only commit/compaction files that intersect with [start_version, end_version] are processed.
-//! Note that `end_version` must be greater than `start_version` (equal versions are not allowed).
-//! This is similar to checkpoints but operates on a subset of versions rather than the entire table.
+//! Log compaction creates files with the naming pattern
+//! `{start_version}.{end_version}.compacted.json` that contain the reconciled actions from all
+//! commit files in the specified version range. Only commit/compaction files that intersect with
+//! [start_version, end_version] are processed. Note that `end_version` must be greater than
+//! `start_version` (equal versions are not allowed). This is similar to checkpoints but operates on
+//! a subset of versions rather than the entire table.
 //!
 //! ## Usage
 //!
 //! The log compaction API follows a similar pattern to the checkpoint API:
 //!
-//! 1. Create a [`LogCompactionWriter`] using [`crate::Snapshot::log_compaction_writer`] to compact the log
-//!    from a given start_version to end_version (inclusive)
+//! 1. Create a [`LogCompactionWriter`] using [`crate::Snapshot::log_compaction_writer`] to compact
+//!    the log from a given start_version to end_version (inclusive)
 //! 2. Get the compaction path from [`LogCompactionWriter::compaction_path`]
 //! 3. Get the compaction data from [`LogCompactionWriter::compaction_data`]
 //! 4. Write the data to the path in cloud storage (engine-specific)

@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 
+use super::scan_file::{CdfScanFile, CdfScanFileType};
+use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME};
 use crate::expressions::Scalar;
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{DeltaResult, Error, ExpressionRef};
-
-use super::scan_file::{CdfScanFile, CdfScanFileType};
-use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME};
 
 /// Gets CDF metadata columns from the logical schema and scan file.
 ///
@@ -26,7 +25,8 @@ fn get_cdf_columns(
             Some((idx, (name, value)))
         }
         (Some(_), CdfScanFileType::Cdc) | (None, _) => {
-            // Cdc files contain the `change_type_` column physically, so we do not insert a metadata-derived value
+            // Cdc files contain the `change_type_` column physically, so we do not insert a
+            // metadata-derived value
             None
         }
     };
@@ -63,7 +63,8 @@ pub(crate) fn scan_file_physical_schema(
     if scan_file.scan_type == CdfScanFileType::Cdc {
         let change_type = StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING);
         let fields = physical_schema.fields().cloned().chain(Some(change_type));
-        // NOTE: We don't validate the fields again because CHANGE_TYPE_COL_NAME should never be used anywhere else
+        // NOTE: We don't validate the fields again because CHANGE_TYPE_COL_NAME should never be
+        // used anywhere else
         StructType::new_unchecked(fields).into()
     } else {
         physical_schema.clone().into()
@@ -126,6 +127,9 @@ pub(crate) fn get_cdf_transform_expr(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use super::*;
     use crate::expressions::Expression;
     use crate::scan::state::DvInfo;
@@ -134,8 +138,6 @@ mod tests {
     use crate::scan::PhysicalPredicate;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
-    use std::collections::HashMap;
-    use std::sync::Arc;
 
     fn create_test_logical_schema() -> SchemaRef {
         Arc::new(StructType::new_unchecked(vec![
@@ -185,7 +187,6 @@ mod tests {
             transform_spec: Some(Arc::new(transform_spec)),
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            logical_stats_schema: None,
             physical_partition_schema: None,
         }
     }
@@ -407,7 +408,6 @@ mod tests {
             transform_spec: Some(Arc::new(transform_spec)),
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
-            logical_stats_schema: None,
             physical_partition_schema: None,
         };
 

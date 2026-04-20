@@ -4,15 +4,15 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
+use super::super::arrow_conversion::kernel_metadata_to_arrow_metadata;
+use super::super::arrow_utils::make_arrow_error;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
 };
-use crate::arrow::datatypes::Schema as ArrowSchema;
-use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
-
-use super::super::arrow_conversion::kernel_metadata_to_arrow_metadata;
-use super::super::arrow_utils::make_arrow_error;
-use crate::engine::ensure_data_types::ensure_data_types;
+use crate::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
+use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{ArrayType, DataType, MapType, Schema, StructField};
@@ -192,7 +192,7 @@ pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResul
         Array(atype) => Arc::new(apply_schema_to_list(array, atype)?),
         Map(mtype) => Arc::new(apply_schema_to_map(array, mtype)?),
         _ => {
-            ensure_data_types(schema, array.data_type(), true)?;
+            ensure_data_types(schema, array.data_type(), ValidationMode::Full)?;
             array.clone()
         }
     };
@@ -201,10 +201,9 @@ pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResul
 
 #[cfg(test)]
 mod apply_schema_validation_tests {
-    use super::*;
-
     use std::sync::Arc;
 
+    use super::*;
     use crate::arrow::array::{Int32Array, StructArray};
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
     use crate::arrow::datatypes::{

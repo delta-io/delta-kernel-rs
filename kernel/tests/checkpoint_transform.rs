@@ -17,13 +17,12 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel::expressions::{column_expr, Scalar};
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::DeltaResult;
-use delta_kernel::Snapshot;
-
-use object_store::memory::InMemory;
-use object_store::path::Path;
-use object_store::ObjectStore;
+use delta_kernel::{DeltaResult, Expression, Snapshot};
 use serde_json::json;
 use test_utils::{insert_data, read_scan, write_batch_to_table};
 use url::Url;
@@ -35,7 +34,7 @@ fn new_in_memory_store() -> (Arc<InMemory>, Url) {
 
 /// Writes a JSON commit file to the store.
 async fn write_commit(store: &Arc<InMemory>, content: &str, version: u64) -> DeltaResult<()> {
-    let path = Path::from(format!("_delta_log/{version:020}.json", version = version));
+    let path = Path::from(format!("_delta_log/{version:020}.json"));
     store.put(&path, content.to_string().into()).await?;
     Ok(())
 }
@@ -75,7 +74,7 @@ fn build_commit(
                 "writerFeatures": []
             }
         });
-        format!("{}\n{}", protocol, metadata)
+        format!("{protocol}\n{metadata}")
     } else {
         metadata.to_string()
     }
@@ -263,8 +262,11 @@ async fn test_checkpoint_partitioned_with_real_data(
         engine.as_ref(),
         batch,
         HashMap::from([
-            ("created_at".to_string(), "2024-01-15 10:30:00".to_string()),
-            ("tag".to_string(), "hello".to_string()),
+            (
+                "created_at".to_string(),
+                Scalar::Timestamp(1_705_314_600_000_000),
+            ),
+            ("tag".to_string(), Scalar::Binary(b"hello".to_vec())),
         ]),
     )
     .await?;
@@ -292,9 +294,9 @@ async fn test_checkpoint_partitioned_with_real_data(
         HashMap::from([
             (
                 "created_at".to_string(),
-                "2025-03-01 09:15:30.123456".to_string(),
+                Scalar::Timestamp(1_740_820_530_123_456),
             ),
-            ("tag".to_string(), "world".to_string()),
+            ("tag".to_string(), Scalar::Binary(b"world".to_vec())),
         ]),
     )
     .await?;
@@ -454,7 +456,7 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
             "createdTime": 1587968585495i64
         }
     });
-    write_commit(&store, &format!("{}\n{}", protocol, metadata), 0).await?;
+    write_commit(&store, &format!("{protocol}\n{metadata}"), 0).await?;
 
     // Version 1: write data for partition category=books
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
@@ -472,7 +474,7 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
         &snapshot,
         engine.as_ref(),
         batch,
-        HashMap::from([("category".to_string(), "books".to_string())]),
+        HashMap::from([("category".to_string(), Scalar::String("books".into()))]),
     )
     .await?;
 
@@ -526,6 +528,99 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
     let batches = read_scan(&scan, engine.clone())?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2);
+
+    Ok(())
+}
+
+const WIDE_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"age","type":"long","nullable":true,"metadata":{}}]}"#;
+
+/// Regression test for https://github.com/delta-io/delta-kernel-rs/issues/2165
+///
+/// When a schema-evolved table has a checkpoint with stats_parsed covering only the
+/// pre-evolution columns, scanning with a predicate on a newly added column should
+/// not panic. The missing stats column should be treated as unknown (no data skipping).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, table_root) = new_in_memory_store();
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(executor)
+            .build(),
+    );
+
+    // Version 0: protocol + metadata with schema [id, name], stats as struct enabled
+    write_commit(
+        &store,
+        &build_commit(NON_PARTITIONED_SCHEMA, &[], true, true, true),
+        0,
+    )
+    .await?;
+
+    // Version 1: write data with [id, name]
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    let result = insert_data(
+        snapshot,
+        &engine,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+        ],
+    )
+    .await?;
+    assert!(result.is_committed());
+
+    // Checkpoint at V1: stats_parsed covers only [id, name]
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref())?;
+
+    // Version 2: schema evolution - add `age` column via new metadata action
+    write_commit(
+        &store,
+        &build_commit(WIDE_SCHEMA, &[], true, true, false),
+        2,
+    )
+    .await?;
+
+    // Version 3: write data with [id, name, age]
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    let result = insert_data(
+        snapshot,
+        &engine,
+        vec![
+            Arc::new(Int64Array::from(vec![4, 5, 6])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["Diana", "Eve", "Frank"])),
+            Arc::new(Int64Array::from(vec![25, 35, 45])),
+        ],
+    )
+    .await?;
+    assert!(result.is_committed());
+
+    // Scan with predicate on `id` (present in checkpoint stats_parsed) should work
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    let predicate = Arc::new(column_expr!("id").gt(Expression::literal(2i64)));
+    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    let batches = read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows > 0, "should return rows matching id > 2");
+
+    // Scan with predicate on `age` (missing from checkpoint stats_parsed) should NOT panic.
+    // The kernel should handle the missing stats column gracefully.
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+    let predicate = Arc::new(column_expr!("age").gt(Expression::literal(30i64)));
+    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    let batches = read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    // The predicate is used for data skipping only (not row-level filtering).
+    // All 6 rows should be returned since data skipping cannot skip any files:
+    // V1 data has no stats for `age`, and V3 data's age range includes values > 30.
+    assert_eq!(
+        total_rows, 6,
+        "all rows returned when data skipping cannot filter"
+    );
 
     Ok(())
 }

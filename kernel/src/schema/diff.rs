@@ -7,8 +7,9 @@
 // This module is not used outside the diff subsystem; suppress unused-code warnings.
 #![allow(dead_code)]
 
-use super::{ColumnMetadataKey, ColumnName, DataType, MetadataValue, StructField, StructType};
 use std::collections::{HashMap, HashSet};
+
+use super::{ColumnMetadataKey, ColumnName, DataType, MetadataValue, StructField, StructType};
 
 /// Represents the difference between two schemas
 #[derive(Debug, Clone, PartialEq)]
@@ -108,7 +109,8 @@ impl SchemaDiff {
         self.added_fields.len() + self.removed_fields.len() + self.updated_fields.len()
     }
 
-    /// Returns true if there are any breaking changes (removed fields, type changes, or tightened nullability)
+    /// Returns true if there are any breaking changes (removed fields, type changes, or tightened
+    /// nullability)
     pub(crate) fn has_breaking_changes(&self) -> bool {
         self.breaking_changes
     }
@@ -193,7 +195,8 @@ struct FieldWithPath {
 /// * `after` - The after/new schema to compare against
 ///
 /// # Returns
-/// A `SchemaDiff` describing all changes including nested fields, or an error if the schemas are invalid
+/// A `SchemaDiff` describing all changes including nested fields, or an error if the schemas are
+/// invalid
 fn compute_schema_diff(
     before: &StructType,
     after: &StructType,
@@ -601,8 +604,10 @@ fn check_field_nullability_change(
 /// Checks for container nullability changes.
 ///
 /// Returns:
-/// - `Some(FieldChangeType::ContainerNullabilityLoosened)` if nullability was relaxed (false -> true)
-/// - `Some(FieldChangeType::ContainerNullabilityTightened)` if nullability was restricted (true -> false)
+/// - `Some(FieldChangeType::ContainerNullabilityLoosened)` if nullability was relaxed (false ->
+///   true)
+/// - `Some(FieldChangeType::ContainerNullabilityTightened)` if nullability was restricted (true ->
+///   false)
 /// - `None` if nullability didn't change
 fn check_container_nullability_change(
     before_nullable: bool,
@@ -618,14 +623,17 @@ fn check_container_nullability_change(
 /// Classifies a type change between two data types.
 ///
 /// Returns:
-/// - A `Vec<FieldChangeType>` containing all changes detected (type changed or container nullability changed)
+/// - A `Vec<FieldChangeType>` containing all changes detected (type changed or container
+///   nullability changed)
 /// - An empty vec if the types are the same container with nested changes handled elsewhere
 ///
 /// This function handles the following cases:
-/// 1. **Struct containers**: Changes to nested fields are captured via field IDs, so return empty vec
+/// 1. **Struct containers**: Changes to nested fields are captured via field IDs, so return empty
+///    vec
 /// 2. **Array containers**:
 ///    - If element types match and only nullability changed, return the specific nullability change
-///    - If element types are both structs with same nullability, nested changes handled via field IDs (return empty vec)
+///    - If element types are both structs with same nullability, nested changes handled via field
+///      IDs (return empty vec)
 ///    - Otherwise, it's a type change
 /// 3. **Map containers**: Similar logic to arrays, but for both key and value types
 /// 4. **Different container types or primitives**: Type change
@@ -728,9 +736,10 @@ fn has_metadata_changes(before: &StructField, after: &StructField) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
-    use std::collections::HashSet;
 
     fn create_field_with_id(
         name: &str,
@@ -742,7 +751,7 @@ mod tests {
             ("delta.columnMapping.id", MetadataValue::Number(id)),
             (
                 "delta.columnMapping.physicalName",
-                MetadataValue::String(format!("col_{}", id)),
+                MetadataValue::String(format!("col_{id}")),
             ),
         ])
     }
@@ -952,7 +961,8 @@ mod tests {
 
     #[test]
     fn test_multiple_with_breaking_change() {
-        // Test that Multiple changes are correctly identified as breaking when they contain breaking changes
+        // Test that Multiple changes are correctly identified as breaking when they contain
+        // breaking changes
         let before = StructType::new_unchecked([create_field_with_id(
             "user_name",
             DataType::STRING,
@@ -1092,7 +1102,8 @@ mod tests {
         assert_eq!(diff.added_fields[0].path, ColumnName::new(["user"]));
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 0);
-        // The filtered paths would have been: user.name, user.email, user.address, user.address.street, user.address.city
+        // The filtered paths would have been: user.name, user.email, user.address,
+        // user.address.street, user.address.city
         assert!(diff.has_breaking_changes()); // Adding non-nullable struct field is breaking
 
         // CASE 2: Removing a parent struct - only parent should be reported, not nested fields
@@ -1138,7 +1149,8 @@ mod tests {
 
     #[test]
     fn test_container_with_nested_changes_not_reported_as_type_change() {
-        // Test that when a struct's nested fields change, the struct itself isn't reported as TypeChanged
+        // Test that when a struct's nested fields change, the struct itself isn't reported as
+        // TypeChanged
         let before = StructType::new_unchecked([create_field_with_id(
             "user",
             DataType::try_struct_type([
@@ -1335,7 +1347,8 @@ mod tests {
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
 
-        // Should see: existing changed, existing_struct changed, existing_struct.old_name->new_name renamed, new_struct added
+        // Should see: existing changed, existing_struct changed, existing_struct.old_name->new_name
+        // renamed, new_struct added
         assert_eq!(diff.added_fields.len(), 1);
         assert_eq!(diff.added_fields[0].path, ColumnName::new(["new_struct"]));
 
@@ -1435,21 +1448,33 @@ mod tests {
             1,
         )]);
 
-        let after = StructType::new_unchecked([create_field_with_id(
-            "level1",
-            DataType::try_struct_type([create_field_with_id(
-                "level2",
-                DataType::try_struct_type([
-                    create_field_with_id("very_deep_field", DataType::STRING, false, 3), // Renamed!
-                ])
-                .unwrap(),
-                false,
-                2,
-            )])
-            .unwrap(),
-            false,
-            1,
-        )]);
+        let after =
+            StructType::new_unchecked([
+                create_field_with_id(
+                    "level1",
+                    DataType::try_struct_type(
+                        [
+                            create_field_with_id(
+                                "level2",
+                                DataType::try_struct_type([
+                                    create_field_with_id(
+                                        "very_deep_field",
+                                        DataType::STRING,
+                                        false,
+                                        3,
+                                    ), // Renamed!
+                                ])
+                                .unwrap(),
+                                false,
+                                2,
+                            ),
+                        ],
+                    )
+                    .unwrap(),
+                    false,
+                    1,
+                ),
+            ]);
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
         assert_eq!(diff.added_fields.len(), 0);
@@ -1626,7 +1651,8 @@ mod tests {
 
     #[test]
     fn test_doubly_nested_array_type_change() {
-        // Test that we can detect type changes in doubly nested arrays: array<array<int>> -> array<array<double>>
+        // Test that we can detect type changes in doubly nested arrays: array<array<int>> ->
+        // array<array<double>>
         let before = StructType::new_unchecked([create_field_with_id(
             "matrix",
             DataType::Array(Box::new(ArrayType::new(
@@ -1774,7 +1800,7 @@ mod tests {
         let before = StructType::new_unchecked([create_field_with_id(
             "matrix",
             DataType::Array(Box::new(ArrayType::new(
-                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))), // Inner elements non-nullable
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))), /* Inner elements non-nullable */
                 false,
             ))),
             false,
@@ -1784,7 +1810,7 @@ mod tests {
         let after = StructType::new_unchecked([create_field_with_id(
             "matrix",
             DataType::Array(Box::new(ArrayType::new(
-                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))), // Inner elements now nullable
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))), /* Inner elements now nullable */
                 false,
             ))),
             false,
@@ -1811,7 +1837,7 @@ mod tests {
         let before = StructType::new_unchecked([create_field_with_id(
             "matrix",
             DataType::Array(Box::new(ArrayType::new(
-                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))), // Inner elements nullable
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))), /* Inner elements nullable */
                 false,
             ))),
             false,
@@ -1821,7 +1847,7 @@ mod tests {
         let after = StructType::new_unchecked([create_field_with_id(
             "matrix",
             DataType::Array(Box::new(ArrayType::new(
-                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))), // Inner elements now non-nullable
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))), /* Inner elements now non-nullable */
                 false,
             ))),
             false,
@@ -1845,14 +1871,15 @@ mod tests {
     fn test_array_nullability_loosened() {
         let before = StructType::new_unchecked([create_field_with_id(
             "items",
-            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))), // Non-nullable elements
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))), /* Non-nullable
+                                                                                 * elements */
             false,
             1,
         )]);
 
         let after = StructType::new_unchecked([create_field_with_id(
             "items",
-            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))), // Nullable elements now
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))), /* Nullable elements now */
             false,
             1,
         )]);
@@ -2135,14 +2162,15 @@ mod tests {
         // After: items: array<int> (elements nullable, type changed)
         let before = StructType::new_unchecked([create_field_with_id(
             "items",
-            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))), // Non-nullable elements
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))), /* Non-nullable
+                                                                                 * elements */
             false,
             1,
         )]);
 
         let after = StructType::new_unchecked([create_field_with_id(
             "items",
-            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))), // Nullable, type changed
+            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))), /* Nullable, type changed */
             false,
             1,
         )]);
@@ -2242,31 +2270,50 @@ mod tests {
             1,
         )]);
 
-        let after = StructType::new_unchecked([create_field_with_id(
-            "data",
-            DataType::try_struct_type([create_field_with_id(
-                "items",
-                DataType::Array(Box::new(ArrayType::new(
-                    DataType::try_struct_type([create_field_with_id(
-                        "inner",
-                        DataType::try_struct_type([
-                            create_field_with_id("renamed_a", DataType::INTEGER, false, 3), // Renamed!
-                            create_field_with_id("added", DataType::LONG, true, 6), // Added!
-                        ])
-                        .unwrap(),
-                        false,
-                        2,
-                    )])
-                    .unwrap(),
+        let after =
+            StructType::new_unchecked([create_field_with_id(
+                "data",
+                DataType::try_struct_type([create_field_with_id(
+                    "items",
+                    DataType::Array(
+                        Box::new(
+                            ArrayType::new(
+                                DataType::try_struct_type(
+                                    [
+                                        create_field_with_id(
+                                            "inner",
+                                            DataType::try_struct_type([
+                                                create_field_with_id(
+                                                    "renamed_a",
+                                                    DataType::INTEGER,
+                                                    false,
+                                                    3,
+                                                ), // Renamed!
+                                                create_field_with_id(
+                                                    "added",
+                                                    DataType::LONG,
+                                                    true,
+                                                    6,
+                                                ), // Added!
+                                            ])
+                                            .unwrap(),
+                                            false,
+                                            2,
+                                        ),
+                                    ],
+                                )
+                                .unwrap(),
+                                false,
+                            ),
+                        ),
+                    ),
                     false,
-                ))),
+                    5,
+                )])
+                .unwrap(),
                 false,
-                5,
-            )])
-            .unwrap(),
-            false,
-            1,
-        )]);
+                1,
+            )]);
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
 
@@ -2322,29 +2369,39 @@ mod tests {
             1,
         )]);
 
-        let after = StructType::new_unchecked([create_field_with_id(
-            "lookup",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::try_struct_type([create_field_with_id(
-                    "nested",
-                    DataType::Map(Box::new(MapType::new(
-                        DataType::INTEGER,
-                        DataType::try_struct_type([
-                            create_field_with_id("renamed_x", DataType::INTEGER, false, 3), // Renamed!
-                        ])
-                        .unwrap(),
+        let after =
+            StructType::new_unchecked([create_field_with_id(
+                "lookup",
+                DataType::Map(Box::new(MapType::new(
+                    DataType::STRING,
+                    DataType::try_struct_type([create_field_with_id(
+                        "nested",
+                        DataType::Map(
+                            Box::new(
+                                MapType::new(
+                                    DataType::INTEGER,
+                                    DataType::try_struct_type([
+                                        create_field_with_id(
+                                            "renamed_x",
+                                            DataType::INTEGER,
+                                            false,
+                                            3,
+                                        ), // Renamed!
+                                    ])
+                                    .unwrap(),
+                                    false,
+                                ),
+                            ),
+                        ),
                         false,
-                    ))),
+                        2,
+                    )])
+                    .unwrap(),
                     false,
-                    2,
-                )])
-                .unwrap(),
+                ))),
                 false,
-            ))),
-            false,
-            1,
-        )]);
+                1,
+            )]);
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
 
@@ -2384,22 +2441,43 @@ mod tests {
             1,
         )]);
 
-        let after = StructType::new_unchecked([create_field_with_id(
-            "matrix",
-            DataType::Array(Box::new(ArrayType::new(
-                DataType::Array(Box::new(ArrayType::new(
-                    DataType::try_struct_type([
-                        create_field_with_id("renamed_x", DataType::INTEGER, false, 2), // Renamed!
-                        create_field_with_id("y", DataType::INTEGER, true, 3),          // Added!
-                    ])
-                    .unwrap(),
+        let after =
+            StructType::new_unchecked([
+                create_field_with_id(
+                    "matrix",
+                    DataType::Array(
+                        Box::new(
+                            ArrayType::new(
+                                DataType::Array(
+                                    Box::new(
+                                        ArrayType::new(
+                                            DataType::try_struct_type([
+                                                create_field_with_id(
+                                                    "renamed_x",
+                                                    DataType::INTEGER,
+                                                    false,
+                                                    2,
+                                                ), // Renamed!
+                                                create_field_with_id(
+                                                    "y",
+                                                    DataType::INTEGER,
+                                                    true,
+                                                    3,
+                                                ), // Added!
+                                            ])
+                                            .unwrap(),
+                                            false,
+                                        ),
+                                    ),
+                                ),
+                                false,
+                            ),
+                        ),
+                    ),
                     false,
-                ))),
-                false,
-            ))),
-            false,
-            1,
-        )]);
+                    1,
+                ),
+            ]);
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
 
@@ -2453,28 +2531,43 @@ mod tests {
             1,
         )]);
 
-        let after = StructType::new_unchecked([create_field_with_id(
-            "complex_map",
-            DataType::Map(Box::new(MapType::new(
-                DataType::Array(Box::new(ArrayType::new(
-                    DataType::try_struct_type([
-                        create_field_with_id("renamed_key_field", DataType::INTEGER, false, 2), // Renamed!
-                    ])
-                    .unwrap(),
-                    false,
-                ))),
-                DataType::Array(Box::new(ArrayType::new(
-                    DataType::try_struct_type([
-                        create_field_with_id("renamed_value_field", DataType::STRING, false, 3), // Renamed!
-                    ])
-                    .unwrap(),
+        let after =
+            StructType::new_unchecked([create_field_with_id(
+                "complex_map",
+                DataType::Map(Box::new(MapType::new(
+                    DataType::Array(Box::new(
+                        ArrayType::new(
+                            DataType::try_struct_type([
+                                create_field_with_id(
+                                    "renamed_key_field",
+                                    DataType::INTEGER,
+                                    false,
+                                    2,
+                                ), // Renamed!
+                            ])
+                            .unwrap(),
+                            false,
+                        ),
+                    )),
+                    DataType::Array(Box::new(
+                        ArrayType::new(
+                            DataType::try_struct_type([
+                                create_field_with_id(
+                                    "renamed_value_field",
+                                    DataType::STRING,
+                                    false,
+                                    3,
+                                ), // Renamed!
+                            ])
+                            .unwrap(),
+                            false,
+                        ),
+                    )),
                     false,
                 ))),
                 false,
-            ))),
-            false,
-            1,
-        )]);
+                1,
+            )]);
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
 
@@ -2532,36 +2625,57 @@ mod tests {
             1,
         )]);
 
-        let after = StructType::new_unchecked([create_field_with_id(
-            "nested_maps",
-            DataType::Map(Box::new(MapType::new(
-                DataType::try_struct_type([create_field_with_id(
-                    "renamed_outer_key", // Renamed!
-                    DataType::INTEGER,
+        let after =
+            StructType::new_unchecked([
+                create_field_with_id(
+                    "nested_maps",
+                    DataType::Map(
+                        Box::new(
+                            MapType::new(
+                                DataType::try_struct_type([create_field_with_id(
+                                    "renamed_outer_key", // Renamed!
+                                    DataType::INTEGER,
+                                    false,
+                                    2,
+                                )])
+                                .unwrap(),
+                                DataType::Map(
+                                    Box::new(
+                                        MapType::new(
+                                            DataType::try_struct_type([create_field_with_id(
+                                                "renamed_inner_key", // Renamed!
+                                                DataType::INTEGER,
+                                                false,
+                                                3,
+                                            )])
+                                            .unwrap(),
+                                            DataType::try_struct_type([
+                                                create_field_with_id(
+                                                    "renamed_data",
+                                                    DataType::STRING,
+                                                    false,
+                                                    4,
+                                                ), // Renamed!
+                                                create_field_with_id(
+                                                    "added",
+                                                    DataType::LONG,
+                                                    true,
+                                                    6,
+                                                ), // Added!
+                                            ])
+                                            .unwrap(),
+                                            false,
+                                        ),
+                                    ),
+                                ),
+                                false,
+                            ),
+                        ),
+                    ),
                     false,
-                    2,
-                )])
-                .unwrap(),
-                DataType::Map(Box::new(MapType::new(
-                    DataType::try_struct_type([create_field_with_id(
-                        "renamed_inner_key", // Renamed!
-                        DataType::INTEGER,
-                        false,
-                        3,
-                    )])
-                    .unwrap(),
-                    DataType::try_struct_type([
-                        create_field_with_id("renamed_data", DataType::STRING, false, 4), // Renamed!
-                        create_field_with_id("added", DataType::LONG, true, 6),           // Added!
-                    ])
-                    .unwrap(),
-                    false,
-                ))),
-                false,
-            ))),
-            false,
-            1,
-        )]);
+                    1,
+                ),
+            ]);
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
 
@@ -2602,7 +2716,8 @@ mod tests {
 
     #[test]
     fn test_deeply_nested_nullability_tightening_is_breaking() {
-        // array<struct<items: array<struct<value int nullable>>>> -> array<struct<items: array<struct<value int not null>>>>
+        // array<struct<items: array<struct<value int nullable>>>> -> array<struct<items:
+        // array<struct<value int not null>>>>
         let before = StructType::new_unchecked([create_field_with_id(
             "wrapper",
             DataType::Array(Box::new(ArrayType::new(
@@ -2625,27 +2740,39 @@ mod tests {
             1,
         )]);
 
-        let after = StructType::new_unchecked([create_field_with_id(
-            "wrapper",
-            DataType::Array(Box::new(ArrayType::new(
-                DataType::try_struct_type([create_field_with_id(
-                    "items",
-                    DataType::Array(Box::new(ArrayType::new(
-                        DataType::try_struct_type([
-                            create_field_with_id("value", DataType::INTEGER, false, 3), // Non-nullable now - BREAKING!
-                        ])
-                        .unwrap(),
-                        false,
-                    ))),
+        let after =
+            StructType::new_unchecked([create_field_with_id(
+                "wrapper",
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([
+                        create_field_with_id(
+                            "items",
+                            DataType::Array(
+                                Box::new(
+                                    ArrayType::new(
+                                        DataType::try_struct_type([
+                                            create_field_with_id(
+                                                "value",
+                                                DataType::INTEGER,
+                                                false,
+                                                3,
+                                            ), // Non-nullable now - BREAKING!
+                                        ])
+                                        .unwrap(),
+                                        false,
+                                    ),
+                                ),
+                            ),
+                            false,
+                            2,
+                        ),
+                    ])
+                    .unwrap(),
                     false,
-                    2,
-                )])
-                .unwrap(),
+                ))),
                 false,
-            ))),
-            false,
-            1,
-        )]);
+                1,
+            )]);
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
 
@@ -2665,7 +2792,8 @@ mod tests {
 
     #[test]
     fn test_deeply_nested_container_nullability_tightening_is_breaking() {
-        // array<struct<items: array<struct<value int> nullable>>> -> array<struct<items: array<struct<value int> not null>>>
+        // array<struct<items: array<struct<value int> nullable>>> -> array<struct<items:
+        // array<struct<value int> not null>>>
         let before = StructType::new_unchecked([create_field_with_id(
             "wrapper",
             DataType::Array(Box::new(ArrayType::new(

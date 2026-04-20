@@ -5,24 +5,25 @@
 //! [`Crc::apply`] advances a CRC forward one commit at a time by applying a delta.
 //!
 //! A CRC tracks two categories of fields, updated differently:
-//! - **Metadata fields** (protocol, metadata, domain metadata, in-commit timestamp, and
-//!   eventually set transactions): always kept up-to-date -- every `apply` unconditionally
-//!   merges these from the delta.
+//! - **Metadata fields** (protocol, metadata, domain metadata, set transactions, in-commit
+//!   timestamp): always kept up-to-date -- every `apply` unconditionally merges these from the
+//!   delta.
 //! - **File stats** (`num_files`, `table_size_bytes`): only updated when the current
-//!   [`FileStatsValidity`] is not terminal and the commit's operation is incremental-safe.
-//!   Once validity degrades (e.g. a non-incremental operation like ANALYZE STATS, or a
-//!   missing file size), file stats stop updating for the lifetime of that CRC.
+//!   [`FileStatsValidity`] is not terminal and the commit's operation is incremental-safe. Once
+//!   validity degrades (e.g. a non-incremental operation like ANALYZE STATS, or a missing file
+//!   size), file stats stop updating for the lifetime of that CRC.
 
-use crate::actions::{DomainMetadata, Metadata, Protocol};
+use tracing::warn;
 
 use super::file_stats::FileStatsDelta;
 use super::{Crc, FileStatsValidity};
+use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 
 /// The CRC-relevant changes ("delta") from a single commit. Produced either by reading a
 /// `.json` commit file during log replay, or from in-memory transaction state during writes.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CrcDelta {
-    /// Net file count and size changes.
+    /// Net file count, size changes and histograms.
     pub(crate) file_stats: FileStatsDelta,
     /// New protocol action, if this commit changed it.
     pub(crate) protocol: Option<Protocol>,
@@ -31,6 +32,9 @@ pub(crate) struct CrcDelta {
     /// All DM actions in this commit (additions and removals). `apply()` only processes these
     /// when the base CRC's `domain_metadata` is `Some` (tracked).
     pub(crate) domain_metadata_changes: Vec<DomainMetadata>,
+    /// All SetTransaction actions in this commit. `apply()` only processes these when the base
+    /// CRC's `set_transactions` is `Some` (tracked).
+    pub(crate) set_transaction_changes: Vec<SetTransaction>,
     /// In-commit timestamp, if present in this commit.
     pub(crate) in_commit_timestamp: Option<i64>,
     /// Must be `Some` with an incremental-safe value for file stats to update. `None` or
@@ -59,6 +63,25 @@ impl CrcDelta {
                 .map(|dm| (dm.domain().to_string(), dm))
                 .collect(),
         );
+        // CREATE TABLE starts with a known-complete set of transactions (possibly empty),
+        // so we always track them.
+        let set_transactions = Some(
+            self.set_transaction_changes
+                .into_iter()
+                .map(|txn| (txn.app_id.clone(), txn))
+                .collect(),
+        );
+        // For version zero the delta IS the full table histogram. Validate that all bins
+        // are non-negative (a real table can't have negative file counts). If validation
+        // fails, drop the histogram.
+        let initial_histogram = self.file_stats.net_histogram.and_then(|delta| {
+            delta
+                .check_non_negative()
+                .inspect_err(|e| {
+                    warn!("Non-negative file count check failed, dropping file size histogram for version zero: {e}");
+                })
+                .ok()
+        });
         Some(Crc {
             table_size_bytes: self.file_stats.net_bytes,
             num_files: self.file_stats.net_files,
@@ -67,7 +90,9 @@ impl CrcDelta {
             protocol,
             metadata,
             domain_metadata,
+            set_transactions,
             in_commit_timestamp_opt: self.in_commit_timestamp,
+            file_size_histogram: initial_histogram,
             ..Default::default()
         })
     }
@@ -107,12 +132,23 @@ impl Crc {
             }
         }
 
+        // Set transactions: upsert by app_id. Only update if the base CRC tracks set
+        // transactions (Some). If None ("not tracked"), leave it as None.
+        if let Some(map) = &mut self.set_transactions {
+            map.extend(
+                delta
+                    .set_transaction_changes
+                    .into_iter()
+                    .map(|txn| (txn.app_id.clone(), txn)),
+            );
+        }
+
         // In-commit timestamp: unconditional replace (not guarded by `if let Some`).
         // If ICT was disabled after being enabled, the delta carries None, which correctly
         // clears the previous value.
         self.in_commit_timestamp_opt = delta.in_commit_timestamp;
 
-        // Bail if already Untrackable -- nothing can recover missing file stats.
+        // Bail if already Untrackable -- nothing can recover missing file stats or histograms.
         if self.file_stats_validity == FileStatsValidity::Untrackable {
             return;
         }
@@ -121,6 +157,7 @@ impl Crc {
         // so that Untrackable can never transition to Indeterminate below.
         if delta.has_missing_file_size {
             self.file_stats_validity = FileStatsValidity::Untrackable;
+            self.file_size_histogram = None;
             return;
         }
 
@@ -129,16 +166,38 @@ impl Crc {
             return;
         }
 
-        let is_safe = delta
+        let is_incremental_safe = delta
             .operation
             .as_deref()
             .is_some_and(FileStatsDelta::is_incremental_safe);
-        if !is_safe {
+        if !is_incremental_safe {
             self.file_stats_validity = FileStatsValidity::Indeterminate;
+            self.file_size_histogram = None;
             return;
         }
         self.num_files += delta.file_stats.net_files;
         self.table_size_bytes += delta.file_stats.net_bytes;
+
+        // Histogram: merge base and delta.
+        // Only update if the base CRC has a histogram AND the delta provides one.
+        // If the merge fails (e.g. negative counts from corrupted data) or the delta is
+        // missing a histogram, drop it rather than leaving stale data.
+        if let (Some(base_hist), Some(delta_hist)) = (
+            self.file_size_histogram.as_ref(),
+            &delta.file_stats.net_histogram,
+        ) {
+            match base_hist.try_apply_delta(delta_hist) {
+                Ok(merged) => self.file_size_histogram = Some(merged),
+                Err(e) => {
+                    warn!("Histogram merge failed, dropping file size histogram: {e}");
+                    self.file_size_histogram = None;
+                }
+            }
+        } else if self.file_size_histogram.is_some() {
+            // The base had a histogram but the delta couldn't provide one. Drop it rather than
+            // leaving a stale value.
+            self.file_size_histogram = None;
+        }
     }
 }
 
@@ -146,8 +205,11 @@ impl Crc {
 mod tests {
     use std::collections::HashMap;
 
+    use rstest::rstest;
+
     use super::*;
     use crate::actions::{DomainMetadata, Metadata, Protocol};
+    use crate::crc::FileSizeHistogram;
 
     fn base_crc() -> Crc {
         Crc {
@@ -164,6 +226,7 @@ mod tests {
             file_stats: FileStatsDelta {
                 net_files,
                 net_bytes,
+                ..Default::default()
             },
             operation: Some("WRITE".to_string()),
             ..Default::default()
@@ -220,7 +283,7 @@ mod tests {
         assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
     }
 
-    /// Simulates forward log replay: apply multiple commit deltas sequentially.
+    /// Applies multiple commit deltas sequentially.
     #[test]
     fn test_apply_multiple_deltas() {
         let mut crc = base_crc();
@@ -514,5 +577,303 @@ mod tests {
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
         assert_eq!(crc.in_commit_timestamp_opt, Some(12345));
+    }
+
+    // ===== apply: set transaction tests =====
+
+    #[test]
+    fn test_apply_adds_set_transaction_to_tracked_map() {
+        let mut crc = base_crc();
+        crc.set_transactions = Some(HashMap::new());
+        let txn = SetTransaction::new("my-app".to_string(), 1, Some(1000));
+        let delta = CrcDelta {
+            set_transaction_changes: vec![txn],
+            ..write_delta(0, 0)
+        };
+        crc.apply(delta);
+
+        let map = crc.set_transactions.as_ref().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["my-app"].version, 1);
+        assert_eq!(map["my-app"].last_updated, Some(1000));
+    }
+
+    #[test]
+    fn test_apply_with_untracked_set_transactions_skips_changes() {
+        let mut crc = base_crc();
+        assert!(crc.set_transactions.is_none()); // Not tracked (default)
+        let txn = SetTransaction::new("my-app".to_string(), 1, Some(1000));
+        let delta = CrcDelta {
+            set_transaction_changes: vec![txn],
+            ..write_delta(0, 0)
+        };
+        crc.apply(delta);
+
+        // set_transactions stays None -- apply() must not create a partial map.
+        assert!(crc.set_transactions.is_none());
+    }
+
+    #[test]
+    fn test_apply_upserts_set_transaction() {
+        let mut crc = base_crc();
+        crc.set_transactions = Some(HashMap::from([(
+            "my-app".to_string(),
+            SetTransaction::new("my-app".to_string(), 1, Some(1000)),
+        )]));
+
+        let txn = SetTransaction::new("my-app".to_string(), 2, Some(2000));
+        let delta = CrcDelta {
+            set_transaction_changes: vec![txn],
+            ..write_delta(0, 0)
+        };
+        crc.apply(delta);
+
+        let map = crc.set_transactions.as_ref().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["my-app"].version, 2);
+        assert_eq!(map["my-app"].last_updated, Some(2000));
+    }
+
+    // ===== into_crc_for_version_zero: set transaction tests =====
+
+    #[test]
+    fn test_into_crc_for_version_zero_with_set_transactions() {
+        let txn = SetTransaction::new("my-app".to_string(), 5, Some(3000));
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            set_transaction_changes: vec![txn],
+            ..write_delta(0, 0)
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        let map = crc.set_transactions.as_ref().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["my-app"].version, 5);
+        assert_eq!(map["my-app"].last_updated, Some(3000));
+    }
+
+    #[test]
+    fn test_into_crc_for_version_zero_with_no_set_transactions() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            ..write_delta(0, 0)
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        // Empty map, not None -- we always know the full state at version zero.
+        assert_eq!(crc.set_transactions, Some(HashMap::new()));
+    }
+
+    // ===== Histogram tests =====
+
+    /// Helper: creates a default-boundary histogram populated with the given file sizes.
+    fn histogram_from_sizes(sizes: &[i64]) -> FileSizeHistogram {
+        let mut hist = FileSizeHistogram::create_default();
+        for &size in sizes {
+            hist.insert(size).unwrap();
+        }
+        hist
+    }
+
+    /// Helper: creates a CRC with a histogram containing the given file sizes.
+    fn base_crc_with_histogram(file_sizes: &[i64]) -> Crc {
+        let hist = histogram_from_sizes(file_sizes);
+        Crc {
+            table_size_bytes: file_sizes.iter().sum(),
+            num_files: file_sizes.len() as i64,
+            num_metadata: 1,
+            num_protocol: 1,
+            file_size_histogram: Some(hist),
+            ..Default::default()
+        }
+    }
+
+    /// Helper: creates a CrcDelta with a delta histogram built from adds and removes.
+    fn write_delta_with_histograms(add_sizes: &[i64], remove_sizes: &[i64]) -> CrcDelta {
+        let mut hist = FileSizeHistogram::create_default();
+        for &s in add_sizes {
+            hist.insert(s).unwrap();
+        }
+        for &s in remove_sizes {
+            hist.remove(s).unwrap();
+        }
+        let net_files = add_sizes.len() as i64 - remove_sizes.len() as i64;
+        let net_bytes: i64 = add_sizes.iter().sum::<i64>() - remove_sizes.iter().sum::<i64>();
+        CrcDelta {
+            file_stats: FileStatsDelta {
+                net_files,
+                net_bytes,
+                net_histogram: Some(hist),
+            },
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Histogram bins used in tests (default boundaries):
+    ///   Bin 0: [0, 8KB)     -- e.g. 100, 200, 300, 500
+    ///   Bin 1: [8KB, 16KB)  -- e.g. 10_000
+    ///   Bin 2: [16KB, 32KB) -- e.g. 20_000
+    ///   Bin 10: [4MB, 8MB)  -- e.g. 5_000_000
+    #[rstest]
+    #[case::single_bin(&[100, 200, 300], &[500], &[200], &[(0, 3, 900)])]
+    #[case::adds_only(&[100], &[200, 300], &[], &[(0, 3, 600)])]
+    #[case::removes_only(&[100, 200, 300], &[], &[100, 200], &[(0, 1, 300)])]
+    #[case::empty_delta(&[100, 10_000], &[], &[], &[(0, 1, 100), (1, 1, 10_000)])]
+    #[case::multi_bin(
+        &[100, 10_000, 20_000],
+        &[200, 10_500],
+        &[100, 20_000],
+        &[(0, 1, 200), (1, 2, 20_500), (2, 0, 0)]
+    )]
+    #[case::large_files(
+        &[100, 5_000_000],
+        &[10_000, 5_500_000],
+        &[100],
+        &[(0, 0, 0), (1, 1, 10_000), (10, 2, 10_500_000)]
+    )]
+    fn apply_merges_histogram(
+        #[case] base: &[i64],
+        #[case] add: &[i64],
+        #[case] remove: &[i64],
+        #[case] expected_bins: &[(usize, i64, i64)],
+    ) {
+        let mut crc = base_crc_with_histogram(base);
+        let delta = write_delta_with_histograms(add, remove);
+        crc.apply(delta);
+
+        let hist = crc.file_size_histogram.as_ref().unwrap();
+        for &(bin, count, bytes) in expected_bins {
+            assert_eq!(hist.file_counts[bin], count, "file_counts[{bin}]");
+            assert_eq!(hist.total_bytes[bin], bytes, "total_bytes[{bin}]");
+        }
+    }
+
+    #[rstest]
+    #[case::base_none_delta_none(None)]
+    #[case::base_some_delta_none(Some(vec![100i64, 200]))]
+    fn apply_drops_histogram_when_delta_missing_histogram(#[case] base_files: Option<Vec<i64>>) {
+        let mut crc = match &base_files {
+            Some(sizes) => base_crc_with_histogram(sizes),
+            None => base_crc(),
+        };
+        let delta = CrcDelta {
+            file_stats: FileStatsDelta {
+                net_files: 1,
+                net_bytes: 100,
+                net_histogram: None,
+            },
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
+        };
+        crc.apply(delta);
+        assert!(
+            crc.file_size_histogram.is_none(),
+            "histogram should be None when delta doesn't provide a histogram"
+        );
+    }
+
+    #[test]
+    fn apply_drops_histogram_on_indeterminate() {
+        let mut crc = base_crc_with_histogram(&[100, 200]);
+        let unsafe_delta = CrcDelta {
+            operation: Some("ANALYZE STATS".to_string()),
+            ..write_delta(1, 100)
+        };
+        crc.apply(unsafe_delta);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
+        assert!(crc.file_size_histogram.is_none());
+    }
+
+    #[test]
+    fn apply_drops_histogram_on_untrackable() {
+        let mut crc = base_crc_with_histogram(&[100, 200]);
+        // A missing file size makes byte-level stats impossible, so the histogram is dropped.
+        let delta = CrcDelta {
+            has_missing_file_size: true,
+            ..write_delta(1, 100)
+        };
+        crc.apply(delta);
+        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
+        assert!(crc.file_size_histogram.is_none());
+    }
+
+    #[test]
+    fn into_crc_for_version_zero_includes_histogram() {
+        let delta_hist = histogram_from_sizes(&[500, 1000]);
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            file_stats: FileStatsDelta {
+                net_files: 2,
+                net_bytes: 1500,
+                net_histogram: Some(delta_hist),
+            },
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        let hist = crc.file_size_histogram.as_ref().unwrap();
+        assert_eq!(hist.file_counts[0], 2);
+        assert_eq!(hist.total_bytes[0], 1500);
+    }
+
+    #[test]
+    fn into_crc_for_version_zero_without_histogram() {
+        // write_delta() produces a CrcDelta with no histogram delta, so
+        // into_crc_for_version_zero cannot construct a file size histogram.
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            ..write_delta(0, 0)
+        };
+        let crc = delta.into_crc_for_version_zero().unwrap();
+        assert!(crc.file_size_histogram.is_none());
+    }
+
+    #[test]
+    fn apply_merges_histogram_with_non_default_boundaries() {
+        // Base CRC with custom 3-bin histogram: [0, 200) [200, 1000) [1000, inf)
+        let boundaries = vec![0, 200, 1000];
+        let base_hist = FileSizeHistogram::try_new(
+            boundaries.clone(),
+            vec![2, 1, 0], // 2 files in bin 0, 1 in bin 1
+            vec![300, 500, 0],
+        )
+        .unwrap();
+        let mut crc = Crc {
+            table_size_bytes: 800,
+            num_files: 3,
+            num_metadata: 1,
+            num_protocol: 1,
+            file_size_histogram: Some(base_hist),
+            ..Default::default()
+        };
+
+        // Delta with matching non-default boundaries: +100 and +1500, -150
+        let mut delta_hist = FileSizeHistogram::create_empty_with_boundaries(boundaries).unwrap();
+        delta_hist.insert(100).unwrap(); // bin 0
+        delta_hist.insert(1500).unwrap(); // bin 2
+        delta_hist.remove(150).unwrap(); // bin 0
+
+        let delta = CrcDelta {
+            file_stats: FileStatsDelta {
+                net_files: 1,    // +2 - 1
+                net_bytes: 1450, // (100 + 1500) - 150
+                net_histogram: Some(delta_hist),
+            },
+            operation: Some("WRITE".to_string()),
+            ..Default::default()
+        };
+
+        crc.apply(delta);
+
+        // Histogram should be preserved (boundaries match)
+        let hist = crc.file_size_histogram.as_ref().unwrap();
+        assert_eq!(hist.sorted_bin_boundaries, vec![0, 200, 1000]);
+        assert_eq!(hist.file_counts, vec![2, 1, 1]); // (2+1-1), (1+0-0), (0+1-0)
+        assert_eq!(hist.total_bytes, vec![250, 500, 1500]); // (300+100-150), (500+0-0), (0+1500-0)
+        assert_eq!(crc.num_files, 4);
+        assert_eq!(crc.table_size_bytes, 2250);
     }
 }

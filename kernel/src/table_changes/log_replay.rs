@@ -5,14 +5,16 @@ use std::collections::{HashMap, HashSet};
 use std::slice;
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::visitors::visit_deletion_vector_at;
-use crate::actions::visitors::InCommitTimestampVisitor;
+use itertools::Itertools;
+use tracing::info;
+
+use crate::actions::visitors::{visit_deletion_vector_at, InCommitTimestampVisitor};
 use crate::actions::{
     get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, COMMIT_INFO_NAME,
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_expr, column_name, ColumnName, Expression};
+use crate::expressions::{column_expr, column_expr_ref, column_name, ColumnName, Expression};
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::data_skipping::DataSkippingFilter;
@@ -25,9 +27,6 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
-
-use itertools::Itertools;
-use tracing::info;
 
 #[cfg(test)]
 mod tests;
@@ -73,9 +72,12 @@ pub(crate) fn table_changes_action_iter(
             DataSkippingFilter::new(
                 engine.as_ref(),
                 Some(predicate),
-                stats_schema,
-                get_log_add_schema().clone(),
+                Some(&stats_schema),
                 stats_expr,
+                None, // no partition columns for table changes (partition_expr unused)
+                column_expr_ref!("partitionValues_parsed"),
+                get_log_add_schema().clone(),
+                None, // Table changes doesn't use metrics yet
             )
         })
         .map(Arc::new);
@@ -103,13 +105,13 @@ pub(crate) fn table_changes_action_iter(
 /// 1. Prepare phase [`LogReplayScanner::try_new`]: This iterates over every action in the commit.
 ///    In this phase, we do the following:
 ///     - Determine if there exist any `cdc` actions. We determine this in the first phase because
-///       the selection vectors for actions are lazily constructed in phase 2. We must know ahead
-///       of time whether to filter out add/remove actions.
+///       the selection vectors for actions are lazily constructed in phase 2. We must know ahead of
+///       time whether to filter out add/remove actions.
 ///     - Constructs the remove deletion vector map from paths belonging to `remove` actions to the
 ///       action's corresponding [`DvInfo`]. This map will be filtered to only contain paths that
-///       exists in another `add` action _within the same commit_. We store the result in `remove_dvs`.
-///       Deletion vector resolution affects whether a remove action is selected in the second
-///       phase, so we must perform it ahead of time in phase 1.
+///       exists in another `add` action _within the same commit_. We store the result in
+///       `remove_dvs`. Deletion vector resolution affects whether a remove action is selected in
+///       the second phase, so we must perform it ahead of time in phase 1.
 ///     - Ensure that reading is supported on any protocol updates.
 ///     - Ensure that Change Data Feed is enabled for any metadata update. See  [`TableProperties`]
 ///     - Ensure that any schema update is compatible with the provided `schema`. Currently, schema
@@ -133,8 +135,9 @@ pub(crate) fn table_changes_action_iter(
 /// See https://github.com/delta-io/delta-kernel-rs/issues/559
 ///
 /// 2. Scan file generation phase [`LogReplayScanner::into_scan_batches`]: This iterates over every
-///    action in the commit, and generates [`TableChangesScanMetadata`]. It does so by transforming the
-///    actions using [`add_transform_expr`], and generating selection vectors with the following rules:
+///    action in the commit, and generates [`TableChangesScanMetadata`]. It does so by transforming
+///    the actions using [`add_transform_expr`], and generating selection vectors with the following
+///    rules:
 ///     - If a `cdc` action was found in the prepare phase, only `cdc` actions are selected
 ///     - Otherwise, select `add` and `remove` actions. Note that only `remove` actions that do not
 ///       share a path with an `add` action are selected.
@@ -163,8 +166,9 @@ struct LogReplayScanner {
 }
 
 impl LogReplayScanner {
-    /// Constructs a LogReplayScanner, performing the Prepare phase detailed in [`LogReplayScanner`].
-    /// This iterates over each action in the commit. It performs the following:
+    /// Constructs a LogReplayScanner, performing the Prepare phase detailed in
+    /// [`LogReplayScanner`]. This iterates over each action in the commit. It performs the
+    /// following:
     /// 1. Check the commits for the presence of a `cdc` action.
     /// 2. Construct a map from path to deletion vector of remove actions that share the same path
     ///    as an add action.
@@ -185,9 +189,9 @@ impl LogReplayScanner {
         // Consider a scenario with a pair of add/remove actions with the same path. The add
         // action has file statistics, while the remove action does not (stats is optional for
         // remove). In this scenario we might skip the add action, while the remove action remains.
-        // As a result, we would read the file path for the remove action, which is unnecessary because
-        // all of the rows will be filtered by the predicate. Instead, we wait until deletion
-        // vectors are resolved so that we can skip both actions in the pair.
+        // As a result, we would read the file path for the remove action, which is unnecessary
+        // because all of the rows will be filtered by the predicate. Instead, we wait until
+        // deletion vectors are resolved so that we can skip both actions in the pair.
         let mut action_iter = engine
             .json_handler()
             .read_json_files(
@@ -286,7 +290,8 @@ impl LogReplayScanner {
             remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
         }
 
-        // If ICT is enabled, then set the timestamp to be the ICT; otherwise, default to the last_modified timestamp value
+        // If ICT is enabled, then set the timestamp to be the ICT; otherwise, default to the
+        // last_modified timestamp value
         let timestamp = if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp)
         {
             let Some(in_commit_timestamp) = in_commit_timestamp_opt else {

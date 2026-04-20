@@ -7,23 +7,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Array, AsArray, StructArray};
-use delta_kernel::arrow::compute::{concat_batches, take};
-use delta_kernel::arrow::compute::{lexsort_to_indices, SortColumn};
+use delta_kernel::arrow::compute::{concat_batches, lexsort_to_indices, take, SortColumn};
 use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
-
-use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::{DeltaResult, Snapshot};
-
-use futures::{stream::TryStreamExt, StreamExt};
+use futures::stream::TryStreamExt;
+use futures::StreamExt;
 use itertools::Itertools;
-use object_store::{local::LocalFileSystem, ObjectStore};
 use paste::paste;
 use url::Url;
 
@@ -421,7 +420,8 @@ skip_test!("canonicalized-paths-special-b": "BUG: path canonicalization");
 // assert(foundFiles.map(_.getPath.split('/').last).toSet == Set("foo", "bar"))
 // // We added two add files with the same path `foo`. The first should have been removed.
 // // The second should remain, and should have a hard-coded modification time of 1700000000000L
-// assert(foundFiles.find(_.getPath.endsWith("foo")).exists(_.getModificationTime == 1700000000000L))
+// assert(foundFiles.find(_.getPath.endsWith("foo")).exists(_.getModificationTime ==
+// 1700000000000L))
 skip_test!("delete-re-add-same-file-different-transactions": "test not yet implemented");
 
 // data file doesn't exist, get the relative path to compare

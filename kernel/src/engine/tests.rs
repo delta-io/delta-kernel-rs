@@ -10,13 +10,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
+use itertools::Itertools;
 use tempfile::{tempdir, NamedTempFile};
+use test_utils::delta_path_for_version;
 use url::Url;
 
 use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
+use crate::object_store::path::Path;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{
@@ -24,10 +27,6 @@ use crate::schema::{
     StructField, StructType,
 };
 use crate::{DeltaResult, Engine, EngineData, FileMeta, JsonHandler, ParquetHandler};
-use itertools::Itertools;
-
-use object_store::path::Path;
-use test_utils::delta_path_for_version;
 
 // ---------------------------------------------------------------------------
 // Shared file-setup helpers

@@ -4,22 +4,23 @@ use std::io::BufReader;
 use std::sync::Arc;
 use std::task::Poll;
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use crate::arrow::json::ReaderBuilder;
-use crate::arrow::record_batch::RecordBatch;
 use bytes::{Buf, Bytes};
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
-use object_store::path::Path;
-use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use url::Url;
 
 use super::executor::TaskExecutor;
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::arrow::json::ReaderBuilder;
+use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_utils::{
     build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
     to_json_bytes,
 };
 use crate::engine_data::FilteredEngineData;
+use crate::metrics::{MetricEvent, MetricsReporter};
+use crate::object_store::path::Path;
+use crate::object_store::{self, DynObjectStore, GetResultPayload, ObjectStoreExt as _, PutMode};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
@@ -38,6 +39,8 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// Limit the number of rows per batch. That is, for batch_size = N, then each RecordBatch
     /// yielded by the stream will have at most N rows.
     batch_size: usize,
+    /// Optional reporter for emitting [`MetricEvent::JsonReadCompleted`] events.
+    reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl<E: TaskExecutor> DefaultJsonHandler<E> {
@@ -47,7 +50,14 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
             task_executor,
             buffer_size: super::DEFAULT_BUFFER_SIZE,
             batch_size: super::DEFAULT_BATCH_SIZE,
+            reporter: None,
         }
+    }
+
+    /// Set a metrics reporter to receive [`MetricEvent::JsonReadCompleted`] events.
+    pub fn with_reporter(mut self, reporter: Option<Arc<dyn MetricsReporter>>) -> Self {
+        self.reporter = reporter;
+        self
     }
 
     /// Set the maximum number read requests to buffer in memory at once in
@@ -169,7 +179,23 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             self.batch_size,
             self.buffer_size,
         );
-        super::stream_future_to_iter(self.task_executor.clone(), future)
+        let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        if let Some(reporter) = &self.reporter {
+            let num_files = files.len() as u64;
+            let bytes_read = files.iter().map(|f| f.size).sum();
+            Ok(Box::new(super::ReadMetricsIterator::new(
+                inner,
+                reporter.clone(),
+                num_files,
+                bytes_read,
+                |num_files, bytes_read| MetricEvent::JsonReadCompleted {
+                    num_files,
+                    bytes_read,
+                },
+            )))
+        } else {
+            Ok(inner)
+        }
     }
 
     // note: for now we just buffer all the data and write it out all at once
@@ -265,6 +291,11 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::task::Waker;
 
+    use futures::future;
+    use itertools::Itertools;
+    use serde_json::json;
+    use tracing::info;
+
     use crate::actions::get_commit_schema;
     use crate::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -272,19 +303,16 @@ mod tests {
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+    use crate::object_store::{CopyOptions, ObjectStore};
+    use crate::object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, Result,
+    };
     use crate::schema::{DataType as DeltaDataType, Schema, StructField};
     use crate::utils::test_utils::string_array_to_engine_data;
-    use futures::future;
-    use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
-    use object_store::memory::InMemory;
-    use object_store::PutMultipartOptions;
-    use object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
-        PutPayload, PutResult, Result,
-    };
-    use serde_json::json;
-    use tracing::info;
 
     // TODO: should just use the one from test_utils, but running into dependency issues
     fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
@@ -295,12 +323,19 @@ mod tests {
 
     use super::*;
 
+    // A wrapper trait that allows us to work with the ObjectStore trait, without directly importing
+    // it and the ambiguous method errors it would bring.
+    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+    trait ObjectStore: crate::object_store::ObjectStore {}
+
+    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
+    impl<T: crate::object_store::ObjectStore + ?Sized> ObjectStore for T {}
+
     /// Store wrapper that wraps an inner store to guarantee the ordering of GET requests. Note
     /// that since the keys are resolved in order, requests to subsequent keys in the order will
     /// block until the earlier keys are requested.
     ///
     /// WARN: Does not handle duplicate keys, and will fail on duplicate requests of the same key.
-    ///
     // TODO(zach): we can handle duplicate requests if we retain the ordering of the keys track
     // that all of the keys prior to the one requested have been resolved.
     #[derive(Debug)]
@@ -350,11 +385,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl<T: ObjectStore> ObjectStore for OrderedGetStore<T> {
-        async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
-            self.inner.put(location, payload).await
-        }
-
+    impl<T: ObjectStore> crate::object_store::ObjectStore for OrderedGetStore<T> {
         async fn put_opts(
             &self,
             location: &Path,
@@ -362,10 +393,6 @@ mod tests {
             opts: PutOptions,
         ) -> Result<PutResult> {
             self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart(location).await
         }
 
         async fn put_multipart_opts(
@@ -380,9 +407,17 @@ mod tests {
         // - if yes, remove the path from the queue and proceed with the GET request, then wake the
         //   next path in order
         // - if no, register the waker and wait
-        async fn get(&self, location: &Path) -> Result<GetResult> {
-            // Do the actual GET request first, then introduce any artificial ordering delays as needed
-            let result = self.inner.get(location).await;
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            // object_store 0.13 implements `head()` via `get_opts(..., head = true)`.
+            // The ordering queue is only meant to serialize content reads for the test, so
+            // skip queue accounting for HEAD probes used while constructing FileMeta.
+            if options.head {
+                return self.inner.get_opts(location, options).await;
+            }
+
+            // Do the actual GET request first, then introduce any artificial ordering delays as
+            // needed
+            let result = self.inner.get_opts(location, options).await;
 
             // we implement a future which only resolves once the requested path is next in order
             future::poll_fn(move |cx| {
@@ -438,24 +473,21 @@ mod tests {
             result
         }
 
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-            self.inner.get_range(location, range).await
-        }
-
         async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
 
-        async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-            self.inner.head(location).await
-        }
-
+        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
         async fn delete(&self, location: &Path) -> Result<()> {
             self.inner.delete(location).await
+        }
+
+        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(locations)
         }
 
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -474,20 +506,19 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
+        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
         async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
             self.inner.copy(from, to).await
         }
 
-        async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.rename(from, to).await
+        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(from, to, options).await
         }
 
+        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
         async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
             self.inner.copy_if_not_exists(from, to).await
-        }
-
-        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.rename_if_not_exists(from, to).await
         }
     }
 
@@ -511,9 +542,10 @@ mod tests {
     }
 
     // Test that operationParameters with boolean/numeric primitives are coerced to strings.
-    // Some delta logs contain values like `"statsOnLoad": false` instead of `"statsOnLoad": "false"`.
-    // Without `with_coerce_primitive(true)`, this would fail with:
-    // "whilst decoding field 'commitInfo': whilst decoding field 'operationParameters': expected string got false"
+    // Some delta logs contain values like `"statsOnLoad": false` instead of `"statsOnLoad":
+    // "false"`. Without `with_coerce_primitive(true)`, this would fail with:
+    // "whilst decoding field 'commitInfo': whilst decoding field 'operationParameters': expected
+    // string got false"
     #[test]
     fn test_parse_json_coerce_operation_parameters() {
         let store = Arc::new(LocalFileSystem::new());
@@ -684,11 +716,13 @@ mod tests {
         );
     }
 
+    use std::io::Write;
+
+    use tempfile::NamedTempFile;
+
     use crate::engine::default::DefaultEngineBuilder;
     use crate::schema::StructType;
     use crate::Engine;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
 
     fn make_invalid_named_temp() -> (NamedTempFile, Url) {
         let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");

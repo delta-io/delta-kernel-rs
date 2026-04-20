@@ -7,14 +7,13 @@ use std::ops::Deref as _;
 use tracing::debug;
 
 use crate::expressions::{Expression, Scalar};
-use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, SchemaTransform, StructField, StructType,
-};
+use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+use crate::transforms::SchemaTransform;
+use crate::DeltaResult;
 
 /// [`SchemaTransform`] that will transform a [`Schema`] and an ordered list of leaf values
 /// (Scalars) into an Expression with a [`Literal`] expr for each leaf.
-#[derive(Debug)]
-pub(crate) struct LiteralExpressionTransform<'a, T: Iterator<Item = &'a Scalar>> {
+struct LiteralExpressionTransform<'a, T: Iterator<Item = &'a Scalar>> {
     /// Leaf values to insert in schema order.
     scalars: T,
     /// A stack of built Expressions. After visiting children, we pop them off to
@@ -48,27 +47,27 @@ pub enum Error {
     Unsupported(String),
 }
 
+/// Transforms the schema and leaf values into a literal row expression.
+pub(crate) fn literal_expression_transform<'a>(
+    schema: &'a StructType,
+    scalars: impl IntoIterator<Item = &'a Scalar>,
+) -> DeltaResult<Expression> {
+    let mut transform = LiteralExpressionTransform {
+        scalars: scalars.into_iter(),
+        stack: Vec::new(),
+        error: Ok(()),
+    };
+    let _ = transform.transform_struct(schema);
+    transform.error?;
+
+    if let Some(s) = transform.scalars.next() {
+        return Err(Error::ExcessScalars(s.clone()).into());
+    }
+
+    transform.stack.pop().ok_or(Error::EmptyStack.into())
+}
+
 impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
-    pub(crate) fn new(scalars: impl IntoIterator<IntoIter = I>) -> Self {
-        Self {
-            scalars: scalars.into_iter(),
-            stack: Vec::new(),
-            error: Ok(()),
-        }
-    }
-
-    /// return the Expression we just built (or propagate Error). the top of `stack` should be our
-    /// final Expression
-    pub(crate) fn try_into_expr(mut self) -> Result<Expression, Error> {
-        self.error?;
-
-        if let Some(s) = self.scalars.next() {
-            return Err(Error::ExcessScalars(s.clone()));
-        }
-
-        self.stack.pop().ok_or(Error::EmptyStack)
-    }
-
     fn set_error(&mut self, error: Error) {
         // Only set when the error not yet set
         if let Err(ref existing_error) = self.error {
@@ -189,18 +188,15 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::sync::Arc;
 
-    use crate::expressions::{ArrayData, MapData};
-    use crate::schema::SchemaRef;
-    use crate::schema::StructType;
-    use crate::DataType as DeltaDataTypes;
-
     use paste::paste;
-
     use Expression as Expr;
+
+    use super::*;
+    use crate::expressions::{ArrayData, MapData};
+    use crate::schema::{SchemaRef, StructType};
+    use crate::DataType as DeltaDataTypes;
 
     // helper to take values/schema to pass to `create_one` and assert the result = expected
     fn assert_single_row_transform(
@@ -208,17 +204,10 @@ mod tests {
         schema: SchemaRef,
         expected: Result<Expr, ()>,
     ) {
-        let mut schema_transform = LiteralExpressionTransform::new(values);
-        let datatype = schema.into();
-        let _transformed = schema_transform.transform(&datatype);
+        let transformed = literal_expression_transform(&schema, values);
         match expected {
-            Ok(expected_expr) => {
-                let actual_expr = schema_transform.try_into_expr().unwrap();
-                assert_eq!(expected_expr, actual_expr);
-            }
-            Err(()) => {
-                assert!(schema_transform.try_into_expr().is_err());
-            }
+            Ok(expected_expr) => assert_eq!(expected_expr, transformed.unwrap()),
+            Err(()) => assert!(transformed.is_err()),
         }
     }
 
