@@ -369,7 +369,10 @@ int main(int argc, char* argv[])
     return -1;
   }
 
-  // an example of using a builder to set options when building an engine
+  // Example of using the builder to set object-store options before building the engine. The
+  // keys accepted here come from object_store's configuration vocabulary (e.g. "aws_region",
+  // "aws_access_key_id"). They are object-store-specific and only meaningful when the table URL
+  // points at that backend -- for a local file:// table the setters have no effect.
   EngineBuilder* engine_builder = engine_builder_res.ok;
   if (!set_builder_opt(engine_builder, "aws_region", "us-west-2")) {
     return -1;
@@ -384,8 +387,8 @@ int main(int argc, char* argv[])
   //   get_default_engine(table_path_slice, NULL);
 
   if (engine_res.tag != OkHandleSharedExternEngine) {
-    print_error("File to get engine", (Error*)engine_builder_res.err);
-    free_error((Error*)engine_builder_res.err);
+    print_error("Failed to get engine", (Error*)engine_res.err);
+    free_error((Error*)engine_res.err);
     return -1;
   }
 
@@ -395,12 +398,16 @@ int main(int argc, char* argv[])
   if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
     print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
     free_error((Error*)snapshot_builder_res.err);
+    free_engine(engine);
     return -1;
   }
+  // snapshot_builder_build consumes the builder handle whether it succeeds or fails, so there
+  // is nothing to free for the builder here.
   ExternResultHandleSharedSnapshot snapshot_res = snapshot_builder_build(snapshot_builder_res.ok);
   if (snapshot_res.tag != OkHandleSharedSnapshot) {
     print_error("Failed to create snapshot.", (Error*)snapshot_res.err);
     free_error((Error*)snapshot_res.err);
+    free_engine(engine);
     return -1;
   }
 
@@ -477,6 +484,14 @@ int main(int argc, char* argv[])
   if (data_iter_res.tag != OkHandleSharedScanMetadataIterator) {
     print_error("Failed to construct scan metadata iterator.", (Error*)data_iter_res.err);
     free_error((Error*)data_iter_res.err);
+    free_scan(scan);
+    free_schema(logical_schema);
+    free_schema(physical_schema);
+    free_snapshot(snapshot);
+    free_engine(engine);
+    free(context.table_root);
+    free(scan_table_path);
+    free_partition_list(context.partition_cols);
     return -1;
   }
 
@@ -484,6 +499,7 @@ int main(int argc, char* argv[])
 
   print_diag("\nIterating scan metadata\n");
 
+  int exit_code = 0;
   // iterate scan files
   for (;;) {
     ExternResultbool ok_res =
@@ -491,7 +507,8 @@ int main(int argc, char* argv[])
     if (ok_res.tag != Okbool) {
       print_error("Failed to iterate scan metadata.", (Error*)ok_res.err);
       free_error((Error*)ok_res.err);
-      return -1;
+      exit_code = -1;
+      break;
     } else if (!ok_res.ok) {
       print_diag("Scan metadata iterator done\n");
       break;
@@ -516,5 +533,5 @@ int main(int argc, char* argv[])
   free(scan_table_path);
   free_partition_list(context.partition_cols);
 
-  return 0;
+  return exit_code;
 }
