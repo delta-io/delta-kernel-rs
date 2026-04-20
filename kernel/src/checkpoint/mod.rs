@@ -115,13 +115,14 @@ use crate::action_reconciliation::{
 use crate::actions::{
     Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
     CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SET_TRANSACTION_NAME, SIDECAR_NAME,
+    SET_TRANSACTION_NAME, SIDECAR_NAME, SIDECAR_SCHEMA_MODIFICATION_TIME, SIDECAR_SCHEMA_PATH,
+    SIDECAR_SCHEMA_SIZE_IN_BYTES, SIDECAR_SCHEMA_TAGS,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{Expression, Scalar, StructData, Transform};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
-use crate::path::ParsedLogPath;
+use crate::path::{self, ParsedLogPath};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
@@ -241,18 +242,31 @@ struct CheckpointSchemaContext {
     is_v2: bool,
 }
 
-pub(crate) const DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT: usize = 50_000;
+/// Default value for [`V2CheckpointConfig::WithSidecar::file_actions_per_sidecar_hint`] --
+/// the suggested upper bound of file actions(`add` and `remove`) per sidecar file when the
+/// caller does not provide an explicit hint.
+pub const DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT: usize = 50_000;
 
 /// Specifies the checkpoint format and behavior.
 #[derive(Debug)]
 pub enum CheckpointSpec {
-    /// Write a V1 checkpoint.
+    /// Write a checkpoint following the V1 spec -- the original checkpoint format, without
+    /// sidecar files or checkpoint metadata. See [V1 spec] for more details.
+    ///
+    /// [V1 spec]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#v1-spec
     V1,
-    /// Write a V2 checkpoint with the given configuration.
+    /// Write a checkpoint following the V2 spec, which allows putting file actions (`add`
+    /// and `remove`) in sidecar files. Requires the `v2Checkpoint` reader/writer feature.
+    /// See [V2 spec] and [Sidecar Files] for more details.
+    ///
+    /// [V2 spec]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#v2-spec
+    /// [Sidecar Files]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-files
     V2(V2CheckpointConfig),
 }
 
 /// Configuration for V2 checkpoints.
+///
+/// Note: "File actions" here means `add` and `remove` actions.
 #[derive(Debug)]
 pub enum V2CheckpointConfig {
     /// Write a V2 checkpoint without sidecar files.
@@ -266,7 +280,7 @@ pub enum V2CheckpointConfig {
         /// batches that cannot be split. For example, if the hint is 99 but a single
         /// `EngineData` batch contains 100 file actions, all 100 will be written to one sidecar.
         ///
-        /// Defaults to `DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT` when `None`.
+        /// Defaults to [`DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT`] when `None`.
         file_actions_per_sidecar_hint: Option<usize>,
     },
 }
@@ -581,11 +595,7 @@ impl CheckpointWriter {
 
     /// Writes a V2 checkpoint with sidecar files. Returns the checkpoint file metadata and
     /// action stats for passing to [`CheckpointWriter::finalize`].
-    ///
-    /// # Parameters
-    /// - `engine`: Engine for data processing and I/O
-    /// - `file_actions_per_sidecar_hint`: Approximate number of file actions per sidecar
-    pub(crate) fn write_checkpoint_with_sidecars(
+    pub(crate) fn write_v2_checkpoint_with_sidecars(
         &self,
         engine: &dyn Engine,
         file_actions_per_sidecar_hint: usize,
@@ -609,27 +619,14 @@ impl CheckpointWriter {
         )?;
 
         // Write sidecar files
-        let sidecars_base = self.snapshot.log_segment().log_root.join("_sidecars/")?;
-
         let mut sidecar_metas: Vec<(String, FileMeta)> = Vec::new();
         loop {
             let mut single_sidecar_iter =
                 SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?
                     .peekable();
             if single_sidecar_iter.peek().is_some() {
-                // Per the protocol, a checkpoint sidecar is a uniquely-named parquet
-                // file: `{unique}.parquet` where `unique` is some unique string such
-                // as a UUID.
-                // We use `<version>.checkpoint.<uuid>.parquet` here.
-                let filename = format!(
-                    "{:020}.checkpoint.{}.parquet",
-                    self.version,
-                    uuid::Uuid::new_v4()
-                );
-                // Per the protocol, sidecar path should be URI-encoded.
-                // All characters in the filename here are Unreserved Characters, so we can just
-                // retain them. Ref: https://www.ietf.org/rfc/rfc2396.txt
-                let sidecar_url = sidecars_base.join(&filename)?;
+                let (filename, sidecar_url) =
+                    path::new_sidecar(self.snapshot.table_root(), self.snapshot.version())?;
                 engine
                     .parquet_handler()
                     .write_parquet_file(sidecar_url.clone(), Box::new(single_sidecar_iter))?;
@@ -667,37 +664,24 @@ impl CheckpointWriter {
             .parquet_handler()
             .write_parquet_file(checkpoint_path.clone(), main_data)?;
 
-        let file_meta = engine.storage_handler().head(&checkpoint_path)?;
-
-        // Build last-checkpoint stats from the exhausted iterator. Per the protocol, the
-        // size_in_bytes covers the main checkpoint file plus all sidecar files, and the
-        // sidecar reference actions written into the main file are counted as extras
-        // beyond what the reconciliation iterator produced.
-        let state = Arc::into_inner(iter_state).ok_or_else(|| {
-            Error::internal_error("ActionReconciliationIteratorState Arc has other references")
-        })?;
-        let total_size_in_bytes = sidecar_metas
+        // Size_in_bytes covers the main checkpoint file plus all sidecar files.
+        let sidecar_sizes_sum = sidecar_metas
             .iter()
-            .try_fold(file_meta.size, |acc, (_, m)| acc.checked_add(m.size))
-            .ok_or_else(|| {
-                Error::internal_error("checkpoint total size_in_bytes overflowed u64")
-            })?;
+            .try_fold(0u64, |acc, (_, m)| acc.checked_add(m.size))
+            .ok_or_else(|| Error::internal_error("sidecar sizes sum overflowed u64"))?;
         let sidecar_count = u64::try_from(sidecar_metas.len()).map_err(|e| {
             Error::internal_error(format!(
                 "Failed to convert sidecar count from usize {} to u64: {e}",
                 sidecar_metas.len()
             ))
         })?;
-        let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
-            total_size_in_bytes,
-            state,
+        self.build_written_checkpoint_info(
+            engine,
+            &checkpoint_path,
+            iter_state,
+            sidecar_sizes_sum,
             sidecar_count,
-        )?;
-
-        Ok(WrittenCheckpointInfo {
-            file_meta,
-            last_checkpoint_stats,
-        })
+        )
     }
 
     /// Writes a checkpoint (V1 or V2 without sidecars). Returns the checkpoint file metadata
@@ -714,13 +698,39 @@ impl CheckpointWriter {
             .parquet_handler()
             .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
 
-        let file_meta = engine.storage_handler().head(&checkpoint_path)?;
+        self.build_written_checkpoint_info(
+            engine,
+            &checkpoint_path,
+            state,
+            0, /* sidecar_sizes_sum */
+            0, /* sidecar_count */
+        )
+    }
+
+    fn build_written_checkpoint_info(
+        &self,
+        engine: &dyn Engine,
+        checkpoint_path: &Url,
+        state: Arc<ActionReconciliationIteratorState>,
+        sidecar_sizes_sum: u64,
+        sidecar_count: u64,
+    ) -> DeltaResult<WrittenCheckpointInfo> {
+        let file_meta = engine.storage_handler().head(checkpoint_path)?;
+        let total_size_in_bytes =
+            file_meta
+                .size
+                .checked_add(sidecar_sizes_sum)
+                .ok_or_else(|| {
+                    Error::internal_error("checkpoint total size_in_bytes overflowed u64")
+                })?;
         let state = Arc::into_inner(state).ok_or_else(|| {
             Error::internal_error("ActionReconciliationIteratorState Arc has other references")
         })?;
-        // No sidecars, so all actions go through the reconciliation iterator.
-        let last_checkpoint_stats =
-            LastCheckpointHintStats::from_reconciliation_state(file_meta.size, state, 0)?;
+        let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
+            total_size_in_bytes,
+            state,
+            sidecar_count,
+        )?;
         Ok(WrittenCheckpointInfo {
             file_meta,
             last_checkpoint_stats,
@@ -830,7 +840,7 @@ impl CheckpointWriter {
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `checkpoint_data_schema`: The output checkpoint schema (must contain a `sidecar` struct
     ///   field)
-    /// - `sidecar_metas`: Pairs of (relative sidecar filename, FileMeta) for each sidecar file
+    /// - `sidecar_metas`: Pairs of (sidecar filename, FileMeta) for each sidecar file
     fn create_sidecar_action_batches(
         &self,
         engine: &dyn Engine,
@@ -855,8 +865,8 @@ impl CheckpointWriter {
             .evaluation_handler()
             .null_row(checkpoint_data_schema.clone())?;
 
-        let mut batches = Vec::with_capacity(sidecar_metas.len());
         // Construct [`EngineData`] batches for sidecar files.
+        let mut batches = Vec::with_capacity(sidecar_metas.len());
         for (filename, meta) in sidecar_metas {
             let size_in_bytes = i64::try_from(meta.size).map_err(|e| {
                 Error::CheckpointWrite(format!(
@@ -869,12 +879,14 @@ impl CheckpointWriter {
             let values: Vec<Scalar> = sidecar_fields
                 .iter()
                 .map(|field| match field.name().as_str() {
-                    "path" => Ok(Scalar::from(filename.clone())),
-                    "sizeInBytes" => Ok(Scalar::from(size_in_bytes)),
-                    "modificationTime" => Ok(Scalar::from(meta.last_modified)),
-                    // Sidecar tags are protocol details, can expose them if there is a need in the
-                    // future.
-                    "tags" => Ok(Scalar::Null(field.data_type().clone())),
+                    SIDECAR_SCHEMA_PATH => Ok(Scalar::from(filename.clone())),
+                    SIDECAR_SCHEMA_SIZE_IN_BYTES => Ok(Scalar::from(size_in_bytes)),
+                    SIDECAR_SCHEMA_MODIFICATION_TIME => Ok(Scalar::from(meta.last_modified)),
+                    // `StructData::try_new` below requires one value per schema field, so we
+                    // must emit `Scalar::Null` for `tags` rather than omit it. Sidecar tags
+                    // are protocol details; we can expose them to connectors if there is a
+                    // need in the future.
+                    SIDECAR_SCHEMA_TAGS => Ok(Scalar::Null(field.data_type().clone())),
                     other => Err(Error::CheckpointWrite(format!(
                         "Unexpected sidecar field: {other}"
                     ))),

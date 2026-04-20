@@ -357,9 +357,16 @@ fn read_last_checkpoint(table_path: &str) -> serde_json::Value {
 
 /// Creates a v2Checkpoint + domainMetadata table with a nested schema (`id: int`,
 /// `info: struct { name: string }`). Inserts 8 files across several commits, removes all of
-/// them, adds domain metadata (with a update for same domain), then inserts 8 fresh files.
-/// Returns the final snapshot. The table should have 8 live adds and 8 remove tombstones.
-async fn v2_table_with_domain_metadata<E: delta_kernel::engine::default::executor::TaskExecutor>(
+/// them, adds domain metadata (with a update for same domain), commits `txn` set-transactions
+/// (with a reconciliation case for `app1`), then inserts 8 fresh files. Returns the final
+/// snapshot. The table should have 8 live adds, 8 remove tombstones, 3 domain metadata
+/// entries, and 2 reconciled `txn` actions (`app1@3`, `app2@5`).
+///
+/// Exercises every action in the V2 checkpoint schema except `sidecar`/`checkpointMetadata`,
+/// which are produced by the checkpoint writer itself.
+async fn v2_table_with_domain_metadata_and_txn<
+    E: delta_kernel::engine::default::executor::TaskExecutor,
+>(
     table_path: &str,
     table_url: &url::Url,
     engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
@@ -438,6 +445,19 @@ async fn v2_table_with_domain_metadata<E: delta_kernel::engine::default::executo
         .post_commit_snapshot()
         .expect("expected post-commit snapshot")
         .clone();
+
+    // SetTransaction commits -- exercise `txn` actions in checkpoint. Two distinct app_ids
+    // plus a second update to `app1` to verify reconciliation picks the latest version.
+    for (app_id, version) in [("app1", 1i64), ("app2", 5), ("app1", 3)] {
+        snapshot = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_transaction_id(app_id.to_string(), version)
+            .commit(engine.as_ref())?
+            .unwrap_committed()
+            .post_commit_snapshot()
+            .expect("expected post-commit snapshot")
+            .clone();
+    }
 
     // Remove all 8 files -> 8 remove tombstones
     let scan = snapshot.clone().scan_builder().build()?;
@@ -618,18 +638,19 @@ fn assert_sidecars_contain_only_file_actions(
 
 /// E2e test for V2 sidecar checkpoint writing and reading:
 ///
-/// 1. Create a V2 table with adds, removes, and domain metadata
+/// 1. Create a V2 table with adds, removes, domain metadata, and set-transactions
 /// 2. Write a V2 checkpoint with sidecars (hint=2)
 /// 3. Add post-checkpoint commits (insert + domain metadata update)
 /// 4. Validate `_last_checkpoint` (version, size, sizeInBytes, numOfAddFiles)
 /// 5. Read the raw checkpoint parquet and validate:
-///    - Main checkpoint has sidecar, protocol, metadata, checkpointMetadata, domainMetadata
+///    - Main checkpoint has sidecar, protocol, metadata, checkpointMetadata, domainMetadata, txn
 ///    - Main checkpoint has NO add/remove actions (they live in sidecars)
 ///    - 5 sidecar references match the actual sidecar files on disk
 ///    - Sidecar files contain only add/remove actions
 ///    - Per-sidecar distribution: 1 sidecar with 8 removes, 4 sidecars with 2 adds each
 ///    - checkpointMetadata version matches checkpoint version
 ///    - 3 reconciled domain metadata actions
+///    - 2 reconciled txn actions (`app1@3`, `app2@5`)
 /// 6. Load a fresh snapshot from the checkpoint + post-checkpoint commits
 /// 7. Verify domain metadata (including post-checkpoint update)
 /// 8. Scan and verify data correctness (9 rows: ids 9-17)
@@ -638,7 +659,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
-    let snapshot = v2_table_with_domain_metadata(&table_path, &table_url, &engine).await?;
+    let snapshot = v2_table_with_domain_metadata_and_txn(&table_path, &table_url, &engine).await?;
     let version = snapshot.version() as i64;
 
     // Write V2 checkpoint with sidecars (hint=2 so file actions split across sidecars)
@@ -685,8 +706,9 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
 
     assert_eq!(last_ckpt["version"], version);
     // size = 1 protocol + 1 metadata + 8 adds + 8 removes + 3 domain metadata
-    //       + 1 checkpointMetadata + 5 sidecar references = 27
-    assert_eq!(last_ckpt["size"].as_i64().unwrap(), 27);
+    //       + 2 set-transactions (app1 reconciled to the latest) + 1 checkpointMetadata
+    //       + 5 sidecar references = 29
+    assert_eq!(last_ckpt["size"].as_i64().unwrap(), 29);
     assert_eq!(
         last_ckpt["sizeInBytes"].as_i64().unwrap(),
         ckpt_file_size + sidecars_total_size
@@ -703,6 +725,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
         "checkpointMetadata",
         "domainMetadata",
         "sidecar",
+        "txn",
     ] {
         assert!(
             ckpt_schema.field_with_name(field_name).is_ok(),
@@ -770,6 +793,38 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
         dm_rows.len(),
         3,
         "checkpoint should contain exactly 3 domainMetadata actions"
+    );
+
+    // Validate txn actions: exactly 2 after reconciliation (app1@3 and app2@5).
+    let txn_col = get_struct_column_from_record_batch(&ckpt_batch, "txn");
+    let txn_rows = valid_row_indices(txn_col, ckpt_batch.num_rows());
+    assert_eq!(
+        txn_rows.len(),
+        2,
+        "checkpoint should contain exactly 2 txn actions after reconciliation"
+    );
+    let txn_app_id_col = txn_col
+        .column_by_name("appId")
+        .expect("txn should have appId field")
+        .as_string::<i32>();
+    let txn_version_col = txn_col
+        .column_by_name("version")
+        .expect("txn should have version field")
+        .as_primitive::<delta_kernel::arrow::datatypes::Int64Type>();
+    let mut txn_pairs: Vec<(String, i64)> = txn_rows
+        .iter()
+        .map(|&r| {
+            (
+                txn_app_id_col.value(r).to_string(),
+                txn_version_col.value(r),
+            )
+        })
+        .collect();
+    txn_pairs.sort();
+    assert_eq!(
+        txn_pairs,
+        vec![("app1".to_string(), 3), ("app2".to_string(), 5)],
+        "txn actions should reflect reconciliation (app1 kept at latest version)"
     );
 
     // === Scan from fresh snapshot to verify data correctness ===

@@ -599,7 +599,7 @@ impl Snapshot {
             })) => {
                 let hint =
                     file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
-                writer.write_checkpoint_with_sidecars(engine, hint)?
+                writer.write_v2_checkpoint_with_sidecars(engine, hint)?
             }
             _ => writer.write_checkpoint_without_sidecars(engine)?,
         };

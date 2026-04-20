@@ -52,6 +52,11 @@ pub(crate) const COMMIT_INFO_NAME: &str = "commitInfo";
 pub(crate) const CDC_NAME: &str = "cdc";
 #[internal_api]
 pub(crate) const SIDECAR_NAME: &str = "sidecar";
+// Field names of the `sidecar` action.
+pub(crate) const SIDECAR_SCHEMA_PATH: &str = "path";
+pub(crate) const SIDECAR_SCHEMA_SIZE_IN_BYTES: &str = "sizeInBytes";
+pub(crate) const SIDECAR_SCHEMA_MODIFICATION_TIME: &str = "modificationTime";
+pub(crate) const SIDECAR_SCHEMA_TAGS: &str = "tags";
 #[internal_api]
 pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
 #[internal_api]

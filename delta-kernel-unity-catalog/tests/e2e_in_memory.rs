@@ -1,20 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{ObjectStore, ObjectStoreExt as _};
-use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::Snapshot;
 use delta_kernel_unity_catalog::{UCCommitter, UCKernelClient};
-use test_utils::{
-    actions_to_string_with_metadata, add_commit, collect_file_action_paths, TestAction,
-};
 use unity_catalog_delta_client_api::{Commit, InMemoryCommitsClient, TableData};
 
 // ============================================================================
@@ -220,94 +212,5 @@ async fn test_cannot_checkpoint_unpublished_snapshot() -> Result<(), TestError> 
 
     let err = snapshot.checkpoint(&engine).unwrap_err();
     assert!(matches!(err, delta_kernel::Error::Generic(msg) if msg.contains("not published")));
-    Ok(())
-}
-
-/// uc-managed V2 table: write commits to InMemory store, load snapshot,
-/// write a sidecar checkpoint, and verify checkpoint + sidecars exist.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_sidecar_checkpoint_uc_managed_v2_table() -> Result<(), TestError> {
-    // Create v0 metadata with catalogManaged + v2Checkpoint features
-    let v0_metadata = test_utils::CATALOG_MANAGED_METADATA.replace(
-        r#""readerFeatures":["catalogManaged"],"writerFeatures":["catalogManaged","inCommitTimestamp"]"#,
-        r#""readerFeatures":["v2Checkpoint","catalogManaged"],"writerFeatures":["v2Checkpoint","catalogManaged","inCommitTimestamp"]"#,
-    );
-
-    let store = Arc::new(InMemory::new());
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    let engine = DefaultEngineBuilder::new(store.clone())
-        .with_task_executor(executor)
-        .build();
-
-    let table_root = "memory:///";
-
-    let v0_actions = actions_to_string_with_metadata(
-        vec![
-            TestAction::Metadata,
-            TestAction::Add("file1.parquet".into()),
-            TestAction::Add("file2.parquet".into()),
-        ],
-        &v0_metadata,
-    );
-    add_commit(table_root, store.as_ref(), 0, v0_actions)
-        .await
-        .map_err(|e| -> TestError { e.to_string().into() })?;
-
-    let table_id = "v2-ckpt-catalog-table";
-    let commits_client = Arc::new(InMemoryCommitsClient::new());
-    commits_client.insert_table(
-        table_id,
-        TableData {
-            max_ratified_version: 0,
-            catalog_commits: vec![],
-        },
-    );
-
-    let catalog = UCKernelClient::new(commits_client.as_ref());
-    let snapshot = catalog
-        .load_snapshot_at(table_id, table_root, 0, &engine)
-        .await?;
-    assert_eq!(snapshot.version(), 0);
-    assert!(snapshot.table_configuration().is_catalog_managed());
-
-    let spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
-        file_actions_per_sidecar_hint: Some(10),
-    });
-    snapshot.snapshot_checkpoint_placeholder(&engine, Some(&spec))?;
-
-    let ckpt_path = Path::from("_delta_log/00000000000000000000.checkpoint.parquet");
-    assert!(
-        store.head(&ckpt_path).await.is_ok(),
-        "checkpoint file should exist"
-    );
-
-    let last_ckpt_path = Path::from("_delta_log/_last_checkpoint");
-    assert!(
-        store.head(&last_ckpt_path).await.is_ok(),
-        "_last_checkpoint file should exist"
-    );
-
-    // Read sidecar parquet files and verify add action paths
-    let sidecar_prefix = Path::from("_delta_log/_sidecars");
-    let sidecar_list = store.list_with_delimiter(Some(&sidecar_prefix)).await?;
-    assert!(
-        !sidecar_list.objects.is_empty(),
-        "at least one sidecar file should exist"
-    );
-
-    let mut batches = Vec::new();
-    for obj in &sidecar_list.objects {
-        let bytes = store.get(&obj.location).await?.bytes().await?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
-            .unwrap()
-            .build()
-            .unwrap();
-        batches.extend(reader.map(|rb| rb.unwrap()));
-    }
-    let (add_paths, _) = collect_file_action_paths(&batches);
-    assert_eq!(add_paths, vec!["file1.parquet", "file2.parquet"]);
-
     Ok(())
 }

@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 pub use counting_reporter::{CountingReporter, RelaxedCounter};
 use delta_kernel::actions::get_log_add_schema;
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
-    RecordBatch, StringArray, StructArray,
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
+    StringArray, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
@@ -1272,46 +1272,4 @@ pub fn assert_partition_values(action: &serde_json::Value, key: &str, expected_v
         "partitionValues should contain key '{key}', got: {pv:?}"
     );
     assert_eq!(pv[key], expected_value);
-}
-
-// === Record batch column helpers ===
-
-/// Gets a column from a [`RecordBatch`] by a nested struct path.
-pub fn get_column_by_path<'a>(rb: &'a RecordBatch, path: &[&str]) -> Option<&'a ArrayRef> {
-    let mut col = rb.column_by_name(path.first()?)?;
-    for segment in &path[1..] {
-        col = col.as_struct_opt()?.column_by_name(segment)?;
-    }
-    Some(col)
-}
-
-/// Collects sorted, non-null string values at the given nested column `path` across all batches.
-/// Checks validity of the immediate parent struct and the leaf column.
-pub fn collect_string_column(batches: &[RecordBatch], path: &[&str]) -> Vec<String> {
-    assert!(!path.is_empty());
-    let mut values = Vec::new();
-    for rb in batches {
-        let Some(parent) = get_column_by_path(rb, &path[..path.len() - 1]) else {
-            continue;
-        };
-        let Some(leaf) = parent.as_struct().column_by_name(path.last().unwrap()) else {
-            continue;
-        };
-        let string_col = leaf.as_string::<i32>();
-        for row in 0..string_col.len() {
-            if parent.is_valid(row) && string_col.is_valid(row) {
-                values.push(string_col.value(row).to_string());
-            }
-        }
-    }
-    values.sort();
-    values
-}
-
-/// Extracts sorted add and remove file paths from checkpoint/sidecar record batches.
-pub fn collect_file_action_paths(batches: &[RecordBatch]) -> (Vec<String>, Vec<String>) {
-    (
-        collect_string_column(batches, &["add", "path"]),
-        collect_string_column(batches, &["remove", "path"]),
-    )
 }
