@@ -902,6 +902,18 @@ fn evaluate_map_to_struct(
         .map(|f| ArrowField::try_from_kernel(*f))
         .try_collect()?;
 
+    // Propagate the input map's null bitmap to the output struct. This is critical:
+    // when a map row is null, the loop above appends null to every child builder
+    // (since no keys match). Without this null bitmap, the output struct row appears
+    // valid (non-null) to Arrow, but its children contain nulls. If any child field
+    // is non-nullable, Arrow rejects this as "Found unmasked nulls for non-nullable
+    // StructArray field". With the bitmap, the struct row is marked null, which masks
+    // the child nulls and satisfies Arrow's validation.
+    //
+    // This matters during checkpoint creation: the COALESCE expression evaluates
+    // MAP_TO_STRUCT for all rows including non-add actions (remove, metadata, protocol)
+    // where the partition values map is null. Partition columns declared NOT NULL would
+    // cause the checkpoint to fail without this propagation.
     Ok(StructArray::try_new(
         arrow_fields.into(),
         output_columns,
