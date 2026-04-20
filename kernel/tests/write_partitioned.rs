@@ -12,9 +12,6 @@ use delta_kernel::arrow::array::{
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
@@ -22,32 +19,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::Snapshot;
 use rstest::rstest;
-use test_utils::{read_scan, test_table_setup_mt};
-use url::Url;
-
-// ==============================================================================
-// Helpers
-// ==============================================================================
-
-async fn write_batch(
-    snapshot: &Arc<Snapshot>,
-    engine: &DefaultEngine<TokioMultiThreadExecutor>,
-    data: RecordBatch,
-    partition_values: HashMap<String, Scalar>,
-) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
-        .with_engine_info("test")
-        .with_data_change(true);
-    let write_context = txn.partitioned_write_context(partition_values)?;
-    let add_meta = engine
-        .write_parquet(&ArrowEngineData::new(data), &write_context)
-        .await?;
-    txn.add_files(add_meta);
-    let committed = txn.commit(engine)?.unwrap_committed();
-    Ok(committed.post_commit_snapshot().unwrap().clone())
-}
+use test_utils::{read_scan, test_table_setup_mt, write_batch_to_table};
 
 // ==============================================================================
 // Tests
@@ -64,34 +36,18 @@ async fn test_write_partitioned_normal_values_roundtrip(
     #[case] cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ===== Step 1: Create table and write one row with normal partition values. =====
-    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let schema = all_types_schema();
-    let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
-    let snapshot = create_all_types_table(&table_path, engine.as_ref(), cm_mode)?;
-    assert_eq!(snapshot.table_configuration().partition_columns().len(), 13);
-
-    let batch = RecordBatch::try_new(arrow_schema, normal_arrow_columns())?;
-    let snapshot = write_batch(
-        &snapshot,
-        engine.as_ref(),
-        batch,
+    let (_tmp_dir, table_path, snapshot, engine) = setup_and_write(
+        all_types_schema(),
+        PARTITION_COLS,
+        cm_mode,
+        normal_arrow_columns(),
         normal_partition_values()?,
     )
     .await?;
+    assert_eq!(snapshot.table_configuration().partition_columns().len(), 13);
 
     // ===== Step 2: Validate add.path structure in the commit log JSON. =====
-    let adds = read_add_actions_json(&table_path, 1)?;
-    assert_eq!(adds.len(), 1, "should have exactly one add action");
-    let add = &adds[0];
-    let raw_path = add["path"].as_str().unwrap();
-
-    assert!(
-        !raw_path.contains("://"),
-        "should produce relative paths, got: {raw_path}"
-    );
-
-    let rel_path = strip_table_root(raw_path, snapshot.table_root());
-
+    let (add, rel_path) = read_single_add(&table_path, 1)?;
     match cm_mode {
         ColumnMappingMode::None => {
             // Hive-style path with Hive encoding: colons -> %3A, spaces -> %20.
@@ -108,16 +64,7 @@ async fn test_write_partitioned_normal_values_roundtrip(
             assert!(rel_path.ends_with(".parquet"));
         }
         ColumnMappingMode::Name | ColumnMappingMode::Id => {
-            // Random 2-char prefix: <2char>/<uuid>.parquet
-            let segments: Vec<&str> = rel_path.split('/').collect();
-            assert_eq!(
-                segments.len(),
-                2,
-                "CM on: path should be <prefix>/<file>, got: {rel_path}"
-            );
-            assert_eq!(segments[0].len(), 2, "prefix should be 2 chars");
-            assert!(segments[0].chars().all(|c| c.is_ascii_alphanumeric()));
-            assert!(segments[1].ends_with(".parquet"));
+            assert_cm_path(&rel_path);
         }
     }
 
@@ -149,16 +96,8 @@ async fn test_write_partitioned_normal_values_roundtrip(
         }
     }
 
-    // ===== Step 4: Read data back via scan and verify all column values. =====
-    let sorted = read_sorted(&snapshot, engine.clone())?;
-    assert_normal_values(&sorted);
-
-    // ===== Step 5: Checkpoint, reload snapshot from checkpoint, read again. =====
-    snapshot.checkpoint(engine.as_ref())?;
-    let table_url = delta_kernel::try_parse_uri(&table_path)?;
-    let snapshot_after_cp = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let sorted = read_sorted(&snapshot_after_cp, engine)?;
-    assert_normal_values(&sorted);
+    // ===== Step 4: Scan and verify values survive checkpoint + reload. =====
+    verify_and_checkpoint(&snapshot, engine, assert_normal_values)?;
 
     Ok(())
 }
@@ -174,32 +113,21 @@ async fn test_write_partitioned_null_values_roundtrip(
     #[case] cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ===== Step 1: Create table and write one row with all-null partition values. =====
-    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let schema = all_types_schema();
-    let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
-    let snapshot = create_all_types_table(&table_path, engine.as_ref(), cm_mode)?;
-
-    let batch = RecordBatch::try_new(arrow_schema, null_arrow_columns())?;
-    let snapshot = write_batch(&snapshot, engine.as_ref(), batch, null_partition_values()?).await?;
+    let (_tmp_dir, table_path, snapshot, engine) = setup_and_write(
+        all_types_schema(),
+        PARTITION_COLS,
+        cm_mode,
+        null_arrow_columns(),
+        null_partition_values()?,
+    )
+    .await?;
 
     // ===== Step 2: Validate add.path structure in the commit log JSON. =====
-    let adds = read_add_actions_json(&table_path, 1)?;
-    assert_eq!(adds.len(), 1, "should have exactly one add action");
-    let add = &adds[0];
-    let raw_path = add["path"].as_str().unwrap();
-
-    assert!(
-        !raw_path.contains("://"),
-        "should produce relative paths, got: {raw_path}"
-    );
-
-    let rel_path = strip_table_root(raw_path, snapshot.table_root());
-
-    let hdp = "__HIVE_DEFAULT_PARTITION__";
+    let (add, rel_path) = read_single_add(&table_path, 1)?;
     match cm_mode {
         ColumnMappingMode::None => {
             // Every partition column should use HIVE_DEFAULT_PARTITION in the path.
-            let expected_prefix = hive_prefix(PARTITION_COLS, hdp);
+            let expected_prefix = hive_prefix(PARTITION_COLS, "__HIVE_DEFAULT_PARTITION__");
             assert!(
                 rel_path.starts_with(&expected_prefix),
                 "CM off null: relative path mismatch.\n  \
@@ -207,14 +135,7 @@ async fn test_write_partitioned_null_values_roundtrip(
             );
         }
         ColumnMappingMode::Name | ColumnMappingMode::Id => {
-            let segments: Vec<&str> = rel_path.split('/').collect();
-            assert_eq!(
-                segments.len(),
-                2,
-                "CM on: path should be <prefix>/<file>, got: {rel_path}"
-            );
-            assert_eq!(segments[0].len(), 2);
-            assert!(segments[0].chars().all(|c| c.is_ascii_alphanumeric()));
+            assert_cm_path(&rel_path);
         }
     }
 
@@ -228,16 +149,8 @@ async fn test_write_partitioned_null_values_roundtrip(
         );
     }
 
-    // ===== Step 4: Read data back via scan and verify all partition columns are null. =====
-    let sorted = read_sorted(&snapshot, engine.clone())?;
-    assert_all_partition_columns_null(&sorted);
-
-    // ===== Step 5: Checkpoint, reload snapshot from checkpoint, read again. =====
-    snapshot.checkpoint(engine.as_ref())?;
-    let table_url = delta_kernel::try_parse_uri(&table_path)?;
-    let snapshot_after_cp = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let sorted = read_sorted(&snapshot_after_cp, engine)?;
-    assert_all_partition_columns_null(&sorted);
+    // ===== Step 4: Scan and verify all-null values survive checkpoint + reload. =====
+    verify_and_checkpoint(&snapshot, engine, assert_all_partition_columns_null)?;
 
     Ok(())
 }
@@ -459,6 +372,19 @@ fn assert_all_partition_columns_null(sorted: &RecordBatch) {
     }
 }
 
+/// Asserts a CM=name/id relative path has the shape `<2char>/<file>.parquet`.
+fn assert_cm_path(rel_path: &str) {
+    let segments: Vec<&str> = rel_path.split('/').collect();
+    assert_eq!(
+        segments.len(),
+        2,
+        "CM on: path should be <prefix>/<file>, got: {rel_path}"
+    );
+    assert_eq!(segments[0].len(), 2, "prefix should be 2 chars");
+    assert!(segments[0].chars().all(|c| c.is_ascii_alphanumeric()));
+    assert!(segments[1].ends_with(".parquet"));
+}
+
 // ==============================================================================
 // Table setup and utility helpers
 // ==============================================================================
@@ -471,14 +397,15 @@ fn cm_mode_str(mode: ColumnMappingMode) -> &'static str {
     }
 }
 
-fn create_all_types_table(
+fn create_partitioned_table(
     table_path: &str,
     engine: &dyn delta_kernel::Engine,
+    schema: Arc<StructType>,
+    partition_cols: &[&str],
     cm_mode: ColumnMappingMode,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
-    let schema = all_types_schema();
     let mut builder = create_table(table_path, schema, "test/1.0")
-        .with_data_layout(DataLayout::partitioned(PARTITION_COLS.to_vec()));
+        .with_data_layout(DataLayout::partitioned(partition_cols));
     if cm_mode != ColumnMappingMode::None {
         builder =
             builder.with_table_properties([("delta.columnMapping.mode", cm_mode_str(cm_mode))]);
@@ -486,8 +413,7 @@ fn create_all_types_table(
     let _ = builder
         .build(engine, Box::new(FileSystemCommitter::new()))?
         .commit(engine)?;
-    let table_url = delta_kernel::try_parse_uri(table_path)?;
-    Ok(Snapshot::builder_for(table_url).build(engine)?)
+    Ok(Snapshot::builder_for(table_path).build(engine)?)
 }
 
 fn read_sorted(
@@ -538,14 +464,66 @@ fn decimal_array(value: i128, precision: u8, scale: i8) -> ArrayRef {
     )
 }
 
+/// Creates a partitioned table, writes one batch, and returns the post-commit snapshot.
+/// Callers can subsequently use [`read_single_add`] with the returned `table_path` to
+/// inspect the commit log.
+async fn setup_and_write(
+    schema: Arc<StructType>,
+    partition_cols: &[&str],
+    cm_mode: ColumnMappingMode,
+    arrow_columns: Vec<ArrayRef>,
+    partition_values: HashMap<String, Scalar>,
+) -> Result<
+    (
+        tempfile::TempDir,
+        String,
+        Arc<Snapshot>,
+        Arc<dyn delta_kernel::Engine>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let (tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
+    let snapshot = create_partitioned_table(
+        &table_path,
+        engine.as_ref(),
+        schema,
+        partition_cols,
+        cm_mode,
+    )?;
+
+    let batch = RecordBatch::try_new(arrow_schema, arrow_columns)?;
+    let snapshot =
+        write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
+
+    Ok((
+        tmp_dir,
+        table_path,
+        snapshot,
+        engine as Arc<dyn delta_kernel::Engine>,
+    ))
+}
+
+/// Reads the snapshot, runs `assert_fn` on the sorted scan result, then checkpoints,
+/// reloads a fresh snapshot from disk, and runs `assert_fn` again on the reloaded scan.
+fn verify_and_checkpoint(
+    snapshot: &Arc<Snapshot>,
+    engine: Arc<dyn delta_kernel::Engine>,
+    assert_fn: fn(&RecordBatch),
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sorted = read_sorted(snapshot, engine.clone())?;
+    assert_fn(&sorted);
+
+    snapshot.checkpoint(engine.as_ref())?;
+    let reloaded = Snapshot::builder_for(snapshot.table_root()).build(engine.as_ref())?;
+    let sorted = read_sorted(&reloaded, engine)?;
+    assert_fn(&sorted);
+    Ok(())
+}
+
 // ==============================================================================
 // JSON commit log helpers
 // ==============================================================================
-
-/// Returns the relative path portion from an add.path, which is always relative.
-fn strip_table_root(path: &str, _table_root: &Url) -> String {
-    path.to_string()
-}
 
 /// Builds an unescaped Hive-style path prefix like `col1=val/col2=val/`.
 /// Only correct when `value` contains no Hive-special characters.
@@ -571,4 +549,21 @@ fn read_add_actions_json(
         .into_iter()
         .filter_map(|v| v.get("add").cloned())
         .collect())
+}
+
+/// Reads the single add action from the commit at `version` and returns the action
+/// together with its path. Asserts the path is relative (no `scheme://` prefix).
+fn read_single_add(
+    table_path: &str,
+    version: u64,
+) -> Result<(serde_json::Value, String), Box<dyn std::error::Error>> {
+    let adds = read_add_actions_json(table_path, version)?;
+    assert_eq!(adds.len(), 1, "should have exactly one add action");
+    let add = adds.into_iter().next().unwrap();
+    let rel_path = add["path"].as_str().unwrap().to_string();
+    assert!(
+        !rel_path.contains("://"),
+        "should produce relative paths, got: {rel_path}"
+    );
+    Ok((add, rel_path))
 }

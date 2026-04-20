@@ -29,7 +29,7 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _}
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version, PRE_COMMIT_VERSION,
+    StorageHandler, Version,
 };
 
 mod domain_metadata_replay;
@@ -153,20 +153,45 @@ fn schema_to_is_not_null_predicate(schema: &StructType) -> Option<PredicateRef> 
 }
 
 impl LogSegment {
-    /// Creates a synthetic LogSegment for pre-commit transactions (e.g., create-table).
-    /// The sentinel version PRE_COMMIT_VERSION indicates no version exists yet on disk.
-    /// This is used to construct a pre-commit snapshot that provides table configuration
-    /// (protocol, metadata, schema) for operations like CTAS.
-    #[allow(dead_code)] // Used by create_table module
-    pub(crate) fn for_pre_commit(log_root: Url) -> Self {
-        use crate::PRE_COMMIT_VERSION;
-        Self {
-            end_version: PRE_COMMIT_VERSION,
+    /// Creates a LogSegment for a newly created table at version 0 from a single commit file.
+    ///
+    /// Normal log segments are built by listing files from storage and replaying them. For CREATE
+    /// TABLE, the table has no prior log. We construct the segment directly from the just created
+    /// commit file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `internal_error` if `commit_file` is not version 0 or not a commit file type.
+    pub(crate) fn new_for_version_zero(
+        log_root: Url,
+        commit_file: ParsedLogPath,
+    ) -> DeltaResult<Self> {
+        require!(
+            commit_file.version == 0,
+            crate::Error::internal_error(format!(
+                "new_for_version_zero called with version {}",
+                commit_file.version
+            ))
+        );
+        require!(
+            commit_file.is_commit(),
+            crate::Error::internal_error(format!(
+                "new_for_version_zero called with non-commit file type: {:?}",
+                commit_file.file_type
+            ))
+        );
+        Ok(Self {
+            end_version: commit_file.version,
             checkpoint_version: None,
             log_root,
             last_checkpoint_metadata: None,
-            listed: LogSegmentFiles::default(),
-        }
+            listed: LogSegmentFiles {
+                max_published_version: Some(commit_file.version),
+                latest_commit_file: Some(commit_file.clone()),
+                ascending_commit_files: vec![commit_file],
+                ..Default::default()
+            },
+        })
     }
 
     #[internal_api]
@@ -1104,11 +1129,7 @@ impl LogSegment {
     }
 
     /// How many commits since a checkpoint, according to this log segment.
-    /// Returns 0 for pre-commit snapshots (where end_version is PRE_COMMIT_VERSION).
     pub(crate) fn commits_since_checkpoint(&self) -> u64 {
-        if self.end_version == PRE_COMMIT_VERSION {
-            return 0;
-        }
         // we can use 0 as the checkpoint version if there is no checkpoint since `end_version - 0`
         // is the correct number of commits since a checkpoint if there are no checkpoints
         let checkpoint_version = self.checkpoint_version.unwrap_or(0);
@@ -1117,11 +1138,7 @@ impl LogSegment {
     }
 
     /// How many commits since a log-compaction or checkpoint, according to this log segment.
-    /// Returns 0 for pre-commit snapshots (where end_version is PRE_COMMIT_VERSION).
     pub(crate) fn commits_since_log_compaction_or_checkpoint(&self) -> u64 {
-        if self.end_version == PRE_COMMIT_VERSION {
-            return 0;
-        }
         // Annoyingly we have to search all the compaction files to determine this, because we only
         // sort by start version, so technically the max end version could be anywhere in the vec.
         // We can return 0 in the case there is no compaction since end_version - 0 is the correct
