@@ -146,7 +146,10 @@ fn linear_search_file_mod_timestamps(
     bound: Bound,
 ) -> Result<Version, LogHistoryError> {
     if commits.is_empty() {
-        return Err(LogHistoryError::TimestampOutOfRange { timestamp, bound });
+        return Err(LogHistoryError::TimestampOutOfRange {
+            timestamp,
+            reason: bound.out_of_range_reason(),
+        });
     }
 
     let lo_version = commits[0].version;
@@ -179,7 +182,10 @@ fn linear_search_file_mod_timestamps(
         prev_monotonic_ts = monotonic_ts;
     }
 
-    result.ok_or(LogHistoryError::TimestampOutOfRange { timestamp, bound })
+    result.ok_or(LogHistoryError::TimestampOutOfRange {
+        timestamp,
+        reason: bound.out_of_range_reason(),
+    })
 }
 
 /// Converts a timestamp to a version based on the specified bound type.
@@ -247,7 +253,10 @@ pub(crate) fn timestamp_to_version(
         TimestampSearchBounds::ICTSearchStartingFrom(lo) => {
             let commit_range = &log_segment.listed.ascending_commit_files[lo..];
             if commit_range.is_empty() {
-                return Err(LogHistoryError::TimestampOutOfRange { timestamp, bound });
+                return Err(LogHistoryError::TimestampOutOfRange {
+                    timestamp,
+                    reason: bound.out_of_range_reason(),
+                });
             }
 
             let lo_version = commit_range.first().map(|c| c.version).unwrap_or(0);
@@ -273,9 +282,10 @@ pub(crate) fn timestamp_to_version(
                     Ok(log_segment.listed.ascending_commit_files[idx].version)
                 }
                 Err(SearchError::KeyFunctionError(error)) => Err(error),
-                Err(SearchError::OutOfRange) => {
-                    Err(LogHistoryError::TimestampOutOfRange { timestamp, bound })
-                }
+                Err(SearchError::OutOfRange) => Err(LogHistoryError::TimestampOutOfRange {
+                    timestamp,
+                    reason: bound.out_of_range_reason(),
+                }),
             }
         }
 

@@ -12,12 +12,23 @@ use std::fmt::Debug;
 ///
 /// * [`Bound::GreatestLower`] - Finds the largest index `i` such that `values[i] <= key`. This
 ///   represents the last element less than or equal to the search key.
+#[allow(unused)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Bound {
+pub(crate) enum Bound {
     /// Find the smallest index with value >= key (first element at or after).
     LeastUpper,
     /// Find the largest index with value <= key (last element at or before).
     GreatestLower,
+}
+
+impl Bound {
+    /// Returns the error message for when a timestamp search is out of range.
+    pub(crate) fn out_of_range_reason(&self) -> &'static str {
+        match self {
+            Bound::LeastUpper => "no version exists at or after this timestamp",
+            Bound::GreatestLower => "no version exists at or before this timestamp",
+        }
+    }
 }
 
 /// Represents the errors that can occur when performing binary search using

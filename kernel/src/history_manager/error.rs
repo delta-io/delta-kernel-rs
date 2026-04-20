@@ -1,6 +1,5 @@
 //! Error types for the history manager module.
 
-use super::search::Bound;
 use super::Timestamp;
 use crate::Version;
 
@@ -32,15 +31,12 @@ pub enum LogHistoryError {
         between_version: Version,
     },
     /// The timestamp is outside the range of available commits.
-    #[error("Timestamp {timestamp} is out of range: {}", match .bound {
-        Bound::LeastUpper => "no version exists at or after this timestamp",
-        Bound::GreatestLower => "no version exists at or before this timestamp",
-    })]
+    #[error("Timestamp {timestamp} is out of range: {reason}")]
     TimestampOutOfRange {
         /// The timestamp that was out of range.
         timestamp: Timestamp,
-        /// The type of bound search that failed.
-        bound: Bound,
+        /// Description of why the timestamp is out of range.
+        reason: &'static str,
     },
     /// An internal error occurred during timestamp conversion.
     #[error("{context}: {source}")]
