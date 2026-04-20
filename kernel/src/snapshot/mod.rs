@@ -471,7 +471,7 @@ impl Snapshot {
     ///
     /// If a checkpoint already exists at this version, returns
     /// [`CheckpointWriteResult::AlreadyExists`] with the original snapshot unchanged.
-    /// Otherwise, writes a checkpoint according to the [`CheckpointSpec`] and returns
+    /// Otherwise, writes a checkpoint parquet file and the `_last_checkpoint` file and returns
     /// [`CheckpointWriteResult::Written`] with an updated [`SnapshotRef`] whose log segment
     /// reflects the new checkpoint. Commits and compaction files subsumed by the checkpoint are
     /// dropped from the returned snapshot.
