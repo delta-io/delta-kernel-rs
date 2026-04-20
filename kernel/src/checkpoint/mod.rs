@@ -219,8 +219,6 @@ impl LastCheckpointHintStats {
 #[derive(Debug)]
 pub(crate) struct WrittenCheckpointInfo {
     /// Metadata of the main checkpoint file.
-    /// SIDECAR_TODO: Remove the #[allow(dead_code)] in next PR
-    #[allow(dead_code)]
     pub(crate) file_meta: FileMeta,
     /// Stats for the `_last_checkpoint` hint.
     pub(crate) last_checkpoint_stats: LastCheckpointHintStats,

@@ -283,7 +283,7 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
 
     // This writes to parquet — will fail if the checkpointMetadata batch has a different
     // schema than the action batches.
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Verify the checkpoint was written and is used by a fresh snapshot
     let snapshot2 = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -344,7 +344,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(2),
     });
-    snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&checkpoint_spec))?;
+    snapshot.checkpoint(engine.as_ref(), Some(&checkpoint_spec))?;
 
     // === Step 3: Add post-checkpoint commits (insert + domain metadata update) ===
     let info_field = Arc::new(ArrowField::new("name", ArrowDataType::Utf8, true));
@@ -587,7 +587,7 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
     let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(1),
     });
-    snapshot2.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&checkpoint_spec))?;
+    snapshot2.checkpoint(engine.as_ref(), Some(&checkpoint_spec))?;
 
     // === Validate sidecar structure ===
     let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
@@ -750,7 +750,7 @@ async fn test_checkpoint_spec_rejected(
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
-    let result = snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&spec));
+    let result = snapshot.checkpoint(engine.as_ref(), Some(&spec));
     let err_msg = result.expect_err("spec should be rejected").to_string();
     assert!(
         err_msg.contains(err_substring),
@@ -785,7 +785,7 @@ async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
     let spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(2),
     });
-    snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&spec))?;
+    snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
 
     // No sidecar files on disk: when there are no file actions, our writer should not even
     // create the `_sidecars` directory.

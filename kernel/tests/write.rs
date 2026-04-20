@@ -3060,7 +3060,7 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             // log segment lazily while writing). This requires `TokioMultiThreadExecutor`,
             // which uses `block_in_place` to avoid deadlocking a single-thread runtime.
             let mt_engine = create_default_engine_mt_executor(&table_url)?;
-            snapshot_v2.checkpoint(mt_engine.as_ref())?;
+            snapshot_v2.checkpoint(mt_engine.as_ref(), None)?;
             Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
         } else {
             Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
@@ -3678,7 +3678,7 @@ async fn test_column_mapping_write(
 
     // Step 3: Checkpoint and verify add.stats uses correct column names
     let snapshot_for_checkpoint = latest_snapshot.clone();
-    snapshot_for_checkpoint.checkpoint(engine.as_ref())?;
+    snapshot_for_checkpoint.checkpoint(engine.as_ref(), None)?;
     let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let add_actions = read_add_infos(&ckpt_snapshot, engine.as_ref())?;
     let mut all_stats: Vec<_> = add_actions
@@ -3988,7 +3988,7 @@ async fn test_checkpoint_non_kernel_written_table() {
     let batches_before = test_utils::read_scan(&scan_before, engine.clone()).unwrap();
 
     // Create checkpoint via snapshot.checkpoint()
-    snapshot.checkpoint(engine.as_ref()).unwrap();
+    snapshot.checkpoint(engine.as_ref(), None).unwrap();
 
     // Read data after checkpoint
     let snapshot_after = Snapshot::builder_for(url.clone())
@@ -4046,7 +4046,7 @@ async fn test_snapshot_checkpoint_on_v1_table(
     )
     .await?;
 
-    snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), spec.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
 
     let delta_log = std::path::Path::new(&table_path).join("_delta_log");
     let ckpt_path = std::fs::read_dir(&delta_log)?
@@ -4096,7 +4096,7 @@ async fn test_snapshot_checkpoint_default_on_v2_table(
     )
     .await?;
 
-    snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), spec.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
 
     let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
     assert!(
@@ -4321,7 +4321,7 @@ async fn test_clustered_table_write_has_stats_parsed(
     )?
     .into_inner();
 
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Read checkpoint parquet directly to verify stats_parsed contains only clustering columns.
     // ScanBuilder::include_all_stats_columns() doesn't support stats_parsed when
