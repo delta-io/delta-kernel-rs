@@ -3116,11 +3116,41 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
     Ok(())
 }
 
-/// Scan with a partition predicate -> `Transaction::remove_files` commits and produces
-/// remove actions only for the targeted partition.
+/// Remove files via scan metadata on a partitioned table. Covers three predicate
+/// shapes against the same table so the remove-transform correctly handles the
+/// parsed scan columns in every combination:
+/// - no predicate: no `partitionValues_parsed`.
+/// - data-column predicate: no `partitionValues_parsed` (negative case; the fix must not affect
+///   scans whose predicate misses the partition columns).
+/// - partition predicate: `partitionValues_parsed` present.
+///
+/// Every case calls `.include_all_stats_columns()`, which forces `stats_parsed`
+/// into the scan output regardless of the predicate shape, so the partition-
+/// predicate case exercises both parsed-column drop paths together while the
+/// other two exercise only the `stats_parsed` drop path. The coalesce
+/// *reconstruction* of `stats` from `stats_parsed` is not exercised here
+/// because `stats` is non-null; the sibling
+/// `test_remove_files_after_predicate_scan_includes_stats_parsed` covers that.
+///
+/// `expected_partitions` is the multiset of `country` values expected across
+/// the generated Remove actions. Its length gives the expected Remove count,
+/// and its contents pin the correct partition was chosen (catches regressions
+/// where the wrong partition is removed).
+#[rstest::rstest]
+#[case::no_predicate(None, &["usa", "japan"])]
+#[case::data_predicate(
+    Some(Pred::gt(column_expr!("id"), Expr::literal(0_i32))),
+    &["usa", "japan"]
+)]
+#[case::partition_predicate(
+    Some(Pred::eq(column_expr!("country"), Expr::literal("usa".to_string()))),
+    &["usa"]
+)]
 #[tokio::test]
-async fn test_remove_files_after_partition_predicate_scan() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn test_remove_files_partitioned_with_parsed_columns(
+    #[case] predicate: Option<Pred>,
+    #[case] expected_partitions: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let partition_col = "country";
@@ -3133,8 +3163,8 @@ async fn test_remove_files_after_partition_predicate_scan() -> Result<(), Box<dy
         DataType::INTEGER,
     )])?);
 
-    // Local directory backing — `read_actions_from_commit` reads the commit JSON
-    // off disk and does not support the default in-memory store's `memory://` URL.
+    // Local directory backing: `read_actions_from_commit` reads commit JSON off disk
+    // and does not support the default in-memory store's `memory://` URL.
     let tmp_dir = tempdir()?;
     let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
 
@@ -3170,18 +3200,12 @@ async fn test_remove_files_after_partition_predicate_scan() -> Result<(), Box<dy
         }
         txn.commit(engine.as_ref())?.unwrap_committed();
 
-        // Predicate on the partition column: causes scan metadata to include the
-        // `partitionValues_parsed` column. Feeding this to remove_files previously
-        // failed at commit ("Too few fields in output schema"). See #2426.
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        let scan = snapshot
-            .clone()
-            .scan_builder()
-            .with_predicate(Arc::new(Pred::eq(
-                column_expr!("country"),
-                Expr::literal("usa".to_string()),
-            )))
-            .build()?;
+        let mut scan_builder = snapshot.clone().scan_builder().include_all_stats_columns();
+        if let Some(pred) = predicate.clone() {
+            scan_builder = scan_builder.with_predicate(Arc::new(pred));
+        }
+        let scan = scan_builder.build()?;
 
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
@@ -3192,21 +3216,42 @@ async fn test_remove_files_after_partition_predicate_scan() -> Result<(), Box<dy
         let committed = txn.commit(engine.as_ref())?.unwrap_committed();
         assert_eq!(committed.commit_version(), 2);
 
-        // Exactly one file was written to the `usa` partition, so exactly one
-        // remove action is expected. Asserting the count catches a regression
-        // where the scan returns zero files (making per-element checks vacuous).
         let remove_actions = read_actions_from_commit(&table_url, 2, "remove")?;
         assert_eq!(
             remove_actions.len(),
-            1,
-            "expected exactly one remove action for the 'usa' partition; got {}: {remove_actions:?}",
+            expected_partitions.len(),
+            "unexpected remove count; got {}: {remove_actions:?}",
             remove_actions.len()
         );
+
+        let mut actual_partitions: Vec<String> = remove_actions
+            .iter()
+            .filter_map(|r| {
+                r["partitionValues"][partition_col]
+                    .as_str()
+                    .map(String::from)
+            })
+            .collect();
+        actual_partitions.sort();
+        let mut expected_sorted: Vec<String> =
+            expected_partitions.iter().map(|s| s.to_string()).collect();
+        expected_sorted.sort();
+        assert_eq!(
+            actual_partitions, expected_sorted,
+            "partitionValues mismatch across removes; got: {remove_actions:?}"
+        );
+
+        // stats_parsed is present on every scan row, so the stats-with-parsed
+        // evaluator is selected for every case; it must still yield a populated
+        // stats JSON on every remove action.
         for remove in &remove_actions {
-            assert_eq!(
-                remove["partitionValues"]["country"].as_str(),
-                Some("usa"),
-                "remove action should only touch the 'usa' partition; got: {remove}"
+            let stats_str = remove["stats"]
+                .as_str()
+                .expect("stats field should be a non-null JSON string");
+            let stats: serde_json::Value = serde_json::from_str(stats_str)?;
+            assert!(
+                stats["numRecords"].as_i64().unwrap_or(0) > 0,
+                "stats.numRecords should be populated, got: {stats}"
             );
         }
     }

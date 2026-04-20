@@ -116,7 +116,6 @@ use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 
 mod checkpoint_transform;
-pub(crate) use checkpoint_transform::PARTITION_VALUES_PARSED_FIELD;
 #[allow(unused)]
 // Used once sidecar checkpoint writing is enabled
 mod sidecar;
