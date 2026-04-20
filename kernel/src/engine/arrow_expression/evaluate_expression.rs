@@ -2130,6 +2130,165 @@ mod tests {
         assert_eq!(col.value(0), "last");
     }
 
+    /// Null map rows with non-nullable output fields must not trigger Arrow validation errors.
+    /// Without propagating the input MapArray's null bitmap to the output StructArray, Arrow
+    /// rejects the result with "Found unmasked nulls for non-nullable StructArray field".
+    #[test]
+    fn test_map_to_struct_propagates_null_bitmap_for_non_nullable_fields() {
+        use crate::arrow::array::{MapBuilder, StringBuilder};
+
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+
+        // Row 0: valid map {"region": "us", "id": "42"}
+        builder.keys().append_value("region");
+        builder.values().append_value("us");
+        builder.keys().append_value("id");
+        builder.values().append_value("42");
+        builder.append(true).unwrap();
+
+        // Row 1: null map (e.g. a null parent struct for remove/metadata/protocol actions)
+        builder.append(false).unwrap();
+
+        // Row 2: valid map {"region": "eu", "id": "7"}
+        builder.keys().append_value("region");
+        builder.values().append_value("eu");
+        builder.keys().append_value("id");
+        builder.values().append_value("7");
+        builder.append(true).unwrap();
+
+        let map_array = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "pv",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        // Non-nullable output fields: triggers the bug when null bitmap is not propagated
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::new("region", DataType::STRING, false),
+            StructField::new("id", DataType::INTEGER, false),
+        ]);
+        let result_type = DataType::Struct(Box::new(output_schema));
+        let expr = Expr::map_to_struct(column_expr!("pv"));
+        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+
+        // The StructArray must carry the null bitmap from the input MapArray
+        assert!(structs.is_valid(0));
+        assert!(structs.is_null(1));
+        assert!(structs.is_valid(2));
+
+        let regions = structs
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ids = structs
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        assert_eq!(regions.value(0), "us");
+        assert_eq!(ids.value(0), 42);
+
+        assert_eq!(regions.value(2), "eu");
+        assert_eq!(ids.value(2), 7);
+    }
+
+    /// Simulates the checkpoint COALESCE pattern:
+    ///   COALESCE(partitionValues_parsed, MAP_TO_STRUCT(partitionValues))
+    /// with a null map row and non-nullable output fields. This is the exact
+    /// expression that fails during checkpoint creation for partitioned tables
+    /// with NOT NULL partition columns and writeStatsAsStruct=true.
+    #[test]
+    fn test_coalesce_map_to_struct_with_null_map_non_nullable_fields() {
+        use crate::arrow::array::{MapBuilder, StringBuilder};
+
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+
+        // Row 0: add action with partition value
+        builder.keys().append_value("date");
+        builder.values().append_value("2024-01-15");
+        builder.append(true).unwrap();
+
+        // Row 1: null map (remove/metadata action where add is null)
+        builder.append(false).unwrap();
+
+        let map_array = builder.finish();
+        let map_type = map_array.data_type().clone();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            // First column: existing partitionValues_parsed (null for commit-sourced rows)
+            ArrowField::new(
+                "pv_parsed",
+                ArrowDataType::Struct(
+                    vec![ArrowField::new("date", ArrowDataType::Date32, false)].into(),
+                ),
+                true,
+            ),
+            // Second column: partitionValues map
+            ArrowField::new("pv", map_type, true),
+        ]));
+
+        // pv_parsed: all null (simulates data from commit JSON that lacks partitionValues_parsed)
+        let pv_parsed = new_null_array(schema.field(0).data_type(), 2);
+        let batch =
+            RecordBatch::try_new(schema, vec![pv_parsed, Arc::new(map_array)]).unwrap();
+
+        let output_schema = StructType::new_unchecked(vec![StructField::new(
+            "date",
+            DataType::DATE,
+            false, // NOT NULL partition column
+        )]);
+        let result_type = DataType::Struct(Box::new(output_schema));
+
+        // COALESCE(pv_parsed, MAP_TO_STRUCT(pv))
+        let expr = Expr::coalesce([
+            Expr::column(["pv_parsed"]),
+            Expr::map_to_struct(column_expr!("pv")),
+        ]);
+        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+
+        // Row 0: pv_parsed is null, MAP_TO_STRUCT succeeds -> non-null struct
+        assert!(structs.is_valid(0));
+        // Row 1: pv_parsed is null, MAP_TO_STRUCT gets null map -> null struct
+        assert!(structs.is_null(1));
+    }
+
+    /// All map rows are null. The output StructArray should be entirely null.
+    #[test]
+    fn test_map_to_struct_all_null_maps_with_non_nullable_fields() {
+        use crate::arrow::array::{MapBuilder, StringBuilder};
+
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.append(false).unwrap();
+        builder.append(false).unwrap();
+
+        let map_array = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "pv",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        let output_schema = StructType::new_unchecked(vec![StructField::new(
+            "key",
+            DataType::STRING,
+            false,
+        )]);
+        let result_type = DataType::Struct(Box::new(output_schema));
+        let expr = Expr::map_to_struct(column_expr!("pv"));
+        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+
+        assert_eq!(structs.len(), 2);
+        assert!(structs.is_null(0));
+        assert!(structs.is_null(1));
+    }
+
     #[test]
     fn test_map_to_struct_non_map_input() {
         let schema = ArrowSchema::new(vec![ArrowField::new("s", ArrowDataType::Utf8, true)]);
