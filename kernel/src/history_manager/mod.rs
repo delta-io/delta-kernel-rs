@@ -126,6 +126,19 @@ fn get_timestamp_search_bounds(
 ///
 /// # Returns
 /// The version matching the bound criteria, or an error if no match exists.
+//
+// NOTE: Monotonization trade-offs
+//
+// File modification timestamps can have clock skew. We monotonize over visible history
+// only, which may produce incorrect results for commits near the retention boundary if
+// metadata cleanup removed skewed commits that affected monotonization.
+//
+// Since ICT is the correct long-term solution for timestamps, we avoid over-investing
+// in file modification timestamp handling.
+//
+// TODO: Today we read full commit history for timestamp conversion, which is expensive.
+// A future backwards-listing optimization would avoid reading full history - at that
+// point, monotonizing over full history becomes a bad trade-off and should be revisited.
 #[allow(unused)]
 fn linear_search_file_mod_timestamps(
     commits: &[ParsedLogPath],
