@@ -293,26 +293,30 @@ pub unsafe extern "C" fn free_scan_table_changes_iter(
 
 /// Get next batch of data from the table changes iterator.
 ///
+/// Returns `Ok(non-null)` with a heap-allocated [`ArrowFFIData`] containing the next batch,
+/// `Ok(null)` when the iterator is exhausted, or `Err` on failure. A non-null pointer must
+/// be freed by the engine via [`crate::engine_data::free_arrow_ffi_data`] exactly once.
+///
 /// # Safety
 ///
-/// The iterator must be valid (returned by [table_changes_scan_execute]) and not yet freed by
-/// [`free_scan_table_changes_iter`].
+/// The iterator must be valid (returned by [`table_changes_scan_execute`]) and not yet freed
+/// by [`free_scan_table_changes_iter`].
 #[no_mangle]
 pub unsafe extern "C" fn scan_table_changes_next(
     data: Handle<SharedScanTableChangesIterator>,
-) -> ExternResult<ArrowFFIData> {
+) -> ExternResult<*mut ArrowFFIData> {
     let data = unsafe { data.as_ref() };
     scan_table_changes_next_impl(data).into_extern_result(&data.engine.as_ref())
 }
 
-fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<ArrowFFIData> {
+fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<*mut ArrowFFIData> {
     let mut data = data
         .data
         .lock()
         .map_err(|_| Error::generic("poisoned scan table changes iterator mutex"))?;
 
     let Some(data) = data.next().transpose()? else {
-        return Ok(ArrowFFIData::empty());
+        return Ok(std::ptr::null_mut());
     };
 
     let record_batch = data.try_into_record_batch()?;
@@ -320,10 +324,10 @@ fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<
     let batch_struct_array: StructArray = record_batch.into();
     let array_data: ArrayData = batch_struct_array.into_data();
     let (out_array, out_schema) = to_ffi(&array_data)?;
-    Ok(ArrowFFIData {
+    Ok(Box::into_raw(Box::new(ArrowFFIData {
         array: out_array,
         schema: out_schema,
-    })
+    })))
 }
 
 #[cfg(test)]
@@ -704,14 +708,16 @@ mod tests {
         let mut i: i32 = 0;
         loop {
             i += 1;
-            let data = ok_or_panic(unsafe {
+            let data_ptr = ok_or_panic(unsafe {
                 scan_table_changes_next(table_changes_scan_iter_result.shallow_copy())
             });
-            if data.array.is_empty() {
+            if data_ptr.is_null() {
                 break;
             }
-            let engine_data =
-                ok_or_panic(unsafe { get_engine_data(data.array, &data.schema, allocate_err) });
+            // Take ownership of the boxed ArrowFFIData; the inner array/schema are moved
+            // into get_engine_data which takes ownership of the FFI_ArrowArray.
+            let ArrowFFIData { array, schema } = *unsafe { Box::from_raw(data_ptr) };
+            let engine_data = ok_or_panic(unsafe { get_engine_data(array, &schema, allocate_err) });
             let record_batch = unsafe { engine_data.into_inner().try_into_record_batch() }?;
 
             println!("Batch ({i}) num rows {:?}", record_batch.num_rows());
