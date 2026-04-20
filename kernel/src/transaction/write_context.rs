@@ -169,15 +169,18 @@ impl WriteContext {
     /// Computes the `add.path` value for the Delta log from a file's absolute URL, formatted
     /// according to this context's [`PathMode`].
     ///
-    /// Custom engines that write parquet files themselves (bypassing [`DefaultEngine::write_parquet`])
-    /// should call this after writing each file to produce the path for their Add action metadata.
+    /// Custom engines that write parquet files themselves (bypassing
+    /// [`DefaultEngine::write_parquet`]) should call this after writing each file to produce
+    /// the path for their Add action metadata.
     ///
     /// # Examples
     ///
     /// Given a table root of `s3://bucket/table/`:
     /// - `PathMode::Relative` + `s3://bucket/table/abc.parquet` -> `"abc.parquet"`
-    /// - `PathMode::Relative` + `s3://bucket/table/year=2024/abc.parquet` -> `"year=2024/abc.parquet"`
-    /// - `PathMode::Absolute` + `s3://bucket/table/abc.parquet` -> `"s3://bucket/table/abc.parquet"`
+    /// - `PathMode::Relative` + `s3://bucket/table/year=2024/abc.parquet` ->
+    ///   `"year=2024/abc.parquet"`
+    /// - `PathMode::Absolute` + `s3://bucket/table/abc.parquet` ->
+    ///   `"s3://bucket/table/abc.parquet"`
     ///
     /// In `Relative` mode, returns an error if the file is not under the table root.
     ///

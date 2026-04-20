@@ -854,8 +854,8 @@ pub trait ParquetHandler: AsAny {
     ///
     /// # Parameters
     ///
-    /// - `location` - The full URL path where the Parquet file should be written
-    ///   (e.g., `s3://bucket/path/file.parquet`).
+    /// - `location` - The full URL path where the Parquet file should be written (e.g.,
+    ///   `s3://bucket/path/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
     ///
     /// # Returns

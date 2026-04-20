@@ -351,9 +351,10 @@ pub enum CheckpointPolicy {
 mod tests {
     use std::collections::HashMap;
 
+    use rstest::rstest;
+
     use super::*;
     use crate::expressions::column_name;
-    use rstest::rstest;
 
     #[test]
     fn test_property_key_constants() {

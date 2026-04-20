@@ -1103,10 +1103,18 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
     let strings: Vec<String> = (0..n)
         .map(|i| {
             // Two steps of Knuth's multiplicative LCG produce four varied 20-digit numbers.
-            let a = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let b = a.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let c = b.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let d = c.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let a = (i as u64)
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let b = a
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let c = b
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let d = c
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             format!("{a:020}{b:020}{c:020}{d:020}{i:020}")
         })
         .collect();
