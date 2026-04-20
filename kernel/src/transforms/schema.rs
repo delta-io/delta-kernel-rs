@@ -62,7 +62,7 @@ pub trait SchemaTransform<'a> {
     /// and `Residual` together. Or, define it manually like this:
     /// ```rust,no_run
     /// # use std::borrow::Cow;
-    /// # use delta_kernel::schema::SchemaTransform;
+    /// # use delta_kernel::transforms::SchemaTransform;
     /// # use delta_kernel::transforms::Carrier;
     /// # struct X;
     /// # impl<'a> SchemaTransform<'a> for X {

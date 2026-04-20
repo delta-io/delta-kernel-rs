@@ -16,7 +16,8 @@ pub use self::schema::{SchemaDepthChecker, SchemaTransform};
 /// Example: fallible schema visitor
 /// ```rust,no_run
 /// # use delta_kernel::transform_output_type;
-/// # use delta_kernel::schema::{SchemaTransform, StructField};
+/// # use delta_kernel::schema::StructField;
+/// # use delta_kernel::transforms::SchemaTransform;
 /// # use delta_kernel::DeltaResult;
 /// struct Validate;
 ///
