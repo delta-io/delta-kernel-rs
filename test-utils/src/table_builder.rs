@@ -158,7 +158,7 @@ impl fmt::Display for FeatureSet {
 ///
 /// Designed for rstest `#[values]` parameterization alongside [`LogState`] and
 /// [`FeatureSet`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum DataLayoutConfig {
     /// No special data layout (default schema).
     Unpartitioned,
@@ -197,12 +197,12 @@ impl DataLayoutConfig {
 
     /// Whether this config uses partitioning.
     pub fn is_partitioned(&self) -> bool {
-        matches!(self, DataLayoutConfig::PartitionedAllTypes)
+        *self == DataLayoutConfig::PartitionedAllTypes
     }
 
     /// Whether this config uses clustering.
     pub fn is_clustered(&self) -> bool {
-        matches!(self, DataLayoutConfig::ClusteredAllTypes)
+        *self == DataLayoutConfig::ClusteredAllTypes
     }
 }
 
@@ -219,6 +219,8 @@ impl fmt::Display for DataLayoutConfig {
 /// Schema with all partition-valid primitive types. Use with [`DataLayoutConfig`] to select
 /// which columns are partition columns. Includes `TimestampNtz` which auto-enables the
 /// `timestampNtz` table feature.
+///
+/// All columns are nullable. Follow-up: add non-nullable variants to test NOT NULL handling.
 pub fn partitioned_schema() -> SchemaRef {
     Arc::new(StructType::new_unchecked(vec![
         // Partition-candidate columns (all valid partition types, matches write_partitioned.rs)
@@ -243,6 +245,8 @@ pub fn partitioned_schema() -> SchemaRef {
 /// Schema with all stats-eligible primitive types for clustering. Boolean and Binary are
 /// excluded (not stats-eligible). Includes `TimestampNtz` which auto-enables the
 /// `timestampNtz` table feature.
+///
+/// All columns are nullable. Follow-up: add non-nullable variants to test NOT NULL handling.
 pub fn clustered_schema() -> SchemaRef {
     Arc::new(StructType::new_unchecked(vec![
         // Clustering-eligible columns (stats-eligible primitive types)
@@ -358,7 +362,10 @@ impl TestTableBuilder {
         self
     }
 
-    /// Set partition columns by logical name. The columns must exist in the schema.
+    /// Set partition columns by logical name. For standard layouts, prefer
+    /// [`with_data_layout`](Self::with_data_layout) which sets schema and columns together.
+    /// Use this directly only when you need a custom schema with specific partition columns.
+    ///
     /// Each data file gets deterministic partition values derived from version and file index.
     /// Clears any previously set clustering columns (partitioning and clustering are mutually
     /// exclusive).
@@ -371,9 +378,12 @@ impl TestTableBuilder {
         self
     }
 
-    /// Set clustering columns by logical name. The columns must exist in the schema and
-    /// have stats-eligible types. Clears any previously set partition columns (partitioning
-    /// and clustering are mutually exclusive).
+    /// Set clustering columns by logical name. For standard layouts, prefer
+    /// [`with_data_layout`](Self::with_data_layout) which sets schema and columns together.
+    /// Use this directly only when you need a custom schema with specific clustering columns.
+    ///
+    /// The columns must exist in the schema and have stats-eligible types. Clears any
+    /// previously set partition columns (partitioning and clustering are mutually exclusive).
     pub fn with_clustering_columns(
         mut self,
         cols: impl IntoIterator<Item = impl Into<String>>,
@@ -384,6 +394,12 @@ impl TestTableBuilder {
     }
 
     /// Apply a [`DataLayoutConfig`], setting the schema and layout columns accordingly.
+    /// This is the recommended way to configure partitioning or clustering -- it sets both
+    /// the schema and columns in one call. Use
+    /// [`with_partition_columns`](Self::with_partition_columns) or
+    /// [`with_clustering_columns`](Self::with_clustering_columns) directly only when you
+    /// need a custom schema with specific columns.
+    ///
     /// For [`DataLayoutConfig::Unpartitioned`], leaves the schema and columns unchanged.
     pub fn with_data_layout(self, config: DataLayoutConfig) -> Self {
         let cols = config.columns();

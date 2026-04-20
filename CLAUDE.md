@@ -202,6 +202,9 @@ Keep this list updated when new protocol features are added to kernel.
 - Code comments state intent and explain "why" -- don't restate what the code self-documents.
 - Place `use` imports at the top of the file (for non-test code) or at the top of the
   `mod tests` block (for test code) -- never inside function bodies.
+- Prefer `==` over `matches!` for simple single-variant enum comparisons. `matches!` is
+  for patterns with bindings or guards. For example: `self == Variant` not
+  `matches!(self, Variant)`.
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
 
