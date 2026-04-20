@@ -22,13 +22,12 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::engine::reader_options;
 use crate::expressions::ColumnName;
 use crate::metrics::{MetricEvent, MetricsReporter};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-};
+use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use crate::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
@@ -58,14 +57,6 @@ pub(crate) fn writer_options(config: &ParquetWriterConfig) -> ArrowWriterOptions
     ArrowWriterOptions::new()
         .with_properties(props)
         .with_skip_arrow_metadata(true)
-}
-
-/// Returns the standard [`ArrowReaderOptions`] for all kernel parquet reads.
-///
-/// Skipping the embedded Arrow IPC schema avoids dependence on Arrow-specific metadata and
-/// ensures that type resolution is driven by the kernel schema rather than the file's schema.
-pub(in crate::engine) fn reader_options() -> ArrowReaderOptions {
-    ArrowReaderOptions::new().with_skip_arrow_metadata(true)
 }
 
 #[derive(Debug)]

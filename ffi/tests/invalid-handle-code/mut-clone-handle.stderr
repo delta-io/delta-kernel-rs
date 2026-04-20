@@ -1,14 +1,14 @@
 error[E0599]: the method `clone_as_arc` exists for struct `Handle<MutFoo>`, but its trait bounds were not satisfied
   --> tests/invalid-handle-code/mut-clone-handle.rs:13:15
    |
-8  | pub struct MutFoo;
-   | ----------------- doesn't satisfy `<MutFoo as HandleDescriptor>::Mutable = False`
+ 8 | pub struct MutFoo;
+   | ----------------- doesn't satisfy `<_ as HandleDescriptor>::Mutable = False`
 ...
 13 |     let r = h.clone_as_arc();
    |               ^^^^^^^^^^^^ method cannot be called on `Handle<MutFoo>` due to unsatisfied trait bounds
    |
    = note: the following trait bounds were not satisfied:
-           `<MutFoo as HandleDescriptor>::Mutable = False`
+           `<MutFoo as HandleDescriptor>::Mutable = delta_kernel_ffi::handle::False`
 
 error[E0271]: type mismatch resolving `<MutFoo as HandleDescriptor>::Mutable == False`
   --> tests/invalid-handle-code/mut-clone-handle.rs:12:41
@@ -16,10 +16,10 @@ error[E0271]: type mismatch resolving `<MutFoo as HandleDescriptor>::Mutable == 
 12 |     let h: Handle<MutFoo> = Arc::new(s).into();
    |                                         ^^^^ type mismatch resolving `<MutFoo as HandleDescriptor>::Mutable == False`
    |
-note: expected this to be `False`
+note: expected this to be `delta_kernel_ffi::handle::False`
   --> tests/invalid-handle-code/mut-clone-handle.rs:7:1
    |
-7  | #[handle_descriptor(target=Foo, mutable=true, sized=true)]
+ 7 | #[handle_descriptor(target=Foo, mutable=true, sized=true)]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = note: required for `Handle<MutFoo>` to implement `From<Arc<Foo>>`
    = note: required for `Arc<Foo>` to implement `Into<Handle<MutFoo>>`
@@ -28,11 +28,11 @@ note: expected this to be `False`
 error[E0599]: the method `clone_handle` exists for struct `Handle<MutFoo>`, but its trait bounds were not satisfied
   --> tests/invalid-handle-code/mut-clone-handle.rs:14:15
    |
-8  | pub struct MutFoo;
-   | ----------------- doesn't satisfy `<MutFoo as HandleDescriptor>::Mutable = False`
+ 8 | pub struct MutFoo;
+   | ----------------- doesn't satisfy `<_ as HandleDescriptor>::Mutable = False`
 ...
 14 |     let h = h.clone_handle();
    |               ^^^^^^^^^^^^
    |
    = note: the following trait bounds were not satisfied:
-           `<MutFoo as HandleDescriptor>::Mutable = False`
+           `<MutFoo as HandleDescriptor>::Mutable = delta_kernel_ffi::handle::False`

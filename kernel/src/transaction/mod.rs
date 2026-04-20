@@ -65,18 +65,6 @@ use stats_verifier::StatsVerifier;
 use write_context::SharedWriteState;
 pub use write_context::WriteContext;
 
-/// Controls how file paths are stored in the Delta log for add actions.
-// TODO(#2402): normalize paths in FileActionKey so mixing is safe, then remove this warning.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum PathMode {
-    /// Store paths relative to the table root (default).
-    #[default]
-    Relative,
-    /// Store absolute paths.
-    Absolute,
-}
-
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
@@ -258,8 +246,6 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
-    // Controls relative vs absolute path storage in the Delta log.
-    path_mode: PathMode,
     // See `shared_write_state()` method.
     shared_write_state: OnceLock<Arc<SharedWriteState>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
@@ -495,24 +481,6 @@ impl<S> Transaction<S> {
             }
             Err(e) => Err(e),
         }
-    }
-
-    /// Set how file paths are stored in the Delta log.
-    ///
-    /// The default is [`PathMode::Relative`]. Use [`PathMode::Absolute`] when the engine
-    /// requires absolute paths (e.g. some external catalogs). Mixing relative and absolute
-    /// paths in the same table is unsafe until path normalization is implemented (#2402).
-    pub fn with_path_mode(mut self, path_mode: PathMode) -> Self {
-        self.path_mode = path_mode;
-        self
-    }
-
-    /// Same as [`Transaction::with_path_mode`] but sets the value directly instead of
-    /// using a fluent API.
-    #[internal_api]
-    #[allow(dead_code)] // used in FFI
-    pub(crate) fn set_path_mode(&mut self, path_mode: PathMode) {
-        self.path_mode = path_mode;
     }
 
     /// Set the data change flag.
@@ -873,7 +841,6 @@ impl<S> Transaction<S> {
                 column_mapping_mode: table_config.column_mapping_mode(),
                 stats_columns: self.stats_columns(),
                 logical_partition_columns: table_config.partition_columns().to_vec(),
-                path_mode: self.path_mode,
             })
         })
     }

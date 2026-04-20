@@ -847,14 +847,16 @@ pub trait ParquetHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
-    /// Write data to a Parquet file at the specified location.
+    /// Write data to a Parquet file at the specified URL.
+    ///
+    /// This method writes the provided `data` to a Parquet file at the given `url`.
     ///
     /// This will overwrite the file if it already exists. For filesystem-backed
     /// implementations, the parent directories must be created if they do not exist.
     ///
     /// # Parameters
     ///
-    /// - `location` - The full URL path where the Parquet file should be written (e.g.,
+    /// - `url` - The full URL path where the Parquet file should be written (e.g.,
     ///   `s3://bucket/path/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
     ///
