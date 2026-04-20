@@ -562,7 +562,8 @@ impl Snapshot {
     ///
     /// # Errors
     /// - If `CheckpointSpec::V2` is used but the table does not support the `v2Checkpoint` feature.
-    /// - If `CheckpointSpec::V1` is used but the table supports `v2Checkpoint` feature.
+    /// - If `CheckpointSpec::V1` is used but the table supports `v2Checkpoint` feature. Note: the
+    ///   Delta protocol permits writing V1 checkpoints to such tables; this is a kernel-limitation.
     /// - If `file_actions_per_sidecar_hint` is `Some(0)`.
     ///
     /// [`CheckpointSpec`]: crate::checkpoint::CheckpointSpec

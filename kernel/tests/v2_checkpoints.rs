@@ -1142,3 +1142,63 @@ async fn test_checkpoint_spec_rejected(
 
     Ok(())
 }
+
+/// V2 checkpoint with sidecar on a table that has no file actions: the loop writes zero
+/// sidecar files, the main checkpoint contains no `sidecar` action rows, and `_last_checkpoint`
+/// reports `numOfAddFiles = 0` and `sizeInBytes` equal to the main checkpoint file size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "value",
+        DataType::INTEGER,
+    )])?);
+
+    // v2 table, no data commits -> only protocol + metadata at version 0.
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let version = snapshot.version();
+
+    let spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: Some(2),
+    });
+    snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&spec))?;
+
+    // No sidecar files on disk: when there are no file actions, our writer should not even
+    // create the `_sidecars` directory.
+    let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
+    assert!(
+        !sidecars_dir.exists(),
+        "_sidecars directory should not exist when there are no file actions, found: {}",
+        sidecars_dir.display()
+    );
+
+    // Main checkpoint contains no `sidecar` action rows.
+    let ckpt_file = load_checkpoint_path(&table_path, version);
+    let ckpt_batch = read_parquet_file(&ckpt_file);
+    let sidecar_col = get_struct_column_from_record_batch(&ckpt_batch, "sidecar");
+    let sidecar_rows = valid_row_indices(sidecar_col, ckpt_batch.num_rows());
+    assert!(
+        sidecar_rows.is_empty(),
+        "main checkpoint should contain no sidecar action rows, found {}",
+        sidecar_rows.len()
+    );
+
+    // `_last_checkpoint` reflects zero adds and a single-file size.
+    let last_ckpt = read_last_checkpoint(&table_path);
+    assert_eq!(last_ckpt["numOfAddFiles"], 0);
+    let ckpt_file_size = std::fs::metadata(&ckpt_file).unwrap().len() as i64;
+    assert_eq!(
+        last_ckpt["sizeInBytes"].as_i64().unwrap(),
+        ckpt_file_size,
+        "sizeInBytes should equal main checkpoint size when there are no sidecars"
+    );
+
+    Ok(())
+}
