@@ -2,12 +2,12 @@
 //!
 //! Validates schemas per the Delta protocol specification.
 
-use std::borrow::Cow;
 use std::collections::HashSet;
 
 use crate::schema::{StructField, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::SchemaTransform;
+use crate::transform_output_type;
 use crate::{DeltaResult, Error};
 
 /// Characters that are invalid in Parquet column names when column mapping is disabled.
@@ -33,7 +33,7 @@ pub(crate) fn validate_schema_for_create(
     // We reuse the SchemaTransform trait for its recursive traversal machinery.
     // The validator never transforms the schema -- it only inspects fields and
     // collects errors. The return value is intentionally discarded.
-    let _ = validator.transform_struct(schema);
+    validator.transform_struct(schema);
     validator.into_result()
 }
 
@@ -78,16 +78,16 @@ impl SchemaValidator {
 }
 
 impl<'a> SchemaTransform<'a> for SchemaValidator {
+    transform_output_type!(|'a, T| ());
+
     /// The default `transform_variant` recurses into the variant's struct fields
     /// (metadata, value) via `recurse_into_struct`. Those fields are protocol-defined
     /// and must be non-null -- they are not user-controlled schema columns. We override
     /// to return the variant struct unchanged, skipping recursion so the non-null check
     /// in `transform_struct_field` does not reject these fixed internal fields.
-    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        Some(Cow::Borrowed(stype))
-    }
+    fn transform_variant(&mut self, _stype: &'a StructType) {}
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+    fn transform_struct_field(&mut self, field: &'a StructField) {
         if let Err(e) = validate_field_name(field.name(), self.cm_enabled) {
             self.errors.push(e.to_string());
         }
@@ -112,9 +112,8 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
             ));
         }
 
-        let result = self.recurse_into_struct_field(field);
+        self.recurse_into_struct_field(field);
         self.current_path.pop();
-        result
     }
 }
 

@@ -1,7 +1,5 @@
 //! Utility functions for the variant type and variant-related table features.
 
-use std::borrow::Cow;
-
 use crate::schema::{Schema, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
