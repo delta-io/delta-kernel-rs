@@ -3116,6 +3116,103 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
     Ok(())
 }
 
+/// Scan with a partition predicate -> `Transaction::remove_files` commits and produces
+/// remove actions only for the targeted partition.
+#[tokio::test]
+async fn test_remove_files_after_partition_predicate_scan() -> Result<(), Box<dyn std::error::Error>>
+{
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let partition_col = "country";
+    let table_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("country", DataType::STRING),
+    ])?);
+    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+
+    // Local directory backing — `read_actions_from_commit` reads the commit JSON
+    // off disk and does not support the default in-memory store's `memory://` URL.
+    let tmp_dir = tempdir()?;
+    let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+
+    for (table_url, engine, _store, _table_name) in setup_test_tables(
+        table_schema.clone(),
+        &[partition_col],
+        Some(&tmp_url),
+        "test_table",
+    )
+    .await?
+    {
+        let engine = Arc::new(engine);
+
+        // Write two partitions: country="usa" and country="japan".
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let mut txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_data_change(true);
+        let append_data = [[1, 2, 3], [10, 20, 30]].map(|data| -> DeltaResult<_> {
+            let data = RecordBatch::try_new(
+                Arc::new(data_schema.as_ref().try_into_arrow()?),
+                vec![Arc::new(Int32Array::from(data.to_vec()))],
+            )?;
+            Ok(Box::new(ArrowEngineData::new(data)))
+        });
+        for (data, partition_val) in append_data.into_iter().zip(["usa", "japan"]) {
+            let ctx = Arc::new(txn.partitioned_write_context(HashMap::from([(
+                partition_col.to_string(),
+                Scalar::String(partition_val.into()),
+            )]))?);
+            let add_meta = engine.write_parquet(data?.as_ref(), ctx.as_ref()).await?;
+            txn.add_files(add_meta);
+        }
+        txn.commit(engine.as_ref())?.unwrap_committed();
+
+        // Predicate on the partition column: causes scan metadata to include the
+        // `partitionValues_parsed` column. Feeding this to remove_files previously
+        // failed at commit ("Too few fields in output schema"). See #2426.
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(Arc::new(Pred::eq(
+                column_expr!("country"),
+                Expr::literal("usa".to_string()),
+            )))
+            .build()?;
+
+        let mut txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_data_change(true);
+        for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+            txn.remove_files(scan_metadata?.scan_files);
+        }
+        let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        assert_eq!(committed.commit_version(), 2);
+
+        // Exactly one file was written to the `usa` partition, so exactly one
+        // remove action is expected. Asserting the count catches a regression
+        // where the scan returns zero files (making per-element checks vacuous).
+        let remove_actions = read_actions_from_commit(&table_url, 2, "remove")?;
+        assert_eq!(
+            remove_actions.len(),
+            1,
+            "expected exactly one remove action for the 'usa' partition; got {}: {remove_actions:?}",
+            remove_actions.len()
+        );
+        for remove in &remove_actions {
+            assert_eq!(
+                remove["partitionValues"]["country"].as_str(),
+                Some("usa"),
+                "remove action should only touch the 'usa' partition; got: {remove}"
+            );
+        }
+    }
+    Ok(())
+}
+
 // Helper function to create a table with CDF enabled
 async fn create_cdf_table(
     table_name: &str,

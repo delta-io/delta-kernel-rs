@@ -11,6 +11,7 @@ use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
     DomainMetadata, Metadata, Protocol, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
+use crate::checkpoint::PARTITION_VALUES_PARSED_FIELD;
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
@@ -1327,7 +1328,11 @@ fn build_remove_transform(
             Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into(),
         )
         .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-        .with_dropped_field("modificationTime");
+        .with_dropped_field("modificationTime")
+        // Scans with a partition-touching predicate add `partitionValues_parsed`
+        // to the scan output schema (see scan/log_replay.rs); drop it so the
+        // remove-transform's field count matches its target schema. See #2426.
+        .with_dropped_field_if_exists(PARTITION_VALUES_PARSED_FIELD);
 
     for column_to_drop in columns_to_drop {
         transform = transform.with_dropped_field(*column_to_drop);
