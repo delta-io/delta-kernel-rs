@@ -1094,104 +1094,50 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
     Ok(())
 }
 
-/// V2 checkpoint spec requires the v2Checkpoint table feature to be enabled.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_checkpoint_spec_requires_v2checkpoint_feature() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let table_url = delta_kernel::try_parse_uri(&table_path)?;
-
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "value",
-        DataType::INTEGER,
-    )])?);
-
-    // Create table WITHOUT v2Checkpoint feature
-    let _ = create_table(&table_path, schema, "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
-
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-
-    // Attempting V2 checkpoint on a table without the feature should fail
-    let spec = CheckpointSpec::V2(V2CheckpointConfig::NoSidecar);
-    let result = snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&spec));
-    assert!(
-        result.is_err(),
-        "V2 spec on table without v2Checkpoint feature should fail"
-    );
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("v2Checkpoint"),
-        "error should mention v2Checkpoint feature, got: {err_msg}"
-    );
-
-    Ok(())
-}
-
-/// V1 checkpoint spec is not allowed when the table supports v2Checkpoint.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v1_checkpoint_rejected_on_v2_table() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let table_url = delta_kernel::try_parse_uri(&table_path)?;
-
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "info",
-            DataType::try_struct_type([StructField::nullable("name", DataType::STRING)])?,
-        ),
-    ])?);
-
-    // Create table WITH v2Checkpoint feature
-    let _ = create_table(&table_path, schema, "DefaultEngine")
-        .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
-
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-
-    let result =
-        snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&CheckpointSpec::V1));
-    assert!(
-        result.is_err(),
-        "V1 spec on table with v2Checkpoint feature should fail"
-    );
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("V1") && err_msg.contains("v2Checkpoint"),
-        "error should mention V1 and v2Checkpoint, got: {err_msg}"
-    );
-
-    Ok(())
-}
-
-/// file_actions_per_sidecar_hint of 0 is rejected.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_sidecar_hint_zero_rejected() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let table_url = delta_kernel::try_parse_uri(&table_path)?;
-
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "value",
-        DataType::INTEGER,
-    )])?);
-
-    let _ = create_table(&table_path, schema, "Test/1.0")
-        .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
-
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-
-    let spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+/// Parameterized negative tests for writing v2 checkpoint with sidecars.
+#[rstest::rstest]
+#[case::v2_spec_requires_v2checkpoint_feature(
+    false,
+    CheckpointSpec::V2(V2CheckpointConfig::NoSidecar),
+    "v2Checkpoint"
+)]
+#[case::v1_rejected_on_v2_table(true, CheckpointSpec::V1, "V1")]
+#[case::sidecar_hint_zero_rejected(
+    true,
+    CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(0),
-    });
+    }),
+    "greater than 0"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_spec_rejected(
+    #[case] enable_v2checkpoint: bool,
+    #[case] spec: CheckpointSpec,
+    #[case] err_substring: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "value",
+        DataType::INTEGER,
+    )])?);
+
+    let mut builder = create_table(&table_path, schema, "Test/1.0");
+    if enable_v2checkpoint {
+        builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
+    }
+    let _ = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
     let result = snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), Some(&spec));
-    assert!(result.is_err(), "hint=0 should be rejected");
-    let err_msg = result.unwrap_err().to_string();
+    let err_msg = result.expect_err("spec should be rejected").to_string();
     assert!(
-        err_msg.contains("greater than 0"),
-        "error should mention hint must be > 0, got: {err_msg}"
+        err_msg.contains(err_substring),
+        "error should mention {err_substring:?}, got: {err_msg}"
     );
 
     Ok(())

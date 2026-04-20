@@ -1,4 +1,4 @@
-//! This module implements the API for writing single-file checkpoints.
+//! This module implements the API for writing Delta checkpoints.
 //!
 //! The entry point for this API is [`Snapshot::create_checkpoint_writer`].
 //!
@@ -8,7 +8,7 @@
 //! | Table Feature    | Resulting Checkpoint Type    | Description                                                                 |
 //! |------------------|-------------------------------|-----------------------------------------------------------------------------|
 //! | No v2Checkpoints | Single-file Classic-named V1 | Follows V1 specification without [`CheckpointMetadata`] action             |
-//! | v2Checkpoints    | Single-file Classic-named V2 | Follows V2 specification with [`CheckpointMetadata`] action while maintaining backward compatibility via classic naming |
+//! | v2Checkpoints    | Classic-named V2             | Follows V2 specification with [`CheckpointMetadata`] action while maintaining backward compatibility via classic naming |
 //!
 //! For more information on the V1/V2 specifications, see the following protocol section:
 //! <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-specs>
@@ -97,9 +97,6 @@
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
 // Future extensions:
-// - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be
-//   extensible for future multi-file support, but the current implementation only supports
-//   single-file checkpoints.
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use itertools::Itertools;
@@ -223,8 +220,8 @@ impl LastCheckpointHintStats {
 /// Result of writing a checkpoint file to storage.
 #[derive(Debug)]
 pub(crate) struct WrittenCheckpointInfo {
-    /// Metadata of the main checkpoint file. Retained for callers that need to update
-    /// the log segment after a successful checkpoint write.
+    /// Metadata of the main checkpoint file.
+    /// SIDECAR_TODO: Remove the #[allow(dead_code)] in next PR
     #[allow(dead_code)]
     pub(crate) file_meta: FileMeta,
     /// Stats for the `_last_checkpoint` hint.
@@ -279,8 +276,6 @@ pub enum V2CheckpointConfig {
         /// This is a hint, not a strict limit, because file actions are stored in `EngineData`
         /// batches that cannot be split. For example, if the hint is 99 but a single
         /// `EngineData` batch contains 100 file actions, all 100 will be written to one sidecar.
-        ///
-        /// Defaults to [`DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT`] when `None`.
         file_actions_per_sidecar_hint: Option<usize>,
     },
 }
@@ -847,17 +842,15 @@ impl CheckpointWriter {
         checkpoint_data_schema: &SchemaRef,
         sidecar_metas: &[(String, FileMeta)],
     ) -> DeltaResult<Vec<Box<dyn EngineData>>> {
-        // Derive the sidecar struct schema from the checkpoint data schema
+        // Derive the sidecar struct schema from the checkpoint data schema.
         let sidecar_field = checkpoint_data_schema
             .field(SIDECAR_NAME)
             .ok_or_else(|| Error::internal_error("checkpoint schema missing sidecar field"))?;
-        let sidecar_struct = match sidecar_field.data_type() {
-            DataType::Struct(s) => s,
-            other => {
-                return Err(Error::internal_error(format!(
-                    "expected sidecar field to be struct, got {other:?}"
-                )));
-            }
+        let DataType::Struct(sidecar_struct) = sidecar_field.data_type() else {
+            return Err(Error::internal_error(format!(
+                "expected sidecar field to be struct, got {:?}",
+                sidecar_field.data_type()
+            )));
         };
         let sidecar_fields: Vec<StructField> = sidecar_struct.fields().cloned().collect();
 
@@ -875,7 +868,7 @@ impl CheckpointWriter {
                 ))
             })?;
 
-            // Build scalar values matching the sidecar schema field order
+            // Build scalar values matching the sidecar schema field order.
             let values: Vec<Scalar> = sidecar_fields
                 .iter()
                 .map(|field| match field.name().as_str() {
