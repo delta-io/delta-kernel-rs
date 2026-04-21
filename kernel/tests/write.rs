@@ -4,10 +4,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray, StructArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, ListArray, MapArray, StringArray,
+    StructArray, TimestampMicrosecondArray,
 };
-use delta_kernel::arrow::buffer::NullBuffer;
+use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
@@ -26,7 +26,8 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef, StructField,
+    StructType,
 };
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
@@ -4448,6 +4449,158 @@ async fn test_create_table_with_data_uses_relative_paths() -> Result<(), Box<dyn
     let batches = test_utils::read_scan(&scan, engine_ref)?;
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 2);
+
+    Ok(())
+}
+
+/// Verifies that writing a table with array, map, and variant columns produces nullCount
+/// statistics for those columns while excluding them from minValues/maxValues.
+#[tokio::test]
+async fn test_write_stats_for_complex_type_columns() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable(
+            "tags",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+        ),
+        StructField::nullable(
+            "props",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::LONG,
+                true,
+            ))),
+        ),
+        StructField::nullable("v", DataType::unshredded_variant()),
+    ])?);
+
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+    let table_url = Url::from_directory_path(table_path).unwrap();
+
+    // Build Arrow arrays: 3 rows, with one null in each complex column
+    let arrow_schema: delta_kernel::arrow::datatypes::Schema = schema.as_ref().try_into_arrow()?;
+    let arrow_schema = Arc::new(arrow_schema);
+
+    let id_array = Int64Array::from(vec![1, 2, 3]);
+
+    // Extract the exact field types from the converted schema to avoid field name mismatches
+    let tags_field = arrow_schema.field_with_name("tags").unwrap();
+    let props_field = arrow_schema.field_with_name("props").unwrap();
+
+    // tags: [["a", "b"], null, ["c"]]
+    let tag_values = StringArray::from(vec!["a", "b", "c"]);
+    let tag_offsets = OffsetBuffer::new(vec![0, 2, 2, 3].into());
+    let list_element_field = match tags_field.data_type() {
+        ArrowDataType::List(f) => f.clone(),
+        other => panic!("expected List, got {other:?}"),
+    };
+    let tag_array = ListArray::new(
+        list_element_field,
+        tag_offsets,
+        Arc::new(tag_values),
+        Some(NullBuffer::from_iter([true, false, true])),
+    );
+
+    // props: [{"k1": 10}, {"k2": 20}, null]
+    let map_keys = StringArray::from(vec!["k1", "k2"]);
+    let map_values = Int64Array::from(vec![Some(10i64), Some(20)]);
+    let (map_entries_field, map_sorted) = match props_field.data_type() {
+        ArrowDataType::Map(f, sorted) => (f.clone(), *sorted),
+        other => panic!("expected Map, got {other:?}"),
+    };
+    let entries_struct_fields = match map_entries_field.data_type() {
+        ArrowDataType::Struct(fields) => fields.clone(),
+        other => panic!("expected Struct for map entries, got {other:?}"),
+    };
+    let map_entries = StructArray::new(
+        entries_struct_fields,
+        vec![
+            Arc::new(map_keys) as ArrayRef,
+            Arc::new(map_values) as ArrayRef,
+        ],
+        None,
+    );
+    let map_offsets = OffsetBuffer::new(vec![0, 1, 2, 2].into());
+    let map_array = MapArray::new(
+        map_entries_field,
+        map_offsets,
+        map_entries,
+        Some(NullBuffer::from_iter([true, true, false])),
+        map_sorted,
+    );
+
+    // v: [variant(1), null, variant({"a": 2})]
+    let variant_metadata = BinaryArray::from(vec![
+        Some(&[0x01, 0x00, 0x00][..]),             // metadata for integer 1
+        None,                                      // null
+        Some(&[0x01, 0x01, 0x00, 0x01, 0x61][..]), // metadata for {"a": 2}
+    ]);
+    let variant_value = BinaryArray::from(vec![
+        Some(&[0x0C, 0x01][..]),                         // value for integer 1
+        None,                                            // null
+        Some(&[0x02, 0x01, 0x00, 0x00, 0x01, 0x02][..]), // value for {"a": 2}
+    ]);
+    let variant_fields = match arrow_schema.field_with_name("v").unwrap().data_type() {
+        ArrowDataType::Struct(fields) => fields.clone(),
+        other => panic!("expected Struct for variant, got {other:?}"),
+    };
+    let variant_array = StructArray::new(
+        variant_fields,
+        vec![
+            Arc::new(variant_metadata) as ArrayRef,
+            Arc::new(variant_value) as ArrayRef,
+        ],
+        Some(NullBuffer::from_iter([true, false, true])),
+    );
+
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(id_array) as ArrayRef,
+            Arc::new(tag_array) as ArrayRef,
+            Arc::new(map_array) as ArrayRef,
+            Arc::new(variant_array) as ArrayRef,
+        ],
+    )?;
+
+    let _snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+
+    // Read the commit and verify stats
+    let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
+    assert_eq!(add_actions.len(), 1);
+
+    let stats: serde_json::Value = serde_json::from_str(
+        add_actions[0]
+            .get("stats")
+            .and_then(|s| s.as_str())
+            .expect("add action should have stats"),
+    )?;
+
+    assert_eq!(stats["numRecords"], 3);
+
+    // nullCount should be present for all columns including array, map, and variant
+    assert_eq!(stats["nullCount"]["id"], 0);
+    assert_eq!(stats["nullCount"]["tags"], 1);
+    assert_eq!(stats["nullCount"]["props"], 1);
+    assert_eq!(stats["nullCount"]["v"], 1);
+
+    // minValues/maxValues should have id but NOT complex types
+    assert!(stats["minValues"]["id"].is_number());
+    assert!(stats["maxValues"]["id"].is_number());
+    for col in ["tags", "props", "v"] {
+        assert!(
+            stats["minValues"].get(col).is_none(),
+            "minValues should not contain {col}"
+        );
+        assert!(
+            stats["maxValues"].get(col).is_none(),
+            "maxValues should not contain {col}"
+        );
+    }
 
     Ok(())
 }
