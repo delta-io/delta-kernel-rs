@@ -96,7 +96,6 @@
 //! [`FileMeta`]: crate::FileMeta
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
-// Future extensions:
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use itertools::Itertools;
@@ -670,7 +669,7 @@ impl CheckpointWriter {
                 sidecar_metas.len()
             ))
         })?;
-        self.build_written_checkpoint_info(
+        build_written_checkpoint_info(
             engine,
             &checkpoint_path,
             iter_state,
@@ -693,43 +692,13 @@ impl CheckpointWriter {
             .parquet_handler()
             .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
 
-        self.build_written_checkpoint_info(
+        build_written_checkpoint_info(
             engine,
             &checkpoint_path,
             state,
             0, /* sidecar_sizes_sum */
             0, /* sidecar_count */
         )
-    }
-
-    fn build_written_checkpoint_info(
-        &self,
-        engine: &dyn Engine,
-        checkpoint_path: &Url,
-        state: Arc<ActionReconciliationIteratorState>,
-        sidecar_sizes_sum: u64,
-        sidecar_count: u64,
-    ) -> DeltaResult<WrittenCheckpointInfo> {
-        let file_meta = engine.storage_handler().head(checkpoint_path)?;
-        let total_size_in_bytes =
-            file_meta
-                .size
-                .checked_add(sidecar_sizes_sum)
-                .ok_or_else(|| {
-                    Error::internal_error("checkpoint total size_in_bytes overflowed u64")
-                })?;
-        let state = Arc::into_inner(state).ok_or_else(|| {
-            Error::internal_error("ActionReconciliationIteratorState Arc has other references")
-        })?;
-        let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
-            total_size_in_bytes,
-            state,
-            sidecar_count,
-        )?;
-        Ok(WrittenCheckpointInfo {
-            file_meta,
-            last_checkpoint_stats,
-        })
     }
 
     /// Creates the checkpoint metadata action for V2 checkpoints.
@@ -950,4 +919,30 @@ pub(crate) fn create_last_checkpoint_data(
             add_actions_counter.into(),
         ],
     )
+}
+
+fn build_written_checkpoint_info(
+    engine: &dyn Engine,
+    checkpoint_path: &Url,
+    state: Arc<ActionReconciliationIteratorState>,
+    sidecar_sizes_sum: u64,
+    sidecar_count: u64,
+) -> DeltaResult<WrittenCheckpointInfo> {
+    let file_meta = engine.storage_handler().head(checkpoint_path)?;
+    let total_size_in_bytes = file_meta
+        .size
+        .checked_add(sidecar_sizes_sum)
+        .ok_or_else(|| Error::internal_error("checkpoint total size_in_bytes overflowed u64"))?;
+    let state = Arc::into_inner(state).ok_or_else(|| {
+        Error::internal_error("ActionReconciliationIteratorState Arc has other references")
+    })?;
+    let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
+        total_size_in_bytes,
+        state,
+        sidecar_count,
+    )?;
+    Ok(WrittenCheckpointInfo {
+        file_meta,
+        last_checkpoint_stats,
+    })
 }
