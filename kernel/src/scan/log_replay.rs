@@ -546,6 +546,7 @@ pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersi
 pub(crate) static CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
 pub(crate) static TAGS_NAME: &str = "tags";
 pub(crate) static STATS_PARSED_NAME: &str = "stats_parsed";
+pub(crate) static PARTITION_VALUES_PARSED_NAME: &str = "partitionValues_parsed";
 
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
@@ -599,7 +600,7 @@ fn scan_row_schema_with_parsed_columns(
     }
     if let Some(schema) = partition_schema {
         fields.push(StructField::nullable(
-            "partitionValues_parsed",
+            PARTITION_VALUES_PARSED_NAME,
             schema.as_ref().clone(),
         ));
     }
