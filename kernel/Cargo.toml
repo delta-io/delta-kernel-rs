@@ -45,6 +45,7 @@ chrono = "0.4.41"
 crc = "3.2.2"
 indexmap = "2.10.0"
 itertools = "0.14"
+percent-encoding = "2"
 rand = "0.9"
 roaring = "0.11.2"
 serde = { version = "1", features = ["derive", "rc"] }
