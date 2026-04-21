@@ -150,12 +150,18 @@ mod tests;
 ///
 /// Construct via [`LastCheckpointHintStats::from_reconciliation_state`].
 ///
+/// # Note
+/// This is intended for sophisticated connectors that customize how checkpoints are
+/// written. If you are not deeply familiar with the Delta protocol, you may use
+/// [`Snapshot::checkpoint`](crate::snapshot::Snapshot::checkpoint), which handles
+/// checkpoint writing end-to-end.
+///
 /// [Last Checkpoint File Schema]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#last-checkpoint-file-schema
 #[derive(Debug)]
 pub struct LastCheckpointHintStats {
     /// The total number of actions stored in the checkpoint (including actions created
     /// outside the reconciliation iterator, e.g. sidecar actions).
-    size: i64,
+    num_actions: i64,
     /// The total size in bytes of the checkpoint. For V2 checkpoint with sidecars,
     /// this is the sum of the main checkpoint file size and all sidecar file sizes.
     size_in_bytes: i64,
@@ -171,18 +177,18 @@ impl LastCheckpointHintStats {
     ///   caller should include the main checkpoint file size plus all sidecar file sizes.
     /// - `state`: fully-exhausted reconciliation iterator state. All data must have been written to
     ///   storage before calling this.
-    /// - `extra_actions_count`: count of actions created outside the reconciliation iterator (e.g.
-    ///   sidecar actions). Use `0` for checkpoints with no such extra actions.
+    /// - `num_sidecars`: number of sidecar actions. Use `0` for V1 checkpoints or V2 checkpoints
+    ///   without sidecars.
     ///
     /// # Errors
     /// - If the reconciliation iterator has not been fully exhausted.
     /// - If `size_in_bytes` exceeds `i64::MAX`.
-    /// - If `extra_actions_count` exceeds `i64::MAX`.
-    /// - If `state.actions_count() + extra_actions_count` overflows `i64`.
+    /// - If `num_sidecars` exceeds `i64::MAX`.
+    /// - If `state.actions_count() + num_sidecars` overflows `i64`.
     pub fn from_reconciliation_state(
         size_in_bytes: u64,
         state: ActionReconciliationIteratorState,
-        extra_actions_count: u64,
+        num_sidecars: u64,
     ) -> DeltaResult<Self> {
         if !state.is_exhausted() {
             return Err(Error::checkpoint_write(
@@ -193,19 +199,20 @@ impl LastCheckpointHintStats {
         let size_in_bytes = i64::try_from(size_in_bytes).map_err(|e| {
             Error::checkpoint_write(format!("size_in_bytes {size_in_bytes} exceeds i64: {e}"))
         })?;
-        let extra = i64::try_from(extra_actions_count).map_err(|e| {
-            Error::checkpoint_write(format!(
-                "extra_actions_count {extra_actions_count} exceeds i64: {e}"
-            ))
+        let num_sidecars_i64 = i64::try_from(num_sidecars).map_err(|e| {
+            Error::checkpoint_write(format!("num_sidecars {num_sidecars} exceeds i64: {e}"))
         })?;
-        let size = state.actions_count().checked_add(extra).ok_or_else(|| {
-            Error::checkpoint_write(format!(
-                "checkpoint action count overflowed i64: {} + {extra_actions_count}",
-                state.actions_count()
-            ))
-        })?;
+        let num_actions = state
+            .actions_count()
+            .checked_add(num_sidecars_i64)
+            .ok_or_else(|| {
+                Error::checkpoint_write(format!(
+                    "checkpoint action count overflowed i64: {} + {num_sidecars}",
+                    state.actions_count()
+                ))
+            })?;
         Ok(Self {
-            size,
+            num_actions,
             size_in_bytes,
             num_of_add_files: state.add_actions_count(),
         })
@@ -513,7 +520,7 @@ impl CheckpointWriter {
         let data = create_last_checkpoint_data(
             engine,
             self.version,
-            last_checkpoint_stats.size,
+            last_checkpoint_stats.num_actions,
             last_checkpoint_stats.num_of_add_files,
             last_checkpoint_stats.size_in_bytes,
         );

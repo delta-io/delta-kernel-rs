@@ -260,8 +260,11 @@ fn try_finalize_checkpoint(
     let state = data_iter.state();
     drop(data_iter);
     let state = Arc::into_inner(state).expect("no other Arc references");
-    let last_checkpoint_stats =
-        LastCheckpointHintStats::from_reconciliation_state(metadata.size, state, 0)?;
+    let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
+        metadata.size,
+        state,
+        0, /* num_sidecars */
+    )?;
     writer.finalize(engine, &last_checkpoint_stats)
 }
 
@@ -464,8 +467,11 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
     let state = data_iter.state();
     drop(data_iter);
     let state = Arc::into_inner(state).expect("no other Arc references");
-    let err = LastCheckpointHintStats::from_reconciliation_state(0, state, 0)
-        .expect_err("from_reconciliation_state should fail on non-exhausted iterator");
+    let err = LastCheckpointHintStats::from_reconciliation_state(
+        0, /* size_in_bytes */
+        state, 0, /* num_sidecars */
+    )
+    .expect_err("from_reconciliation_state should fail on non-exhausted iterator");
     assert!(err
         .to_string()
         .contains("reconciliation iterator must be fully consumed"));
@@ -474,22 +480,22 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
 }
 
 #[test]
-fn test_last_checkpoint_hint_stats_with_nonzero_extra_actions() -> DeltaResult<()> {
+fn test_last_checkpoint_hint_stats_with_nonzero_num_sidecars() -> DeltaResult<()> {
     let state = ActionReconciliationIteratorState::new_exhausted(5, 2);
     let stats = LastCheckpointHintStats::from_reconciliation_state(100, state, 3)?;
-    assert_eq!(stats.size, 8); // 5 reconciled + 3 extra
+    assert_eq!(stats.num_actions, 8); // 5 reconciled + 3 sidecar actions
     assert_eq!(stats.size_in_bytes, 100);
-    assert_eq!(stats.num_of_add_files, 2); // extras do not bump this
+    assert_eq!(stats.num_of_add_files, 2); // sidecar actions do not bump this
     Ok(())
 }
 
 #[rstest::rstest]
-#[case::extra_actions_exceeds_i64(
+#[case::num_sidecars_exceeds_i64(
     0,
     0,
     0,
     u64::MAX,
-    "extra_actions_count 18446744073709551615 exceeds i64"
+    "num_sidecars 18446744073709551615 exceeds i64"
 )]
 #[case::actions_count_overflow(
     i64::MAX,
@@ -509,16 +515,13 @@ fn test_last_checkpoint_hint_stats_rejects_invalid_input(
     #[case] actions_count: i64,
     #[case] add_actions_count: i64,
     #[case] size_in_bytes: u64,
-    #[case] extra_actions_count: u64,
+    #[case] num_sidecars: u64,
     #[case] expected_err_substring: &str,
 ) {
     let state = ActionReconciliationIteratorState::new_exhausted(actions_count, add_actions_count);
-    let err = LastCheckpointHintStats::from_reconciliation_state(
-        size_in_bytes,
-        state,
-        extra_actions_count,
-    )
-    .expect_err("invalid input must error");
+    let err =
+        LastCheckpointHintStats::from_reconciliation_state(size_in_bytes, state, num_sidecars)
+            .expect_err("invalid input must error");
     assert!(
         err.to_string().contains(expected_err_substring),
         "error should mention {expected_err_substring}, got: {err}"
