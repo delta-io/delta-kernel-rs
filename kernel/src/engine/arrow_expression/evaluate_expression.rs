@@ -265,15 +265,7 @@ pub fn evaluate_expression(
         (Literal(scalar), _) => {
             validate_array_type(scalar.to_array(batch.num_rows())?, result_type)
         }
-        (Column(name), _) => {
-            // Column extraction uses ordinal-based struct validation because column mapping
-            // can cause physical/logical name mismatches. apply_schema handles renaming.
-            let arr = extract_column(batch, name)?;
-            if let Some(expected) = result_type {
-                ensure_data_types(expected, arr.data_type(), ValidationMode::TypesOnly)?;
-            }
-            Ok(arr)
-        }
+        (Column(name), _) => validate_array_type(extract_column(batch, name)?, result_type),
         (Struct(fields, nullability), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_expression(fields, batch, output_schema, nullability.as_ref())
         }
@@ -2297,7 +2289,7 @@ mod tests {
     }
 
     #[test]
-    fn column_extract_struct_with_mismatched_field_names() {
+    fn column_extract_struct_rejects_mismatched_field_names() {
         let batch = make_struct_batch(
             vec![
                 ArrowField::new("col-abc-001", ArrowDataType::Int64, true),
@@ -2309,7 +2301,6 @@ mod tests {
             ],
         );
 
-        // Logical names differ from physical names due to column mapping
         let logical_type = DataType::try_struct_type([
             StructField::nullable("my_column", DataType::LONG),
             StructField::nullable("other_column", DataType::LONG),
@@ -2318,39 +2309,15 @@ mod tests {
 
         let expr = column_expr!("stats");
         let result = evaluate_expression(&expr, &batch, Some(&logical_type));
-
-        // Ordinal-based validation passes: same field count and types by position.
-        // The downstream apply_schema transformation handles renaming.
-        let arr = result.expect("should succeed with mismatched names but matching types");
-        let struct_arr = arr.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_arr.num_columns(), 2);
-        assert_eq!(struct_arr.len(), 2);
-    }
-
-    #[test]
-    fn column_extract_struct_rejects_mismatched_field_count() {
-        let batch = make_struct_batch(
-            vec![ArrowField::new("col-abc-001", ArrowDataType::Int64, true)],
-            vec![Arc::new(Int64Array::from(vec![Some(1), Some(2)]))],
-        );
-
-        let logical_type = DataType::try_struct_type([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-        ])
-        .unwrap();
-
-        let expr = column_expr!("stats");
-        let result = evaluate_expression(&expr, &batch, Some(&logical_type));
-        assert_result_error_with_message(result, "Struct field count mismatch");
+        assert_result_error_with_message(result, "Missing Struct fields");
     }
 
     #[test]
     fn column_extract_struct_rejects_mismatched_child_types() {
         let batch = make_struct_batch(
             vec![
-                ArrowField::new("col-abc-001", ArrowDataType::Int64, true),
-                ArrowField::new("col-abc-002", ArrowDataType::Utf8, true),
+                ArrowField::new("a", ArrowDataType::Int64, true),
+                ArrowField::new("b", ArrowDataType::Utf8, true),
             ],
             vec![
                 Arc::new(Int64Array::from(vec![Some(1)])),
@@ -2358,7 +2325,6 @@ mod tests {
             ],
         );
 
-        // Expect two LONG columns, but the second arrow field is Utf8
         let logical_type = DataType::try_struct_type([
             StructField::nullable("a", DataType::LONG),
             StructField::nullable("b", DataType::LONG),
@@ -2371,7 +2337,7 @@ mod tests {
     }
 
     #[test]
-    fn column_extract_struct_with_matching_names_still_works() {
+    fn column_extract_struct_with_matching_names_works() {
         let batch = make_struct_batch(
             vec![
                 ArrowField::new("a", ArrowDataType::Int64, true),
@@ -2394,15 +2360,11 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// Exercises the exact code path from `get_add_transform_expr` where a `struct_from`
-    /// expression wraps `column_expr!("add.stats_parsed")`. When the checkpoint parquet has
-    /// stats_parsed with physical column names (e.g. `col-abc-001`) but the output schema
-    /// uses logical names (e.g. `id`), `evaluate_struct_expression` calls
-    /// `evaluate_expression(Column, struct_result_type)` with mismatched field names.
-    /// Without ordinal-based validation this fails with a name mismatch error.
+    /// When a `struct_from` expression wraps a `Column` referencing stats_parsed, and the
+    /// checkpoint parquet has physical column names (e.g. `col-abc-001`) but the output schema
+    /// uses logical names (e.g. `id`), name-based validation correctly rejects the mismatch.
     #[test]
-    fn struct_from_with_column_tolerates_nested_name_mismatch() {
-        // Build a batch mimicking checkpoint data: add.stats_parsed uses physical names
+    fn struct_from_with_column_rejects_nested_name_mismatch() {
         let stats_fields: Vec<ArrowField> = vec![
             ArrowField::new("col-abc-001", ArrowDataType::Int64, true),
             ArrowField::new("col-abc-002", ArrowDataType::Int64, true),
@@ -2442,7 +2404,6 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(add_struct)]).unwrap();
 
-        // struct_from mimicking get_add_transform_expr: wraps a Column referencing stats_parsed
         let expr = Expr::struct_from([
             column_expr_ref!("add.path"),
             column_expr_ref!("add.stats_parsed"),
@@ -2462,36 +2423,6 @@ mod tests {
         .unwrap();
 
         let result = evaluate_expression(&expr, &batch, Some(&output_type));
-        result.expect("struct_from with Column sub-expression should tolerate field name mismatch");
-    }
-
-    #[test]
-    fn column_extract_nested_struct_with_mismatched_names() {
-        let inner_fields = vec![ArrowField::new("phys-inner", ArrowDataType::Int64, true)];
-        let inner_struct = ArrowDataType::Struct(inner_fields.clone().into());
-        let batch = make_struct_batch(
-            vec![ArrowField::new("phys-outer", inner_struct, true)],
-            vec![Arc::new(
-                StructArray::try_new(
-                    inner_fields.into(),
-                    vec![Arc::new(Int64Array::from(vec![Some(42)]))],
-                    None,
-                )
-                .unwrap(),
-            )],
-        );
-
-        let logical_type = DataType::try_struct_type([StructField::nullable(
-            "logical_outer",
-            DataType::struct_type_unchecked([StructField::nullable(
-                "logical_inner",
-                DataType::LONG,
-            )]),
-        )])
-        .unwrap();
-
-        let expr = column_expr!("stats");
-        let result = evaluate_expression(&expr, &batch, Some(&logical_type));
-        assert!(result.is_ok());
+        assert_result_error_with_message(result, "Missing Struct fields");
     }
 }
