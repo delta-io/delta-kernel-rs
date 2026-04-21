@@ -585,7 +585,7 @@ impl Snapshot {
                 ));
             }
             Some(CheckpointSpec::V1) if v2_supported => {
-                return Err(Error::checkpoint_write(
+                return Err(Error::unsupported(
                     "Kernel does not support writing V1 checkpoints when the table supports v2Checkpoint",
                 ));
             }

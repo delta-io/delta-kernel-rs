@@ -542,6 +542,9 @@ fn assert_sidecar_actions_match_disk(
     let sidecar_mtime_col = sidecar_col
         .column_by_name("modificationTime")
         .expect("sidecar should have modificationTime field");
+    let sidecar_tags_col = sidecar_col
+        .column_by_name("tags")
+        .expect("sidecar should have tags field");
     let sidecars_base = delta_kernel::try_parse_uri(table_path)
         .unwrap()
         .join("_delta_log/_sidecars/")
@@ -574,6 +577,11 @@ fn assert_sidecar_actions_match_disk(
         assert_eq!(
             recorded_mtime, file_meta.last_modified,
             "sidecar modificationTime should match actual file mtime for {path}"
+        );
+
+        assert!(
+            sidecar_tags_col.is_null(row),
+            "sidecar tags should be null for {path}"
         );
     }
 }

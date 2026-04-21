@@ -4,8 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray, StructArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, RecordBatchReader, StringArray,
+    StructArray, TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
@@ -24,6 +24,7 @@ use delta_kernel::expressions::{column_expr, ColumnName, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
+use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
@@ -44,7 +45,7 @@ use test_utils::{
     create_default_engine_mt_executor, create_table, create_table_and_load_snapshot,
     engine_store_setup, nested_batches, nested_schema, read_actions_from_commit, read_add_infos,
     remove_all_and_get_remove_actions, resolve_field, set_json_value, setup_test_tables, test_read,
-    test_table_setup, write_batch_to_table,
+    test_table_setup, test_table_setup_mt, write_batch_to_table,
 };
 use url::Url;
 use uuid::Uuid;
@@ -4019,6 +4020,101 @@ async fn test_checkpoint_non_kernel_written_table() {
                 .is_some_and(|n| n.contains(".checkpoint.parquet"))
         });
     assert!(has_checkpoint, "Expected at least one checkpoint file");
+}
+
+/// Passing `None` to `snapshot.checkpoint()` on a V1 table (no `v2Checkpoint` feature)
+/// writes a V1 checkpoint: the main parquet schema must not contain a `checkpointMetadata`
+/// column.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_snapshot_checkpoint_default_on_v1_table() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let mut snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        simple_id_batch(&schema, vec![1, 2]),
+        HashMap::new(),
+    )
+    .await?;
+
+    snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), None)?;
+
+    let delta_log = std::path::Path::new(&table_path).join("_delta_log");
+    let ckpt_path = std::fs::read_dir(&delta_log)?
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.contains(".checkpoint.parquet"))
+        })
+        .expect("checkpoint parquet should exist")
+        .path();
+    let file = std::fs::File::open(&ckpt_path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let schema = reader.schema();
+    assert!(
+        schema.field_with_name("checkpointMetadata").is_err(),
+        "V1 checkpoint must not contain `checkpointMetadata` column, found schema: {schema:?}"
+    );
+
+    Ok(())
+}
+
+/// Passing `None` to `snapshot.checkpoint()` on a V2 table (with `v2Checkpoint`
+/// feature) writes a V2 classic checkpoint with no sidecars: the `_sidecars` directory must not
+/// exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_snapshot_checkpoint_default_on_v2_table() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let mut snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema.clone(),
+        engine.as_ref(),
+        &[("delta.feature.v2Checkpoint", "supported")],
+    )?;
+
+    snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        simple_id_batch(&schema, vec![1, 2]),
+        HashMap::new(),
+    )
+    .await?;
+
+    snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), None)?;
+
+    let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
+    assert!(
+        !sidecars_dir.exists(),
+        "_sidecars directory should not exist when spec=None produces a no-sidecar checkpoint, \
+         found: {}",
+        sidecars_dir.display()
+    );
+
+    // V2 checkpoint must contain a `checkpointMetadata` column.
+    let delta_log = std::path::Path::new(&table_path).join("_delta_log");
+    let ckpt_path = std::fs::read_dir(&delta_log)?
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.contains(".checkpoint.parquet"))
+        })
+        .expect("checkpoint parquet should exist")
+        .path();
+    let file = std::fs::File::open(&ckpt_path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let schema = reader.schema();
+    assert!(
+        schema.field_with_name("checkpointMetadata").is_ok(),
+        "V2 checkpoint must contain `checkpointMetadata` column, found schema: {schema:?}"
+    );
+
+    Ok(())
 }
 
 struct ClusteredTableSetup {
