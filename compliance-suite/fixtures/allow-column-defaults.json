@@ -58,9 +58,6 @@
       "writerFeatures": []
     }
   },
-  "$notes": {
-    "orphan_writer_feature": "At (3,7), the spec requires activation properties to be paired with the corresponding feature in writerFeatures. Writing an activation property for a feature absent from writerFeatures is invalid committed state."
-  },
   "cases": [
     {
       "ordinal": 1,
@@ -76,23 +73,23 @@
     },
     {
       "ordinal": 2,
-      "name": "allow_column_defaults_create_table_3_7_no_feature_listed_fails",
+      "name": "allow_column_defaults_create_table_3_7_no_feature_listed_succeeds",
       "flavor": "orphan",
       "feature": "allowColumnDefaults",
-      "description": "Creating a (3,7) table with a CURRENT_DEFAULT column but allowColumnDefaults absent from writerFeatures fails.",
-      "note": "$notes.orphan_writer_feature",
+      "description": "Creating a (3,7) table with a CURRENT_DEFAULT column but allowColumnDefaults absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
       "operation": {
         "type": "create_table",
         "protocol": "$protocols.modern_3_7",
         "metadata": {"schemaString": "$schemas.default_column"}
       },
-      "expected_outcome": "failure"
+      "expected_outcome": "success"
     },
     {
       "ordinal": 3,
       "name": "allow_column_defaults_read_snapshot_3_7_with_default_column_succeeds",
       "feature": "allowColumnDefaults",
-      "description": "Reading a (3,7)+[allowColumnDefaults] table with a CURRENT_DEFAULT column succeeds: allowColumnDefaults is writer-only.",
+      "description": "Reading a (3,7)+[allowColumnDefaults] table with a CURRENT_DEFAULT column succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_allow_column_defaults"},
@@ -104,11 +101,11 @@
     },
     {
       "ordinal": 4,
-      "name": "allow_column_defaults_empty_commit_3_7_no_feature_listed_fails",
+      "name": "allow_column_defaults_empty_commit_3_7_no_feature_listed_succeeds",
       "flavor": "orphan",
       "feature": "allowColumnDefaults",
-      "description": "Appending to a (3,7) table with a CURRENT_DEFAULT column but allowColumnDefaults absent from writerFeatures fails.",
-      "note": "$notes.orphan_writer_feature",
+      "description": "Committing to a (3,7) table with a CURRENT_DEFAULT column but allowColumnDefaults absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7"},
@@ -116,13 +113,13 @@
         ]
       },
       "operation": {"type": "empty_commit"},
-      "expected_outcome": "failure"
+      "expected_outcome": "success"
     },
     {
       "ordinal": 5,
       "name": "allow_column_defaults_supported_active_empty_commit_succeeds",
       "feature": "allowColumnDefaults",
-      "description": "Appending to a (3,7)+[allowColumnDefaults] table with a CURRENT_DEFAULT column succeeds.",
+      "description": "Committing to a (3,7)+[allowColumnDefaults] table with a CURRENT_DEFAULT column succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_allow_column_defaults"},
@@ -137,7 +134,7 @@
       "name": "allow_column_defaults_read_snapshot_3_7_no_feature_listed_succeeds",
       "flavor": "orphan",
       "feature": "allowColumnDefaults",
-      "description": "Reading a (3,7) table with a CURRENT_DEFAULT column but allowColumnDefaults absent from writerFeatures succeeds; allowColumnDefaults is writer-only.",
+      "description": "Reading a (3,7) table with a CURRENT_DEFAULT column but allowColumnDefaults absent from writerFeatures succeeds.",
       "note": "$errata.orphan_feature_metadata",
       "setup": {
         "log_actions": [
@@ -153,7 +150,7 @@
       "name": "allow_column_defaults_supported_not_active_empty_commit_succeeds",
       "flavor": "supported_not_active",
       "feature": "allowColumnDefaults",
-      "description": "Appending to a (3,7)+[allowColumnDefaults] table without any default column succeeds: the feature is supported but not active.",
+      "description": "Committing to a (3,7)+[allowColumnDefaults] table without any default column succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_allow_column_defaults"},
@@ -168,7 +165,7 @@
       "name": "allow_column_defaults_supported_not_active_read_snapshot_succeeds",
       "flavor": "supported_not_active",
       "feature": "allowColumnDefaults",
-      "description": "Reading a (3,7)+[allowColumnDefaults] table without any default column succeeds: the feature is supported but not active.",
+      "description": "Reading a (3,7)+[allowColumnDefaults] table without any default column succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_allow_column_defaults"},
@@ -229,7 +226,7 @@
       "ordinal": 12,
       "name": "allow_column_defaults_cm_empty_commit_3_7_succeeds",
       "feature": "allowColumnDefaults",
-      "description": "Appending to a (3,7)+[columnMapping,allowColumnDefaults] table with a CM-annotated column with a CURRENT_DEFAULT succeeds.",
+      "description": "Committing to a (3,7)+[columnMapping,allowColumnDefaults] table with a CM-annotated column with a CURRENT_DEFAULT succeeds.",
       "note": "$errata.sql_expression_cm_name_resolution",
       "setup": {
         "log_actions": [
@@ -253,7 +250,7 @@
       "name": "allow_column_defaults_read_snapshot_2_7_writer_only_succeeds",
       "feature": "allowColumnDefaults",
       "flavor": "supported_not_active",
-      "description": "Reading a (2,7)+[allowColumnDefaults] table succeeds; allowColumnDefaults is writer-only and readers need not understand writer-only features.",
+      "description": "Reading a (2,7)+[allowColumnDefaults] table succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_2_7_allow_column_defaults"},
@@ -268,7 +265,7 @@
       "name": "allow_column_defaults_empty_commit_2_7_writer_feature_listed_succeeds",
       "feature": "allowColumnDefaults",
       "flavor": "supported_not_active",
-      "description": "Appending to a (2,7)+[allowColumnDefaults] table without a CURRENT_DEFAULT annotation succeeds; no default substitution is required when no rows are written.",
+      "description": "Committing to a (2,7)+[allowColumnDefaults] table without a CURRENT_DEFAULT annotation succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_2_7_allow_column_defaults"},
@@ -277,6 +274,21 @@
       },
       "operation": {"type": "empty_commit"},
       "expected_outcome": "success"
+    },
+    {
+      "ordinal": 15,
+      "name": "allow_column_defaults_check_constraints_create_table_3_7_default_violates_constraint_fails",
+      "feature": "allowColumnDefaults",
+      "description": "Creating a (3,7)+[allowColumnDefaults,checkConstraints] table with a default value that violates the check constraint fails.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_allow_check_constraints",
+        "metadata": {
+          "schemaString": "$schemas.default_column",
+          "configuration": {"delta.constraints.id_gt_100": "id > 100"}
+        }
+      },
+      "expected_outcome": "failure"
     }
   ]
 }

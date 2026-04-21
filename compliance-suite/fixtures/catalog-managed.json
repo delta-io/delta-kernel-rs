@@ -46,7 +46,7 @@
       "ordinal": 1,
       "name": "catalog_managed_create_table_3_7_feature_listed_succeeds",
       "feature": "catalogManaged",
-      "description": "Creating a (3,7)+[catalogManaged,inCommitTimestamp] table succeeds; catalogManaged is reader+writer and must appear in both feature lists.",
+      "description": "Creating a (3,7)+[catalogManaged,inCommitTimestamp] table succeeds.",
       "note": "$notes.catalog_managed_ict_write_enforcement",
       "operation": {
         "type": "create_table",
@@ -62,7 +62,7 @@
       "ordinal": 2,
       "name": "catalog_managed_read_snapshot_3_7_feature_listed_succeeds",
       "feature": "catalogManaged",
-      "description": "Reading a (3,7)+[catalogManaged,inCommitTimestamp] table succeeds; reader requirements concern catalog-based table discovery, not per-file data access.",
+      "description": "Reading a (3,7)+[catalogManaged,inCommitTimestamp] table succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.catalog_managed_3_7"},
@@ -82,7 +82,7 @@
       "name": "catalog_managed_read_snapshot_3_7_without_ict_fails",
       "feature": "catalogManaged",
       "flavor": "missing_dependency",
-      "description": "Reading a (3,7)+[catalogManaged] table that lacks inCommitTimestamp fails; catalogManaged requires inCommitTimestamp to be supported and active.",
+      "description": "Reading a (3,7)+[catalogManaged] table without inCommitTimestamp support fails.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.catalog_managed_3_7_no_ict"},
@@ -96,7 +96,7 @@
       "ordinal": 4,
       "name": "catalog_managed_empty_commit_3_7_no_ict_in_prior_commit_fails",
       "feature": "catalogManaged",
-      "description": "Appending to a (3,7)+[catalogManaged,inCommitTimestamp] table fails when the prior commit lacks inCommitTimestamp.",
+      "description": "Committing to a (3,7)+[catalogManaged,inCommitTimestamp] table fails when there is no prior commitInfo with inCommitTimestamp.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.catalog_managed_3_7"},
@@ -116,7 +116,7 @@
       "name": "catalog_managed_create_table_3_7_writer_only_fails",
       "feature": "catalogManaged",
       "flavor": "insufficient_protocol",
-      "description": "Creating a (3,7) table with catalogManaged in writerFeatures but absent from readerFeatures fails; catalogManaged is a reader+writer feature and must be listed in both.",
+      "description": "Creating a (3,7) table with catalogManaged only in writerFeatures fails.",
       "operation": {
         "type": "create_table",
         "protocol": "$protocols.catalog_managed_3_7_writer_only",
@@ -128,7 +128,7 @@
       "ordinal": 6,
       "name": "catalog_owned_preview_create_table_3_7_feature_listed_succeeds",
       "feature": "catalogOwned-preview",
-      "description": "Creating a (3,7)+[catalogOwned-preview,inCommitTimestamp] table succeeds; catalogOwned-preview is the pre-ratification name for catalogManaged, retained for backwards compatibility.",
+      "description": "Creating a (3,7)+[catalogOwned-preview,inCommitTimestamp] table succeeds.",
       "note": "$notes.catalog_owned_preview_ratification",
       "operation": {
         "type": "create_table",
@@ -144,7 +144,7 @@
       "ordinal": 7,
       "name": "catalog_owned_preview_read_snapshot_3_7_feature_listed_succeeds",
       "feature": "catalogOwned-preview",
-      "description": "Reading a (3,7)+[catalogOwned-preview,inCommitTimestamp] table succeeds; reader requirements are identical to catalogManaged.",
+      "description": "Reading a (3,7)+[catalogOwned-preview,inCommitTimestamp] table succeeds.",
       "note": "$notes.catalog_owned_preview_ratification",
       "setup": {
         "log_actions": [
@@ -164,7 +164,7 @@
       "ordinal": 8,
       "name": "catalog_managed_empty_commit_3_7_with_ict_succeeds",
       "feature": "catalogManaged",
-      "description": "Appending to a (3,7)+[catalogManaged,inCommitTimestamp] table succeeds when the prior commit contains a valid inCommitTimestamp.",
+      "description": "Committing to a (3,7)+[catalogManaged,inCommitTimestamp] table succeeds with valid prior inCommitTimestamp state.",
       "note": "$notes.catalog_managed_ict_write_enforcement",
       "setup": {
         "log_actions": [
@@ -186,7 +186,7 @@
       "name": "catalog_managed_read_snapshot_3_7_reader_only_fails",
       "feature": "catalogManaged",
       "flavor": "insufficient_protocol",
-      "description": "Reading a (3,7) table with catalogManaged in readerFeatures but absent from writerFeatures fails; listing a feature only in readerFeatures is forbidden.",
+      "description": "Reading a (3,7) table with catalogManaged only in readerFeatures fails.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.catalog_managed_3_7_reader_only"},

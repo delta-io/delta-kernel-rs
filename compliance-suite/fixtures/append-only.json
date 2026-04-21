@@ -21,16 +21,14 @@
       "writerFeatures": []
     }
   },
-  "$notes": {
-    "orphan_writer_feature": "At (3,7), the spec requires activation properties to be paired with the corresponding feature in writerFeatures. Writing an activation property for a feature absent from writerFeatures is invalid committed state."
-  },
+  "$notes": {},
   "cases": [
     {
       "ordinal": 1,
       "name": "append_only_create_table_1_1_succeeds",
       "flavor": "orphan",
       "feature": "appendOnly",
-      "description": "Creating a (1,1) table with delta.appendOnly=true succeeds; writer version 1 does not support appendOnly but the spec does not require rejection of an unrecognized activation property.",
+      "description": "Creating a (1,1) table with delta.appendOnly=true succeeds.",
       "note": "$errata.orphan_feature_metadata",
       "operation": {
         "type": "create_table",
@@ -79,7 +77,7 @@
       "name": "append_only_empty_commit_1_2_succeeds",
       "flavor": "legacy",
       "feature": "appendOnly",
-      "description": "Appending to a (1,2) table with delta.appendOnly=true succeeds.",
+      "description": "Committing to a (1,2) table with delta.appendOnly=true succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.legacy_1_2"},
@@ -96,11 +94,11 @@
     },
     {
       "ordinal": 5,
-      "name": "append_only_create_table_3_7_no_feature_listed_with_property",
+      "name": "append_only_create_table_3_7_no_feature_listed_with_property_succeeds",
       "flavor": "orphan",
       "feature": "appendOnly",
-      "description": "Creating a (3,7) table with delta.appendOnly=true but appendOnly absent from writerFeatures fails.",
-      "note": "$notes.orphan_writer_feature",
+      "description": "Creating a (3,7) table with delta.appendOnly=true but appendOnly absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
       "operation": {
         "type": "create_table",
         "protocol": "$protocols.modern_3_7",
@@ -109,15 +107,15 @@
           "schemaString": "$schemas.simple_int"
         }
       },
-      "expected_outcome": "failure"
+      "expected_outcome": "success"
     },
     {
       "ordinal": 6,
-      "name": "append_only_empty_commit_3_7_no_feature_listed_with_property_fails",
+      "name": "append_only_empty_commit_3_7_no_feature_listed_with_property_succeeds",
       "flavor": "orphan",
       "feature": "appendOnly",
-      "description": "Appending to a (3,7) table with delta.appendOnly=true but appendOnly absent from writerFeatures fails.",
-      "note": "$notes.orphan_writer_feature",
+      "description": "Committing to a (3,7) table with delta.appendOnly=true but appendOnly absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7"},
@@ -130,14 +128,14 @@
         ]
       },
       "operation": {"type": "empty_commit"},
-      "expected_outcome": "failure"
+      "expected_outcome": "success"
     },
     {
       "ordinal": 7,
       "name": "append_only_read_snapshot_3_7_no_feature_listed_with_property",
       "flavor": "orphan",
       "feature": "appendOnly",
-      "description": "Reading a (3,7) table with delta.appendOnly=true but appendOnly absent from writerFeatures succeeds; appendOnly is writer-only.",
+      "description": "Reading a (3,7) table with delta.appendOnly=true but appendOnly absent from writerFeatures succeeds.",
       "note": "$errata.orphan_feature_metadata",
       "setup": {
         "log_actions": [
@@ -173,7 +171,7 @@
       "name": "append_only_supported_not_active_empty_commit_succeeds",
       "flavor": "supported_not_active",
       "feature": "appendOnly",
-      "description": "Appending to a (3,7)+[appendOnly] table without delta.appendOnly=true succeeds.",
+      "description": "Committing to a (3,7)+[appendOnly] table with no delta.appendOnly property succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_append_only"},
@@ -188,7 +186,7 @@
       "name": "append_only_supported_not_active_read_snapshot_succeeds",
       "flavor": "supported_not_active",
       "feature": "appendOnly",
-      "description": "Reading a (3,7)+[appendOnly] table without delta.appendOnly=true succeeds.",
+      "description": "Reading a (3,7)+[appendOnly] table with no delta.appendOnly property succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_append_only"},
@@ -202,7 +200,7 @@
       "ordinal": 11,
       "name": "append_only_supported_active_empty_commit_succeeds",
       "feature": "appendOnly",
-      "description": "Appending to a (3,7)+[appendOnly] table with delta.appendOnly=true succeeds.",
+      "description": "Committing to a (3,7)+[appendOnly] table with delta.appendOnly=true succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_append_only"},
@@ -241,7 +239,7 @@
       "name": "append_only_read_snapshot_1_2_with_property_succeeds",
       "flavor": "legacy",
       "feature": "appendOnly",
-      "description": "Reading a (1,2) table with delta.appendOnly=true succeeds; appendOnly is writer-only.",
+      "description": "Reading a (1,2) table with delta.appendOnly=true succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.legacy_1_2"},
@@ -261,12 +259,33 @@
       "name": "append_only_supported_not_active_create_table_succeeds",
       "flavor": "supported_not_active",
       "feature": "appendOnly",
-      "description": "Creating a (3,7)+[appendOnly] table without delta.appendOnly=true succeeds; the feature is supported but not active.",
+      "description": "Creating a (3,7)+[appendOnly] table with no delta.appendOnly property succeeds.",
       "operation": {
         "type": "create_table",
         "protocol": "$protocols.modern_3_7_append_only",
         "metadata": {"schemaString": "$schemas.simple_int"}
       },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 15,
+      "name": "append_only_empty_commit_1_1_succeeds",
+      "flavor": "orphan",
+      "feature": "appendOnly",
+      "description": "Committing to a (1,1) table with delta.appendOnly=true succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_1"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.appendOnly": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
       "expected_outcome": "success"
     }
   ]

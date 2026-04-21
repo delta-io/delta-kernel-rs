@@ -102,7 +102,7 @@ within the file would otherwise repeat the same value verbatim.
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | snake_case, globally unique across all fixture files; used by test code to load by name |
-| `description` | string | One sentence beginning with the operation ("Reading a...", "Creating a...", "Appending to..."): scenario, expected outcome, and the spec reason in brief |
+| `description` | string | One sentence beginning with the operation ("Reading a...", "Creating a...", "Committing to..."): scenario, expected outcome, and the spec reason in brief |
 | `operation` | object | The operation to perform (see Operation types below) |
 | `expected_outcome` | string | `"success"` or `"failure"` |
 
@@ -237,7 +237,7 @@ merging into it. Runners should raise an error at run time if `schemaString` is 
 2. Choose a descriptive `name` in snake_case, unique across all fixture files. Prefix with
    the operation type (`read_snapshot_`, `create_table_`, `empty_commit_`).
 3. Write a `description` that opens with the operation ("Reading a...", "Creating a...",
-   "Appending to...") and in one sentence covers: scenario, expected outcome, spec reason.
+   "Committing to...") and in one sentence covers: scenario, expected outcome, spec reason.
 4. Set `feature` to the Delta feature name if applicable.
 5. Set `flavor` if the case belongs to a sub-category used for filtering (e.g.
    `"unknown_feature"`, `"writer_only_read"`, `"supported_not_active"`).
@@ -367,7 +367,7 @@ gaps:
 
 - **Nested schemas**: the spec requires CM annotations on every nested field (struct,
   map key/value, array element). No case exercises annotation propagation through nesting.
-  Requires adding a `cm_annotated_nested` schema entry and corresponding read/append cases.
+  Requires adding a `cm_annotated_nested` schema entry and corresponding read/commit cases.
 - **`delta.columnMapping.maxColumnId`**: the spec requires this property to increase
   monotonically as columns are introduced. No case verifies its presence or value.
   Requires `schema_evolution` or `insert_rows` operation support.
