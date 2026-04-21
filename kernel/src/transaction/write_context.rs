@@ -121,6 +121,8 @@ impl WriteContext {
     /// [`build_add_file_metadata`]: crate::engine::default::build_add_file_metadata
     // TODO(#2357): respect `delta.randomizeFilePrefixes` and `delta.randomPrefixLength`
     // table properties. Currently random prefixes are only used when column mapping is on.
+    // TODO(#2436): revisit this API shape. Returning a `Url` forces callers to URI-decode
+    // before filesystem writes and keep it encoded for `add.path`, which is unintuitive.
     pub fn write_dir(&self) -> Url {
         let mut url = self.shared.table_root.clone();
         match self.shared.column_mapping_mode {

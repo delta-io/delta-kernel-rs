@@ -31,8 +31,14 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
 /// Characters encoded by [`uri_encode_path`]: `%`, space, and ASCII chars illegal in a
-/// URI path, plus all ASCII controls via [`CONTROLS`]. Non-ASCII UTF-8 bytes pass through
-/// because [`AsciiSet`] is ASCII-only by construction.
+/// URI path, plus all ASCII controls via [`CONTROLS`]. Non-ASCII UTF-8 bytes are ALSO
+/// percent-encoded by `utf8_percent_encode` (each byte of the UTF-8 sequence becomes
+/// `%XX`), even though they are not in the [`AsciiSet`]. For example:
+/// `uri_encode_path("München") == "M%C3%BCnchen"`, because `ü` is `0xC3 0xBC` in UTF-8.
+///
+/// TODO(#2423): Delta-Spark leaves non-ASCII bytes raw in `add.path` (e.g. `München`
+/// stays as `München`). Our current behavior diverges — revisit once kernel matches
+/// Delta-Spark's `add.path` encoding for non-ASCII.
 const HADOOP_URI_PATH_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
