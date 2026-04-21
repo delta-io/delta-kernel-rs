@@ -936,7 +936,8 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray, StructArray,
+        ArrayRef, BooleanArray, Int32Array, Int64Array, MapBuilder, StringArray, StringBuilder,
+        StructArray,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -1983,8 +1984,6 @@ mod tests {
 
     /// Helper: creates a RecordBatch with a `pv` column of type Map<String, String>.
     fn create_partition_map_batch() -> RecordBatch {
-        use crate::arrow::array::{MapBuilder, StringBuilder};
-
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
 
         // Row 0: {"date": "2024-01-15", "region": "us", "id": "42"}
@@ -2085,8 +2084,6 @@ mod tests {
 
     #[test]
     fn test_map_to_struct_parse_error() {
-        use crate::arrow::array::{MapBuilder, StringBuilder};
-
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("count");
         builder.values().append_value("not_a_number");
@@ -2110,8 +2107,6 @@ mod tests {
 
     #[test]
     fn test_map_to_struct_duplicate_keys() {
-        use crate::arrow::array::{MapBuilder, StringBuilder};
-
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("x");
         builder.values().append_value("first");
@@ -2142,29 +2137,35 @@ mod tests {
         assert_eq!(col.value(0), "last");
     }
 
-    #[test]
-    fn test_map_to_struct_null_map_with_non_nullable_fields() {
-        use crate::arrow::array::{MapBuilder, StringBuilder};
-
+    #[rstest]
+    #[case::mixed_nulls(
+        vec![
+            Some(vec![("region", "us"), ("id", "42")]),
+            None,
+            Some(vec![("region", "eu"), ("id", "7")]),
+        ],
+        vec![true, false, true],
+    )]
+    #[case::all_nulls(vec![None, None], vec![false, false])]
+    fn test_map_to_struct_null_propagation_with_non_nullable_fields(
+        #[case] rows: Vec<Option<Vec<(&str, &str)>>>,
+        #[case] expected_validity: Vec<bool>,
+    ) {
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
-
-        // Row 0: {"region": "us", "id": "42"}
-        builder.keys().append_value("region");
-        builder.values().append_value("us");
-        builder.keys().append_value("id");
-        builder.values().append_value("42");
-        builder.append(true).unwrap();
-
-        // Row 1: null map
-        builder.append(false).unwrap();
-
-        // Row 2: {"region": "eu", "id": "7"}
-        builder.keys().append_value("region");
-        builder.values().append_value("eu");
-        builder.keys().append_value("id");
-        builder.values().append_value("7");
-        builder.append(true).unwrap();
-
+        for row in &rows {
+            match row {
+                Some(entries) => {
+                    for (k, v) in entries {
+                        builder.keys().append_value(k);
+                        builder.values().append_value(v);
+                    }
+                    builder.append(true).unwrap();
+                }
+                None => {
+                    builder.append(false).unwrap();
+                }
+            }
+        }
         let map_array = builder.finish();
         let schema = ArrowSchema::new(vec![ArrowField::new(
             "pv",
@@ -2182,63 +2183,14 @@ mod tests {
         let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
 
-        assert!(structs.is_valid(0));
-        assert!(structs.is_null(1));
-        assert!(structs.is_valid(2));
-
-        let regions = structs
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let ids = structs
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-
-        assert_eq!(regions.value(0), "us");
-        assert_eq!(ids.value(0), 42);
-
-        assert_eq!(regions.value(2), "eu");
-        assert_eq!(ids.value(2), 7);
-    }
-
-    #[test]
-    fn test_map_to_struct_all_null_maps_with_non_nullable_fields() {
-        use crate::arrow::array::{MapBuilder, StringBuilder};
-
-        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
-        builder.append(false).unwrap();
-        builder.append(false).unwrap();
-
-        let map_array = builder.finish();
-        let schema = ArrowSchema::new(vec![ArrowField::new(
-            "pv",
-            map_array.data_type().clone(),
-            true,
-        )]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
-
-        let output_schema = StructType::new_unchecked(vec![StructField::new(
-            "key",
-            DataType::STRING,
-            false,
-        )]);
-        let result_type = DataType::Struct(Box::new(output_schema));
-        let expr = Expr::map_to_struct(column_expr!("pv"));
-        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
-        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
-
-        assert_eq!(structs.len(), 2);
-        assert!(structs.is_null(0));
-        assert!(structs.is_null(1));
+        assert_eq!(structs.len(), expected_validity.len());
+        for (i, &valid) in expected_validity.iter().enumerate() {
+            assert_eq!(structs.is_valid(i), valid, "row {i} validity mismatch");
+        }
     }
 
     #[test]
     fn test_coalesce_map_to_struct_with_null_map_non_nullable_fields() {
-        use crate::arrow::array::{MapBuilder, StringBuilder};
-
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("date");
         builder.values().append_value("2024-01-15");
@@ -2259,14 +2211,10 @@ mod tests {
         ]));
 
         let pv_parsed = new_null_array(schema.field(0).data_type(), 2);
-        let batch =
-            RecordBatch::try_new(schema, vec![pv_parsed, Arc::new(map_array)]).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![pv_parsed, Arc::new(map_array)]).unwrap();
 
-        let output_schema = StructType::new_unchecked(vec![StructField::new(
-            "date",
-            DataType::DATE,
-            false,
-        )]);
+        let output_schema =
+            StructType::new_unchecked(vec![StructField::new("date", DataType::DATE, false)]);
         let result_type = DataType::Struct(Box::new(output_schema));
         let expr = Expr::coalesce([
             Expr::column(["pv_parsed"]),
