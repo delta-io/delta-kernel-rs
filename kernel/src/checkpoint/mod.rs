@@ -71,9 +71,9 @@
 //!     .ok_or(Error::internal_error("checkpoint state Arc still has other references"))?;
 //! let last_checkpoint_stats =
 //!     delta_kernel::checkpoint::LastCheckpointHintStats::from_reconciliation_state(
-//!         metadata.size,
 //!         state,
-//!         0,
+//!         metadata.size,
+//!         0, /* num_sidecars */
 //!     )?;
 //!
 //! // Finalize the checkpoint by passing the stats
@@ -173,10 +173,10 @@ impl LastCheckpointHintStats {
     /// Constructs a `LastCheckpointHintStats` from the fully-exhausted reconciliation state.
     ///
     /// # Parameters
-    /// - `size_in_bytes`: total byte size of the checkpoint. For V2 checkpoints with sidecars, the
-    ///   caller should include the main checkpoint file size plus all sidecar file sizes.
     /// - `state`: fully-exhausted reconciliation iterator state. All data must have been written to
     ///   storage before calling this.
+    /// - `size_in_bytes`: total byte size of the checkpoint. For V2 checkpoints with sidecars, the
+    ///   caller should include the main checkpoint file size plus all sidecar file sizes.
     /// - `num_sidecars`: number of sidecar actions. Use `0` for V1 checkpoints or V2 checkpoints
     ///   without sidecars.
     ///
@@ -186,8 +186,8 @@ impl LastCheckpointHintStats {
     /// - If `num_sidecars` exceeds `i64::MAX`.
     /// - If `state.actions_count() + num_sidecars` overflows `i64`.
     pub fn from_reconciliation_state(
-        size_in_bytes: u64,
         state: ActionReconciliationIteratorState,
+        size_in_bytes: u64,
         num_sidecars: u64,
     ) -> DeltaResult<Self> {
         if !state.is_exhausted() {
@@ -392,7 +392,7 @@ impl CheckpointWriter {
     /// let state = Arc::into_inner(state)
     ///     .ok_or(Error::internal_error("checkpoint state Arc still has other references"))?;
     /// let last_checkpoint_stats =
-    ///     LastCheckpointHintStats::from_reconciliation_state(size_in_bytes, state, 0)?;
+    ///     LastCheckpointHintStats::from_reconciliation_state(state, size_in_bytes, 0)?;
     /// writer.finalize(&engine, &last_checkpoint_stats)?;
     /// ```
     // Implementation overview:

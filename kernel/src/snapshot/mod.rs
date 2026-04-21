@@ -527,8 +527,8 @@ impl Snapshot {
         })?;
         // V1 checkpoint: no sidecars are written.
         let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
-            file_meta.size,
             state,
+            file_meta.size,
             0, /* num_sidecars */
         )?;
         writer.finalize(engine, &last_checkpoint_stats)?;

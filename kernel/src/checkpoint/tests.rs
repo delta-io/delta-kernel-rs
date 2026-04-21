@@ -261,8 +261,8 @@ fn try_finalize_checkpoint(
     drop(data_iter);
     let state = Arc::into_inner(state).expect("no other Arc references");
     let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
-        metadata.size,
         state,
+        metadata.size,
         0, /* num_sidecars */
     )?;
     writer.finalize(engine, &last_checkpoint_stats)
@@ -468,8 +468,8 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
     drop(data_iter);
     let state = Arc::into_inner(state).expect("no other Arc references");
     let err = LastCheckpointHintStats::from_reconciliation_state(
-        0, /* size_in_bytes */
-        state, 0, /* num_sidecars */
+        state, 0, /* size_in_bytes */
+        0, /* num_sidecars */
     )
     .expect_err("from_reconciliation_state should fail on non-exhausted iterator");
     assert!(err
@@ -482,7 +482,7 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
 #[test]
 fn test_last_checkpoint_hint_stats_with_nonzero_num_sidecars() -> DeltaResult<()> {
     let state = ActionReconciliationIteratorState::new_exhausted(5, 2);
-    let stats = LastCheckpointHintStats::from_reconciliation_state(100, state, 3)?;
+    let stats = LastCheckpointHintStats::from_reconciliation_state(state, 100, 3)?;
     assert_eq!(stats.num_actions, 8); // 5 reconciled + 3 sidecar actions
     assert_eq!(stats.size_in_bytes, 100);
     assert_eq!(stats.num_of_add_files, 2); // sidecar actions do not bump this
@@ -520,7 +520,7 @@ fn test_last_checkpoint_hint_stats_rejects_invalid_input(
 ) {
     let state = ActionReconciliationIteratorState::new_exhausted(actions_count, add_actions_count);
     let err =
-        LastCheckpointHintStats::from_reconciliation_state(size_in_bytes, state, num_sidecars)
+        LastCheckpointHintStats::from_reconciliation_state(state, size_in_bytes, num_sidecars)
             .expect_err("invalid input must error");
     assert!(
         err.to_string().contains(expected_err_substring),
