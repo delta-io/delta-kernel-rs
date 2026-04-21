@@ -56,7 +56,14 @@ fn list_from_storage(
     start_version: Version,
     end_version: Version,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
-    let start_from = log_root.join(&format!("{start_version:020}"))?;
+    // List from the directory root instead of a specific version offset.
+    // This works around an issue in Azure/OneLake's list_with_offset where
+    // an offset path like _delta_log/00000000000000000643 (no extension) is treated
+    // as a prefix boundary, incorrectly excluding files at that exact version.
+    // By listing the entire directory and filtering by start_version below,
+    // we avoid the edge case and work correctly regardless of table structure.
+    // See: https://github.com/delta-io/delta-kernel-rs/issues/2433
+    let start_from = log_root.clone();
     let files = storage
         .list_from(&start_from)?
         .map(|meta| ParsedLogPath::try_from(meta?))
@@ -66,7 +73,7 @@ fn list_from_storage(
         // normal `version.crc` files which are listed + captured normally. Additionally
         // we likely aren't even 'seeing' these files since lexicographically the string
         // "." comes before the string "0".
-        .filter_map_ok(|path_opt| path_opt.filter(|p| p.should_list()))
+        .filter_map_ok(move |path_opt| path_opt.filter(|p| p.should_list() && p.version >= start_version))
         .take_while(move |path_res| match path_res {
             // discard any path with too-large version; keep errors
             Ok(path) => path.version <= end_version,
