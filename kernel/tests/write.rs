@@ -11,6 +11,7 @@ use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -4063,11 +4064,16 @@ async fn test_snapshot_checkpoint_default_on_v1_table() -> Result<(), Box<dyn st
     Ok(())
 }
 
-/// Passing `None` to `snapshot.checkpoint()` on a V2 table (with `v2Checkpoint`
-/// feature) writes a V2 classic checkpoint with no sidecars: the `_sidecars` directory must not
-/// exist.
+/// On a V2 table (table with `v2Checkpoint` feature), passing either `None` or
+/// `Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))` to `snapshot.checkpoint()` produces
+/// a V2 classic checkpoint with no sidecars.
+#[rstest::rstest]
+#[case::none(None)]
+#[case::v2_no_sidecar(Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_snapshot_checkpoint_default_on_v2_table() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_snapshot_checkpoint_default_on_v2_table(
+    #[case] spec: Option<CheckpointSpec>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_schema();
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let mut snapshot = create_table_and_load_snapshot(
@@ -4085,13 +4091,12 @@ async fn test_snapshot_checkpoint_default_on_v2_table() -> Result<(), Box<dyn st
     )
     .await?;
 
-    snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), None)?;
+    snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), spec.as_ref())?;
 
     let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
     assert!(
         !sidecars_dir.exists(),
-        "_sidecars directory should not exist when spec=None produces a no-sidecar checkpoint, \
-         found: {}",
+        "_sidecars directory should not exist for a no-sidecar V2 checkpoint, found: {}",
         sidecars_dir.display()
     );
 
