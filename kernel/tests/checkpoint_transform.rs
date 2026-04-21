@@ -15,6 +15,7 @@ use delta_kernel::arrow::compute::{concat_batches, sort_to_indices, take};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema, TimestampMicrosecondType,
 };
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{column_expr, Scalar};
@@ -22,9 +23,12 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Expression, Snapshot};
 use serde_json::json;
-use test_utils::{insert_data, read_scan, write_batch_to_table};
+use test_utils::{insert_data, read_scan, test_table_setup_mt, write_batch_to_table};
 use url::Url;
 
 /// Creates an in-memory store and the table root URL.
@@ -532,9 +536,6 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
     Ok(())
 }
 
-/// Schema with a non-nullable partition column (`category`).
-const NON_NULLABLE_PARTITION_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"category","type":"string","nullable":false,"metadata":{}}]}"#;
-
 const WIDE_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"age","type":"long","nullable":true,"metadata":{}}]}"#;
 
 /// Regression test for https://github.com/delta-io/delta-kernel-rs/issues/2165
@@ -629,41 +630,35 @@ async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
 }
 
 /// Checkpoint creation succeeds for tables with non-nullable partition columns and
-/// writeStatsAsStruct=true. The `partitionValues_parsed` schema must force all partition fields
-/// nullable (values come from map lookups which can return null), regardless of what the table
-/// schema declares.
+/// writeStatsAsStruct=true. The `partitionValues_parsed` schema must have all partition fields
+/// forced to be nullable, regardless of what the table schema declares.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_non_nullable_partition_column() -> Result<(), Box<dyn std::error::Error>> {
-    let (store, table_root) = new_in_memory_store();
-    let executor = Arc::new(TokioMultiThreadExecutor::new(
-        tokio::runtime::Handle::current(),
-    ));
-    let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
-            .with_task_executor(executor)
-            .build(),
-    );
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
 
-    // Version 0: protocol + metadata with non-nullable partition column, stats as struct
-    write_commit(
-        &store,
-        &build_commit(
-            NON_NULLABLE_PARTITION_SCHEMA,
-            &["category"],
-            true,
-            true,
-            true,
-        ),
-        0,
-    )
-    .await?;
+    // Create a partitioned table with a non-nullable partition column and stats as struct
+    let schema = Arc::new(StructType::try_new([
+        StructField::not_null("id", DataType::LONG),
+        StructField::not_null("name", DataType::STRING),
+        StructField::not_null("category", DataType::STRING),
+    ])?);
+    let partition_cols: Vec<String> = vec!["category".into()];
+    let _ = create_table(&table_path, schema, "test/1.0")
+        .with_data_layout(DataLayout::partitioned(partition_cols))
+        .with_table_properties([
+            ("delta.checkpoint.writeStatsAsStruct", "true"),
+            ("delta.checkpoint.writeStatsAsJson", "true"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
 
-    // Version 1: write data for partition category=books
-    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    // Write data for partition category=books
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let batch = RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
-            Field::new("id", ArrowDataType::Int64, true),
-            Field::new("name", ArrowDataType::Utf8, true),
+            Field::new("id", ArrowDataType::Int64, false),
+            Field::new("name", ArrowDataType::Utf8, false),
         ])),
         vec![
             Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
@@ -681,11 +676,11 @@ async fn test_checkpoint_non_nullable_partition_column() -> Result<(), Box<dyn s
     // Checkpoint with writeStatsAsStruct=true -- this would fail with
     // Arrow(InvalidArgumentError("Found unmasked nulls for non-nullable StructArray field"))
     // if partitionValues_parsed copied the non-nullable constraint from the table schema.
-    let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     snapshot.checkpoint(engine.as_ref())?;
 
     // Verify data round-trips correctly through a scan after the checkpoint
-    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine.clone())?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();

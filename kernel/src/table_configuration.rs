@@ -303,9 +303,9 @@ impl TableConfiguration {
     /// Returns the physical partition schema for `partitionValues_parsed`.
     ///
     /// Field names are physical column names (respecting column mapping mode),
-    /// and field types are the actual partition column data types. All fields are forced nullable
-    /// because partition values are derived from map lookups (`MAP_TO_STRUCT` over the
-    /// string-valued `partitionValues` map), which can return null for any missing key.
+    /// and field types are the actual partition column data types. All fields are forced to be
+    /// nullable because this schema is used across all checkpoint rows, and only add-action rows
+    /// have partition values -- non-add rows will have null values for these fields.
     /// Returns `None` if the table has no partition columns.
     pub(crate) fn build_partition_values_parsed_schema(&self) -> Option<SchemaRef> {
         let partition_columns = self.metadata().partition_columns();
@@ -327,7 +327,7 @@ impl TableConfiguration {
                 StructField::new(
                     field.physical_name(column_mapping_mode).to_owned(),
                     field.data_type().clone(),
-                    true, // Always nullable: values come from map lookups
+                    true, // Always nullable: non-add checkpoint rows have no partition values
                 )
             })
             .collect();
