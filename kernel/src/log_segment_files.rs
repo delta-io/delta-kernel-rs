@@ -908,4 +908,98 @@ mod list_log_files_with_log_tail_tests {
         // max_published_version reflects all published commits seen (filesystem 0-5 + log_tail 6-10)
         assert_eq!(max_pub, Some(10));
     }
+
+    /// Mimics Azure/OneLake's buggy `list_with_offset`: when `list_from` is called with a
+    /// "bare offset" path (last segment is all digits with no extension, e.g.
+    /// `_delta_log/00000000000000000005`), the underlying service treats it as a prefix
+    /// boundary and excludes any file whose path starts with that offset string —
+    /// notably `00000000000000000005.checkpoint.parquet`. For directory-like paths
+    /// (ending in `/`) the handler behaves correctly.
+    struct OneLakeMockStorageHandler {
+        files: Vec<FileMeta>,
+    }
+
+    impl StorageHandler for OneLakeMockStorageHandler {
+        fn list_from(
+            &self,
+            path: &Url,
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+            let path_str = path.as_str().to_string();
+            let last_segment = path
+                .path_segments()
+                .and_then(|mut s| s.next_back())
+                .unwrap_or("");
+            let is_bare_offset = !last_segment.is_empty()
+                && !last_segment.contains('.')
+                && last_segment.chars().all(|c| c.is_ascii_digit());
+
+            let mut out: Vec<FileMeta> = self
+                .files
+                .iter()
+                .filter(|f| {
+                    let s = f.location.as_str();
+                    if is_bare_offset {
+                        s > path_str.as_str() && !s.starts_with(&path_str)
+                    } else {
+                        s >= path_str.as_str()
+                    }
+                })
+                .cloned()
+                .collect();
+            out.sort_by(|a, b| a.location.as_str().cmp(b.location.as_str()));
+            Ok(Box::new(out.into_iter().map(Ok)))
+        }
+        fn read_files(
+            &self,
+            _: Vec<crate::FileSlice>,
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+            panic!("read_files should not be called during listing");
+        }
+        fn put(&self, _: &Url, _: bytes::Bytes, _: bool) -> DeltaResult<()> {
+            panic!("put should not be called during listing");
+        }
+        fn copy_atomic(&self, _: &Url, _: &Url) -> DeltaResult<()> {
+            panic!("copy_atomic should not be called during listing");
+        }
+        fn head(&self, _: &Url) -> DeltaResult<FileMeta> {
+            panic!("head should not be called during listing");
+        }
+    }
+
+    fn file_meta(url: &str) -> FileMeta {
+        FileMeta {
+            location: Url::parse(url).unwrap(),
+            last_modified: 0,
+            size: 100,
+        }
+    }
+
+    /// Regression for [#2433]: Azure/OneLake's `list_with_offset` treated a bare offset
+    /// path like `_delta_log/00000000000000000005` as a prefix boundary, causing the
+    /// matching `00000000000000000005.checkpoint.parquet` to be omitted. Listing must
+    /// work around this — listing from the directory root and filtering by start_version.
+    ///
+    /// [#2433]: https://github.com/delta-io/delta-kernel-rs/issues/2433
+    #[test]
+    fn test_list_with_onelake_offset_prefix_bug() {
+        let log_root = Url::parse("memory:///_delta_log/").unwrap();
+        let mut files: Vec<FileMeta> = (0u64..=5)
+            .map(|v| file_meta(&format!("memory:///_delta_log/{v:020}.json")))
+            .collect();
+        files.push(file_meta(
+            "memory:///_delta_log/00000000000000000005.checkpoint.parquet",
+        ));
+
+        let storage = OneLakeMockStorageHandler { files };
+        let result =
+            LogSegmentFiles::list(&storage, &log_root, vec![], Some(5), None).unwrap();
+
+        // Pre-fix: list_from was called with `memory:///_delta_log/00000000000000000005`,
+        // the mock would drop the .checkpoint.parquet file, and checkpoint_parts would be empty.
+        assert_eq!(result.checkpoint_parts.len(), 1);
+        assert_eq!(result.checkpoint_parts[0].version, 5);
+        assert!(result.checkpoint_parts[0].is_checkpoint());
+        // The commit at version 5 is preserved as latest_commit_file across the checkpoint flush.
+        assert_eq!(result.latest_commit_file.as_ref().unwrap().version, 5);
+    }
 }
