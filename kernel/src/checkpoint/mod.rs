@@ -275,6 +275,9 @@ pub enum V2CheckpointConfig {
         /// This is a hint, not a strict limit, because file actions are stored in `EngineData`
         /// batches that cannot be split. For example, if the hint is 99 but a single
         /// `EngineData` batch contains 100 file actions, all 100 will be written to one sidecar.
+        ///
+        /// When `None`, kernel uses [`DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT`] (50,000) as the
+        /// default.
         file_actions_per_sidecar_hint: Option<usize>,
     },
 }
