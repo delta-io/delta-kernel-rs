@@ -18,9 +18,9 @@
 //!
 //! # Limitations
 //!
-//! All timestamp queries are limited to the state captured in the [`Snapshot`] provided during
-//! construction. For tables without ICT enabled, timestamp queries rely on file modification
-//! timestamps, which are not guaranteed to be monotonically increasing across commits.
+//! All timestamp queries are limited to the state captured in the provided [`Snapshot`]. For
+//! tables without ICT enabled, timestamp queries rely on file modification timestamps, which are
+//! not guaranteed to be monotonically increasing across commits.
 
 use std::cmp::Ordering;
 
@@ -40,7 +40,10 @@ pub(crate) mod search;
 pub(crate) mod error;
 
 /// A timestamp representing milliseconds since the Unix epoch (1970-01-01 00:00:00 UTC).
-pub(crate) type Timestamp = i64;
+///
+/// This type is used throughout the history_manager module for timestamp-to-version conversion.
+/// All timestamp values should be specified in milliseconds, not seconds or nanoseconds.
+pub type Timestamp = i64;
 
 /// Determines the search strategy for timestamp-to-version conversion based on ICT enablement.
 #[derive(Debug, PartialEq, Eq)]
@@ -380,10 +383,10 @@ pub(crate) fn timestamp_to_version(
     }
 }
 
-/// Gets the latest version that occurs before or at the given `timestamp`.
+/// Gets the latest version with a timestamp at or before `timestamp`.
 ///
-/// This finds the version whose timestamp is less than or equal to `timestamp`.
-/// If no such version exists, returns [`LogHistoryError::TimestampOutOfRange`].
+/// Returns [`LogHistoryError::TimestampOutOfRange`] if no version exists at or before
+/// the given timestamp.
 ///
 /// # Examples
 /// ```ignore
@@ -407,10 +410,10 @@ pub fn latest_version_as_of(
     timestamp_to_version(snapshot, engine, timestamp, Bound::GreatestLower).map_err(Into::into)
 }
 
-/// Gets the first version that occurs at or after the given `timestamp`.
+/// Gets the first version with a timestamp at or after `timestamp`.
 ///
-/// This finds the version whose timestamp is greater than or equal to `timestamp`.
-/// If no such version exists, returns [`LogHistoryError::TimestampOutOfRange`].
+/// Returns [`LogHistoryError::TimestampOutOfRange`] if no version exists at or after
+/// the given timestamp.
 ///
 /// # Examples
 /// ```ignore
@@ -421,7 +424,7 @@ pub fn latest_version_as_of(
 /// let engine = DefaultEngine::try_new(...)?;
 /// let snapshot = Snapshot::builder_for(table_uri).build(&engine)?;
 ///
-/// // Find the first version that occurred after January 1, 2023
+/// // Find the first version that occurred at or after January 1, 2023
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
 /// let version = first_version_after(&snapshot, &engine, timestamp)?;
 /// ```
@@ -749,6 +752,57 @@ mod tests {
         assert!(
             matches!(res, TimestampSearchBounds::ICTSearchStartingFrom(0)),
             "{res:?}"
+        );
+    }
+
+    /// Tests the fast path: when pre-ICT commits are cleaned up (e.g., via VACUUM), the first
+    /// commit in the log segment is at or after ICT enablement. All visible commits have ICT,
+    /// so we return ICTSearchStartingFrom(0) directly without binary search.
+    #[rstest::rstest]
+    #[case::before_all(50)]
+    #[case::at_ict_enablement(300)]
+    #[case::after_ict_enablement(350)]
+    #[case::after_all(1000)]
+    #[tokio::test]
+    async fn test_search_bounds_fast_path_pre_ict_commits_cleaned_up(#[case] timestamp: Timestamp) {
+        // Table: ICT enabled at v3 with ts=300, but only v3+ remain after cleanup
+        let timestamps = [
+            (50, None),
+            (150, None),
+            (250, None),
+            (350, Some(300)),
+            (450, Some(400)),
+        ];
+        let (table, engine, snapshot, _log_segment) =
+            build_test_snapshot(&timestamps, Some(3), None).await;
+
+        // Simulate cleanup: delete pre-ICT commit files (v0, v1, v2)
+        let log_dir = table.table_root().join("_delta_log");
+        for version in 0..3 {
+            let file_name = format!("{:020}.json", version);
+            std::fs::remove_file(log_dir.join(&file_name)).unwrap();
+        }
+
+        // Build a new log segment that only sees v3+ (simulating post-cleanup state)
+        let cleaned_log_segment = LogSegment::for_timestamp_conversion(
+            engine.storage_handler().as_ref(),
+            snapshot.log_segment().log_root.clone(),
+            snapshot.version(),
+            None,
+        )
+        .unwrap();
+
+        // Verify the log segment only contains v3+ (first_version=3 >= ict_enablement_version=3)
+        assert_eq!(
+            cleaned_log_segment.listed.ascending_commit_files[0].version,
+            3
+        );
+
+        // The fast path should trigger: returns ICTSearchStartingFrom(0) for any timestamp
+        let res = get_timestamp_search_bounds(&snapshot, &cleaned_log_segment, timestamp).unwrap();
+        assert!(
+            matches!(res, TimestampSearchBounds::ICTSearchStartingFrom(0)),
+            "Expected fast path ICTSearchStartingFrom(0), got {res:?}"
         );
     }
 
