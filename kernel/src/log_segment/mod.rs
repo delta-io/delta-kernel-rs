@@ -3,6 +3,11 @@
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::internal_api;
+use itertools::Itertools;
+use tracing::{debug, info, instrument, warn};
+use url::Url;
+
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
     get_log_add_schema, schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, METADATA_NAME,
@@ -13,24 +18,18 @@ use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointHintSummary};
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
+#[internal_api]
+use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::MetricId;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::schema::compare::SchemaComparison;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version, PRE_COMMIT_VERSION,
+    StorageHandler, Version,
 };
-use delta_kernel_derive::internal_api;
-
-#[internal_api]
-use crate::log_segment_files::LogSegmentFiles;
-use crate::schema::compare::SchemaComparison;
-
-use itertools::Itertools;
-use tracing::{debug, info, instrument, warn};
-use url::Url;
 
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
@@ -92,9 +91,9 @@ pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<Actio
 /// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
 /// and commit files and guarantees the following:
 ///     1. Commit file versions will not have any gaps between them.
-///     2. If checkpoint(s) is/are present in the range, only commits with versions greater than the most
-///        recent checkpoint version are retained. There will not be a gap between the checkpoint
-///        version and the first commit version.
+///     2. If checkpoint(s) is/are present in the range, only commits with versions greater than the
+///        most recent checkpoint version are retained. There will not be a gap between the
+///        checkpoint version and the first commit version.
 ///     3. All checkpoint_parts must belong to the same checkpoint version, and must form a complete
 ///        version. Multi-part checkpoints must have all their parts.
 ///
@@ -153,20 +152,45 @@ fn schema_to_is_not_null_predicate(schema: &StructType) -> Option<PredicateRef> 
 }
 
 impl LogSegment {
-    /// Creates a synthetic LogSegment for pre-commit transactions (e.g., create-table).
-    /// The sentinel version PRE_COMMIT_VERSION indicates no version exists yet on disk.
-    /// This is used to construct a pre-commit snapshot that provides table configuration
-    /// (protocol, metadata, schema) for operations like CTAS.
-    #[allow(dead_code)] // Used by create_table module
-    pub(crate) fn for_pre_commit(log_root: Url) -> Self {
-        use crate::PRE_COMMIT_VERSION;
-        Self {
-            end_version: PRE_COMMIT_VERSION,
+    /// Creates a LogSegment for a newly created table at version 0 from a single commit file.
+    ///
+    /// Normal log segments are built by listing files from storage and replaying them. For CREATE
+    /// TABLE, the table has no prior log. We construct the segment directly from the just created
+    /// commit file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `internal_error` if `commit_file` is not version 0 or not a commit file type.
+    pub(crate) fn new_for_version_zero(
+        log_root: Url,
+        commit_file: ParsedLogPath,
+    ) -> DeltaResult<Self> {
+        require!(
+            commit_file.version == 0,
+            crate::Error::internal_error(format!(
+                "new_for_version_zero called with version {}",
+                commit_file.version
+            ))
+        );
+        require!(
+            commit_file.is_commit(),
+            crate::Error::internal_error(format!(
+                "new_for_version_zero called with non-commit file type: {:?}",
+                commit_file.file_type
+            ))
+        );
+        Ok(Self {
+            end_version: commit_file.version,
             checkpoint_version: None,
             log_root,
             last_checkpoint_metadata: None,
-            listed: LogSegmentFiles::default(),
-        }
+            listed: LogSegmentFiles {
+                max_published_version: Some(commit_file.version),
+                latest_commit_file: Some(commit_file.clone()),
+                ascending_commit_files: vec![commit_file],
+                ..Default::default()
+            },
+        })
     }
 
     #[internal_api]
@@ -267,7 +291,8 @@ impl LogSegment {
     /// parts. All these parts will have the same checkpoint version.
     ///
     /// The options for constructing a LogSegment for Snapshot are as follows:
-    /// - `checkpoint_hint`: a `LastCheckpointHint` to start the log segment from (e.g. from reading the `last_checkpoint` file).
+    /// - `checkpoint_hint`: a `LastCheckpointHint` to start the log segment from (e.g. from reading
+    ///   the `last_checkpoint` file).
     /// - `time_travel_version`: The version of the log that the Snapshot will be at.
     ///
     /// [`Snapshot`]: crate::snapshot::Snapshot
@@ -339,16 +364,19 @@ impl LogSegment {
         // time_travel_version is not present
         let end_version = time_travel_version;
 
-        // Keep the hint only if it points at or before end_version, or if there is no end_version bound
+        // Keep the hint only if it points at or before end_version, or if there is no end_version
+        // bound
         let usable_hint = checkpoint_hint.filter(|cp| end_version.is_none_or(|v| cp.version <= v));
 
         // Cases:
         //
-        // 1. usable_hint present, end_version is Some  --> list_with_checkpoint_hint from hint.version TO end_version
-        // 2. usable_hint present, end_version is None  --> list_with_checkpoint_hint from hint.version unbounded
-        // 3. no usable_hint,      end_version is Some  --> backward-scan for checkpoint before end_version,
-        //                                                  list from that checkpoint TO end_version
-        //                                                  (falls back to v0 if no checkpoint found)
+        // 1. usable_hint present, end_version is Some  --> list_with_checkpoint_hint from
+        //    hint.version TO end_version
+        // 2. usable_hint present, end_version is None  --> list_with_checkpoint_hint from
+        //    hint.version unbounded
+        // 3. no usable_hint,      end_version is Some  --> backward-scan for checkpoint before
+        //    end_version, list from that checkpoint TO end_version (falls back to v0 if no
+        //    checkpoint found)
         // 4. no usable_hint,      end_version is None  --> list from v0 unbounded
 
         let listed_files = match (usable_hint, end_version) {
@@ -376,10 +404,11 @@ impl LogSegment {
         )
     }
 
-    /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between versions
-    /// `start_version` and `end_version`: Its LogSegment is made of zero checkpoints and all commits
-    /// between versions `start_version` (inclusive) and `end_version` (inclusive). If no `end_version`
-    /// is specified it will be the most recent version by default.
+    /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between
+    /// versions `start_version` and `end_version`: Its LogSegment is made of zero checkpoints
+    /// and all commits between versions `start_version` (inclusive) and `end_version`
+    /// (inclusive). If no `end_version` is specified it will be the most recent version by
+    /// default.
     #[internal_api]
     pub(crate) fn for_table_changes(
         storage: &dyn StorageHandler,
@@ -424,7 +453,6 @@ impl LogSegment {
     /// consist only of contiguous commit files up to `end_version` (inclusive). If present,
     /// `limit` specifies the maximum length of the returned log segment. The log segment may be
     /// shorter than `limit` if there are missing commits.
-    ///
     // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
     // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
     pub(crate) fn for_timestamp_conversion(
@@ -533,10 +561,11 @@ impl LogSegment {
         // so a checkpoint at N covers everything and we can clear them entirely.
         new_log_segment.listed.ascending_commit_files.clear();
         new_log_segment.listed.ascending_compaction_files.clear();
-        // TODO(#839): Once CheckpointWriter exposes the output schema, build a LastCheckpointHintSummary
-        // and thread it through here instead of None. Today the schema is computed inside checkpoint_data()
-        // but not returned. With None, the next scan will read the checkpoint parquet footer
-        // to determine the schema (e.g. whether stats_parsed or sidecar columns exist).
+        // TODO(#839): Once CheckpointWriter exposes the output schema, build a
+        // LastCheckpointHintSummary and thread it through here instead of None. Today the
+        // schema is computed inside checkpoint_data() but not returned. With None, the next
+        // scan will read the checkpoint parquet footer to determine the schema (e.g.
+        // whether stats_parsed or sidecar columns exist).
         new_log_segment.last_checkpoint_metadata = None;
         Ok(new_log_segment)
     }
@@ -649,7 +678,8 @@ impl LogSegment {
             (Some(a), Some(b)) => Some(Arc::new(Predicate::and((*a).clone(), (*b).clone()))),
         };
 
-        // `replay` expects commit files to be sorted in descending order, so the return value here is correct
+        // `replay` expects commit files to be sorted in descending order, so the return value here
+        // is correct
         let commit_stream = CommitReader::try_new(engine, self, commit_read_schema)?;
 
         let checkpoint_result = self.create_checkpoint_stream(
@@ -739,8 +769,8 @@ impl LogSegment {
     /// - No checkpoint parts: return (None, [])
     /// - Multi-part (always V1, no sidecars): return checkpoint schema directly
     /// - UUID-named JSON (always V2): extract sidecars, read first sidecar's schema
-    /// - Classic-named or UUID-named parquet (V1 or V2): read checkpoint schema from
-    ///   hint or footer, then check for sidecar column to distinguish
+    /// - Classic-named or UUID-named parquet (V1 or V2): read checkpoint schema from hint or
+    ///   footer, then check for sidecar column to distinguish
     ///   - Has sidecar column (V2): extract sidecars, read first sidecar's schema
     ///   - No sidecar column (V1): use checkpoint schema directly
     fn get_file_actions_schema_and_sidecars(
@@ -1101,11 +1131,7 @@ impl LogSegment {
     }
 
     /// How many commits since a checkpoint, according to this log segment.
-    /// Returns 0 for pre-commit snapshots (where end_version is PRE_COMMIT_VERSION).
     pub(crate) fn commits_since_checkpoint(&self) -> u64 {
-        if self.end_version == PRE_COMMIT_VERSION {
-            return 0;
-        }
         // we can use 0 as the checkpoint version if there is no checkpoint since `end_version - 0`
         // is the correct number of commits since a checkpoint if there are no checkpoints
         let checkpoint_version = self.checkpoint_version.unwrap_or(0);
@@ -1114,11 +1140,7 @@ impl LogSegment {
     }
 
     /// How many commits since a log-compaction or checkpoint, according to this log segment.
-    /// Returns 0 for pre-commit snapshots (where end_version is PRE_COMMIT_VERSION).
     pub(crate) fn commits_since_log_compaction_or_checkpoint(&self) -> u64 {
-        if self.end_version == PRE_COMMIT_VERSION {
-            return 0;
-        }
         // Annoyingly we have to search all the compaction files to determine this, because we only
         // sort by start version, so technically the max end version could be anywhere in the vec.
         // We can return 0 in the case there is no compaction since end_version - 0 is the correct

@@ -132,6 +132,91 @@ void do_visit_scan_metadata(void* engine_context, HandleSharedScanMetadata scan_
   free_scan_metadata(scan_metadata);
 }
 
+// === Arrow batch-mode scan metadata ===
+//
+// Alternative to the callback-based scan_metadata_next + visit_scan_metadata path above.
+// Returns scan file metadata as an Arrow RecordBatch (via C Data Interface) plus a selection
+// vector and per-row transforms, avoiding per-row FFI overhead.
+//
+// This is useful for engines that can process Arrow data natively -- they can extract file
+// paths, sizes, deletion vector descriptors, and partition values directly from batch columns
+// rather than receiving them one-at-a-time via callbacks.
+#ifdef PRINT_ARROW_DATA
+void iterate_scan_metadata_arrow(
+  struct EngineContext* context,
+  SharedScanMetadataIterator* data_iter)
+{
+  for (;;) {
+    ExternResultScanMetadataArrowResult res =
+      scan_metadata_next_arrow(data_iter, context->engine);
+    if (res.tag != OkScanMetadataArrowResult) {
+      print_error("Failed to get arrow scan metadata.", (Error*)res.err);
+      free_error((Error*)res.err);
+      return;
+    }
+    ScanMetadataArrowResult* result = res.ok;
+    if (!result) {
+      print_diag("Arrow scan metadata iterator done\n");
+      break;
+    }
+
+    // Import the Arrow batch via C Data Interface
+    GError* error = NULL;
+    GArrowSchema* schema =
+      garrow_schema_import((gpointer)&result->arrow_data.schema, &error);
+    if (!schema) {
+      printf("Failed to import arrow schema: %s\n", error->message);
+      g_error_free(error);
+      free_scan_metadata_arrow_result(result);
+      return;
+    }
+    GArrowRecordBatch* batch =
+      garrow_record_batch_import((gpointer)&result->arrow_data.array, schema, &error);
+    if (!batch) {
+      printf("Failed to import arrow batch: %s\n", error->message);
+      g_error_free(error);
+      g_object_unref(schema);
+      free_scan_metadata_arrow_result(result);
+      return;
+    }
+
+    // Count selected rows from the selection vector
+    int64_t num_rows = garrow_record_batch_get_n_rows(batch);
+    uintptr_t selected_count = 0;
+    for (uintptr_t i = 0; i < result->selection_vector.len; i++) {
+      if (result->selection_vector.ptr[i]) {
+        selected_count++;
+      }
+    }
+    print_diag("Arrow scan metadata batch: %" PRId64 " rows, %" PRIuPTR " selected (files to scan)\n",
+               num_rows, selected_count);
+
+    // Access per-row transforms -- an engine would apply these when reading each file
+    for (uintptr_t i = 0; i < result->selection_vector.len; i++) {
+      if (!result->selection_vector.ptr[i]) {
+        continue;
+      }
+      struct OptionalValueHandleSharedExpression transform =
+        get_transform_for_row(i, result->transforms);
+      if (transform.tag == SomeHandleSharedExpression) {
+        print_diag("  row %" PRIuPTR ": has transform\n", i);
+        free_kernel_expression(transform.some);
+      } else {
+        print_diag("  row %" PRIuPTR ": no transform needed\n", i);
+      }
+    }
+
+    // A real engine would extract file paths, sizes, DV info, and partition values
+    // from the batch columns (path, size, modificationTime, stats, deletionVector,
+    // fileConstantValues) and use read_parquet_file() to read each file's data.
+
+    g_object_unref(batch);
+    g_object_unref(schema);
+    free_scan_metadata_arrow_result(result);
+  }
+}
+#endif // PRINT_ARROW_DATA
+
 // Called for each element of the partition StringSliceIterator. We just turn the slice into a
 // `char*` and append it to our list. We knew the total number of partitions up front, so this
 // assumes that `list->cols` has been allocated with enough space to store the pointer.
@@ -284,7 +369,10 @@ int main(int argc, char* argv[])
     return -1;
   }
 
-  // an example of using a builder to set options when building an engine
+  // Example of using the builder to set object-store options before building the engine. The
+  // keys accepted here come from object_store's configuration vocabulary (e.g. "aws_region",
+  // "aws_access_key_id"). They are object-store-specific and only meaningful when the table URL
+  // points at that backend -- for a local file:// table the setters have no effect.
   EngineBuilder* engine_builder = engine_builder_res.ok;
   if (!set_builder_opt(engine_builder, "aws_region", "us-west-2")) {
     return -1;
@@ -299,8 +387,8 @@ int main(int argc, char* argv[])
   //   get_default_engine(table_path_slice, NULL);
 
   if (engine_res.tag != OkHandleSharedExternEngine) {
-    print_error("File to get engine", (Error*)engine_builder_res.err);
-    free_error((Error*)engine_builder_res.err);
+    print_error("Failed to get engine", (Error*)engine_res.err);
+    free_error((Error*)engine_res.err);
     return -1;
   }
 
@@ -310,12 +398,16 @@ int main(int argc, char* argv[])
   if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
     print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
     free_error((Error*)snapshot_builder_res.err);
+    free_engine(engine);
     return -1;
   }
+  // snapshot_builder_build consumes the builder handle whether it succeeds or fails, so there
+  // is nothing to free for the builder here.
   ExternResultHandleSharedSnapshot snapshot_res = snapshot_builder_build(snapshot_builder_res.ok);
   if (snapshot_res.tag != OkHandleSharedSnapshot) {
     print_error("Failed to create snapshot.", (Error*)snapshot_res.err);
     free_error((Error*)snapshot_res.err);
+    free_engine(engine);
     return -1;
   }
 
@@ -392,6 +484,14 @@ int main(int argc, char* argv[])
   if (data_iter_res.tag != OkHandleSharedScanMetadataIterator) {
     print_error("Failed to construct scan metadata iterator.", (Error*)data_iter_res.err);
     free_error((Error*)data_iter_res.err);
+    free_scan(scan);
+    free_schema(logical_schema);
+    free_schema(physical_schema);
+    free_snapshot(snapshot);
+    free_engine(engine);
+    free(context.table_root);
+    free(scan_table_path);
+    free_partition_list(context.partition_cols);
     return -1;
   }
 
@@ -399,6 +499,7 @@ int main(int argc, char* argv[])
 
   print_diag("\nIterating scan metadata\n");
 
+  int exit_code = 0;
   // iterate scan files
   for (;;) {
     ExternResultbool ok_res =
@@ -406,7 +507,8 @@ int main(int argc, char* argv[])
     if (ok_res.tag != Okbool) {
       print_error("Failed to iterate scan metadata.", (Error*)ok_res.err);
       free_error((Error*)ok_res.err);
-      return -1;
+      exit_code = -1;
+      break;
     } else if (!ok_res.ok) {
       print_diag("Scan metadata iterator done\n");
       break;
@@ -431,5 +533,5 @@ int main(int argc, char* argv[])
   free(scan_table_path);
   free_partition_list(context.partition_cols);
 
-  return 0;
+  return exit_code;
 }

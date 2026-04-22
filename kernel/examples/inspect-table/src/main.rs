@@ -1,3 +1,8 @@
+use std::collections::HashMap;
+use std::process::ExitCode;
+use std::sync::{Arc, LazyLock};
+
+use clap::{Parser, Subcommand};
 use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::actions::visitors::{
     visit_metadata_at, visit_protocol_at, AddVisitor, CdcVisitor, RemoveVisitor,
@@ -9,20 +14,13 @@ use delta_kernel::actions::{
 };
 use delta_kernel::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use delta_kernel::expressions::ColumnName;
+use delta_kernel::metrics::{LoggingMetricsReporter, WithMetricsReporterLayer};
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
 use delta_kernel::{DeltaResult, Error, Snapshot};
-
-use delta_kernel::metrics::{LoggingMetricsReporter, WithMetricsReporterLayer};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
-
-use std::collections::HashMap;
-use std::process::ExitCode;
-use std::sync::{Arc, LazyLock};
-
-use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]

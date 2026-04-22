@@ -3,15 +3,14 @@
 //! This module contains the methods that perform a lightweight log replay to extract the latest
 //! Protocol and Metadata actions from a [`LogSegment`].
 
+use tracing::{info, instrument, warn};
+
+use super::LogSegment;
 use crate::actions::{get_commit_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::{CrcLoadResult, LazyCrc};
 use crate::log_replay::ActionsBatch;
 use crate::metrics::MetricId;
 use crate::{DeltaResult, Engine, Error};
-
-use tracing::{info, instrument, warn};
-
-use super::LogSegment;
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.

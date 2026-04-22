@@ -46,6 +46,8 @@ impl SequentialScanMetadata {
             sequential,
             operation_id,
             start: Instant::now(),
+            // TODO: Associate a unique scan ID with this span to correlate sequential and parallel
+            // phases
             span: info_span!("sequential_scan_metadata"),
         }
     }

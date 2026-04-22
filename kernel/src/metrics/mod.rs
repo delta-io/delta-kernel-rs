@@ -78,10 +78,8 @@ pub use reporter::{
     ReportGeneratorLayer,
 };
 use tracing::Subscriber;
-use tracing_subscriber::{
-    layer::{Layered, SubscriberExt as _},
-    registry::LookupSpan,
-};
+use tracing_subscriber::layer::{Layered, SubscriberExt as _};
+use tracing_subscriber::registry::LookupSpan;
 
 /// Extension trait that adds [`with_metrics_reporter_layer`] to any compatible tracing subscriber.
 ///

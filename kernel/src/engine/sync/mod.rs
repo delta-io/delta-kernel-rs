@@ -1,16 +1,17 @@
 //! A simple, single threaded, test-only [`Engine`] that can only read from the local filesystem
 
+use std::fs::File;
+use std::sync::Arc;
+
+use itertools::Itertools;
+use tracing::debug;
+
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
     JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
 };
-
-use itertools::Itertools;
-use std::fs::File;
-use std::sync::Arc;
-use tracing::debug;
 
 pub(crate) mod json;
 mod parquet;

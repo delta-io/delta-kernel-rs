@@ -7,20 +7,18 @@
 use std::fs::{self, File};
 use std::path::Path;
 
-use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
-use delta_kernel::engine::arrow_conversion::TryFromKernel;
-use itertools::Itertools;
-use tracing::debug;
-
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::concat_batches;
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::DeltaResult;
 use delta_kernel_benchmarks::models::{ReadExpected, SnapshotExpected};
-
-use crate::data::assert_data_matches;
+use itertools::Itertools;
+use tracing::debug;
 
 use super::workload::{ReadResult, SnapshotResult};
+use crate::data::assert_data_matches;
 
 /// Read expected data from parquet files in expected_dir/expected_data/.
 fn read_expected_data(expected_dir: &Path) -> Result<RecordBatch, String> {

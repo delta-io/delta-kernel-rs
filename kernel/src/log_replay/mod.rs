@@ -13,17 +13,16 @@
 //! This module provides structures for efficient batch processing, focusing on file action
 //! deduplication with `FileActionDeduplicator` which tracks unique files across log batches
 //! to minimize memory usage for tables with extensive history.
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use delta_kernel_derive::internal_api;
+use tracing::debug;
+
 use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::Deduplicator;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::{DeltaResult, EngineData};
-
-use delta_kernel_derive::internal_api;
-
-use std::collections::HashSet;
-use std::sync::Arc;
-
-use tracing::debug;
 
 pub(crate) mod deduplicator;
 
@@ -133,7 +132,8 @@ impl Deduplicator for FileActionDeduplicator<'_> {
     /// - `skip_removes`: Whether to skip remove actions when extracting file actions
     ///
     /// # Returns
-    /// - `Ok(Some((key, is_add)))`: When a file action is found, returns the key and whether it's an add operation
+    /// - `Ok(Some((key, is_add)))`: When a file action is found, returns the key and whether it's
+    ///   an add operation
     /// - `Ok(None)`: When no file action is found
     /// - `Err(...)`: On any error during extraction
     fn extract_file_action<'a>(
@@ -148,7 +148,8 @@ impl Deduplicator for FileActionDeduplicator<'_> {
             return Ok(Some((FileActionKey::new(path, dv_unique_id), true)));
         }
 
-        // The AddRemoveDedupVisitor skips remove actions when extracting file actions from a checkpoint batch.
+        // The AddRemoveDedupVisitor skips remove actions when extracting file actions from a
+        // checkpoint batch.
         if skip_removes {
             return Ok(None);
         }
@@ -186,8 +187,8 @@ impl ActionsBatch {
     ///
     /// # Parameters
     /// - `actions`: A boxed [`EngineData`] instance representing the actions batch.
-    /// - `is_log_batch`: A boolean indicating whether the batch is from a commit log (`true`) or
-    ///   a checkpoint/CRC/elsewhere (`false`).
+    /// - `is_log_batch`: A boolean indicating whether the batch is from a commit log (`true`) or a
+    ///   checkpoint/CRC/elsewhere (`false`).
     pub(crate) fn new(actions: Box<dyn EngineData>, is_log_batch: bool) -> Self {
         Self {
             actions,
@@ -223,55 +224,59 @@ where
 
 /// A trait for processing batches of actions from Delta transaction logs during log replay.
 ///
-/// Log replay processors scan transaction logs in **reverse chronological order** (newest to oldest),
-/// filtering and transforming action batches into specialized output types. These processors:
+/// Log replay processors scan transaction logs in **reverse chronological order** (newest to
+/// oldest), filtering and transforming action batches into specialized output types. These
+/// processors:
 ///
 /// - **Track and deduplicate file actions** to apply appropriate `Remove` actions to corresponding
 ///   `Add` actions (and omit the file from the log replay output)
 /// - **Maintain selection vectors** to indicate which actions in each batch should be included.
-/// - **Apply custom filtering logic** based on the processor’s purpose (e.g., checkpointing, scanning).
-/// - **Data skipping** filters are applied to the initial selection vector to reduce the number of rows
-///   processed by the processor, (if a filter is provided).
+/// - **Apply custom filtering logic** based on the processor’s purpose (e.g., checkpointing,
+///   scanning).
+/// - **Data skipping** filters are applied to the initial selection vector to reduce the number of
+///   rows processed by the processor, (if a filter is provided).
 ///
 /// # Implementations
 ///
-/// - [`ScanLogReplayProcessor`]: Used for table scans, this processor filters and selects deduplicated
-///   `Add` actions from log batches to reconstruct the view of the table at a specific point in time.
-///   Note that scans do not expose `Remove` actions. Data skipping may be applied when a predicate is
-///   provided.
+/// - [`ScanLogReplayProcessor`]: Used for table scans, this processor filters and selects
+///   deduplicated `Add` actions from log batches to reconstruct the view of the table at a specific
+///   point in time. Note that scans do not expose `Remove` actions. Data skipping may be applied
+///   when a predicate is provided.
 ///
-/// - [`ActionReconciliationProcessor`]: Used for action reconciliation (including checkpoint writing),
-///   this processor filters and selects actions from log batches for inclusion in V1 spec checkpoint files.
-///   Unlike scans, action reconciliation processing includes additional actions, such as `Remove`, `Metadata`,
-///   and `Protocol`, required to fully reconstruct table state. Data skipping is not applied during action
-///   reconciliation processing.
+/// - [`ActionReconciliationProcessor`]: Used for action reconciliation (including checkpoint
+///   writing), this processor filters and selects actions from log batches for inclusion in V1 spec
+///   checkpoint files. Unlike scans, action reconciliation processing includes additional actions,
+///   such as `Remove`, `Metadata`, and `Protocol`, required to fully reconstruct table state. Data
+///   skipping is not applied during action reconciliation processing.
 ///
 /// [`ActionReconciliationProcessor`]: crate::action_reconciliation::log_replay::ActionReconciliationProcessor
 ///
 /// # Action Iterator Input
 ///
-/// The [`LogReplayProcessor::process_actions_iter`] method is the entry point for log replay processing.
-/// It takes as input an iterator of (actions batch, is_commit_batch flag) tuples and returns an iterator of
-/// processor-specific output types with selection vectors. The is_commit_batch bool flag in each tuple
-/// indicates whether the batch came from a commit log (`true`) or checkpoint (`false`). Action batches
-/// **must** be sorted by the order of the actions in the log from most recent to oldest.
+/// The [`LogReplayProcessor::process_actions_iter`] method is the entry point for log replay
+/// processing. It takes as input an iterator of (actions batch, is_commit_batch flag) tuples and
+/// returns an iterator of processor-specific output types with selection vectors. The
+/// is_commit_batch bool flag in each tuple indicates whether the batch came from a commit log
+/// (`true`) or checkpoint (`false`). Action batches **must** be sorted by the order of the actions
+/// in the log from most recent to oldest.
 ///
 /// Each row that is selected in the returned output **must** be included in the processor's result
 /// (e.g., in scan results or checkpoint files), while non-selected rows **must** be ignored.
 ///
 /// # Output Types
 ///
-/// The [`LogReplayProcessor::Output`] type represents the material result of log replay, and it must
-/// implement the [`HasSelectionVector`] trait to allow filtering of irrelevant rows:
+/// The [`LogReplayProcessor::Output`] type represents the material result of log replay, and it
+/// must implement the [`HasSelectionVector`] trait to allow filtering of irrelevant rows:
 ///
 /// - For **scans**, the output type is [`ScanMetadata`], which contains the file actions (`Add`
-///   actions) that need to be applied to build the table's view, accompanied by a
-///   **selection vector** that identifies which rows should be included. A transform vector may
-///   also be included to handle schema changes, such as renaming columns or modifying data types.
+///   actions) that need to be applied to build the table's view, accompanied by a **selection
+///   vector** that identifies which rows should be included. A transform vector may also be
+///   included to handle schema changes, such as renaming columns or modifying data types.
 ///
 /// - For **checkpoints**, the output type is [`FilteredEngineData`], which includes the actions
 ///   necessary to write to the checkpoint file (`Add`, `Remove`, `Metadata`, `Protocol` actions),
-///   filtered by the **selection vector** to determine which rows are included in the final checkpoint.
+///   filtered by the **selection vector** to determine which rows are included in the final
+///   checkpoint.
 ///
 /// TODO: Refactor the Change Data Feed (CDF) processor to use this trait.
 #[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
@@ -287,9 +292,11 @@ pub(crate) trait LogReplayProcessor: Sized {
     ///   representing a batch of actions and a boolean flag indicating whether the batch originates
     ///   from a commit log, `false` if from a checkpoint.
     ///
-    /// Returns a [`DeltaResult`] containing the processor’s output, which includes only selected actions.
+    /// Returns a [`DeltaResult`] containing the processor’s output, which includes only selected
+    /// actions.
     ///
-    /// Note: Since log replay is stateful, processing may update internal processor state (e.g., deduplication sets).
+    /// Note: Since log replay is stateful, processing may update internal processor state (e.g.,
+    /// deduplication sets).
     fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
 
     /// Applies the processor to an actions iterator and filters out empty results.
@@ -332,8 +339,8 @@ pub(crate) trait LogReplayProcessor: Sized {
     /// - `batch`: A reference to the batch of actions to be processed.
     ///
     /// # Returns
-    /// A `DeltaResult<Vec<bool>>`, where each boolean indicates if the corresponding row should be included.
-    /// If no filter is provided, all rows are selected.
+    /// A `DeltaResult<Vec<bool>>`, where each boolean indicates if the corresponding row should be
+    /// included. If no filter is provided, all rows are selected.
     fn build_selection_vector(&self, batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
         match self.data_skipping_filter() {
             Some(filter) => filter.apply(batch),
@@ -357,11 +364,12 @@ pub(crate) trait HasSelectionVector {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use super::deduplicator::CheckpointDeduplicator;
     use super::*;
     use crate::engine_data::GetData;
     use crate::DeltaResult;
-    use std::collections::{HashMap, HashSet};
 
     /// Mock GetData implementation for testing
     struct MockGetData {

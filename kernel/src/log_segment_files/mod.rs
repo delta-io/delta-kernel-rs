@@ -4,8 +4,8 @@
 //! 2. [`list`]: Lists all commit and checkpoint files between the provided start and end versions.
 //! 3. [`list_with_checkpoint_hint`]: Lists all commit and checkpoint files after the provided
 //!    checkpoint hint.
-//! 4. [`list_with_backward_checkpoint_scan`]: Scans backward from an end version in
-//!    1000-version windows until a complete checkpoint is found or the log is exhausted.
+//! 4. [`list_with_backward_checkpoint_scan`]: Scans backward from an end version in 1000-version
+//!    windows until a complete checkpoint is found or the log is exhausted.
 //!
 //! After listing, one can leverage the [`LogSegmentFiles`] to construct a [`LogSegment`].
 //!
@@ -18,30 +18,34 @@
 
 use std::collections::HashMap;
 
-use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::path::{LogPathFileType, LogPathFileType::*, ParsedLogPath};
-use crate::{DeltaResult, Error, StorageHandler, Version};
-
 use delta_kernel_derive::internal_api;
-
 use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
+
+use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::path::LogPathFileType::*;
+use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::{DeltaResult, Error, StorageHandler, Version};
 
 #[cfg(test)]
 mod tests;
 
 /// Represents the set of log files found during a listing operation in the Delta log directory.
 ///
-/// - `ascending_commit_files`: All commit and staged commit files found, sorted by version. May contain gaps.
+/// - `ascending_commit_files`: All commit and staged commit files found, sorted by version. May
+///   contain gaps.
 /// - `ascending_compaction_files`: All compaction commit files found, sorted by version.
-/// - `checkpoint_parts`: All parts of the most recent complete checkpoint (all same version). Empty if no checkpoint found.
-/// - `latest_crc_file`: The CRC file with the highest version, only if version >= checkpoint version.
+/// - `checkpoint_parts`: All parts of the most recent complete checkpoint (all same version). Empty
+///   if no checkpoint found.
+/// - `latest_crc_file`: The CRC file with the highest version, only if version >= checkpoint
+///   version.
 /// - `latest_commit_file`: The commit file with the highest version, or `None` if no commits were
-///    found. This field may be present even when `ascending_commit_files` is empty, such as when a
-///    checkpoint subsumes all commits. In that case, it is retained because downstream code (e.g.
-///    In-Commit Timestamp reading) needs access to the commit file at the snapshot version.
-/// - `max_published_version`: The highest published commit file version, or `None` if no published commits were found.
+///   found. This field may be present even when `ascending_commit_files` is empty, such as when a
+///   checkpoint subsumes all commits. In that case, it is retained because downstream code (e.g.
+///   In-Commit Timestamp reading) needs access to the commit file at the snapshot version.
+/// - `max_published_version`: The highest published commit file version, or `None` if no published
+///   commits were found.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[internal_api]
 pub(crate) struct LogSegmentFiles {
@@ -197,8 +201,8 @@ fn should_process_log_file(file: &ParsedLogPath) -> bool {
 /// share the same version number (e.g., commit, checkpoint parts, CRC files).
 ///
 /// We need to group by version because:
-/// 1. A version may have multiple checkpoint parts that must be collected before we can
-///    determine if the checkpoint is complete
+/// 1. A version may have multiple checkpoint parts that must be collected before we can determine
+///    if the checkpoint is complete
 /// 2. If a complete checkpoint exists, we can discard all commits before it
 ///
 /// Groups are flushed (processed) when we encounter a file with a different version or
@@ -207,7 +211,8 @@ fn should_process_log_file(file: &ParsedLogPath) -> bool {
 struct ListingAccumulator {
     /// The result being built up
     output: LogSegmentFiles,
-    /// Staging area for checkpoint parts at the current version group; always empty when iteration ends
+    /// Staging area for checkpoint parts at the current version group; always empty when iteration
+    /// ends
     pending_checkpoint_parts: Vec<ParsedLogPath>,
     /// End-version bound used in process_file() to filter CompactedCommit files
     // TODO(#2337): remove allow(dead_code) when log compaction is re-enabled
@@ -316,8 +321,8 @@ impl LogSegmentFiles {
     ///
     /// - `fs_files`: files listed from storage in ascending version order
     /// - `log_tail`: list of commits that takes precedence over the filesystem ones
-    /// - `start_version`: start version of the entire listing range provided; in practice,
-    ///   this is the lower bound (inclusive) for log_tail entries included in the result
+    /// - `start_version`: start version of the entire listing range provided; in practice, this is
+    ///   the lower bound (inclusive) for log_tail entries included in the result
     /// - `end_version`: upper bound (inclusive) on versions to include, `None` means no bound
     pub(crate) fn build_log_segment_files(
         fs_files: impl Iterator<Item = DeltaResult<ParsedLogPath>>,
@@ -456,8 +461,8 @@ impl LogSegmentFiles {
         })
     }
 
-    /// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
-    /// If successful, this returns a `LogSegmentFiles`.
+    /// List all commit and checkpoint files with versions above the provided `start_version`
+    /// (inclusive). If successful, this returns a `LogSegmentFiles`.
     ///
     /// The `log_tail` is an optional sequence of commits provided by the caller, e.g. via
     /// [`SnapshotBuilder::with_log_tail`]. It may contain either published or staged commits. The
@@ -467,7 +472,8 @@ impl LogSegmentFiles {
     /// checkpoints, compactions) are always taken from the filesystem.
     // TODO: encode some of these guarantees in the output types. e.g. we could have:
     // - SortedCommitFiles: Vec<ParsedLogPath>, is_ascending: bool, end_version: Version
-    // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same version)
+    // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same
+    //   version)
     #[instrument(name = "log.list", skip_all, fields(start = ?start_version, end = ?end_version), err)]
     pub(crate) fn list(
         storage: &dyn StorageHandler,
@@ -482,8 +488,9 @@ impl LogSegmentFiles {
         Self::build_log_segment_files(fs_iter, log_tail, start, end_version)
     }
 
-    /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that all
-    /// the returned [`ParsedLogPath`]s will have a version less than or equal to the `end_version`.
+    /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that
+    /// all the returned [`ParsedLogPath`]s will have a version less than or equal to the
+    /// `end_version`.
     pub(crate) fn list_with_checkpoint_hint(
         checkpoint_metadata: &LastCheckpointHint,
         storage: &dyn StorageHandler,
@@ -500,7 +507,8 @@ impl LogSegmentFiles {
         )?;
 
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
-            // Kernel should not compensate for corrupt tables, so we fail if we can't find a checkpoint
+            // Kernel should not compensate for corrupt tables, so we fail if we can't find a
+            // checkpoint
             return Err(Error::invalid_checkpoint(
                 "Had a _last_checkpoint hint but didn't find any checkpoints",
             ));
@@ -527,10 +535,10 @@ impl LogSegmentFiles {
     /// To find the checkpoint without a full forward listing from version 0, this scans backward
     /// from `end_version` in windows of size [`BACKWARD_SCAN_WINDOW_SIZE`], stopping as soon as
     /// a complete checkpoint is found (or version 0 is reached).
-    /// Then, all files from the windows that were scanned are combined with `log_tail` to produce a log segment
-    /// rooted at the checkpoint version (or version 0 if no checkpoint) with all commits after the
-    /// checkpoint version. A log_tail commit at exactly the checkpoint version may be included at this
-    /// stage but will be filtered out by `LogSegment::try_new`.
+    /// Then, all files from the windows that were scanned are combined with `log_tail` to produce a
+    /// log segment rooted at the checkpoint version (or version 0 if no checkpoint) with all
+    /// commits after the checkpoint version. A log_tail commit at exactly the checkpoint
+    /// version may be included at this stage but will be filtered out by `LogSegment::try_new`.
     ///
     /// For example, given the desired end_version = 12500 and a checkpoint at v8900:
     /// - Window 1 [11501, 12501): no checkpoint -> continue
@@ -551,7 +559,8 @@ impl LogSegmentFiles {
         let mut windows: Vec<Vec<ParsedLogPath>> = Vec::new();
         let mut found_checkpoint_version: Option<Version> = None;
         // upper is the exclusive upper bound of the next window; adding 1 includes end_version
-        // in the first window. The inclusive range passed to list_from_storage is [lower, upper - 1].
+        // in the first window. The inclusive range passed to list_from_storage is [lower, upper -
+        // 1].
         let mut upper = end_version + 1;
         while upper > 0 {
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);

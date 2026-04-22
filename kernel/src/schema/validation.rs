@@ -20,6 +20,8 @@ const INVALID_PARQUET_CHARS: &[char] = &[' ', ',', ';', '{', '}', '(', ')', '\n'
 /// 1. Schema is non-empty
 /// 2. No duplicate column names (case-insensitive, including nested fields)
 /// 3. Column names contain only valid characters
+/// 4. Rejects fields with `delta.invariants` metadata (SQL expression invariants are not supported
+///    by kernel; see `TableConfiguration::ensure_write_supported`)
 pub(crate) fn validate_schema_for_create(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
@@ -35,7 +37,8 @@ pub(crate) fn validate_schema_for_create(
     validator.into_result()
 }
 
-/// Schema visitor that validates field names and detects duplicates.
+/// Schema visitor that validates field names, detects duplicates, and rejects
+/// unsupported column metadata.
 ///
 /// Implements `SchemaTransform` to reuse the existing recursive struct/array/map traversal.
 /// Collects all validation errors so the caller gets a complete list of violations in a
@@ -84,6 +87,28 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
         // separator would make column "a.b" indistinguishable from nested field b in
         // struct a. Null bytes cannot appear in column names, so they are safe to use.
         self.current_path.push(field.name().to_ascii_lowercase());
+
+        // Reject `delta.invariants` metadata on any field. Kernel cannot evaluate SQL
+        // expression invariants, so writing to any table with invariants metadata is
+        // blocked by `TableConfiguration::ensure_write_supported`. Reject at create
+        // time with a clearer, path-aware error.
+        //
+        // Note: unlike `NonNullFieldChecker`, this validator intentionally does NOT
+        // skip recursion into variant internals. Variants are not expected to carry
+        // `delta.invariants`; if they ever do, bubble the error up loudly instead of
+        // silently skipping it.
+        //
+        // When kernel gains SQL expression invariant support, remove this rejection
+        // and replace it with a check that delegates to the invariant evaluation
+        // pipeline.
+        if field.has_invariants() {
+            self.errors.push(format!(
+                "Column '{}' has `delta.invariants` metadata; SQL expression invariants \
+                 are not supported by kernel",
+                self.current_path.join(".")
+            ));
+        }
+
         let key = self.current_path.join("\0");
         if !self.seen_paths.insert(key) {
             self.errors.push(format!(
@@ -131,9 +156,12 @@ fn validate_field_name(name: &str, cm_enabled: bool) -> DeltaResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use rstest::rstest;
+
+    use super::*;
+    use crate::schema::{
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    };
 
     // === Schema builders for test cases ===
 
@@ -273,6 +301,67 @@ mod tests {
         ])
     }
 
+    // === Helpers for building invariants metadata ===
+    //
+    // These tests assert that `delta.invariants` metadata is rejected at CREATE TABLE.
+    // When kernel gains SQL expression invariant support (see tracking issue for
+    // invariant evaluation), these tests should be repurposed to feed a supported
+    // invariant expression through the full write path instead of being deleted
+    // outright.
+
+    fn field_with_invariant(name: &str, data_type: DataType, nullable: bool) -> StructField {
+        let mut field = StructField::new(name, data_type, nullable);
+        field.metadata.insert(
+            ColumnMetadataKey::Invariants.as_ref().to_string(),
+            MetadataValue::String(r#"{"expression": {"expression": "x > 0"}}"#.to_string()),
+        );
+        field
+    }
+
+    fn schema_top_level_invariant() -> StructType {
+        StructType::new_unchecked(vec![
+            field_with_invariant("x", DataType::INTEGER, true),
+            StructField::new("y", DataType::INTEGER, true),
+        ])
+    }
+
+    fn schema_nested_invariant() -> StructType {
+        let inner =
+            StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
+        StructType::new_unchecked(vec![StructField::new(
+            "parent",
+            DataType::Struct(Box::new(inner)),
+            true,
+        )])
+    }
+
+    fn schema_array_nested_invariant() -> StructType {
+        let inner =
+            StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
+        StructType::new_unchecked(vec![StructField::new(
+            "arr",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Struct(Box::new(inner)),
+                true,
+            ))),
+            true,
+        )])
+    }
+
+    fn schema_map_nested_invariant() -> StructType {
+        let inner =
+            StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
+        StructType::new_unchecked(vec![StructField::new(
+            "map",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::Struct(Box::new(inner)),
+                true,
+            ))),
+            true,
+        )])
+    }
+
     // === Valid schemas ===
 
     #[rstest]
@@ -313,5 +402,26 @@ mod tests {
                 "Expected '{expected}' in error, got: {err}"
             );
         }
+    }
+
+    // === delta.invariants metadata rejection ===
+
+    #[rstest]
+    #[case::top_level(schema_top_level_invariant(), "x")]
+    #[case::nested_struct(schema_nested_invariant(), "parent.child")]
+    #[case::array_nested(schema_array_nested_invariant(), "arr.child")]
+    #[case::map_nested(schema_map_nested_invariant(), "map.child")]
+    fn invariants_metadata_rejected(#[case] schema: StructType, #[case] expected_path: &str) {
+        let result = validate_schema_for_create(&schema, ColumnMappingMode::None);
+        let err = result.expect_err("expected delta.invariants metadata rejection");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("delta.invariants"),
+            "Expected delta.invariants mention in error, got: {msg}"
+        );
+        assert!(
+            msg.contains(expected_path),
+            "Expected path '{expected_path}' in error, got: {msg}"
+        );
     }
 }

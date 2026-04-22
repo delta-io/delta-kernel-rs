@@ -12,7 +12,7 @@ mod variant;
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -28,8 +28,8 @@ use test_utils::{assert_result_error_with_message, test_table_setup};
 /// Shared with sub-modules.
 pub(crate) fn simple_schema() -> DeltaResult<Arc<StructType>> {
     Ok(Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new("value", DataType::STRING, true),
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
     ])?))
 }
 
@@ -37,9 +37,9 @@ pub(crate) fn simple_schema() -> DeltaResult<Arc<StructType>> {
 /// Shared with sub-modules.
 pub(crate) fn partition_test_schema() -> DeltaResult<Arc<StructType>> {
     Ok(Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
-        StructField::new("date", DataType::DATE, true),
-        StructField::new("value", DataType::STRING, true),
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("date", DataType::DATE),
+        StructField::nullable("value", DataType::STRING),
     ])?))
 }
 
@@ -49,11 +49,11 @@ async fn test_create_simple_table() -> DeltaResult<()> {
 
     // Create schema for an events table
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("event_id", DataType::LONG, false),
-        StructField::new("user_id", DataType::LONG, false),
-        StructField::new("event_type", DataType::STRING, false),
-        StructField::new("timestamp", DataType::TIMESTAMP, false),
-        StructField::new("properties", DataType::STRING, true),
+        StructField::nullable("event_id", DataType::LONG),
+        StructField::nullable("user_id", DataType::LONG),
+        StructField::nullable("event_type", DataType::STRING),
+        StructField::nullable("timestamp", DataType::TIMESTAMP),
+        StructField::nullable("properties", DataType::STRING),
     ])?);
 
     // Create table using new API
@@ -157,11 +157,11 @@ async fn test_create_table_already_exists() -> DeltaResult<()> {
 
     // Create schema for a user profiles table
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("user_id", DataType::LONG, false),
-        StructField::new("username", DataType::STRING, false),
-        StructField::new("email", DataType::STRING, false),
-        StructField::new("created_at", DataType::TIMESTAMP, false),
-        StructField::new("is_active", DataType::BOOLEAN, false),
+        StructField::nullable("user_id", DataType::LONG),
+        StructField::nullable("username", DataType::STRING),
+        StructField::nullable("email", DataType::STRING),
+        StructField::nullable("created_at", DataType::TIMESTAMP),
+        StructField::nullable("is_active", DataType::BOOLEAN),
     ])?);
 
     // Create table first time
@@ -194,14 +194,131 @@ async fn test_create_table_empty_schema_not_supported() -> DeltaResult<()> {
     Ok(())
 }
 
+fn top_level_non_null_schema() -> Arc<StructType> {
+    Arc::new(
+        StructType::try_new(vec![
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable("value", DataType::STRING),
+        ])
+        .expect("non-null top-level schema should be valid"),
+    )
+}
+
+fn nested_non_null_schema() -> Arc<StructType> {
+    let nested = StructType::try_new(vec![StructField::not_null("child", DataType::INTEGER)])
+        .expect("nested non-null schema should be valid");
+    Arc::new(
+        StructType::try_new(vec![StructField::nullable(
+            "nested",
+            DataType::Struct(Box::new(nested)),
+        )])
+        .expect("top-level nested schema should be valid"),
+    )
+}
+
+/// CREATE TABLE with non-null columns succeeds and auto-enables the `invariants`
+/// writer feature in the protocol. Delta-Spark treats non-null schema columns as
+/// implicit invariants and requires the feature to be declared.
+#[rstest]
+#[case::top_level_non_null(top_level_non_null_schema())]
+#[case::nested_non_null(nested_non_null_schema())]
+fn test_create_table_with_non_null_columns_auto_enables_invariants(
+    #[case] schema: Arc<StructType>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let protocol = snapshot.table_configuration().protocol();
+    assert!(
+        protocol
+            .writer_features()
+            .is_some_and(|f| f.contains(&TableFeature::Invariants)),
+        "Invariants feature should be auto-added to writer features for non-null schema"
+    );
+    // Invariants is writer-only; reader features should not contain it.
+    assert!(
+        !protocol
+            .reader_features()
+            .is_some_and(|f| f.contains(&TableFeature::Invariants)),
+        "Invariants should not appear in reader features"
+    );
+
+    Ok(())
+}
+
+/// CREATE TABLE with `delta.feature.invariants=supported` + a non-null schema succeeds
+/// and lands the feature in writerFeatures exactly once. Non-null columns auto-enable
+/// the feature and the explicit signal also tries to enable it; both paths firing
+/// together must not duplicate the entry. This also verifies users can pre-enable the
+/// feature so a later ALTER TABLE ADD COLUMN NOT NULL does not need a protocol upgrade.
+#[tokio::test]
+async fn test_create_table_with_invariants_feature_signal_allowed() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    // Non-null schema auto-enables Invariants; the feature signal also tries to add it.
+    // Both code paths firing together must produce exactly one Invariants entry.
+    let schema = top_level_non_null_schema();
+
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.feature.invariants", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let protocol = snapshot.table_configuration().protocol();
+    let writer_features = protocol
+        .writer_features()
+        .expect("writer features should be present");
+    let invariants_count = writer_features
+        .iter()
+        .filter(|f| **f == TableFeature::Invariants)
+        .count();
+    assert_eq!(
+        invariants_count, 1,
+        "Invariants should appear exactly once in writerFeatures; got {invariants_count}"
+    );
+    assert!(
+        !protocol
+            .reader_features()
+            .is_some_and(|f| f.contains(&TableFeature::Invariants)),
+        "Invariants should not appear in readerFeatures (writer-only feature)"
+    );
+
+    Ok(())
+}
+
+/// CREATE TABLE rejects any schema with `delta.invariants` metadata annotations
+/// because kernel cannot evaluate SQL expression invariants.
+#[tokio::test]
+async fn test_create_table_rejects_delta_invariants_metadata() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let mut field = StructField::nullable("x", DataType::INTEGER);
+    field.metadata.insert(
+        ColumnMetadataKey::Invariants.as_ref().to_string(),
+        MetadataValue::String(r#"{"expression": {"expression": "x > 0"}}"#.to_string()),
+    );
+    let schema = Arc::new(StructType::try_new(vec![field])?);
+
+    let result = create_table(&table_path, schema, "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert_result_error_with_message(result, "delta.invariants");
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_create_table_log_actions() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Create schema
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("user_id", DataType::LONG, false),
-        StructField::new("action", DataType::STRING, false),
+        StructField::nullable("user_id", DataType::LONG),
+        StructField::nullable("action", DataType::STRING),
     ])?);
 
     let engine_info = "AuditService/2.1.0";
@@ -490,8 +607,8 @@ fn test_create_table_special_char_column_name(#[case] cm_enabled: bool) -> Delta
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("valid_col", DataType::INTEGER, false),
-        StructField::new("bad column", DataType::STRING, true),
+        StructField::nullable("valid_col", DataType::INTEGER),
+        StructField::nullable("bad column", DataType::STRING),
     ])?);
 
     let mut builder = create_table(&table_path, schema, "Test/1.0");

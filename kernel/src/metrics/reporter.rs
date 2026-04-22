@@ -11,9 +11,8 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 use uuid::Uuid;
 
-use crate::metrics::MetricId;
-
 use super::MetricEvent;
+use crate::metrics::MetricId;
 
 /// Trait for reporting metrics events from Delta operations.
 ///
@@ -57,8 +56,9 @@ impl MetricsReporter for LoggingMetricsReporter {
 /// A [`tracing_subscriber::Layer`] that converts tracing spans into [`MetricEvent`]s and
 /// forwards them to a registered [`MetricsReporter`].
 ///
-/// Typically added to a subscriber via [`super::WithMetricsReporterLayer::with_metrics_reporter_layer`]
-/// rather than constructed directly.
+/// Typically added to a subscriber via
+/// [`super::WithMetricsReporterLayer::with_metrics_reporter_layer`] rather than constructed
+/// directly.
 #[derive(Debug)]
 pub struct ReportGeneratorLayer {
     reporter: Arc<dyn MetricsReporter>,

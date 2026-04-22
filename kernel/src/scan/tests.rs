@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-
 use rstest::rstest;
 
+use super::*;
 use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
@@ -21,12 +21,9 @@ use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{
-    Engine, EvaluationHandler, FileDataReadResultIterator, FileMeta, JsonHandler, ParquetFooter,
-    ParquetHandler, PredicateRef, StorageHandler,
+    Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, JsonHandler,
+    ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
 };
-use crate::{EngineData, Snapshot};
-
-use super::*;
 
 /// Helper macro to extract a typed column from a RecordBatch or StructArray.
 macro_rules! get_column {
@@ -1381,7 +1378,8 @@ fn test_scan_metadata_with_multiple_stats_columns() {
     }
 }
 
-/// Test that `with_stats_columns` with a nonexistent column name produces empty stats for that column.
+/// Test that `with_stats_columns` with a nonexistent column name produces empty stats for that
+/// column.
 #[test]
 fn test_scan_metadata_with_nonexistent_stats_columns() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();

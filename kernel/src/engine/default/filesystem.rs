@@ -24,6 +24,8 @@ use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 /// thread.
 ///
 /// Generic over the inner stream type and item type.
+/// The `event_fn` receives (duration, num_files, bytes_read) to construct the appropriate
+/// MetricEvent. Metrics are emitted either when the iterator is exhausted or when dropped.
 struct MetricsIterator<I, T> {
     inner: I,
     name: &'static str,
@@ -131,9 +133,10 @@ async fn list_from_impl(
 ) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
     let start = Instant::now();
 
-    // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
-    // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
-    // because it strips trailing /, so we're reduced to manually checking the original URL.
+    // The offset is used for list-after; the prefix is used to restrict the listing to a specific
+    // directory. Unfortunately, `Path` provides no easy way to check whether a name is
+    // directory-like, because it strips trailing /, so we're reduced to manually checking the
+    // original URL.
     let offset = Path::from_url_path(path.path())?;
     let prefix = if path.path().ends_with('/') {
         offset.clone()
@@ -339,19 +342,17 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 ///
 /// Although the `object_store` crate explicitly says it _does not_ return a sorted listing, in
 /// practice many implementations actually do:
-/// - AWS:
-///   [`ListObjectsV2`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)
-///   states: "For general purpose buckets, ListObjectsV2 returns objects in lexicographical
-///   order based on their key names."
-/// - Azure: Docs state
-///   [here](https://learn.microsoft.com/en-us/rest/api/storageservices/enumerating-blob-resources):
-///   "A listing operation returns an XML response that contains all or part of the requested
-///   list. The operation returns entities in alphabetical order."
-/// - GCP: The [main](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) doc
-///   doesn't indicate order, but [this
-///   page](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) does say: "This page
-///   shows you how to list the [objects](https://cloud.google.com/storage/docs/objects) stored
-///   in your Cloud Storage buckets, which are ordered in the list lexicographically by name."
+/// - AWS: [`ListObjectsV2`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)
+///   states: "For general purpose buckets, ListObjectsV2 returns objects in lexicographical order
+///   based on their key names."
+/// - Azure: Docs state [here](https://learn.microsoft.com/en-us/rest/api/storageservices/enumerating-blob-resources):
+///   "A listing operation returns an XML response that contains all or part of the requested list.
+///   The operation returns entities in alphabetical order."
+/// - GCP: The [main](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) doc doesn't indicate
+///   order, but [this page](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) does say:
+///   "This page shows you how to list the [objects](https://cloud.google.com/storage/docs/objects)
+///   stored in your Cloud Storage buckets, which are ordered in the list lexicographically by
+///   name."
 fn supports_ordered_listing(url: &Url) -> bool {
     !((url.scheme() == "file")
         // S3 Directory Buckets
@@ -366,17 +367,15 @@ mod tests {
     use std::time::Duration;
 
     use itertools::Itertools;
-
     use test_utils::delta_path_for_version;
 
+    use super::*;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::utils::current_time_duration;
     use crate::Engine as _;
-
-    use super::*;
 
     fn setup_test() -> (
         tempfile::TempDir,

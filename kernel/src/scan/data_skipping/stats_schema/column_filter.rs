@@ -3,11 +3,9 @@
 //! This module contains [`StatsColumnFilter`], which determines which columns
 //! should have statistics collected based on table configuration.
 
-use crate::{
-    column_trie::ColumnTrie,
-    schema::{ColumnName, DataType, Schema, StructField},
-    table_properties::DataSkippingNumIndexedCols,
-};
+use crate::column_trie::ColumnTrie;
+use crate::schema::{ColumnName, DataType, Schema, StructField};
+use crate::table_properties::DataSkippingNumIndexedCols;
 
 /// Configuration for statistics columns
 pub(crate) struct StatsConfig<'a> {
@@ -15,8 +13,8 @@ pub(crate) struct StatsConfig<'a> {
     /// `data_skipping_num_indexed_cols`.
     /// See delta.dataSkippingStatsColumns in the Delta protocol for more details.
     pub(crate) data_skipping_stats_columns: Option<&'a [ColumnName]>,
-    /// Maximum number of leaf columns to include. Ignored when `data_skipping_stats_columns` is set.
-    /// See delta.dataSkippingNumIndexedCols in the Delta protocol for more details.
+    /// Maximum number of leaf columns to include. Ignored when `data_skipping_stats_columns` is
+    /// set. See delta.dataSkippingNumIndexedCols in the Delta protocol for more details.
     pub(crate) data_skipping_num_indexed_cols: Option<DataSkippingNumIndexedCols>,
 }
 
@@ -171,8 +169,9 @@ impl<'col> StatsColumnFilter<'col> {
     /// Required columns (e.g. clustering columns) are always included, even past the column limit.
     pub(crate) fn should_include_for_table(&self) -> bool {
         match &self.data_skipping_stats_trie {
-            // In explicit dataSkippingStatsColumns mode, include exactly columns selected by the trie.
-            // Required columns are already merged into the trie during initialization.
+            // In explicit dataSkippingStatsColumns mode, include exactly columns selected by the
+            // trie. Required columns are already merged into the trie during
+            // initialization.
             Some(trie) => trie.contains_prefix_of(&self.path),
             // In count-based mode, include until limit; required columns can exceed the limit.
             None => !self.at_column_limit() || self.is_required_column(),
@@ -245,7 +244,8 @@ impl<'col> StatsColumnFilter<'col> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{schema::StructType, table_properties::TableProperties};
+    use crate::schema::StructType;
+    use crate::table_properties::TableProperties;
 
     fn make_props_with_num_cols(n: u64) -> TableProperties {
         [(

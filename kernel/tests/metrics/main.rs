@@ -6,8 +6,8 @@
 //! verified through the same code paths a real engine connector would exercise.
 //!
 //! Tests are organized by concern:
-//! - [`snapshot_load`]: snapshot-loading scenarios (delta-only, checkpoint, compaction, CRC,
-//!   and on-demand API calls like `get_domain_metadata`)
+//! - [`snapshot_load`]: snapshot-loading scenarios (delta-only, checkpoint, compaction, CRC, and
+//!   on-demand API calls like `get_domain_metadata`)
 //! - [`scan`]: scan execution scenarios (`scan.execute()` parquet data-file reads)
 //!
 //! Where possible, tests use [`TestTableBuilder`] for table setup. Tests that need

@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-
 use delta_kernel_benchmarks::models::{
     default_read_configs, ParallelScan, ReadConfig, ReadOperation, Spec,
 };
@@ -77,7 +76,8 @@ fn run_benchmark(c: &mut Criterion, runner: &dyn WorkloadRunner, reporter: &Coun
 
 fn build_read_configs(table_name: &str) -> Vec<ReadConfig> {
     // Choose which benchmark configurations to run for a given table
-    // TODO: This function will take in table info to choose the appropriate configs for a given table
+    // TODO: This function will take in table info to choose the appropriate configs for a given
+    // table
     let mut configs = default_read_configs();
     if table_name.contains("V2Chkpt") {
         configs.push(ReadConfig {
