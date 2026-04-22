@@ -21,7 +21,7 @@ const SIDECAR_SCHEMA_TAGS: &str = "tags";
 /// Creates a single [`EngineData`] batch containing one row per sidecar file.
 ///
 /// Each row has the `sidecar` field populated and all other fields set to null.
-/// All rows are emitted in one batch via [`EvaluationHandler::create_many`].
+/// All rows are created in one batch via [`EvaluationHandler::create_many`].
 ///
 /// Returns an empty `Vec` when there are no sidecars.
 ///
@@ -55,6 +55,8 @@ pub(super) fn create_sidecar_action_batches(
         .iter()
         .position(|f| f.name() == SIDECAR_NAME)
         .ok_or_else(|| Error::internal_error("checkpoint schema missing sidecar field"))?;
+    // Per-row data template (follows checkpoint data schema, all fields null). Each sidecar row is
+    // built by cloning this and populating only the `sidecar` field.
     let null_template: Vec<Scalar> = checkpoint_data_fields
         .iter()
         .map(|f| Scalar::Null(f.data_type().clone()))
@@ -64,12 +66,7 @@ pub(super) fn create_sidecar_action_batches(
     let rows: Vec<Vec<Scalar>> = sidecar_metas
         .iter()
         .map(|(filename, meta)| -> DeltaResult<Vec<Scalar>> {
-            let size_in_bytes = i64::try_from(meta.size).map_err(|e| {
-                Error::CheckpointWrite(format!(
-                    "Failed to convert sidecar size {} to i64: {e}",
-                    meta.size
-                ))
-            })?;
+            let size_in_bytes = meta.size_as_i64()?;
 
             // Sidecar struct values, ordered to match `sidecar_fields`.
             let values: Vec<Scalar> = sidecar_fields
@@ -80,9 +77,10 @@ pub(super) fn create_sidecar_action_batches(
                     SIDECAR_SCHEMA_PATH => Ok(Scalar::from(filename.clone())),
                     SIDECAR_SCHEMA_SIZE_IN_BYTES => Ok(Scalar::from(size_in_bytes)),
                     SIDECAR_SCHEMA_MODIFICATION_TIME => Ok(Scalar::from(meta.last_modified)),
-                    // `StructData::try_new` requires one value per schema field, so we
-                    // emit `Scalar::Null` for `tags`. Sidecar tags are protocol details;
-                    // we can expose them to connectors if there is a need in the future.
+                    // Sidecar tags are protocol details; we can let connectors specify them
+                    // in the future if there is a need. For now we leave it as null.
+                    // We explicitly fill it with `Scalar::Null` here, since
+                    // `StructData::try_new` requires one value per schema field.
                     SIDECAR_SCHEMA_TAGS => Ok(Scalar::Null(field.data_type().clone())),
                     other => Err(Error::CheckpointWrite(format!(
                         "Unexpected sidecar field: {other}"

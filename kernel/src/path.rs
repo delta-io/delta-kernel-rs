@@ -1140,4 +1140,36 @@ pub(crate) mod tests {
             "read_in_commit_timestamp can only be called on commit files",
         );
     }
+
+    /// Verifies `new_sidecar` builds a `<version:020>.checkpoint.<uuid>.parquet` filename
+    /// under `<table_root>/_delta_log/_sidecars/`.
+    #[rstest::rstest]
+    #[case::version_zero(0)]
+    #[case::small_version(7)]
+    #[case::large_version(1_234_567_890)]
+    fn test_new_sidecar_path(#[case] version: Version) {
+        let table_root = Url::parse("memory:///table/").unwrap();
+        let (filename, url) = new_sidecar(&table_root, version).unwrap();
+
+        // Filename: `<version:020>.checkpoint.<uuid>.parquet`
+        let prefix = format!("{version:020}.checkpoint.");
+        assert!(
+            filename.starts_with(&prefix) && filename.ends_with(".parquet"),
+            "unexpected filename: {filename}"
+        );
+        // The middle segment must be a valid UUID.
+        let uuid_part = filename
+            .strip_prefix(&prefix)
+            .and_then(|s| s.strip_suffix(".parquet"))
+            .unwrap();
+        Uuid::parse_str(uuid_part).expect("middle segment must be a valid UUID");
+
+        // URL: `<table_root>/_delta_log/_sidecars/<filename>`
+        let expected = table_root
+            .join("_delta_log/_sidecars/")
+            .unwrap()
+            .join(&filename)
+            .unwrap();
+        assert_eq!(url, expected);
+    }
 }
