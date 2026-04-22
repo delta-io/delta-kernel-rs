@@ -1,6 +1,3 @@
-// Low-level timestamp conversion internals. Made public in a later PR.
-#![allow(unused)]
-
 //! This module provides functions for performing timestamp queries over the Delta Log, translating
 //! between timestamps and Delta versions.
 //!
@@ -37,7 +34,7 @@ use crate::{DeltaResult, Engine, Error as DeltaError, Version};
 
 pub(crate) mod search;
 
-pub(crate) mod error;
+pub mod error;
 
 /// A timestamp representing milliseconds since the Unix epoch (1970-01-01 00:00:00 UTC).
 ///

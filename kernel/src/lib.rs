@@ -164,7 +164,7 @@ pub(crate) mod last_checkpoint_hint;
 
 pub(crate) mod log_segment_files;
 
-pub(crate) mod history_manager;
+pub mod history_manager;
 
 #[cfg(feature = "internal-api")]
 pub mod parallel;
