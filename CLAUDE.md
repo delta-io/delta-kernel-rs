@@ -204,6 +204,9 @@ Keep this list updated when new protocol features are added to kernel.
 - Prefer `==` over `matches!` for simple single-variant enum comparisons. `matches!` is
   for patterns with bindings or guards. For example: `self == Variant` not
   `matches!(self, Variant)`.
+- Prefer `StructField::nullable` / `StructField::not_null` over
+  `StructField::new(name, type, bool)` when nullability is known at compile time.
+  Reserve `StructField::new` for cases where nullability is a runtime value.
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
 
