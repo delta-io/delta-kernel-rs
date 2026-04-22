@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 
 use error::LogHistoryError;
 use search::{binary_search_by_key_with_bounds, Bound, SearchError};
-use tracing::{info, warn};
+use tracing::{info, trace};
 
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
@@ -169,9 +169,11 @@ fn linear_search_file_mod_timestamps(
         // Monotonize: ensure each timestamp is strictly greater than the previous
         let monotonic_ts = raw_ts.max(prev_monotonic_ts + 1);
         if monotonic_ts != raw_ts {
-            warn!(
+            trace!(
                 version = commit.version,
-                raw_ts, monotonic_ts, "Adjusted non-monotonic timestamp"
+                raw_ts,
+                monotonic_ts,
+                "Adjusted non-monotonic timestamp"
             );
         }
 
