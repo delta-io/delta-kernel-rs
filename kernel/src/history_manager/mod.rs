@@ -398,9 +398,8 @@ pub(crate) fn timestamp_to_version(
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
 /// let version = latest_version_as_of(&snapshot, &engine, timestamp)?;
 /// ```
-#[allow(unused)]
-#[tracing::instrument(skip(snapshot, engine), fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
-pub(crate) fn latest_version_as_of(
+#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+pub fn latest_version_as_of(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     timestamp: Timestamp,
@@ -426,9 +425,8 @@ pub(crate) fn latest_version_as_of(
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
 /// let version = first_version_after(&snapshot, &engine, timestamp)?;
 /// ```
-#[allow(unused)]
-#[tracing::instrument(skip(snapshot, engine), fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
-pub(crate) fn first_version_after(
+#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+pub fn first_version_after(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     timestamp: Timestamp,
@@ -479,9 +477,8 @@ pub(crate) fn first_version_after(
 /// let (start_version, end_version) =
 ///     timestamp_range_to_versions(&snapshot, &engine, start_timestamp, Some(end_timestamp))?;
 /// ```
-#[allow(unused)]
-#[tracing::instrument(skip(snapshot, engine), fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
-pub(crate) fn timestamp_range_to_versions(
+#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+pub fn timestamp_range_to_versions(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     start_timestamp: Timestamp,
@@ -1058,31 +1055,24 @@ mod tests {
         }
     }
 
-    // Table: v0=50, v1=150, v2=250 (file mod), v3=300, v4=400 (ICT at v3)
-    // Comprehensive boundary test cases matching test_latest_version_as_of and
-    // test_first_version_after
+    /// Table: v0=50, v1=150, v2=250 (file mod), v3=300, v4=400 (ICT at v3)
     #[rstest::rstest]
-    // Basic range tests
     #[case::basic_range(50, Some(300), Ok((0, Some(3))))]
     #[case::no_end(100, None, Ok((1, None)))]
     #[case::start_equals_end(150, Some(150), Ok((1, Some(1))))]
     #[case::spanning_ict_boundary(100, Some(350), Ok((1, Some(3))))]
     #[case::entire_table(0, Some(1000), Ok((0, Some(4))))]
-    // Exact timestamp boundaries
     #[case::exact_v0_to_v1(50, Some(150), Ok((0, Some(1))))]
     #[case::exact_v1_to_v2(150, Some(250), Ok((1, Some(2))))]
     #[case::exact_v3_ict_to_v4(300, Some(400), Ok((3, Some(4))))]
-    // File mod region boundaries
     #[case::between_v0_v1_to_exact_v2(100, Some(250), Ok((1, Some(2))))]
     #[case::just_after_last_file_mod_no_end(251, None, Ok((3, None)))]
     #[case::just_before_ict_to_just_after(299, Some(301), Ok((3, Some(3))))]
-    // ICT region boundaries
     #[case::exact_ict_to_after_all(300, Some(1000), Ok((3, Some(4))))]
     #[case::between_ict_commits(350, Some(400), Ok((4, Some(4))))]
     #[case::just_after_ict_to_end(301, Some(1000), Ok((4, Some(4))))]
-    // Error cases embedded as rstest cases
-    #[case::end_before_all_fails(0, Some(40), Err(()))] // No version at or before end_timestamp=40
-    #[case::start_after_all_fails(500, Some(1000), Err(()))] // No version at or after start_timestamp=500
+    #[case::end_before_all_fails(0, Some(40), Err(()))]
+    #[case::start_after_all_fails(500, Some(1000), Err(()))]
     #[tokio::test]
     async fn test_timestamp_range_to_versions(
         #[case] start: Timestamp,
@@ -1343,8 +1333,8 @@ mod tests {
     #[case::exact_v0_to_v2(100, Some(300), Ok((0, Some(2))))]
     #[case::between_commits(150, Some(250), Ok((1, Some(1))))]
     #[case::start_equals_end_exact(200, Some(200), Ok((1, Some(1))))]
-    #[case::end_before_all_fails(50, Some(80), Err(()))] // No version at or before end_timestamp=80
-    #[case::start_after_all_fails(400, Some(500), Err(()))] // No version at or after start_timestamp=400
+    #[case::end_before_all_fails(50, Some(80), Err(()))]
+    #[case::start_after_all_fails(400, Some(500), Err(()))]
     #[tokio::test]
     async fn test_timestamp_range_file_mod_only(
         #[case] start: Timestamp,
@@ -1372,8 +1362,8 @@ mod tests {
     #[case::exact_v0_to_v2(100, Some(300), Ok((0, Some(2))))]
     #[case::between_commits(150, Some(250), Ok((1, Some(1))))]
     #[case::start_equals_end_exact(200, Some(200), Ok((1, Some(1))))]
-    #[case::end_before_all_fails(50, Some(80), Err(()))] // No version at or before end_timestamp=80
-    #[case::start_after_all_fails(400, Some(500), Err(()))] // No version at or after start_timestamp=400
+    #[case::end_before_all_fails(50, Some(80), Err(()))]
+    #[case::start_after_all_fails(400, Some(500), Err(()))]
     #[tokio::test]
     async fn test_timestamp_range_ict_from_creation(
         #[case] start: Timestamp,
