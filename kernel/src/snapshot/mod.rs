@@ -578,11 +578,7 @@ impl Snapshot {
         engine: &dyn Engine,
         spec: Option<&CheckpointSpec>,
     ) -> DeltaResult<()> {
-        info!(
-            "Writing checkpoint for snapshot version {} with spec {:?}",
-            self.version(),
-            spec
-        );
+        info!("snapshot version = {}, spec = {:?}", self.version(), spec);
         let v2_supported = self
             .table_configuration()
             .is_feature_supported(&TableFeature::V2Checkpoint);
