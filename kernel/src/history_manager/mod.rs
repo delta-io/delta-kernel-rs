@@ -511,6 +511,11 @@ pub fn timestamp_range_to_versions(
         );
     }
 
+    // TODO(#2449): Optimize by reusing the log segment between the two timestamp conversions.
+    // Currently, both first_version_after and latest_version_as_of each build their own
+    // log segment via listing. We could build the segment once and pass it to a shared
+    // helper (e.g., timestamp_to_version_in_segment) to cut listing time in half.
+
     // Convert the start timestamp to version
     let start_version = first_version_after(snapshot, engine, start_timestamp)?;
 
