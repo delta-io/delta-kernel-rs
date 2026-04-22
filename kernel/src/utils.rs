@@ -211,11 +211,6 @@ pub(crate) mod test_utils {
         pub(crate) fn events(&self) -> Vec<MetricEvent> {
             self.events.lock().unwrap().clone()
         }
-
-        /// Clears all captured events.
-        pub(crate) fn clear(&self) {
-            self.events.lock().unwrap().clear();
-        }
     }
 
     #[derive(Serialize)]
