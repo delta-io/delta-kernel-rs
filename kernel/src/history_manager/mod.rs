@@ -233,6 +233,45 @@ fn linear_search_file_mod_timestamps(
     })
 }
 
+/// Binary search over commits with In-Commit Timestamps (ICT).
+///
+/// ICT timestamps are guaranteed monotonic by protocol, so binary search is safe.
+fn binary_search_ict_timestamps(
+    commits: &[ParsedLogPath],
+    timestamp: Timestamp,
+    bound: Bound,
+    engine: &dyn Engine,
+) -> Result<Version, LogHistoryError> {
+    if commits.is_empty() {
+        return Err(LogHistoryError::TimestampOutOfRange {
+            timestamp,
+            reason: bound.out_of_range_reason(),
+        });
+    }
+
+    let lo_version = commits[0].version;
+    let hi_version = commits[commits.len() - 1].version;
+    info!(
+        lo_version,
+        hi_version, "ICT binary search over version range"
+    );
+
+    let commit_to_ict = |commit: &ParsedLogPath| -> Result<Timestamp, LogHistoryError> {
+        commit
+            .read_in_commit_timestamp(engine)
+            .map_err(|e| LogHistoryError::internal("failed to read in-commit timestamp", e))
+    };
+
+    match binary_search_by_key_with_bounds(commits, timestamp, commit_to_ict, bound) {
+        Ok(idx) => Ok(commits[idx].version),
+        Err(SearchError::KeyFunctionError(error)) => Err(error),
+        Err(SearchError::OutOfRange) => Err(LogHistoryError::TimestampOutOfRange {
+            timestamp,
+            reason: bound.out_of_range_reason(),
+        }),
+    }
+}
+
 /// Converts a timestamp to a version based on the specified bound type.
 ///
 /// This function finds the appropriate commit version that corresponds to the given timestamp
@@ -325,69 +364,24 @@ pub(crate) fn timestamp_to_version(
     );
     debug_assert!(log_segment.end_version == snapshot.log_segment().end_version);
 
-    let len = log_segment.listed.ascending_commit_files.len();
-
     // Determine the type of timestamp search. The search may either be over file modification
     // timestamps or over In-Commit Timestamps.
+    let commits = &log_segment.listed.ascending_commit_files;
     let search_bounds = get_timestamp_search_bounds(snapshot, &log_segment, timestamp)?;
 
     match search_bounds {
         TimestampSearchBounds::ExactMatch(version) => Ok(version),
-
-        // ICT search: use binary search (ICT timestamps are guaranteed monotonic by protocol)
         TimestampSearchBounds::ICTSearchStartingFrom(lo) => {
-            let commit_range = &log_segment.listed.ascending_commit_files[lo..];
-            if commit_range.is_empty() {
-                return Err(LogHistoryError::TimestampOutOfRange {
-                    timestamp,
-                    reason: bound.out_of_range_reason(),
-                });
-            }
-
-            let lo_version = commit_range[0].version;
-            let hi_version = commit_range[commit_range.len() - 1].version;
-            info!(
-                lo_version,
-                hi_version, "ICT binary search over version range"
-            );
-
-            let commit_to_ict = |commit: &ParsedLogPath| -> Result<Timestamp, LogHistoryError> {
-                commit
-                    .read_in_commit_timestamp(engine)
-                    .map_err(|e| LogHistoryError::internal("failed to read in-commit timestamp", e))
-            };
-
-            let search_result =
-                binary_search_by_key_with_bounds(commit_range, timestamp, commit_to_ict, bound);
-
-            match search_result {
-                Ok(relative_idx) => {
-                    let idx = lo + relative_idx;
-                    debug_assert!(idx < len, "Index should be valid");
-                    Ok(log_segment.listed.ascending_commit_files[idx].version)
-                }
-                Err(SearchError::KeyFunctionError(error)) => Err(error),
-                Err(SearchError::OutOfRange) => Err(LogHistoryError::TimestampOutOfRange {
-                    timestamp,
-                    reason: bound.out_of_range_reason(),
-                }),
-            }
+            binary_search_ict_timestamps(&commits[lo..], timestamp, bound, engine)
         }
-
-        // File modification search: use linear scan with monotonization
-        // (file mod timestamps are NOT guaranteed monotonic due to clock skew)
         TimestampSearchBounds::FileModificationSearch => {
-            let commits = &log_segment.listed.ascending_commit_files[..];
             linear_search_file_mod_timestamps(commits, timestamp, bound)
         }
-
-        // File modification search up to ICT enablement point
         TimestampSearchBounds::FileModificationSearchUntil {
             index,
             ict_enablement_version,
         } => {
-            let commits = &log_segment.listed.ascending_commit_files[..index];
-            linear_search_file_mod_timestamps(commits, timestamp, bound).or_else(|e| {
+            linear_search_file_mod_timestamps(&commits[..index], timestamp, bound).or_else(|e| {
                 // For LeastUpper, if no version found in pre-ICT region, the ICT enablement
                 // version is the answer (protocol guarantees enablementTs > prev_mod_time)
                 match (&e, bound) {
