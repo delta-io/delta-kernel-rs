@@ -1,3 +1,6 @@
+// Low-level timestamp conversion internals. Made public in a later PR.
+#![allow(unused)]
+
 //! This module defines the [`binary_search_by_key_with_bounds`] utility method. This can be used to
 //! search over sorted slices of values to find the greatest lower or least upper bounds.
 use std::cmp::Ordering;

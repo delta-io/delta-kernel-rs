@@ -1,3 +1,6 @@
+// Low-level timestamp conversion internals. Made public in a later PR.
+#![allow(unused)]
+
 //! Error types for the history manager module.
 
 use super::Timestamp;

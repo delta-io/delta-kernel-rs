@@ -164,9 +164,6 @@ pub(crate) mod last_checkpoint_hint;
 
 pub(crate) mod log_segment_files;
 
-#[cfg(feature = "internal-api")]
-pub mod history_manager;
-#[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
 
 #[cfg(feature = "internal-api")]

@@ -1,3 +1,6 @@
+// Low-level timestamp conversion internals. Made public in a later PR.
+#![allow(unused)]
+
 //! This module provides functions for performing timestamp queries over the Delta Log, translating
 //! between timestamps and Delta versions.
 
@@ -16,9 +19,6 @@ use crate::{Engine, Error as DeltaError, Version};
 
 pub(crate) mod search;
 
-#[cfg(feature = "internal-api")]
-pub mod error;
-#[cfg(not(feature = "internal-api"))]
 pub(crate) mod error;
 
 type Timestamp = i64;
