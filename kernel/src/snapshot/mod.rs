@@ -171,30 +171,30 @@ impl Snapshot {
         target_version: impl Into<Option<Version>>,
         operation_id: MetricId,
     ) -> DeltaResult<Arc<Self>> {
-        let old_log_segment = &existing_snapshot.log_segment;
-        let old_version = existing_snapshot.version();
+        let existing_log_segment = &existing_snapshot.log_segment;
+        let existing_snapshot_version = existing_snapshot.version();
         let requested_version = target_version.into();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
-            if requested_version == old_version {
+            if requested_version == existing_snapshot_version {
                 // Re-requesting the same version
                 return Ok(existing_snapshot.clone());
             }
-            if requested_version < old_version {
+            if requested_version < existing_snapshot_version {
                 // Hint is too new: error since this is effectively an incorrect optimization
                 return Err(Error::Generic(format!(
-                    "Requested snapshot version {requested_version} is older than snapshot hint version {old_version}"
+                    "Requested snapshot version {requested_version} is older than snapshot hint version {existing_snapshot_version}"
                 )));
             }
         } else {
-            tracing::Span::current().record("version", old_version);
+            tracing::Span::current().record("version", existing_snapshot_version);
         }
 
-        let log_root = old_log_segment.log_root.clone();
+        let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
 
         // Start listing just after the previous segment's checkpoint, if any.
-        let listing_start = old_log_segment.checkpoint_version.unwrap_or(0) + 1;
+        let listing_start = existing_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
         // Check for new commits (and CRC)
         let new_listed_files = LogSegmentFiles::list(
@@ -212,14 +212,18 @@ impl Snapshot {
             && new_listed_files.checkpoint_parts().is_empty()
         {
             match requested_version {
-                Some(requested_version) if requested_version != old_version => {
-                    // No new commits, but we are looking for a new version
+                // requested == existing_snapshot_version was handled earlier, and
+                // requested < existing_snapshot_version returned an error earlier, so any Some
+                // here is requested > existing_snapshot_version but no such commit exists.
+                Some(requested_version) => {
                     return Err(Error::Generic(format!(
-                        "Requested snapshot version {requested_version} is newer than the latest version {old_version}"
+                        "Requested snapshot version {requested_version} is not available: \
+                         no new commits were found after existing snapshot version \
+                         {existing_snapshot_version}"
                     )));
                 }
-                _ => {
-                    // No new commits, just return the same snapshot
+                None => {
+                    // No new commits and no explicit target, just return the same snapshot
                     return Ok(existing_snapshot.clone());
                 }
             }
@@ -237,22 +241,23 @@ impl Snapshot {
             LogSegment::try_new(new_listed_files, log_root.clone(), requested_version, None)?;
 
         let new_end_version = new_log_segment.end_version;
-        if new_end_version < old_version {
+        if new_end_version < existing_snapshot_version {
             // we should never see a new log segment with a version < the existing snapshot
             // version, that would mean a commit was incorrectly deleted from the log
             return Err(Error::Generic(format!(
-                "Unexpected state: The newest version in the log {new_end_version} is older than the old version {old_version}")));
+                "Unexpected state: the newest version in the log {new_end_version} is older than the existing snapshot version {existing_snapshot_version}")));
         }
         if new_log_segment.checkpoint_version.is_some() {
             // We found a checkpoint in the new log segment, so build a fresh snapshot from it.
             // TODO(#2218): consider incremental P&M replay instead of full rebuild.
-            // Pass the resolved lazy_crc so the full rebuild can reuse a loaded CRC if the
-            // version matches. If the new segment has no CRC file, resolve_crc falls back to
-            // the old segment's CRC, which is safe: read_protocol_metadata validates the CRC
-            // version against end_version and falls back to log replay when they differ.
+            // Pass the resolved lazy_crc so the full rebuild can reuse an already-loaded CRC
+            // when the resolved CRC version matches the existing snapshot's CRC version. If the
+            // new segment has no CRC file, resolve_crc falls back to the existing snapshot's
+            // CRC, which is safe: read_protocol_metadata validates the CRC version against
+            // end_version and falls back to log replay when they differ.
             let (crc_file, lazy_crc) = Self::resolve_crc(
                 &new_log_segment,
-                old_log_segment,
+                existing_log_segment,
                 &existing_snapshot.lazy_crc,
             );
             // Inject the resolved CRC file path so the rebuilt snapshot remembers it.
@@ -270,7 +275,7 @@ impl Snapshot {
             return Ok(Arc::new(snapshot?));
         }
 
-        if new_end_version == old_version {
+        if new_end_version == existing_snapshot_version {
             // No new commits and no newly discovered checkpoint, just return the same snapshot.
             return Ok(existing_snapshot.clone());
         }
@@ -290,22 +295,23 @@ impl Snapshot {
         new_log_segment
             .listed
             .ascending_commit_files
-            .retain(|log_path| old_version < log_path.version);
+            .retain(|log_path| existing_snapshot_version < log_path.version);
         // Deduplicate compaction files the same way: the new listing re-lists from
-        // checkpoint_version, so it includes compaction files already in the old segment.
-        // Note: This removes all _new_ compaction files that start at or before `old_version`,
-        // which may drop useful compaction files that span across the old/new boundary
-        // (e.g. a new compaction(1, 3) when old_version=2). This is conservative but safe.
+        // checkpoint_version, so it includes compaction files already in the existing segment.
+        // Note: This removes all _new_ compaction files that start at or before
+        // `existing_snapshot_version`, which may drop useful compaction files that span
+        // across the old/new boundary (e.g. a new compaction(1, 3) when
+        // existing_snapshot_version=2). This is conservative but safe.
         new_log_segment
             .listed
             .ascending_compaction_files
-            .retain(|log_path| old_version < log_path.version);
+            .retain(|log_path| existing_snapshot_version < log_path.version);
 
         // we have new commits and no new checkpoint: we replay new commits for P+M and then
         // create a new snapshot by combining LogSegments and building a new TableConfiguration
         let (crc_file, lazy_crc) = Self::resolve_crc(
             &new_log_segment,
-            old_log_segment,
+            existing_log_segment,
             &existing_snapshot.lazy_crc,
         );
 
@@ -319,34 +325,36 @@ impl Snapshot {
         )?;
 
         // NB: we must add the new log segment to the existing snapshot's log segment
-        let mut ascending_commit_files = old_log_segment.listed.ascending_commit_files.clone();
+        let mut ascending_commit_files = existing_log_segment.listed.ascending_commit_files.clone();
         ascending_commit_files.extend(new_log_segment.listed.ascending_commit_files);
-        let mut ascending_compaction_files =
-            old_log_segment.listed.ascending_compaction_files.clone();
+        let mut ascending_compaction_files = existing_log_segment
+            .listed
+            .ascending_compaction_files
+            .clone();
         ascending_compaction_files.extend(new_log_segment.listed.ascending_compaction_files);
 
-        // Use the new latest_commit if available, otherwise use the old one
+        // Use the new latest_commit if available, otherwise use the existing one.
         // This handles the case where the new listing returned no commits
-        let latest_commit_file =
-            new_latest_commit_file.or_else(|| old_log_segment.listed.latest_commit_file.clone());
-        // we can pass in just the old checkpoint parts since by the time we reach this line, we
-        // know there are no checkpoints in the new log segment.
+        let latest_commit_file = new_latest_commit_file
+            .or_else(|| existing_log_segment.listed.latest_commit_file.clone());
+        // we can pass in just the existing checkpoint parts since by the time we reach this
+        // line, we know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
             LogSegmentFiles {
                 ascending_commit_files,
                 ascending_compaction_files,
-                checkpoint_parts: old_log_segment.listed.checkpoint_parts.clone(),
+                checkpoint_parts: existing_log_segment.listed.checkpoint_parts.clone(),
                 latest_crc_file: crc_file,
                 latest_commit_file,
                 max_published_version: new_log_segment
                     .listed
                     .max_published_version
-                    .max(old_log_segment.listed.max_published_version),
+                    .max(existing_log_segment.listed.max_published_version),
             },
             log_root,
             requested_version,
-            // Preserve `_last_checkpoint` hint from old segment
-            old_log_segment.last_checkpoint_hint_summary(),
+            // Preserve `_last_checkpoint` hint from existing segment
+            existing_log_segment.last_checkpoint_hint_summary(),
         )?;
 
         tracing::Span::current().record("version", table_configuration.version());
@@ -359,17 +367,17 @@ impl Snapshot {
 
     /// Determine the CRC file and LazyCrc for an incremental snapshot update.
     ///
-    /// Prefers the new segment's CRC file, falls back to the old segment's. If the resolved
-    /// CRC version matches the existing snapshot's LazyCrc, reuses it to avoid redundant I/O
-    /// (it may already be loaded in memory).
+    /// Prefers the new segment's CRC file, falls back to the existing segment's. If the
+    /// resolved CRC version matches the existing snapshot's LazyCrc version, reuses it to
+    /// avoid redundant I/O (it may already be loaded in memory).
     fn resolve_crc(
         new_log_segment: &LogSegment,
-        old_log_segment: &LogSegment,
+        existing_log_segment: &LogSegment,
         existing_lazy_crc: &Arc<LazyCrc>,
     ) -> (Option<ParsedLogPath>, Arc<LazyCrc>) {
         let new_crc_file = new_log_segment.listed.latest_crc_file.clone();
-        let old_crc_file = old_log_segment.listed.latest_crc_file.clone();
-        let crc_file = new_crc_file.or(old_crc_file);
+        let existing_crc_file = existing_log_segment.listed.latest_crc_file.clone();
+        let crc_file = new_crc_file.or(existing_crc_file);
         let crc_version = crc_file.as_ref().map(|f| f.version);
         let lazy_crc = if crc_version == existing_lazy_crc.crc_version() {
             existing_lazy_crc.clone()
@@ -382,8 +390,8 @@ impl Snapshot {
     /// Create a new [`Snapshot`] instance.
     ///
     /// When `inherited_lazy_crc` is `Some`, reuses it (e.g. carried forward from a previous
-    /// snapshot whose CRC version matches); otherwise creates a fresh [`LazyCrc`] from the log
-    /// segment's CRC file.
+    /// snapshot whose CRC version matches `log_segment.listed.latest_crc_file`'s version);
+    /// otherwise creates a fresh [`LazyCrc`] from the log segment's CRC file.
     #[instrument(err, fields(version, operation_id = %operation_id), skip(engine))]
     fn try_new_from_log_segment(
         location: Url,
@@ -1496,7 +1504,7 @@ mod tests {
         // version exceeds latest version of the table = err
         assert!(matches!(
             Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine),
-            Err(Error::Generic(msg)) if msg == "Requested snapshot version 1 is newer than the latest version 0"
+            Err(Error::Generic(msg)) if msg == "Requested snapshot version 1 is not available: no new commits were found after existing snapshot version 0"
         ));
 
         // b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
@@ -2777,7 +2785,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_early_return_reuses_lazy_crc() -> DeltaResult<()> {
+    async fn test_incremental_snapshot_checkpoint_early_return_reuses_lazy_crc() -> DeltaResult<()>
+    {
         let ctx = setup_incremental_snapshot_test()?;
 
         // Create commits 0-3
@@ -2828,7 +2837,7 @@ mod tests {
     // When the checkpoint early-return discovers a newer CRC alongside the new checkpoint,
     // resolve_crc should create a fresh (unloaded) LazyCrc rather than reusing the old one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_checkpoint_early_return_creates_fresh_lazy_crc_when_version_changes(
+    async fn test_incremental_snapshot_checkpoint_early_return_creates_fresh_lazy_crc_when_crc_version_changes(
     ) -> DeltaResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
 
@@ -3034,7 +3043,7 @@ mod tests {
     /// This test documents a limitation: When deduplicating compactions, the deduplication logic
     /// only checks the start version (lo), not the hi version. So a new compaction file (1,3)
     /// added after building the base snapshot at v2 gets filtered out because its start version
-    /// (1) <= old_version (2).
+    /// (1) <= existing_snapshot_version (2).
     #[tokio::test]
     #[ignore = "log compaction disabled (#2337)"]
     async fn test_incremental_snapshot_with_new_compaction_files() -> DeltaResult<()> {
@@ -3064,7 +3073,7 @@ mod tests {
         write_compaction_file(&store, 1, 3).await?;
 
         // Build v3 incrementally - the new (1,3) file gets filtered out because
-        // the deduplication only looks at start version: 1 <= old_version (2)
+        // the deduplication only looks at start version: 1 <= existing_snapshot_version (2)
         let snapshot_v3 = Snapshot::builder_from(snapshot_v2)
             .at_version(3)
             .build(&engine)?;
