@@ -50,9 +50,7 @@
       "writerFeatures": ["appendOnly", "changeDataFeed"]
     }
   },
-  "$notes": {
-    "orphan_writer_feature": "At (3,7), the spec requires activation properties to be paired with the corresponding feature in writerFeatures. Writing an activation property for a feature absent from writerFeatures is invalid committed state."
-  },
+  "$notes": {},
   "cases": [
     {
       "ordinal": 1,
@@ -91,7 +89,7 @@
       "name": "change_data_feed_read_snapshot_1_4_with_property_succeeds",
       "flavor": "legacy",
       "feature": "changeDataFeed",
-      "description": "Reading a (1,4) table with delta.enableChangeDataFeed=true succeeds; changeDataFeed is writer-only.",
+      "description": "Reading a (1,4) table with delta.enableChangeDataFeed=true succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.legacy_1_4"},
@@ -111,7 +109,7 @@
       "name": "change_data_feed_empty_commit_1_4_with_property",
       "flavor": "legacy",
       "feature": "changeDataFeed",
-      "description": "Appending to a (1,4) table with delta.enableChangeDataFeed=true succeeds.",
+      "description": "Committing to a (1,4) table with delta.enableChangeDataFeed=true succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.legacy_1_4"},
@@ -128,11 +126,11 @@
     },
     {
       "ordinal": 5,
-      "name": "change_data_feed_create_table_3_7_no_feature_listed_with_property_fails",
+      "name": "change_data_feed_create_table_3_7_no_feature_listed_with_property_succeeds",
       "flavor": "orphan",
       "feature": "changeDataFeed",
-      "description": "Creating a (3,7) table with delta.enableChangeDataFeed=true but changeDataFeed absent from writerFeatures fails.",
-      "note": "$notes.orphan_writer_feature",
+      "description": "Creating a (3,7) table with delta.enableChangeDataFeed=true but changeDataFeed absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
       "operation": {
         "type": "create_table",
         "protocol": "$protocols.modern_3_7",
@@ -141,14 +139,14 @@
           "schemaString": "$schemas.simple_int"
         }
       },
-      "expected_outcome": "failure"
+      "expected_outcome": "success"
     },
     {
       "ordinal": 6,
       "name": "change_data_feed_empty_commit_3_7_no_feature_listed_with_property_succeeds",
       "flavor": "orphan",
       "feature": "changeDataFeed",
-      "description": "Appending to a (3,7) table with delta.enableChangeDataFeed=true but changeDataFeed absent from writerFeatures succeeds.",
+      "description": "Committing to a (3,7) table with delta.enableChangeDataFeed=true but changeDataFeed absent from writerFeatures succeeds.",
       "note": "$errata.orphan_feature_metadata",
       "setup": {
         "log_actions": [
@@ -169,7 +167,7 @@
       "name": "change_data_feed_read_snapshot_3_7_no_feature_listed_with_property",
       "flavor": "orphan",
       "feature": "changeDataFeed",
-      "description": "Reading a (3,7) table with delta.enableChangeDataFeed=true but changeDataFeed absent from writerFeatures succeeds; changeDataFeed is writer-only.",
+      "description": "Reading a (3,7) table with delta.enableChangeDataFeed=true but changeDataFeed absent from writerFeatures succeeds.",
       "note": "$errata.orphan_feature_metadata",
       "setup": {
         "log_actions": [
@@ -205,7 +203,7 @@
       "name": "change_data_feed_supported_not_active_empty_commit_succeeds",
       "flavor": "supported_not_active",
       "feature": "changeDataFeed",
-      "description": "Appending to a (3,7)+[changeDataFeed] table without delta.enableChangeDataFeed=true succeeds.",
+      "description": "Committing to a (3,7)+[changeDataFeed] table without delta.enableChangeDataFeed=true succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_change_data_feed"},
@@ -234,7 +232,7 @@
       "ordinal": 11,
       "name": "change_data_feed_supported_active_empty_commit_succeeds",
       "feature": "changeDataFeed",
-      "description": "Appending to a (3,7)+[changeDataFeed] table with delta.enableChangeDataFeed=true succeeds.",
+      "description": "Committing to a (3,7)+[changeDataFeed] table with delta.enableChangeDataFeed=true succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_change_data_feed"},
@@ -325,7 +323,7 @@
       "name": "change_data_feed_supported_not_active_create_table_succeeds",
       "feature": "changeDataFeed",
       "flavor": "supported_not_active",
-      "description": "Creating a (3,7)+[changeDataFeed] table without delta.enableChangeDataFeed=true succeeds; the feature is supported but not active.",
+      "description": "Creating a (3,7)+[changeDataFeed] table without delta.enableChangeDataFeed=true succeeds.",
       "operation": {
         "type": "create_table",
         "protocol": "$protocols.modern_3_7_change_data_feed",

@@ -8,7 +8,7 @@ static CHECK_CONSTRAINTS: LazyLock<Fixture> =
 
 compliance_case_inexpressible!(CHECK_CONSTRAINTS, 1); // fixture uses protocol (1,2); create_table() always produces (3,7)
 compliance_case_failure!(CHECK_CONSTRAINTS, 2, "'delta.constraints.id_positive' is not supported during CREATE TABLE");
-compliance_case_success!(CHECK_CONSTRAINTS, 3);
+compliance_case_failure!(CHECK_CONSTRAINTS, 3, diverges: "kernel does not reject empty_commit on tables that already carry orphan checkConstraints metadata");
 compliance_case_inexpressible!(CHECK_CONSTRAINTS, 4); // fixture uses protocol (1,3); create_table() always produces (3,7)
 compliance_case_success!(CHECK_CONSTRAINTS, 5);
 compliance_case_success!(CHECK_CONSTRAINTS, 6, "Feature 'checkConstraints' is not supported");

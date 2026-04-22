@@ -11,8 +11,8 @@
   },
   "clustering_missing_domain_metadata_action": {
     "title": "Clustered table with no delta.clustering domainMetadata action in the log",
-    "spec_says": "The spec requires writers to track clustering column names via a domainMetadata action with domain delta.clustering. It does not address what readers must do when this action is absent.",
-    "controversy": "Absence of the delta.clustering action may represent a valid transient state (e.g. clustering enabled but no OPTIMIZE run yet) or an invalid one. The spec is silent on whether readers must reject or can proceed."
+    "spec_says": "Clustering is a Writers-only feature. When clustering is supported, writers must track clustering column names in a domainMetadata action with domain delta.clustering. The spec also says clustering columns can be specified at table creation or added later.",
+    "controversy": "The spec does not explicitly say whether a clustered table with no clustering columns selected yet must still carry a delta.clustering domainMetadata action (for example with an empty clusteringColumns list), or whether that action can be omitted until clustering columns are first defined."
   },
   "column_mapping_asymmetric_protocol_support": {
     "title": "columnMapping with asymmetric reader/writer protocol support",

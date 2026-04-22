@@ -77,11 +77,11 @@
     },
     {
       "ordinal": 3,
-      "name": "check_constraints_empty_commit_3_7_no_feature_listed_with_constraint_succeeds",
+      "name": "check_constraints_empty_commit_3_7_no_feature_listed_with_constraint_fails",
       "flavor": "orphan",
       "feature": "checkConstraints",
-      "description": "Appending to a (3,7) table with a delta.constraints.* property but checkConstraints absent from writerFeatures succeeds.",
-      "note": "$errata.orphan_feature_metadata",
+      "description": "Committing to a (3,7) table with a delta.constraints.* property but checkConstraints absent from writerFeatures fails.",
+      "note": "$notes.orphan_writer_feature",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7"},
@@ -94,7 +94,7 @@
         ]
       },
       "operation": {"type": "empty_commit"},
-      "expected_outcome": "success"
+      "expected_outcome": "failure"
     },
     {
       "ordinal": 4,
@@ -117,7 +117,7 @@
       "name": "check_constraints_read_snapshot_3_7_no_feature_listed_with_constraint",
       "flavor": "orphan",
       "feature": "checkConstraints",
-      "description": "Reading a (3,7) table with a delta.constraints.* property but checkConstraints absent from writerFeatures succeeds; checkConstraints is writer-only.",
+      "description": "Reading a (3,7) table with a delta.constraints.* property but checkConstraints absent from writerFeatures succeeds.",
       "note": "$errata.orphan_feature_metadata",
       "setup": {
         "log_actions": [
@@ -138,7 +138,7 @@
       "name": "check_constraints_supported_not_active_empty_commit_succeeds",
       "flavor": "supported_not_active",
       "feature": "checkConstraints",
-      "description": "Appending to a (3,7)+[checkConstraints] table without any delta.constraints.* property succeeds: the feature is supported but not active.",
+      "description": "Committing to a (3,7)+[checkConstraints] table without any delta.constraints.* property succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_check_constraints"},
@@ -152,7 +152,7 @@
       "ordinal": 7,
       "name": "check_constraints_supported_active_empty_commit_succeeds",
       "feature": "checkConstraints",
-      "description": "Appending to a (3,7)+[checkConstraints] table with a delta.constraints.* property succeeds.",
+      "description": "Committing to a (3,7)+[checkConstraints] table with a delta.constraints.* property succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_check_constraints"},
@@ -172,7 +172,7 @@
       "name": "check_constraints_empty_commit_1_3_with_constraint_succeeds",
       "flavor": "legacy",
       "feature": "checkConstraints",
-      "description": "Appending to a (1,3) table with a delta.constraints.* property succeeds: checkConstraints are always supported at writer version 3.",
+      "description": "Committing to a (1,3) table with a delta.constraints.* property succeeds: checkConstraints are always supported at writer version 3.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.legacy_1_3"},
@@ -244,7 +244,7 @@
       "ordinal": 12,
       "name": "check_constraints_cm_empty_commit_3_7_both_features_listed_succeeds",
       "feature": "checkConstraints",
-      "description": "Appending to a (3,7)+[columnMapping,checkConstraints] table with a CM-annotated column and a constraint referencing the logical column name succeeds.",
+      "description": "Committing to a (3,7)+[columnMapping,checkConstraints] table with a CM-annotated column and a constraint referencing the logical column name succeeds.",
       "note": "$errata.sql_expression_cm_name_resolution",
       "setup": {
         "log_actions": [
@@ -284,7 +284,7 @@
       "name": "check_constraints_read_snapshot_1_3_with_constraint_succeeds",
       "flavor": "legacy",
       "feature": "checkConstraints",
-      "description": "Reading a (1,3) table with a delta.constraints.* property succeeds: checkConstraints is writer-only.",
+      "description": "Reading a (1,3) table with a delta.constraints.* property succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.legacy_1_3"},
@@ -303,7 +303,7 @@
       "ordinal": 15,
       "name": "check_constraints_read_snapshot_3_7_feature_listed_succeeds",
       "feature": "checkConstraints",
-      "description": "Reading a (3,7)+[checkConstraints] table with a delta.constraints.* property succeeds: checkConstraints is writer-only.",
+      "description": "Reading a (3,7)+[checkConstraints] table with a delta.constraints.* property succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_check_constraints"},
@@ -323,7 +323,7 @@
       "name": "check_constraints_supported_not_active_read_snapshot_succeeds",
       "flavor": "supported_not_active",
       "feature": "checkConstraints",
-      "description": "Reading a (3,7)+[checkConstraints] table without any delta.constraints.* property succeeds: the feature is supported but not active.",
+      "description": "Reading a (3,7)+[checkConstraints] table without any delta.constraints.* property succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_check_constraints"},

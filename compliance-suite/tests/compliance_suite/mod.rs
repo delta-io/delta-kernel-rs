@@ -253,17 +253,30 @@ fn apply_metadata_defaults(metadata: &mut Value) {
         .or_insert_with(|| Value::Object(Default::default()));
 }
 
+/// Apply Delta domainMetadata defaults to the inner domainMetadata object.
+///
+/// Fills in `removed=false` when absent.
+fn apply_domain_metadata_defaults(domain_metadata: &mut Value) {
+    let obj = domain_metadata
+        .as_object_mut()
+        .expect("domainMetadata value must be a JSON object");
+    obj.entry("removed").or_insert(Value::Bool(false));
+}
+
 /// Write a list of Delta log actions as version 0 of the table in `store`.
 ///
 /// Actions are written as NDJSON to `_delta_log/00000000000000000000.json`. Any `metaData`
-/// action in the list has defaults applied before serialization.
+/// or `domainMetadata` action in the list has defaults applied before serialization.
 async fn write_log_v0(store: &InMemory, actions: &[Value]) {
     let ndjson = actions
         .iter()
-        .map(|a| {
-            let mut a = a.clone();
+        .cloned()
+        .map(|mut a| {
             if let Some(metadata) = a.get_mut("metaData") {
                 apply_metadata_defaults(metadata);
+            }
+            if let Some(domain_metadata) = a.get_mut("domainMetadata") {
+                apply_domain_metadata_defaults(domain_metadata);
             }
             serde_json::to_string(&a).expect("serialize log action")
         })

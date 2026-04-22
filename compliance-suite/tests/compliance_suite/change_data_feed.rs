@@ -10,7 +10,7 @@ compliance_case_inexpressible!(CHANGE_DATA_FEED, 1); // fixture uses protocol (1
 compliance_case_inexpressible!(CHANGE_DATA_FEED, 2); // fixture uses protocol (1,3); create_table() always produces (3,7)
 compliance_case_success!(CHANGE_DATA_FEED, 3);
 compliance_case_success!(CHANGE_DATA_FEED, 4, "Feature 'checkConstraints' is not supported");
-compliance_case_failure!(CHANGE_DATA_FEED, 5, diverges: "kernel does not require changeDataFeed listed when delta.enableChangeDataFeed=true");
+compliance_case_success!(CHANGE_DATA_FEED, 5);
 compliance_case_success!(CHANGE_DATA_FEED, 6);
 compliance_case_success!(CHANGE_DATA_FEED, 7);
 compliance_case_success!(CHANGE_DATA_FEED, 8);
