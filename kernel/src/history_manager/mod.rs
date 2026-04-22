@@ -3,6 +3,24 @@
 
 //! This module provides functions for performing timestamp queries over the Delta Log, translating
 //! between timestamps and Delta versions.
+//!
+//! # Usage
+//!
+//! Use this module to:
+//! - Convert timestamps or timestamp ranges into Delta versions or version ranges
+//! - Perform time travel queries
+//! - Execute timestamp-based change data feed queries
+//!
+//! The history_manager module works with tables regardless of whether they have In-Commit
+//! Timestamps (ICT) enabled. ICT is a Delta table feature that stores precise commit timestamps
+//! in the commit metadata rather than relying on file modification times, which can be affected
+//! by clock skew or filesystem limitations.
+//!
+//! # Limitations
+//!
+//! All timestamp queries are limited to the state captured in the [`Snapshot`] provided during
+//! construction. For tables without ICT enabled, timestamp queries rely on file modification
+//! timestamps, which are not guaranteed to be monotonically increasing across commits.
 
 use std::cmp::Ordering;
 
@@ -15,16 +33,16 @@ use crate::path::ParsedLogPath;
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
 use crate::utils::require;
-use crate::{Engine, Error as DeltaError, Version};
+use crate::{DeltaResult, Engine, Error as DeltaError, Version};
 
 pub(crate) mod search;
 
 pub(crate) mod error;
 
-type Timestamp = i64;
+/// A timestamp representing milliseconds since the Unix epoch (1970-01-01 00:00:00 UTC).
+pub(crate) type Timestamp = i64;
 
 /// Determines the search strategy for timestamp-to-version conversion based on ICT enablement.
-#[allow(unused)]
 #[derive(Debug, PartialEq, Eq)]
 enum TimestampSearchBounds {
     /// The timestamp exactly matches the ICT enablement timestamp.
@@ -42,11 +60,29 @@ enum TimestampSearchBounds {
     },
 }
 
-/// Given a timestamp, this function determines the commit range that timestamp conversion
-/// should search. A timestamp search may be conducted over one of two version ranges:
-///     1) A range of commits whose timestamp is the file modification timestamp
-///     2) A range of commits whose timestamp is an in-commit timestamp.
-#[allow(unused)]
+/// Determines the search strategy for timestamp-to-version conversion based on ICT enablement.
+///
+/// Given a timestamp, this function determines which commit range to search and what timestamp
+/// source to use (file modification time vs in-commit timestamp). A timestamp search may be
+/// conducted over one of two version ranges:
+///   1) A range of commits whose timestamp is the file modification timestamp
+///   2) A range of commits whose timestamp is an in-commit timestamp
+///
+/// # Returns
+///
+/// - [`TimestampSearchBounds::FileModificationSearch`]: ICT not enabled; search all commits using
+///   file modification timestamps.
+/// - [`TimestampSearchBounds::ICTSearchStartingFrom`]: Search commits with ICT enabled using
+///   in-commit timestamps (binary search).
+/// - [`TimestampSearchBounds::FileModificationSearchUntil`]: Timestamp is before ICT enablement;
+///   search pre-ICT commits using file modification timestamps.
+/// - [`TimestampSearchBounds::ExactMatch`]: Timestamp exactly matches the ICT enablement timestamp.
+///
+/// # Errors
+///
+/// Returns [`LogHistoryError::Internal`] if:
+/// - Failed to read table configuration
+/// - ICT enablement version is beyond the log segment (indicates corrupted metadata)
 #[tracing::instrument(skip(snapshot, log_segment), ret)]
 fn get_timestamp_search_bounds(
     snapshot: &Snapshot,
@@ -75,6 +111,13 @@ fn get_timestamp_search_bounds(
         }
     };
 
+    // Fast path: if the first commit is at or after ICT enablement (e.g., old commits cleaned
+    // up), all commits in the segment have ICT - skip binary search.
+    let first_version = log_segment.listed.ascending_commit_files[0].version;
+    if first_version >= ict_enablement_version {
+        return Ok(TimestampSearchBounds::ICTSearchStartingFrom(0));
+    }
+
     // Get the index of the ICT enablement version in the log segment. If the version is not
     // present, binary_search returns the insertion point (first commit at or after).
     let commit_count = log_segment.listed.ascending_commit_files.len();
@@ -84,16 +127,12 @@ fn get_timestamp_search_bounds(
         .binary_search_by(|x| x.version.cmp(&ict_enablement_version))
         .unwrap_or_else(|idx| idx);
 
-    // The ICT enablement index must be within the log segment. If it equals commit_count,
-    // the ICT enablement version is beyond all commits in the segment.
+    // Invariant: ICT enablement version must be within the log segment. If it equals
+    // commit_count, the enablement version is beyond the table's latest version.
     require!(
         ict_enablement_idx < commit_count,
-        LogHistoryError::internal(
-            "ICT enablement version beyond log segment",
-            DeltaError::generic(format!(
-                "ICT enablement version {} not in log segment (index {} >= count {})",
-                ict_enablement_version, ict_enablement_idx, commit_count
-            ))
+        LogHistoryError::internal_message(
+            "ICT enablement version is beyond the table's latest version"
         )
     );
 
@@ -144,7 +183,6 @@ fn get_timestamp_search_bounds(
 // TODO: Today we read full commit history for timestamp conversion, which is expensive.
 // A future backwards-listing optimization would avoid reading full history - at that
 // point, monotonizing over full history becomes a bad trade-off and should be revisited.
-#[allow(unused)]
 fn linear_search_file_mod_timestamps(
     commits: &[ParsedLogPath],
     timestamp: Timestamp,
@@ -167,7 +205,7 @@ fn linear_search_file_mod_timestamps(
     for commit in commits {
         let raw_ts = commit.location.last_modified;
         // Monotonize: ensure each timestamp is strictly greater than the previous
-        let monotonic_ts = raw_ts.max(prev_monotonic_ts + 1);
+        let monotonic_ts = raw_ts.max(prev_monotonic_ts.saturating_add(1));
         if monotonic_ts != raw_ts {
             trace!(
                 version = commit.version,
@@ -221,17 +259,36 @@ fn linear_search_file_mod_timestamps(
 /// # Errors
 /// Returns [`LogHistoryError::TimestampOutOfRange`] if the timestamp is out of range. This can
 /// happen in the following cases based on the bound:
-/// - `Bound::GreatestLower`: There is no commit whose timestamp is lower than the given
+/// - `Bound::GreatestLower`: There is no commit whose timestamp is less than or equal to the given
 ///   `timestamp`.
-/// - `Bound::LeastUpper`: There is no commit whose timestamp is greater than the given `timestamp`.
-#[allow(unused)]
+/// - `Bound::LeastUpper`: There is no commit whose timestamp is greater than or equal to the given
+///   `timestamp`.
 pub(crate) fn timestamp_to_version(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     timestamp: Timestamp,
     bound: Bound,
 ) -> Result<Version, LogHistoryError> {
-    // Get log segment for timestamp conversion
+    // TODO(#2443): Support staged commits (catalog-managed tables). Staged commits have ICT
+    // (required by catalog-managed), so timestamps are available. However, we currently
+    // rebuild the log segment from storage which doesn't include staged commits. To support
+    // this, we'd need to pass the snapshot's log_tail into the log segment construction.
+    let has_staged_commits = snapshot
+        .log_segment()
+        .listed
+        .ascending_commit_files
+        .last() // Use last since a log segment always ends with staged commits from `log_tail`
+        .is_some_and(|c| c.file_type == crate::path::LogPathFileType::StagedCommit);
+    if has_staged_commits {
+        return Err(LogHistoryError::internal_message(
+            "timestamp conversion not yet supported for snapshots with staged commits",
+        ));
+    }
+
+    // Build a dedicated log segment for timestamp conversion. We cannot reuse
+    // snapshot.log_segment() because it may include a checkpoint prefix with gaps in
+    // the commit sequence. for_timestamp_conversion returns only contiguous commits,
+    // which is required for correct timestamp-to-version mapping.
     let log_segment = LogSegment::for_timestamp_conversion(
         engine.storage_handler().as_ref(),
         snapshot.log_segment().log_root.clone(),
@@ -266,8 +323,8 @@ pub(crate) fn timestamp_to_version(
                 });
             }
 
-            let lo_version = commit_range.first().map(|c| c.version).unwrap_or(0);
-            let hi_version = commit_range.last().map(|c| c.version).unwrap_or(0);
+            let lo_version = commit_range[0].version;
+            let hi_version = commit_range[commit_range.len() - 1].version;
             info!(
                 lo_version,
                 hi_version, "ICT binary search over version range"
@@ -310,15 +367,169 @@ pub(crate) fn timestamp_to_version(
         } => {
             let commits = &log_segment.listed.ascending_commit_files[..index];
             linear_search_file_mod_timestamps(commits, timestamp, bound).or_else(|e| {
-                // For LeastUpper, if no version found, the ICT enablement version is the answer
-                if bound == Bound::LeastUpper {
-                    Ok(ict_enablement_version)
-                } else {
-                    Err(e)
+                // For LeastUpper, if no version found in pre-ICT region, the ICT enablement
+                // version is the answer (protocol guarantees enablementTs > prev_mod_time)
+                match (&e, bound) {
+                    (LogHistoryError::TimestampOutOfRange { .. }, Bound::LeastUpper) => {
+                        Ok(ict_enablement_version)
+                    }
+                    _ => Err(e),
                 }
             })
         }
     }
+}
+
+/// Gets the latest version that occurs before or at the given `timestamp`.
+///
+/// This finds the version whose timestamp is less than or equal to `timestamp`.
+/// If no such version exists, returns [`LogHistoryError::TimestampOutOfRange`].
+///
+/// # Examples
+/// ```ignore
+/// use delta_kernel::snapshot::Snapshot;
+/// use delta_kernel::engine::default::DefaultEngine;
+/// use delta_kernel::history_manager::latest_version_as_of;
+///
+/// let engine = DefaultEngine::try_new(...)?;
+/// let snapshot = Snapshot::builder_for(table_uri).build(&engine)?;
+///
+/// // Get the latest version as of January 1, 2023
+/// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
+/// let version = latest_version_as_of(&snapshot, &engine, timestamp)?;
+/// ```
+#[allow(unused)]
+#[tracing::instrument(skip(snapshot, engine), fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+pub(crate) fn latest_version_as_of(
+    snapshot: &Snapshot,
+    engine: &dyn Engine,
+    timestamp: Timestamp,
+) -> DeltaResult<Version> {
+    timestamp_to_version(snapshot, engine, timestamp, Bound::GreatestLower).map_err(Into::into)
+}
+
+/// Gets the first version that occurs at or after the given `timestamp`.
+///
+/// This finds the version whose timestamp is greater than or equal to `timestamp`.
+/// If no such version exists, returns [`LogHistoryError::TimestampOutOfRange`].
+///
+/// # Examples
+/// ```ignore
+/// use delta_kernel::snapshot::Snapshot;
+/// use delta_kernel::engine::default::DefaultEngine;
+/// use delta_kernel::history_manager::first_version_after;
+///
+/// let engine = DefaultEngine::try_new(...)?;
+/// let snapshot = Snapshot::builder_for(table_uri).build(&engine)?;
+///
+/// // Find the first version that occurred after January 1, 2023
+/// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
+/// let version = first_version_after(&snapshot, &engine, timestamp)?;
+/// ```
+#[allow(unused)]
+#[tracing::instrument(skip(snapshot, engine), fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+pub(crate) fn first_version_after(
+    snapshot: &Snapshot,
+    engine: &dyn Engine,
+    timestamp: Timestamp,
+) -> DeltaResult<Version> {
+    timestamp_to_version(snapshot, engine, timestamp, Bound::LeastUpper).map_err(Into::into)
+}
+
+/// Converts a timestamp range to a corresponding version range.
+///
+/// This function finds the version range that corresponds to the given timestamp range.
+/// The returned tuple contains:
+/// - The first (earliest) version with a timestamp greater than or equal to `start_timestamp`
+/// - If `end_timestamp` is provided, the version with a timestamp less than or equal to
+///   `end_timestamp`.
+///
+/// # Arguments
+/// * `snapshot` - The snapshot that defines the searchable version range
+/// * `engine` - The engine used to access version history
+/// * `start_timestamp` - The lower bound timestamp (inclusive), in milliseconds since Unix epoch
+/// * `end_timestamp` - The optional upper bound timestamp (inclusive), or `None` to indicate no
+///   upper bound
+///
+/// # Returns
+/// A tuple containing the start version and optional end version (inclusive)
+///
+/// # Errors
+/// Returns [`LogHistoryError::InvalidTimestampRange`] if `start_timestamp > end_timestamp`.
+///
+/// Returns [`LogHistoryError::TimestampOutOfRange`] if:
+/// - No version exists at or after `start_timestamp`
+/// - `end_timestamp` is provided and no version exists at or before it
+///
+/// Returns [`LogHistoryError::EmptyTimestampRange`] if the entire range falls between two commits.
+///
+/// # Examples
+/// ```ignore
+/// use delta_kernel::snapshot::Snapshot;
+/// use delta_kernel::engine::default::DefaultEngine;
+/// use delta_kernel::history_manager::timestamp_range_to_versions;
+///
+/// let engine = DefaultEngine::try_new(...)?;
+/// let snapshot = Snapshot::builder_for(table_uri).build(&engine)?;
+///
+/// // Find versions between January 1, 2023 and March 1, 2023
+/// let start_timestamp = 1672531200000; // Jan 1, 2023 (milliseconds since epoch)
+/// let end_timestamp = 1677628800000;   // Mar 1, 2023 (milliseconds since epoch)
+///
+/// let (start_version, end_version) =
+///     timestamp_range_to_versions(&snapshot, &engine, start_timestamp, Some(end_timestamp))?;
+/// ```
+#[allow(unused)]
+#[tracing::instrument(skip(snapshot, engine), fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+pub(crate) fn timestamp_range_to_versions(
+    snapshot: &Snapshot,
+    engine: &dyn Engine,
+    start_timestamp: Timestamp,
+    end_timestamp: Option<Timestamp>,
+) -> DeltaResult<(Version, Option<Version>)> {
+    if let Some(end_timestamp) = end_timestamp {
+        // The `start_timestamp` must be no greater than the `end_timestamp`.
+        require!(
+            start_timestamp <= end_timestamp,
+            LogHistoryError::InvalidTimestampRange {
+                start_timestamp,
+                end_timestamp
+            }
+            .into()
+        );
+    }
+
+    // Convert the start timestamp to version
+    let start_version = first_version_after(snapshot, engine, start_timestamp)?;
+
+    // If the end timestamp is present, convert it to an end version
+    let end_version = end_timestamp
+        .map(|end| {
+            let end_version = latest_version_as_of(snapshot, engine, end)?;
+
+            // Verify that the start version is no greater than the end version. This can
+            // happen in the case that the entire timestamp range falls between two commits.
+            // Consider the following history:
+            // |-------------|--------------------|---------------|
+            // v4       start_timestamp      end_timestamp       v5
+            //
+            // The latest version as of the end_timestamp is 4. The first version after the
+            // start_timestamp is 5. Thus in the case where end_version < start_version, we
+            // return an [`LogHistoryError::EmptyTimestampRange`].
+            require!(
+                start_version <= end_version,
+                DeltaError::from(LogHistoryError::EmptyTimestampRange {
+                    start_timestamp,
+                    end_timestamp: end,
+                    between_version: end_version,
+                })
+            );
+
+            Ok(end_version)
+        })
+        .transpose()?;
+
+    Ok((start_version, end_version))
 }
 
 #[cfg(test)]
@@ -469,6 +680,11 @@ mod tests {
         (table, engine, snapshot, log_segment)
     }
 
+    // ====================================================================================
+    // Tests for low-level internal functions: get_timestamp_search_bounds,
+    // timestamp_to_version, linear_search_file_mod_timestamps
+    // ====================================================================================
+
     // Table: v0=50, v1=150, v2=250 (file mod only), snapshot at v2 (no ICT)
     #[rstest::rstest]
     #[case::before_all(0)]
@@ -603,6 +819,8 @@ mod tests {
     #[case::just_before_ict_glb(299, Bound::GreatestLower, Some(2))]
     #[case::just_after_ict_glb(301, Bound::GreatestLower, Some(3))]
     #[case::just_after_ict_lub(301, Bound::LeastUpper, Some(4))]
+    #[case::between_ict_commits(350, Bound::GreatestLower, Some(3))]
+    #[case::between_ict_commits_lub(350, Bound::LeastUpper, Some(4))]
     #[tokio::test]
     async fn test_timestamp_to_version_standard_table(
         #[case] timestamp: Timestamp,
@@ -759,5 +977,420 @@ mod tests {
             matches!(res, Err(LogHistoryError::Internal { .. })),
             "Expected internal error for missing ICT: {res:?}"
         );
+    }
+
+    // ====================================================================================
+    // Tests for high-level public APIs: latest_version_as_of, first_version_after,
+    // timestamp_range_to_versions
+    // ====================================================================================
+
+    // Table: v0=50, v1=150, v2=250 (file mod), v3=300, v4=400 (ICT at v3)
+    // Matches test_timestamp_to_version_standard_table cases for GreatestLower bound
+    #[rstest::rstest]
+    #[case::before_all(0, None)]
+    #[case::exact_v0(50, Some(0))]
+    #[case::between_v0_v1(100, Some(0))]
+    #[case::exact_v1(150, Some(1))]
+    #[case::just_after_last_file_mod(251, Some(2))]
+    #[case::just_before_ict(299, Some(2))]
+    #[case::exact_ict_enablement(300, Some(3))]
+    #[case::just_after_ict(301, Some(3))]
+    #[case::between_ict_commits(350, Some(3))]
+    #[case::after_all(1000, Some(4))]
+    #[tokio::test]
+    async fn test_latest_version_as_of(
+        #[case] timestamp: Timestamp,
+        #[case] expected: Option<Version>,
+    ) {
+        let timestamps = [
+            (50, None),
+            (150, None),
+            (250, None),
+            (350, Some(300)),
+            (450, Some(400)),
+        ];
+        let table = mock_table_with_timestamps(&timestamps, Some(3)).await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let res = latest_version_as_of(&snapshot, &engine, timestamp);
+        match expected {
+            Some(v) => assert_eq!(res.unwrap(), v),
+            None => assert!(res.is_err(), "{res:?}"),
+        }
+    }
+
+    // Table: v0=50, v1=150, v2=250 (file mod), v3=300, v4=400 (ICT at v3)
+    // Matches test_timestamp_to_version_standard_table cases for LeastUpper bound
+    #[rstest::rstest]
+    #[case::before_all(0, Some(0))]
+    #[case::exact_v0(50, Some(0))]
+    #[case::between_v0_v1(100, Some(1))]
+    #[case::exact_v1(150, Some(1))]
+    #[case::just_after_last_file_mod(251, Some(3))]
+    #[case::just_before_ict(299, Some(3))]
+    #[case::exact_ict_enablement(300, Some(3))]
+    #[case::just_after_ict(301, Some(4))]
+    #[case::between_ict_commits(350, Some(4))]
+    #[case::after_all(1000, None)]
+    #[tokio::test]
+    async fn test_first_version_after(
+        #[case] timestamp: Timestamp,
+        #[case] expected: Option<Version>,
+    ) {
+        let timestamps = [
+            (50, None),
+            (150, None),
+            (250, None),
+            (350, Some(300)),
+            (450, Some(400)),
+        ];
+        let table = mock_table_with_timestamps(&timestamps, Some(3)).await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let res = first_version_after(&snapshot, &engine, timestamp);
+        match expected {
+            Some(v) => assert_eq!(res.unwrap(), v),
+            None => assert!(res.is_err(), "{res:?}"),
+        }
+    }
+
+    // Table: v0=50, v1=150, v2=250 (file mod), v3=300, v4=400 (ICT at v3)
+    // Comprehensive boundary test cases matching test_latest_version_as_of and
+    // test_first_version_after
+    #[rstest::rstest]
+    // Basic range tests
+    #[case::basic_range(50, Some(300), Ok((0, Some(3))))]
+    #[case::no_end(100, None, Ok((1, None)))]
+    #[case::start_equals_end(150, Some(150), Ok((1, Some(1))))]
+    #[case::spanning_ict_boundary(100, Some(350), Ok((1, Some(3))))]
+    #[case::entire_table(0, Some(1000), Ok((0, Some(4))))]
+    // Exact timestamp boundaries
+    #[case::exact_v0_to_v1(50, Some(150), Ok((0, Some(1))))]
+    #[case::exact_v1_to_v2(150, Some(250), Ok((1, Some(2))))]
+    #[case::exact_v3_ict_to_v4(300, Some(400), Ok((3, Some(4))))]
+    // File mod region boundaries
+    #[case::between_v0_v1_to_exact_v2(100, Some(250), Ok((1, Some(2))))]
+    #[case::just_after_last_file_mod_no_end(251, None, Ok((3, None)))]
+    #[case::just_before_ict_to_just_after(299, Some(301), Ok((3, Some(3))))]
+    // ICT region boundaries
+    #[case::exact_ict_to_after_all(300, Some(1000), Ok((3, Some(4))))]
+    #[case::between_ict_commits(350, Some(400), Ok((4, Some(4))))]
+    #[case::just_after_ict_to_end(301, Some(1000), Ok((4, Some(4))))]
+    // Error cases embedded as rstest cases
+    #[case::end_before_all_fails(0, Some(40), Err(()))] // No version at or before end_timestamp=40
+    #[case::start_after_all_fails(500, Some(1000), Err(()))] // No version at or after start_timestamp=500
+    #[tokio::test]
+    async fn test_timestamp_range_to_versions(
+        #[case] start: Timestamp,
+        #[case] end: Option<Timestamp>,
+        #[case] expected: Result<(Version, Option<Version>), ()>,
+    ) {
+        let timestamps = [
+            (50, None),
+            (150, None),
+            (250, None),
+            (350, Some(300)),
+            (450, Some(400)),
+        ];
+        let table = mock_table_with_timestamps(&timestamps, Some(3)).await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let res = timestamp_range_to_versions(&snapshot, &engine, start, end);
+        match expected {
+            Ok(v) => assert_eq!(res.unwrap(), v),
+            Err(()) => assert!(res.is_err(), "{res:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_range_invalid_range() {
+        // Table: v0=50, v1=150, v2=250 (file mod), v3=300, v4=400 (ICT at v3)
+        let timestamps = [
+            (50, None),
+            (150, None),
+            (250, None),
+            (350, Some(300)),
+            (450, Some(400)),
+        ];
+        let table = mock_table_with_timestamps(&timestamps, Some(3)).await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let res = timestamp_range_to_versions(&snapshot, &engine, 300, Some(100));
+        assert!(
+            matches!(
+                res,
+                Err(crate::Error::LogHistory(ref e))
+                    if matches!(**e, LogHistoryError::InvalidTimestampRange { .. })
+            ),
+            "{res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_range_empty_range() {
+        // Table: v0=50, v1=150, v2=250 (file mod), v3=300, v4=400 (ICT at v3)
+        let timestamps = [
+            (50, None),
+            (150, None),
+            (250, None),
+            (350, Some(300)),
+            (450, Some(400)),
+        ];
+        let table = mock_table_with_timestamps(&timestamps, Some(3)).await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        // Timestamps 51-149 fall between v0 (ts=50) and v1 (ts=150)
+        let res = timestamp_range_to_versions(&snapshot, &engine, 51, Some(149));
+        assert!(
+            matches!(
+                res,
+                Err(crate::Error::LogHistory(ref e))
+                    if matches!(**e, LogHistoryError::EmptyTimestampRange { between_version: 0, .. })
+            ),
+            "{res:?}"
+        );
+    }
+
+    // ====================================================================================
+    // High-level API tests for additional table configurations
+    // ====================================================================================
+
+    /// File-mod-only table (no ICT): v0=100, v1=200, v2=300
+    #[rstest::rstest]
+    #[case::exact_match(200, Some(1))]
+    #[case::between_commits(150, Some(0))]
+    #[case::after_all(500, Some(2))]
+    #[case::before_all(50, None)]
+    #[tokio::test]
+    async fn test_latest_version_as_of_file_mod_only(
+        #[case] timestamp: Timestamp,
+        #[case] expected: Option<Version>,
+    ) {
+        let table =
+            mock_table_with_timestamps(&[(100, None), (200, None), (300, None)], None).await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let res = latest_version_as_of(&snapshot, &engine, timestamp);
+        match expected {
+            Some(v) => assert_eq!(res.unwrap(), v),
+            None => assert!(res.is_err(), "{res:?}"),
+        }
+    }
+
+    /// File-mod-only table (no ICT): v0=100, v1=200, v2=300
+    #[rstest::rstest]
+    #[case::exact_match(200, Some(1))]
+    #[case::between_commits(150, Some(1))]
+    #[case::before_all(50, Some(0))]
+    #[case::after_all(500, None)]
+    #[tokio::test]
+    async fn test_first_version_after_file_mod_only(
+        #[case] timestamp: Timestamp,
+        #[case] expected: Option<Version>,
+    ) {
+        let table =
+            mock_table_with_timestamps(&[(100, None), (200, None), (300, None)], None).await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let res = first_version_after(&snapshot, &engine, timestamp);
+        match expected {
+            Some(v) => assert_eq!(res.unwrap(), v),
+            None => assert!(res.is_err(), "{res:?}"),
+        }
+    }
+
+    /// ICT from creation: v0=100, v1=200, v2=300 (all ICT)
+    #[rstest::rstest]
+    #[case::exact_match(200, Some(1))]
+    #[case::between_commits(150, Some(0))]
+    #[case::after_all(500, Some(2))]
+    #[case::before_all(50, None)]
+    #[tokio::test]
+    async fn test_latest_version_as_of_ict_from_creation(
+        #[case] timestamp: Timestamp,
+        #[case] expected: Option<Version>,
+    ) {
+        let table =
+            mock_table_with_timestamps(&[(0, Some(100)), (0, Some(200)), (0, Some(300))], Some(0))
+                .await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let res = latest_version_as_of(&snapshot, &engine, timestamp);
+        match expected {
+            Some(v) => assert_eq!(res.unwrap(), v),
+            None => assert!(res.is_err(), "{res:?}"),
+        }
+    }
+
+    /// ICT from creation: v0=100, v1=200, v2=300 (all ICT)
+    #[rstest::rstest]
+    #[case::exact_match(200, Some(1))]
+    #[case::between_commits(150, Some(1))]
+    #[case::before_all(50, Some(0))]
+    #[case::after_all(500, None)]
+    #[tokio::test]
+    async fn test_first_version_after_ict_from_creation(
+        #[case] timestamp: Timestamp,
+        #[case] expected: Option<Version>,
+    ) {
+        let table =
+            mock_table_with_timestamps(&[(0, Some(100)), (0, Some(200)), (0, Some(300))], Some(0))
+                .await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let res = first_version_after(&snapshot, &engine, timestamp);
+        match expected {
+            Some(v) => assert_eq!(res.unwrap(), v),
+            None => assert!(res.is_err(), "{res:?}"),
+        }
+    }
+
+    /// Non-monotonic file mod timestamps (clock skew):
+    /// Raw: v0=100, v1=200, v2=150, v3=180, v4=300
+    /// Monotonized: v0=100, v1=200, v2=201, v3=202, v4=300
+    #[rstest::rstest]
+    #[case::exact_v1(200, Some(1))]
+    #[case::monotonized_v2(201, Some(2))]
+    #[case::monotonized_v3(202, Some(3))]
+    #[case::between_v3_v4(250, Some(3))]
+    #[case::raw_v2_between_v0_v1(150, Some(0))]
+    #[tokio::test]
+    async fn test_latest_version_as_of_non_monotonic(
+        #[case] timestamp: Timestamp,
+        #[case] expected: Option<Version>,
+    ) {
+        let table = mock_table_with_timestamps(
+            &[
+                (100, None),
+                (200, None),
+                (150, None), // Clock skew - earlier than v1
+                (180, None), // Clock skew - earlier than v1
+                (300, None),
+            ],
+            None,
+        )
+        .await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let res = latest_version_as_of(&snapshot, &engine, timestamp);
+        match expected {
+            Some(v) => assert_eq!(res.unwrap(), v),
+            None => assert!(res.is_err(), "{res:?}"),
+        }
+    }
+
+    /// Non-monotonic file mod timestamps (clock skew):
+    /// Raw: v0=100, v1=200, v2=150, v3=180, v4=300
+    /// Monotonized: v0=100, v1=200, v2=201, v3=202, v4=300
+    #[rstest::rstest]
+    #[case::exact_v1(200, Some(1))]
+    #[case::monotonized_v2(201, Some(2))]
+    #[case::monotonized_v3(202, Some(3))]
+    #[case::after_v3_monotonized(203, Some(4))]
+    #[case::raw_v2_maps_to_v1(150, Some(1))]
+    #[tokio::test]
+    async fn test_first_version_after_non_monotonic(
+        #[case] timestamp: Timestamp,
+        #[case] expected: Option<Version>,
+    ) {
+        let table = mock_table_with_timestamps(
+            &[
+                (100, None),
+                (200, None),
+                (150, None), // Clock skew - earlier than v1
+                (180, None), // Clock skew - earlier than v1
+                (300, None),
+            ],
+            None,
+        )
+        .await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let res = first_version_after(&snapshot, &engine, timestamp);
+        match expected {
+            Some(v) => assert_eq!(res.unwrap(), v),
+            None => assert!(res.is_err(), "{res:?}"),
+        }
+    }
+
+    /// timestamp_range_to_versions with file-mod-only table (v0=100, v1=200, v2=300)
+    #[rstest::rstest]
+    #[case::basic_range(100, Some(200), Ok((0, Some(1))))]
+    #[case::entire_table(50, Some(500), Ok((0, Some(2))))]
+    #[case::no_end(150, None, Ok((1, None)))]
+    #[case::exact_v0_to_v2(100, Some(300), Ok((0, Some(2))))]
+    #[case::between_commits(150, Some(250), Ok((1, Some(1))))]
+    #[case::start_equals_end_exact(200, Some(200), Ok((1, Some(1))))]
+    #[case::end_before_all_fails(50, Some(80), Err(()))] // No version at or before end_timestamp=80
+    #[case::start_after_all_fails(400, Some(500), Err(()))] // No version at or after start_timestamp=400
+    #[tokio::test]
+    async fn test_timestamp_range_file_mod_only(
+        #[case] start: Timestamp,
+        #[case] end: Option<Timestamp>,
+        #[case] expected: Result<(Version, Option<Version>), ()>,
+    ) {
+        let table =
+            mock_table_with_timestamps(&[(100, None), (200, None), (300, None)], None).await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let res = timestamp_range_to_versions(&snapshot, &engine, start, end);
+        match expected {
+            Ok(v) => assert_eq!(res.unwrap(), v),
+            Err(()) => assert!(res.is_err(), "{res:?}"),
+        }
+    }
+
+    /// timestamp_range_to_versions with ICT from creation (v0=100, v1=200, v2=300)
+    #[rstest::rstest]
+    #[case::basic_range(100, Some(200), Ok((0, Some(1))))]
+    #[case::entire_table(50, Some(500), Ok((0, Some(2))))]
+    #[case::no_end(150, None, Ok((1, None)))]
+    #[case::exact_v0_to_v2(100, Some(300), Ok((0, Some(2))))]
+    #[case::between_commits(150, Some(250), Ok((1, Some(1))))]
+    #[case::start_equals_end_exact(200, Some(200), Ok((1, Some(1))))]
+    #[case::end_before_all_fails(50, Some(80), Err(()))] // No version at or before end_timestamp=80
+    #[case::start_after_all_fails(400, Some(500), Err(()))] // No version at or after start_timestamp=400
+    #[tokio::test]
+    async fn test_timestamp_range_ict_from_creation(
+        #[case] start: Timestamp,
+        #[case] end: Option<Timestamp>,
+        #[case] expected: Result<(Version, Option<Version>), ()>,
+    ) {
+        let table =
+            mock_table_with_timestamps(&[(0, Some(100)), (0, Some(200)), (0, Some(300))], Some(0))
+                .await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(table.table_root()).unwrap();
+        let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
+
+        let res = timestamp_range_to_versions(&snapshot, &engine, start, end);
+        match expected {
+            Ok(v) => assert_eq!(res.unwrap(), v),
+            Err(()) => assert!(res.is_err(), "{res:?}"),
+        }
     }
 }

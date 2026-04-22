@@ -62,7 +62,6 @@ impl LogHistoryError {
     }
 
     /// Creates an internal error with just a context message.
-    #[allow(unused)]
     pub(crate) fn internal_message(context: &'static str) -> Self {
         Self::Internal {
             context,
