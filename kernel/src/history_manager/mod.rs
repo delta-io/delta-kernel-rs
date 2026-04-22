@@ -269,6 +269,27 @@ pub(crate) fn timestamp_to_version(
     timestamp: Timestamp,
     bound: Bound,
 ) -> Result<Version, LogHistoryError> {
+    // Short-circuit: compare against snapshot's timestamp to avoid log segment rebuild.
+    // This optimization mirrors Delta Spark and Java Kernel behavior.
+    let snap_ts = snapshot
+        .get_timestamp(engine)
+        .map_err(|e| LogHistoryError::internal("failed to get snapshot timestamp", e))?;
+    match (timestamp.cmp(&snap_ts), bound) {
+        // Exact match: snapshot version satisfies both bounds
+        (Ordering::Equal, _) => return Ok(snapshot.version()),
+        // Timestamp after snapshot: for GreatestLower, snapshot is the answer
+        (Ordering::Greater, Bound::GreatestLower) => return Ok(snapshot.version()),
+        // Timestamp after snapshot: for LeastUpper, no version exists
+        (Ordering::Greater, Bound::LeastUpper) => {
+            return Err(LogHistoryError::TimestampOutOfRange {
+                timestamp,
+                reason: bound.out_of_range_reason(),
+            });
+        }
+        // Timestamp before snapshot: need to search the log
+        _ => {}
+    }
+
     // TODO(#2443): Support staged commits (catalog-managed tables). Staged commits have ICT
     // (required by catalog-managed), so timestamps are available. However, we currently
     // rebuild the log segment from storage which doesn't include staged commits. To support
