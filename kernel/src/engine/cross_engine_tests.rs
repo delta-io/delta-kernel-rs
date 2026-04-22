@@ -21,6 +21,7 @@ use crate::engine::default::parquet::DefaultParquetHandler;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncParquetHandler;
 use crate::object_store::local::LocalFileSystem;
+use crate::object_store::path::Path;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::ARROW_SCHEMA_META_KEY;
@@ -30,6 +31,7 @@ fn default_parquet_handler() -> Box<dyn ParquetHandler> {
     Box::new(DefaultParquetHandler::new(
         Arc::new(LocalFileSystem::new()),
         Arc::new(TokioBackgroundExecutor::new()),
+        Path::from(""),
     ))
 }
 
@@ -41,6 +43,7 @@ fn default_json_handler() -> Box<dyn JsonHandler> {
     Box::new(DefaultJsonHandler::new(
         Arc::new(LocalFileSystem::new()),
         Arc::new(TokioBackgroundExecutor::new()),
+        Path::from(""),
     ))
 }
 

@@ -20,6 +20,7 @@ use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::metrics::MetricsReporter;
+use crate::object_store::path::Path;
 use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
@@ -154,37 +155,79 @@ pub struct DefaultEngine<E: TaskExecutor> {
 
 /// Builder for creating [`DefaultEngine`] instances.
 ///
+/// The canonical entry point is [`DefaultEngineBuilder::from_url`], which handles both
+/// object store construction and URL path prefix derivation. Use [`DefaultEngineBuilder::new`]
+/// directly only when you need to plug in a pre-built object store.
+///
 /// # Example
 ///
 /// ```no_run
 /// # use std::sync::Arc;
+/// # use url::Url;
 /// # use delta_kernel::engine::default::DefaultEngineBuilder;
 /// # use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-/// # use delta_kernel::object_store::local::LocalFileSystem;
-/// // Build a DefaultEngine with default executor
-/// let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
-///     .build();
+/// # use delta_kernel::DeltaResult;
+/// # fn example() -> DeltaResult<()> {
+/// let url = Url::parse("file:///path/to/table")?;
 ///
-/// // Build with a custom executor
-/// let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+/// // Build a DefaultEngine from a URL (resolves store + prefix in one step).
+/// let engine = DefaultEngineBuilder::from_url(&url)?.build();
+///
+/// // Or with a custom executor:
+/// let engine = DefaultEngineBuilder::from_url(&url)?
 ///     .with_task_executor(Arc::new(TokioBackgroundExecutor::new()))
 ///     .build();
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug)]
 pub struct DefaultEngineBuilder<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
     metrics_reporter: Option<Arc<dyn MetricsReporter>>,
+    url_path_prefix: Path,
 }
 
 impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
     /// Create a new [`DefaultEngineBuilder`] instance with the default executor.
-    pub fn new(object_store: Arc<DynObjectStore>) -> Self {
+    ///
+    /// `url_path_prefix` is the prefix returned by [`storage::store_from_url`] /
+    /// [`storage::store_from_url_opts`] and is required so that all handlers convert URLs
+    /// to store-relative paths correctly. For schemes that encode the bucket/container in
+    /// the URL authority (S3, ABFSS, local filesystem) pass `Path::from("")`. For Azure
+    /// HTTPS URLs, pass the container name returned by the storage helpers.
+    ///
+    /// Prefer [`DefaultEngineBuilder::from_url`] when you don't already have a pre-built
+    /// object store -- it computes the store and prefix in one step.
+    pub fn new(object_store: Arc<DynObjectStore>, url_path_prefix: Path) -> Self {
         Self {
             object_store,
             task_executor: Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
             metrics_reporter: None,
+            url_path_prefix,
         }
+    }
+
+    /// Create a new [`DefaultEngineBuilder`] from a URL, resolving both the object store
+    /// and the URL path prefix via [`storage::store_from_url`].
+    ///
+    /// This is the canonical entry point for most callers. It eliminates the possibility of
+    /// forgetting to set the URL path prefix, which would silently break Azure HTTPS URLs.
+    pub fn from_url(url: &Url) -> DeltaResult<Self> {
+        let (store, prefix) = storage::store_from_url(url)?;
+        Ok(Self::new(store, prefix))
+    }
+
+    /// Create a new [`DefaultEngineBuilder`] from a URL with custom options, via
+    /// [`storage::store_from_url_opts`].
+    pub fn from_url_opts<I, K, V>(url: &Url, options: I) -> DeltaResult<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let (store, prefix) = storage::store_from_url_opts(url, options)?;
+        Ok(Self::new(store, prefix))
     }
 }
 
@@ -206,12 +249,18 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
             object_store: self.object_store,
             task_executor,
             metrics_reporter: self.metrics_reporter,
+            url_path_prefix: self.url_path_prefix,
         }
     }
 
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.metrics_reporter)
+        DefaultEngine::new_with_opts(
+            self.object_store,
+            self.task_executor,
+            self.metrics_reporter,
+            self.url_path_prefix,
+        )
     }
 }
 
@@ -221,10 +270,13 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
+    /// - `url_path_prefix`: The URL path prefix returned by [`storage::store_from_url`] /
+    ///   [`storage::store_from_url_opts`].
     pub fn builder(
         object_store: Arc<DynObjectStore>,
+        url_path_prefix: Path,
     ) -> DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
-        DefaultEngineBuilder::new(object_store)
+        DefaultEngineBuilder::new(object_store, url_path_prefix)
     }
 }
 
@@ -233,20 +285,30 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         object_store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
         metrics_reporter: Option<Arc<dyn MetricsReporter>>,
+        url_path_prefix: Path,
     ) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
                 metrics_reporter.clone(),
+                url_path_prefix.clone(),
             )),
             json: Arc::new(
-                DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
-                    .with_reporter(metrics_reporter.clone()),
+                DefaultJsonHandler::new(
+                    object_store.clone(),
+                    task_executor.clone(),
+                    url_path_prefix.clone(),
+                )
+                .with_reporter(metrics_reporter.clone()),
             ),
             parquet: Arc::new(
-                DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
-                    .with_reporter(metrics_reporter.clone()),
+                DefaultParquetHandler::new(
+                    object_store.clone(),
+                    task_executor.clone(),
+                    url_path_prefix,
+                )
+                .with_reporter(metrics_reporter.clone()),
             ),
             object_store,
             task_executor,
@@ -389,7 +451,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngineBuilder::new(object_store).build();
+        let engine = DefaultEngineBuilder::new(object_store, Path::from("")).build();
         test_arrow_engine(&engine, &url);
     }
 
@@ -398,7 +460,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngineBuilder::new(object_store).build();
+        let engine = DefaultEngineBuilder::new(object_store, Path::from("")).build();
         test_arrow_engine(&engine, &url);
     }
 
@@ -408,7 +470,7 @@ mod tests {
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
         let reporter = Arc::new(TestMetricsReporter);
-        let engine = DefaultEngineBuilder::new(object_store)
+        let engine = DefaultEngineBuilder::new(object_store, Path::from(""))
             .with_metrics_reporter(reporter)
             .build();
         assert!(engine.get_metrics_reporter().is_some());
@@ -427,7 +489,7 @@ mod tests {
         let executor = Arc::new(executor::tokio::TokioMultiThreadExecutor::new(
             rt.handle().clone(),
         ));
-        let engine = DefaultEngineBuilder::new(object_store)
+        let engine = DefaultEngineBuilder::new(object_store, Path::from(""))
             .with_task_executor(executor)
             .build();
         test_arrow_engine(&engine, &url);
@@ -438,7 +500,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::builder(object_store).build();
+        let engine = DefaultEngine::builder(object_store, Path::from("")).build();
         test_arrow_engine(&engine, &url);
     }
 
@@ -449,11 +511,19 @@ mod tests {
         let object_store = Arc::new(LocalFileSystem::new());
         let reporter = Arc::new(TestMetricsReporter);
         let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
-        let engine = DefaultEngineBuilder::new(object_store)
+        let engine = DefaultEngineBuilder::new(object_store, Path::from(""))
             .with_metrics_reporter(reporter)
             .with_task_executor(executor)
             .build();
         assert!(engine.get_metrics_reporter().is_some());
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_default_engine_builder_from_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let engine = DefaultEngineBuilder::from_url(&url).unwrap().build();
         test_arrow_engine(&engine, &url);
     }
 

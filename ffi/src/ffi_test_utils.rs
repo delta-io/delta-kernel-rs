@@ -9,6 +9,7 @@ use std::sync::Arc;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 #[cfg(test)]
 use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::path::Path;
 #[cfg(test)]
 use test_utils::add_commit;
 
@@ -96,7 +97,7 @@ pub(crate) async fn setup_snapshot(
     let table_root = "memory:///";
     let storage = Arc::new(InMemory::new());
     add_commit(table_root, storage.as_ref(), 0, commit_data).await?;
-    let engine = DefaultEngineBuilder::new(storage.clone()).build();
+    let engine = DefaultEngineBuilder::new(storage.clone(), Path::from("")).build();
     let engine = engine_to_handle(Arc::new(engine), allocate_err);
     let snap = unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
     Ok((engine, snap))

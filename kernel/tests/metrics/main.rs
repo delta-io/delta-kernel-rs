@@ -20,6 +20,7 @@ use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::object_store::path::Path;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -39,7 +40,7 @@ fn measuring_engine(
     Arc<CountingReporter>,
 ) {
     let reporter = Arc::new(CountingReporter::default());
-    let engine = DefaultEngineBuilder::new(store)
+    let engine = DefaultEngineBuilder::new(store, Path::from(""))
         .with_metrics_reporter(reporter.clone())
         .build();
     (engine, reporter)

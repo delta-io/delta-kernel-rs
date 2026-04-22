@@ -103,7 +103,7 @@ async fn test_checkpoint_stats_config_with_real_data(
         tokio::runtime::Handle::current(),
     ));
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(store.clone(), Path::from(""))
             .with_task_executor(executor)
             .build(),
     );
@@ -226,7 +226,7 @@ async fn test_checkpoint_partitioned_with_real_data(
         tokio::runtime::Handle::current(),
     ));
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(store.clone(), Path::from(""))
             .with_task_executor(executor)
             .build(),
     );
@@ -427,7 +427,7 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
         tokio::runtime::Handle::current(),
     ));
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(store.clone(), Path::from(""))
             .with_task_executor(executor)
             .build(),
     );
@@ -547,7 +547,7 @@ async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
         tokio::runtime::Handle::current(),
     ));
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(store.clone(), Path::from(""))
             .with_task_executor(executor)
             .build(),
     );

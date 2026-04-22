@@ -156,7 +156,7 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()
         .build()?;
     let store = table.store().clone();
     let table_url = Url::parse(table.table_root()).unwrap();
-    let setup_engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+    let setup_engine = Arc::new(DefaultEngineBuilder::new(store.clone(), Path::from("")).build());
 
     // Write a compacted log file covering versions 0-2 using the public API
     let snap2 = Snapshot::builder_for(table.table_root()).build(setup_engine.as_ref())?;

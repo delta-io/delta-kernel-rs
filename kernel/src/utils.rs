@@ -188,6 +188,7 @@ pub(crate) mod test_utils {
     use crate::metrics::{MetricEvent, MetricsReporter};
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path as ObjectPath;
     use crate::object_store::ObjectStoreExt as _;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
@@ -727,7 +728,8 @@ pub(crate) mod test_utils {
             ColumnMappingMode::None => "none",
         };
         let store = Arc::new(InMemory::new());
-        let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store).build());
+        let engine: Arc<dyn Engine> =
+            Arc::new(DefaultEngineBuilder::new(store, ObjectPath::from("")).build());
 
         let txn = create_table("memory:///test_table", schema, "DefaultEngine")
             .with_table_properties([("delta.columnMapping.mode", mode_str)])
@@ -837,7 +839,7 @@ pub(crate) mod test_utils {
             .map_err(|_| Error::Generic("Failed to create URL from path".to_string()))?;
 
         let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(DefaultEngineBuilder::new(store).build());
+        let engine = Arc::new(DefaultEngineBuilder::new(store, ObjectPath::from("")).build());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
         Ok((engine, snapshot, tempdir))
     }
