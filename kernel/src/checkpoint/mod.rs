@@ -626,7 +626,7 @@ impl CheckpointWriter {
         // Write sidecar files
         let mut sidecar_metas: Vec<(String, FileMeta)> = Vec::new();
         loop {
-            if let Some(entry) = write_one_sidecar(
+            if let Some(entry) = write_single_sidecar(
                 engine,
                 &splitter,
                 file_actions_per_sidecar_hint,
@@ -847,7 +847,7 @@ pub(crate) fn create_last_checkpoint_data(
 }
 
 /// Writes one sidecar file. Returns `None` if the splitter yielded no rows for this sidecar.
-fn write_one_sidecar(
+fn write_single_sidecar(
     engine: &dyn Engine,
     splitter: &Arc<Mutex<SidecarSplitter>>,
     file_actions_per_sidecar_hint: usize,
