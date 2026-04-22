@@ -307,38 +307,54 @@ impl Snapshot {
         // (Also reached from Case D.2 when a checkpoint at or below the existing snapshot
         // version was discovered.)
         //
-        // All examples start from: old segment = checkpoint@v0 + commit@v1, v2, v3
+        // All examples start from: existing segment = checkpoint@v0 + commit@v1, v2, v3
         //                          existing_snapshot_version = v3, listing_start = v1
         //
-        // 1. target=v3, no new commits: listing:          commit@v1, v2, v3 new_end_version(v3) ==
-        //    existing_snapshot_version(v3), no new checkpoint -> return same snapshot (caught
-        //    above)
+        // The `#[rustfmt::skip]` below attaches to the `retain` statement at the end of the
+        // comment block; it protects the preceding column-aligned examples from being
+        // reflowed by rustfmt's `wrap_comments = true`. Do not remove without also
+        // restructuring the examples to survive a reflow.
+        #[rustfmt::skip]
+        // 1. target=v3, no new commits:
+        //    listing:          commit@v1, v2, v3
+        //    new_end_version(v3) == existing_snapshot_version(v3), no new checkpoint
+        //    -> return same snapshot (caught above)
         //
-        // 2. target=v4, one new commit: listing:          commit@v1, v2, v3, v4 after dedup: drop
-        //    v1-v3 (already in existing snapshot) -> ascending_commit_files = [commit@v4] commit@v4
-        //    is replayed for P&M below and merged into the combined log segment.
+        // 2. target=v4, one new commit:
+        //    listing:          commit@v1, v2, v3, v4
+        //    after dedup:      drop v1-v3 (already in existing snapshot)
+        //                      -> ascending_commit_files = [commit@v4]
+        //    commit@v4 is replayed for P&M below and merged into the combined log segment.
         //
-        // 3. target=v6, new checkpoint@v5 written since last build: listing:          commit@v1-v4,
-        //    then checkpoint@v5 + commit@v6 (checkpoint flush drops v1-v4; checkpoint@v5 is a
-        //    complete snapshot through v5, so all earlier commits are not needed) new segment:
-        //    checkpoint@v5 + commit@v6 new_checkpoint_version(v5) > existing_snapshot_version(v3)
-        //    -> full rebuild (caught above)
+        // 3. target=v6, new checkpoint@v5 written since last build:
+        //    listing:          commit@v1-v4, then checkpoint@v5 + commit@v6
+        //                      (checkpoint flush drops v1-v4; checkpoint@v5 is a complete
+        //                       snapshot through v5, so all earlier commits are not needed)
+        //    new segment:      checkpoint@v5 + commit@v6
+        //    new_checkpoint_version(v5) > existing_snapshot_version(v3) -> full rebuild
+        //    (caught above)
         //
-        // 4. target=v4, new checkpoint@v2 written since last build: listing:          commit@v1,
-        //    then checkpoint@v2 + commit@v3, v4 (checkpoint flush drops v1) new segment:
-        //    checkpoint@v2 + commit@v3, v4 after dedup:      drop commit@v3 (already in existing
-        //    snapshot) -> ascending_commit_files = [commit@v4] commit@v3 is not lost: the old
-        //    segment contributes it below (old commits above checkpoint@v2 = [commit@v3]) combined
-        //    segment: checkpoint@v2 + commit@v3 (from old) + commit@v4 (from new) checkpoint@v2 is
-        //    kept in checkpoint_parts to advance the listing base.
+        // 4. target=v4, new checkpoint@v2 written since last build:
+        //    listing:          commit@v1, then checkpoint@v2 + commit@v3, v4
+        //                      (checkpoint flush drops v1)
+        //    new segment:      checkpoint@v2 + commit@v3, v4
+        //    after dedup:      drop commit@v3 (already in existing snapshot)
+        //                      -> ascending_commit_files = [commit@v4]
+        //    commit@v3 is not lost: the existing segment contributes it below
+        //    (existing commits above checkpoint@v2 = [commit@v3])
+        //    combined segment: checkpoint@v2 + commit@v3 (from existing) + commit@v4 (from new)
+        //    checkpoint@v2 is kept in checkpoint_parts to advance the listing base.
         //
-        // 5. target=v3, new checkpoint@v2 written since last build, no new commits: listing:
-        //    commit@v1, then checkpoint@v2 + commit@v3 (checkpoint flush drops v1) new segment:
-        //    checkpoint@v2 + commit@v3 after dedup:      drop commit@v3 (already in existing
-        //    snapshot) -> ascending_commit_files = [] commit@v3 is not lost: the old segment
-        //    contributes it below (old commits above checkpoint@v2 = [commit@v3]) combined segment:
-        //    checkpoint@v2 + commit@v3 (from old) checkpoint@v2 is kept in checkpoint_parts to
-        //    advance the listing base.
+        // 5. target=v3, new checkpoint@v2 written since last build, no new commits:
+        //    listing:          commit@v1, then checkpoint@v2 + commit@v3
+        //                      (checkpoint flush drops v1)
+        //    new segment:      checkpoint@v2 + commit@v3
+        //    after dedup:      drop commit@v3 (already in existing snapshot)
+        //                      -> ascending_commit_files = []
+        //    commit@v3 is not lost: the existing segment contributes it below
+        //    (existing commits above checkpoint@v2 = [commit@v3])
+        //    combined segment: checkpoint@v2 + commit@v3 (from existing)
+        //    checkpoint@v2 is kept in checkpoint_parts to advance the listing base.
         new_log_segment
             .listed
             .ascending_commit_files
@@ -2987,11 +3003,13 @@ mod tests {
         })
     }
 
-    // `resolve_crc` in the checkpoint-rebuild path (case D) must correctly decide between
-    // reusing the existing snapshot's CRC, creating a fresh LazyCrc, or dropping the CRC
-    // entirely. Each case below sets up commits 0-3, writes an existing CRC, builds
-    // snapshot_v3, writes a checkpoint, optionally writes a new CRC, then runs the
-    // incremental update and checks the outcome.
+    // `resolve_crc` when the new listing discovers a checkpoint *at or below* the existing
+    // snapshot version must correctly decide between reusing the existing snapshot's CRC,
+    // creating a fresh LazyCrc, or dropping the CRC entirely. Each case below sets up
+    // commits 0-3, writes an existing CRC, builds snapshot_v3, writes a checkpoint,
+    // optionally writes a new CRC, then runs the incremental update and checks the outcome.
+    // (The checkpoint-*ahead* path is covered separately by
+    // `test_incremental_snapshot_multi_hop_replay_then_rebuild_drops_stale_crc`.)
     //
     // Version axis for `refresh_to_newer` (existing_crc_v=2, new_ckpt_v=1, new_crc_v=3):
     //
@@ -3025,7 +3043,7 @@ mod tests {
     #[case::crc_equals_ckpt(2, 2, None, Some(2), true)]
     #[case::drop_below_ckpt(1, 2, None, None, false)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_checkpoint_rebuild_crc_resolution(
+    async fn test_incremental_snapshot_crc_resolution_when_checkpoint_at_or_below_snapshot(
         #[case] existing_crc_v: u64,
         #[case] new_ckpt_v: u64,
         #[case] newly_listed_crc_v: Option<u64>,
@@ -3179,7 +3197,100 @@ mod tests {
         Ok(())
     }
 
-    // Multi-hop: v0 -> v5 (incremental P+M replay) -> v10 (checkpoint rebuild).
+    // Regression: the stale-CRC skip in the P+M-replay path prevents silent metadata
+    // regression when an at-or-below checkpoint is discovered and the inherited CRC is
+    // older than the existing snapshot's P&M. Without the skip,
+    // `read_protocol_metadata_opt`'s Case 2(b) fallback loads the stale CRC's P&M and
+    // `TableConfiguration::try_new_from` overwrites the existing (correct) state with it.
+    //
+    // Setup: commits 0-3 with a metadata change at commit 2; stale CRC@v1 captures the
+    // pre-change P&M; snapshot_v3 picks up the v2 metadata via log replay. A new
+    // checkpoint@v1 is then written (at or below snapshot_v3, so the update takes the
+    // P+M-replay path). The pruned replay on commits > v3 is empty, so without the skip
+    // it would fall back to CRC@v1 and regress to the pre-v2 configuration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_snapshot_preserves_metadata_when_below_checkpoint_crc_is_stale(
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        let table_root = ctx.url.as_str();
+
+        // commit 0: initial P&M with empty configuration.
+        commit(
+            table_root,
+            &ctx.store,
+            0,
+            vec![
+                protocol_action(1, 2),
+                metadata_action(json!({})),
+                add_action("f0.parquet"),
+            ],
+        )
+        .await;
+        // commit 1: data-only add.
+        commit(table_root, &ctx.store, 1, vec![add_action("f1.parquet")]).await;
+        // commit 2: metadata change (new configuration property).
+        commit(
+            table_root,
+            &ctx.store,
+            2,
+            vec![
+                metadata_action(json!({"delta.myKey": "myValue"})),
+                add_action("f2.parquet"),
+            ],
+        )
+        .await;
+        // commit 3: data-only add.
+        commit(table_root, &ctx.store, 3, vec![add_action("f3.parquet")]).await;
+
+        // CRC@v1 captures pre-v2 metadata (empty configuration) -- "stale" relative to the
+        // existing snapshot's v2-derived P&M.
+        ctx.store
+            .put(
+                &delta_path_for_version(1, "crc"),
+                make_test_crc_json(200, 2).to_string().into(),
+            )
+            .await?;
+
+        let snapshot_v3 = Snapshot::builder_for(table_root)
+            .at_version(3)
+            .build(ctx.engine.as_ref())?;
+        // Log replay picks up v2's metadata change despite CRC@v1's stale snapshot.
+        assert_eq!(
+            snapshot_v3
+                .table_properties()
+                .unknown_properties
+                .get("delta.myKey"),
+            Some(&"myValue".to_string())
+        );
+
+        // Write checkpoint@v1 (at or below snapshot_v3, so incremental update takes the
+        // P+M-replay path instead of a full rebuild).
+        Snapshot::builder_for(table_root)
+            .at_version(1)
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref())?;
+
+        // Incremental update. The pruned replay on commits > 3 is empty. With the stale-
+        // CRC skip, the replay returns (None, None) and `TableConfiguration::try_new_from`
+        // preserves existing P&M. Without the skip, Case 2(b) would load CRC@v1's stale
+        // metadata and overwrite the existing (correct) v2 configuration.
+        let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
+        let fresh = Snapshot::builder_for(table_root).build(ctx.engine.as_ref())?;
+        compare_snapshots(&updated, &fresh);
+
+        // Observable contract: v2 metadata preserved.
+        assert_eq!(
+            updated
+                .table_properties()
+                .unknown_properties
+                .get("delta.myKey"),
+            Some(&"myValue".to_string())
+        );
+
+        Ok(())
+    }
+
+    // Multi-hop: v0 -> v5 (incremental P+M replay) -> v10 (checkpoint-ahead full rebuild).
     // Verifies that a loaded LazyCrc carried into the second hop is *not* reused when
     // the new checkpoint invalidates the existing CRC (resulting LazyCrc is fresh and
     // unloaded, not the loaded Arc from snapshot_v5).
@@ -3221,10 +3332,10 @@ mod tests {
             .build(ctx.engine.as_ref())?
             .checkpoint(ctx.engine.as_ref(), None)?;
 
-        // Hop 3: incremental v5 -> v10 (discovers a new checkpoint@v7, triggering rebuild).
-        // CRC@v5 is below the new checkpoint (5 < 7) so the filter drops it, and the rebuilt
-        // snapshot gets a fresh unloaded LazyCrc rather than the v5 Arc that was loaded
-        // above.
+        // Hop 3: incremental v5 -> v10 (discovers a new checkpoint@v7 ahead of the
+        // existing snapshot version, triggering full rebuild). CRC@v5 is below
+        // the new checkpoint (5 < 7) so the filter drops it, and the rebuilt snapshot gets
+        // a fresh unloaded LazyCrc rather than the v5 Arc that was loaded above.
         let snapshot_v10 = Snapshot::builder_from(snapshot_v5).build(ctx.engine.as_ref())?;
         let fresh_v10 = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         compare_snapshots(&snapshot_v10, &fresh_v10);
@@ -3346,59 +3457,36 @@ mod tests {
     async fn test_checkpoint_at_or_below_snapshot_version_preserves_pm_from_commits_in_between(
     ) -> DeltaResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
+        let table_root = ctx.url.as_str();
 
-        // Commit 0: initial protocol (1, 2) + metadata.
-        let commit0 = vec![
-            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
-            json!({
-                "metaData": {
-                    "id": "test-id",
-                    "format": {"provider": "parquet", "options": {}},
-                    "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
-                    "partitionColumns": [],
-                    "configuration": {},
-                    "createdTime": 1587968585495i64
-                }
-            }),
-            json!({"add": {"path": "file1.parquet", "partitionValues": {}, "size": 100, "modificationTime": 1000, "dataChange": true}}),
-        ];
-        commit(ctx.url.as_str(), &ctx.store, 0, commit0).await;
-
-        // Commit 1: just an add file (no P&M change).
+        // Commit 0: initial protocol (1, 2) + metadata + first file.
         commit(
-            ctx.url.as_str(),
+            table_root,
             &ctx.store,
-            1,
-            vec![json!({"add": {"path": "file2.parquet", "partitionValues": {}, "size": 200, "modificationTime": 2000, "dataChange": true}})],
+            0,
+            vec![
+                protocol_action(1, 2),
+                metadata_action(json!({})),
+                add_action("file1.parquet"),
+            ],
         )
         .await;
-
-        // Commit 2: protocol upgrade to (2, 5).
-        commit(
-            ctx.url.as_str(),
-            &ctx.store,
-            2,
-            vec![json!({"protocol": {"minReaderVersion": 2, "minWriterVersion": 5}})],
-        )
-        .await;
-
-        // Commit 3: just an add file.
-        commit(
-            ctx.url.as_str(),
-            &ctx.store,
-            3,
-            vec![json!({"add": {"path": "file3.parquet", "partitionValues": {}, "size": 300, "modificationTime": 3000, "dataChange": true}})],
-        )
-        .await;
+        // Commit 1: data-only add.
+        commit(table_root, &ctx.store, 1, vec![add_action("file2.parquet")]).await;
+        // Commit 2: protocol upgrade to (2, 5). This is the change the incremental update
+        // must preserve rather than regressing to checkpoint@v1's older protocol.
+        commit(table_root, &ctx.store, 2, vec![protocol_action(2, 5)]).await;
+        // Commit 3: data-only add.
+        commit(table_root, &ctx.store, 3, vec![add_action("file3.parquet")]).await;
 
         // Write initial checkpoint at v0 so that listing_start = v0+1 = 1.
-        Snapshot::builder_for(ctx.url.as_str())
+        Snapshot::builder_for(table_root)
             .at_version(0)
             .build(ctx.engine.as_ref())?
             .checkpoint(ctx.engine.as_ref())?;
 
         // Build snapshot at v3: has checkpoint@v0, protocol (2, 5) from commit 2.
-        let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
+        let snapshot_v3 = Snapshot::builder_for(table_root)
             .at_version(3)
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v3.log_segment.checkpoint_version, Some(0));
@@ -3419,19 +3507,13 @@ mod tests {
 
         // Write a checkpoint at v1 (v1 >= listing_start=1, so it is discoverable).
         // This checkpoint captures only protocol (1, 2) from commit 0.
-        Snapshot::builder_for(ctx.url.as_str())
+        Snapshot::builder_for(table_root)
             .at_version(1)
             .build(ctx.engine.as_ref())?
             .checkpoint(ctx.engine.as_ref())?;
 
-        // Add commit 4 (new state beyond existing_snapshot_version=3).
-        commit(
-            ctx.url.as_str(),
-            &ctx.store,
-            4,
-            vec![json!({"add": {"path": "file4.parquet", "partitionValues": {}, "size": 400, "modificationTime": 4000, "dataChange": true}})],
-        )
-        .await;
+        // Commit 4: add file (new state beyond existing_snapshot_version=3).
+        commit(table_root, &ctx.store, 4, vec![add_action("file4.parquet")]).await;
 
         // Incremental update from v3: listing starts from v1, discovers checkpoint@v1.
         // Must preserve protocol (2, 5) from commit 2, not regress to (1, 2) from checkpoint@v1.
