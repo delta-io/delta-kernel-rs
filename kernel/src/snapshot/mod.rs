@@ -97,7 +97,7 @@ impl std::fmt::Debug for Snapshot {
 impl Snapshot {
     /// Create a new [`SnapshotBuilder`] to build a new [`Snapshot`] for a given table root. If you
     /// instead have an existing [`Snapshot`] you would like to do minimal work to update, consider
-    /// using
+    /// using [`Snapshot::builder_from`] instead.
     pub fn builder_for(table_root: impl AsRef<str>) -> SnapshotBuilder {
         SnapshotBuilder::new_for(table_root)
     }
@@ -105,25 +105,27 @@ impl Snapshot {
     /// Create a new [`SnapshotBuilder`] to incrementally update a [`Snapshot`] to a more recent
     /// version.
     ///
-    /// We implement a simple heuristic:
-    /// 1. if the caller explicitly requests the existing version, just return the existing snapshot
-    /// 2. if the new version < existing version, error: there is no optimization to do here
-    /// 3. list from (existing checkpoint version + 1) onward (or from version 1 if there is no
-    ///    checkpoint yet)
-    /// 4. if a newer or newly discovered checkpoint is found while refreshing to the latest
-    ///    version, create a new snapshot from that checkpoint (and commits after it), even if the
-    ///    table version itself did not advance
-    /// 5. if no new checkpoint is found and the table version did not advance, return the existing
-    ///    snapshot
-    /// 6. if no new checkpoint is found, do lightweight P+M replay on the latest commits after
-    ///    ensuring we only retain commits > any checkpoints
+    /// Given an existing snapshot and an optional `target_version`, the update proceeds by case:
     ///
-    /// # Parameters
+    /// - **A.** `target_version == existing_version`: return the existing snapshot unchanged.
+    /// - **B.** `target_version < existing_version`: error. The incremental path only moves
+    ///   forward.
+    /// - Otherwise, list the log from (existing checkpoint version + 1) onward (or from version 1
+    ///   if there is no checkpoint yet), and then one of the following applies:
+    ///   - **C.1.** Listing is empty and `target_version` is set: error (the target is newer than
+    ///     anything in the log).
+    ///   - **C.2.** Listing is empty and no `target_version`: return the existing snapshot.
+    ///   - **D.** Listing contains a checkpoint: build a fresh snapshot from that checkpoint (and
+    ///     any commits after it), reusing the existing CRC if its version matches.
+    ///   - **E.** Listing contains commits but no new checkpoint and no version advance: return the
+    ///     existing snapshot.
+    ///   - **F.** Listing contains new commits (and no new checkpoint): run lightweight P+M replay
+    ///     on the new commits and merge them into the existing log segment.
     ///
-    /// - `existing_snapshot`: reference to an existing [`Snapshot`]
-    /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `target_version`: target version of the [`Snapshot`]. None will create a snapshot at the
-    ///   latest version of the table.
+    /// Each case is marked with `// case X` in `Snapshot::try_new_from_impl`.
+    ///
+    /// The target version (default: latest) is set via [`SnapshotBuilder::at_version`], and the
+    /// engine is passed to [`SnapshotBuilder::build`].
     pub fn builder_from(existing_snapshot: SnapshotRef) -> SnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
     }
@@ -176,12 +178,12 @@ impl Snapshot {
         let requested_version = target_version.into();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
+            // case A: re-requesting the same version.
             if requested_version == existing_snapshot_version {
-                // Re-requesting the same version
                 return Ok(existing_snapshot.clone());
             }
+            // case B: incremental path only moves forward.
             if requested_version < existing_snapshot_version {
-                // Hint is too new: error since this is effectively an incorrect optimization
                 return Err(Error::Generic(format!(
                     "Requested snapshot version {requested_version} is older than snapshot hint version {existing_snapshot_version}"
                 )));
@@ -212,9 +214,9 @@ impl Snapshot {
             && new_listed_files.checkpoint_parts().is_empty()
         {
             match requested_version {
-                // requested == existing_snapshot_version was handled earlier, and
-                // requested < existing_snapshot_version returned an error earlier, so any Some
-                // here is requested > existing_snapshot_version but no such commit exists.
+                // case C.1: caller requested a specific version (necessarily >
+                // existing_snapshot_version since cases A and B were handled above), but
+                // no such commit exists in the log.
                 Some(requested_version) => {
                     return Err(Error::Generic(format!(
                         "Requested snapshot version {requested_version} is not available: \
@@ -222,8 +224,8 @@ impl Snapshot {
                          {existing_snapshot_version}"
                     )));
                 }
+                // case C.2: no new commits and no explicit target; latest is existing.
                 None => {
-                    // No new commits and no explicit target, just return the same snapshot
                     return Ok(existing_snapshot.clone());
                 }
             }
@@ -248,22 +250,21 @@ impl Snapshot {
                 "Unexpected state: the newest version in the log {new_end_version} is older than the existing snapshot version {existing_snapshot_version}")));
         }
         if new_log_segment.checkpoint_version.is_some() {
-            // We found a checkpoint in the new log segment, so build a fresh snapshot from it.
+            // case D: listing contains a checkpoint; build a fresh snapshot from it.
             // TODO(#2218): consider incremental P&M replay instead of full rebuild.
-            // Pass the resolved lazy_crc so the full rebuild can reuse an already-loaded CRC
-            // when the resolved CRC version matches the existing snapshot's CRC version. If the
-            // new segment has no CRC file, resolve_crc falls back to the existing snapshot's
-            // CRC, which is safe: read_protocol_metadata validates the CRC version against
-            // end_version and falls back to log replay when they differ.
+            // `resolve_crc` picks the CRC for the rebuilt segment (see its doc for the
+            // invariant-preserving fallback rules) and reuses the existing `LazyCrc` when
+            // the resolved CRC version matches.
             let (crc_file, lazy_crc) = Self::resolve_crc(
                 &new_log_segment,
                 existing_log_segment,
                 &existing_snapshot.lazy_crc,
             );
             // Inject the resolved CRC file path so the rebuilt snapshot remembers it.
-            // Without this, if the CRC is below the new listing start (and thus not found
-            // by the listing), the rebuilt snapshot's log_segment.latest_crc_file would be
-            // None, causing future incremental updates to lose the CRC reference.
+            // Without this, if the existing CRC was below the new listing start (and thus
+            // not surfaced by the listing), the rebuilt snapshot would have
+            // `latest_crc_file = None` and future incremental updates would fall through to
+            // full log replay instead of taking the CRC fast path.
             new_log_segment.listed.latest_crc_file = crc_file;
             let snapshot = Self::try_new_from_log_segment(
                 existing_snapshot.table_root().clone(),
@@ -275,18 +276,18 @@ impl Snapshot {
             return Ok(Arc::new(snapshot?));
         }
 
+        // case E: no new checkpoint, version did not advance; return existing.
         if new_end_version == existing_snapshot_version {
-            // No new commits and no newly discovered checkpoint, just return the same snapshot.
             return Ok(existing_snapshot.clone());
         }
 
-        // after this point, we incrementally update the snapshot with the new log segment.
-        // first we remove the 'overlap' in commits, example:
+        // case F: new commits, no new checkpoint; lightweight P+M replay + merge.
+        // First we remove the 'overlap' in commits, example:
         //
-        //    old logsegment checkpoint1-commit1-commit2-commit3
-        // 1. new logsegment             commit1-commit2-commit3
-        // 2. new logsegment             commit1-commit2-commit3-commit4
-        // 3. new logsegment                     checkpoint2+commit2-commit3-commit4
+        //    existing logsegment checkpoint1-commit1-commit2-commit3
+        // 1. new logsegment                  commit1-commit2-commit3
+        // 2. new logsegment                  commit1-commit2-commit3-commit4
+        // 3. new logsegment                          checkpoint2+commit2-commit3-commit4
         //
         // retain does
         // 1. new logsegment             [empty] -> caught above
@@ -367,16 +368,31 @@ impl Snapshot {
 
     /// Determine the CRC file and LazyCrc for an incremental snapshot update.
     ///
-    /// Prefers the new segment's CRC file, falls back to the existing segment's. If the
-    /// resolved CRC version matches the existing snapshot's LazyCrc version, reuses it to
-    /// avoid redundant I/O (it may already be loaded in memory).
+    /// Prefers the new segment's CRC file; falls back to the existing segment's CRC if and
+    /// only if its version is >= the new segment's checkpoint version. If the resolved CRC
+    /// version matches the existing snapshot's LazyCrc version, reuses it to avoid redundant
+    /// I/O (it may already be loaded in memory).
+    ///
+    /// The filter preserves the [`LogSegmentFiles`] invariant `crc.version >=
+    /// checkpoint.version`. Without it, a stale inherited CRC could silently produce wrong
+    /// P&M via [`LogSegment::read_protocol_metadata_opt`]'s Case 2(b) fallback (see test
+    /// `test_incremental_snapshot_drops_stale_crc_preserves_correct_metadata`).
     fn resolve_crc(
         new_log_segment: &LogSegment,
         existing_log_segment: &LogSegment,
         existing_lazy_crc: &Arc<LazyCrc>,
     ) -> (Option<ParsedLogPath>, Arc<LazyCrc>) {
         let new_crc_file = new_log_segment.listed.latest_crc_file.clone();
-        let existing_crc_file = existing_log_segment.listed.latest_crc_file.clone();
+        let crc_satisfies_new_ckpt = |crc: &ParsedLogPath| {
+            new_log_segment
+                .checkpoint_version
+                .is_none_or(|ckpt_v| crc.version >= ckpt_v)
+        };
+        let existing_crc_file = existing_log_segment
+            .listed
+            .latest_crc_file
+            .clone()
+            .filter(crc_satisfies_new_ckpt);
         let crc_file = new_crc_file.or(existing_crc_file);
         let crc_version = crc_file.as_ref().map(|f| f.version);
         let lazy_crc = if crc_version == existing_lazy_crc.crc_version() {
@@ -2619,41 +2635,60 @@ mod tests {
         assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
     }
 
-    // Helper: create a minimal test table with commits 0-N
+    // Action builders for incremental-snapshot tests. Centralized so commit setup stays
+    // consistent across tests (e.g. the schema matches `make_test_crc_json`).
+    fn protocol_action(min_reader: u32, min_writer: u32) -> serde_json::Value {
+        json!({"protocol": {"minReaderVersion": min_reader, "minWriterVersion": min_writer}})
+    }
+
+    fn metadata_action(configuration: serde_json::Value) -> serde_json::Value {
+        json!({
+            "metaData": {
+                "id": "test-id",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": configuration,
+                "createdTime": 1587968585495i64,
+            }
+        })
+    }
+
+    fn add_action(path: &str) -> serde_json::Value {
+        json!({
+            "add": {
+                "path": path,
+                "partitionValues": {},
+                "size": 100,
+                "modificationTime": 1000,
+                "dataChange": true,
+            }
+        })
+    }
+
+    // Helper: create a minimal test table with commits 0..num_commits.
     async fn setup_test_table_with_commits(
         table_root: impl AsRef<str>,
         store: &InMemory,
         num_commits: u64,
     ) -> DeltaResult<()> {
-        // Commit 0: protocol + metadata + first file
-        let commit0 = vec![
-            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
-            json!({
-                "metaData": {
-                    "id": "test-id",
-                    "format": {"provider": "parquet", "options": {}},
-                    "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
-                    "partitionColumns": [],
-                    "configuration": {},
-                    "createdTime": 1587968585495i64
-                }
-            }),
-            json!({"add": {"path": "file1.parquet", "partitionValues": {}, "size": 100, "modificationTime": 1000, "dataChange": true}}),
-        ];
-        commit(table_root.as_ref(), store, 0, commit0).await;
+        // Commit 0: protocol + metadata + first file.
+        commit(
+            table_root.as_ref(),
+            store,
+            0,
+            vec![
+                protocol_action(1, 2),
+                metadata_action(json!({})),
+                add_action("file1.parquet"),
+            ],
+        )
+        .await;
 
-        // Additional commits with just add actions
+        // Additional commits with just add actions.
         for i in 1..num_commits {
-            let commit_i = vec![json!({
-                "add": {
-                    "path": format!("file{}.parquet", i + 1),
-                    "partitionValues": {},
-                    "size": (i + 1) * 100,
-                    "modificationTime": (i + 1) * 1000,
-                    "dataChange": true
-                }
-            })];
-            commit(table_root.as_ref(), store, i, commit_i).await;
+            let path = format!("file{}.parquet", i + 1);
+            commit(table_root.as_ref(), store, i, vec![add_action(&path)]).await;
         }
         Ok(())
     }
@@ -2765,13 +2800,13 @@ mod tests {
         Ok(())
     }
 
-    /// CRC JSON for the standard test table (see [`setup_test_table_with_commits`]).
+    // CRC JSON for the standard test table (see `setup_test_table_with_commits`).
     fn make_test_crc_json(table_size_bytes: i64, num_files: i64) -> serde_json::Value {
         json!({
-            "table_size_bytes": table_size_bytes,
-            "num_files": num_files,
-            "num_metadata": 1,
-            "num_protocol": 1,
+            "tableSizeBytes": table_size_bytes,
+            "numFiles": num_files,
+            "numMetadata": 1,
+            "numProtocol": 1,
             "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
             "metadata": {
                 "id": "test-id",
@@ -2784,105 +2819,235 @@ mod tests {
         })
     }
 
+    // `resolve_crc` in the checkpoint-rebuild path (case D) must correctly decide between
+    // reusing the existing snapshot's CRC, creating a fresh LazyCrc, or dropping the CRC
+    // entirely. Each case below sets up commits 0-3, writes an existing CRC, builds
+    // snapshot_v3, writes a checkpoint, optionally writes a new CRC, then runs the
+    // incremental update and checks the outcome.
+    //
+    // reuse_existing:   existing crc@v2 stays when new ckpt@v1 is below it (invariant OK)
+    //                   and no newer CRC was listed; the LazyCrc Arc is reused (loaded).
+    // refresh_to_newer: existing crc@v2 is superseded by a newly-listed crc@v3; the new
+    //                   CRC version wins and produces a fresh unloaded LazyCrc.
+    // crc_equals_ckpt:  existing crc@v2 and new ckpt@v2 sit at the same version -- sanity
+    //                   coverage for the invariant boundary `crc.version >= checkpoint.version`.
+    //                   (Note: this case does not pin `>=` vs `>` in `resolve_crc`'s filter
+    //                   because the listing also re-surfaces the existing CRC, so
+    //                   `new_crc_file = Some(v2)` wins via `.or(existing)` regardless of the
+    //                   filter's verdict on the existing CRC fallback. A scenario where only
+    //                   the fallback exercises the boundary is structurally unreachable: it
+    //                   would require the existing CRC to be below listing_start, but the
+    //                   LogSegmentFiles invariant forces existing_crc_version >=
+    //                   existing_checkpoint_version = listing_start - 1.)
+    // drop_below_ckpt:  existing crc@v1 would violate the LogSegmentFiles invariant with
+    //                   new ckpt@v2 (1 < 2), so it is filtered out; result has no CRC.
+    #[rstest]
+    #[case::reuse_existing(2, 1, None, Some(2), true)]
+    #[case::refresh_to_newer(2, 1, Some(3), Some(3), true)]
+    #[case::crc_equals_ckpt(2, 2, None, Some(2), true)]
+    #[case::drop_below_ckpt(1, 2, None, None, false)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_checkpoint_early_return_reuses_lazy_crc() -> DeltaResult<()>
-    {
+    async fn test_incremental_snapshot_checkpoint_rebuild_crc_resolution(
+        #[case] existing_crc_v: u64,
+        #[case] new_ckpt_v: u64,
+        #[case] newly_listed_crc_v: Option<u64>,
+        #[case] expected_crc_v: Option<u64>,
+        #[case] expect_loaded: bool,
+    ) -> DeltaResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
-
-        // Create commits 0-3
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
 
-        // Write a well-formed CRC at v2 with P&M matching the table's schema.
-        let crc_path = delta_path_for_version(2, "crc");
         ctx.store
-            .put(&crc_path, make_test_crc_json(300, 3).to_string().into())
+            .put(
+                &delta_path_for_version(existing_crc_v, "crc"),
+                make_test_crc_json(300, 3).to_string().into(),
+            )
             .await?;
 
-        // Build snapshot at v3 -- its log segment will reference CRC at v2.
         let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(3)
             .build(ctx.engine.as_ref())?;
-        assert_eq!(snapshot_v3.lazy_crc.crc_version(), Some(2));
+        assert_eq!(snapshot_v3.lazy_crc.crc_version(), Some(existing_crc_v));
 
-        // Force-load the CRC so it's cached in the OnceLock.
-        let _ = snapshot_v3.lazy_crc.get_or_load(ctx.engine.as_ref());
-        assert!(snapshot_v3.lazy_crc.is_loaded());
-
-        // Write a checkpoint at v1 so that the incremental update hits the checkpoint
-        // early-return. The CRC file (v2) is unchanged.
+        // Write the new checkpoint, plus optionally a newer CRC alongside it.
         Snapshot::builder_for(ctx.url.as_str())
-            .at_version(1)
+            .at_version(new_ckpt_v)
             .build(ctx.engine.as_ref())?
             .checkpoint(ctx.engine.as_ref())?;
+        if let Some(v) = newly_listed_crc_v {
+            ctx.store
+                .put(
+                    &delta_path_for_version(v, "crc"),
+                    make_test_crc_json(400, 4).to_string().into(),
+                )
+                .await?;
+        }
 
-        // Incremental update from v3: discovers the new checkpoint, takes the early-return.
-        let updated = Snapshot::builder_from(snapshot_v3.clone()).build(ctx.engine.as_ref())?;
+        let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
 
-        // Verify structural correctness: same result as a fresh snapshot build.
+        // Observable equivalence: incremental update matches a fresh rebuild, including
+        // `log_segment.listed.latest_crc_file` (so a filter-bypass regression is caught by
+        // `compare_snapshots`, not just by the explicit CRC assertions below).
         let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         compare_snapshots(&updated, &fresh);
         assert_eq!(updated.version(), 3);
-        assert_eq!(updated.log_segment.checkpoint_version, Some(1));
+        assert_eq!(updated.log_segment.checkpoint_version, Some(new_ckpt_v));
+        assert_eq!(updated.lazy_crc.crc_version(), expected_crc_v);
+        assert_eq!(
+            updated
+                .log_segment
+                .listed
+                .latest_crc_file
+                .as_ref()
+                .map(|f| f.version),
+            expected_crc_v
+        );
+        assert_eq!(updated.lazy_crc.is_loaded(), expect_loaded);
 
-        // The LazyCrc should be reused (already loaded) rather than a fresh unloaded one.
-        assert_eq!(updated.lazy_crc.crc_version(), Some(2));
-        assert!(
-            updated.lazy_crc.is_loaded(),
-            "LazyCrc should be reused from old snapshot, not freshly created"
+        Ok(())
+    }
+
+    // Stronger regression for the `resolve_crc` invariant filter: set up a metadata change
+    // at the checkpoint version so that a stale inherited CRC would produce wrong
+    // Metadata, not just wrong bookkeeping. Without the filter, the incremental update
+    // would return Metadata from commit 0 (via Case 2(b) fallback on a below-checkpoint
+    // CRC); the fresh rebuild would return Metadata from commit 2. `compare_snapshots`
+    // catches that on `table_configuration`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_snapshot_drops_stale_crc_preserves_correct_metadata(
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        let table_root = ctx.url.as_str();
+
+        // commit 0: initial P&M with empty configuration.
+        commit(
+            table_root,
+            &ctx.store,
+            0,
+            vec![
+                protocol_action(1, 2),
+                metadata_action(json!({})),
+                add_action("f0.parquet"),
+            ],
+        )
+        .await;
+        // commit 1: data-only add.
+        commit(table_root, &ctx.store, 1, vec![add_action("f1.parquet")]).await;
+        // commit 2: metadata change (new configuration property). A stale CRC@v1 would miss
+        // this.
+        commit(
+            table_root,
+            &ctx.store,
+            2,
+            vec![
+                metadata_action(json!({"delta.myKey": "myValue"})),
+                add_action("f2.parquet"),
+            ],
+        )
+        .await;
+        // commit 3: data-only add.
+        commit(table_root, &ctx.store, 3, vec![add_action("f3.parquet")]).await;
+
+        // CRC@v1 captures the BEFORE metadata (no "delta.myKey" property). This is the
+        // stale CRC we expect the filter to reject.
+        ctx.store
+            .put(
+                &delta_path_for_version(1, "crc"),
+                make_test_crc_json(200, 2).to_string().into(),
+            )
+            .await?;
+
+        let snapshot_v3 = Snapshot::builder_for(table_root)
+            .at_version(3)
+            .build(ctx.engine.as_ref())?;
+        // snapshot_v3 was built via log replay, which correctly picks up the v2 metadata
+        // change (pruned replay over commits after CRC@v1 finds the new metaData action).
+        assert_eq!(
+            snapshot_v3
+                .table_properties()
+                .unknown_properties
+                .get("delta.myKey"),
+            Some(&"myValue".to_string())
+        );
+
+        // Write checkpoint@v2, incorporating the new metadata.
+        Snapshot::builder_for(table_root)
+            .at_version(2)
+            .build(ctx.engine.as_ref())?
+            .checkpoint(ctx.engine.as_ref())?;
+
+        // Incremental update. With the filter: CRC@v1 dropped, log replay via checkpoint@v2
+        // returns the correct new metadata. Without the filter: Case 2(b) fallback returns
+        // CRC@v1's stale (empty) configuration, and compare_snapshots fails on
+        // table_configuration.
+        let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
+        let fresh = Snapshot::builder_for(table_root).build(ctx.engine.as_ref())?;
+        compare_snapshots(&updated, &fresh);
+
+        // Observable contract: the user-visible metadata reflects the v2 change, not the
+        // v0 baseline captured by the stale CRC.
+        assert_eq!(
+            updated
+                .table_properties()
+                .unknown_properties
+                .get("delta.myKey"),
+            Some(&"myValue".to_string())
         );
 
         Ok(())
     }
 
-    // When the checkpoint early-return discovers a newer CRC alongside the new checkpoint,
-    // resolve_crc should create a fresh (unloaded) LazyCrc rather than reusing the old one.
+    // Multi-hop: v0 -> v5 (case F, P+M replay) -> v10 (case D, checkpoint rebuild).
+    // Verifies the case-F -> case-D sequence, including that a loaded existing LazyCrc is
+    // not reused when the filter drops it on the case-D hop (the resulting LazyCrc must be
+    // unloaded, not the loaded Arc from snapshot_v5).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_checkpoint_early_return_creates_fresh_lazy_crc_when_crc_version_changes(
-    ) -> DeltaResult<()> {
+    async fn test_incremental_snapshot_multi_hop_case_f_then_case_d() -> DeltaResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 11).await?;
 
-        // Create commits 0-3
-        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
-
-        // Write a CRC at v2 -- this is what snapshot_v3 will reference.
-        let crc_v2_path = delta_path_for_version(2, "crc");
+        // CRC at v5 with matching P&M; it is well above any checkpoint (none exists yet),
+        // so every hop inherits it.
         ctx.store
-            .put(&crc_v2_path, make_test_crc_json(300, 3).to_string().into())
+            .put(
+                &delta_path_for_version(5, "crc"),
+                make_test_crc_json(600, 6).to_string().into(),
+            )
             .await?;
 
-        // Build snapshot at v3 -- references CRC at v2.
-        let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
-            .at_version(3)
+        // Hop 1: snapshot at v0.
+        let snapshot_v0 = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(0)
             .build(ctx.engine.as_ref())?;
-        assert_eq!(snapshot_v3.lazy_crc.crc_version(), Some(2));
+        assert_eq!(snapshot_v0.lazy_crc.crc_version(), None);
 
-        // Force-load the v2 CRC into the OnceLock.
-        let _ = snapshot_v3.lazy_crc.get_or_load(ctx.engine.as_ref());
-        assert!(snapshot_v3.lazy_crc.is_loaded());
+        // Hop 2: incremental v0 -> v5 (case F: new commits, no checkpoint). This picks up
+        // CRC@v5 from the listing.
+        let snapshot_v5 = Snapshot::builder_from(snapshot_v0).build(ctx.engine.as_ref())?;
+        assert_eq!(snapshot_v5.log_segment.checkpoint_version, None);
+        assert_eq!(snapshot_v5.lazy_crc.crc_version(), Some(5));
 
-        // Write a checkpoint at v1 AND a newer CRC at v3, so the incremental update
-        // sees a different CRC version than the old snapshot's (v2 -> v3).
+        // Force-load the v5 CRC so we can observe that a dropped CRC yields a fresh
+        // unloaded LazyCrc on the next hop (not the loaded v5 Arc carried forward).
+        let _ = snapshot_v5.lazy_crc.get_or_load(ctx.engine.as_ref());
+        assert!(snapshot_v5.lazy_crc.is_loaded());
+
+        // Write checkpoint at v7.
         Snapshot::builder_for(ctx.url.as_str())
-            .at_version(1)
+            .at_version(7)
             .build(ctx.engine.as_ref())?
             .checkpoint(ctx.engine.as_ref())?;
 
-        let crc_v3_path = delta_path_for_version(3, "crc");
-        ctx.store
-            .put(&crc_v3_path, make_test_crc_json(400, 4).to_string().into())
-            .await?;
-
-        // Incremental update: discovers both the new checkpoint and the newer CRC at v3.
-        let updated = Snapshot::builder_from(snapshot_v3).build(ctx.engine.as_ref())?;
-
-        // Verify structural correctness: same result as a fresh snapshot build.
-        let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
-        compare_snapshots(&updated, &fresh);
-        assert_eq!(updated.version(), 3);
-        assert_eq!(updated.log_segment.checkpoint_version, Some(1));
-
-        // A fresh LazyCrc at v3 should have been created rather than reusing the old v2 one.
-        assert_eq!(updated.lazy_crc.crc_version(), Some(3));
+        // Hop 3: incremental v5 -> v10 (case D: discovers checkpoint@v7). CRC@v5 is below
+        // the new checkpoint (5 < 7) so the filter drops it, and the rebuilt snapshot gets
+        // a fresh unloaded LazyCrc rather than the v5 Arc that was loaded above.
+        let snapshot_v10 = Snapshot::builder_from(snapshot_v5).build(ctx.engine.as_ref())?;
+        let fresh_v10 = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        compare_snapshots(&snapshot_v10, &fresh_v10);
+        assert_eq!(snapshot_v10.version(), 10);
+        assert_eq!(snapshot_v10.log_segment.checkpoint_version, Some(7));
+        assert_eq!(snapshot_v10.lazy_crc.crc_version(), None);
+        assert!(!snapshot_v10.lazy_crc.is_loaded());
 
         Ok(())
     }
