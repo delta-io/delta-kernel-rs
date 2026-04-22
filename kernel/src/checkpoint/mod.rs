@@ -850,8 +850,8 @@ fn build_written_checkpoint_info(
         Error::internal_error("ActionReconciliationIteratorState Arc has other references")
     })?;
     let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
-        total_size_in_bytes,
         state,
+        total_size_in_bytes,
         sidecar_count,
     )?;
     Ok(WrittenCheckpointInfo {
