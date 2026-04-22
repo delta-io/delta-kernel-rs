@@ -1265,26 +1265,14 @@ mod tests {
         let stats = collect_stats(&batch, &[column_name!("id"), column_name!("map_col")]).unwrap();
 
         // === THEN: map_col has nullCount=1 but no min/max ===
-        let null_count = stats
-            .column_by_name("nullCount")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
+        let null_count = child_struct(&stats, "nullCount");
         let map_nulls = null_count
             .column_by_name("map_col")
             .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+            .as_primitive::<Int64Type>();
         assert_eq!(map_nulls.value(0), 1);
 
-        let min_values = stats
-            .column_by_name("minValues")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
+        let min_values = child_struct(&stats, "minValues");
         assert!(min_values.column_by_name("id").is_some());
         assert!(min_values.column_by_name("map_col").is_none());
     }
@@ -1330,34 +1318,22 @@ mod tests {
         )
         .unwrap();
 
-        // === WHEN: collecting stats with "v" as a terminal column (not "v.metadata", "v.value") ===
+        // === WHEN: collecting stats with "v" as a terminal column ===
         let stats = collect_stats(&batch, &[column_name!("id"), column_name!("v")]).unwrap();
 
         // === THEN: v has nullCount=1 at the struct level, no recursion, no min/max ===
-        let null_count = stats
-            .column_by_name("nullCount")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
+        let null_count = child_struct(&stats, "nullCount");
         let v_nulls = null_count
             .column_by_name("v")
             .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+            .as_primitive::<Int64Type>();
         assert_eq!(v_nulls.value(0), 1);
 
         // v must NOT be recursed into, no nested metadata/value in nullCount
         assert!(null_count.column_by_name("metadata").is_none());
         assert!(null_count.column_by_name("value").is_none());
 
-        let min_values = stats
-            .column_by_name("minValues")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
+        let min_values = child_struct(&stats, "minValues");
         assert!(min_values.column_by_name("id").is_some());
         assert!(min_values.column_by_name("v").is_none());
     }
@@ -1442,6 +1418,16 @@ mod tests {
             get_stat::<Int32Type>(&stats, "maxValues", "my_struct", "b"),
             20
         );
+    }
+
+    /// Extracts a named child column from a StructArray, downcasting it to StructArray.
+    fn child_struct<'a>(parent: &'a StructArray, name: &str) -> &'a StructArray {
+        parent
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
     }
 
     // Generic helper to extract and downcast nested columns from stats
