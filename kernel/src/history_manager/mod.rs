@@ -97,16 +97,21 @@ fn get_timestamp_search_bounds(
         )
     );
 
-    // Based on the in-commit timestamp enablement, determine the search bounds. If the
-    // desired timestamp is in the ICT range, we must _only_ search over commits with ICT
-    // enabled. Otherwise, the timestamp range must only consist of commits that use file
-    // modification time as the timestamp.
+    // Per PROTOCOL.md section on In-Commit Timestamps:
+    //   - ts >= enablementTs => consider only versions >= enablementVersion (ICT region)
+    //   - ts <  enablementTs => consider only versions <  enablementVersion (file mod region)
     let result = match timestamp.cmp(&ict_timestamp) {
+        // Equal: enablementTs IS the ICT of enablementVersion, so this version is the exact
+        // answer for both bounds (GreatestLower and LeastUpper).
         Ordering::Equal => TimestampSearchBounds::ExactMatch(ict_enablement_version),
+        // Less: Restrict search to the pre-ICT region via FileModificationSearchUntil. The
+        // protocol guarantees enablementTs > prev_mod_time, so when the pre-ICT linear scan
+        // fails for LeastUpper, enablementVersion is the true least upper bound.
         Ordering::Less => TimestampSearchBounds::FileModificationSearchUntil {
             index: ict_enablement_idx,
             ict_enablement_version,
         },
+        // Greater: Restrict search to ICT commits only via ICTSearchStartingFrom.
         Ordering::Greater => TimestampSearchBounds::ICTSearchStartingFrom(ict_enablement_idx),
     };
     Ok(result)
