@@ -319,9 +319,18 @@ void log_line_callback(KernelStringSlice line) {
 int main(int argc, char* argv[])
 {
   char* requested_cols = NULL;
+  bool use_arrow_metadata = false;
   int c;
-  while ((c = getopt (argc, argv, "c:")) != -1) {
+  while ((c = getopt (argc, argv, "ac:")) != -1) {
     switch (c) {
+    case 'a':
+      // Use the Arrow batch-mode scan metadata path (scan_metadata_next_arrow) instead of
+      // the callback-based path (scan_metadata_next + visit_scan_metadata). This path
+      // returns scan-file metadata as Arrow C Data Interface batches; engines that already
+      // process Arrow natively can extract path/size/stats/DV/partition-values directly
+      // from the batch columns rather than via per-row callbacks.
+      use_arrow_metadata = true;
+      break;
     case 'c':
       requested_cols = optarg;
       break;
@@ -344,9 +353,16 @@ int main(int argc, char* argv[])
   }
 
   if (optind != (argc - 1)) {
-    printf("Usage: %s [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
+    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
     return -1;
   }
+
+#ifndef PRINT_ARROW_DATA
+  if (use_arrow_metadata) {
+    fprintf(stderr, "-a (arrow-batch metadata) requires building with PRINT_DATA=ON\n");
+    return -1;
+  }
+#endif
 
   char* table_path = argv[optind];
   printf("Reading table at %s\n", table_path);
@@ -500,18 +516,29 @@ int main(int argc, char* argv[])
   print_diag("\nIterating scan metadata\n");
 
   int exit_code = 0;
-  // iterate scan files
-  for (;;) {
-    ExternResultbool ok_res =
-      scan_metadata_next(data_iter, &context, do_visit_scan_metadata);
-    if (ok_res.tag != Okbool) {
-      print_error("Failed to iterate scan metadata.", (Error*)ok_res.err);
-      free_error((Error*)ok_res.err);
-      exit_code = -1;
-      break;
-    } else if (!ok_res.ok) {
-      print_diag("Scan metadata iterator done\n");
-      break;
+#ifdef PRINT_ARROW_DATA
+  if (use_arrow_metadata) {
+    // Arrow batch-mode: hand each metadata batch to iterate_scan_metadata_arrow, which
+    // imports it via arrow-glib for inspection. This path does NOT call read_parquet_file;
+    // a real engine would walk the batch columns and read parquet itself.
+    iterate_scan_metadata_arrow(&context, data_iter);
+  } else
+#endif
+  {
+    // Callback-mode: kernel calls back into do_visit_scan_metadata for each metadata batch,
+    // which then walks each scan file via visit_scan_metadata + scan_row_callback.
+    for (;;) {
+      ExternResultbool ok_res =
+        scan_metadata_next(data_iter, &context, do_visit_scan_metadata);
+      if (ok_res.tag != Okbool) {
+        print_error("Failed to iterate scan metadata.", (Error*)ok_res.err);
+        free_error((Error*)ok_res.err);
+        exit_code = -1;
+        break;
+      } else if (!ok_res.ok) {
+        print_diag("Scan metadata iterator done\n");
+        break;
+      }
     }
   }
 
