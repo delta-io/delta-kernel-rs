@@ -129,6 +129,17 @@ impl Snapshot {
         SnapshotBuilder::new_from(existing_snapshot)
     }
 
+    /// Create a new [`Snapshot`] from a [`LogSegment`] and [`TableConfiguration`].
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
+        Self::new_with_crc(
+            log_segment,
+            table_configuration,
+            Arc::new(LazyCrc::new(None)),
+        )
+    }
+
     /// Internal constructor that accepts an explicit [`LazyCrc`].
     pub(crate) fn new_with_crc(
         log_segment: LogSegment,
