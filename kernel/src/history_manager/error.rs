@@ -39,23 +39,31 @@ pub enum LogHistoryError {
         reason: &'static str,
     },
     /// An internal error occurred during timestamp conversion.
-    #[error("{context}: {source}")]
+    #[error("{context}{}", source.as_ref().map(|e| format!(": {e}")).unwrap_or_default())]
     Internal {
         /// Description of the operation that failed.
         context: &'static str,
-        /// The underlying error.
+        /// The underlying error, if any.
         #[source]
-        source: Box<crate::Error>,
+        source: Option<Box<crate::Error>>,
     },
 }
 
 impl LogHistoryError {
-    /// Creates an internal error with context describing the failed operation.
-    #[allow(unused)]
+    /// Creates an internal error with context and an underlying cause.
     pub(crate) fn internal(context: &'static str, source: crate::Error) -> Self {
         Self::Internal {
             context,
-            source: Box::new(source),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// Creates an internal error with just a context message.
+    #[allow(unused)]
+    pub(crate) fn internal_message(context: &'static str) -> Self {
+        Self::Internal {
+            context,
+            source: None,
         }
     }
 }
