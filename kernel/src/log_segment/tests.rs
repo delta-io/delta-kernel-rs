@@ -4031,24 +4031,55 @@ async fn test_try_new_with_checkpoint_rejects_invalid_path(
 }
 
 #[rstest]
-#[case::classic_parquet("file:///_delta_log/00000000000000000002.checkpoint.parquet")]
-#[case::v2_uuid(
-    "file:///_delta_log/00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet"
+// Classic parquet checkpoint with no pre-existing CRC (most common path).
+#[case::classic_parquet_no_crc(
+    "file:///_delta_log/00000000000000000002.checkpoint.parquet",
+    None,
+    None
+)]
+// V2 UUID checkpoint with no pre-existing CRC.
+#[case::v2_uuid_no_crc(
+    "file:///_delta_log/00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet",
+    None,
+    None,
+)]
+// Stale CRC (version 1 < checkpoint 2) must be cleared to preserve the LogSegmentFiles
+// invariant that `latest_crc_file.version >= checkpoint version`.
+#[case::stale_crc_cleared(
+    "file:///_delta_log/00000000000000000002.checkpoint.parquet",
+    Some(1),
+    None
+)]
+// CRC at the checkpoint version satisfies the invariant and must be retained.
+#[case::crc_at_checkpoint_version_retained(
+    "file:///_delta_log/00000000000000000002.checkpoint.parquet",
+    Some(2),
+    Some(2)
 )]
 #[tokio::test]
-async fn test_try_new_with_checkpoint_sets_checkpoint_and_clears_commits(#[case] path: &str) {
-    let log_segment = create_segment_for(LogSegmentConfig {
+async fn test_try_new_with_checkpoint(
+    #[case] ckpt_path: &str,
+    #[case] crc_version: Option<u64>,
+    #[case] expected_crc_version: Option<u64>,
+) {
+    let mut log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &[0, 1, 2],
         compaction_versions: &[(0, 2)],
         ..Default::default()
     })
     .await;
+    if let Some(v) = crc_version {
+        // Bypass try_new_with_crc_file's end_version check so we can plant a stale CRC.
+        log_segment.listed.latest_crc_file =
+            Some(create_log_path(&format!("file:///_delta_log/{v:020}.crc")));
+    }
     assert!(!log_segment.listed.ascending_commit_files.is_empty());
     // TODO(#2337): restore to assert !is_empty() when log compaction is re-enabled
     assert!(log_segment.listed.ascending_compaction_files.is_empty());
 
-    let ckpt_path = create_log_path(path);
-    let result = log_segment.try_new_with_checkpoint(ckpt_path).unwrap();
+    let result = log_segment
+        .try_new_with_checkpoint(create_log_path(ckpt_path))
+        .unwrap();
 
     assert_eq!(result.checkpoint_version, Some(2));
     assert_eq!(result.listed.checkpoint_parts.len(), 1);
@@ -4056,6 +4087,10 @@ async fn test_try_new_with_checkpoint_sets_checkpoint_and_clears_commits(#[case]
     assert!(result.listed.ascending_commit_files.is_empty());
     assert!(result.listed.ascending_compaction_files.is_empty());
     assert!(result.last_checkpoint_hint_summary().is_none());
+    assert_eq!(
+        result.listed.latest_crc_file.as_ref().map(|c| c.version),
+        expected_crc_version
+    );
 
     // latest_commit_file is preserved for ICT access even though commits are cleared
     assert_eq!(
