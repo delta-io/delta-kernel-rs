@@ -3197,12 +3197,6 @@ mod tests {
         Ok(())
     }
 
-    // Regression: the stale-CRC skip in the P+M-replay path prevents silent metadata
-    // regression when an at-or-below checkpoint is discovered and the inherited CRC is
-    // older than the existing snapshot's P&M. Without the skip,
-    // `read_protocol_metadata_opt`'s Case 2(b) fallback loads the stale CRC's P&M and
-    // `TableConfiguration::try_new_from` overwrites the existing (correct) state with it.
-    //
     // Setup: commits 0-3 with a metadata change at commit 2; stale CRC@v1 captures the
     // pre-change P&M; snapshot_v3 picks up the v2 metadata via log replay. A new
     // checkpoint@v1 is then written (at or below snapshot_v3, so the update takes the
