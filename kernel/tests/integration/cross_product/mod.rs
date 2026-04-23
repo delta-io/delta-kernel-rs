@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use delta_kernel::engine::default::DefaultEngineBuilder;
-use delta_kernel::{DeltaResult, Engine, Snapshot};
+use delta_kernel::{DeltaResult, Engine, FileMeta, LogPath, Snapshot};
 use rstest::rstest;
 use rstest_reuse::apply;
 use test_utils::table_builder::{
@@ -36,7 +36,7 @@ fn test_cross_product_read_write(
     let table = test_table(log_state.clone(), feature_set, data_layout, table_config);
     let engine: Arc<dyn Engine> =
         Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
-    let snap = build_snapshot!(version_target, table.table_root(), engine.as_ref());
+    let snap = build_snapshot!(version_target, &table, engine.as_ref());
 
     let expected_version = match &version_target {
         VersionTarget::Latest | VersionTarget::IncrementalToLatest { .. } => {
