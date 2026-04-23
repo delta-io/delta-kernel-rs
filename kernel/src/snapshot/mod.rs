@@ -544,16 +544,19 @@ impl Snapshot {
         let checkpoint_log_path = ParsedLogPath::try_from(file_meta)?.ok_or_else(|| {
             Error::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
+        let checkpoint_version = checkpoint_log_path.version;
         let new_log_segment = self
             .log_segment
             .try_new_with_checkpoint(checkpoint_log_path)?;
-        // Mirror `lazy_crc` from the new log segment's `latest_crc_file`:
-        // `try_new_with_checkpoint` either preserves the existing CRC or clears a stale
-        // one, and `lazy_crc` must track whichever outcome occurred.
-        let lazy_crc = if new_log_segment.listed.latest_crc_file.is_some() {
-            self.lazy_crc.clone()
-        } else {
+        // Drop a cached CRC that predates the checkpoint version.
+        let lazy_crc = if self
+            .lazy_crc
+            .crc_version()
+            .is_some_and(|v| v < checkpoint_version)
+        {
             Arc::new(LazyCrc::new(None))
+        } else {
+            self.lazy_crc.clone()
         };
         Ok((
             CheckpointWriteResult::Written,
