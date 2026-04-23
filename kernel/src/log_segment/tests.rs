@@ -4030,38 +4030,32 @@ async fn test_try_new_with_checkpoint_rejects_invalid_path(
     assert_result_error_with_message(result, expected_error);
 }
 
+// CRC state is orthogonal to checkpoint path format, so we express the path format as a
+// `#[values]` axis (classic parquet vs. V2 UUID) and the CRC state as `#[case]` rows. The
+// cartesian product covers every pairing without enumerating 6 `#[case]`s by hand.
+//
+// CRC states:
+//   - no_crc:                  no pre-existing CRC (most common path)
+//   - stale_crc_cleared:       CRC@v1 < checkpoint@v2. Must be cleared to preserve the
+//     LogSegmentFiles invariant `latest_crc_file.version >= checkpoint version`.
+//   - crc_at_checkpoint_retained: CRC@v2 satisfies the invariant and must be retained.
 #[rstest]
-// Classic parquet checkpoint with no pre-existing CRC (most common path).
-#[case::classic_parquet_no_crc(
-    "file:///_delta_log/00000000000000000002.checkpoint.parquet",
-    None,
-    None
-)]
-// V2 UUID checkpoint with no pre-existing CRC.
-#[case::v2_uuid_no_crc(
-    "file:///_delta_log/00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet",
-    None,
-    None,
-)]
-// Stale CRC (version 1 < checkpoint 2) must be cleared to preserve the LogSegmentFiles
-// invariant that `latest_crc_file.version >= checkpoint version`.
-#[case::stale_crc_cleared(
-    "file:///_delta_log/00000000000000000002.checkpoint.parquet",
-    Some(1),
-    None
-)]
-// CRC at the checkpoint version satisfies the invariant and must be retained.
-#[case::crc_at_checkpoint_version_retained(
-    "file:///_delta_log/00000000000000000002.checkpoint.parquet",
-    Some(2),
-    Some(2)
-)]
+#[case::no_crc(None, None)]
+#[case::stale_crc_cleared(Some(1), None)]
+#[case::crc_at_checkpoint_retained(Some(2), Some(2))]
 #[tokio::test]
 async fn test_try_new_with_checkpoint(
-    #[case] ckpt_path: &str,
+    #[values(
+        "checkpoint.parquet",
+        "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet"
+    )]
+    ckpt_suffix: &str,
     #[case] crc_version: Option<u64>,
     #[case] expected_crc_version: Option<u64>,
 ) {
+    const CHECKPOINT_VERSION: u64 = 2;
+    let ckpt_url = format!("file:///_delta_log/{CHECKPOINT_VERSION:020}.{ckpt_suffix}");
+
     let mut log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &[0, 1, 2],
         compaction_versions: &[(0, 2)],
@@ -4078,12 +4072,15 @@ async fn test_try_new_with_checkpoint(
     assert!(log_segment.listed.ascending_compaction_files.is_empty());
 
     let result = log_segment
-        .try_new_with_checkpoint(create_log_path(ckpt_path))
+        .try_new_with_checkpoint(create_log_path(&ckpt_url))
         .unwrap();
 
-    assert_eq!(result.checkpoint_version, Some(2));
+    assert_eq!(result.checkpoint_version, Some(CHECKPOINT_VERSION));
     assert_eq!(result.listed.checkpoint_parts.len(), 1);
-    assert_eq!(result.listed.checkpoint_parts[0].version, 2);
+    assert_eq!(
+        result.listed.checkpoint_parts[0].version,
+        CHECKPOINT_VERSION
+    );
     assert!(result.listed.ascending_commit_files.is_empty());
     assert!(result.listed.ascending_compaction_files.is_empty());
     assert!(result.last_checkpoint_hint_summary().is_none());
