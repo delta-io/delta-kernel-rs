@@ -5,6 +5,7 @@ use delta_kernel_derive::internal_api;
 use tracing::{info_span, Span};
 
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
+use crate::log_segment::LogSegment;
 use crate::metrics::reporter::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::parallel_phase::ParallelPhase;
@@ -36,6 +37,7 @@ pub struct SequentialScanMetadata {
     pub(crate) sequential: SequentialPhase<ScanLogReplayProcessor>,
     operation_id: MetricId,
     start: Instant,
+    deferred_parallel_checkpoint_planning: Option<DeferredParallelCheckpointPlanning>,
     span: Span,
 }
 
@@ -46,20 +48,50 @@ impl SequentialScanMetadata {
             sequential,
             operation_id,
             start: Instant::now(),
+            deferred_parallel_checkpoint_planning: None,
             // TODO: Associate a unique scan ID with this span to correlate sequential and parallel
             // phases
             span: info_span!("sequential_scan_metadata"),
         }
     }
 
+    pub(crate) fn new_with_deferred_parallel_checkpoint_planning(
+        sequential: SequentialPhase<ScanLogReplayProcessor>,
+        engine: Arc<dyn Engine>,
+        action_schema: SchemaRef,
+        stats_schema: Option<SchemaRef>,
+        partition_schema: Option<SchemaRef>,
+    ) -> Self {
+        let operation_id = MetricId::new();
+        Self {
+            sequential,
+            operation_id,
+            start: Instant::now(),
+            deferred_parallel_checkpoint_planning: Some(DeferredParallelCheckpointPlanning {
+                engine,
+                action_schema,
+                stats_schema,
+                partition_schema,
+            }),
+            span: info_span!("sequential_scan_metadata"),
+        }
+    }
+
     pub fn finish(self) -> DeltaResult<AfterSequentialScanMetadata> {
-        let _guard = self.span.enter();
-        match self.sequential.finish()? {
+        let Self {
+            sequential,
+            operation_id,
+            start,
+            deferred_parallel_checkpoint_planning,
+            span,
+        } = self;
+        let _guard = span.enter();
+        match sequential.finish()? {
             AfterSequential::Done(processor) => {
                 let event = processor.get_metrics().to_event(
-                    self.operation_id,
+                    operation_id,
                     ScanType::SequentialPhase,
-                    self.start.elapsed(),
+                    start.elapsed(),
                 );
                 processor
                     .get_metrics()
@@ -67,12 +99,24 @@ impl SequentialScanMetadata {
                 emit_scan_metadata_completed(&event);
                 Ok(AfterSequentialScanMetadata::Done)
             }
-            AfterSequential::Parallel { processor, files } => {
+            AfterSequential::Parallel {
+                mut processor,
+                files,
+            } => {
                 let event = processor.get_metrics().to_event(
-                    self.operation_id,
+                    operation_id,
                     ScanType::SequentialPhase,
-                    self.start.elapsed(),
+                    start.elapsed(),
                 );
+                if let Some(deferred_planning) = deferred_parallel_checkpoint_planning.as_ref() {
+                    if let Some(checkpoint_info) = deferred_planning.finalize(&files)? {
+                        processor.set_checkpoint_info(
+                            deferred_planning.engine.as_ref(),
+                            checkpoint_info,
+                        )?;
+                    }
+                }
+
                 processor
                     .get_metrics()
                     .log("Sequential scan metadata completed");
@@ -82,13 +126,39 @@ impl SequentialScanMetadata {
                 Ok(AfterSequentialScanMetadata::Parallel {
                     state: Box::new(ParallelState {
                         inner: processor,
-                        operation_id: self.operation_id,
+                        operation_id,
                         parallel_start: Instant::now(),
                     }),
                     files,
                 })
             }
         }
+    }
+}
+
+struct DeferredParallelCheckpointPlanning {
+    engine: Arc<dyn Engine>,
+    action_schema: SchemaRef,
+    stats_schema: Option<SchemaRef>,
+    partition_schema: Option<SchemaRef>,
+}
+
+impl DeferredParallelCheckpointPlanning {
+    fn finalize(
+        &self,
+        files: &[FileMeta],
+    ) -> DeltaResult<Option<crate::log_segment::CheckpointReadInfo>> {
+        if files.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(LogSegment::projected_checkpoint_read_info_from_files(
+            self.engine.as_ref(),
+            self.action_schema.clone(),
+            self.stats_schema.as_deref(),
+            self.partition_schema.as_deref(),
+            files,
+        )?))
     }
 }
 

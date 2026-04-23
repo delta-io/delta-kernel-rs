@@ -716,6 +716,81 @@ impl LogSegment {
         Ok(result.actions)
     }
 
+    pub(crate) fn projected_checkpoint_read_info(
+        &self,
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+    ) -> DeltaResult<CheckpointReadInfo> {
+        self.plan_projected_checkpoint_read(engine, action_schema, stats_schema, partition_schema)
+            .map(|(checkpoint_info, _)| checkpoint_info)
+    }
+
+    pub(crate) fn projected_single_part_checkpoint_read_info(
+        &self,
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+    ) -> DeltaResult<CheckpointReadInfo> {
+        let file_actions_schema = match self.listed.checkpoint_parts.as_slice() {
+            [] => None,
+            [checkpoint] => match &checkpoint.file_type {
+                MultiPartCheckpoint { .. } => {
+                    return Err(Error::internal_error(
+                        "projected_single_part_checkpoint_read_info called with a multi-part checkpoint",
+                    ));
+                }
+                UuidCheckpoint if checkpoint.extension.as_str() == "json" => None,
+                SinglePartCheckpoint | UuidCheckpoint
+                    if checkpoint.extension.as_str() == "parquet" =>
+                {
+                    Some(Self::read_checkpoint_schema(
+                        engine,
+                        checkpoint,
+                        self.checkpoint_schema().as_ref(),
+                    )?)
+                }
+                _ => None,
+            },
+            _ => {
+                return Err(Error::internal_error(
+                    "projected_single_part_checkpoint_read_info called with multiple checkpoint parts",
+                ));
+            }
+        };
+
+        Self::build_projected_checkpoint_read_info(
+            action_schema,
+            file_actions_schema.as_deref(),
+            stats_schema,
+            partition_schema,
+            false,
+        )
+    }
+
+    pub(crate) fn projected_checkpoint_read_info_from_files(
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+        file_actions_files: &[FileMeta],
+    ) -> DeltaResult<CheckpointReadInfo> {
+        let file_actions_schema = match file_actions_files.first() {
+            Some(first) => Some(engine.parquet_handler().read_parquet_footer(first)?.schema),
+            None => None,
+        };
+
+        Self::build_projected_checkpoint_read_info(
+            action_schema,
+            file_actions_schema.as_deref(),
+            stats_schema,
+            partition_schema,
+            false,
+        )
+    }
+
     /// find a minimal set to cover the range of commits we want. This is greedy so not always
     /// optimal, but we assume there are rarely overlapping compactions so this is okay. NB: This
     /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
@@ -864,85 +939,13 @@ impl LogSegment {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        let need_file_actions = schema_contains_file_actions(&action_schema);
-
-        let (file_actions_schema, sidecar_files) = if need_file_actions {
-            self.get_file_actions_schema_and_sidecars(engine)?
-        } else {
-            (None, vec![])
-        };
-
-        // Check if checkpoint has compatible stats_parsed and add it to the schema if so
-        let has_stats_parsed =
-            stats_schema
-                .zip(file_actions_schema.as_ref())
-                .is_some_and(|(stats, file_schema)| {
-                    Self::schema_has_compatible_stats_parsed(file_schema, stats)
-                });
-
-        let has_partition_values_parsed = partition_schema
-            .zip(file_actions_schema.as_ref())
-            .is_some_and(|(ps, fs)| Self::schema_has_compatible_partition_values_parsed(fs, ps));
-
-        // Build final schema with any additional fields needed
-        // (stats_parsed, partitionValues_parsed, sidecar)
-        let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
-        let needs_add_augmentation = has_stats_parsed || has_partition_values_parsed;
-        let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
-            let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =
-                (needs_add_augmentation, action_schema.field("add"))
-            {
-                let DataType::Struct(add_struct) = add_field.data_type() else {
-                    return Err(Error::internal_error(
-                        "add field in action schema must be a struct",
-                    ));
-                };
-                let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
-
-                if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
-                    add_fields.push(StructField::nullable(
-                        "stats_parsed",
-                        DataType::Struct(Box::new(ss.clone())),
-                    ));
-                }
-
-                if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
-                    add_fields.push(StructField::nullable(
-                        "partitionValues_parsed",
-                        DataType::Struct(Box::new(ps.clone())),
-                    ));
-                }
-
-                // Rebuild schema with modified add field
-                action_schema
-                    .fields()
-                    .map(|f| {
-                        if f.name() == "add" {
-                            StructField::new(
-                                add_field.name(),
-                                StructType::new_unchecked(add_fields.clone()),
-                                add_field.is_nullable(),
-                            )
-                            .with_metadata(add_field.metadata.clone())
-                        } else {
-                            f.clone()
-                        }
-                    })
-                    .collect()
-            } else {
-                action_schema.fields().cloned().collect()
-            };
-
-            // Add sidecar column at top-level for V2 checkpoints
-            if needs_sidecar {
-                new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
-            }
-
-            Arc::new(StructType::new_unchecked(new_fields))
-        } else {
-            // No modifications needed, use schema as-is
-            action_schema.clone()
-        };
+        let (checkpoint_info, sidecar_files) = self.plan_projected_checkpoint_read(
+            engine,
+            action_schema,
+            stats_schema,
+            partition_schema,
+        )?;
+        let augmented_checkpoint_read_schema = checkpoint_info.checkpoint_read_schema.clone();
 
         let checkpoint_file_meta: Vec<_> = self
             .listed
@@ -1004,13 +1007,119 @@ impl LogSegment {
             .chain(sidecar_batches.map_ok(|batch| ActionsBatch::new(batch, false)));
 
         let checkpoint_info = CheckpointReadInfo {
-            has_stats_parsed,
-            has_partition_values_parsed,
+            has_stats_parsed: checkpoint_info.has_stats_parsed,
+            has_partition_values_parsed: checkpoint_info.has_partition_values_parsed,
             checkpoint_read_schema: augmented_checkpoint_read_schema,
         };
         Ok(ActionsWithCheckpointInfo {
             actions: actions_iter,
             checkpoint_info,
+        })
+    }
+
+    fn plan_projected_checkpoint_read(
+        &self,
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+    ) -> DeltaResult<(CheckpointReadInfo, Vec<FileMeta>)> {
+        let need_file_actions = schema_contains_file_actions(&action_schema);
+
+        let (file_actions_schema, sidecar_files) = if need_file_actions {
+            self.get_file_actions_schema_and_sidecars(engine)?
+        } else {
+            (None, vec![])
+        };
+
+        let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
+        let checkpoint_info = Self::build_projected_checkpoint_read_info(
+            action_schema,
+            file_actions_schema.as_deref(),
+            stats_schema,
+            partition_schema,
+            needs_sidecar,
+        )?;
+
+        Ok((checkpoint_info, sidecar_files))
+    }
+
+    fn build_projected_checkpoint_read_info(
+        action_schema: SchemaRef,
+        file_actions_schema: Option<&StructType>,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+        include_sidecar_field: bool,
+    ) -> DeltaResult<CheckpointReadInfo> {
+        let has_stats_parsed =
+            stats_schema
+                .zip(file_actions_schema)
+                .is_some_and(|(stats, file_schema)| {
+                    Self::schema_has_compatible_stats_parsed(file_schema, stats)
+                });
+
+        let has_partition_values_parsed = partition_schema
+            .zip(file_actions_schema)
+            .is_some_and(|(ps, fs)| Self::schema_has_compatible_partition_values_parsed(fs, ps));
+
+        let needs_add_augmentation = has_stats_parsed || has_partition_values_parsed;
+        let checkpoint_read_schema = if needs_add_augmentation || include_sidecar_field {
+            let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =
+                (needs_add_augmentation, action_schema.field("add"))
+            {
+                let DataType::Struct(add_struct) = add_field.data_type() else {
+                    return Err(Error::internal_error(
+                        "add field in action schema must be a struct",
+                    ));
+                };
+                let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
+
+                if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
+                    add_fields.push(StructField::nullable(
+                        "stats_parsed",
+                        DataType::Struct(Box::new(ss.clone())),
+                    ));
+                }
+
+                if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
+                    add_fields.push(StructField::nullable(
+                        "partitionValues_parsed",
+                        DataType::Struct(Box::new(ps.clone())),
+                    ));
+                }
+
+                action_schema
+                    .fields()
+                    .map(|field| {
+                        if field.name() == "add" {
+                            StructField::new(
+                                add_field.name(),
+                                StructType::new_unchecked(add_fields.clone()),
+                                add_field.is_nullable(),
+                            )
+                            .with_metadata(add_field.metadata.clone())
+                        } else {
+                            field.clone()
+                        }
+                    })
+                    .collect()
+            } else {
+                action_schema.fields().cloned().collect()
+            };
+
+            if include_sidecar_field {
+                new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+            }
+
+            Arc::new(StructType::new_unchecked(new_fields))
+        } else {
+            action_schema
+        };
+
+        Ok(CheckpointReadInfo {
+            has_stats_parsed,
+            has_partition_values_parsed,
+            checkpoint_read_schema,
         })
     }
 

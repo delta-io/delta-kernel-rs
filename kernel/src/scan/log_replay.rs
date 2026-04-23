@@ -270,6 +270,43 @@ impl ScanLogReplayProcessor {
         self.metrics.as_ref()
     }
 
+    pub(crate) fn set_checkpoint_info(
+        &mut self,
+        engine: &dyn Engine,
+        checkpoint_info: CheckpointReadInfo,
+    ) -> DeltaResult<()> {
+        let (stats_schema_for_transform, partition_schema_for_transform) = if self.skip_stats {
+            (None, None)
+        } else {
+            (
+                self.state_info.physical_stats_schema.clone(),
+                self.state_info.physical_partition_schema.clone(),
+            )
+        };
+
+        let output_schema = scan_row_schema_with_parsed_columns(
+            stats_schema_for_transform.clone(),
+            partition_schema_for_transform.clone(),
+        );
+        let has_stats_parsed = checkpoint_info.has_stats_parsed;
+        let has_partition_values_parsed = checkpoint_info.has_partition_values_parsed;
+
+        self.checkpoint_transform = engine.evaluation_handler().new_expression_evaluator(
+            checkpoint_info.checkpoint_read_schema.clone(),
+            get_add_transform_expr(
+                stats_schema_for_transform,
+                has_stats_parsed,
+                self.skip_stats,
+                partition_schema_for_transform,
+                has_partition_values_parsed,
+            ),
+            output_schema.into(),
+        )?;
+        self.checkpoint_info = checkpoint_info;
+
+        Ok(())
+    }
+
     /// Serialize the processor state for distributed processing.
     ///
     /// Consumes the processor and returns a `SerializableScanState` containing:
