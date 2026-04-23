@@ -3242,7 +3242,7 @@ mod tests {
         // commit 3: data-only add.
         commit(table_root, &ctx.store, 3, vec![add_action("f3.parquet")]).await;
 
-        // CRC@v1 captures pre-v2 metadata (empty configuration) -- "stale" relative to the
+        // CRC@v1 captures pre-v2 metadata (empty configuration); "stale" relative to the
         // existing snapshot's v2-derived P&M.
         ctx.store
             .put(
