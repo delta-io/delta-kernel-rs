@@ -2096,7 +2096,7 @@ mod test {
         "id",
         vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
     )]
-    // --- nested schema ---
+    // --- nested schema (includes map/array inside struct as leaf columns) ---
     #[case::nested_none(
         test_schema_nested(),
         "none",
@@ -2104,6 +2104,8 @@ mod test {
             ColumnName::new(["id"]),
             ColumnName::new(["info", "name"]),
             ColumnName::new(["info", "age"]),
+            ColumnName::new(["info", "tags"]),
+            ColumnName::new(["info", "scores"]),
         ],
     )]
     #[case::nested_name(
@@ -2113,6 +2115,8 @@ mod test {
             ColumnName::new(["phys_id"]),
             ColumnName::new(["phys_info", "phys_name"]),
             ColumnName::new(["phys_info", "phys_age"]),
+            ColumnName::new(["phys_info", "phys_tags"]),
+            ColumnName::new(["phys_info", "phys_scores"]),
         ],
     )]
     #[case::nested_id(
@@ -2122,39 +2126,41 @@ mod test {
             ColumnName::new(["phys_id"]),
             ColumnName::new(["phys_info", "phys_name"]),
             ColumnName::new(["phys_info", "phys_age"]),
+            ColumnName::new(["phys_info", "phys_tags"]),
+            ColumnName::new(["phys_info", "phys_scores"]),
         ],
     )]
-    // --- schema with map (map fields excluded from stats) ---
+    // --- schema with map (included as leaf for nullCount stats) ---
     #[case::map_none(
         test_schema_with_map(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+        vec![ColumnName::new(["id"]), ColumnName::new(["entries"]), ColumnName::new(["name"])],
     )]
     #[case::map_name(
         test_schema_with_map_and_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_entries"]), ColumnName::new(["phys_name"])],
     )]
     #[case::map_id(
         test_schema_with_map_and_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_entries"]), ColumnName::new(["phys_name"])],
     )]
-    // --- schema with array (array fields excluded from stats) ---
+    // --- schema with array (included as leaf for nullCount stats) ---
     #[case::array_none(
         test_schema_with_array(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+        vec![ColumnName::new(["id"]), ColumnName::new(["items"]), ColumnName::new(["name"])],
     )]
     #[case::array_name(
         test_schema_with_array_and_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_items"]), ColumnName::new(["phys_name"])],
     )]
     #[case::array_id(
         test_schema_with_array_and_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_items"]), ColumnName::new(["phys_name"])],
     )]
     fn test_physical_stats_column_names_all_schemas(
         #[case] schema: SchemaRef,
