@@ -122,7 +122,7 @@ impl Snapshot {
     ///   - **F.** Listing contains new commits (and no new checkpoint): run lightweight P+M replay
     ///     on the new commits and merge them into the existing log segment.
     ///
-    /// Each case is marked with `// case X` in `Snapshot::try_new_from_impl`.
+    /// Each case is marked with `// case X` in `Snapshot::try_new_from`.
     ///
     /// The target version (default: latest) is set via [`SnapshotBuilder::at_version`], and the
     /// engine is passed to [`SnapshotBuilder::build`].
@@ -185,7 +185,8 @@ impl Snapshot {
             // case B: incremental path only moves forward.
             if requested_version < existing_snapshot_version {
                 return Err(Error::Generic(format!(
-                    "Requested snapshot version {requested_version} is older than snapshot hint version {existing_snapshot_version}"
+                    "Requested snapshot version {requested_version} is older than snapshot \
+                    hint version {existing_snapshot_version}"
                 )));
             }
         } else {
@@ -247,25 +248,20 @@ impl Snapshot {
             // we should never see a new log segment with a version < the existing snapshot
             // version, that would mean a commit was incorrectly deleted from the log
             return Err(Error::Generic(format!(
-                "Unexpected state: the newest version in the log {new_end_version} is older than the existing snapshot version {existing_snapshot_version}")));
+                "Unexpected state: the newest version in the log {new_end_version} is \
+                 older than the existing snapshot version {existing_snapshot_version}"
+            )));
         }
         if new_log_segment.checkpoint_version.is_some() {
             // case D: listing contains a checkpoint; build a fresh snapshot from it.
             // TODO(#2218): consider incremental P&M replay instead of full rebuild.
-            // `resolve_crc` picks the CRC for the rebuilt segment (see its doc for the
-            // invariant-preserving fallback rules) and reuses the existing `LazyCrc` when
-            // the resolved CRC version matches.
-            let (crc_file, lazy_crc) = Self::resolve_crc(
+            // `resolve_crc` reuses the existing `LazyCrc` when the resolved CRC version
+            // matches, avoiding redundant I/O.
+            let (_, lazy_crc) = Self::resolve_crc(
                 &new_log_segment,
                 existing_log_segment,
                 &existing_snapshot.lazy_crc,
             );
-            // Inject the resolved CRC file path so the rebuilt snapshot remembers it.
-            // Without this, if the existing CRC was below the new listing start (and thus
-            // not surfaced by the listing), the rebuilt snapshot would have
-            // `latest_crc_file = None` and future incremental updates would fall through to
-            // full log replay instead of taking the CRC fast path.
-            new_log_segment.listed.latest_crc_file = crc_file;
             let snapshot = Self::try_new_from_log_segment(
                 existing_snapshot.table_root().clone(),
                 new_log_segment,
@@ -2825,22 +2821,32 @@ mod tests {
     // snapshot_v3, writes a checkpoint, optionally writes a new CRC, then runs the
     // incremental update and checks the outcome.
     //
-    // reuse_existing:   existing crc@v2 stays when new ckpt@v1 is below it (invariant OK)
-    //                   and no newer CRC was listed; the LazyCrc Arc is reused (loaded).
-    // refresh_to_newer: existing crc@v2 is superseded by a newly-listed crc@v3; the new
-    //                   CRC version wins and produces a fresh unloaded LazyCrc.
-    // crc_equals_ckpt:  existing crc@v2 and new ckpt@v2 sit at the same version -- sanity
-    //                   coverage for the invariant boundary `crc.version >= checkpoint.version`.
-    //                   (Note: this case does not pin `>=` vs `>` in `resolve_crc`'s filter
-    //                   because the listing also re-surfaces the existing CRC, so
-    //                   `new_crc_file = Some(v2)` wins via `.or(existing)` regardless of the
-    //                   filter's verdict on the existing CRC fallback. A scenario where only
-    //                   the fallback exercises the boundary is structurally unreachable: it
-    //                   would require the existing CRC to be below listing_start, but the
-    //                   LogSegmentFiles invariant forces existing_crc_version >=
-    //                   existing_checkpoint_version = listing_start - 1.)
-    // drop_below_ckpt:  existing crc@v1 would violate the LogSegmentFiles invariant with
-    //                   new ckpt@v2 (1 < 2), so it is filtered out; result has no CRC.
+    // Version axis for `refresh_to_newer` (existing_crc_v=2, new_ckpt_v=1, new_crc_v=3):
+    //
+    //   v0 --------- v1 --------- v2 --------- v3
+    //                new_ckpt      existing     newly-listed
+    //                              crc (loaded) crc
+    //                              ^^^^^^^^     ^^^^^^^^^^^^
+    //                         snapshot_v3's    wins on version mismatch
+    //                         lazy_crc         -> fresh unloaded LazyCrc
+    //
+    // Cases:
+    //   reuse_existing:   existing crc@v2 stays when new ckpt@v1 is below it (invariant OK)
+    //                     and no newer CRC was listed; LazyCrc Arc is reused (loaded).
+    //   refresh_to_newer: existing crc@v2 is superseded by a newly-listed crc@v3; new CRC
+    //                     version wins and produces a fresh unloaded LazyCrc.
+    //   crc_equals_ckpt:  existing crc@v2 and new ckpt@v2 sit at the same version; sanity
+    //                     coverage for the invariant boundary `crc.version >= ckpt.version`.
+    //                     (Note: does not pin `>=` vs `>` in `resolve_crc`'s filter because
+    //                     the listing re-surfaces the existing CRC, so `new_crc_file =
+    //                     Some(v2)` wins via `.or(existing)` regardless of the filter. A
+    //                     scenario where only the fallback exercises the boundary is
+    //                     structurally unreachable: it would require the existing CRC to be
+    //                     below listing_start, but the LogSegmentFiles invariant forces
+    //                     existing_crc_version >= existing_checkpoint_version = listing_start
+    //                     - 1.)
+    //   drop_below_ckpt:  existing crc@v1 would violate the LogSegmentFiles invariant with
+    //                     new ckpt@v2 (1 < 2), so it is filtered out; result has no CRC.
     #[rstest]
     #[case::reuse_existing(2, 1, None, Some(2), true)]
     #[case::refresh_to_newer(2, 1, Some(3), Some(3), true)]
@@ -2868,8 +2874,12 @@ mod tests {
             .at_version(3)
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v3.lazy_crc.crc_version(), Some(existing_crc_v));
+        // Building the snapshot loaded the CRC while resolving P&M: commits after
+        // existing_crc_v contain no P&M changes, so read_protocol_metadata_opt's Case 2(b)
+        // fallback loads the CRC.
+        assert!(snapshot_v3.lazy_crc.is_loaded());
 
-        // Write the new checkpoint, plus optionally a newer CRC alongside it.
+        // Write the new checkpoint, then optionally plant a newer CRC at `newly_listed_crc_v`.
         Snapshot::builder_for(ctx.url.as_str())
             .at_version(new_ckpt_v)
             .build(ctx.engine.as_ref())?
@@ -2997,12 +3007,13 @@ mod tests {
         Ok(())
     }
 
-    // Multi-hop: v0 -> v5 (case F, P+M replay) -> v10 (case D, checkpoint rebuild).
-    // Verifies the case-F -> case-D sequence, including that a loaded existing LazyCrc is
-    // not reused when the filter drops it on the case-D hop (the resulting LazyCrc must be
+    // Multi-hop: v0 -> v5 (incremental P+M replay) -> v10 (checkpoint rebuild).
+    // Verifies that a loaded LazyCrc carried into the second hop is *not* reused when
+    // the new checkpoint invalidates the existing CRC (resulting LazyCrc is fresh and
     // unloaded, not the loaded Arc from snapshot_v5).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_snapshot_multi_hop_case_f_then_case_d() -> DeltaResult<()> {
+    async fn test_incremental_snapshot_multi_hop_replay_then_rebuild_drops_stale_crc(
+    ) -> DeltaResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 11).await?;
 
@@ -3021,7 +3032,7 @@ mod tests {
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v0.lazy_crc.crc_version(), None);
 
-        // Hop 2: incremental v0 -> v5 (case F: new commits, no checkpoint). This picks up
+        // Hop 2: incremental v0 -> v5 (new commits, no checkpoint -> P+M replay). This picks up
         // CRC@v5 from the listing.
         let snapshot_v5 = Snapshot::builder_from(snapshot_v0).build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v5.log_segment.checkpoint_version, None);
@@ -3038,9 +3049,10 @@ mod tests {
             .build(ctx.engine.as_ref())?
             .checkpoint(ctx.engine.as_ref())?;
 
-        // Hop 3: incremental v5 -> v10 (case D: discovers checkpoint@v7). CRC@v5 is below
-        // the new checkpoint (5 < 7) so the filter drops it, and the rebuilt snapshot gets
-        // a fresh unloaded LazyCrc rather than the v5 Arc that was loaded above.
+        // Hop 3: incremental v5 -> v10 (discovers a new checkpoint@v7, triggering rebuild).
+        // CRC@v5 is below the new checkpoint (5 < 7) so the filter drops it, and the rebuilt
+        // snapshot gets a fresh unloaded LazyCrc rather than the v5 Arc that was loaded
+        // above.
         let snapshot_v10 = Snapshot::builder_from(snapshot_v5).build(ctx.engine.as_ref())?;
         let fresh_v10 = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         compare_snapshots(&snapshot_v10, &fresh_v10);
