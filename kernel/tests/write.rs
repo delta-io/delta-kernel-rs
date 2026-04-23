@@ -4023,11 +4023,16 @@ async fn test_checkpoint_non_kernel_written_table() {
     assert!(has_checkpoint, "Expected at least one checkpoint file");
 }
 
-/// Passing `None` to `snapshot.checkpoint()` on a V1 table (no `v2Checkpoint` feature)
-/// writes a V1 checkpoint: the main parquet schema must not contain a `checkpointMetadata`
-/// column.
+/// On a V1 table (no `v2Checkpoint` feature), passing either `None` or
+/// `Some(CheckpointSpec::V1)` to `snapshot.checkpoint()` produces a V1 checkpoint: the main
+/// parquet schema must not contain a `checkpointMetadata` column.
+#[rstest::rstest]
+#[case::none(None)]
+#[case::v1(Some(CheckpointSpec::V1))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_snapshot_checkpoint_default_on_v1_table() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_snapshot_checkpoint_on_v1_table(
+    #[case] spec: Option<CheckpointSpec>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_schema();
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let mut snapshot =
@@ -4041,7 +4046,7 @@ async fn test_snapshot_checkpoint_default_on_v1_table() -> Result<(), Box<dyn st
     )
     .await?;
 
-    snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), None)?;
+    snapshot.snapshot_checkpoint_placeholder(engine.as_ref(), spec.as_ref())?;
 
     let delta_log = std::path::Path::new(&table_path).join("_delta_log");
     let ckpt_path = std::fs::read_dir(&delta_log)?
