@@ -161,3 +161,7 @@ harness = false
 [[bench]]
 name = "expression_bench"
 harness = false
+
+[[bench]]
+name = "json_schema_bench"
+harness = false
