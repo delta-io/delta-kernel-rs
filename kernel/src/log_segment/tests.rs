@@ -4030,15 +4030,6 @@ async fn test_try_new_with_checkpoint_rejects_invalid_path(
     assert_result_error_with_message(result, expected_error);
 }
 
-// CRC state is orthogonal to checkpoint path format, so we express the path format as a
-// `#[values]` axis (classic parquet vs. V2 UUID) and the CRC state as `#[case]` rows. The
-// cartesian product covers every pairing without enumerating 6 `#[case]`s by hand.
-//
-// CRC states:
-//   - no_crc:                  no pre-existing CRC (most common path)
-//   - stale_crc_cleared:       CRC@v1 < checkpoint@v2. Must be cleared to preserve the
-//     LogSegmentFiles invariant `latest_crc_file.version >= checkpoint version`.
-//   - crc_at_checkpoint_retained: CRC@v2 satisfies the invariant and must be retained.
 #[rstest]
 #[case::no_crc(None, None)]
 #[case::stale_crc_cleared(Some(1), None)]
