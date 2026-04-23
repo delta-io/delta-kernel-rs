@@ -40,3 +40,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 
 [dev-dependencies]
 rstest = "0.23"
+rstest_reuse = "0.7"
+
+# rstest/rstest_reuse are also needed as regular deps so that rstest_reuse templates
+# defined in table_builder.rs (non-test code) can be exported to other crates' tests.
+[dependencies.rstest]
+version = "0.23"
+
+[dependencies.rstest_reuse]
+version = "0.7"
