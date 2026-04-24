@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs::create_dir_all;
 use std::path::Path;
 use std::process::ExitCode;
@@ -8,12 +7,9 @@ use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::arrow::array::{
     ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::util::pretty::print_batches;
-use itertools::Itertools;
-use url::Url;
-
-use delta_kernel::arrow::array::TimestampMicrosecondArray;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
@@ -23,6 +19,8 @@ use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_delta_table;
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
+use itertools::Itertools;
+use url::Url;
 
 /// An example program that writes to a Delta table and creates it if necessary.
 #[derive(Parser)]
@@ -44,7 +42,8 @@ struct Cli {
     #[arg(long, short, default_value = "10")]
     num_rows: usize,
     // TODO: Support providing input data from a JSON file instead of generating random data
-    // TODO: Support specifying whether the transaction should overwrite, append, or error if the table already exists
+    // TODO: Support specifying whether the transaction should overwrite, append, or error if the
+    // table already exists
 }
 
 #[tokio::main]
@@ -95,9 +94,9 @@ async fn try_main() -> DeltaResult<()> {
         .with_data_change(true);
 
     // Write the data using the engine
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.unpartitioned_write_context()?);
     let file_metadata = engine
-        .write_parquet(&sample_data, write_context.as_ref(), HashMap::new())
+        .write_parquet(&sample_data, write_context.as_ref())
         .await?;
 
     // Add the file metadata to the transaction

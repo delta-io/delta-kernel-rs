@@ -2,8 +2,8 @@
 //!
 //! The [`Deduplicator`] trait supports two deduplication strategies:
 //!
-//! - **JSON commit files** (`is_log_batch = true`): Tracks (path, dv_unique_id) and updates
-//!   the hashmap as files are seen. Implementation: [`FileActionDeduplicator`]
+//! - **JSON commit files** (`is_log_batch = true`): Tracks (path, dv_unique_id) and updates the
+//!   hashmap as files are seen. Implementation: [`FileActionDeduplicator`]
 //!
 //! - **Checkpoint files** (`is_log_batch = false`): Uses (path, dv_unique_id) to filter actions
 //!   using a read-only hashmap pre-populated from the commit log phase. Future implementation.
@@ -34,7 +34,8 @@ pub(crate) trait Deduplicator {
     /// to track new files. Returns `true` if the file should be filtered out.
     fn check_and_record_seen(&mut self, key: FileActionKey) -> bool;
 
-    /// Returns `true` for commit log batches (updates hashmap), `false` for checkpoints (read-only).
+    /// Returns `true` for commit log batches (updates hashmap), `false` for checkpoints
+    /// (read-only).
     fn is_log_batch(&self) -> bool;
 
     /// Extracts the deletion vector unique ID if it exists.
@@ -42,7 +43,8 @@ pub(crate) trait Deduplicator {
     /// This function retrieves the necessary fields for constructing a deletion vector unique ID
     /// by accessing `getters` at `dv_start_index` and the following two indices. Specifically:
     /// - `dv_start_index` retrieves the storage type (`deletionVector.storageType`).
-    /// - `dv_start_index + 1` retrieves the path or inline deletion vector (`deletionVector.pathOrInlineDv`).
+    /// - `dv_start_index + 1` retrieves the path or inline deletion vector
+    ///   (`deletionVector.pathOrInlineDv`).
     /// - `dv_start_index + 2` retrieves the optional offset (`deletionVector.offset`).
     fn extract_dv_unique_id<'a>(
         &self,

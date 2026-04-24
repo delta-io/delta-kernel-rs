@@ -2,12 +2,11 @@ use std::error;
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
-use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use itertools::Itertools;
-
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
+use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
+use itertools::Itertools;
 
 mod common;
 

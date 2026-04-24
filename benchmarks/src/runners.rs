@@ -10,27 +10,27 @@
 //! - S3 tables (`table_path` with s3://): credentials from `AWS_*` env vars
 //! - Local tables: local filesystem engine
 
-use crate::models::{
-    ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
-    TimeTravel,
-};
-use crate::predicate_parser::parse_predicate;
+use std::hint::black_box;
+use std::sync::Arc;
+
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::PredicateRef;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
-use delta_kernel::Engine;
-use delta_kernel::Snapshot;
+use delta_kernel::{Engine, Snapshot};
 use delta_kernel_unity_catalog::UCKernelClient;
 use unity_catalog_delta_client_api::{Error as UcApiError, Operation};
 use unity_catalog_delta_rest_client::{
     ClientConfig, Error as UcRestError, UCClient, UCCommitsRestClient,
 };
-
-use std::hint::black_box;
-use std::sync::Arc;
 use url::Url;
+
+use crate::models::{
+    ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
+    TimeTravel,
+};
+use crate::predicate_parser::parse_predicate;
 
 /// Delta table property indicating catalog-managed support.
 const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
@@ -210,7 +210,8 @@ pub struct ReadMetadataRunner {
     engine: Arc<dyn Engine>,
     name: String,
     config: ReadConfig,
-    thread_pool: Option<rayon::ThreadPool>, // None for serial configuration, Some for parallel configuration
+    thread_pool: Option<rayon::ThreadPool>, /* None for serial configuration, Some for parallel
+                                             * configuration */
     predicate: Option<PredicateRef>,
 }
 
@@ -229,7 +230,7 @@ impl ReadMetadataRunner {
         let predicate = read_spec
             .predicate
             .as_deref()
-            .map(parse_predicate)
+            .map(|sql| parse_predicate(sql, &snapshot.schema()))
             .transpose()?
             .map(Arc::new);
 
@@ -416,9 +417,10 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use super::*;
     use crate::models::{ParallelScan, ReadConfig, ReadSpec, TableInfo, TimeTravel};
-    use std::sync::LazyLock;
 
     fn test_runtime() -> Arc<tokio::runtime::Runtime> {
         static RT: LazyLock<Arc<tokio::runtime::Runtime>> = LazyLock::new(|| {

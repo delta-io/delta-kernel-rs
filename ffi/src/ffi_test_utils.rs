@@ -5,6 +5,13 @@ use std::ptr::NonNull;
 #[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
+use delta_kernel::engine::default::DefaultEngineBuilder;
+#[cfg(test)]
+use delta_kernel::object_store::memory::InMemory;
+#[cfg(test)]
+use test_utils::add_commit;
+
 use crate::error::{EngineError, ExternResult, KernelError};
 #[cfg(test)]
 use crate::{
@@ -12,12 +19,6 @@ use crate::{
     SharedExternEngine, SharedSnapshot,
 };
 use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
-#[cfg(test)]
-use delta_kernel::engine::default::DefaultEngineBuilder;
-#[cfg(test)]
-use delta_kernel::object_store::memory::InMemory;
-#[cfg(test)]
-use test_utils::add_commit;
 
 // Used to allocate EngineErrors with test information from Rust tests
 #[cfg(test)]
@@ -121,8 +122,9 @@ pub(crate) fn assert_extern_result_error_with_message<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::panic;
+
+    use super::*;
 
     #[test]
     fn test_ok_or_panic_with_error() {

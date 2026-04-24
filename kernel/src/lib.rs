@@ -74,10 +74,11 @@
 extern crate self as delta_kernel;
 
 use std::any::Any;
+use std::cmp::Ordering;
 use std::fs::DirEntry;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::SystemTime;
-use std::{cmp::Ordering, ops::Range};
 
 use bytes::Bytes;
 use url::Url;
@@ -88,7 +89,8 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
-// Public under test-utils so integration tests can inspect CRC state via Snapshot::get_current_crc_if_loaded_for_testing.
+// Public under test-utils so integration tests can inspect CRC state via
+// Snapshot::get_current_crc_if_loaded_for_testing.
 #[cfg(feature = "test-utils")]
 pub mod crc;
 #[cfg(not(feature = "test-utils"))]
@@ -111,9 +113,14 @@ pub mod table_properties;
 pub mod transaction;
 pub mod transforms;
 
+pub use crc::{FileSizeHistogram, FileStats};
 pub use log_path::LogPath;
 
-mod row_tracking;
+// Public under test-utils so integration tests can call get_high_water_mark via snapshot.
+#[cfg(feature = "test-utils")]
+pub mod row_tracking;
+#[cfg(not(feature = "test-utils"))]
+pub(crate) mod row_tracking;
 
 pub(crate) mod clustering;
 
@@ -121,6 +128,9 @@ mod arrow_compat;
 #[cfg(any(feature = "arrow-57", feature = "arrow-58"))]
 pub use arrow_compat::*;
 
+#[cfg(feature = "internal-api")]
+pub mod column_trie;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod column_trie;
 pub mod kernel_predicates;
 pub(crate) mod utils;
@@ -154,10 +164,7 @@ pub(crate) mod last_checkpoint_hint;
 
 pub(crate) mod log_segment_files;
 
-#[cfg(feature = "internal-api")]
 pub mod history_manager;
-#[cfg(not(feature = "internal-api"))]
-pub(crate) mod history_manager;
 
 #[cfg(feature = "internal-api")]
 pub mod parallel;
@@ -171,15 +178,11 @@ pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
 pub use error::{DeltaResult, Error};
+use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
-pub use metrics::MetricsReporter;
-pub use snapshot::Snapshot;
-pub use snapshot::SnapshotRef;
-
-use expressions::literal_expression_transform;
-use expressions::Scalar;
 use schema::{StructField, StructType};
+pub use snapshot::{Snapshot, SnapshotRef};
 
 #[cfg(any(
     feature = "default-engine-native-tls",
@@ -190,10 +193,6 @@ pub mod engine;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
-
-/// Sentinel version indicating a pre-commit state (table does not exist yet).
-/// Used for create-table transactions before the first commit.
-pub const PRE_COMMIT_VERSION: Version = u64::MAX;
 
 pub type FileSize = u64;
 pub type FileIndex = u64;
@@ -408,7 +407,8 @@ pub trait ExpressionEvaluator: AsAny {
     /// Evaluate the expression on a given EngineData.
     ///
     /// Produces one value for each row of the input.
-    /// The data type of the output is same as the type output of the expression this evaluator is using.
+    /// The data type of the output is same as the type output of the expression this evaluator is
+    /// using.
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>>;
 }
 
@@ -610,25 +610,26 @@ pub trait StorageHandler: AsAny {
 
 /// Provides JSON handling functionality to Delta Kernel.
 ///
-/// Delta Kernel can use this handler to parse JSON strings into Row or read content from JSON files.
-/// Connectors can leverage this trait to provide their best implementation of the JSON parsing
-/// capability to Delta Kernel.
+/// Delta Kernel can use this handler to parse JSON strings into Row or read content from JSON
+/// files. Connectors can leverage this trait to provide their best implementation of the JSON
+/// parsing capability to Delta Kernel.
 pub trait JsonHandler: AsAny {
-    /// Parse the given json strings and return the fields requested by output schema as columns in [`EngineData`].
-    /// json_strings MUST be a single column batch of engine data, and the column type must be string
+    /// Parse the given json strings and return the fields requested by output schema as columns in
+    /// [`EngineData`]. json_strings MUST be a single column batch of engine data, and the
+    /// column type must be string
     fn parse_json(
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn EngineData>>;
 
-    /// Read and parse the JSON format file at given locations and return the data as EngineData with
-    /// the columns requested by physical schema. Note: The [`FileDataReadResultIterator`] must emit
-    /// data from files in the order that `files` is given. For example if files ["a", "b"] is provided,
-    /// then the engine data iterator must first return all the engine data from file "a", _then_ all
-    /// the engine data from file "b". Moreover, for a given file, all of its [`EngineData`] and
-    /// constituent rows must be in order that they occur in the file. Consider a file with rows
-    /// (1, 2, 3). The following are legal iterator batches:
+    /// Read and parse the JSON format file at given locations and return the data as EngineData
+    /// with the columns requested by physical schema. Note: The [`FileDataReadResultIterator`]
+    /// must emit data from files in the order that `files` is given. For example if files ["a",
+    /// "b"] is provided, then the engine data iterator must first return all the engine data
+    /// from file "a", _then_ all the engine data from file "b". Moreover, for a given file, all
+    /// of its [`EngineData`] and constituent rows must be in order that they occur in the file.
+    /// Consider a file with rows (1, 2, 3). The following are legal iterator batches:
     ///    iter: [EngineData(1, 2), EngineData(3)]
     ///    iter: [EngineData(1), EngineData(2, 3)]
     ///    iter: [EngineData(1, 2, 3)]
@@ -668,8 +669,8 @@ pub trait JsonHandler: AsAny {
     /// # Parameters
     ///
     /// - `path` - URL specifying the location to write the JSON file
-    /// - `data` - Iterator of EngineData to write to the JSON file. Each row should be written as
-    ///   a new JSON object appended to the file. (that is, the file is newline-delimited JSON, and
+    /// - `data` - Iterator of EngineData to write to the JSON file. Each row should be written as a
+    ///   new JSON object appended to the file. (that is, the file is newline-delimited JSON, and
     ///   each row is a JSON object on a single line)
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.
@@ -718,16 +719,17 @@ pub trait ParquetHandler: AsAny {
     /// must be in the same order as specified in `physical_schema`.
     ///
     /// Parquet columns are matched to `physical_schema` [`StructField`]s using the following rules:
-    /// 1. **Field ID**: If a [`StructField`] in `physical_schema` contains a field ID
-    ///    (specified in [`ColumnMetadataKey::ParquetFieldId`] metadata), use the ID to
-    ///    match the Parquet column's field id
-    /// 2. **Field Name**: If no field ID is present in the `physical_schema`'s [`StructField`] or no matching parquet field ID is found,
-    ///    fall back to matching by column name
+    /// 1. **Field ID**: If a [`StructField`] in `physical_schema` contains a field ID (specified in
+    ///    [`ColumnMetadataKey::ParquetFieldId`] metadata), use the ID to match the Parquet column's
+    ///    field id
+    /// 2. **Field Name**: If no field ID is present in the `physical_schema`'s [`StructField`] or
+    ///    no matching parquet field ID is found, fall back to matching by column name
     ///
     /// # Metadata Columns
     ///
     /// The ParquetHandler must support virtual metadata columns that provide additional information
-    /// about each row. These columns are not stored in the Parquet file but are generated at read time.
+    /// about each row. These columns are not stored in the Parquet file but are generated at read
+    /// time.
     ///
     /// ## Row Index Column
     ///
@@ -738,7 +740,8 @@ pub trait ParquetHandler: AsAny {
     /// - **Column name**: User-specified (commonly `"row_index"` or `"_metadata.row_index"`)
     /// - **Type**: `LONG` (non-nullable)
     /// - **Values**: Sequential integers starting at 0 for each file
-    /// - **Use case**: Track row positions for downstream processing, or internally used to compute Row IDs
+    /// - **Use case**: Track row positions for downstream processing, or internally used to compute
+    ///   Row IDs
     ///
     /// Example: A file with 5 rows would have row_index values `[0, 1, 2, 3, 4]`.
     ///
@@ -785,7 +788,8 @@ pub trait ParquetHandler: AsAny {
     /// ## Column Matching Examples
     ///
     /// Consider a `physical_schema` with the following fields:
-    /// - Column 0:  `"i_logical"` (integer, non-null) with field ID 1 (via [`ColumnMetadataKey::ParquetFieldId`])
+    /// - Column 0:  `"i_logical"` (integer, non-null) with field ID 1 (via
+    ///   [`ColumnMetadataKey::ParquetFieldId`])
     /// - Column 1: `"s"` (string, nullable) with no field ID metadata
     /// - Column 2: `"i2"` (integer, nullable) with no field ID metadata
     ///
@@ -843,12 +847,13 @@ pub trait ParquetHandler: AsAny {
     ///
     /// This method writes the provided `data` to a Parquet file at the given `url`.
     ///
-    /// This will overwrite the file if it already exists.
+    /// This will overwrite the file if it already exists. For filesystem-backed
+    /// implementations, the parent directories must be created if they do not exist.
     ///
     /// # Parameters
     ///
-    /// - `url` - The full URL path where the Parquet file should be written
-    ///   (e.g., `s3://bucket/path/file.parquet`).
+    /// - `url` - The full URL path where the Parquet file should be written (e.g.,
+    ///   `s3://bucket/path/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
     ///
     /// # Returns
@@ -914,19 +919,11 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
-
-    /// Get the connector provided [`MetricsReporter`] for metrics collection.
-    ///
-    /// Returns an optional reporter that will receive metric events from Delta operations.
-    /// The default implementation returns None (no metrics reporting).
-    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
-        None
-    }
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared
-// pieces of default-engine-native-tls and default-engine-rustls. the crate can't compile with _only_
-// default-engine-base, so we give a friendly error here.
+// pieces of default-engine-native-tls and default-engine-rustls. the crate can't compile with
+// _only_ default-engine-base, so we give a friendly error here.
 #[cfg(all(
     feature = "default-engine-base",
     not(any(
@@ -941,8 +938,8 @@ compile_error!(
 
 // Rustdoc's documentation tests can do some things that regular unit tests can't. Here we are
 // using doctests to test macros. Specifically, we are testing for failed macro invocations due
-// to invalid input, not the macro output when the macro invocation is successful (which can/should be
-// done in unit tests). This module is not exclusively for macro tests only so other doctests can also be added.
-// https://doc.rust-lang.org/rustdoc/write-documentation/documentation-tests.html#include-items-only-when-collecting-doctests
+// to invalid input, not the macro output when the macro invocation is successful (which can/should
+// be done in unit tests). This module is not exclusively for macro tests only so other doctests can
+// also be added. https://doc.rust-lang.org/rustdoc/write-documentation/documentation-tests.html#include-items-only-when-collecting-doctests
 #[cfg(doctest)]
 mod doctests;

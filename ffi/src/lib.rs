@@ -10,6 +10,12 @@ use std::default::Default;
 use std::os::raw::{c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
+
+use delta_kernel::actions::{Metadata, Protocol};
+use delta_kernel::schema::Schema;
+use delta_kernel::snapshot::{Snapshot, SnapshotRef};
+use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
+use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 #[cfg(feature = "default-engine-base")]
@@ -17,13 +23,6 @@ use {
     delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor,
     std::collections::HashMap,
 };
-
-use delta_kernel::actions::{Metadata, Protocol};
-use delta_kernel::schema::Schema;
-use delta_kernel::snapshot::{Snapshot, SnapshotRef};
-use delta_kernel::LogPath;
-use delta_kernel::{DeltaResult, Engine, EngineData, Version};
-use delta_kernel_ffi_macros::handle_descriptor;
 
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
 // twice. So we tell it to ignore one of the declarations to avoid double-definition errors.
@@ -374,8 +373,7 @@ mod private {
         }
     }
 }
-pub use private::KernelBoolSlice;
-pub use private::KernelRowIndexArray;
+pub use private::{KernelBoolSlice, KernelRowIndexArray};
 
 /// # Safety
 ///
@@ -394,8 +392,9 @@ pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
     let _ = slice.into_vec();
 }
 
-// TODO: Do we want this handle at all? Perhaps we should just _always_ pass raw *mut c_void pointers
-// that are the engine data? Even if we want the type, should it be a shared handle instead?
+// TODO: Do we want this handle at all? Perhaps we should just _always_ pass raw *mut c_void
+// pointers that are the engine data? Even if we want the type, should it be a shared handle
+// instead?
 /// an opaque struct that encapsulates data read by an engine. this handle can be passed back into
 /// some kernel calls to operate on the data, or can be converted into the raw data as read by the
 /// [`delta_kernel::Engine`] by calling [`get_raw_engine_data`]
@@ -897,7 +896,6 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
 /// Perform a full checkpoint of the specified snapshot using the supplied engine.
 ///
 /// This writes the checkpoint parquet file and the `_last_checkpoint` file.
-///
 // TODO: Expose the updated snapshot via a new FFI function that returns a snapshot handle.
 ///
 /// # Safety
@@ -1019,8 +1017,8 @@ pub unsafe extern "C" fn get_partition_columns(
     iter.into()
 }
 
-/// Visit each metadata configuration (key/value pair) for the specified snapshot by invoking the provided
-/// `visitor` callback once per entry.
+/// Visit each metadata configuration (key/value pair) for the specified snapshot by invoking the
+/// provided `visitor` callback once per entry.
 ///
 /// # Safety
 ///
@@ -1076,9 +1074,8 @@ pub unsafe extern "C" fn free_protocol(protocol: Handle<SharedProtocol>) {
 /// Visit all fields of the protocol in a single FFI call. The caller provides:
 /// - `visit_versions`: called once with `(context, min_reader_version, min_writer_version)`
 /// - `visit_feature`: called once per feature with `(context, is_reader, feature_name)`.
-///   `is_reader` is `true` for reader features, `false` for writer features.
-///   If the protocol uses legacy versioning (no explicit feature lists), the `visit_feature`
-///   callback will not fire.
+///   `is_reader` is `true` for reader features, `false` for writer features. If the protocol uses
+///   legacy versioning (no explicit feature lists), the `visit_feature` callback will not fire.
 ///
 /// # Safety
 /// Caller is responsible for providing a valid protocol handle, a valid `context` pointer, and
@@ -1290,12 +1287,8 @@ impl<T> Default for ReferenceSet<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::error::{EngineError, KernelError};
-    use crate::ffi_test_utils::{
-        allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
-        ok_or_panic, recover_string, setup_snapshot,
-    };
+    use std::collections::HashMap;
+
     use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
@@ -1304,14 +1297,19 @@ mod tests {
     use delta_kernel::schema::StructType;
     use rstest::rstest;
     use serde_json::Value;
-    use std::collections::HashMap;
-    use test_utils::add_staged_commit;
     use test_utils::{
         actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
-        actions_to_string_with_metadata, add_commit, create_table, TestAction, METADATA,
-        METADATA_WITH_FEATURES, METADATA_WITH_TABLE_PROPERTIES,
+        actions_to_string_with_metadata, add_commit, add_staged_commit, create_table, TestAction,
+        METADATA, METADATA_WITH_FEATURES, METADATA_WITH_TABLE_PROPERTIES,
     };
     use url::Url;
+
+    use super::*;
+    use crate::error::{EngineError, KernelError};
+    use crate::ffi_test_utils::{
+        allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
+        ok_or_panic, recover_string, setup_snapshot,
+    };
 
     #[no_mangle]
     extern "C" fn allocate_null_err(_: KernelError, _: KernelStringSlice) -> *mut EngineError {
@@ -1685,7 +1683,8 @@ mod tests {
     }
 
     // Test checkpoint using FFI engine builder APIs with multithreaded executor.
-    // NOTE: We made this a sync test to simulate the expected case: C code calling FFI APIs to build engine without existing tokio runtime.
+    // NOTE: We made this a sync test to simulate the expected case: C code calling FFI APIs to
+    // build engine without existing tokio runtime.
     #[cfg(feature = "default-engine-base")]
     #[test]
     fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {

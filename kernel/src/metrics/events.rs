@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::time::Duration;
+
 use uuid::Uuid;
 
 /// Unique identifier for a metrics operation.
@@ -9,7 +10,7 @@ use uuid::Uuid;
 /// Each operation (Snapshot, Transaction, Scan) gets a unique MetricId that
 /// is used to correlate all events from that operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MetricId(Uuid);
+pub struct MetricId(pub(crate) Uuid);
 
 /// Identifies which scan execution path produced a scan metadata metrics event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,8 +110,7 @@ pub enum MetricEvent {
     /// [`JsonHandler::read_json_files`]: crate::JsonHandler::read_json_files
     JsonReadCompleted { num_files: u64, bytes_read: u64 },
 
-    /// Parquet file read operation completed (one event per
-    /// [`ParquetHandler::read_parquet_files`] call).
+    /// Parquet file read completed (one event per [`ParquetHandler::read_parquet_files`] call).
     ///
     /// `bytes_read` is the sum of `FileMeta::size` for the requested files (on-disk size),
     /// which is the best available approximation without re-reading the bytes.

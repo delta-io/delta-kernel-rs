@@ -15,7 +15,7 @@
 //! # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
 //!
 //! let schema = Arc::new(StructType::try_new(vec![
-//!     StructField::new("id", DataType::INTEGER, false),
+//!     StructField::new("id", DataType::INTEGER, true),
 //! ])?);
 //!
 //! let result = create_table("/path/to/table", schema, "MyApp/1.0")
@@ -32,18 +32,18 @@
 #![allow(unreachable_pub, dead_code)]
 
 use std::marker::PhantomData;
+use std::sync::OnceLock;
 
+// Re-export the builder so callers can still access it from this module path.
+pub use super::builder::create_table::CreateTableTransactionBuilder;
 use crate::actions::DomainMetadata;
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::SchemaRef;
-use crate::snapshot::SnapshotRef;
+use crate::table_configuration::TableConfiguration;
 use crate::transaction::{CreateTable, Transaction};
 use crate::utils::current_time_ms;
 use crate::DeltaResult;
-
-// Re-export the builder so callers can still access it from this module path.
-pub use super::builder::create_table::CreateTableTransactionBuilder;
 
 /// A type alias for create-table transactions.
 ///
@@ -53,8 +53,8 @@ pub use super::builder::create_table::CreateTableTransactionBuilder;
 ///
 /// # Operations NOT available on create-table transactions
 ///
-/// - **`with_domain_metadata_removed()`** — Cannot remove domain metadata from a table
-///   that doesn't exist yet.
+/// - **`with_domain_metadata_removed()`** — Cannot remove domain metadata from a table that doesn't
+///   exist yet.
 /// - **`remove_files()`** — Cannot remove files from a table that has no files.
 /// - **`with_blind_append()`** — Blind append semantics don't apply to table creation.
 /// - **`update_deletion_vectors()`** — Deletion vectors require an existing table.
@@ -72,7 +72,7 @@ pub use super::builder::create_table::CreateTableTransactionBuilder;
 /// # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
 ///
 /// let schema = Arc::new(StructType::try_new(vec![
-///     StructField::new("id", DataType::INTEGER, false),
+///     StructField::new("id", DataType::INTEGER, true),
 /// ])?);
 ///
 /// let result = create_table("/path/to/table", schema, "MyApp/1.0")
@@ -106,7 +106,7 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 ///
 /// # fn main() -> delta_kernel::DeltaResult<()> {
 /// let schema = Arc::new(StructType::new_unchecked(vec![
-///     StructField::new("id", DataType::INTEGER, false),
+///     StructField::new("id", DataType::INTEGER, true),
 ///     StructField::new("name", DataType::STRING, true),
 /// ]));
 ///
@@ -133,31 +133,29 @@ impl CreateTableTransaction {
     /// Create a new transaction for creating a new table. This is used when the table doesn't
     /// exist yet and we need to create it with Protocol and Metadata actions.
     ///
-    /// The `pre_commit_snapshot` is a synthetic snapshot created from the protocol and metadata
-    /// that will be committed. It uses `PRE_COMMIT_VERSION` as a sentinel to indicate no
-    /// version exists yet on disk.
+    /// The `effective_table_config` is the table configuration that will be committed (protocol,
+    /// metadata, schema).
     ///
     /// This is typically called via `CreateTableTransactionBuilder::build()` rather than directly.
     pub(crate) fn try_new_create_table(
-        pre_commit_snapshot: SnapshotRef,
+        effective_table_config: TableConfiguration,
         engine_info: String,
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
     ) -> DeltaResult<Self> {
-        // TODO(sanuj) Today transactions expect a read snapshot to be passed in and we pass
-        // in the pre_commit_snapshot for CREATE. To support other operations such as ALTERs
-        // there might be cleaner alternatives which can clearly disambiguate b/w a snapshot
-        // the was read vs the effective snapshot we will use for the commit.
         let span = tracing::info_span!(
             "txn",
-            path = %pre_commit_snapshot.table_root(),
+            path = %effective_table_config.table_root(),
             operation = "CREATE",
         );
 
         Ok(Transaction {
             span,
-            read_snapshot: pre_commit_snapshot,
+            read_snapshot_opt: None,
+            effective_table_config,
+            should_emit_protocol: true,
+            should_emit_metadata: true,
             committer,
             operation: Some("CREATE TABLE".to_string()),
             engine_info: Some(engine_info),
@@ -173,6 +171,7 @@ impl CreateTableTransaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
+            shared_write_state: OnceLock::new(),
             _state: PhantomData,
         })
     }

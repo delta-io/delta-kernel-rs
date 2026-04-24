@@ -40,7 +40,7 @@ fn clustering_test_schema() -> DeltaResult<Arc<StructType>> {
         true,
     )])?;
     Ok(Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, false),
+        StructField::new("id", DataType::INTEGER, true),
         StructField::new("name", DataType::STRING, true),
         StructField::new("address", DataType::Struct(Box::new(address)), true),
         StructField::new("l1", DataType::Struct(Box::new(l1)), true),
@@ -50,19 +50,26 @@ fn clustering_test_schema() -> DeltaResult<Arc<StructType>> {
 #[rstest]
 #[case::top_level(vec![vec!["id"]])]
 #[case::nested_2(vec![vec!["address", "city"]])]
+#[case::mismatched_casing(vec![vec!["ID"]])]
+#[case::nested_mismatched_casing(vec![vec!["ADDRESS", "CITY"]])]
 #[case::mixed(vec![vec!["id"], vec!["name"], vec!["address", "city"], vec!["address", "zip"], vec!["l1", "l2", "l3", "l4", "value"]])]
 #[tokio::test]
 async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let schema = clustering_test_schema()?;
-    let expected_cols: Vec<ColumnName> = col_paths
+    let input_cols: Vec<ColumnName> = col_paths
         .iter()
         .map(|p| ColumnName::new(p.iter().copied()))
+        .collect();
+    // Schema fields are all lowercase; normalization converts user casing to schema casing
+    let expected_cols: Vec<ColumnName> = col_paths
+        .iter()
+        .map(|p| ColumnName::new(p.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>()))
         .collect();
 
     let txn = create_table(&table_path, schema, "Test/1.0")
         .with_data_layout(DataLayout::Clustered {
-            columns: expected_cols.clone(),
+            columns: input_cols,
         })
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
@@ -95,7 +102,8 @@ async fn test_create_clustered_table(#[case] col_paths: Vec<Vec<&str>>) -> Delta
     Ok(())
 }
 
-/// Test that combining explicit feature signals with auto-enabled features doesn't create duplicates.
+/// Test that combining explicit feature signals with auto-enabled features doesn't create
+/// duplicates.
 ///
 /// This tests the edge case where a user provides `delta.feature.domainMetadata=supported`
 /// AND uses `DataLayout::Clustered`. Both would try to add DomainMetadata, but we should

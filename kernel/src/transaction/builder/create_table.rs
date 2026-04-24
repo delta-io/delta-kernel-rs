@@ -11,15 +11,18 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use url::Url;
+use uuid::Uuid;
 
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
-use crate::log_segment::LogSegment;
+use crate::schema::validation::validate_schema_for_create;
 use crate::schema::variant_utils::schema_contains_variant_type;
-use crate::schema::{DataType, SchemaRef, StructType};
-use crate::snapshot::Snapshot;
+use crate::schema::{
+    normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
+    StructType,
+};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     assign_column_mapping_metadata, get_any_level_column_physical_name,
@@ -31,13 +34,14 @@ use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
     ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_TYPE_WIDENING, SET_TRANSACTION_RETENTION_DURATION,
+    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
-use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
+use crate::{DeltaResult, Engine, Error, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
 ///
@@ -65,6 +69,12 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::AppendOnly,
     TableFeature::ChangeDataFeed,
     TableFeature::TypeWidening,
+    TableFeature::RowTracking,
+    // Invariants is auto-enabled by `maybe_enable_invariants` when the schema has non-null
+    // fields. Allowing explicit `delta.feature.invariants=supported` lets users pre-enable
+    // the feature on an all-nullable table so a later ALTER TABLE ADD COLUMN NOT NULL does
+    // not need a protocol upgrade.
+    TableFeature::Invariants,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
@@ -85,8 +95,11 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     ENABLE_CHANGE_DATA_FEED,
     ENABLE_TYPE_WIDENING,
     APPEND_ONLY,
+    ENABLE_ROW_TRACKING,
     // Set transaction retention duration: controls expiration of txn identifiers
     SET_TRANSACTION_RETENTION_DURATION,
+    // Parquet format version: controls the Parquet writer version for data files
+    PARQUET_FORMAT_VERSION,
 ];
 
 /// Ensures that no Delta table exists at the given path.
@@ -179,11 +192,12 @@ fn add_feature_to_lists(
     }
 }
 
-/// Configures clustering support for table creation (used by unit tests).
+/// Test-only helper for clustering support during table creation.
 ///
-/// Validates clustering columns, adds required features (DomainMetadata, ClusteredTable),
-/// and creates the domain metadata action.
-fn apply_clustering_for_table_create(
+/// Validates clustering columns, adds the `DomainMetadata` and `ClusteredTable` features
+/// directly, and creates the domain metadata action.
+#[cfg(test)]
+fn validate_clustering_and_make_domain_metadata(
     logical_schema: &SchemaRef,
     logical_columns: &[ColumnName],
     reader_features: &mut Vec<TableFeature>,
@@ -229,8 +243,8 @@ struct DataLayoutResult {
 /// 1. Top-level columns (nested paths are not supported)
 /// 2. Present in the schema
 /// 3. Not duplicated
-/// 4. Of a primitive type (Struct, Array, Map are rejected because partition values
-///    must be representable as directory-path strings)
+/// 4. Of a primitive type (Struct, Array, Map are rejected because partition values must be
+///    representable as directory-path strings)
 /// 5. A strict subset of the schema columns (at least one non-partition column required)
 fn validate_partition_columns(
     schema: &StructType,
@@ -283,10 +297,10 @@ fn validate_partition_columns(
 /// Handles all [`DataLayout`] variants:
 ///
 /// - **None**: Returns defaults (no domain metadata, no clustering/partition columns).
-/// - **Clustered**: Validates clustering columns, resolves to physical names, adds
-///   `DomainMetadata` + `ClusteredTable` features, creates clustering domain metadata.
-/// - **Partitioned**: Validates partition columns and stores logical names. No domain
-///   metadata or special features are needed (partitioning is a core Delta feature).
+/// - **Clustered**: Validates clustering columns, resolves to physical names, adds the
+///   `DomainMetadata` and `ClusteredTable` features, creates clustering domain metadata.
+/// - **Partitioned**: Validates partition columns and stores logical names. No domain metadata or
+///   special features are needed (partitioning is a core Delta feature).
 fn apply_data_layout(
     data_layout: &DataLayout,
     effective_schema: &SchemaRef,
@@ -297,9 +311,13 @@ fn apply_data_layout(
         DataLayout::None => Ok(DataLayoutResult::default()),
 
         DataLayout::Clustered { columns } => {
-            validate_clustering_columns(effective_schema, columns)?;
+            // Normalize clustering column names to match schema casing. This allows users
+            // to specify clustering columns case-insensitively (e.g. schema has columns
+            // "A", "B", "C" and user clusters by "c", "a").
+            let normalized = normalize_column_names_to_schema_casing(effective_schema, columns);
+            validate_clustering_columns(effective_schema, &normalized)?;
 
-            let physical_columns: Vec<ColumnName> = columns
+            let physical_columns: Vec<ColumnName> = normalized
                 .iter()
                 .map(|c| {
                     get_any_level_column_physical_name(effective_schema, c, column_mapping_mode)
@@ -327,12 +345,13 @@ fn apply_data_layout(
         }
 
         DataLayout::Partitioned { columns } => {
-            validate_partition_columns(effective_schema, columns)?;
+            let normalized = normalize_column_names_to_schema_casing(effective_schema, columns);
+            validate_partition_columns(effective_schema, &normalized)?;
 
             Ok(DataLayoutResult {
                 system_domain_metadata: vec![],
                 clustering_columns: None,
-                partition_columns: Some(columns.clone()),
+                partition_columns: Some(normalized),
             })
         }
     }
@@ -362,6 +381,31 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     }
 }
 
+/// Conditionally adds the `invariants` writer feature to the protocol when the schema contains
+/// any non-null column (`nullable: false`) anywhere in the tree.
+///
+/// Delta-Spark treats `nullable: false` as an implicit column invariant and requires the
+/// `invariants` writer feature to be listed in the protocol's `writerFeatures` to read/write
+/// such tables. Auto-enabling ensures kernel-created tables with non-null columns are
+/// compatible with Spark readers/writers.
+///
+/// Explicit `delta.invariants` metadata annotations are rejected by
+/// `validate_schema_for_create`, so this only flips on the feature for nullability-driven
+/// invariants. Kernel does not itself enforce the null mask at write time -- it relies on
+/// the engine's `ParquetHandler` to do so. Kernel's default `ParquetHandler` uses
+/// `arrow-rs`, whose `RecordBatch::try_new` rejects null values in fields marked
+/// `nullable: false`. Other engine implementations must provide an equivalent guarantee
+/// in their write path.
+fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_contains_non_null_fields(schema) {
+        add_feature_to_lists(
+            TableFeature::Invariants,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
 /// Auto-enables allowed features whose [`EnablementCheck::EnabledIf`] check is satisfied by the
 /// table properties. Features with [`EnablementCheck::AlwaysIfSupported`] are skipped since they
 /// don't require property-driven enablement.
@@ -375,9 +419,49 @@ fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProp
                     &mut validated.reader_features,
                     &mut validated.writer_features,
                 );
+                // RowTracking requires DomainMetadata as a dependency
+                if *feature == TableFeature::RowTracking {
+                    add_feature_to_lists(
+                        TableFeature::DomainMetadata,
+                        &mut validated.reader_features,
+                        &mut validated.writer_features,
+                    );
+                }
             }
         }
     }
+}
+
+/// Sets materialized column name properties when row tracking is enabled.
+///
+/// Writes `delta.rowTracking.materializedRowIdColumnName` and
+/// `delta.rowTracking.materializedRowCommitVersionColumnName` into the table
+/// properties using UUID-based column names (`_row-id-col-{uuid}` and
+/// `_row-commit-version-col-{uuid}`). These names record which physical columns
+/// store materialized row IDs and commit versions.
+///
+/// Only fires when `delta.enableRowTracking=true` is set. Feature-signal-only tables
+/// (`delta.feature.rowTracking=supported` without the enablement property) do not get
+/// these properties because the materialized columns are part of the "enabled" state, not
+/// the "supported" state.
+fn maybe_set_materialized_row_tracking_column_name_properties(
+    validated: &mut ValidatedTableProperties,
+) {
+    if validated
+        .properties
+        .get(ENABLE_ROW_TRACKING)
+        .is_none_or(|v| v != "true")
+    {
+        return;
+    }
+    validated.properties.insert(
+        MATERIALIZED_ROW_ID_COLUMN_NAME.to_string(),
+        format!("_row-id-col-{}", Uuid::new_v4()),
+    );
+    validated.properties.insert(
+        MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME.to_string(),
+        format!("_row-commit-version-col-{}", Uuid::new_v4()),
+    );
 }
 
 /// Ensures that `inCommitTimestamp` is enabled when `catalogManaged` is present. Adds the ICT
@@ -517,7 +601,16 @@ fn validate_extract_table_features_and_properties(
         }
 
         // Add to appropriate feature lists based on feature type
+        let needs_domain_metadata = feature == TableFeature::RowTracking;
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
+        // RowTracking requires DomainMetadata as a dependency
+        if needs_domain_metadata {
+            add_feature_to_lists(
+                TableFeature::DomainMetadata,
+                &mut reader_features,
+                &mut writer_features,
+            );
+        }
     }
 
     // Validate remaining delta.* properties against allow list
@@ -571,7 +664,8 @@ impl CreateTableTransactionBuilder {
     ///
     /// Custom application properties (those not starting with `delta.`) are always allowed.
     /// Delta properties (`delta.*`) are validated against an allow list during [`build()`].
-    /// Feature flags (`delta.feature.*`) are not supported during CREATE TABLE.
+    /// Feature flags (`delta.feature.*=supported`) are supported for the subset of features
+    /// listed in `ALLOWED_DELTA_FEATURES`.
     ///
     /// This method can be called multiple times. If a property key already exists from a
     /// previous call, the new value will overwrite the old one.
@@ -587,7 +681,7 @@ impl CreateTableTransactionBuilder {
     /// # use delta_kernel::schema::{StructType, DataType, StructField};
     /// # use std::sync::Arc;
     /// # fn example() -> delta_kernel::DeltaResult<()> {
-    /// # let schema = Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)])?);
+    /// # let schema = Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)])?);
     /// let builder = create_table("/path/to/table", schema, "MyApp/1.0")
     ///     .with_table_properties([
     ///         ("myapp.version", "1.0"),
@@ -615,8 +709,8 @@ impl CreateTableTransactionBuilder {
     ///
     /// - [`DataLayout::None`]: No special organization (default)
     /// - [`DataLayout::Clustered`]: Data files are optimized for queries on clustering columns
-    /// - [`DataLayout::Partitioned`]: Data files are organized into directories by partition
-    ///   column values
+    /// - [`DataLayout::Partitioned`]: Data files are organized into directories by partition column
+    ///   values
     ///
     /// Partitioning and clustering are mutually exclusive.
     ///
@@ -632,8 +726,8 @@ impl CreateTableTransactionBuilder {
     /// # use std::sync::Arc;
     /// # fn example() -> delta_kernel::DeltaResult<()> {
     /// # let schema = Arc::new(StructType::try_new(vec![
-    /// #     StructField::new("id", DataType::INTEGER, false),
-    /// #     StructField::new("date", DataType::STRING, false),
+    /// #     StructField::new("id", DataType::INTEGER, true),
+    /// #     StructField::new("date", DataType::STRING, true),
     /// # ])?);
     /// // Clustered layout:
     /// let builder = create_table("/path/to/table", schema.clone(), "MyApp/1.0")
@@ -660,8 +754,12 @@ impl CreateTableTransactionBuilder {
     /// - Checks that the table path is valid
     /// - Verifies the table doesn't already exist
     /// - Validates the schema is non-empty
+    /// - Rejects schemas with `delta.invariants` metadata annotations (unsupported by kernel)
     /// - Validates the data layout is valid
     /// - Validates table properties against the allow list
+    ///
+    /// Non-null columns (`nullable: false`) are allowed. The `invariants` writer feature is
+    /// auto-added to the protocol when the schema has any non-null column.
     ///
     /// # Arguments
     ///
@@ -674,6 +772,7 @@ impl CreateTableTransactionBuilder {
     /// - The table path is invalid
     /// - A table already exists at the given path
     /// - The schema is empty
+    /// - The schema has `delta.invariants` metadata on any column
     /// - The data layout is invalid
     /// - Unsupported delta properties or feature flags are specified
     pub fn build(
@@ -684,10 +783,6 @@ impl CreateTableTransactionBuilder {
         // Validate path
         let table_url = try_parse_uri(&self.path)?;
 
-        // Validate schema is non-empty
-        if self.schema.fields().len() == 0 {
-            return Err(Error::generic("Schema cannot be empty"));
-        }
         // Check if table already exists by looking for _delta_log directory
         let delta_log_url = table_url.join("_delta_log/")?;
         let storage = engine.storage_handler();
@@ -703,6 +798,9 @@ impl CreateTableTransactionBuilder {
         let (effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
 
+        // Validate schema (non-empty, column names, duplicates, no `delta.invariants` metadata)
+        validate_schema_for_create(&effective_schema, column_mapping_mode)?;
+
         // Validate data layout and resolve column names (physical for clustering, logical
         // for partitioning). Adds required table features for clustering.
         let data_layout_result = apply_data_layout(
@@ -712,15 +810,19 @@ impl CreateTableTransactionBuilder {
             &mut validated,
         )?;
 
-        // Schema-driven auto-enablement: detect types that require a feature
+        // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+        maybe_enable_invariants(&effective_schema, &mut validated);
 
         // Property-driven auto-enablement: check enablement properties
         maybe_auto_enable_property_driven_features(&mut validated);
 
         // Auto-enable inCommitTimestamp for catalogManaged tables
         maybe_enable_ict_for_catalog_managed(&mut validated)?;
+
+        // Set materialized row tracking column names when row tracking is enabled.
+        maybe_set_materialized_row_tracking_column_name_properties(&mut validated);
 
         // Create Protocol action with table features support
         let protocol =
@@ -743,15 +845,12 @@ impl CreateTableTransactionBuilder {
             validated.properties,
         )?;
 
-        // Create pre-commit snapshot from protocol/metadata
-        let log_root = table_url.join("_delta_log/")?;
-        let log_segment = LogSegment::for_pre_commit(log_root);
-        let table_configuration =
-            TableConfiguration::try_new(metadata, protocol, table_url, PRE_COMMIT_VERSION)?;
+        // Build TableConfiguration directly for the new table
+        let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
 
-        // Create Transaction<CreateTable> with pre-commit snapshot
+        // Create Transaction<CreateTable> with the effective table configuration
         Transaction::try_new_create_table(
-            Arc::new(Snapshot::new(log_segment, table_configuration)),
+            table_configuration,
             self.engine_info,
             committer,
             data_layout_result.system_domain_metadata,
@@ -768,7 +867,7 @@ mod tests {
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_features::FeatureType;
-    use crate::table_properties::ENABLE_ICEBERG_COMPAT_V1;
+    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V1, PARQUET_FORMAT_VERSION};
     use crate::utils::test_utils::assert_result_error_with_message;
 
     fn test_schema() -> SchemaRef {
@@ -863,6 +962,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parquet_format_version_accepted() {
+        let properties =
+            HashMap::from([(PARQUET_FORMAT_VERSION.to_string(), "2.12.0".to_string())]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert_eq!(
+            validated.properties.get(PARQUET_FORMAT_VERSION),
+            Some(&"2.12.0".to_string()),
+        );
+        assert!(validated.reader_features.is_empty());
+        assert!(validated.writer_features.is_empty());
+    }
+
+    #[test]
     fn test_validate_unsupported_properties() {
         // Delta properties not on allow list are rejected
         let mut properties = HashMap::new();
@@ -915,7 +1027,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let dm = apply_clustering_for_table_create(
+        let dm = validate_clustering_and_make_domain_metadata(
             &schema,
             &[ColumnName::new(["id"])],
             &mut reader_features,
@@ -944,7 +1056,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let dm = apply_clustering_for_table_create(
+        let dm = validate_clustering_and_make_domain_metadata(
             &schema,
             &[ColumnName::new(["id"]), ColumnName::new(["date"])],
             &mut reader_features,
@@ -973,7 +1085,7 @@ mod tests {
         let mut reader_features = vec![];
         let mut writer_features = vec![];
 
-        let result = apply_clustering_for_table_create(
+        let result = validate_clustering_and_make_domain_metadata(
             &schema,
             &[ColumnName::new(["nonexistent"])],
             &mut reader_features,
@@ -1005,7 +1117,7 @@ mod tests {
         let mut writer_features = vec![];
 
         let nested_col = ColumnName::new(["address", "city"]);
-        let dm = apply_clustering_for_table_create(
+        let dm = validate_clustering_and_make_domain_metadata(
             &schema,
             &[nested_col],
             &mut reader_features,
@@ -1126,6 +1238,62 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::all_nullable(
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, true),
+            StructField::new("name", DataType::STRING, true),
+        ])),
+        false,
+    )]
+    #[case::top_level_non_null(
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+        ])),
+        true,
+    )]
+    #[case::nested_non_null(
+        Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "parent",
+            DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                "child",
+                DataType::INTEGER,
+                false,
+            )]))),
+            true,
+        )])),
+        true,
+    )]
+    #[case::variant_only(
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, true),
+            StructField::new("v", DataType::unshredded_variant(), true),
+        ])),
+        false,
+    )]
+    fn test_maybe_enable_invariants(#[case] schema: SchemaRef, #[case] expect_invariants: bool) {
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![],
+            writer_features: vec![],
+        };
+
+        maybe_enable_invariants(&schema, &mut validated);
+
+        assert_eq!(
+            validated
+                .writer_features
+                .contains(&TableFeature::Invariants),
+            expect_invariants,
+            "Expected Invariants feature presence = {expect_invariants}"
+        );
+        assert!(
+            validated.reader_features.is_empty(),
+            "Invariants is writer-only; reader_features should be empty"
+        );
+    }
+
+    #[rstest::rstest]
     #[case::property_true(&[("delta.enableInCommitTimestamps", "true")], true, true)]
     #[case::property_false(&[("delta.enableInCommitTimestamps", "false")], false, true)]
     #[case::property_absent(&[], false, false)]
@@ -1172,6 +1340,7 @@ mod tests {
     #[case::change_data_feed(TableFeature::ChangeDataFeed, "changeDataFeed")]
     #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
     #[case::catalog_managed(TableFeature::CatalogManaged, "catalogManaged")]
+    #[case::invariants(TableFeature::Invariants, "invariants")]
     fn test_feature_signal_accepted(#[case] feature: TableFeature, #[case] feature_name: &str) {
         let key = format!("delta.feature.{feature_name}");
         let properties = HashMap::from([(key, "supported".to_string())]);
@@ -1419,6 +1588,44 @@ mod tests {
         assert_eq!(
             validated.properties.get(ENABLE_IN_COMMIT_TIMESTAMPS),
             Some(&"true".to_string()),
+        );
+    }
+
+    /// Verifies that both activation paths add `RowTracking` and `DomainMetadata` to
+    /// `writer_features`. For the feature-signal path, `delta.enableRowTracking` must NOT
+    /// be present in the properties (signal grants support, not enablement).
+    #[rstest::rstest]
+    #[case::enablement_property(
+        HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
+        true, // enablement property is set
+    )]
+    #[case::feature_signal(
+        HashMap::from([("delta.feature.rowTracking".to_string(), "supported".to_string())]),
+        false, // enablement property is NOT set
+    )]
+    fn test_row_tracking_activation_adds_required_features(
+        #[case] properties: HashMap<String, String>,
+        #[case] expect_enablement_property: bool,
+    ) {
+        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        maybe_auto_enable_property_driven_features(&mut validated);
+
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::RowTracking),
+            "Expected RowTracking in writer_features"
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::DomainMetadata),
+            "Expected DomainMetadata in writer_features"
+        );
+        assert_eq!(
+            validated.properties.contains_key(ENABLE_ROW_TRACKING),
+            expect_enablement_property,
+            "delta.enableRowTracking presence mismatch"
         );
     }
 

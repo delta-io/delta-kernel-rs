@@ -77,7 +77,8 @@ pub(crate) fn validate_clustering_columns(
         }
 
         // Walk the column path through nested structs and validate the leaf type.
-        // walk_column_fields validates: non-empty path, each field exists, intermediates are structs.
+        // walk_column_fields validates: non-empty path, each field exists, intermediates are
+        // structs.
         let fields = schema.walk_column_fields(col)?;
         let leaf_type = fields
             .last()

@@ -4,6 +4,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
+use serde::{Deserialize, Serialize};
+use url::Url;
+use visitors::{MetadataVisitor, ProtocolVisitor};
+
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
@@ -17,12 +22,6 @@ use crate::{
     DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta,
     IntoEngineData, RowVisitor as _,
 };
-
-use url::Url;
-use visitors::{MetadataVisitor, ProtocolVisitor};
-
-use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
-use serde::{Deserialize, Serialize};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
@@ -243,9 +242,7 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns an error if there are any metadata columns in the schema.
-    // TODO: remove allow(dead_code) after we use this API in CREATE TABLE, etc.
     #[internal_api]
-    #[allow(dead_code)]
     pub(crate) fn try_new(
         name: Option<String>,
         description: Option<String>,
@@ -480,7 +477,8 @@ impl Protocol {
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
 
-        // The protocol states that Reader features may be present if and only if the min_reader_version is 3
+        // The protocol states that Reader features may be present if and only if the
+        // min_reader_version is 3
         if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
             require!(
                 reader_features.is_some(),
@@ -497,7 +495,8 @@ impl Protocol {
             );
         }
 
-        // The protocol states that Writer features may be present if and only if the min_writer_version is 7
+        // The protocol states that Writer features may be present if and only if the
+        // min_writer_version is 7
         if min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
             require!(
                 writer_features.is_some(),
@@ -518,7 +517,8 @@ impl Protocol {
         match (&reader_features, &writer_features) {
             (Some(reader_features), Some(writer_features)) => {
                 // Check all reader features are ReaderWriter and present in writer features.
-                // Unknown features are treated as potentially ReaderWriter for forward compatibility.
+                // Unknown features are treated as potentially ReaderWriter for forward
+                // compatibility.
                 let check_r = reader_features.iter().all(|feature| {
                     matches!(
                         feature.feature_type(),
@@ -533,7 +533,8 @@ impl Protocol {
                 );
 
                 // Check all writer features that are ReaderWriter must also be in reader features
-                // Unknown features are treated as potentially Writer-only for forward compatibility.
+                // Unknown features are treated as potentially Writer-only for forward
+                // compatibility.
                 let check_w = writer_features
                     .iter()
                     .all(|feature| match feature.feature_type() {
@@ -551,8 +552,9 @@ impl Protocol {
             (None, None) => Ok(()),
             (None, Some(writer_features)) => {
                 // Special case: reader version 2 implies ColumnMapping support.
-                // All other ReaderWriter features require explicit reader_features list (reader version 3).
-                // Unknown features are treated as potentially Writer-only for forward compatibility.
+                // All other ReaderWriter features require explicit reader_features list (reader
+                // version 3). Unknown features are treated as potentially
+                // Writer-only for forward compatibility.
                 let is_valid = writer_features.iter().all(|feature| {
                     match feature.feature_type() {
                         FeatureType::WriterOnly | FeatureType::Unknown => true,
@@ -706,8 +708,8 @@ pub(crate) struct Add {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub(crate) path: String,
 
-    /// A map from partition column to value for this logical file. This map can contain null in the
-    /// values meaning a partition is null. We drop those values from this map, due to the
+    /// A map from partition column to value for this logical file. This map can contain null in
+    /// the values meaning a partition is null. We drop those values from this map, due to the
     /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
     /// null values. This means an engine can assume that if a partition is found in
     /// [`Metadata::partition_columns`] but not in this map, its value is null.
@@ -726,7 +728,8 @@ pub(crate) struct Add {
     /// in the added file must be contained in one or more remove actions in the same version.
     pub(crate) data_change: bool,
 
-    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file encoded as a JSON string.
+    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this
+    /// logical file encoded as a JSON string.
     ///
     /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
@@ -806,7 +809,8 @@ pub(crate) struct Remove {
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) size: Option<i64>,
 
-    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file encoded as a JSON string.
+    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this
+    /// logical file encoded as a JSON string.
     ///
     /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
@@ -843,8 +847,8 @@ pub(crate) struct Cdc {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub path: String,
 
-    /// A map from partition column to value for this logical file. This map can contain null in the
-    /// values meaning a partition is null. We drop those values from this map, due to the
+    /// A map from partition column to value for this logical file. This map can contain null in
+    /// the values meaning a partition is null. We drop those values from this map, due to the
     /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
     /// null values. This means an engine can assume that if a partition is found in
     /// [`Metadata::partition_columns`] but not in this map, its value is null.
@@ -938,7 +942,8 @@ impl Sidecar {
     }
 }
 
-/// The CheckpointMetadata action describes details about a checkpoint following the V2 specification.
+/// The CheckpointMetadata action describes details about a checkpoint following the V2
+/// specification.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -1018,24 +1023,23 @@ impl DomainMetadata {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use serde_json::json;
 
     use super::set_transaction::is_set_txn_expired;
     use super::*;
+    use crate::arrow::array::{
+        Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
+        MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
+    };
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+    use crate::arrow::json::ReaderBuilder;
+    use crate::engine::arrow_data::EngineDataArrowExt as _;
+    use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    use crate::schema::{ArrayType, DataType, MapType, StructField};
+    use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{
-        arrow::{
-            array::{
-                Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
-                MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
-            },
-            datatypes::{DataType as ArrowDataType, Field, Schema},
-            json::ReaderBuilder,
-        },
-        engine::{arrow_data::EngineDataArrowExt as _, arrow_expression::ArrowEvaluationHandler},
-        schema::{ArrayType, DataType, MapType, StructField},
-        utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
-    use serde_json::json;
 
     // duplicated
     struct ExprEngine(Arc<dyn EvaluationHandler>);

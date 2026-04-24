@@ -1,17 +1,19 @@
-//! Conversions from kernel schema types to arrow schema types.
+//! Conversions between kernel schema types and arrow schema types.
+
+pub mod scalar;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use itertools::Itertools;
 
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
-use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use itertools::Itertools;
-
 use crate::error::Error;
+use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
@@ -352,6 +354,8 @@ impl TryFromArrow<&ArrowDataType> for DataType {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::engine::arrow_conversion::ArrowField;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
@@ -361,7 +365,6 @@ mod tests {
     };
     use crate::transforms::SchemaTransform;
     use crate::DeltaResult;
-    use std::collections::HashMap;
 
     #[test]
     fn test_metadata_string_conversion() -> DeltaResult<()> {

@@ -18,25 +18,24 @@
 //!   AddFile { partitionValues: {"region": "US/East"}, path: "region=US%252FEast/..." }
 //! ```
 //!
-//! - **Step 1: Validation** (`validation` module): checks partition column
-//!   key completeness and value types against the table schema. Runs first to reject bad
-//!   input before doing any serialization work.
+//! - **Step 1: Validation** (`validation` module): checks partition column key completeness and
+//!   value types against the table schema. Runs first to reject bad input before doing any
+//!   serialization work.
 //!
-//! - **Step 2: Serialization** (FUTURE: `partition/serialization.rs`): converts validated
-//!   typed `Scalar` values to protocol-compliant strings for `add.partitionValues`. Null,
-//!   empty string, and empty binary all serialize as JSON `null`.
+//! - **Step 2: Serialization** (`serialization` module): converts validated typed `Scalar` values
+//!   to protocol-compliant strings for `add.partitionValues`. Null, empty string, and empty binary
+//!   all serialize as JSON `null`.
 //!
-//! - **Step 3: Path encoding** (`hive` module): percent-encodes serialized strings for
-//!   Hive-style filesystem directory names. Only a small set of ASCII characters is
-//!   encoded; spaces and non-ASCII pass through raw. Hive-style paths are optional; the
-//!   Delta protocol does not require them. Kernel uses them for partitioned tables without
-//!   column mapping enabled. Happens lazily in the write path.
+//! - **Step 3: Path encoding** (`hive` module): percent-encodes serialized strings for Hive-style
+//!   filesystem directory names. Only a small set of ASCII characters is encoded; spaces and
+//!   non-ASCII pass through raw. Hive-style paths are optional; the Delta protocol does not require
+//!   them. Kernel uses them for partitioned tables without column mapping enabled. Happens lazily
+//!   in the write path.
 //!
-//! - **Step 4: URI encoding**: an additional layer of URI encoding per RFC 2396 applied
-//!   when constructing `add.path` in the Delta log. More aggressive than step 3:
-//!   characters like space (0x20), `<`, `>`, `{`, `}`, and `|` that survive Hive
-//!   encoding get percent-encoded. Characters already percent-encoded by step 3
-//!   (e.g., `%2F`) get double-encoded (e.g., `%252F`).
+//! - **Step 4: URI encoding**: an additional layer of URI encoding per RFC 2396 applied when
+//!   constructing `add.path` in the Delta log. More aggressive than step 3: characters like space
+//!   (0x20), `<`, `>`, `{`, `}`, and `|` that survive Hive encoding get percent-encoded. Characters
+//!   already percent-encoded by step 3 (e.g., `%2F`) get double-encoded (e.g., `%252F`).
 //!
 //! # Encoding by type
 //!
@@ -62,9 +61,9 @@
 //! 13  |                | -32768 (min)                 | p=-32768                                  | same               | "-32768"
 //! 14  |                | NULL                         | p=__HIVE_DEFAULT_PARTITION__              | same               | null
 //! 15  | DOUBLE         | 0.0                          | p=0.0                                     | same               | "0.0"
-//! 16  |                | -0.0                         | p=0.0                                     | same               | "0.0"
+//! 16  |                | -0.0                         | p=-0.0*                                   | same               | "-0.0"*
 //! 17  |                | 1.7976931348623157E308 (max) | p=1.7976931348623157E308                  | same               | "1.7976931348623157E308"
-//! 18  |                | 4.9E-324 (min positive)      | p=4.9E-324                                | same               | "4.9E-324"
+//! 18  |                | 5E-324 (min subnormal)       | p=5.0E-324*                               | same               | "5.0E-324"*
 //! 19  |                | NaN                          | p=NaN                                     | same               | "NaN"
 //! 20  |                | Infinity                     | p=Infinity                                | same               | "Infinity"
 //! 21  |                | -Infinity                    | p=-Infinity                               | same               | "-Infinity"
@@ -90,17 +89,24 @@
 //! 41  |                | 1970-01-01 00:00:00          | p=1970-01-01 00%3A00%3A00                 | p=...%2000%253A... | "1970-01-01T08:00:00.000000Z"
 //! 42  |                | 2024-06-15 23:59:59.999999   | p=2024-06-15 23%3A59%3A59.999999          | p=...%2023%253A... | "2024-06-16T06:59:59.999999Z"
 //! 43  |                | NULL                         | p=__HIVE_DEFAULT_PARTITION__              | same               | null
-//! 44  | TIMESTAMP_NTZ  | 2024-06-15 12:30:45          | p=2024-06-15 12%3A30%3A45                 | p=...%2012%253A... | "2024-06-15 12:30:45"
-//! 45  |                | 1970-01-01 00:00:00          | p=1970-01-01 00%3A00%3A00                 | p=...%2000%253A... | "1970-01-01 00:00:00"
+//! 44  | TIMESTAMP_NTZ  | 2024-06-15 12:30:45          | p=2024-06-15 12%3A30%3A45                 | p=...%2012%253A... | "2024-06-15 12:30:45.000000"*
+//! 45  |                | 1970-01-01 00:00:00          | p=1970-01-01 00%3A00%3A00                 | p=...%2000%253A... | "1970-01-01 00:00:00.000000"*
 //! 46  |                | NULL                         | p=__HIVE_DEFAULT_PARTITION__              | same               | null
 //! ```
 //!
 //! Notable behaviors:
-//! - DOUBLE `-0.0` normalizes to `"0.0"` everywhere.
 //! - DECIMAL always includes the full scale (18 trailing digits for `DECIMAL(38,18)`).
-//! - TIMESTAMP `partitionValues` are UTC ISO-8601 with microsecond precision. The
-//!   filesystem dir and `add.path` use local time without timezone.
+//! - TIMESTAMP `partitionValues` are UTC ISO-8601 with microsecond precision. The filesystem dir
+//!   and `add.path` use local time without timezone.
 //! - TIMESTAMP_NTZ `partitionValues` omit the timezone and use space-separated format.
+//!
+//! `*` = kernel diverges from Delta-Spark:
+//! - Row 16: Delta-Spark normalizes `-0.0` to `"0.0"` at the SQL layer. Kernel preserves the sign,
+//!   producing `"-0.0"` (matching Java's `Double.toString(-0.0)`).
+//! - Row 18: Delta-Spark formats the smallest subnormal as `"4.9E-324"`. Rust's shortest-
+//!   representation algorithm produces `"5.0E-324"`. Both parse to the same `f64`.
+//! - Rows 44-45: Delta-Spark omits `.000000` when sub-seconds are zero. Kernel always includes
+//!   microsecond precision. Both formats round-trip through `parse_scalar`.
 //!
 //! # String and binary encoding
 //!
@@ -141,15 +147,15 @@
 //!
 //! Key observations:
 //!
-//! - `add.path` applies an additional layer of URI encoding on top of the Hive-encoded
-//!   directory name. Characters that Hive leaves raw (space, `<`, `>`, `}`, `|`) get
-//!   percent-encoded in `add.path`. Characters that Hive already encoded (`/` -> `%2F`)
-//!   get double-encoded in `add.path` (`%2F` -> `%252F`).
-//! - `partitionValues` stores the raw value with no encoding. Null and empty string are
-//!   both represented as JSON `null`.
+//! - `add.path` applies an additional layer of URI encoding on top of the Hive-encoded directory
+//!   name. Characters that Hive leaves raw (space, `<`, `>`, `}`, `|`) get percent-encoded in
+//!   `add.path`. Characters that Hive already encoded (`/` -> `%2F`) get double-encoded in
+//!   `add.path` (`%2F` -> `%252F`).
+//! - `partitionValues` stores the raw value with no encoding. Null and empty string are both
+//!   represented as JSON `null`.
 //! - NUL bytes cause write failures at the filesystem level (`mkdirs` error).
-//! - Non-empty binary values are interpreted as raw bytes. If the bytes happen to be
-//!   valid UTF-8, they work (e.g., `X'48454C4C4F'` = "HELLO").
+//! - Non-empty binary values are interpreted as raw bytes. If the bytes happen to be valid UTF-8,
+//!   they work (e.g., `X'48454C4C4F'` = "HELLO").
 //!
 //! **Spark bug: non-UTF-8 binary (e.g., `X'DEADBEEF'`) passes raw bytes through to the
 //! filesystem path and `partitionValues` JSON, producing invalid UTF-8 in both. The JSON
@@ -157,4 +163,5 @@
 //! system prevents non-UTF-8 bytes from reaching the encoding layer.
 
 pub(crate) mod hive;
+pub mod serialization;
 pub(crate) mod validation;

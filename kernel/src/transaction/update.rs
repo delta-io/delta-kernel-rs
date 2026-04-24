@@ -11,10 +11,12 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
+use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
+use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::committer::Committer;
@@ -31,9 +33,6 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
 use crate::utils::current_time_ms;
 use crate::{DataType, DeltaResult, Engine, Expression};
-use delta_kernel_derive::internal_api;
-
-use super::Transaction;
 
 // =============================================================================
 // Update table transactions only
@@ -72,9 +71,14 @@ impl Transaction {
             read_version = read_snapshot.version(),
         );
 
+        let effective_table_config = read_snapshot.table_configuration().clone();
+
         Ok(Transaction {
             span,
-            read_snapshot,
+            read_snapshot_opt: Some(read_snapshot),
+            effective_table_config,
+            should_emit_protocol: false,
+            should_emit_metadata: false,
             committer,
             operation: None,
             engine_info: None,
@@ -90,6 +94,7 @@ impl Transaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
+            shared_write_state: OnceLock::new(),
             _state: PhantomData,
         })
     }
@@ -120,8 +125,8 @@ impl Transaction {
     /// If the domain does not exist in the Delta log, this is a no-op.
     /// Note that each domain can only appear once per transaction. That is, multiple operations
     /// on the same domain are disallowed in a single transaction, as well as setting and removing
-    /// the same domain in a single transaction. If a duplicate domain is included, the `commit` will
-    /// fail (that is, we don't eagerly check domain validity here).
+    /// the same domain in a single transaction. If a duplicate domain is included, the `commit`
+    /// will fail (that is, we don't eagerly check domain validity here).
     /// Removing metadata for multiple distinct domains is allowed.
     pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.user_domain_removals.push(domain);
@@ -134,7 +139,8 @@ impl Transaction {
     ///
     /// The expected schema for `remove_metadata` is given by [`scan_row_schema`]. It is expected
     /// this will be the result of passing [`FilteredEngineData`] returned from a scan
-    /// with the selection vector modified to select rows for removal (selected rows in the selection vector are the ones to be removed).
+    /// with the selection vector modified to select rows for removal (selected rows in the
+    /// selection vector are the ones to be removed).
     ///
     /// # Example
     ///
@@ -196,7 +202,8 @@ impl Transaction {
 
     /// Update deletion vectors for files in the table.
     ///
-    /// This method can be called multiple times to update deletion vectors for different sets of files.
+    /// This method can be called multiple times to update deletion vectors for different sets of
+    /// files.
     ///
     /// This method takes a map of file paths to new deletion vector descriptors and an iterator
     /// of scan file data. It joins the two together internally and will generate appropriate
@@ -204,8 +211,8 @@ impl Transaction {
     ///
     /// # Arguments
     ///
-    /// * `new_dv_descriptors` - A map from data file path (as provided in scan operations) to
-    ///   the new deletion vector descriptor for that file.
+    /// * `new_dv_descriptors` - A map from data file path (as provided in scan operations) to the
+    ///   new deletion vector descriptor for that file.
     /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata. The
     ///   selected elements of each FilteredEngineData must be a superset of the paths that key
     ///   `new_dv_descriptors`.
@@ -254,8 +261,7 @@ impl Transaction {
             ));
         }
         if !self
-            .read_snapshot
-            .table_configuration()
+            .effective_table_config
             .is_feature_supported(&TableFeature::DeletionVectors)
         {
             return Err(Error::unsupported(
@@ -323,11 +329,13 @@ impl Transaction {
 // =============================================================================
 
 /// Column name for temporary column used during deletion vector updates.
-/// This column holds new DV descriptors appended to scan file metadata before transforming to final add actions.
+/// This column holds new DV descriptors appended to scan file metadata before transforming to final
+/// add actions.
 static NEW_DELETION_VECTOR_NAME: &str = "newDeletionVector";
 
 /// Schema for scan row data with an additional column for new deletion vector descriptors.
-/// This is an intermediate schema used during deletion vector updates before transforming to final add actions.
+/// This is an intermediate schema used during deletion vector updates before transforming to final
+/// add actions.
 static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked(
         scan_row_schema()
@@ -348,7 +356,8 @@ fn intermediate_dv_schema() -> &'static SchemaRef {
 /// Schema for scan row data with nullable statistics fields.
 /// Used when generating remove actions to ensure statistics can be null if missing.
 // Safety: The panic here is acceptable because scan_row_schema() is a known valid schema.
-// If transformation fails, it indicates a programmer error in schema construction that should be caught during development.
+// If transformation fails, it indicates a programmer error in schema construction that should be
+// caught during development.
 #[allow(clippy::panic)]
 static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     schema_with_all_fields_nullable(scan_row_schema().as_ref())
@@ -364,7 +373,8 @@ fn nullable_scan_rows_schema() -> &'static SchemaRef {
 /// Schema for restored add actions with nullable statistics fields.
 /// Used when transforming scan data back to add actions with potentially missing statistics.
 // Safety: The panic here is acceptable because restored_add_schema() is a known valid schema.
-// If transformation fails, it indicates a programmer error in schema construction that should be caught during development.
+// If transformation fails, it indicates a programmer error in schema construction that should be
+// caught during development.
 #[allow(clippy::panic)]
 static NULLABLE_RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     schema_with_all_fields_nullable(restored_add_schema())
@@ -377,10 +387,11 @@ fn nullable_restored_add_schema() -> &'static SchemaRef {
     &NULLABLE_RESTORED_ADD_SCHEMA
 }
 
-/// Schema for add actions that is nullable for use in transforms as as a workaround to avoid issues with null values in required fields
-/// that aren't selected.
+/// Schema for add actions that is nullable for use in transforms as as a workaround to avoid issues
+/// with null values in required fields that aren't selected.
 // Safety: The panic here is acceptable because add_log_schema is a known valid schema.
-// If transformation fails, it indicates a programmer error in schema construction that should be caught during development.
+// If transformation fails, it indicates a programmer error in schema construction that should be
+// caught during development.
 #[allow(clippy::panic)]
 static NULLABLE_ADD_LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     schema_with_all_fields_nullable(get_log_add_schema())
@@ -430,8 +441,8 @@ fn new_dv_column_schema() -> &'static SchemaRef {
 impl<S> Transaction<S> {
     /// Generate remove/add action pairs for files with DV updates.
     ///
-    /// This method processes the cached matched files, generating the necessary Remove and Add actions.
-    /// For each file:
+    /// This method processes the cached matched files, generating the necessary Remove and Add
+    /// actions. For each file:
     /// 1. A Remove action is generated for the old file
     /// 2. An Add action is generated with the new DV descriptor
     pub(super) fn generate_dv_update_actions<'a>(
@@ -462,10 +473,11 @@ impl<S> Transaction<S> {
         file_metadata_batch: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         let evaluation_handler = engine.evaluation_handler();
-        // Transform to replace the deletionVector field with the new DV from NEW_DELETION_VECTOR_NAME,
-        // then drop the NEW_DELETION_VECTOR_NAME column. The engine data has this temporary column
-        // appended by update_deletion_vectors(), but it is not expected by the transforms used in
-        // generate_remove_actions() which expect only the scan row schema fields.
+        // Transform to replace the deletionVector field with the new DV from
+        // NEW_DELETION_VECTOR_NAME, then drop the NEW_DELETION_VECTOR_NAME column. The
+        // engine data has this temporary column appended by update_deletion_vectors(), but
+        // it is not expected by the transforms used in generate_remove_actions() which
+        // expect only the scan row schema fields.
         let with_new_dv_transform = Expression::transform(
             Transform::new_top_level()
                 .with_replaced_field(

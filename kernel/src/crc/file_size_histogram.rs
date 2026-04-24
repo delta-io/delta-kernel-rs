@@ -79,6 +79,31 @@ pub struct FileSizeHistogram {
 }
 
 impl FileSizeHistogram {
+    /// Returns the sorted bin boundaries defining the histogram ranges.
+    ///
+    /// Each element represents the inclusive lower bound of a bin. The bin covers
+    /// `[sorted_bin_boundaries[i], sorted_bin_boundaries[i+1])`, with the last bin
+    /// extending to infinity. The first element is always 0.
+    pub fn sorted_bin_boundaries(&self) -> &[i64] {
+        &self.sorted_bin_boundaries
+    }
+
+    /// Returns the file count for each bin.
+    ///
+    /// Each element is the number of files whose size falls within the corresponding
+    /// bin's range. Length matches [`sorted_bin_boundaries()`](Self::sorted_bin_boundaries).
+    pub fn file_counts(&self) -> &[i64] {
+        &self.file_counts
+    }
+
+    /// Returns the total bytes for each bin.
+    ///
+    /// Each element is the sum of file sizes within the corresponding bin's range.
+    /// Length matches [`sorted_bin_boundaries()`](Self::sorted_bin_boundaries).
+    pub fn total_bytes(&self) -> &[i64] {
+        &self.total_bytes
+    }
+
     /// Creates a new histogram with the given arrays, after validation.
     ///
     /// Validates that:
@@ -252,9 +277,10 @@ impl FileSizeHistogram {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rstest::rstest;
     use test_utils::assert_result_error_with_message;
+
+    use super::*;
 
     // ===== Construction =====
 

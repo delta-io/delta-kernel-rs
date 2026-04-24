@@ -12,21 +12,17 @@ use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::compute::{concat_batches, sort_to_indices, take};
-use delta_kernel::arrow::datatypes::TimestampMicrosecondType;
 use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema, TimestampMicrosecondType,
 };
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngineBuilder;
-use delta_kernel::expressions::column_expr;
+use delta_kernel::expressions::{column_expr, Scalar};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::DeltaResult;
-use delta_kernel::Expression;
-use delta_kernel::Snapshot;
-
+use delta_kernel::{DeltaResult, Expression, Snapshot};
 use serde_json::json;
 use test_utils::{insert_data, read_scan, write_batch_to_table};
 use url::Url;
@@ -266,8 +262,11 @@ async fn test_checkpoint_partitioned_with_real_data(
         engine.as_ref(),
         batch,
         HashMap::from([
-            ("created_at".to_string(), "2024-01-15 10:30:00".to_string()),
-            ("tag".to_string(), "hello".to_string()),
+            (
+                "created_at".to_string(),
+                Scalar::Timestamp(1_705_314_600_000_000),
+            ),
+            ("tag".to_string(), Scalar::Binary(b"hello".to_vec())),
         ]),
     )
     .await?;
@@ -295,9 +294,9 @@ async fn test_checkpoint_partitioned_with_real_data(
         HashMap::from([
             (
                 "created_at".to_string(),
-                "2025-03-01 09:15:30.123456".to_string(),
+                Scalar::Timestamp(1_740_820_530_123_456),
             ),
-            ("tag".to_string(), "world".to_string()),
+            ("tag".to_string(), Scalar::Binary(b"world".to_vec())),
         ]),
     )
     .await?;
@@ -475,7 +474,7 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
         &snapshot,
         engine.as_ref(),
         batch,
-        HashMap::from([("category".to_string(), "books".to_string())]),
+        HashMap::from([("category".to_string(), Scalar::String("books".into()))]),
     )
     .await?;
 

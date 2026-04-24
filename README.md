@@ -52,19 +52,20 @@ consumer's own `Engine` trait, the kernel has a feature flag to enable a default
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.20.0"
+delta_kernel = "0.21.0"
 
 # or turn on the default engine, based on latest arrow
-delta_kernel = { version = "0.20.0", features = ["default-engine", "arrow"] }
+delta_kernel = { version = "0.21.0", features = ["default-engine-rustls", "arrow"] }
 ```
 
 ### Feature flags
-There are more feature flags in addition to the `default-engine` flag shown above. Relevant flags
-include:
+There are more feature flags in addition to the `default-engine-rustls` flag shown above. Relevant
+flags include:
 
 | Feature flag  | Description   |
 | ------------- | ------------- |
-| `default-engine`    | Turn on the 'default' engine: async, arrow-based `Engine` implementation  |
+| `default-engine-rustls`    | Turn on the 'default' engine with rustls TLS backend  |
+| `default-engine-native-tls`| Turn on the 'default' engine with native-tls TLS backend  |
 | `arrow-conversion`  | Conversion utilities for arrow/kernel schema interoperation |
 | `arrow-expression`  | Expression system implementation for arrow |
 
@@ -74,8 +75,8 @@ are still unstable. We therefore may break APIs within minor releases (that is, 
 we will not break APIs in patch releases (`0.1.0` -> `0.1.1`).
 
 ## Arrow versioning
-If you enable the `default-engine` feature, you get an implementation of the `Engine` trait that
-uses [Arrow] as its data format.
+If you enable a default engine feature (`default-engine-rustls` or `default-engine-native-tls`),
+you get an implementation of the `Engine` trait that uses [Arrow] as its data format.
 
 The [`arrow crate`](https://docs.rs/arrow/latest/arrow/) tends to release new major versions rather
 frequently. To enable engines that already integrate arrow to also integrate kernel and not force
