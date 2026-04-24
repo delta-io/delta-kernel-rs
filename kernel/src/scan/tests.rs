@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use rstest::rstest;
 
 use super::*;

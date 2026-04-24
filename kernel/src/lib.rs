@@ -857,21 +857,25 @@ pub trait ParquetHandler: AsAny {
     /// in a row group. Unlike data file statistics, these aggregates can be misleading when
     /// some files are missing statistics (null stat values are invisible to footer min/max).
     ///
-    /// The `predicate` uses the original column names from the table schema (e.g. `x > 10`),
-    /// not checkpoint-internal column paths. The `partition_columns` identifies which predicate
-    /// columns are partition columns (their statistics are always reliable in checkpoint files).
+    /// The `predicate` uses physical column names (e.g. `x > 10`, or `col-abc-123 > 10` under
+    /// column mapping), not checkpoint-internal column paths like `add.stats_parsed.minValues.x`.
+    /// The `partition_columns` set contains the physical names of the table's partition columns,
+    /// used to distinguish partition-value stats (`add.partitionValues_parsed.<col>`) from data
+    /// column stats (`add.stats_parsed.*.<col>`).
     ///
-    /// The default implementation falls back to [`read_parquet_files`](Self::read_parquet_files)
-    /// which uses standard row group skipping without checkpoint-specific null guarding. Engines
-    /// that want correct checkpoint row group skipping should override this method.
+    /// The default implementation falls back to [`read_parquet_files`](Self::read_parquet_files).
+    /// Because the predicate references bare physical column names that do not match the
+    /// checkpoint's nested stats schema, the fallback performs no row group skipping on
+    /// checkpoint files. Engines that want row group skipping on checkpoints should override
+    /// this method.
     fn read_checkpoint_parquet_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-        partition_columns: HashSet<String>,
+        partition_columns: &HashSet<String>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let _ = partition_columns; // unused in default impl
+        let _ = partition_columns;
         self.read_parquet_files(files, physical_schema, predicate)
     }
 

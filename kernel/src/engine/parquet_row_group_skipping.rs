@@ -278,6 +278,11 @@ fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
 
 /// Checks whether a parquet column has any null values in a row group, based on its footer stats.
 /// Returns `true` if the column has nulls, or if nullcount stats are unavailable (conservative).
+///
+/// Trusts `Some(0)` as "no nulls". This relies on the checkpoint parquet writer having written
+/// an accurate null count; see https://github.com/apache/arrow-rs/issues/9451 for an arrow-rs
+/// decoding bug where missing nullcount stats were returned as `Some(0)`. Kernel's own checkpoint
+/// writer emits per-column null counts, so this is safe for kernel-written checkpoints.
 fn column_has_nulls(row_group: &RowGroupMetaData, col_index: usize) -> bool {
     row_group
         .column(col_index)
@@ -348,16 +353,28 @@ impl<'a> CheckpointRowGroupFilter<'a> {
     }
 
     /// Applies the predicate to a checkpoint row group. Returns `false` if the row group can be
-    /// safely skipped (none of its add file rows can match the predicate).
+    /// safely skipped.
+    ///
+    /// The predicate may reference two kinds of columns:
+    /// 1. Add-file data columns (e.g. `x > 10`), evaluated via checkpoint-aware stat lookups under
+    ///    `add.stats_parsed.*` / `add.partitionValues_parsed.*`.
+    /// 2. Top-level action-identifier columns (e.g. `txn.appId IS NOT NULL`), evaluated via direct
+    ///    parquet footer stats. These let callers skip row groups that contain no rows of the
+    ///    action type they care about.
+    ///
+    /// Both filters are evaluated; the row group is pruned if either returns `Some(false)`.
     pub(crate) fn apply(
         row_group: &'a RowGroupMetaData,
         predicate: &Predicate,
         partition_columns: &'a HashSet<String>,
     ) -> bool {
         use crate::kernel_predicates::KernelPredicateEvaluator as _;
-        CheckpointRowGroupFilter::new(row_group, predicate, partition_columns)
+        let checkpoint_ok = CheckpointRowGroupFilter::new(row_group, predicate, partition_columns)
             .eval_sql_where(predicate)
-            != Some(false)
+            != Some(false);
+        let direct_ok =
+            RowGroupFilter::new(row_group, predicate).eval_sql_where(predicate) != Some(false);
+        checkpoint_ok && direct_ok
     }
 
     /// Returns `true` if the column is a partition column.
@@ -406,7 +423,7 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
             return extract_max_scalar(data_type, self.get_stats_at(idx)?);
         }
         let max = self.get_guarded_stat(col, data_type, |i| i.max_index, extract_max_scalar)?;
-        Some(adjust_stats_for_truncation(max))
+        Some(widen_max_stat_for_truncation(max))
     }
 
     fn get_parquet_nullcount_stat(&self, col: &ColumnName) -> Option<i64> {
@@ -437,16 +454,16 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
     }
 }
 
-/// Adjusts a max stat value to account for millisecond truncation in JSON-serialized stats.
+/// Widens a max stat value to account for millisecond truncation in JSON-serialized stats.
 /// `stats_parsed` inherits from JSON stats which truncate timestamps to millisecond precision:
 /// `stored_max <= actual_max <= stored_max + 999us`. Adding 999us ensures we never falsely
 /// prune files whose actual max exceeds the truncated value. Non-timestamp values pass through
 /// unchanged.
 ///
-/// See also [`DataSkippingPredicateCreator::adjust_scalar_for_max_stat_truncation`] in
-/// `scan/data_skipping.rs`, which handles the same truncation issue from the predicate side
-/// (subtracting 999us from the comparison value instead of adding to the stat).
-fn adjust_stats_for_truncation(val: Scalar) -> Scalar {
+/// The scan-side counterpart is `adjust_stats_for_truncation` in `scan/data_skipping.rs`, which
+/// handles the same truncation issue from the predicate side (subtracting 999us from the
+/// comparison value instead of adding to the stat).
+fn widen_max_stat_for_truncation(val: Scalar) -> Scalar {
     match val {
         Scalar::Timestamp(us) => Scalar::Timestamp(us.saturating_add(999)),
         Scalar::TimestampNtz(us) => Scalar::TimestampNtz(us.saturating_add(999)),
@@ -490,7 +507,6 @@ pub(crate) fn compute_field_indices(
 
 /// Returns `true` if the column is a top-level partition column.
 /// Delta partition columns are always top-level (no nested partition columns).
-#[allow(dead_code)]
 fn is_partition_column(col: &ColumnName, partition_columns: &HashSet<String>) -> bool {
     let path = col.path();
     path.len() == 1 && partition_columns.contains(path[0].as_str())
