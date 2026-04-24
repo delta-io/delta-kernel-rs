@@ -238,12 +238,17 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     }
 }
 
-/// Internal async implementation of read_parquet_files
+/// Internal async implementation of read_parquet_files and read_checkpoint_parquet_files.
+///
+/// When `checkpoint_partition_columns` is `Some`, files are read as checkpoint/sidecar files
+/// using [`CheckpointRowGroupFilter`] for row group skipping. When `None`, files are read as
+/// data files using the standard [`RowGroupFilter`].
 async fn read_parquet_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileMeta>,
     physical_schema: SchemaRef,
     predicate: Option<PredicateRef>,
+    checkpoint_partition_columns: Option<HashSet<String>>,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
@@ -276,12 +281,13 @@ async fn read_parquet_files_impl(
         let store = store.clone();
         let schema = physical_schema.clone();
         let predicate = predicate.clone();
+        let checkpoint_partition_columns = checkpoint_partition_columns.clone();
         async move {
             open_parquet_file(
                 store,
                 schema,
                 predicate,
-                None, // not a checkpoint file
+                checkpoint_partition_columns,
                 None,
                 super::DEFAULT_BATCH_SIZE,
                 file,
@@ -290,47 +296,6 @@ async fn read_parquet_files_impl(
         }
     });
     // create a stream from that iterator which buffers up to `buffer_size` futures at a time
-    let result_stream = stream::iter(file_futures)
-        .buffered(super::DEFAULT_BUFFER_SIZE)
-        .try_flatten()
-        .map_ok(|record_batch| -> Box<dyn EngineData> {
-            Box::new(ArrowEngineData::new(record_batch))
-        });
-
-    Ok(Box::pin(result_stream))
-}
-
-/// Like [`read_parquet_files_impl`] but for checkpoint/sidecar files. Uses
-/// [`CheckpointRowGroupFilter`] for row group skipping instead of [`RowGroupFilter`].
-async fn read_checkpoint_parquet_files_impl(
-    store: Arc<DynObjectStore>,
-    files: Vec<FileMeta>,
-    physical_schema: SchemaRef,
-    predicate: Option<PredicateRef>,
-    partition_columns: HashSet<String>,
-) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
-    if files.is_empty() {
-        return Ok(Box::pin(stream::empty()));
-    }
-
-    let file_futures = files.into_iter().map(move |file| {
-        let store = store.clone();
-        let schema = physical_schema.clone();
-        let predicate = predicate.clone();
-        let partition_columns = partition_columns.clone();
-        async move {
-            open_parquet_file(
-                store,
-                schema,
-                predicate,
-                Some(partition_columns),
-                None,
-                super::DEFAULT_BATCH_SIZE,
-                file,
-            )
-            .await
-        }
-    });
     let result_stream = stream::iter(file_futures)
         .buffered(super::DEFAULT_BUFFER_SIZE)
         .try_flatten()
@@ -355,6 +320,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             files.to_vec(),
             physical_schema,
             predicate,
+            None,
         );
         let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(Box::new(super::ReadMetricsIterator::new(
@@ -365,21 +331,31 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         )))
     }
 
+    /// Reads checkpoint or sidecar parquet files using [`CheckpointRowGroupFilter`] for row group
+    /// skipping. See [`ParquetHandler::read_checkpoint_parquet_files`] for the full contract.
     fn read_checkpoint_parquet_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-        partition_columns: HashSet<String>,
+        partition_columns: &HashSet<String>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let future = read_checkpoint_parquet_files_impl(
+        let num_files = files.len() as u64;
+        let bytes_read = files.iter().map(|f| f.size).sum();
+        let future = read_parquet_files_impl(
             self.store.clone(),
             files.to_vec(),
             physical_schema,
             predicate,
-            partition_columns,
+            Some(partition_columns.clone()),
         );
-        super::stream_future_to_iter(self.task_executor.clone(), future)
+        let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        Ok(Box::new(super::ReadMetricsIterator::new(
+            inner,
+            num_files,
+            bytes_read,
+            emit_parquet_read_completed,
+        )))
     }
 
     /// Writes engine data to a Parquet file at the specified location.

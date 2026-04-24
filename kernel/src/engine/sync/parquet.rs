@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::sync::Arc;
 
@@ -28,6 +29,16 @@ fn try_create_from_parquet(
     predicate: Option<PredicateRef>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
+    try_create_from_parquet_inner(file, schema, predicate, None, file_location)
+}
+
+fn try_create_from_parquet_inner(
+    file: File,
+    schema: SchemaRef,
+    predicate: Option<PredicateRef>,
+    checkpoint_partition_columns: Option<Arc<HashSet<String>>>,
+    file_location: String,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
     let reader_options = reader_options();
     let metadata = ArrowReaderMetadata::load(&file, reader_options.clone())?;
@@ -44,7 +55,14 @@ fn try_create_from_parquet(
 
     // Filter row groups and row indexes if a predicate is provided
     if let Some(predicate) = predicate {
-        builder = builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut());
+        builder = match checkpoint_partition_columns {
+            Some(partition_columns) => builder.with_checkpoint_row_group_filter(
+                predicate.as_ref(),
+                &partition_columns,
+                row_indexes.as_mut(),
+            ),
+            None => builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut()),
+        };
     }
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
@@ -68,6 +86,19 @@ impl ParquetHandler for SyncParquetHandler {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         read_files(files, schema, predicate, try_create_from_parquet)
+    }
+
+    fn read_checkpoint_parquet_files(
+        &self,
+        files: &[FileMeta],
+        schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        partition_columns: &HashSet<String>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        let partition_columns = Arc::new(partition_columns.clone());
+        read_files(files, schema, predicate, move |file, schema, pred, loc| {
+            try_create_from_parquet_inner(file, schema, pred, Some(partition_columns.clone()), loc)
+        })
     }
 
     /// Writes engine data to a Parquet file at the specified location.

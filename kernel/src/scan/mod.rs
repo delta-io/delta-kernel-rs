@@ -713,18 +713,12 @@ impl Scan {
                 self.build_actions_meta_predicate(),
             )
         };
-        let partition_columns = self
-            .snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns()
-            .to_vec();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
             meta_predicate,
-            partition_columns,
+            self.physical_partition_column_names(),
             self.state_info
                 .physical_stats_schema
                 .as_ref()
@@ -794,12 +788,6 @@ impl Scan {
                 self.build_actions_meta_predicate(),
             )
         };
-        let partition_columns = self
-            .snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns()
-            .to_vec();
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
@@ -807,7 +795,7 @@ impl Scan {
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
                 meta_predicate,
-                partition_columns,
+                self.physical_partition_column_names(),
                 self.state_info
                     .physical_stats_schema
                     .as_ref()
@@ -830,6 +818,17 @@ impl Scan {
         };
         self.state_info.physical_stats_schema.as_ref()?;
         Some(predicate.clone())
+    }
+
+    /// Returns the physical names of the table's partition columns. These match the column names
+    /// used in the physical predicate and in the checkpoint parquet schema under
+    /// `add.partitionValues_parsed.*`.
+    fn physical_partition_column_names(&self) -> Vec<String> {
+        self.state_info
+            .physical_partition_schema
+            .as_ref()
+            .map(|s| s.fields().map(|f| f.name().to_string()).collect())
+            .unwrap_or_default()
     }
 
     /// Start a parallel scan metadata processing for the table.
