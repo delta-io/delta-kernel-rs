@@ -269,6 +269,7 @@ async fn read_parquet_files_impl(
             1024,
             physical_schema.clone(),
             predicate,
+            checkpoint_ctx.clone(),
         ));
         let stream = FileStream::new(files, arrow_schema, file_opener)?.map_ok(
             |record_batch| -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch)) },
@@ -547,6 +548,7 @@ async fn open_parquet_file(
 struct PresignedUrlOpener {
     batch_size: usize,
     predicate: Option<PredicateRef>,
+    checkpoint_ctx: Option<(Option<PredicateRef>, HashSet<String>)>,
     limit: Option<usize>,
     table_schema: SchemaRef,
     client: reqwest::Client,
@@ -557,11 +559,13 @@ impl PresignedUrlOpener {
         batch_size: usize,
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
+        checkpoint_ctx: Option<(Option<PredicateRef>, HashSet<String>)>,
     ) -> Self {
         Self {
             batch_size,
             table_schema: schema,
             predicate,
+            checkpoint_ctx,
             limit: None,
             client: reqwest::Client::new(),
         }
@@ -573,6 +577,7 @@ impl FileOpener for PresignedUrlOpener {
         let batch_size = self.batch_size;
         let table_schema = self.table_schema.clone();
         let predicate = self.predicate.clone();
+        let checkpoint_ctx = self.checkpoint_ctx.clone();
         let limit = self.limit;
         let client = self.client.clone(); // uses Arc internally according to reqwest docs
         let file_location = file_meta.location.to_string();
@@ -601,9 +606,24 @@ impl FileOpener for PresignedUrlOpener {
             let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
                 .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
-            // Filter row groups and row indexes if a predicate is provided
-            if let Some(ref predicate) = predicate {
-                builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
+            // Filter row groups and row indexes if a predicate is provided. Route through the
+            // checkpoint-aware filter when reading checkpoint/sidecar files so we don't alias
+            // user predicate columns to Delta action leaves in the parquet schema.
+            match (predicate.as_deref(), &checkpoint_ctx) {
+                (pred, Some((action_predicate, partition_columns)))
+                    if pred.is_some() || action_predicate.is_some() =>
+                {
+                    builder = builder.with_checkpoint_row_group_filter(
+                        pred,
+                        action_predicate.as_deref(),
+                        partition_columns,
+                        row_indexes.as_mut(),
+                    );
+                }
+                (Some(pred), None) => {
+                    builder = builder.with_row_group_filter(pred, row_indexes.as_mut());
+                }
+                _ => {}
             }
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)

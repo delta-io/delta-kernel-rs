@@ -865,11 +865,12 @@ pub trait ParquetHandler: AsAny {
     ///   partition-value stats from data column stats.
     ///
     /// The default implementation falls back to [`read_parquet_files`](Self::read_parquet_files)
-    /// with the user predicate. It performs no data-column row group skipping on checkpoint
-    /// files because the predicate uses bare physical column names that do not match the
-    /// checkpoint's nested stats schema; only the IS NOT NULL guards in the predicate (if any)
-    /// take effect. Engines that want full checkpoint row group skipping should override this
-    /// method.
+    /// without any predicate: the user `predicate` uses bare physical column names that can
+    /// alias Delta action leaves in the checkpoint parquet schema (e.g. a user column path
+    /// `protocol.minReaderVersion` collides with the protocol action's field), so forwarding
+    /// it to an engine that performs row group filtering would risk false pruning. The
+    /// `action_predicate` and `partition_columns` are also dropped. Engines that want row
+    /// group skipping on checkpoints should override this method.
     fn read_checkpoint_parquet_files(
         &self,
         files: &[FileMeta],
@@ -878,8 +879,8 @@ pub trait ParquetHandler: AsAny {
         action_predicate: Option<PredicateRef>,
         partition_columns: &HashSet<String>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let _ = (action_predicate, partition_columns);
-        self.read_parquet_files(files, physical_schema, predicate)
+        let _ = (predicate, action_predicate, partition_columns);
+        self.read_parquet_files(files, physical_schema, None)
     }
 
     /// Write data to a Parquet file at the specified URL.
