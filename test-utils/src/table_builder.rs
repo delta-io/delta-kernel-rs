@@ -1,11 +1,16 @@
+// rstest_reuse templates generate macros that appear unused when building the lib target
+// (they're only consumed by tests in this and other crates).
+#![allow(unused_macros)]
+
 //! A composable test table builder for delta-kernel-rs.
 //!
 //! The builder writes data by default (1 parquet file with 10 rows per commit). Override
 //! with [`TestTableBuilder::with_data`] when a test needs specific file/row counts.
 //!
-//! Provides four orthogonal axes for parameterized testing:
+//! Provides five orthogonal axes for parameterized testing:
 //! - [`LogState`] -- what log files exist on disk (commits, checkpoints, CRC)
 //! - [`FeatureSet`] -- which Delta table features are enabled
+//! - [`TableConfig`] -- runtime knobs (e.g. stats format) orthogonal to features
 //! - [`VersionTarget`] -- how the snapshot is loaded (latest, time travel, incremental)
 //! - [`DataLayoutConfig`] -- data layout (unpartitioned, partitioned, clustered)
 //!
@@ -58,6 +63,7 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
+use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -127,6 +133,150 @@ impl FeatureSet {
     pub fn empty() -> Self {
         Self::new()
     }
+
+    // === Feature methods ===
+    //
+    // Each method enables one table feature via its natural property:
+    //   - Enablement property (e.g. delta.enableInCommitTimestamps=true) for features that have one
+    //   - Feature signal (delta.feature.X=supported) for protocol-only features
+    //
+    // TimestampNtz and clustering are NOT FeatureSet methods -- they are driven by
+    // the schema (TimestampNtz columns auto-enable the feature) and DataLayoutConfig
+    // (clustering via with_data_layout) respectively.
+
+    /// Set column mapping mode ("name" or "id"). Passing "none" is a no-op.
+    pub fn column_mapping(mut self, mode: &str) -> Self {
+        if mode != "none" {
+            self.table_properties
+                .push(("delta.columnMapping.mode".into(), mode.into()));
+        }
+        self
+    }
+
+    pub fn ict(mut self) -> Self {
+        self.table_properties
+            .push(("delta.enableInCommitTimestamps".into(), "true".into()));
+        self
+    }
+
+    pub fn v2_checkpoint(mut self) -> Self {
+        self.table_properties
+            .push(("delta.feature.v2Checkpoint".into(), "supported".into()));
+        self
+    }
+
+    pub fn deletion_vectors(mut self) -> Self {
+        self.table_properties
+            .push(("delta.enableDeletionVectors".into(), "true".into()));
+        self
+    }
+
+    pub fn append_only(mut self) -> Self {
+        self.table_properties
+            .push(("delta.appendOnly".into(), "true".into()));
+        self
+    }
+
+    pub fn change_data_feed(mut self) -> Self {
+        self.table_properties
+            .push(("delta.enableChangeDataFeed".into(), "true".into()));
+        self
+    }
+
+    pub fn type_widening(mut self) -> Self {
+        self.table_properties
+            .push(("delta.enableTypeWidening".into(), "true".into()));
+        self
+    }
+
+    pub fn domain_metadata(mut self) -> Self {
+        self.table_properties
+            .push(("delta.feature.domainMetadata".into(), "supported".into()));
+        self
+    }
+
+    pub fn vacuum_protocol_check(mut self) -> Self {
+        self.table_properties.push((
+            "delta.feature.vacuumProtocolCheck".into(),
+            "supported".into(),
+        ));
+        self
+    }
+
+    pub fn row_tracking(mut self) -> Self {
+        self.table_properties
+            .push(("delta.enableRowTracking".into(), "true".into()));
+        self
+    }
+
+    /// Set an arbitrary table property. Useful for properties that don't have a
+    /// dedicated method.
+    pub fn with_property(mut self, key: &str, value: &str) -> Self {
+        self.table_properties.push((key.into(), value.into()));
+        self
+    }
+
+    /// Common feature sets for cross-product testing: empty, one per feature, and one
+    /// with all features combined. Not the full power set -- add specific combos as needed.
+    pub fn common() -> Vec<Self> {
+        vec![
+            Self::empty(),
+            Self::new().column_mapping("name"),
+            Self::new().ict(),
+            Self::new().v2_checkpoint(),
+            Self::new().deletion_vectors(),
+            Self::new().append_only(),
+            Self::new().change_data_feed(),
+            Self::new().type_widening(),
+            Self::new().domain_metadata(),
+            Self::new().vacuum_protocol_check(),
+            Self::new().row_tracking(),
+            // All features combined
+            Self::new()
+                .column_mapping("name")
+                .ict()
+                .v2_checkpoint()
+                .deletion_vectors()
+                .append_only()
+                .change_data_feed()
+                .type_widening()
+                .domain_metadata()
+                .vacuum_protocol_check()
+                .row_tracking(),
+        ]
+    }
+
+    /// Whether v2_checkpoint is enabled.
+    pub fn has_v2_checkpoint(&self) -> bool {
+        self.table_properties
+            .iter()
+            .any(|(k, v)| k == "delta.feature.v2Checkpoint" && v == "supported")
+    }
+
+    /// Returns the table features implied by the properties in this set. Used by tests
+    /// to check that each builder method actually enables the right feature.
+    pub fn expected_features(&self) -> Vec<TableFeature> {
+        let mut out = Vec::new();
+        for (k, _) in &self.table_properties {
+            match k.as_str() {
+                "delta.columnMapping.mode" => out.push(TableFeature::ColumnMapping),
+                "delta.enableInCommitTimestamps" => out.push(TableFeature::InCommitTimestamp),
+                "delta.feature.v2Checkpoint" => out.push(TableFeature::V2Checkpoint),
+                "delta.enableDeletionVectors" => out.push(TableFeature::DeletionVectors),
+                "delta.appendOnly" => out.push(TableFeature::AppendOnly),
+                "delta.enableChangeDataFeed" => out.push(TableFeature::ChangeDataFeed),
+                "delta.enableTypeWidening" => out.push(TableFeature::TypeWidening),
+                "delta.feature.domainMetadata" => out.push(TableFeature::DomainMetadata),
+                "delta.feature.vacuumProtocolCheck" => out.push(TableFeature::VacuumProtocolCheck),
+                "delta.enableRowTracking" => {
+                    out.push(TableFeature::RowTracking);
+                    out.push(TableFeature::DomainMetadata); // row tracking depends on DM
+                }
+                _ => {}
+            }
+        }
+        out
+    }
 }
 
 impl fmt::Display for FeatureSet {
@@ -148,6 +298,151 @@ impl fmt::Display for FeatureSet {
             .collect();
         write!(f, "{}", props.join(", "))
     }
+}
+
+// ===========================================================================
+// TableConfig
+// ===========================================================================
+
+/// Table configuration properties that are orthogonal to table features.
+///
+/// These are pure runtime knobs (e.g. stats format, checkpoint interval) that don't
+/// affect the protocol or enable features. Use as a separate cross-product axis from
+/// [`FeatureSet`] since the two are independent.
+#[derive(Clone, Debug, Default)]
+pub struct TableConfig {
+    pub(crate) table_properties: Vec<(String, String)>,
+}
+
+impl TableConfig {
+    /// Default table configuration (no properties set).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set `delta.checkpoint.writeStatsAsJson`.
+    pub fn write_stats_as_json(mut self, enabled: bool) -> Self {
+        self.table_properties.push((
+            "delta.checkpoint.writeStatsAsJson".into(),
+            enabled.to_string(),
+        ));
+        self
+    }
+
+    /// Set `delta.checkpoint.writeStatsAsStruct`.
+    pub fn write_stats_as_struct(mut self, enabled: bool) -> Self {
+        self.table_properties.push((
+            "delta.checkpoint.writeStatsAsStruct".into(),
+            enabled.to_string(),
+        ));
+        self
+    }
+
+    /// Common table configs for cross-product testing: default plus all four stats
+    /// property combos.
+    pub fn common() -> Vec<Self> {
+        vec![
+            Self::new(),
+            Self::new()
+                .write_stats_as_json(true)
+                .write_stats_as_struct(false),
+            Self::new()
+                .write_stats_as_json(false)
+                .write_stats_as_struct(true),
+            Self::new()
+                .write_stats_as_json(true)
+                .write_stats_as_struct(true),
+            Self::new()
+                .write_stats_as_json(false)
+                .write_stats_as_struct(false),
+        ]
+    }
+}
+
+impl fmt::Display for TableConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.table_properties.is_empty() {
+            return write!(f, "default");
+        }
+        let props: Vec<_> = self
+            .table_properties
+            .iter()
+            .map(|(k, v)| {
+                let short_key = k
+                    .strip_prefix("delta.checkpoint.")
+                    .or_else(|| k.strip_prefix("delta."))
+                    .unwrap_or(k);
+                format!("{short_key}={v}")
+            })
+            .collect();
+        write!(f, "{}", props.join(", "))
+    }
+}
+
+// ===========================================================================
+// rstest_reuse templates
+// ===========================================================================
+
+// Standard `#[values]` lists for cross-product testing. Apply with `#[apply(template_name)]`
+// on an rstest test function. Each template injects one parameter; combine multiple templates
+// to build a cross-product. Tests that only need a subset should use inline `#[values]` instead.
+//
+// Example:
+// ```ignore
+// use rstest::rstest;
+// use rstest_reuse::apply;
+// use test_utils::table_builder::*;
+//
+// #[apply(feature_sets)]
+// #[apply(table_configs)]
+// fn test_scan(feature_set: FeatureSet, table_config: TableConfig) { ... }
+// ```
+
+/// All common feature sets: empty, one per feature, and all combined.
+#[rstest_reuse::template]
+#[rstest::rstest]
+pub fn feature_sets(
+    #[values(
+        FeatureSet::empty(),
+        FeatureSet::new().column_mapping("name"),
+        FeatureSet::new().ict(),
+        FeatureSet::new().v2_checkpoint(),
+        FeatureSet::new().deletion_vectors(),
+        FeatureSet::new().append_only(),
+        FeatureSet::new().change_data_feed(),
+        FeatureSet::new().type_widening(),
+        FeatureSet::new().domain_metadata(),
+        FeatureSet::new().vacuum_protocol_check(),
+        FeatureSet::new().row_tracking(),
+        FeatureSet::new()
+            .column_mapping("name")
+            .ict()
+            .v2_checkpoint()
+            .deletion_vectors()
+            .append_only()
+            .change_data_feed()
+            .type_widening()
+            .domain_metadata()
+            .vacuum_protocol_check()
+            .row_tracking()
+    )]
+    feature_set: FeatureSet,
+) {
+}
+
+/// All common table configs: default plus four stats combos.
+#[rstest_reuse::template]
+#[rstest::rstest]
+pub fn table_configs(
+    #[values(
+        TableConfig::new(),
+        TableConfig::new().write_stats_as_json(true).write_stats_as_struct(false),
+        TableConfig::new().write_stats_as_json(false).write_stats_as_struct(true),
+        TableConfig::new().write_stats_as_json(true).write_stats_as_struct(true),
+        TableConfig::new().write_stats_as_json(false).write_stats_as_struct(false)
+    )]
+    table_config: TableConfig,
+) {
 }
 
 // ===========================================================================
@@ -308,6 +603,7 @@ impl fmt::Display for VersionTarget {
 pub struct TestTableBuilder {
     log_state: LogState,
     features: FeatureSet,
+    table_config: TableConfig,
     schema: SchemaRef,
     partition_columns: Vec<String>,
     clustering_columns: Vec<String>,
@@ -328,6 +624,7 @@ impl TestTableBuilder {
         Self {
             log_state: LogState::with_commits(1),
             features: FeatureSet::empty(),
+            table_config: TableConfig::new(),
             schema: default_schema(),
             partition_columns: Vec::new(),
             clustering_columns: Vec::new(),
@@ -345,6 +642,12 @@ impl TestTableBuilder {
     /// Set the table features.
     pub fn with_features(mut self, f: FeatureSet) -> Self {
         self.features = f;
+        self
+    }
+
+    /// Set table configuration properties (orthogonal to features).
+    pub fn with_table_config(mut self, c: TableConfig) -> Self {
+        self.table_config = c;
         self
     }
 
@@ -438,12 +741,15 @@ impl TestTableBuilder {
 
         // Version 0: CreateTable
         let mut builder = create_table(table_root, schema, "TestTableBuilder/1.0");
-        if !self.features.table_properties.is_empty() {
+        let all_properties: Vec<_> = self
+            .features
+            .table_properties
+            .iter()
+            .chain(self.table_config.table_properties.iter())
+            .collect();
+        if !all_properties.is_empty() {
             builder = builder.with_table_properties(
-                self.features
-                    .table_properties
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str())),
+                all_properties.iter().map(|(k, v)| (k.as_str(), v.as_str())),
             );
         }
         if !self.partition_columns.is_empty() {
@@ -483,7 +789,14 @@ impl TestTableBuilder {
         Ok(TestTable {
             store,
             table_root: table_root.to_string(),
-            description: format!("{} + {}", self.log_state, self.features),
+            description: if self.table_config.table_properties.is_empty() {
+                format!("{} + {}", self.log_state, self.features)
+            } else {
+                format!(
+                    "{} + {} + config({})",
+                    self.log_state, self.features, self.table_config
+                )
+            },
         })
     }
 }
@@ -938,6 +1251,79 @@ mod tests {
             VersionTarget::AtVersion(v) => *v,
         };
         assert_eq!(snap.version(), expected);
+    }
+
+    #[rstest_reuse::apply(feature_sets)]
+    fn test_feature_sets_enable_table_features(feature_set: FeatureSet) -> DeltaResult<()> {
+        let expected_features = feature_set.expected_features();
+        let table = TestTableBuilder::new().with_features(feature_set).build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        let protocol = snap.table_configuration().protocol();
+        let writer_features = protocol
+            .writer_features()
+            .expect("should have writer features");
+        for feature in &expected_features {
+            assert!(
+                writer_features.contains(feature),
+                "expected {feature:?} in writer_features: {writer_features:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_column_mapping_none_is_noop() {
+        let fs = FeatureSet::new().column_mapping("none");
+        assert!(fs.table_properties.is_empty());
+    }
+
+    #[test]
+    fn test_has_v2_checkpoint() {
+        assert!(!FeatureSet::empty().has_v2_checkpoint());
+        assert!(FeatureSet::new().v2_checkpoint().has_v2_checkpoint());
+        assert!(!FeatureSet::new().ict().has_v2_checkpoint());
+    }
+
+    #[test]
+    fn test_table_config_properties_applied() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_table_config(
+                TableConfig::new()
+                    .write_stats_as_json(false)
+                    .write_stats_as_struct(true),
+            )
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 0);
+        Ok(())
+    }
+
+    /// Verifies every common table config builds successfully.
+    #[rstest_reuse::apply(table_configs)]
+    fn test_all_table_configs_build(table_config: TableConfig) -> DeltaResult<()> {
+        TestTableBuilder::new()
+            .with_table_config(table_config)
+            .build()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_with_column_mapping() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_commits(2))
+            .with_features(FeatureSet::new().column_mapping("name"))
+            .with_data(1, 5)
+            .build()?;
+        let engine: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+        let scan = snap.scan_builder().build()?;
+        let batches = crate::read_scan(&scan, engine)?;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 5);
+        Ok(())
     }
 
     #[test]
