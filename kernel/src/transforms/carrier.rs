@@ -4,12 +4,12 @@ use std::fmt::Debug;
 
 /// Carrier abstraction for transform outputs.
 ///
-/// A carrier can represent one of three outcomes for a transformed node:
+/// A carrier can represent one of two outcomes for a transformed node:
 /// - present value (`Cow<'a, T>`)
 /// - residual outcome (`Self::Residual`)
 ///
-/// Depending on carrier choice, residual can encode filtered-out and/or error cases. A
-/// non-filtering infallible carrier has `Residual = Infallible`.
+/// Depending on carrier choice, a residual encodes filtered-out and/or error cases. A non-filtering
+/// infallible carrier has `Residual = Infallible`.
 ///
 /// Different carriers encode those states differently:
 /// - `()` and `Result<(), E>` are carriers for read-only visitor transforms that return no value
@@ -140,7 +140,7 @@ impl<'a, T: ToOwned + ?Sized, E: Debug> Carrier<'a, T> for Result<Cow<'a, T>, E>
     }
 }
 
-/// Carrier for fallible filtering transforms, which immediateky abort on Err and can also drop
+/// Carrier for fallible filtering transforms, which immediately abort on Err and can also drop
 /// nodes by returning None.
 impl<'a, T: ToOwned + ?Sized, E: Debug> Carrier<'a, T> for Result<Option<Cow<'a, T>>, E> {
     /// Residual None means drop, Some error means abort

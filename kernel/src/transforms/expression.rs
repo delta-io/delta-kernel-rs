@@ -10,6 +10,7 @@ use crate::transforms::{
     map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
     Carrier,
 };
+use crate::{DeltaResult, Error};
 
 /// Generic framework for recursive bottom-up transforms of expressions and predicates.
 ///
@@ -466,14 +467,17 @@ impl ExpressionDepthChecker {
     // Triggers the requested recursion only doing so would not exceed the depth limit.
     fn depth_limited<'a, T: std::fmt::Debug + ToOwned + ?Sized>(
         &mut self,
-        recurse: impl FnOnce(&mut Self, &'a T) -> Result<(), ()>,
+        recurse: impl FnOnce(&mut Self, &'a T) -> DeltaResult<()>,
         arg: &'a T,
-    ) -> Result<(), ()> {
+    ) -> DeltaResult<()> {
         self.call_count += 1;
         if self.current_depth > self.max_depth_seen {
             self.max_depth_seen = self.current_depth;
             if self.current_depth > self.depth_limit {
-                return Err(());
+                return Err(Error::schema(format!(
+                    "Max expression depth {} exceeded by {arg:?}",
+                    self.depth_limit
+                )));
             }
         }
         self.current_depth += 1;
@@ -484,45 +488,45 @@ impl ExpressionDepthChecker {
 }
 
 impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
-    transform_output_type!(|'a, T| Result<(), ()>);
+    transform_output_type!(|'a, T| DeltaResult<()>);
 
-    fn transform_expr_struct(&mut self, fields: &'a [ExpressionRef]) -> Result<(), ()> {
+    fn transform_expr_struct(&mut self, fields: &'a [ExpressionRef]) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_expr_struct, fields)
     }
 
-    fn transform_expr_pred(&mut self, pred: &'a Predicate) -> Result<(), ()> {
+    fn transform_expr_pred(&mut self, pred: &'a Predicate) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_expr_pred, pred)
     }
 
-    fn transform_pred_not(&mut self, pred: &'a Predicate) -> Result<(), ()> {
+    fn transform_pred_not(&mut self, pred: &'a Predicate) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_pred_not, pred)
     }
 
-    fn transform_pred_unary(&mut self, pred: &'a UnaryPredicate) -> Result<(), ()> {
+    fn transform_pred_unary(&mut self, pred: &'a UnaryPredicate) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_pred_unary, pred)
     }
 
-    fn transform_expr_binary(&mut self, expr: &'a BinaryExpression) -> Result<(), ()> {
+    fn transform_expr_binary(&mut self, expr: &'a BinaryExpression) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_expr_binary, expr)
     }
 
-    fn transform_pred_binary(&mut self, pred: &'a BinaryPredicate) -> Result<(), ()> {
+    fn transform_pred_binary(&mut self, pred: &'a BinaryPredicate) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_pred_binary, pred)
     }
 
-    fn transform_pred_junction(&mut self, pred: &'a JunctionPredicate) -> Result<(), ()> {
+    fn transform_pred_junction(&mut self, pred: &'a JunctionPredicate) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_pred_junction, pred)
     }
 
-    fn transform_pred_opaque(&mut self, pred: &'a OpaquePredicate) -> Result<(), ()> {
+    fn transform_pred_opaque(&mut self, pred: &'a OpaquePredicate) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_pred_opaque, pred)
     }
 
-    fn transform_expr_opaque(&mut self, expr: &'a OpaqueExpression) -> Result<(), ()> {
+    fn transform_expr_opaque(&mut self, expr: &'a OpaqueExpression) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_expr_opaque, expr)
     }
 
-    fn transform_expr_map_to_struct(&mut self, expr: &'a MapToStructExpression) -> Result<(), ()> {
+    fn transform_expr_map_to_struct(&mut self, expr: &'a MapToStructExpression) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_expr_map_to_struct, expr)
     }
 }
@@ -544,7 +548,6 @@ mod tests {
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::schema::{DataType, StructField, StructType};
-    use crate::DeltaResult;
 
     #[derive(Debug, PartialEq)]
     struct OpaqueTestOp(String);
