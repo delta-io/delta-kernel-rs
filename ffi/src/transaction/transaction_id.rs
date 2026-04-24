@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use delta_kernel::transaction::Transaction;
+use delta_kernel::{DeltaResult, Snapshot};
+
 use crate::error::ExternResult;
 use crate::handle::Handle;
 use crate::transaction::ExclusiveTransaction;
@@ -8,17 +11,15 @@ use crate::{
     SharedSnapshot, TryFromStringSlice,
 };
 
-use delta_kernel::transaction::Transaction;
-use delta_kernel::{DeltaResult, Snapshot};
-
-/// Associates an app_id and version with a transaction. These will be applied to the table on commit.
+/// Associates an app_id and version with a transaction. These will be applied to the table on
+/// commit.
 ///
 /// # Returns
 /// A new handle to the transaction that will set the `app_id` version to `version` on commit
 ///
 /// # Safety
-/// Caller is responsible for passing [valid][Handle#Validity] handles. The `app_id` string slice must be valid.
-/// CONSUMES TRANSACTION
+/// Caller is responsible for passing [valid][Handle#Validity] handles. The `app_id` string slice
+/// must be valid. CONSUMES TRANSACTION
 #[no_mangle]
 pub unsafe extern "C" fn with_transaction_id(
     txn: Handle<ExclusiveTransaction>,
@@ -46,8 +47,8 @@ fn with_transaction_id_impl(
 /// The version number if found, or an error of type `MissingDataError` when the app_id was not set
 ///
 /// # Safety
-/// Caller must ensure [valid][Handle#Validity] handles are provided for snapshot and engine. The `app_id`
-/// string slice must be valid.
+/// Caller must ensure [valid][Handle#Validity] handles are provided for snapshot and engine. The
+/// `app_id` string slice must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn get_app_id_version(
     snapshot: Handle<SharedSnapshot>,
@@ -73,18 +74,19 @@ fn get_app_id_version_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
 
+    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::Snapshot;
+    use tempfile::tempdir;
+    use test_utils::setup_test_tables;
+    use url::Url;
+
+    use super::*;
     use crate::ffi_test_utils::ok_or_panic;
     use crate::kernel_string_slice;
     use crate::tests::get_default_engine;
     use crate::transaction::{commit, transaction};
-    use delta_kernel::schema::{DataType, StructField, StructType};
-    use delta_kernel::Snapshot;
-    use std::sync::Arc;
-    use tempfile::tempdir;
-    use test_utils::setup_test_tables;
-    use url::Url;
 
     #[cfg(feature = "default-engine-base")]
     #[tokio::test]

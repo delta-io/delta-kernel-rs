@@ -19,7 +19,6 @@
 //!       expected_metadata/    # Expected add files after data skipping as Parquet files
 //!         part-aaaaa.parquet
 //!         part-bbbbb.parquet
-//!
 //! ```
 //!
 //! ## Expected Data Format

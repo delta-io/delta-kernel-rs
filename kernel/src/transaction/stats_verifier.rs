@@ -273,19 +273,17 @@ impl RowVisitor for ColumnStatsVisitor<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::sync::Arc;
 
     use rstest::rstest;
 
+    use super::*;
+    use crate::arrow::array::types::{
+        Date32Type, Decimal128Type, Float32Type, Float64Type, Int32Type, TimestampMicrosecondType,
+    };
     #[cfg(feature = "nanosecond-timestamps")]
     use crate::arrow::array::TimestampNanosecondArray;
     use crate::arrow::array::{
-        types::{
-            Date32Type, Decimal128Type, Float32Type, Float64Type, Int32Type,
-            TimestampMicrosecondType,
-        },
         Array, ArrayRef, BinaryArray, BooleanArray, Int16Array, Int64Array, Int8Array,
         LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
     };

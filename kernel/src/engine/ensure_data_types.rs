@@ -1,21 +1,17 @@
 //! Helpers to ensure that kernel data types match arrow data types
 
-use std::{
-    collections::{HashMap, HashSet},
-    ops::Deref,
-};
+use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 
-use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit};
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
 use super::arrow_conversion::TryIntoArrow as _;
-use crate::{
-    engine::arrow_utils::make_arrow_error,
-    schema::{DataType, MetadataValue, StructField},
-    utils::require,
-    DeltaResult, Error,
-};
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit};
+use crate::engine::arrow_utils::make_arrow_error;
+use crate::schema::{DataType, MetadataValue, StructField};
+use crate::utils::require;
+use crate::{DeltaResult, Error};
 
 /// Controls how `ensure_data_types` validates struct fields and metadata.
 #[derive(Clone, Copy)]
@@ -239,7 +235,8 @@ fn check_cast_compat(
             // timestamps are able to be cast between each other
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
-        // Allow up-casting to a larger type if it's safe and can't cause overflow or loss of precision.
+        // Allow up-casting to a larger type if it's safe and can't cause overflow or loss of
+        // precision.
         (Int8, Int16 | Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
         (Int16, Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
         (Int32, Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
@@ -263,8 +260,8 @@ fn check_cast_compat(
     }
 }
 
-// Returns whether the given source type can be safely cast to a decimal with the given precision and scale without
-// loss of information.
+// Returns whether the given source type can be safely cast to a decimal with the given precision
+// and scale without loss of information.
 fn can_upcast_to_decimal(
     source_type: &ArrowDataType,
     target_precision: u8,
@@ -316,19 +313,18 @@ fn metadata_eq(
 mod tests {
     use std::sync::Arc;
 
+    use super::*;
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
-
     use crate::engine::arrow_conversion::TryFromKernel as _;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
     use crate::utils::test_utils::assert_result_error_with_message;
 
-    use super::*;
-
     #[test]
     fn accepts_safe_decimal_casts() {
-        use super::can_upcast_to_decimal;
         use ArrowDataType::*;
+
+        use super::can_upcast_to_decimal;
 
         assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 0i8));
         assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 1i8));
@@ -365,8 +361,9 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_decimal_casts() {
-        use super::can_upcast_to_decimal;
         use ArrowDataType::*;
+
+        use super::can_upcast_to_decimal;
 
         assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, 1i8));
         assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, -1i8));

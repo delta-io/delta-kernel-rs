@@ -45,14 +45,15 @@ chrono = "0.4.41"
 crc = "3.2.2"
 indexmap = "2.10.0"
 itertools = "0.14"
+percent-encoding = "2"
 rand = "0.9"
 roaring = "0.11.2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 strum = { version = "0.27", features = ["derive"] }
 thiserror = "2"
-# only for structured logging
 tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = "0.3"
 url = "2"
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
@@ -121,8 +122,8 @@ schema-diff = []
 # corresponding RFC (https://github.com/delta-io/delta/issues/6081).
 nanosecond-timestamps = ["test_utils/nanosecond-timestamps"]
 
-# this is an 'internal' feature flag which has all the shared bits from default-engine and
-# default-engine-rustls
+# this is an 'internal' feature flag which has all the shared bits from default-engine-native-tls
+# and default-engine-rustls
 default-engine-base = [
   "arrow-conversion",
   "arrow-expression",

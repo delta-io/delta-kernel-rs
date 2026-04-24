@@ -12,6 +12,8 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
+use delta_kernel_derive::internal_api;
+use tracing::warn;
 use url::Url;
 
 use crate::actions::{Metadata, Protocol};
@@ -34,8 +36,6 @@ use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
-use delta_kernel_derive::internal_api;
-use tracing::warn;
 
 /// Expected schema for file statistics, using physical column names.
 ///
@@ -136,8 +136,8 @@ impl TableConfiguration {
     ///
     /// Note: In the future, we will perform stricter checks on the set of reader and writer
     /// features. In particular, we will check that:
-    ///     - Non-legacy features must appear in both reader features and writer features lists.
-    ///       If such a feature is present, the reader version and writer version must be 3, and 5
+    ///     - Non-legacy features must appear in both reader features and writer features lists. If
+    ///       such a feature is present, the reader version and writer version must be 3, and 5
     ///       respectively.
     ///     - Legacy reader features occur when the reader version is 3, but the writer version is
     ///       either 5 or 6. In this case, the writer feature list must be empty.
@@ -205,17 +205,25 @@ impl TableConfiguration {
     /// Creates a new [`TableConfiguration`] representing the table configuration immediately
     /// after a commit.
     ///
-    /// This method takes a pre-commit table configuration and produces a post-commit
-    /// configuration at the committed version. This allows immediate use of the new table
-    /// configuration without re-reading metadata from storage.
+    /// This method takes the current table configuration and produces a post-commit
+    /// configuration at the committed version. If the commit included new Protocol or Metadata
+    /// actions (e.g. ALTER TABLE), those are passed in and the configuration is rebuilt with
+    /// full validation. Otherwise the existing configuration is cloned with only the version
+    /// updated.
     ///
-    /// TODO: Take in Protocol (when Kernel-RS supports protocol changes)
-    /// TODO: Take in Metadata (when Kernel-RS supports metadata changes)
-    pub(crate) fn new_post_commit(table_configuration: &Self, new_version: Version) -> Self {
-        Self {
-            version: new_version,
-            ..table_configuration.clone()
-        }
+    /// Returns the new [`TableConfiguration`] at `new_version`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the new metadata/protocol combination fails
+    /// [`TableConfiguration::try_new`] validation (e.g., unsupported features, invalid schema).
+    pub(crate) fn new_post_commit(
+        table_configuration: &Self,
+        new_version: Version,
+        new_metadata: Option<Metadata>,
+        new_protocol: Option<Protocol>,
+    ) -> DeltaResult<Self> {
+        Self::try_new_from(table_configuration, new_metadata, new_protocol, new_version)
     }
 
     /// Generates the expected schema for file statistics.
@@ -240,8 +248,8 @@ impl TableConfiguration {
     /// - **`delta.dataSkippingStatsColumns`**: If set, only specified columns are included.
     /// - **`delta.dataSkippingNumIndexedCols`**: Otherwise, includes the first N leaf columns
     ///   (default 32).
-    /// - **Required columns** (e.g. clustering columns): Per the Delta protocol, always included
-    ///   in statistics, regardless of the above settings.
+    /// - **Required columns** (e.g. clustering columns): Per the Delta protocol, always included in
+    ///   statistics, regardless of the above settings.
     /// - **Requested columns**: Optional output filter that limits which columns appear in the
     ///   schema without affecting column counting.
     ///
@@ -416,9 +424,9 @@ impl TableConfiguration {
 
     /// The physical schema ([`SchemaRef`]) of this table at this version.
     ///
-    /// When column mapping is disabled, this is identical to [`logical_schema`](Self::logical_schema).
-    /// Otherwise, field names are replaced with physical column names derived from column
-    /// mapping metadata.
+    /// When column mapping is disabled, this is identical to
+    /// [`logical_schema`](Self::logical_schema). Otherwise, field names are replaced with
+    /// physical column names derived from column mapping metadata.
     #[internal_api]
     pub(crate) fn physical_schema(&self) -> SchemaRef {
         self.physical_schemas.full.clone()
@@ -632,7 +640,8 @@ impl TableConfiguration {
 
     /// Internal helper for write operations
     fn ensure_write_supported(&self) -> DeltaResult<()> {
-        // Version check: kernel supports writer versions MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
+        // Version check: kernel supports writer versions
+        // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
             self.protocol.min_writer_version() >= MIN_VALID_RW_VERSION,
             Error::InvalidProtocol(format!(
@@ -703,8 +712,8 @@ impl TableConfiguration {
 
     /// Returns `true` if row tracking is suspended for this table.
     ///
-    /// Row tracking is suspended when the `delta.rowTrackingSuspended` table property is set to `true`.
-    /// Note that:
+    /// Row tracking is suspended when the `delta.rowTrackingSuspended` table property is set to
+    /// `true`. Note that:
     /// - Row tracking can be _supported_ and _suspended_ at the same time.
     /// - Row tracking cannot be _enabled_ while _suspended_.
     pub(crate) fn is_row_tracking_suspended(&self) -> bool {
@@ -811,14 +820,14 @@ mod test {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use rstest::rstest;
     use url::Url;
 
+    use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol};
-    use crate::schema::ColumnName;
-    use crate::schema::{DataType, SchemaRef, StructField, StructType};
-    use crate::table_features::ColumnMappingMode;
+    use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
     use crate::table_features::{
-        FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
+        ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::{
@@ -831,9 +840,6 @@ mod test {
         test_schema_with_map_and_column_mapping,
     };
     use crate::Error;
-    use rstest::rstest;
-
-    use super::{InCommitTimestampEnablement, TableConfiguration};
 
     fn create_mock_table_config(
         props_to_enable: &[(&str, &str)],
@@ -991,8 +997,9 @@ mod test {
 
     #[test]
     fn write_with_cdf() {
-        use crate::table_properties::{APPEND_ONLY, ENABLE_CHANGE_DATA_FEED};
         use TableFeature::*;
+
+        use crate::table_properties::{APPEND_ONLY, ENABLE_CHANGE_DATA_FEED};
         let cases = [
             (
                 // Writing to CDF-enabled table is supported for writes
@@ -1553,7 +1560,8 @@ mod test {
             create_mock_table_config_with_version(&[], Some(&[TableFeature::ChangeDataFeed]), 2, 7);
         assert!(!config.is_feature_supported(&feature));
 
-        // Test with protocol reader=3, writer=7 (both non-legacy) - feature in list, should be supported
+        // Test with protocol reader=3, writer=7 (both non-legacy) - feature in list, should be
+        // supported
         let config = create_mock_table_config(&[], &[TableFeature::AppendOnly]);
         assert!(config.is_feature_supported(&feature));
 
@@ -1585,7 +1593,8 @@ mod test {
             create_mock_table_config_with_version(&[], Some(&[TableFeature::AppendOnly]), 2, 7);
         // ColumnMapping (ReaderWriter) should NOT be supported because:
         // - reader=2 (legacy) checks version: 2 >= 2 (reader_supported = true)
-        // - writer=7 (non-legacy) checks list: ColumnMapping not in writer_features (writer_supported = false)
+        // - writer=7 (non-legacy) checks list: ColumnMapping not in writer_features
+        //   (writer_supported = false)
         // - Result: false (requires BOTH to be true)
         assert!(!config.is_feature_supported(&feature));
 
@@ -1931,7 +1940,8 @@ mod test {
     }
 
     /// Schema with a data column and two partition columns, all with column mapping metadata.
-    /// data_col (long) -> phys_data, part_a (string) -> phys_part_a, part_b (integer) -> phys_part_b
+    /// data_col (long) -> phys_data, part_a (string) -> phys_part_a, part_b (integer) ->
+    /// phys_part_b
     fn partitioned_schema_with_column_mapping() -> SchemaRef {
         let data_col: StructField = serde_json::from_str(
             r#"{
@@ -2137,7 +2147,7 @@ mod test {
         "id",
         vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
     )]
-    // --- nested schema ---
+    // --- nested schema (includes map/array inside struct as leaf columns) ---
     #[case::nested_none(
         test_schema_nested(),
         "none",
@@ -2145,6 +2155,8 @@ mod test {
             ColumnName::new(["id"]),
             ColumnName::new(["info", "name"]),
             ColumnName::new(["info", "age"]),
+            ColumnName::new(["info", "tags"]),
+            ColumnName::new(["info", "scores"]),
         ],
     )]
     #[case::nested_name(
@@ -2154,6 +2166,8 @@ mod test {
             ColumnName::new(["phys_id"]),
             ColumnName::new(["phys_info", "phys_name"]),
             ColumnName::new(["phys_info", "phys_age"]),
+            ColumnName::new(["phys_info", "phys_tags"]),
+            ColumnName::new(["phys_info", "phys_scores"]),
         ],
     )]
     #[case::nested_id(
@@ -2163,39 +2177,41 @@ mod test {
             ColumnName::new(["phys_id"]),
             ColumnName::new(["phys_info", "phys_name"]),
             ColumnName::new(["phys_info", "phys_age"]),
+            ColumnName::new(["phys_info", "phys_tags"]),
+            ColumnName::new(["phys_info", "phys_scores"]),
         ],
     )]
-    // --- schema with map (map fields excluded from stats) ---
+    // --- schema with map (included as leaf for nullCount stats) ---
     #[case::map_none(
         test_schema_with_map(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+        vec![ColumnName::new(["id"]), ColumnName::new(["entries"]), ColumnName::new(["name"])],
     )]
     #[case::map_name(
         test_schema_with_map_and_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_entries"]), ColumnName::new(["phys_name"])],
     )]
     #[case::map_id(
         test_schema_with_map_and_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_entries"]), ColumnName::new(["phys_name"])],
     )]
-    // --- schema with array (array fields excluded from stats) ---
+    // --- schema with array (included as leaf for nullCount stats) ---
     #[case::array_none(
         test_schema_with_array(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+        vec![ColumnName::new(["id"]), ColumnName::new(["items"]), ColumnName::new(["name"])],
     )]
     #[case::array_name(
         test_schema_with_array_and_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_items"]), ColumnName::new(["phys_name"])],
     )]
     #[case::array_id(
         test_schema_with_array_and_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_items"]), ColumnName::new(["phys_name"])],
     )]
     fn test_physical_stats_column_names_all_schemas(
         #[case] schema: SchemaRef,

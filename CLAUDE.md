@@ -30,7 +30,7 @@ cargo nextest run -p delta_kernel --lib --all-features test_name_here
 cargo nextest run --workspace --all-features test_name_here
 
 # Format, lint, and doc check (always run after code changes)
-cargo fmt \
+cargo +nightly fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
   && cargo doc --workspace --all-features --no-deps
 
@@ -39,7 +39,7 @@ cargo clippy --workspace --no-default-features --features arrow \
   --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
 
 # Quick pre-push check (mimics CI)
-cargo fmt \
+cargo +nightly fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
   && cargo doc --workspace --all-features --no-deps \
   && cargo nextest run --workspace --all-features
@@ -61,11 +61,10 @@ cargo fmt \
 
 ### Feature Flags
 
-- `default-engine` / `default-engine-rustls` / `default-engine-native-tls` -- async
-  Arrow/Tokio engine (pick one TLS backend)
+- `default-engine-rustls` / `default-engine-native-tls` -- async Arrow/Tokio engine (pick a TLS backend)
 - `arrow`, `arrow-XX`, `arrow-YY` -- Arrow version selection (kernel tracks the latest two
   major Arrow releases; `arrow` defaults to latest). Kernel itself does not depend on Arrow,
-  but default-engine does.
+  but the default engine does.
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `clustered-table` -- clustered table write support (experimental)
@@ -121,6 +120,14 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   merged into it as a new `#[case]`. A common pattern is toggling a feature (e.g.
   column mapping on/off) and asserting success vs. error.
 - Reuse helpers from `test_utils` instead of writing custom ones when possible.
+- **Committing in tests:** Use `txn.commit(engine)?.unwrap_committed()` to assert a
+  successful commit and get the `CommittedTransaction`. Do NOT use `match` + `panic!`
+  for this -- `unwrap_committed()` provides a clear error message on failure. Available
+  under `#[cfg(test)]` and the `test-utils` feature.
+- **Prefer snapshot/public API assertions over reading raw commit JSON.** Only read raw
+  commit JSON when the data is inaccessible via public API (e.g., system domain metadata
+  is blocked by `get_domain_metadata`). For commit JSON reads, use `read_actions_from_commit`
+  from `test_utils` -- do NOT write local helpers that duplicate this.
 - **`add_commit` and table setup in tests:** `add_commit` takes a `table_root` string and
   resolves it to an absolute object-store path. The `table_root` must be a proper URL string
   with a trailing slash (e.g. `"memory:///"`, `"file:///tmp/my_table/"`). Avoid using the
@@ -194,6 +201,12 @@ Keep this list updated when new protocol features are added to kernel.
 - Code comments state intent and explain "why" -- don't restate what the code self-documents.
 - Place `use` imports at the top of the file (for non-test code) or at the top of the
   `mod tests` block (for test code) -- never inside function bodies.
+- Prefer `==` over `matches!` for simple single-variant enum comparisons. `matches!` is
+  for patterns with bindings or guards. For example: `self == Variant` not
+  `matches!(self, Variant)`.
+- Prefer `StructField::nullable` / `StructField::not_null` over
+  `StructField::new(name, type, bool)` when nullability is known at compile time.
+  Reserve `StructField::new` for cases where nullability is a runtime value.
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
 
@@ -218,7 +231,7 @@ and data flow. Keep it concise.
 a newer (potentially compromised) transitive dependency. If `Cargo.lock` is out of sync with
 `Cargo.toml`, the build fails immediately, forcing dependency changes to be explicit and
 reviewable. See the top-level comment in `build.yml` for full rationale. Commands exempt from
-`--locked`: `cargo fmt` (no dep resolution), `cargo msrv verify/show` (wrapper tool),
+`--locked`: `cargo +nightly fmt` (no dep resolution), `cargo msrv verify/show` (wrapper tool),
 `cargo miri setup` (tooling setup).
 
 Ensure that when writing any github action you are considering safety including thinking of

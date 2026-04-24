@@ -1,20 +1,17 @@
 //! Definitions of errors that the delta kernel can encounter
 
-use std::{
-    backtrace::{Backtrace, BacktraceStatus},
-    convert::Infallible,
-    num::ParseIntError,
-    str::Utf8Error,
-};
-
-use crate::schema::{DataType, StructType};
-use crate::table_properties::ParseIntervalError;
-use crate::Version;
+use std::backtrace::{Backtrace, BacktraceStatus};
+use std::convert::Infallible;
+use std::num::ParseIntError;
+use std::str::Utf8Error;
 
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
 use crate::object_store;
+use crate::schema::{DataType, StructType};
+use crate::table_properties::ParseIntervalError;
+use crate::Version;
 
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
@@ -228,6 +225,10 @@ pub enum Error {
     /// Validation error for file statistics (e.g., missing required clustering column stats)
     #[error("Stats validation error: {0}")]
     StatsValidation(String),
+
+    /// Error during log history operations (timestamp queries, version lookups)
+    #[error(transparent)]
+    LogHistory(#[from] Box<crate::history_manager::error::LogHistoryError>),
 }
 
 // Convenience constructors for Error types that take a String argument

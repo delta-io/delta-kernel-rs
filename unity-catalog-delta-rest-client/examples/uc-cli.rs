@@ -1,6 +1,8 @@
-use clap::{Parser, Subcommand};
 use std::time::Duration;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+use clap::{Parser, Subcommand};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{fmt, EnvFilter};
 use unity_catalog_delta_client_api::{Commit, CommitsRequest, GetCommitsClient, Operation};
 use unity_catalog_delta_rest_client::{UCClient, UCCommitsRestClient};
 

@@ -5,15 +5,15 @@ mod column_filter;
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use column_filter::StatsColumnFilter;
+pub(crate) use column_filter::StatsConfig;
+
 use crate::schema::{
     ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
     StructType,
 };
 use crate::transforms::SchemaTransform;
 use crate::{DeltaResult, Error};
-
-use column_filter::StatsColumnFilter;
-pub(crate) use column_filter::StatsConfig;
 
 /// Generates the expected schema for file statistics.
 ///
@@ -28,10 +28,11 @@ pub(crate) use column_filter::StatsConfig;
 /// It tracks the count of null values for each column. All leaf fields from the base schema
 /// are converted to LONG type (since null counts are always integers).
 ///
-/// Note: Map, Array, and Variant types are excluded from statistics entirely (including
-/// `nullCount`) as they are not eligible for data skipping. The `nullCount` schema includes
-/// primitive types that aren't eligible for min/max (e.g., Boolean, Binary) since null counts
-/// are still meaningful for those types.
+/// Note: Array, Map, and Variant types are included in `nullCount` (null counts are meaningful
+/// for these types) but excluded from `minValues`/`maxValues` (not eligible for data skipping).
+/// They count as leaf columns against the indexed column limit. The `nullCount` schema also
+/// includes primitive types that aren't eligible for min/max (e.g., Boolean, Binary) since null
+/// counts are still meaningful for those types.
 ///
 /// The `minValues`/`maxValues` struct fields are also nested structures mirroring the table's
 /// column hierarchy. They additionally filter out leaf fields with non-eligible data types
@@ -48,11 +49,11 @@ pub(crate) use column_filter::StatsConfig;
 ///   entry in `minValues`/`maxValues`. The `nullCount` entry is still present and equals
 ///   `numRecords`.
 /// - String min/max values must be truncated to a prefix no longer than 32 characters. For min
-///   values, simple prefix truncation is valid (the truncated value is always <= the original).
-///   For max values, a tie-breaker character must be appended after truncation to ensure the
-///   result is >= all actual values: ASCII DEL (0x7F) when the truncated character is ASCII,
-///   or U+10FFFF otherwise. If a valid truncation point cannot be found within 64 characters,
-///   the max value is omitted (returning `None`).
+///   values, simple prefix truncation is valid (the truncated value is always <= the original). For
+///   max values, a tie-breaker character must be appended after truncation to ensure the result is
+///   greater than or equal to all actual values: ASCII DEL (0x7F) when the truncated character is
+///   ASCII, or U+10FFFF otherwise. If a valid truncation point cannot be found within 64
+///   characters, the max value is omitted (returning `None`).
 /// - Binary min/max values are not collected (Binary is not eligible for data skipping).
 /// - Boolean values are not eligible for min/max statistics but do have `nullCount`.
 ///
@@ -124,11 +125,10 @@ pub(crate) use column_filter::StatsConfig;
 ///
 /// - `data_schema`: The table's data schema (partition columns excluded).
 /// - `config`: Stats configuration controlling which columns are included.
-/// - `required_columns`: Columns that must always be included in statistics (write path).
-///   Per the Delta protocol, clustering columns must have statistics regardless of table
-///   property settings.
-/// - `requested_columns`: Filter output to only these columns (read path). If specified,
-///   only columns that also pass the `config` filtering will be included.
+/// - `required_columns`: Columns that must always be included in statistics (write path). Per the
+///   Delta protocol, clustering columns must have statistics regardless of table property settings.
+/// - `requested_columns`: Filter output to only these columns (read path). If specified, only
+///   columns that also pass the `config` filtering will be included.
 #[allow(unused)]
 pub(crate) fn expected_stats_schema(
     data_schema: &Schema,
@@ -304,8 +304,8 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
 /// Transforms a table schema into a base stats schema.
 ///
 /// Base stats schema in this case refers the subsets of fields in the table schema
-/// that may be considered for stats collection. Depending on the type of stats - min/max/nullcount/... -
-/// additional transformations may be applied.
+/// that may be considered for stats collection. Depending on the type of stats -
+/// min/max/nullcount/... - additional transformations may be applied.
 ///
 /// All fields in the output are nullable. Clustering columns are always included per
 /// the Delta protocol.
@@ -325,10 +325,22 @@ impl<'col> BaseStatsTransform<'col> {
             filter: StatsColumnFilter::new(config, required_columns, requested_columns),
         }
     }
+
+    /// Checks whether a leaf column (primitive, array, map, or variant) should be included in the
+    /// stats schema and records it against the column limit if so. The column limit is based on
+    /// schema order, so we count all leaf columns that pass the table filter, but only generate
+    /// stats for requested columns.
+    fn include_leaf(&mut self) -> bool {
+        if !self.filter.should_include_for_table() {
+            return false;
+        }
+        self.filter.record_included();
+        self.filter.should_include_for_requested()
+    }
 }
 
 impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
-    // Always traverse struct fields -- only primitive leaf values count against the column limit
+    // Always traverse struct fields. All non-struct leaf types count against the column limit.
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.filter.enter_field(field.name());
         let data_type = self.transform(&field.data_type);
@@ -337,28 +349,19 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
     }
 
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        if !self.filter.should_include_for_table() {
-            return None;
-        }
-
-        // The n_columns limit is based on schema order, so we count all leaf columns that pass the
-        // table filter, but then we only generate stats for requested columns.
-        self.filter.record_included();
-        self.filter
-            .should_include_for_requested()
-            .then_some(Cow::Borrowed(ptype))
+        self.include_leaf().then_some(Cow::Borrowed(ptype))
     }
 
-    fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        None // not stats-eligible
+    fn transform_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+        self.include_leaf().then_some(Cow::Borrowed(atype))
     }
 
-    fn transform_map(&mut self, _: &'a MapType) -> Option<Cow<'a, MapType>> {
-        None // not stats-eligible
+    fn transform_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
+        self.include_leaf().then_some(Cow::Borrowed(mtype))
     }
 
-    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
-        None // not stats-eligible
+    fn transform_variant(&mut self, vtype: &'a StructType) -> Option<Cow<'a, StructType>> {
+        self.include_leaf().then_some(Cow::Borrowed(vtype))
     }
 }
 
@@ -369,9 +372,8 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
 struct MinMaxStatsTransform;
 
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
-    // Array, Map, and Variant fields are filtered out by BaseStatsTransform, so these methods
-    // are typically not called. They're kept as a safety net in case the transform is used
-    // independently or the filtering logic changes.
+    // Array, Map, and Variant fields pass through BaseStatsTransform (for nullCount) but must
+    // be excluded from min/max stats.
     fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
         None
     }
@@ -421,10 +423,9 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::schema::ArrayType;
     use crate::table_properties::TableProperties;
-
-    use super::*;
 
     fn stats_config_from_table_properties(properties: &TableProperties) -> StatsConfig<'_> {
         StatsConfig {
@@ -531,9 +532,10 @@ mod tests {
         )
         .unwrap();
 
-        // nullCount excludes array fields (tags) - only eligible primitive types
+        // nullCount includes array fields (tags) as leaf columns
         let expected_null_nested = StructType::new_unchecked([
             StructField::nullable("name", DataType::LONG),
+            StructField::nullable("tags", DataType::LONG),
             StructField::nullable("score", DataType::LONG),
         ]);
         let expected_null = StructType::new_unchecked([
@@ -592,6 +594,62 @@ mod tests {
             .into_owned();
 
         let expected = expected_stats(null_count, expected_fields);
+
+        assert_eq!(&expected, &stats_schema);
+    }
+
+    #[test]
+    fn test_stats_schema_stats_columns_with_complex_types() {
+        // When dataSkippingStatsColumns explicitly names a complex type column, only that
+        // column (plus any other named columns) should appear in the stats schema.
+        let properties: TableProperties = [(
+            "delta.dataSkippingStatsColumns".to_string(),
+            "id,tags".to_string(),
+        )]
+        .into();
+
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable(
+                "tags",
+                DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
+            ),
+            StructField::nullable(
+                "metadata",
+                DataType::Map(Box::new(MapType::new(
+                    DataType::STRING,
+                    DataType::STRING,
+                    true,
+                ))),
+            ),
+            StructField::nullable("name", DataType::STRING),
+        ]);
+
+        let stats_schema = expected_stats_schema(
+            &file_schema,
+            &stats_config_from_table_properties(&properties),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // nullCount: only id and tags (explicitly requested)
+        let expected_null_count = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("tags", DataType::LONG),
+        ]);
+
+        // minValues/maxValues: only id (tags excluded by MinMaxStatsTransform)
+        let expected_min_max =
+            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
+
+        let expected = StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", expected_null_count),
+            StructField::nullable("minValues", expected_min_max.clone()),
+            StructField::nullable("maxValues", expected_min_max),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ]);
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -671,7 +729,8 @@ mod tests {
     fn test_stats_schema_nested_different_fields_in_null_vs_minmax() {
         let properties: TableProperties = [("key", "value")].into();
 
-        // Create a nested schema where some nested fields are eligible for min/max and others aren't
+        // Create a nested schema where some nested fields are eligible for min/max and others
+        // aren't
         let user_struct = StructType::new_unchecked([
             StructField::nullable("name", DataType::STRING), // eligible for min/max
             StructField::nullable("is_admin", DataType::BOOLEAN), // NOT eligible for min/max
@@ -743,13 +802,14 @@ mod tests {
         )
         .unwrap();
 
-        // nullCount includes boolean and binary (primitives) but excludes array
+        // nullCount includes boolean, binary, and array (all non-struct types get nullCount)
         let expected_null_count = StructType::new_unchecked([
             StructField::nullable("is_active", DataType::LONG),
             StructField::nullable("metadata", DataType::LONG),
+            StructField::nullable("tags", DataType::LONG),
         ]);
 
-        // minValues/maxValues: no fields are eligible (boolean/binary excluded)
+        // minValues/maxValues: no fields are eligible (boolean/binary/array excluded)
         let expected = StructType::new_unchecked([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", expected_null_count),
@@ -760,14 +820,15 @@ mod tests {
     }
 
     #[test]
-    fn test_stats_schema_map_array_dont_count_against_limit() {
-        // Test that Map and Array fields don't count against the column limit.
-        // With a limit of 2, if we have: array, map, col1, col2, col3
-        // We should get stats for col1 and col2 (the first 2 eligible columns),
-        // not be limited by the array and map fields.
+    fn test_stats_schema_complex_types_count_against_limit() {
+        // Array, Map, and Variant are leaf columns that count against the column limit,
+        // matching Spark's truncateSchema which counts all non-struct fields.
+        // With a limit of 3, if we have: array, map, variant, col1, col2
+        // We should get nullCount for the 3 complex types (the first 3 leaf columns),
+        // and col1/col2 are excluded by the limit.
         let properties: TableProperties = [(
             "delta.dataSkippingNumIndexedCols".to_string(),
-            "2".to_string(),
+            "3".to_string(),
         )]
         .into();
 
@@ -784,9 +845,9 @@ mod tests {
                     true,
                 ))),
             ),
+            StructField::nullable("v", DataType::unshredded_variant()),
             StructField::nullable("col1", DataType::LONG),
             StructField::nullable("col2", DataType::STRING),
-            StructField::nullable("col3", DataType::INTEGER), // Should be excluded by limit
         ]);
 
         let stats_schema = expected_stats_schema(
@@ -797,21 +858,70 @@ mod tests {
         )
         .unwrap();
 
-        // nullCount has only eligible primitive columns (col1 and col2).
-        // Map/Array/Variant are excluded from all stats.
+        // nullCount includes array, map, and variant (the first 3 leaf columns).
+        // col1/col2 are excluded by the limit.
         let expected_null_count = StructType::new_unchecked([
-            StructField::nullable("col1", DataType::LONG),
-            StructField::nullable("col2", DataType::LONG),
+            StructField::nullable("tags", DataType::LONG),
+            StructField::nullable("metadata", DataType::LONG),
+            StructField::nullable("v", DataType::LONG),
         ]);
 
-        // minValues/maxValues only have eligible primitive types (col1 and col2).
-        // Map/Array are filtered out by MinMaxStatsTransform.
-        let expected_min_max = StructType::new_unchecked([
-            StructField::nullable("col1", DataType::LONG),
-            StructField::nullable("col2", DataType::STRING),
+        // minValues/maxValues: all 3 complex types are excluded by MinMaxStatsTransform,
+        // and col1/col2 are past the limit, so no min/max fields at all.
+        let expected = StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", expected_null_count),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
-        let expected = expected_stats(expected_null_count, expected_min_max);
+        assert_eq!(&expected, &stats_schema);
+    }
+
+    #[test]
+    fn test_stats_schema_complex_type_consumes_slot_before_primitive() {
+        // Validates that a complex type consuming a slot causes a subsequent primitive to
+        // be excluded. With limit=2: id (long), tags (array), name (string), only id and
+        // tags get stats, name is excluded.
+        let properties: TableProperties = [(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            "2".to_string(),
+        )]
+        .into();
+
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable(
+                "tags",
+                DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
+            ),
+            StructField::nullable("name", DataType::STRING),
+        ]);
+
+        let stats_schema = expected_stats_schema(
+            &file_schema,
+            &stats_config_from_table_properties(&properties),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // nullCount: id and tags (first 2 leaf columns). name is excluded.
+        let expected_null_count = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("tags", DataType::LONG),
+        ]);
+
+        // minValues/maxValues: only id (tags excluded by MinMaxStatsTransform, name past limit)
+        let expected_min_max =
+            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
+
+        let expected = StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", expected_null_count),
+            StructField::nullable("minValues", expected_min_max.clone()),
+            StructField::nullable("maxValues", expected_min_max),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ]);
 
         assert_eq!(&expected, &stats_schema);
     }
@@ -908,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stats_column_names_skips_non_eligible_types() {
+    fn test_stats_column_names_includes_complex_types() {
         let properties: TableProperties = [("key", "value")].into();
 
         let file_schema = StructType::new_unchecked([
@@ -925,6 +1035,7 @@ mod tests {
                     true,
                 ))),
             ),
+            StructField::nullable("v", DataType::unshredded_variant()),
             StructField::nullable("name", DataType::STRING),
         ]);
 
@@ -934,10 +1045,16 @@ mod tests {
         };
         let columns = stats_column_names(&file_schema, &config, None);
 
-        // Array and Map types should be excluded
+        // Array, Map, and Variant are leaf columns and included in the stats column list
         assert_eq!(
             columns,
-            vec![ColumnName::new(["id"]), ColumnName::new(["name"]),]
+            vec![
+                ColumnName::new(["id"]),
+                ColumnName::new(["tags"]),
+                ColumnName::new(["metadata"]),
+                ColumnName::new(["v"]),
+                ColumnName::new(["name"]),
+            ]
         );
     }
 

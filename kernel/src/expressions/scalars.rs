@@ -504,10 +504,11 @@ impl Scalar {
                 .then(|| d1.bits().partial_cmp(&d2.bits()))
                 .flatten(),
             (Decimal(_), _) => None,
-            (Null(_), _) => None, // NOTE: NULL values are incomparable by definition (SQL NULL semantics)
+            // NOTE: NULL values are incomparable by definition (SQL NULL semantics)
+            (Null(_), _) => None,
             (Struct(_), _) => None, // TODO: Support Struct?
-            (Array(_), _) => None, // TODO: Support Array?
-            (Map(_), _) => None,  // TODO: Support Map?
+            (Array(_), _) => None,  // TODO: Support Array?
+            (Map(_), _) => None,    // TODO: Support Map?
         }
     }
 }
@@ -744,9 +745,9 @@ impl PrimitiveType {
             // Timestamps may additionally be encoded as a ISO 8601 formatted string such as
             // `1970-01-01T00:00:00.123456Z`.
             //
-            // The difference arises mostly in how they are to be handled on the engine side - i.e. timestampNTZ
-            // is not adjusted to UTC, this is just so we can (de-)serialize it as a date sting.
-            // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
+            // The difference arises mostly in how they are to be handled on the engine side - i.e.
+            // timestampNTZ is not adjusted to UTC, this is just so we can
+            // (de-)serialize it as a date sting. https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
             TimestampNtz | Timestamp => {
                 let mut timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f");
 
@@ -796,7 +797,8 @@ impl PrimitiveType {
     /// Parse a string as a scalar value, returning an error if the string is not parseable.
     ///
     /// The `f` function is used to convert the parsed value into a `Scalar`.
-    /// The desired type that `FromStr::parse` should parse into is inferred from the parameter type of `f`.
+    /// The desired type that `FromStr::parse` should parse into is inferred from the parameter type
+    /// of `f`.
     fn parse_str_as_scalar<T: std::str::FromStr>(
         &self,
         raw: &str,
@@ -853,11 +855,10 @@ impl PrimitiveType {
 mod tests {
     use std::f32::consts::PI;
 
+    use super::*;
     use crate::expressions::{column_expr, BinaryPredicateOp};
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{Expression as Expr, Predicate as Pred};
-
-    use super::*;
 
     #[test]
     fn test_bad_decimal() {

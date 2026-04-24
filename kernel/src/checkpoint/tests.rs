@@ -1,31 +1,37 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{from_slice, json, Value};
+use tempfile::tempdir;
+use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
+use url::Url;
 
 use crate::action_reconciliation::{
-    deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
+    deleted_file_retention_timestamp_with_time, ActionReconciliationIterator,
+    ActionReconciliationIteratorState, DEFAULT_RETENTION_SECS,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
-use crate::arrow::datatypes::DataType;
-use crate::arrow::{
-    array::{create_array, Array, AsArray, RecordBatch, StructArray},
-    datatypes::{Field, Schema},
+use crate::arrow::array::{create_array, Array, AsArray, RecordBatch, StructArray};
+use crate::arrow::datatypes::{DataType, Field, Schema};
+use crate::checkpoint::{
+    create_last_checkpoint_data, CheckpointWriter, LastCheckpointHintStats,
+    CHECKPOINT_ACTIONS_SCHEMA_V2,
 };
-use crate::checkpoint::{create_last_checkpoint_data, CHECKPOINT_ACTIONS_SCHEMA_V2};
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngineBuilder;
 use crate::log_replay::HasSelectionVector;
 use crate::object_store::local::LocalFileSystem;
-use crate::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
+use crate::object_store::memory::InMemory;
+use crate::object_store::path::Path;
+use crate::object_store::ObjectStoreExt as _;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
 use crate::transaction::create_table::create_table;
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
-use serde_json::{from_slice, json, Value};
-use tempfile::tempdir;
-use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
-use url::Url;
 
 #[rstest::rstest]
 #[case::default_retention(
@@ -245,6 +251,23 @@ pub(super) fn create_remove_action(path: &str) -> Action {
     })
 }
 
+fn try_finalize_checkpoint(
+    writer: CheckpointWriter,
+    engine: &dyn crate::Engine,
+    metadata: &FileMeta,
+    data_iter: ActionReconciliationIterator,
+) -> DeltaResult<()> {
+    let state = data_iter.state();
+    drop(data_iter);
+    let state = Arc::into_inner(state).expect("no other Arc references");
+    let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
+        state,
+        metadata.size,
+        0, /* num_sidecars */
+    )?;
+    writer.finalize(engine, &last_checkpoint_stats)
+}
+
 /// Helper to verify the contents of the `_last_checkpoint` file
 async fn assert_last_checkpoint_contents(
     store: &Arc<InMemory>,
@@ -339,7 +362,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, &data_iter.state())?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
     // Asserts the checkpoint file contents:
     // - version: latest version (2)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action
@@ -407,7 +430,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, &data_iter.state())?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
     // Asserts the checkpoint file contents:
     // - version: specified version (0)
     // - size: 1 metadata + 1 protocol
@@ -440,22 +463,69 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
 
     /* The returned data iterator has batches that we do not consume */
 
-    let size_in_bytes = 10;
-    let metadata = FileMeta {
-        location: Url::parse("memory:///fake_path_2")?,
-        last_modified: 0,
-        size: size_in_bytes,
-    };
-
-    // Attempt to finalize the checkpoint with an iterator that has not been fully consumed
-    let err = writer
-        .finalize(&engine, &metadata, &data_iter.state())
-        .expect_err("finalize should fail");
-    assert!(
-        err.to_string().contains("Error writing checkpoint: The checkpoint data iterator must be fully consumed and written to storage before calling finalize")
-    );
+    // Attempting to build LastCheckpointHintStats from a non-exhausted state should fail
+    let state = data_iter.state();
+    drop(data_iter);
+    let state = Arc::into_inner(state).expect("no other Arc references");
+    let err = LastCheckpointHintStats::from_reconciliation_state(
+        state, 0, /* size_in_bytes */
+        0, /* num_sidecars */
+    )
+    .expect_err("from_reconciliation_state should fail on non-exhausted iterator");
+    assert!(err
+        .to_string()
+        .contains("reconciliation iterator must be fully consumed"));
 
     Ok(())
+}
+
+#[test]
+fn test_last_checkpoint_hint_stats_with_nonzero_num_sidecars() -> DeltaResult<()> {
+    let state = ActionReconciliationIteratorState::new_exhausted(5, 2);
+    let stats = LastCheckpointHintStats::from_reconciliation_state(state, 100, 3)?;
+    assert_eq!(stats.num_actions, 8); // 5 reconciled + 3 sidecar actions
+    assert_eq!(stats.size_in_bytes, 100);
+    assert_eq!(stats.num_of_add_files, 2); // sidecar actions do not bump this
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::num_sidecars_exceeds_i64(
+    0,
+    0,
+    0,
+    u64::MAX,
+    "num_sidecars 18446744073709551615 exceeds i64"
+)]
+#[case::actions_count_overflow(
+    i64::MAX,
+    0,
+    0,
+    1,
+    "checkpoint action count overflowed i64: 9223372036854775807 + 1"
+)]
+#[case::size_in_bytes_exceeds_i64(
+    0,
+    0,
+    u64::MAX,
+    0,
+    "size_in_bytes 18446744073709551615 exceeds i64"
+)]
+fn test_last_checkpoint_hint_stats_rejects_invalid_input(
+    #[case] actions_count: i64,
+    #[case] add_actions_count: i64,
+    #[case] size_in_bytes: u64,
+    #[case] num_sidecars: u64,
+    #[case] expected_err_substring: &str,
+) {
+    let state = ActionReconciliationIteratorState::new_exhausted(actions_count, add_actions_count);
+    let err =
+        LastCheckpointHintStats::from_reconciliation_state(state, size_in_bytes, num_sidecars)
+            .expect_err("invalid input must error");
+    assert!(
+        err.to_string().contains(expected_err_substring),
+        "error should mention {expected_err_substring}, got: {err}"
+    );
 }
 
 /// Tests the `checkpoint()` API with:
@@ -525,7 +595,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, &data_iter.state())?;
+    try_finalize_checkpoint(writer, &engine, &metadata, data_iter)?;
     // Asserts the checkpoint file contents:
     // - version: latest version (1)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action + 1 checkpointMetadata
@@ -944,8 +1014,8 @@ fn verify_checkpoint_schema_with_partitions(
 /// For each combination (json1, struct1, json2, struct2):
 /// 1. Writes checkpoint 1 to parquet with (json1, struct1) settings
 /// 2. Changes config to (json2, struct2)
-/// 3. Reads from checkpoint 1 to produce checkpoint 2 data, exercising COALESCE paths
-///    (e.g., recovering stats from stats_parsed via ToJson, or vice versa)
+/// 3. Reads from checkpoint 1 to produce checkpoint 2 data, exercising COALESCE paths (e.g.,
+///    recovering stats from stats_parsed via ToJson, or vice versa)
 /// 4. Verifies checkpoint 2 schema matches (json2, struct2)
 #[rstest::rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

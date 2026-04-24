@@ -1,10 +1,12 @@
-//! This module handles [`CdfScanFile`]s for [`TableChangesScan`]. A [`CdfScanFile`] consists of all the
-//! metadata required to generate a change data feed. [`CdfScanFile`] can be constructed using
-//! [`CdfScanFileVisitor`]. The visitor reads from engine data with the schema [`cdf_scan_row_schema`].
-//! You can convert engine data to this schema using the [`cdf_scan_row_expression`].
-use itertools::Itertools;
+//! This module handles [`CdfScanFile`]s for [`TableChangesScan`]. A [`CdfScanFile`] consists of all
+//! the metadata required to generate a change data feed. [`CdfScanFile`] can be constructed using
+//! [`CdfScanFileVisitor`]. The visitor reads from engine data with the schema
+//! [`cdf_scan_row_schema`]. You can convert engine data to this schema using the
+//! [`cdf_scan_row_expression`].
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
+
+use itertools::Itertools;
 
 use super::log_replay::TableChangesScanMetadata;
 use crate::actions::visitors::visit_deletion_vector_at;
@@ -78,9 +80,10 @@ pub(crate) fn scan_metadata_to_scan_file(
 /// scan.
 ///
 /// The arguments to the callback are:
-/// * `context`: an `&mut context` argument. this can be anything that engine needs to pass through to each call
-/// * `CdfScanFile`: a [`CdfScanFile`] struct that holds all the metadata required to perform Change Data
-///   Feed
+/// * `context`: an `&mut context` argument. this can be anything that engine needs to pass through
+///   to each call
+/// * `CdfScanFile`: a [`CdfScanFile`] struct that holds all the metadata required to perform Change
+///   Data Feed
 ///
 /// ## Context
 /// A note on the `context`. This can be any value the engine wants. This function takes ownership

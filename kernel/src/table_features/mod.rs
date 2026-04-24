@@ -1,25 +1,16 @@
-use itertools::Itertools;
-use serde::{Deserialize, Serialize};
-use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
-
-use crate::actions::Protocol;
-use crate::expressions::Scalar;
-use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::DataType;
-use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Error};
-use delta_kernel_derive::internal_api;
-
 #[internal_api]
 pub(crate) use column_mapping::get_any_level_column_physical_name;
-pub(crate) use column_mapping::physical_to_logical_column_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
 pub(crate) use column_mapping::{
     assign_column_mapping_metadata, column_mapping_mode, get_column_mapping_mode_from_properties,
-    get_field_column_mapping_info,
+    get_field_column_mapping_info, physical_to_logical_column_name,
 };
+use delta_kernel_derive::internal_api;
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
 #[cfg(feature = "nanosecond-timestamps")]
 pub(crate) use timestamp_nanos::{
     schema_contains_timestamp_nanos, validate_timestamp_nanos_feature_support,
@@ -27,6 +18,13 @@ pub(crate) use timestamp_nanos::{
 pub(crate) use timestamp_ntz::{
     schema_contains_timestamp_ntz, validate_timestamp_ntz_feature_support,
 };
+
+use crate::actions::Protocol;
+use crate::expressions::Scalar;
+use crate::schema::derive_macro_utils::ToDataType;
+use crate::schema::DataType;
+use crate::table_properties::TableProperties;
+use crate::{DeltaResult, Error};
 mod column_mapping;
 #[cfg(feature = "nanosecond-timestamps")]
 mod timestamp_nanos;
@@ -58,7 +56,8 @@ pub const SET_TABLE_FEATURE_SUPPORTED_PREFIX: &str = "delta.feature.";
 /// Example: `"delta.feature.deletionVectors" -> "supported"`
 pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
 
-/// Table features represent protocol capabilities required to correctly read or write a given table.
+/// Table features represent protocol capabilities required to correctly read or write a given
+/// table.
 /// - Readers must implement all features required for correct table reads.
 /// - Writers must implement all features required for correct table writes.
 ///
@@ -154,8 +153,8 @@ pub(crate) enum TableFeature {
     TypeWideningPreview,
     /// version 2 of checkpointing
     V2Checkpoint,
-    /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
-    /// protocol checks during VACUUM operations
+    /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and
+    /// writer protocol checks during VACUUM operations
     VacuumProtocolCheck,
     /// This feature enables support for the variant data type, which stores semi-structured data.
     VariantType,
@@ -175,8 +174,8 @@ pub(crate) enum TableFeature {
 /// Only ColumnMapping qualifies with min_reader_version = 2.
 pub(crate) static LEGACY_READER_FEATURES: [TableFeature; 1] = [TableFeature::ColumnMapping];
 
-/// Writer and ReaderWriter features that can be supported by legacy writers (min_writer_version < 7).
-/// These are features with min_writer_version in range [1, 6].
+/// Writer and ReaderWriter features that can be supported by legacy writers (min_writer_version <
+/// 7). These are features with min_writer_version in range [1, 6].
 pub(crate) static LEGACY_WRITER_FEATURES: [TableFeature; 7] = [
     // Writer-only features (min_writer < 7)
     TableFeature::AppendOnly,       // min_writer = 2
@@ -205,7 +204,8 @@ pub(crate) enum FeatureType {
 pub(crate) enum EnablementCheck {
     /// Feature is enabled if it's supported (appears in protocol feature lists)
     AlwaysIfSupported,
-    /// Feature is enabled if supported AND the provided function returns true when checking table properties
+    /// Feature is enabled if supported AND the provided function returns true when checking table
+    /// properties
     EnabledIf(fn(&TableProperties) -> bool),
 }
 
@@ -260,7 +260,8 @@ impl MinReaderWriterVersion {
     }
 }
 
-/// Rich metadata about a table feature including version requirements, dependencies, and support status
+/// Rich metadata about a table feature including version requirements, dependencies, and support
+/// status
 pub(crate) struct FeatureInfo {
     /// The type of feature (WriterOnly, ReaderWriter, or Unknown)
     pub feature_type: FeatureType,
@@ -291,9 +292,10 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
 };
 
-// Although kernel marks invariants as "Supported", invariants must NOT actually be present in the table schema.
-// Kernel will fail to write to any table that actually uses invariants (see check in TableConfiguration::ensure_write_supported).
-// This is to allow legacy tables with the Invariants feature enabled but not in use.
+// Although kernel marks invariants as "Supported", invariants must NOT actually be present in the
+// table schema. Kernel will fail to write to any table that actually uses invariants (see check in
+// TableConfiguration::ensure_write_supported). This is to allow legacy tables with the Invariants
+// feature enabled but not in use.
 static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 2)),
@@ -367,10 +369,12 @@ static DOMAIN_METADATA_INFO: FeatureInfo = FeatureInfo {
 };
 
 // TODO(#1125): IcebergCompatV1 requires schema type validation to block Map, Array, and Void types.
-// This validation is not yet implemented. The feature is marked as NotSupported for writes until proper validation is added.
+// This validation is not yet implemented. The feature is marked as NotSupported for writes until
+// proper validation is added.
+//
 // See Delta Spark: IcebergCompat.scala CheckNoListMapNullType (lines 422-433)
-// See Java Kernel: IcebergWriterCompatMetadataValidatorAndUpdater.java UNSUPPORTED_TYPES_CHECK
-// See https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv1 for more requirements to support
+// See Java Kernel: IcebergWriterCompatMetadataValidatorAndUpdater.java
+// UNSUPPORTED_TYPES_CHECK See https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv1 for more requirements to support
 static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
@@ -398,7 +402,9 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
 
 // TODO(#1125): IcebergCompatV2 requires schema type validation. Unlike V1, V2 allows Map and Array
 // types but needs validation against an allowlist of supported types.
-// This validation is not yet implemented. The feature is marked as NotSupported for writes until proper validation is added.
+// This validation is not yet implemented. The feature is marked as NotSupported for writes until
+// proper validation is added.
+
 // See Delta Spark: IcebergCompat.scala CheckTypeInV2AllowList (lines 450-459)
 // See Java Kernel: IcebergCompatMetadataValidatorAndUpdater.java V2_SUPPORTED_TYPES
 // See https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2 for more requirements to support.

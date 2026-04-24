@@ -1,27 +1,23 @@
-use crate::arrow::array::StringArray;
-use crate::scan::state_info::StateInfo;
-use crate::schema::StructType;
-use crate::utils::test_utils::string_array_to_engine_data;
-use itertools::Itertools;
 use std::sync::Arc;
 
-use crate::log_replay::ActionsBatch;
-use crate::log_segment::CheckpointReadInfo;
-use crate::{
-    actions::get_commit_schema,
-    engine::{
-        arrow_data::ArrowEngineData,
-        sync::{json::SyncJsonHandler, SyncEngine},
-    },
-    scan::log_replay::scan_action_iter,
-    schema::SchemaRef,
-    JsonHandler,
-};
+use itertools::Itertools;
 
 use super::state::ScanCallback;
 use super::PhysicalPredicate;
+use crate::actions::get_commit_schema;
+use crate::arrow::array::StringArray;
+use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::sync::json::SyncJsonHandler;
+use crate::engine::sync::SyncEngine;
+use crate::log_replay::ActionsBatch;
+use crate::log_segment::CheckpointReadInfo;
+use crate::scan::log_replay::scan_action_iter;
+use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::TransformSpec;
+use crate::schema::{SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
+use crate::utils::test_utils::string_array_to_engine_data;
+use crate::JsonHandler;
 
 // Generates a batch of sidecar actions with the given paths.
 // The schema is provided as null columns affect equality checks.
