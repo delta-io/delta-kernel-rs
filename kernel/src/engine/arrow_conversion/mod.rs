@@ -52,6 +52,55 @@ pub(crate) fn kernel_metadata_to_arrow_metadata(
         .collect()
 }
 
+/// Looks up a nested field id for the given dot-path in the StructField's nested-ids metadata.
+pub(crate) fn lookup_nested_field_id(
+    field: &StructField,
+    path: &str,
+) -> Result<Option<i64>, ArrowError> {
+    // Order matters: `delta.columnMapping.nested.ids` takes precedence over
+    // `parquet.field.nested.ids` when both are present on the same StructField.
+    let keys = [
+        ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
+        ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
+    ];
+    for key in keys {
+        let Some(value) = field.metadata().get(key) else {
+            continue;
+        };
+        let MetadataValue::Other(json) = value else {
+            return Err(ArrowError::SchemaError(format!(
+                "'{key}' on field '{}' must be a JSON object",
+                field.name()
+            )));
+        };
+        let Some(obj) = json.as_object() else {
+            return Err(ArrowError::SchemaError(format!(
+                "'{key}' on field '{}' must be a JSON object",
+                field.name()
+            )));
+        };
+        let Some(entry) = obj.get(path) else {
+            return Ok(None);
+        };
+        return entry.as_i64().map(Some).ok_or_else(|| {
+            ArrowError::SchemaError(format!(
+                "'{key}['{path}']' on field '{}' must be an integer, got {entry}",
+                field.name()
+            ))
+        });
+    }
+    Ok(None)
+}
+
+/// Helper: arrow field metadata containing just the `PARQUET:field_id` entry, or empty if `None`.
+fn parquet_field_id_metadata(id: Option<i64>) -> HashMap<String, String> {
+    let mut meta = HashMap::new();
+    if let Some(id) = id {
+        meta.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
+    }
+    meta
+}
+
 /// Convert a kernel type into an arrow type (automatically implemented for all types that
 /// implement [`TryFromKernel`])
 pub trait TryIntoArrow<ArrowType> {
@@ -108,10 +157,62 @@ impl TryFromKernel<&StructType> for ArrowSchema {
 impl TryFromKernel<&StructField> for ArrowField {
     fn try_from_kernel(f: &StructField) -> Result<Self, ArrowError> {
         let metadata = kernel_metadata_to_arrow_metadata(f)?;
-        let field = ArrowField::new(f.name(), f.data_type().try_into_arrow()?, f.is_nullable())
-            .with_metadata(metadata);
+        let arrow_type = match f.data_type() {
+            // For Array/Map fields, build the inner arrow structure with nested field IDs
+            // looked up from this StructField's `parquet.field.nested.ids` metadata. The rest
+            // of the type graph below recurses via `nested_type_to_arrow` so further nesting
+            // keeps using `f` as the nearest-ancestor until a `Struct` resets the root.
+            DataType::Array(_) | DataType::Map(_) => {
+                map_array_type_to_arrow(f, f.name(), f.data_type())?
+            }
+            _ => f.data_type().try_into_arrow()?,
+        };
+        let field = ArrowField::new(f.name(), arrow_type, f.is_nullable()).with_metadata(metadata);
 
         Ok(field)
+    }
+}
+
+/// Recursive arrow-type builder that propagates nested field IDs from `ancestor`'s
+/// `parquet.field.nested.ids` / `delta.columnMapping.nested.ids` metadata onto the synthesized
+/// `element` / `key` / `value` arrow fields. `relative_path` is the dot-chained path rooted at
+/// `ancestor.name()` for the current position in the type graph.
+fn map_array_type_to_arrow(
+    ancestor: &StructField,
+    relative_path: &str,
+    dt: &DataType,
+) -> Result<ArrowDataType, ArrowError> {
+    match dt {
+        DataType::Array(a) => {
+            let element_path = format!("{relative_path}.{LIST_ARRAY_ROOT}");
+            let element_id = lookup_nested_field_id(ancestor, &element_path)?;
+            let element_type = map_array_type_to_arrow(ancestor, &element_path, a.element_type())?;
+            let element_field = ArrowField::new(LIST_ARRAY_ROOT, element_type, a.contains_null())
+                .with_metadata(parquet_field_id_metadata(element_id));
+            Ok(ArrowDataType::List(Arc::new(element_field)))
+        }
+        DataType::Map(m) => {
+            let key_path = format!("{relative_path}.{MAP_KEY_DEFAULT}");
+            let value_path = format!("{relative_path}.{MAP_VALUE_DEFAULT}");
+            let key_id = lookup_nested_field_id(ancestor, &key_path)?;
+            let value_id = lookup_nested_field_id(ancestor, &value_path)?;
+            let key_type = map_array_type_to_arrow(ancestor, &key_path, m.key_type())?;
+            let value_type = map_array_type_to_arrow(ancestor, &value_path, m.value_type())?;
+            let key_field = ArrowField::new(MAP_KEY_DEFAULT, key_type, false)
+                .with_metadata(parquet_field_id_metadata(key_id));
+            let value_field =
+                ArrowField::new(MAP_VALUE_DEFAULT, value_type, m.value_contains_null())
+                    .with_metadata(parquet_field_id_metadata(value_id));
+            let entries = ArrowField::new(
+                MAP_ROOT_DEFAULT,
+                ArrowDataType::Struct(vec![key_field, value_field].into()),
+                false, // always non-null
+            );
+            Ok(ArrowDataType::Map(Arc::new(entries), false))
+        }
+        // Struct resets the root; each of its own StructField children handles its own
+        // nested-ids metadata when recursing through TryFromKernel<&StructField>.
+        DataType::Struct(_) | DataType::Primitive(_) | DataType::Variant(_) => dt.try_into_arrow(),
     }
 }
 
@@ -638,5 +739,184 @@ mod tests {
             StructField::try_from_arrow(&arrow_field),
             "conflicting parquet field IDs",
         );
+    }
+
+    // ===== IcebergCompatV3 nested field ids =====
+
+    /// Build a JSON metadata value mapping nested paths to ids, suitable for use as the value of
+    /// `parquet.field.nested.ids` or `delta.columnMapping.nested.ids` on a StructField.
+    fn nested_ids_json<const N: usize>(entries: [(&str, i64); N]) -> MetadataValue {
+        let obj: serde_json::Map<String, serde_json::Value> = entries
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::from(v)))
+            .collect();
+        MetadataValue::Other(serde_json::Value::Object(obj))
+    }
+
+    /// Recursively pull `PARQUET:field_id` entries from the arrow schema, indexed by field name.
+    fn arrow_parquet_field_ids(schema: &ArrowSchema) -> HashMap<String, String> {
+        collect_arrow_field_ids(schema, PARQUET_FIELD_ID_META_KEY)
+            .into_iter()
+            .collect()
+    }
+
+    /// Protocol example: `col1: array[array[int]]` stores all nested ids on `col1` itself.
+    #[test]
+    fn test_nested_ids_array_of_array() -> DeltaResult<()> {
+        let inner_array = ArrayType::new(DataType::INTEGER, true);
+        let outer_array = ArrayType::new(DataType::Array(Box::new(inner_array)), true);
+        let schema = StructType::try_new(vec![StructField::new(
+            "col1",
+            DataType::Array(Box::new(outer_array)),
+            true,
+        )
+        .with_metadata([(
+            ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
+            nested_ids_json([("col1.element", 100), ("col1.element.element", 101)]),
+        )])])?;
+
+        let arrow_schema = ArrowSchema::try_from_kernel(&schema)?;
+        let ids = arrow_parquet_field_ids(&arrow_schema);
+        // Both nested `element` arrow fields carry the same name; collect_arrow_field_ids preserves
+        // duplicates (Vec semantics), so converting through a HashMap collapses them. Assert the
+        // raw ordered list instead for full coverage.
+        let ordered: Vec<(String, String)> =
+            collect_arrow_field_ids(&arrow_schema, PARQUET_FIELD_ID_META_KEY);
+        assert_eq!(
+            ordered,
+            vec![
+                ("element".to_string(), "100".to_string()),
+                ("element".to_string(), "101".to_string()),
+            ],
+            "Outer array element => 100; inner array element => 101"
+        );
+        assert!(!ids.contains_key("col1"), "col1 has no PARQUET:field_id");
+        Ok(())
+    }
+
+    /// Protocol example: `col2: map[int, array[int]]` — `col2.key`, `col2.value`, and
+    /// `col2.value.element` all stored on `col2`.
+    #[test]
+    fn test_nested_ids_map_of_int_to_array() -> DeltaResult<()> {
+        let value_array = ArrayType::new(DataType::INTEGER, true);
+        let map = MapType::new(
+            DataType::INTEGER,
+            DataType::Array(Box::new(value_array)),
+            true,
+        );
+        let schema = StructType::try_new(vec![StructField::new(
+            "col2",
+            DataType::Map(Box::new(map)),
+            true,
+        )
+        .with_metadata([(
+            ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
+            nested_ids_json([
+                ("col2.key", 102),
+                ("col2.value", 103),
+                ("col2.value.element", 104),
+            ]),
+        )])])?;
+
+        let arrow_schema = ArrowSchema::try_from_kernel(&schema)?;
+        let ordered: Vec<(String, String)> =
+            collect_arrow_field_ids(&arrow_schema, PARQUET_FIELD_ID_META_KEY);
+        assert_eq!(
+            ordered,
+            vec![
+                ("key".to_string(), "102".to_string()),
+                ("value".to_string(), "103".to_string()),
+                ("element".to_string(), "104".to_string()),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Protocol example: `col3: map[int, struct<subcol1: array[int]>]`. Nested ids for the map
+    /// itself live on `col3`; nested ids for the array inside `subcol1` live on `subcol1` because
+    /// a Struct resets the nearest-ancestor root.
+    #[test]
+    fn test_nested_ids_map_of_int_to_struct_with_array() -> DeltaResult<()> {
+        let subcol1_array = ArrayType::new(DataType::INTEGER, true);
+        let subcol1 = StructField::new("subcol1", DataType::Array(Box::new(subcol1_array)), true)
+            .with_metadata([(
+                ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
+                nested_ids_json([("subcol1.element", 107)]),
+            )]);
+        let value_struct = StructType::try_new(vec![subcol1])?;
+        let map = MapType::new(
+            DataType::INTEGER,
+            DataType::Struct(Box::new(value_struct)),
+            true,
+        );
+        let schema = StructType::try_new(vec![StructField::new(
+            "col3",
+            DataType::Map(Box::new(map)),
+            true,
+        )
+        .with_metadata([(
+            ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
+            nested_ids_json([("col3.key", 105), ("col3.value", 106)]),
+        )])])?;
+
+        let arrow_schema = ArrowSchema::try_from_kernel(&schema)?;
+        let ordered: Vec<(String, String)> =
+            collect_arrow_field_ids(&arrow_schema, PARQUET_FIELD_ID_META_KEY);
+        assert_eq!(
+            ordered,
+            vec![
+                ("key".to_string(), "105".to_string()),
+                ("value".to_string(), "106".to_string()),
+                ("element".to_string(), "107".to_string()),
+            ]
+        );
+        Ok(())
+    }
+
+    /// When both `delta.columnMapping.nested.ids` and `parquet.field.nested.ids` are present, the
+    /// `delta.columnMapping.nested.ids` key takes precedence.
+    #[test]
+    fn test_nested_ids_internal_key_wins() -> DeltaResult<()> {
+        let array = ArrayType::new(DataType::INTEGER, true);
+        let schema = StructType::try_new(vec![StructField::new(
+            "col1",
+            DataType::Array(Box::new(array)),
+            true,
+        )
+        .with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
+                nested_ids_json([("col1.element", 42)]),
+            ),
+            (
+                ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
+                nested_ids_json([("col1.element", 999)]),
+            ),
+        ])])?;
+
+        let arrow_schema = ArrowSchema::try_from_kernel(&schema)?;
+        let ordered: Vec<(String, String)> =
+            collect_arrow_field_ids(&arrow_schema, PARQUET_FIELD_ID_META_KEY);
+        assert_eq!(
+            ordered,
+            vec![("element".to_string(), "42".to_string())],
+            "delta.columnMapping.nested.ids should win over parquet.field.nested.ids"
+        );
+        Ok(())
+    }
+
+    /// Missing nested-id entry produces no PARQUET:field_id on the nested arrow field.
+    #[test]
+    fn test_nested_ids_missing_entry_omits_id() -> DeltaResult<()> {
+        let array = ArrayType::new(DataType::INTEGER, true);
+        let schema = StructType::try_new(vec![StructField::new(
+            "col1",
+            DataType::Array(Box::new(array)),
+            true,
+        )])?;
+        let arrow_schema = ArrowSchema::try_from_kernel(&schema)?;
+        let ordered = collect_arrow_field_ids(&arrow_schema, PARQUET_FIELD_ID_META_KEY);
+        assert!(ordered.is_empty());
+        Ok(())
     }
 }

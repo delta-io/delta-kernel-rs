@@ -429,15 +429,29 @@ impl TableConfiguration {
         self.physical_schemas.full.clone()
     }
 
+    /// Whether partition column values must be physically materialized in Parquet data files.
+    ///
+    /// True when either:
+    ///   * The [`MaterializePartitionColumns`] writer feature is enabled, or
+    ///   * [`IcebergCompatV3`] is enabled — the V3 writer requirements mandate materializing
+    ///     partition values in data files for Iceberg compatibility.
+    ///
+    /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
+    /// [`IcebergCompatV3`]: crate::table_features::TableFeature::IcebergCompatV3
+    pub(crate) fn should_materialize_partition_columns(&self) -> bool {
+        self.is_feature_enabled(&TableFeature::MaterializePartitionColumns)
+            || self.is_feature_enabled(&TableFeature::IcebergCompatV3)
+    }
+
     /// The physical schema for writing data files.
     ///
-    /// When [`MaterializePartitionColumns`] is enabled, returns the full physical schema
+    /// When [`should_materialize_partition_columns`] is true, returns the full physical schema
     /// (partition columns are materialized in data files). Otherwise, returns the physical
     /// schema with partition columns excluded.
     ///
-    /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
+    /// [`should_materialize_partition_columns`]: Self::should_materialize_partition_columns
     pub(crate) fn physical_write_schema(&self) -> SchemaRef {
-        if self.is_feature_enabled(&TableFeature::MaterializePartitionColumns) {
+        if self.should_materialize_partition_columns() {
             self.physical_schema()
         } else {
             self.physical_data_schema_without_partition_columns()
@@ -1672,6 +1686,38 @@ mod test {
             config.ensure_operation_supported(Operation::Write).is_ok(),
             "RowTracking with DomainMetadata should be supported for writes"
         );
+    }
+
+    #[test]
+    fn test_should_materialize_partition_columns() {
+        use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V3, ENABLE_ROW_TRACKING};
+
+        // No triggers → do not materialize.
+        let config = create_mock_table_config(&[], &[]);
+        assert!(!config.should_materialize_partition_columns());
+
+        // materializePartitionColumns feature alone → materialize.
+        let config = create_mock_table_config(&[], &[TableFeature::MaterializePartitionColumns]);
+        assert!(config.should_materialize_partition_columns());
+
+        // icebergCompatV3 alone → materialize. (We only need is_feature_enabled to return true,
+        // not the full V3 feature_requirements, so RowTracking/CM don't need to be set up here.)
+        let config = create_mock_table_config(
+            &[
+                (ENABLE_ICEBERG_COMPAT_V3, "true"),
+                (ENABLE_ROW_TRACKING, "true"),
+            ],
+            &[
+                TableFeature::IcebergCompatV3,
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+            ],
+        );
+        assert!(config.should_materialize_partition_columns());
+
+        // icebergCompatV3 writer feature supported but property not enabled → do not materialize.
+        let config = create_mock_table_config(&[], &[TableFeature::IcebergCompatV3]);
+        assert!(!config.should_materialize_partition_columns());
     }
 
     #[test]

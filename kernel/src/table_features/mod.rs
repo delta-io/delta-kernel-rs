@@ -4,8 +4,9 @@ pub(crate) use column_mapping::get_any_level_column_physical_name;
 pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
 pub(crate) use column_mapping::{
-    assign_column_mapping_metadata, column_mapping_mode, get_column_mapping_mode_from_properties,
-    get_field_column_mapping_info, physical_to_logical_column_name,
+    assign_column_mapping_metadata, assign_nested_field_ids, column_mapping_mode,
+    get_column_mapping_mode_from_properties, get_field_column_mapping_info,
+    physical_to_logical_column_name,
 };
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -110,6 +111,8 @@ pub(crate) enum TableFeature {
     IcebergCompatV1,
     /// Iceberg compatibility support
     IcebergCompatV2,
+    /// Iceberg compatibility support (v3)
+    IcebergCompatV3,
     /// The Clustered Table feature facilitates the physical clustering of rows
     /// that share similar values on a predefined set of clustering columns.
     #[strum(serialize = "clustering")]
@@ -423,6 +426,36 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
+// IcebergCompatV3 ensures tables can be converted to Apache Iceberg V3. Spec:
+// https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-compat-v3.md
+//
+static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[
+        FeatureRequirement::Enabled(TableFeature::ColumnMapping),
+        FeatureRequirement::Custom(|_protocol, properties| {
+            let mode = properties.column_mapping_mode;
+            if !matches!(
+                mode,
+                Some(ColumnMappingMode::Name) | Some(ColumnMappingMode::Id)
+            ) {
+                return Err(Error::generic(
+                    "IcebergCompatV3 requires Column Mapping in 'name' or 'id' mode",
+                ));
+            }
+            Ok(())
+        }),
+        FeatureRequirement::Enabled(TableFeature::RowTracking),
+        FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
+        FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV2),
+    ],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::EnabledIf(|props| {
+        props.enable_iceberg_compat_v3 == Some(true)
+    }),
+};
+
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
@@ -604,6 +637,7 @@ impl TableFeature {
             | TableFeature::InCommitTimestamp
             | TableFeature::IcebergCompatV1
             | TableFeature::IcebergCompatV2
+            | TableFeature::IcebergCompatV3
             | TableFeature::ClusteredTable
             | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
             TableFeature::Unknown(_) => FeatureType::Unknown,
@@ -638,6 +672,7 @@ impl TableFeature {
             TableFeature::DomainMetadata => &DOMAIN_METADATA_INFO,
             TableFeature::IcebergCompatV1 => &ICEBERG_COMPAT_V1_INFO,
             TableFeature::IcebergCompatV2 => &ICEBERG_COMPAT_V2_INFO,
+            TableFeature::IcebergCompatV3 => &ICEBERG_COMPAT_V3_INFO,
             TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
             TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
 
@@ -776,6 +811,7 @@ mod tests {
                 TableFeature::DomainMetadata => "domainMetadata",
                 TableFeature::IcebergCompatV1 => "icebergCompatV1",
                 TableFeature::IcebergCompatV2 => "icebergCompatV2",
+                TableFeature::IcebergCompatV3 => "icebergCompatV3",
                 TableFeature::ClusteredTable => "clustering",
                 TableFeature::MaterializePartitionColumns => "materializePartitionColumns",
                 TableFeature::CatalogManaged => "catalogManaged",

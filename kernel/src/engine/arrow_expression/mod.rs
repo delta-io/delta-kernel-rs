@@ -365,7 +365,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
             }
             (expr, output_type) => {
                 let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
-                let array_ref = apply_schema_to(&array_ref, output_type)?;
+                let array_ref = apply_schema_to(&array_ref, output_type, None)?;
                 let arrow_type = ArrowDataType::try_from_kernel(output_type)?;
                 let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
                 RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
