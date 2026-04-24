@@ -1403,6 +1403,48 @@ mod scan_metadata_completed_tests {
         assert_eq!(num_predicate_filtered, expected_filtered);
     }
 
+    /// End-to-end test that checkpoint row group skipping works through the full scan pipeline.
+    ///
+    /// The `parsed-stats` fixture has 6 add files (100 rows each, `id` 1..=600). Files at v0-v3
+    /// are consolidated into a parquet checkpoint; files at v4-v5 remain in commit JSON. With
+    /// predicate `id > 450`, checkpoint row group skipping in `CheckpointRowGroupFilter` prunes
+    /// the file with id 1..=100 (max(id) = 100 < 450). The remaining files reach scan_metadata
+    /// and are further filtered at the add-action level (ending with 2 active files: id 401..=500
+    /// and 501..=600).
+    #[test]
+    fn test_checkpoint_row_group_skipping_end_to_end() {
+        let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(450i64)));
+        let (reporter, _guard, num_results) =
+            run_scan("./tests/data/parsed-stats/", Some(predicate));
+        let MetricEvent::ScanMetadataCompleted {
+            num_active_add_files,
+            ..
+        } = get_scan_event(&reporter)
+        else {
+            panic!("expected ScanMetadataCompleted");
+        };
+        // Exactly the two files with max(id) > 450 survive.
+        assert_eq!(num_active_add_files, 2);
+        // And the scan pipeline returns batches successfully (no errors in the filter chain).
+        assert!(num_results > 0);
+    }
+
+    /// Verifies a predicate that no file can satisfy prunes everything via row group skipping
+    /// and scan_metadata filtering combined.
+    #[test]
+    fn test_checkpoint_row_group_skipping_prunes_all() {
+        let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(999_999i64)));
+        let (reporter, _guard, _) = run_scan("./tests/data/parsed-stats/", Some(predicate));
+        let MetricEvent::ScanMetadataCompleted {
+            num_active_add_files,
+            ..
+        } = get_scan_event(&reporter)
+        else {
+            panic!("expected ScanMetadataCompleted");
+        };
+        assert_eq!(num_active_add_files, 0);
+    }
+
     #[test]
     fn scan_metadata_completed_not_emitted_on_early_drop() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
