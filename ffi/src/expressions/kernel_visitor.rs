@@ -500,6 +500,16 @@ impl NullTypeTag {
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
+                // Geometry/Geography carry an SRID string (and for Geography, an edge
+                // algorithm) that cannot fit in the (tag, u8, u8) payload this function
+                // returns. We route them through NullTypeTag::Binary to stay consistent
+                // with the FFI schema visitor (which routes geo columns through
+                // visit_binary): consumers see a uniformly binary view of geo across
+                // schema and expressions in this PR. CRS is lost at the FFI boundary
+                // either way -- there is no side channel for it here. Once real FFI geo
+                // support lands, new NullTypeTag::Geometry / ::Geography variants will
+                // replace this arm.
+                PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => (Self::Binary, 0, 0),
             },
             _ => (Self::NonPrimitive, 0, 0),
         }

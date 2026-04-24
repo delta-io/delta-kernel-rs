@@ -199,6 +199,9 @@ fn extract_min_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
             decimal_from_bytes(b.min_bytes_opt(), *d)?
         }
         (Decimal(..), _) => return None,
+        // WKB bytes are not lexicographically orderable, so parquet min/max are not
+        // meaningful for Geometry/Geography columns.
+        (Geometry(_) | Geography(_), _) => return None,
     };
     Some(value)
 }
@@ -243,6 +246,9 @@ fn extract_max_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
             decimal_from_bytes(b.max_bytes_opt(), *d)?
         }
         (Decimal(..), _) => return None,
+        // WKB bytes are not lexicographically orderable, so parquet min/max are not
+        // meaningful for Geometry/Geography columns.
+        (Geometry(_) | Geography(_), _) => return None,
     };
     Some(value)
 }

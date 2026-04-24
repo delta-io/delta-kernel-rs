@@ -176,6 +176,14 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
+                    // Geometry/Geography are WKB-encoded bytes at the Arrow layer. The SRID
+                    // (and edge algorithm for Geography) belongs on the ArrowField as
+                    // GeoArrow extension metadata (the `crs` / `edges` keys), not on the
+                    // ArrowDataType itself. Attaching that metadata is deferred to the
+                    // StructField -> ArrowField conversion path.
+                    PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
+                        Ok(ArrowDataType::Binary)
+                    }
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
