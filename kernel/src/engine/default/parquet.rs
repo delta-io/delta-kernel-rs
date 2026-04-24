@@ -240,15 +240,15 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
 
 /// Internal async implementation of read_parquet_files and read_checkpoint_parquet_files.
 ///
-/// When `checkpoint_partition_columns` is `Some`, files are read as checkpoint/sidecar files
-/// using [`CheckpointRowGroupFilter`] for row group skipping. When `None`, files are read as
-/// data files using the standard [`RowGroupFilter`].
+/// When `checkpoint_ctx` is `Some`, files are read as checkpoint/sidecar files using
+/// [`CheckpointRowGroupFilter`] for row group skipping. When `None`, files are read as data files
+/// using the standard [`RowGroupFilter`].
 async fn read_parquet_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileMeta>,
     physical_schema: SchemaRef,
     predicate: Option<PredicateRef>,
-    checkpoint_partition_columns: Option<HashSet<String>>,
+    checkpoint_ctx: Option<(Option<PredicateRef>, HashSet<String>)>,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
@@ -281,13 +281,13 @@ async fn read_parquet_files_impl(
         let store = store.clone();
         let schema = physical_schema.clone();
         let predicate = predicate.clone();
-        let checkpoint_partition_columns = checkpoint_partition_columns.clone();
+        let checkpoint_ctx = checkpoint_ctx.clone();
         async move {
             open_parquet_file(
                 store,
                 schema,
                 predicate,
-                checkpoint_partition_columns,
+                checkpoint_ctx,
                 None,
                 super::DEFAULT_BATCH_SIZE,
                 file,
@@ -331,13 +331,14 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         )))
     }
 
-    /// Reads checkpoint or sidecar parquet files using [`CheckpointRowGroupFilter`] for row group
-    /// skipping. See [`ParquetHandler::read_checkpoint_parquet_files`] for the full contract.
+    /// Reads checkpoint or sidecar parquet files using `CheckpointRowGroupFilter` for row group
+    /// skipping. See `ParquetHandler::read_checkpoint_parquet_files` for the full contract.
     fn read_checkpoint_parquet_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
+        action_predicate: Option<PredicateRef>,
         partition_columns: &HashSet<String>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         let num_files = files.len() as u64;
@@ -347,7 +348,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             files.to_vec(),
             physical_schema,
             predicate,
-            Some(partition_columns.clone()),
+            Some((action_predicate, partition_columns.clone())),
         );
         let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(Box::new(super::ReadMetricsIterator::new(
@@ -451,7 +452,7 @@ async fn open_parquet_file(
     store: Arc<DynObjectStore>,
     table_schema: SchemaRef,
     predicate: Option<PredicateRef>,
-    checkpoint_partition_columns: Option<HashSet<String>>,
+    checkpoint_ctx: Option<(Option<PredicateRef>, HashSet<String>)>,
     limit: Option<usize>,
     batch_size: usize,
     file_meta: FileMeta,
@@ -505,16 +506,21 @@ async fn open_parquet_file(
         .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
     // Filter row groups and row indexes if a predicate is provided
-    if let Some(ref predicate) = predicate {
-        if let Some(ref partition_columns) = checkpoint_partition_columns {
+    match (predicate.as_deref(), &checkpoint_ctx) {
+        (pred, Some((action_predicate, partition_columns)))
+            if pred.is_some() || action_predicate.is_some() =>
+        {
             builder = builder.with_checkpoint_row_group_filter(
-                predicate,
+                pred,
+                action_predicate.as_deref(),
                 partition_columns,
                 row_indexes.as_mut(),
             );
-        } else {
-            builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
         }
+        (Some(pred), None) => {
+            builder = builder.with_row_group_filter(pred, row_indexes.as_mut());
+        }
+        _ => {}
     }
     if let Some(limit) = limit {
         builder = builder.with_limit(limit)

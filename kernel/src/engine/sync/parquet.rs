@@ -23,20 +23,11 @@ use crate::{
 
 pub(crate) struct SyncParquetHandler;
 
-fn try_create_from_parquet(
-    file: File,
-    schema: SchemaRef,
-    predicate: Option<PredicateRef>,
-    file_location: String,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    try_create_from_parquet_inner(file, schema, predicate, None, file_location)
-}
-
 fn try_create_from_parquet_inner(
     file: File,
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
-    checkpoint_partition_columns: Option<Arc<HashSet<String>>>,
+    checkpoint_ctx: Option<(Option<PredicateRef>, Arc<HashSet<String>>)>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
@@ -54,15 +45,21 @@ fn try_create_from_parquet_inner(
         .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
     // Filter row groups and row indexes if a predicate is provided
-    if let Some(predicate) = predicate {
-        builder = match checkpoint_partition_columns {
-            Some(partition_columns) => builder.with_checkpoint_row_group_filter(
-                predicate.as_ref(),
-                &partition_columns,
+    match (predicate.as_deref(), &checkpoint_ctx) {
+        (pred, Some((action_predicate, partition_columns)))
+            if pred.is_some() || action_predicate.is_some() =>
+        {
+            builder = builder.with_checkpoint_row_group_filter(
+                pred,
+                action_predicate.as_deref(),
+                partition_columns,
                 row_indexes.as_mut(),
-            ),
-            None => builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut()),
-        };
+            );
+        }
+        (Some(pred), None) => {
+            builder = builder.with_row_group_filter(pred, row_indexes.as_mut());
+        }
+        _ => {}
     }
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
@@ -85,7 +82,9 @@ impl ParquetHandler for SyncParquetHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        read_files(files, schema, predicate, try_create_from_parquet)
+        read_files(files, schema, predicate, |file, schema, pred, loc| {
+            try_create_from_parquet_inner(file, schema, pred, None, loc)
+        })
     }
 
     fn read_checkpoint_parquet_files(
@@ -93,11 +92,13 @@ impl ParquetHandler for SyncParquetHandler {
         files: &[FileMeta],
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
+        action_predicate: Option<PredicateRef>,
         partition_columns: &HashSet<String>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         let partition_columns = Arc::new(partition_columns.clone());
         read_files(files, schema, predicate, move |file, schema, pred, loc| {
-            try_create_from_parquet_inner(file, schema, pred, Some(partition_columns.clone()), loc)
+            let ctx = Some((action_predicate.clone(), partition_columns.clone()));
+            try_create_from_parquet_inner(file, schema, pred, ctx, loc)
         })
     }
 

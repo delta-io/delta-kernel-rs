@@ -36,15 +36,21 @@ pub(crate) trait ParquetRowGroupSkipping {
     /// parquet files where statistics are nested under `add.stats_parsed.*` and partition values
     /// under `add.partitionValues_parsed.*`.
     ///
-    /// The `predicate` uses physical column names (e.g. `x > 10`, or `col-abc-123 > 10` under
-    /// column mapping), and the filter internally maps them to the checkpoint's nested stats
-    /// schema layout.
-    /// Statistics for data columns are null-guarded: if a stat column contains any null values
-    /// in the row group (indicating some files lack that statistic), the stat is treated as
-    /// unavailable to prevent false pruning.
+    /// The optional `predicate` uses physical column names (e.g. `x > 10`, or `col-abc-123 > 10`
+    /// under column mapping), and the filter internally maps them to the checkpoint's nested stats
+    /// schema layout. Statistics for data columns are null-guarded: if a stat column contains any
+    /// null values in the row group (indicating some files lack that statistic), the stat is
+    /// treated as unavailable to prevent false pruning.
+    ///
+    /// The optional `action_predicate` is evaluated directly against the checkpoint parquet schema
+    /// (not through the checkpoint stats layout) to prune row groups that contain no rows of the
+    /// caller's action types of interest (e.g. `txn.appId IS NOT NULL` to skip row groups with no
+    /// txn actions). It MUST only reference top-level action-identifier columns -- passing user
+    /// data columns here can cause false pruning when their paths collide with action leaves.
     fn with_checkpoint_row_group_filter(
         self,
-        predicate: &Predicate,
+        predicate: Option<&Predicate>,
+        action_predicate: Option<&Predicate>,
         partition_columns: &HashSet<String>,
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self;
@@ -74,7 +80,8 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
 
     fn with_checkpoint_row_group_filter(
         self,
-        predicate: &Predicate,
+        predicate: Option<&Predicate>,
+        action_predicate: Option<&Predicate>,
         partition_columns: &HashSet<String>,
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self {
@@ -84,11 +91,16 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
             .iter()
             .enumerate()
             .filter_map(|(ordinal, row_group)| {
-                CheckpointRowGroupFilter::apply(row_group, predicate, partition_columns)
-                    .then_some(ordinal)
+                CheckpointRowGroupFilter::apply(
+                    row_group,
+                    predicate,
+                    action_predicate,
+                    partition_columns,
+                )
+                .then_some(ordinal)
             })
             .collect();
-        debug!("with_checkpoint_row_group_filter({predicate:#?}) = {ordinals:?})");
+        debug!("with_checkpoint_row_group_filter({predicate:#?}, {action_predicate:#?}) = {ordinals:?})");
         if let Some(row_indexes) = row_indexes {
             row_indexes.select_row_groups(&ordinals);
         }
@@ -352,28 +364,35 @@ impl<'a> CheckpointRowGroupFilter<'a> {
         }
     }
 
-    /// Applies the predicate to a checkpoint row group. Returns `false` if the row group can be
+    /// Applies predicates to a checkpoint row group. Returns `false` if the row group can be
     /// safely skipped.
     ///
-    /// The predicate may reference two kinds of columns:
-    /// 1. Add-file data columns (e.g. `x > 10`), evaluated via checkpoint-aware stat lookups under
-    ///    `add.stats_parsed.*` / `add.partitionValues_parsed.*`.
-    /// 2. Top-level action-identifier columns (e.g. `txn.appId IS NOT NULL`), evaluated via direct
-    ///    parquet footer stats. These let callers skip row groups that contain no rows of the
-    ///    action type they care about.
+    /// The optional `predicate` (user data predicate) is evaluated via checkpoint-aware stat
+    /// lookups under `add.stats_parsed.*` / `add.partitionValues_parsed.*`. The optional
+    /// `action_predicate` is evaluated via direct parquet footer stats; it MUST only reference
+    /// top-level action-identifier columns (e.g. `txn.appId IS NOT NULL`) so there is no risk of
+    /// aliasing to user data columns whose paths happen to collide with a Delta action path.
     ///
-    /// Both filters are evaluated; the row group is pruned if either returns `Some(false)`.
+    /// Both filters are evaluated independently; the row group is pruned if either returns
+    /// `Some(false)`.
     pub(crate) fn apply(
         row_group: &'a RowGroupMetaData,
-        predicate: &Predicate,
+        predicate: Option<&Predicate>,
+        action_predicate: Option<&Predicate>,
         partition_columns: &'a HashSet<String>,
     ) -> bool {
         use crate::kernel_predicates::KernelPredicateEvaluator as _;
-        let checkpoint_ok = CheckpointRowGroupFilter::new(row_group, predicate, partition_columns)
-            .eval_sql_where(predicate)
-            != Some(false);
-        let direct_ok =
-            RowGroupFilter::new(row_group, predicate).eval_sql_where(predicate) != Some(false);
+        let checkpoint_ok = match predicate {
+            Some(p) => {
+                CheckpointRowGroupFilter::new(row_group, p, partition_columns).eval_sql_where(p)
+                    != Some(false)
+            }
+            None => true,
+        };
+        let direct_ok = match action_predicate {
+            Some(p) => RowGroupFilter::new(row_group, p).eval_sql_where(p) != Some(false),
+            None => true,
+        };
         checkpoint_ok && direct_ok
     }
 
