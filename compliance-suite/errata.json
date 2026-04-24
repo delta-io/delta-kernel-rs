@@ -12,12 +12,12 @@
   "domain_metadata_support_term_ambiguity": {
     "title": "domainMetadata 'support' wording ambiguity",
     "spec_says": "The spec text for domainMetadata uses 'support' in prose about reader behavior while also defining protocol-level support/enablement concepts elsewhere. It also says readers may ignore unrecognized metadata domains.",
-    "controversy": "It is ambiguous whether 'readers who do not support domain metadata' means readers that do not implement domainMetadata semantics, or readers where protocol-level feature support/enablement is absent. This affects interpretation of orphan domainMetadata actions and whether they are tolerated vs rejected."
+    "controversy": "It is ambiguous whether 'readers who do not support domain metadata' means readers that do not implement domainMetadata semantics, or readers where protocol-level feature support/enablement is absent. This affects the interpretation of orphan domainMetadata actions and whether they are expressly tolerated or merely not rejected (because the spec says nothing)."
   },
   "iceberg_compat_dv_restriction": {
-    "title": "icebergCompatV1 vs icebergCompatV2: different DV restriction semantics",
-    "spec_says": "icebergCompatV1 requires deletionVectors not be supported when ICv1 is enabled. icebergCompatV2 only requires deletionVectors not be active (supported-but-not-active is permitted).",
-    "controversy": "The asymmetry between ICv1 and ICv2 is specified but subtle. ICv1 prohibits DV support entirely; ICv2 only prohibits DV activation. Implementations may conflate the two."
+    "title": "Iceberg compatibility: CM support dependency vs DV activation semantics",
+    "spec_says": "For Iceberg compatibility features, columnMapping is a support dependency (feature-level requirement), while deletionVectors restrictions are scoped to active behavior. ICv1 active requires DV not be supported; ICv2 active requires DV not be active.",
+    "controversy": "For ICv1 and ICv2, CM and DV use different support-vs-enablement boundaries: CM is a support dependency, while DV is activation-scoped. Implementations may incorrectly apply ICv1 DV strictness to ICv2, or treat CM as activation-only in either version."
   },
   "nullable_false_invariants": {
     "title": "nullable=false columns and the invariants/checkConstraints feature requirement",

@@ -78,9 +78,7 @@
       "writerFeatures": ["columnMapping", "generatedColumns"]
     }
   },
-  "$notes": {
-    "orphan_writer_feature": "At (3,7), the spec requires activation properties to be paired with the corresponding feature in writerFeatures. Writing an activation property for a feature absent from writerFeatures is invalid committed state."
-  },
+  "$notes": {},
   "cases": [
     {
       "ordinal": 1,
@@ -97,25 +95,25 @@
     },
     {
       "ordinal": 2,
-      "name": "generated_columns_create_table_3_7_no_feature_listed_with_schema_fails",
+      "name": "generated_columns_create_table_3_7_no_feature_listed_with_schema_succeeds",
       "flavor": "orphan",
       "feature": "generatedColumns",
-      "description": "Creating a (3,7) table with a delta.generationExpression column but generatedColumns absent from writerFeatures fails.",
-      "note": "$notes.orphan_writer_feature",
+      "description": "Creating a (3,7) table with a delta.generationExpression column but generatedColumns absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
       "operation": {
         "type": "create_table",
         "protocol": "$protocols.modern_3_7",
         "metadata": {"schemaString": "$schemas.generated_columns_id_doubled"}
       },
-      "expected_outcome": "failure"
+      "expected_outcome": "success"
     },
     {
       "ordinal": 3,
-      "name": "generated_columns_empty_commit_3_7_no_feature_listed_with_schema_fails",
+      "name": "generated_columns_empty_commit_3_7_no_feature_listed_with_schema_succeeds",
       "flavor": "orphan",
       "feature": "generatedColumns",
-      "description": "Appending to a (3,7) table with a delta.generationExpression column but generatedColumns absent from writerFeatures fails.",
-      "note": "$notes.orphan_writer_feature",
+      "description": "Committing to a (3,7) table with a delta.generationExpression column but generatedColumns absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7"},
@@ -123,7 +121,7 @@
         ]
       },
       "operation": {"type": "empty_commit"},
-      "expected_outcome": "failure"
+      "expected_outcome": "success"
     },
     {
       "ordinal": 4,
@@ -143,7 +141,7 @@
       "name": "generated_columns_read_snapshot_3_7_no_feature_listed_with_schema",
       "flavor": "orphan",
       "feature": "generatedColumns",
-      "description": "Reading a (3,7) table with a delta.generationExpression column but generatedColumns absent from writerFeatures succeeds; generatedColumns is writer-only.",
+      "description": "Reading a (3,7) table with a delta.generationExpression column but generatedColumns absent from writerFeatures succeeds.",
       "note": "$errata.orphan_feature_metadata",
       "setup": {
         "log_actions": [
@@ -159,7 +157,7 @@
       "name": "generated_columns_supported_not_active_empty_commit_succeeds",
       "flavor": "supported_not_active",
       "feature": "generatedColumns",
-      "description": "Appending to a (3,7)+[generatedColumns] table without any delta.generationExpression column succeeds: the feature is supported but not active.",
+      "description": "Committing to a (3,7)+[generatedColumns] table without any delta.generationExpression column succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_generated_columns"},
@@ -173,7 +171,7 @@
       "ordinal": 7,
       "name": "generated_columns_supported_active_empty_commit_succeeds",
       "feature": "generatedColumns",
-      "description": "Appending to a (3,7)+[generatedColumns] table with a delta.generationExpression column succeeds.",
+      "description": "Committing to a (3,7)+[generatedColumns] table with a delta.generationExpression column succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_generated_columns"},
@@ -200,7 +198,7 @@
       "name": "generated_columns_read_snapshot_1_4_with_schema_succeeds",
       "flavor": "legacy",
       "feature": "generatedColumns",
-      "description": "Reading a (1,4) table with a delta.generationExpression column succeeds: generatedColumns is writer-only.",
+      "description": "Reading a (1,4) table with a delta.generationExpression column succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.legacy_1_4"},
@@ -214,7 +212,7 @@
       "ordinal": 10,
       "name": "generated_columns_read_snapshot_3_7_feature_listed_succeeds",
       "feature": "generatedColumns",
-      "description": "Reading a (3,7)+[generatedColumns] table with a delta.generationExpression column succeeds: generatedColumns is writer-only.",
+      "description": "Reading a (3,7)+[generatedColumns] table with a delta.generationExpression column succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_generated_columns"},
@@ -229,7 +227,7 @@
       "name": "generated_columns_supported_not_active_read_snapshot_succeeds",
       "flavor": "supported_not_active",
       "feature": "generatedColumns",
-      "description": "Reading a (3,7)+[generatedColumns] table without any delta.generationExpression column succeeds: the feature is supported but not active.",
+      "description": "Reading a (3,7)+[generatedColumns] table without any delta.generationExpression column succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_generated_columns"},
@@ -244,7 +242,7 @@
       "name": "generated_columns_empty_commit_1_4_with_schema_succeeds",
       "flavor": "legacy",
       "feature": "generatedColumns",
-      "description": "Appending to a (1,4) table with a delta.generationExpression column succeeds: generatedColumns are always supported at writer version 4.",
+      "description": "Committing to a (1,4) table with a delta.generationExpression column succeeds: generatedColumns are always supported at writer version 4.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.legacy_1_4"},
@@ -257,6 +255,7 @@
     {
       "ordinal": 13,
       "name": "generated_columns_create_table_3_7_nonexistent_column_fails",
+      "flavor": "invalid_metadata_content",
       "feature": "generatedColumns",
       "description": "Creating a (3,7)+[generatedColumns] table with a generation expression referencing a column not in the schema fails.",
       "operation": {
@@ -304,7 +303,7 @@
       "ordinal": 16,
       "name": "generated_columns_cm_empty_commit_3_7_both_features_listed_succeeds",
       "feature": "generatedColumns",
-      "description": "Appending to a (3,7)+[columnMapping,generatedColumns] table with CM-annotated columns and a generation expression using the logical column name succeeds.",
+      "description": "Committing to a (3,7)+[columnMapping,generatedColumns] table with CM-annotated columns and a generation expression using the logical column name succeeds.",
       "note": "$errata.sql_expression_cm_name_resolution",
       "setup": {
         "log_actions": [

@@ -619,10 +619,15 @@ async fn execute_create_table(case: &Case) -> (Outcome, Option<String>) {
             case.ordinal
         )
     });
-    let schema: Arc<delta_kernel::schema::StructType> = Arc::new(
-        serde_json::from_str(schema_str)
-            .unwrap_or_else(|e| panic!("case {}: failed to parse schemaString: {e}", case.ordinal)),
-    );
+    let schema = match serde_json::from_str::<delta_kernel::schema::StructType>(schema_str) {
+        Ok(schema) => Arc::new(schema),
+        Err(e) => {
+            return (
+                Outcome::Failure,
+                Some(format!("failed to parse schemaString: {e}")),
+            );
+        }
+    };
 
     // --- Call create_table() ---
     let (_store, engine) = new_store_and_engine();

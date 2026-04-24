@@ -117,7 +117,7 @@
       "name": "check_constraints_read_snapshot_3_7_no_feature_listed_with_constraint",
       "flavor": "orphan",
       "feature": "checkConstraints",
-      "description": "Reading a (3,7) table with a delta.constraints.* property but checkConstraints absent from writerFeatures succeeds.",
+      "description": "Reading a (3,7) table with a delta.constraints.* property but checkConstraints absent from writerFeatures succeeds; checkConstraints is writer-only.",
       "note": "$errata.orphan_feature_metadata",
       "setup": {
         "log_actions": [

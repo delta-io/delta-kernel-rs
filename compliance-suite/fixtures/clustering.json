@@ -94,6 +94,7 @@
       "ordinal": 4,
       "name": "clustering_read_snapshot_1_7_feature_and_domain_metadata_listed_succeeds",
       "feature": "clustering",
+      "flavor": "missing_required_metadata",
       "description": "Reading a (1,7)+[clustering,domainMetadata] table with no delta.clustering domainMetadata action succeeds.",
       "note": "$errata.invalid_table_state_reader_rejection",
       "setup": {
