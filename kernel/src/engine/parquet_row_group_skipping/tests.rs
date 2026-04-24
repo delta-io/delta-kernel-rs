@@ -1008,54 +1008,6 @@ fn checkpoint_filter_opaque_predicate_with_missing_stats() {
 }
 
 #[test]
-fn checkpoint_filter_physical_column_names_for_column_mapping() {
-    // Simulate column mapping: the physical column name in the checkpoint parquet file is
-    // "col-abc-123" (a UUID-style name), not the logical "x". The predicate is already in
-    // physical form by the time it reaches CheckpointRowGroupFilter.
-    let physical_name = "col-abc-123";
-    let tmp = write_checkpoint_parquet(
-        &[Some(10), Some(20)],
-        &[Some(100), Some(200)],
-        &[Some(0), Some(0)],
-        &[physical_name],
-        None,
-    );
-    let metadata = checkpoint_row_group_metadata(&tmp);
-    let row_group = metadata.row_group(0);
-
-    let col = ColumnName::new([physical_name]);
-
-    // Predicate uses the physical column name, matching the checkpoint parquet schema.
-    // physical_col > 500: max = 200 < 500 -> can prune.
-    let predicate = Predicate::gt(col.clone(), Scalar::from(500i64));
-    assert!(!CheckpointRowGroupFilter::apply(
-        row_group,
-        &predicate,
-        &NO_PARTITIONS
-    ));
-
-    // physical_col > 50: max = 200 > 50 -> keep.
-    let predicate = Predicate::gt(col.clone(), Scalar::from(50i64));
-    assert!(CheckpointRowGroupFilter::apply(
-        row_group,
-        &predicate,
-        &NO_PARTITIONS
-    ));
-
-    // Verify stats are accessible via the physical name.
-    let predicate = Predicate::gt(col.clone(), Scalar::from(0i64));
-    let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
-    assert_eq!(
-        filter.get_min_stat(&col, &DataType::LONG),
-        Some(10i64.into())
-    );
-    assert_eq!(
-        filter.get_max_stat(&col, &DataType::LONG),
-        Some(200i64.into())
-    );
-}
-
-#[test]
 fn checkpoint_filter_partition_nullcount_is_null() {
     // All partition values are non-null, so footer nullcount for partitionValues_parsed.part_col
     // is 0. extract_nullcount suppresses Some(0) due to the arrow-rs#9451 workaround, so

@@ -467,7 +467,7 @@ fn adjust_stats_for_truncation(val: Scalar) -> Scalar {
 fn extract_max_i64(stats: &Statistics) -> Option<i64> {
     match stats {
         Statistics::Int64(s) => Some(*s.max_opt()?),
-        Statistics::Int32(s) => Some(*s.max_opt()? as i64),
+        Statistics::Int32(s) => Some(i64::from(*s.max_opt()?)),
         _ => None,
     }
 }
@@ -526,8 +526,8 @@ fn compute_checkpoint_field_indices(
 
         // Match add.partitionValues_parsed.<col>
         // Delta partition columns are always top-level (no nested partition columns).
-        if parts.len() >= 3 && parts[0] == "add" && parts[1] == "partitionValues_parsed" {
-            let col_name = ColumnName::new(&parts[2..]);
+        if parts.len() == 3 && parts[0] == "add" && parts[1] == "partitionValues_parsed" {
+            let col_name = ColumnName::new([&parts[2]]);
             if referenced_columns.contains(&col_name)
                 && is_partition_column(&col_name, partition_columns)
             {
