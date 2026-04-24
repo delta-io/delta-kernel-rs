@@ -6,6 +6,7 @@ use std::ops::Deref as _;
 use crate::expressions::{Expression, Scalar};
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::DeltaResult;
 
 /// [`SchemaTransform`] that will transform a [`Schema`] and an ordered list of leaf values
 /// (Scalars) into an Expression with a [`Literal`] expr for each leaf.
@@ -45,15 +46,15 @@ pub enum Error {
 pub(crate) fn literal_expression_transform<'a>(
     schema: &'a StructType,
     scalars: impl IntoIterator<Item = &'a Scalar>,
-) -> Result<Expression, Error> {
+) -> DeltaResult<Expression> {
     let mut transform = LiteralExpressionTransform {
         scalars: scalars.into_iter(),
         stack: Vec::new(),
     };
     transform.transform_struct(schema)?;
     match transform.scalars.next() {
-        Some(s) => Err(Error::ExcessScalars(s.clone())),
-        None => transform.stack.pop().ok_or(Error::EmptyStack),
+        Some(s) => Err(Error::ExcessScalars(s.clone()).into()),
+        None => transform.stack.pop().ok_or(Error::EmptyStack.into()),
     }
 }
 

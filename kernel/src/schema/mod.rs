@@ -1290,25 +1290,24 @@ pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
 
 /// Visitor that reports whether any non-null (`nullable: false`) field exists in a schema.
 /// Walks the full schema tree including nested struct, array element, and map value structs.
-struct NonNullFieldChecker {
-    found: bool,
-}
+struct NonNullFieldChecker;
 
 impl<'a> SchemaTransform<'a> for NonNullFieldChecker {
+    transform_output_type!(|'a, T| Result<(), ()>);
+
     /// Skip recursion into variant internals. The `metadata` and `value` fields inside a
     /// `Variant` are protocol-defined, always non-null, and not user-controlled, so they
     /// must not be treated as user-declared non-null columns.
-    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        Some(Cow::Borrowed(stype))
+    fn transform_variant(&mut self, _stype: &'a StructType) -> Result<(), ()> {
+        Ok(())
     }
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
         if !field.is_nullable() {
-            self.found = true;
-        } else if !self.found {
-            let _ = self.recurse_into_struct_field(field);
+            return Err(());
         }
-        Some(Cow::Borrowed(field))
+
+        self.recurse_into_struct_field(field)
     }
 }
 
@@ -1317,9 +1316,7 @@ impl<'a> SchemaTransform<'a> for NonNullFieldChecker {
 ///
 /// Skips `Variant` internal struct fields, which are protocol-defined and always non-null.
 pub(crate) fn schema_contains_non_null_fields(schema: &Schema) -> bool {
-    let mut checker = NonNullFieldChecker { found: false };
-    let _ = checker.transform_struct(schema);
-    checker.found
+    NonNullFieldChecker.transform_struct(schema).is_err()
 }
 
 /// Normalizes column name field names to match the casing in the schema.
