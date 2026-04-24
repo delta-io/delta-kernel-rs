@@ -1,4 +1,0 @@
-# The kernel Error enum contains large variants (ArrowError, ObjectStore::Error) that push
-# the enum past clippy's default 128-byte threshold. Raise the threshold to accommodate the
-# existing design rather than boxing all error variants.
-large-error-threshold = 200
