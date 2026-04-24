@@ -8,8 +8,8 @@ static COLUMN_MAPPING: LazyLock<Fixture> = LazyLock::new(|| Fixture::load("colum
 compliance_case_inexpressible!(COLUMN_MAPPING, 1); // fixture uses protocol (1,5); create_table() always produces (3,7)
 compliance_case_inexpressible!(COLUMN_MAPPING, 2); // fixture uses protocol (2,5); create_table() always produces (3,7)
 compliance_case_inexpressible!(COLUMN_MAPPING, 3); // fixture uses protocol (2,5); create_table() always produces (3,7)
-compliance_case_inexpressible!(COLUMN_MAPPING, 4); // fixture uses protocol (2,5); create_table() always produces (3,7)
-compliance_case_inexpressible!(COLUMN_MAPPING, 5); // fixture uses protocol (2,5); create_table() always produces (3,7)
+compliance_case_failure!(COLUMN_MAPPING, 4, "Duplicate column mapping ID");
+compliance_case_failure!(COLUMN_MAPPING, 5, "annotation on field 'id' must be a number");
 compliance_case_success!(COLUMN_MAPPING, 6, "already has column mapping metadata");
 compliance_case_success!(COLUMN_MAPPING, 7, "already has column mapping metadata");
 compliance_case_success!(COLUMN_MAPPING, 8, "is annotated with delta.columnMapping.physicalName");

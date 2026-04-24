@@ -96,6 +96,10 @@ protocol objects, note text) across cases.
 Reference syntax: `"$schemas.simple_int"`, `"$protocols.modern_2_7_deletion_vectors"`,
 `"$notes.feature_active_without_support"`. Only add a shared entry when three or more cases
 within the file would otherwise repeat the same value verbatim.
+Exception: a single-use `$schemas.*` entry is allowed when it avoids an unreadable escaped
+JSON `schemaString` literal in `metaData` setup actions. See TODOs for tracked follow-up.
+Use ASCII-only text in fixture JSON files and notes. Replace typographic punctuation and
+unicode escapes with ASCII equivalents (for example, `--` instead of em dash escapes).
 
 ### Required fields
 
@@ -133,6 +137,12 @@ acceptance PR reference) in a per-fixture `$notes` entry so it does not need to 
 re-derived.
 
 ### Operation types
+
+#### Operation scope
+
+Operations in this fixture format are metadata/protocol oriented. They must not require
+creating or reading data files unless a dedicated operation type explicitly defines that
+contract.
 
 #### `create_table`
 
@@ -175,8 +185,8 @@ Opens a write transaction on a pre-existing table and commits it with no actions
 `setup`. This is sufficient for protocol-level write validation (does the writer accept or
 reject based on the protocol + feature state?). It is NOT sufficient to test row-level
 constraint features (invariants, checkConstraints, generatedColumns) or to exercise data
-write paths (column mapping physical name assignment, DV numRecords, etc.), which require
-a future `insert_rows` operation type (see TODOs).
+write paths (column mapping physical name assignment, DV numRecords, etc.). See TODOs for
+operation types that cover those paths.
 
 ```json
 {
@@ -240,19 +250,15 @@ merging into it. Runners should raise an error at run time if `schemaString` is 
    "Committing to...") and in one sentence covers: scenario, expected outcome, spec reason.
 4. Set `feature` to the Delta feature name if applicable.
 5. Set `flavor` if the case belongs to a sub-category used for filtering (e.g.
-   `"unknown_feature"`, `"writer_only_read"`, `"supported_not_active"`).
+   `"unknown_feature"`, `"writer_only_read"`, `"supported_not_active"`,
+   `"missing_required_metadata"`, `"invalid_metadata_content"`).
 6. For `create_table` cases, supply `operation.protocol` and `operation.metadata`.
 7. For `read_snapshot`/`empty_commit` cases, supply `setup.log_actions` with at least a
-   `protocol` action and a `metaData` action. The `metaData` entry requires only
-   `schemaString`; omit `id`, `format`, empty `partitionColumns`, and empty `configuration`
-   (all have standard defaults applied by the runner at run time).
+   `protocol` action and a `metaData` action. Follow the Setup and defaults rules above.
 8. Set `expected_outcome` to your best reading of the spec.
-9. Add `note` only for spec ambiguity/errata OR non-obvious fixture characteristics. For
-   errata-level controversies, use `"$errata.<key>"` — add a new entry to `errata.json`
-   if none exists yet. No runtime error strings in notes.
+9. Add `note` using the Optional fields rules above.
 10. Use `$schemas.*`, `$protocols.*`, or `$notes.*` references instead of inlining repeated
-    values. Add new shared entries to the relevant section when three or more cases share
-    the same value.
+    values. Follow the Shared reference section rules above.
 
 ### Filtering fixtures
 
@@ -283,10 +289,16 @@ python fixtures/format-json.py protocol-validity.json
 
 ## TODOs
 
+### Operation capability gaps
+
+The current operation set is intentionally metadata/protocol oriented. Feature checks that
+require explicit write payload control, scan-level log validation, or data-file I/O are
+tracked in the TODO items below.
+
 ### `create_table` success cases need postconditions
 
-Currently a `create_table` success case only asserts that no exception was thrown. That is
-insufficient: a runtime could succeed by committing something entirely different from what
+A `create_table` success case only asserts that no exception was thrown. That is
+insufficient: a runtime could succeed by committing something different from what
 was requested, and the fixture would pass.
 
 The correct postcondition for a success case is that the requested feature is supported and
@@ -298,10 +310,9 @@ requests `deletionVectors` must result in a committed table where `deletionVecto
 in both feature lists and `delta.enableDeletionVectors=true` is in the committed
 configuration.
 
-There is no immediate easy fix: supporting postconditions requires the harness to read back
-the committed snapshot and assert against it, and the fixture format needs a way to express
-what "active" means per feature. Until then, `committed_protocol` in the result JSON is
-purely diagnostic.
+Supporting postconditions requires the harness to read back the committed snapshot and
+assert against it, and the fixture format needs a way to express what "active" means per
+feature. `committed_protocol` in the result JSON is diagnostic.
 
 ### nullable=false and the invariants feature
 
@@ -333,7 +344,7 @@ write operation type with explicit log actions exists:
 
 `empty_commit` commits no data rows, so constraint features (invariants, checkConstraints,
 generatedColumns) and data-reading features (columnMapping, typeWidening) cannot be
-validated end-to-end with the current operation types. Two future operation types:
+validated end-to-end. Operation types to cover this:
 
 - **`insert_rows`**: commits a specified set of rows (as inline JSON or a parquet snippet).
   Needed for: invariant violations, constraint violations, generated column enforcement.
@@ -341,10 +352,16 @@ validated end-to-end with the current operation types. Two future operation type
   parquet files + injected `add` actions). Needed for: column mapping physical/logical name
   resolution, type widening coercion, variant decoding. Setup would need to include the
   actual parquet file bytes or a reference to a fixture file.
+- **`validate_scan`** (proposed): consumes and validates scan/log inputs that require looking
+  at all relevant `add` actions without creating or reading data files. Needed for cases that
+  are stronger than `read_snapshot` metadata checks but still intended to remain file-I/O-free.
+- **`write_actions`** (proposed): commits an explicit set of log actions (`add`, `remove`,
+  etc.) without requiring data-file reads. Needed for write-path negative tests such as
+  DV-bearing `add` rejection when deletionVectors is orphaned or supported-but-not-active.
 
 ### Invalid schema/metadata combos on pre-existing tables
 
-The current fixture set only injects valid log actions via `setup.log_actions`. Many
+The fixture set injects only valid log actions via `setup.log_actions`. Many
 validations (e.g. CM annotations present with `mode=none`, duplicate CM IDs, missing
 annotations on nested fields) have no coverage because a writer's own code path would
 never produce these states. TODO: add setup-based cases that inject these states directly
@@ -357,8 +374,8 @@ including intermediate helper nodes for nested types (array `element`, map `key`
 These nodes have no corresponding `StructField` in the Delta schema and therefore no `metadata`
 slot for `delta.columnMapping.id`. The spec stores their IDs in the nearest enclosing
 `StructField`'s metadata under dedicated keys — but the exact key names and encoding structure
-require re-reading the relevant PROTOCOL.md sections before writing cases. No fixture currently
-tests nested CM annotation correctness under icebergCompatV1 or V2.
+require re-reading the relevant PROTOCOL.md sections before writing cases. No fixture tests
+nested CM annotation correctness under icebergCompatV1 or V2.
 
 ### columnMapping: nested schema and maxColumnId coverage
 
@@ -393,7 +410,7 @@ All require a future `write_actions` operation type that can specify exact commi
 
 ### domainMetadata: write-path and multi-commit coverage
 
-Several key domainMetadata spec requirements are untestable with the current operation model:
+Several key domainMetadata spec requirements are untestable with the operation model:
 
 - **System-controlled domain write rejection**: the spec forbids writers from allowing users
   to write `domainMetadata` actions whose domain name starts with `delta.`. Requires a
@@ -409,7 +426,7 @@ Several key domainMetadata spec requirements are untestable with the current ope
 
 ### Cross-cutting feature combinations: dedicated fixture
 
-Cross-feature test cases are currently scattered across per-feature files and were added
+Cross-feature test cases are scattered across per-feature files and were added
 ad-hoc. Several of the existing combinations (e.g. CDF+DV, vacuumProtocolCheck+DV) have no
 spec-defined interaction — "this feature is important so test it alongside things" is not a
 principle. These cases should be audited; those without a concrete spec rationale should be
@@ -436,8 +453,8 @@ combined case unless the spec says something specific about their combination.
 
 ### Additional operation types
 
-CDF reads, schema evolution DDL, OPTIMIZE (file compaction), and VACUUM currently have
-no coverage. These exercise feature-specific write paths not reachable via `empty_commit`.
+CDF reads, schema evolution DDL, OPTIMIZE (file compaction), and VACUUM have no coverage.
+These exercise feature-specific write paths not reachable via `empty_commit`.
 
 ### Feature enablement vs. support state
 
@@ -459,4 +476,4 @@ configurations (e.g. appendOnly feature listed, delta.appendOnly absent).
 - **No error strings in fixtures**: runtime error messages are not portable. Only spec
   rules go in `note`.
 - **`create_table` as starting point**: easier to specify an exact initial protocol state
-  than ALTER TABLE. ALTER TABLE tests are also needed and will be added separately.
+  than ALTER TABLE. ALTER TABLE coverage is tracked through separate operation-type TODOs.

@@ -165,6 +165,7 @@
       "ordinal": 8,
       "name": "clustering_empty_commit_1_7_feature_and_domain_metadata_listed_without_delta_clustering_domain_fails",
       "feature": "clustering",
+      "flavor": "missing_required_metadata",
       "description": "Committing to a (1,7)+[clustering,domainMetadata] table without a delta.clustering domainMetadata action fails.",
       "note": "$notes.domain_metadata_action_required",
       "setup": {
@@ -221,6 +222,7 @@
       "ordinal": 11,
       "name": "clustering_empty_commit_1_7_with_delta_clustering_domain_metadata_invalid_shape_fails",
       "feature": "clustering",
+      "flavor": "invalid_metadata_content",
       "description": "Committing to a (1,7)+[clustering,domainMetadata] table fails when delta.clustering domainMetadata has invalid clusteringColumns JSON shape.",
       "note": "$notes.invalid_domain_metadata_content",
       "setup": {
@@ -242,6 +244,7 @@
       "ordinal": 12,
       "name": "clustering_empty_commit_1_7_with_delta_clustering_nonexistent_column_fails",
       "feature": "clustering",
+      "flavor": "invalid_metadata_content",
       "description": "Committing to a (1,7)+[clustering,domainMetadata] table fails when delta.clustering references a non-existent clustering column.",
       "note": "$notes.invalid_domain_metadata_content",
       "setup": {
@@ -263,6 +266,7 @@
       "ordinal": 13,
       "name": "clustering_empty_commit_3_7_column_mapping_with_logical_names_fails",
       "feature": "clustering",
+      "flavor": "invalid_metadata_content",
       "description": "Committing to a (3,7)+[columnMapping,clustering,domainMetadata] table fails when delta.clustering uses logical names instead of physical names.",
       "note": "$notes.invalid_domain_metadata_content",
       "setup": {

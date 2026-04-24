@@ -14,6 +14,37 @@
           "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "col-abc"}
         }
       ]
+    },
+    "cm_duplicate_ids": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "col-1"}
+        },
+        {
+          "name": "value",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "col-2"}
+        }
+      ]
+    },
+    "cm_non_int_id": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {
+            "delta.columnMapping.id": "one",
+            "delta.columnMapping.physicalName": "col-1"
+          }
+        }
+      ]
     }
   },
   "$protocols": {
@@ -24,27 +55,30 @@
       "writerFeatures": ["columnMapping"]
     },
     "legacy_1_2": {"minReaderVersion": 1, "minWriterVersion": 2},
+    "legacy_1_5": {"minReaderVersion": 1, "minWriterVersion": 5},
     "legacy_2_5": {"minReaderVersion": 2, "minWriterVersion": 5}
   },
   "$notes": {
-    "usage_tracking_rfc_gap": "The proposed columnMappingUsageTracking feature (RFC not yet accepted) adds hasDroppedOrRenamed tracking and changes physical name assignment rules. Zero fixture coverage exists. Cases should be added once the RFC is accepted."
+    "mode_annotations_required": "In columnMapping mode=name and mode=id, each field must carry both delta.columnMapping.physicalName and delta.columnMapping.id metadata.",
+    "cm_mode_effect_not_directly_observable": "These metadata-only cases verify accept/reject behavior, but they do not write/read data files. Because of that, they cannot directly verify whether delta.columnMapping.mode was actually applied (for example, via physical names or field IDs)."
   },
   "cases": [
     {
       "ordinal": 1,
-      "name": "column_mapping_name_mode_rejects_protocol_1_5",
+      "name": "column_mapping_name_mode_protocol_1_5_succeeds",
       "feature": "columnMapping",
       "flavor": "insufficient_protocol",
-      "description": "Creating a (1,5) table with mode=name fails; minReaderVersion=1 is insufficient for columnMapping.",
+      "description": "Creating a (1,5) table with mode=name succeeds but does not enable CM.",
+      "note": "$notes.cm_mode_effect_not_directly_observable",
       "operation": {
         "type": "create_table",
-        "protocol": {"minReaderVersion": 1, "minWriterVersion": 5},
+        "protocol": "$protocols.legacy_1_5",
         "metadata": {
           "configuration": {"delta.columnMapping.mode": "name"},
           "schemaString": "$schemas.simple_int"
         }
       },
-      "expected_outcome": "failure"
+      "expected_outcome": "success"
     },
     {
       "ordinal": 2,
@@ -80,34 +114,42 @@
     },
     {
       "ordinal": 4,
-      "name": "column_mapping_name_mode_missing_annotations_create_table_fails",
+      "name": "column_mapping_read_snapshot_3_7_duplicate_column_ids_fails",
       "feature": "columnMapping",
-      "flavor": "legacy",
-      "description": "Creating a (2,5) table with mode=name but no CM schema annotations fails; the committed schema would lack required physical name metadata.",
-      "operation": {
-        "type": "create_table",
-        "protocol": "$protocols.legacy_2_5",
-        "metadata": {
-          "configuration": {"delta.columnMapping.mode": "name"},
-          "schemaString": "$schemas.simple_int"
-        }
+      "flavor": "invalid_metadata_content",
+      "description": "Reading a (3,7)+[columnMapping] table fails when two fields share the same delta.columnMapping.id value.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_column_mapping"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.cm_duplicate_ids",
+              "configuration": {"delta.columnMapping.mode": "id"}
+            }
+          }
+        ]
       },
+      "operation": {"type": "read_snapshot"},
       "expected_outcome": "failure"
     },
     {
       "ordinal": 5,
-      "name": "column_mapping_id_mode_missing_annotations_create_table_fails",
+      "name": "column_mapping_read_snapshot_3_7_non_integer_column_id_fails",
       "feature": "columnMapping",
-      "flavor": "legacy",
-      "description": "Creating a (2,5) table with mode=id but no CM schema annotations fails; the committed schema would lack required physical name and id metadata.",
-      "operation": {
-        "type": "create_table",
-        "protocol": "$protocols.legacy_2_5",
-        "metadata": {
-          "configuration": {"delta.columnMapping.mode": "id"},
-          "schemaString": "$schemas.simple_int"
-        }
+      "flavor": "invalid_metadata_content",
+      "description": "Reading a (3,7)+[columnMapping] table fails when delta.columnMapping.id is not an integer.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_column_mapping"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.cm_non_int_id",
+              "configuration": {"delta.columnMapping.mode": "id"}
+            }
+          }
+        ]
       },
+      "operation": {"type": "read_snapshot"},
       "expected_outcome": "failure"
     },
     {
@@ -142,11 +184,11 @@
     },
     {
       "ordinal": 8,
-      "name": "column_mapping_orphan_metadata_without_feature_succeeds",
+      "name": "column_mapping_read_snapshot_1_2_protocol_insufficient_cm_not_honored_succeeds",
       "feature": "columnMapping",
-      "flavor": "orphan",
-      "description": "Reading a (1,2) table with CM schema annotations and mode=name succeeds.",
-      "note": "$errata.orphan_feature_metadata",
+      "flavor": "insufficient_protocol",
+      "description": "Reading a (1,2) table with CM schema annotations and mode=name succeeds; protocol (1,2) is insufficient for CM.",
+      "note": "$notes.cm_mode_effect_not_directly_observable",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.legacy_1_2"},
@@ -167,10 +209,10 @@
       "feature": "columnMapping",
       "flavor": "insufficient_protocol",
       "description": "Reading a (1,5) table with mode=name succeeds; reader v1 is insufficient for CM.",
-      "note": "$errata.column_mapping_asymmetric_protocol_support",
+      "note": "$notes.cm_mode_effect_not_directly_observable",
       "setup": {
         "log_actions": [
-          {"protocol": {"minReaderVersion": 1, "minWriterVersion": 5}},
+          {"protocol": "$protocols.legacy_1_5"},
           {
             "metaData": {
               "schemaString": "$schemas.cm_annotated",
@@ -188,7 +230,7 @@
       "feature": "columnMapping",
       "flavor": "insufficient_protocol",
       "description": "Reading a (2,4) table with mode=name succeeds; writer v4 is insufficient for CM (v5+ required).",
-      "note": "$errata.column_mapping_asymmetric_protocol_support",
+      "note": "$notes.cm_mode_effect_not_directly_observable",
       "setup": {
         "log_actions": [
           {"protocol": {"minReaderVersion": 2, "minWriterVersion": 4}},
@@ -209,7 +251,7 @@
       "feature": "columnMapping",
       "flavor": "insufficient_protocol",
       "description": "Reading a (1,7)+[columnMapping in writerFeatures] table with mode=name succeeds; reader v1 is insufficient for CM.",
-      "note": "$errata.column_mapping_asymmetric_protocol_support",
+      "note": "$notes.cm_mode_effect_not_directly_observable",
       "setup": {
         "log_actions": [
           {
@@ -274,8 +316,9 @@
       "ordinal": 14,
       "name": "column_mapping_read_snapshot_2_7_cm_in_writer_features_reader_v2_succeeds",
       "feature": "columnMapping",
-      "flavor": "legacy",
+      "flavor": "insufficient_protocol",
       "description": "Reading a (2,7)+[columnMapping in writerFeatures] table with mode=name succeeds; reader v2 honors CM mode.",
+      "note": "$notes.cm_mode_effect_not_directly_observable",
       "setup": {
         "log_actions": [
           {
@@ -301,7 +344,8 @@
       "name": "column_mapping_supported_not_active_read_snapshot_succeeds",
       "feature": "columnMapping",
       "flavor": "supported_not_active",
-      "description": "Reading a (3,7)+[columnMapping] table without delta.columnMapping.mode set succeeds.",
+      "description": "Reading a (3,7)+[columnMapping] table without delta.columnMapping.mode set succeeds; CM is supported but not active.",
+      "note": "$notes.cm_mode_effect_not_directly_observable",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_column_mapping"},
@@ -317,6 +361,7 @@
       "feature": "columnMapping",
       "flavor": "supported_not_active",
       "description": "Reading a (3,7)+[columnMapping] table with mode=none succeeds; readers use display names directly.",
+      "note": "$notes.cm_mode_effect_not_directly_observable",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_column_mapping"},
@@ -374,7 +419,7 @@
       "name": "column_mapping_empty_commit_2_5_name_mode_succeeds",
       "feature": "columnMapping",
       "flavor": "legacy",
-      "description": "Appending to a (2,5) table with mode=name and CM schema annotations succeeds.",
+      "description": "Committing to a (2,5) table with mode=name and CM schema annotations succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.legacy_2_5"},
@@ -394,7 +439,7 @@
       "name": "column_mapping_empty_commit_2_5_id_mode_succeeds",
       "feature": "columnMapping",
       "flavor": "legacy",
-      "description": "Appending to a (2,5) table with mode=id and CM schema annotations succeeds.",
+      "description": "Committing to a (2,5) table with mode=id and CM schema annotations succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.legacy_2_5"},
@@ -413,7 +458,7 @@
       "ordinal": 21,
       "name": "column_mapping_empty_commit_3_7_name_mode_succeeds",
       "feature": "columnMapping",
-      "description": "Appending to a (3,7)+[columnMapping] table with mode=name and CM schema annotations succeeds.",
+      "description": "Committing to a (3,7)+[columnMapping] table with mode=name and CM schema annotations succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_column_mapping"},
@@ -432,7 +477,7 @@
       "ordinal": 22,
       "name": "column_mapping_empty_commit_3_7_id_mode_succeeds",
       "feature": "columnMapping",
-      "description": "Appending to a (3,7)+[columnMapping] table with mode=id and CM schema annotations succeeds.",
+      "description": "Committing to a (3,7)+[columnMapping] table with mode=id and CM schema annotations succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_column_mapping"},
@@ -451,7 +496,9 @@
       "ordinal": 23,
       "name": "column_mapping_name_mode_missing_annotations_create_table_3_7_fails",
       "feature": "columnMapping",
-      "description": "Creating a (3,7)+[columnMapping] table with mode=name but no CM schema annotations fails; every field must carry delta.columnMapping.physicalName metadata when mode=name is active.",
+      "flavor": "missing_required_metadata",
+      "description": "Creating a (3,7)+[columnMapping] table with mode=name but no CM schema annotations fails.",
+      "note": "$notes.mode_annotations_required",
       "operation": {
         "type": "create_table",
         "protocol": "$protocols.modern_3_7_column_mapping",
@@ -466,7 +513,9 @@
       "ordinal": 24,
       "name": "column_mapping_id_mode_missing_annotations_create_table_3_7_fails",
       "feature": "columnMapping",
-      "description": "Creating a (3,7)+[columnMapping] table with mode=id but no CM schema annotations fails; fields need both delta.columnMapping.physicalName and delta.columnMapping.id metadata.",
+      "flavor": "missing_required_metadata",
+      "description": "Creating a (3,7)+[columnMapping] table with mode=id but no CM schema annotations fails.",
+      "note": "$notes.mode_annotations_required",
       "operation": {
         "type": "create_table",
         "protocol": "$protocols.modern_3_7_column_mapping",
@@ -481,7 +530,9 @@
       "ordinal": 25,
       "name": "column_mapping_name_mode_missing_annotations_empty_commit_3_7_fails",
       "feature": "columnMapping",
-      "description": "Appending to a (3,7)+[columnMapping] table with mode=name but no CM schema annotations fails; every field must carry delta.columnMapping.physicalName metadata when mode=name is active.",
+      "flavor": "missing_required_metadata",
+      "description": "Committing to a (3,7)+[columnMapping] table with mode=name but no CM schema annotations fails.",
+      "note": "$notes.mode_annotations_required",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_column_mapping"},
@@ -500,7 +551,9 @@
       "ordinal": 26,
       "name": "column_mapping_id_mode_missing_annotations_empty_commit_3_7_fails",
       "feature": "columnMapping",
-      "description": "Appending to a (3,7)+[columnMapping] table with mode=id but no CM schema annotations fails; fields need both delta.columnMapping.physicalName and delta.columnMapping.id metadata.",
+      "flavor": "missing_required_metadata",
+      "description": "Committing to a (3,7)+[columnMapping] table with mode=id but no CM schema annotations fails.",
+      "note": "$notes.mode_annotations_required",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.modern_3_7_column_mapping"},

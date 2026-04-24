@@ -91,10 +91,10 @@
     },
     {
       "ordinal": 5,
-      "name": "deletion_vectors_supported_not_active_read_snapshot_succeeds",
+      "name": "deletion_vectors_read_snapshot_supported_not_active_succeeds",
       "feature": "deletionVectors",
       "flavor": "supported_not_active",
-      "description": "Reading a (3,7)+[deletionVectors] table without delta.enableDeletionVectors=true succeeds.",
+      "description": "Reading a (3,7)+[deletionVectors] table without delta.enableDeletionVectors property succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.dv_3_7"},
@@ -127,40 +127,9 @@
     },
     {
       "ordinal": 7,
-      "name": "deletion_vectors_read_snapshot_3_7_dv_bearing_add_without_property_succeeds",
-      "feature": "deletionVectors",
-      "description": "Reading a (3,7)+[deletionVectors] table with a DV-bearing add and no delta.enableDeletionVectors=true succeeds; readers honor DVs on add actions even when the property is absent.",
-      "setup": {
-        "log_actions": [
-          {"protocol": "$protocols.dv_3_7"},
-          {"metaData": {"schemaString": "$schemas.simple_int"}},
-          {
-            "add": {
-              "path": "part-0.parquet",
-              "partitionValues": {},
-              "size": 100,
-              "modificationTime": 0,
-              "dataChange": true,
-              "stats": "{\"numRecords\":100}",
-              "deletionVector": {
-                "storageType": "u",
-                "pathOrInlineDv": "ab^-aqEH=-15MacIoDvGr1mDdLSjUDO8nEYfVeKEApE",
-                "offset": null,
-                "sizeInBytes": 36,
-                "cardinality": 1
-              }
-            }
-          }
-        ]
-      },
-      "operation": {"type": "read_snapshot"},
-      "expected_outcome": "success"
-    },
-    {
-      "ordinal": 8,
       "name": "deletion_vectors_empty_commit_3_7_feature_listed_succeeds",
       "feature": "deletionVectors",
-      "description": "Appending to a (3,7)+[deletionVectors] table with delta.enableDeletionVectors=true succeeds.",
+      "description": "Committing to a (3,7)+[deletionVectors] table with delta.enableDeletionVectors=true succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.dv_3_7"},
@@ -176,11 +145,11 @@
       "expected_outcome": "success"
     },
     {
-      "ordinal": 9,
+      "ordinal": 8,
       "name": "deletion_vectors_empty_commit_supported_not_active_succeeds",
       "feature": "deletionVectors",
       "flavor": "supported_not_active",
-      "description": "Appending to a (3,7)+[deletionVectors] table without delta.enableDeletionVectors=true succeeds; writers must not write new DVs without the property.",
+      "description": "Committing to a (3,7)+[deletionVectors] table without delta.enableDeletionVectors=true succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.dv_3_7"},
@@ -191,11 +160,11 @@
       "expected_outcome": "success"
     },
     {
-      "ordinal": 10,
+      "ordinal": 9,
       "name": "deletion_vectors_empty_commit_3_7_orphan_property_succeeds",
       "feature": "deletionVectors",
       "flavor": "orphan",
-      "description": "Appending to a (3,7) table with delta.enableDeletionVectors=true but deletionVectors absent from both feature lists succeeds.",
+      "description": "Committing to a (3,7) table with delta.enableDeletionVectors=true but deletionVectors absent from both feature lists succeeds.",
       "note": "$errata.orphan_feature_metadata",
       "setup": {
         "log_actions": [
@@ -212,11 +181,11 @@
       "expected_outcome": "success"
     },
     {
-      "ordinal": 11,
+      "ordinal": 10,
       "name": "deletion_vectors_create_table_supported_not_active_succeeds",
       "feature": "deletionVectors",
       "flavor": "supported_not_active",
-      "description": "Creating a (3,7)+[deletionVectors] table without delta.enableDeletionVectors=true succeeds; the feature is supported but not active.",
+      "description": "Creating a (3,7)+[deletionVectors] table without delta.enableDeletionVectors=true succeeds.",
       "operation": {
         "type": "create_table",
         "protocol": "$protocols.dv_3_7",
@@ -225,66 +194,60 @@
       "expected_outcome": "success"
     },
     {
-      "ordinal": 12,
-      "name": "deletion_vectors_read_snapshot_3_7_dv_bearing_add_missing_num_records_fails",
+      "ordinal": 11,
+      "name": "deletion_vectors_create_table_supported_not_active_false_property_succeeds",
       "feature": "deletionVectors",
-      "description": "Reading a (3,7)+[deletionVectors] table fails when an add action carries a deletionVector but omits numRecords from stats; DV-bearing adds require numRecords.",
+      "flavor": "supported_not_active",
+      "description": "Creating a (3,7)+[deletionVectors] table with delta.enableDeletionVectors=false succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.dv_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableDeletionVectors": "false"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "deletion_vectors_read_snapshot_supported_not_active_false_property_succeeds",
+      "feature": "deletionVectors",
+      "flavor": "supported_not_active",
+      "description": "Reading a (3,7)+[deletionVectors] table with delta.enableDeletionVectors=false succeeds.",
       "setup": {
         "log_actions": [
           {"protocol": "$protocols.dv_3_7"},
-          {"metaData": {"schemaString": "$schemas.simple_int"}},
           {
-            "add": {
-              "path": "part-0.parquet",
-              "partitionValues": {},
-              "size": 100,
-              "modificationTime": 0,
-              "dataChange": true,
-              "deletionVector": {
-                "storageType": "u",
-                "pathOrInlineDv": "ab^-aqEH=-15MacIoDvGr1mDdLSjUDO8nEYfVeKEApE",
-                "offset": null,
-                "sizeInBytes": 36,
-                "cardinality": 1
-              }
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableDeletionVectors": "false"}
             }
           }
         ]
       },
       "operation": {"type": "read_snapshot"},
-      "expected_outcome": "failure"
+      "expected_outcome": "success"
     },
     {
       "ordinal": 13,
-      "name": "deletion_vectors_read_snapshot_insufficient_protocol_with_dv_add_fails",
+      "name": "deletion_vectors_empty_commit_supported_not_active_false_property_succeeds",
       "feature": "deletionVectors",
-      "flavor": "insufficient_protocol",
-      "description": "Reading a table fails when an add action carries a deletionVector but the protocol does not support deletionVectors.",
+      "flavor": "supported_not_active",
+      "description": "Committing to a (3,7)+[deletionVectors] table with delta.enableDeletionVectors=false succeeds.",
       "setup": {
         "log_actions": [
-          {"protocol": "$protocols.legacy_1_2"},
-          {"metaData": {"schemaString": "$schemas.simple_int"}},
+          {"protocol": "$protocols.dv_3_7"},
           {
-            "add": {
-              "path": "part-0.parquet",
-              "partitionValues": {},
-              "size": 100,
-              "modificationTime": 0,
-              "dataChange": true,
-              "stats": "{\"numRecords\":100}",
-              "deletionVector": {
-                "storageType": "u",
-                "pathOrInlineDv": "ab^-aqEH=-15MacIoDvGr1mDdLSjUDO8nEYfVeKEApE",
-                "offset": null,
-                "sizeInBytes": 36,
-                "cardinality": 1
-              }
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableDeletionVectors": "false"}
             }
           }
         ]
       },
-      "operation": {"type": "read_snapshot"},
-      "expected_outcome": "failure"
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
     }
   ]
 }

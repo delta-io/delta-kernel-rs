@@ -9,15 +9,10 @@
     "spec_says": "The spec defines writer obligations whose violation produces invalid table state. It does not always specify whether readers must detect and reject such states.",
     "controversy": "When a table violates a writer requirement (e.g. clustered + partitioned, clustering without domainMetadata co-listed), whether readers are obligated to reject is often unspecified. Failure is the expected fixture outcome since the state is definitively invalid."
   },
-  "clustering_missing_domain_metadata_action": {
-    "title": "Clustered table with no delta.clustering domainMetadata action in the log",
-    "spec_says": "Clustering is a Writers-only feature. When clustering is supported, writers must track clustering column names in a domainMetadata action with domain delta.clustering. The spec also says clustering columns can be specified at table creation or added later.",
-    "controversy": "The spec does not explicitly say whether a clustered table with no clustering columns selected yet must still carry a delta.clustering domainMetadata action (for example with an empty clusteringColumns list), or whether that action can be omitted until clustering columns are first defined."
-  },
-  "column_mapping_asymmetric_protocol_support": {
-    "title": "columnMapping with asymmetric reader/writer protocol support",
-    "spec_says": "The CM property 'should only be honored if the table's protocol has reader and writer versions...that support the columnMapping table feature.' Both reader (v2+) and writer (v5+) requirements must be satisfied simultaneously. CM has separate reader and writer version thresholds, unlike most features.",
-    "controversy": "When one side satisfies its CM requirement but the other does not \u2014 e.g. (1,5) where writer v5 is sufficient but reader v1 is not; (2,4) where reader v2 is sufficient but writer v4 is not; (1,7)+CM in writerFeatures where the writer side is satisfied but reader v1 is not \u2014 the property is not honored, but whether such a table state is itself invalid (and should be rejected) or merely degenerate is unspecified."
+  "domain_metadata_support_term_ambiguity": {
+    "title": "domainMetadata 'support' wording ambiguity",
+    "spec_says": "The spec text for domainMetadata uses 'support' in prose about reader behavior while also defining protocol-level support/enablement concepts elsewhere. It also says readers may ignore unrecognized metadata domains.",
+    "controversy": "It is ambiguous whether 'readers who do not support domain metadata' means readers that do not implement domainMetadata semantics, or readers where protocol-level feature support/enablement is absent. This affects interpretation of orphan domainMetadata actions and whether they are tolerated vs rejected."
   },
   "iceberg_compat_dv_restriction": {
     "title": "icebergCompatV1 vs icebergCompatV2: different DV restriction semantics",

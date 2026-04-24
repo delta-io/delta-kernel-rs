@@ -10,4 +10,5 @@ compliance_case_success!(DOMAIN_METADATA, 2);
 compliance_case_success!(DOMAIN_METADATA, 3);
 compliance_case_success!(DOMAIN_METADATA, 4);
 compliance_case_success!(DOMAIN_METADATA, 5);
-compliance_case_sentinel!(DOMAIN_METADATA, 6);
+compliance_case_success!(DOMAIN_METADATA, 6);
+compliance_case_sentinel!(DOMAIN_METADATA, 7);
