@@ -218,6 +218,12 @@ impl Scalar {
                     "Interval is not supported as scalar yet.",
                 ));
             }
+            // Geometry/Geography are WKB-encoded bytes at the Arrow layer, so null appends
+            // route through the BinaryBuilder path. GeoArrow extension metadata is attached
+            // at the ArrowField level (in a schema), not to the builder produced here.
+            DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+                append_nulls_as!(array::BinaryBuilder)
+            }
         }
         Ok(())
     }

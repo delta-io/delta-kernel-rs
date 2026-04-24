@@ -191,6 +191,8 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
             format!("Interval types are not supported for stats validation: {dt}"),
         )),
         &DataType::VOID
+        | DataType::Primitive(PrimitiveType::Geometry(_))
+        | DataType::Primitive(PrimitiveType::Geography(_))
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)
@@ -224,10 +226,15 @@ fn is_stat_present<'b>(
         DataType::Primitive(PrimitiveType::Decimal(_)) => {
             Ok(getter.get_decimal(row_idx, field_name)?.is_some())
         }
+<<<<<<< HEAD
         &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => Err(Error::unsupported(
             format!("Interval types are not supported for stats presence check: {data_type}"),
         )),
         &DataType::VOID
+=======
+        DataType::Primitive(PrimitiveType::Geometry(_))
+        | DataType::Primitive(PrimitiveType::Geography(_))
+>>>>>>> 16671702 (geo schema type and table feat)
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)

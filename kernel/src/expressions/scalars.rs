@@ -788,6 +788,11 @@ impl PrimitiveType {
             IntervalYearMonth | IntervalDayTime => Err(Error::unsupported(
                 "Interval types are not supported as scalar or partition values",
             )),
+            // Geometry/Geography are not valid partition column types, so there is no
+            // partition-value string format to parse here.
+            Geometry(_) | Geography(_) => Err(Error::generic(
+                "Geometry and Geography types are not supported as partition column values",
+            )),
         }
     }
 
