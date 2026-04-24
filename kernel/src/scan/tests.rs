@@ -878,6 +878,41 @@ fn test_build_actions_meta_predicate_no_predicate() {
 }
 
 #[test]
+fn test_physical_partition_column_names_with_column_mapping() {
+    // Partition columns are stored as logical names in metadata.partitionColumns, but the
+    // physical predicate passed to CheckpointRowGroupFilter uses physical names. The filter
+    // matches partition columns by physical name against `add.partitionValues_parsed.<col>`,
+    // so the partition column set must also be physical.
+    //
+    // This table has column mapping (name mode) with one partition column "category" whose
+    // physical name is a UUID-style identifier.
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/partition_cm/name/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+    // Build a scan with a partition predicate.
+    let predicate = Arc::new(Pred::eq(column_expr!("category"), Expr::literal("a")));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()
+        .unwrap();
+
+    let names = scan.physical_partition_column_names();
+    assert_eq!(names.len(), 1);
+    let physical_name = &names[0];
+    assert_ne!(
+        physical_name, "category",
+        "Expected a physical (UUID-style) name, not the logical name"
+    );
+    assert!(
+        physical_name.starts_with("col-"),
+        "Expected physical name to start with 'col-', got {physical_name:?}"
+    );
+}
+
+#[test]
 fn test_build_actions_meta_predicate_static_skip_all() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
