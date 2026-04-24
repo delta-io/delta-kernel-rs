@@ -19,16 +19,16 @@ const INVALID_PARQUET_CHARS: &[char] = &[' ', ',', ';', '{', '}', '(', ')', '\n'
 /// 1. Schema is non-empty
 /// 2. No duplicate column names (case-insensitive, including nested fields)
 /// 3. Column names contain only valid characters
-/// 4. Rejects non-null columns when the `invariants` writer feature is not enabled
+/// 4. Rejects fields with `delta.invariants` metadata (SQL expression invariants are not supported
+///    by kernel; see `TableConfiguration::ensure_write_supported`)
 pub(crate) fn validate_schema_for_create(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
-    invariants_enabled: bool,
 ) -> DeltaResult<()> {
     if schema.num_fields() == 0 {
         return Err(Error::generic("Schema cannot be empty"));
     }
-    let mut validator = SchemaValidator::new(column_mapping_mode, invariants_enabled);
+    let mut validator = SchemaValidator::new(column_mapping_mode);
     // We reuse the SchemaTransform trait for its recursive traversal machinery.
     // The validator never transforms the schema -- it only inspects fields and
     // collects errors. The return value is intentionally discarded.
@@ -36,7 +36,8 @@ pub(crate) fn validate_schema_for_create(
     validator.into_result()
 }
 
-/// Schema visitor that validates field names and detects duplicates.
+/// Schema visitor that validates field names, detects duplicates, and rejects
+/// unsupported column metadata.
 ///
 /// Implements `SchemaTransform` to reuse the existing recursive struct/array/map traversal.
 /// Collects all validation errors so the caller gets a complete list of violations in a
@@ -47,17 +48,15 @@ pub(crate) fn validate_schema_for_create(
 /// built with `new_unchecked`.
 struct SchemaValidator {
     cm_enabled: bool,
-    invariants_enabled: bool,
     seen_paths: HashSet<String>,
     current_path: Vec<String>,
     errors: Vec<String>,
 }
 
 impl SchemaValidator {
-    fn new(column_mapping_mode: ColumnMappingMode, invariants_enabled: bool) -> Self {
+    fn new(column_mapping_mode: ColumnMappingMode) -> Self {
         Self {
             cm_enabled: !matches!(column_mapping_mode, ColumnMappingMode::None),
-            invariants_enabled,
             seen_paths: HashSet::new(),
             current_path: Vec::new(),
             errors: Vec::new(),
@@ -79,13 +78,6 @@ impl SchemaValidator {
 impl<'a> SchemaTransform<'a> for SchemaValidator {
     transform_output_type!(|'a, T| ());
 
-    /// The default `transform_variant` recurses into the variant's struct fields
-    /// (metadata, value) via `recurse_into_struct`. Those fields are protocol-defined
-    /// and must be non-null -- they are not user-controlled schema columns. We override
-    /// to return the variant struct unchanged, skipping recursion so the non-null check
-    /// in `transform_struct_field` does not reject these fixed internal fields.
-    fn transform_variant(&mut self, _stype: &'a StructType) {}
-
     fn transform_struct_field(&mut self, field: &'a StructField) {
         if let Err(e) = validate_field_name(field.name(), self.cm_enabled) {
             self.errors.push(e.to_string());
@@ -96,13 +88,28 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
         // separator would make column "a.b" indistinguishable from nested field b in
         // struct a. Null bytes cannot appear in column names, so they are safe to use.
         self.current_path.push(field.name().to_ascii_lowercase());
-        if !self.invariants_enabled && !field.is_nullable() {
+
+        // Reject `delta.invariants` metadata on any field. Kernel cannot evaluate SQL
+        // expression invariants, so writing to any table with invariants metadata is
+        // blocked by `TableConfiguration::ensure_write_supported`. Reject at create
+        // time with a clearer, path-aware error.
+        //
+        // Note: unlike `NonNullFieldChecker`, this validator intentionally does NOT
+        // skip recursion into variant internals. Variants are not expected to carry
+        // `delta.invariants`; if they ever do, bubble the error up loudly instead of
+        // silently skipping it.
+        //
+        // When kernel gains SQL expression invariant support, remove this rejection
+        // and replace it with a check that delegates to the invariant evaluation
+        // pipeline.
+        if field.has_invariants() {
             self.errors.push(format!(
-                "Non-null column '{}' is not supported during CREATE TABLE unless \
-                 writer feature 'invariants' is enabled",
+                "Column '{}' has `delta.invariants` metadata; SQL expression invariants \
+                 are not supported by kernel",
                 self.current_path.join(".")
             ));
         }
+
         let key = self.current_path.join("\0");
         if !self.seen_paths.insert(key) {
             self.errors.push(format!(
@@ -152,7 +159,9 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use crate::schema::{
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    };
 
     // === Schema builders for test cases ===
 
@@ -292,51 +301,61 @@ mod tests {
         ])
     }
 
-    fn schema_all_nullable() -> StructType {
+    // === Helpers for building invariants metadata ===
+    //
+    // These tests assert that `delta.invariants` metadata is rejected at CREATE TABLE.
+    // When kernel gains SQL expression invariant support (see tracking issue for
+    // invariant evaluation), these tests should be repurposed to feed a supported
+    // invariant expression through the full write path instead of being deleted
+    // outright.
+
+    fn field_with_invariant(name: &str, data_type: DataType, nullable: bool) -> StructField {
+        let mut field = StructField::new(name, data_type, nullable);
+        field.metadata.insert(
+            ColumnMetadataKey::Invariants.as_ref().to_string(),
+            MetadataValue::String(r#"{"expression": {"expression": "x > 0"}}"#.to_string()),
+        );
+        field
+    }
+
+    fn schema_top_level_invariant() -> StructType {
         StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, true),
-            StructField::new("name", DataType::STRING, true),
+            field_with_invariant("x", DataType::INTEGER, true),
+            StructField::new("y", DataType::INTEGER, true),
         ])
     }
 
-    fn schema_top_level_non_null() -> StructType {
-        StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
-    }
-
-    fn schema_nested_non_null() -> StructType {
-        let nested =
-            StructType::new_unchecked(vec![StructField::new("child", DataType::INTEGER, false)]);
+    fn schema_nested_invariant() -> StructType {
+        let inner =
+            StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
         StructType::new_unchecked(vec![StructField::new(
             "parent",
-            DataType::Struct(Box::new(nested)),
+            DataType::Struct(Box::new(inner)),
             true,
         )])
     }
 
-    fn schema_array_nested_non_null() -> StructType {
-        let nested =
-            StructType::new_unchecked(vec![StructField::new("child", DataType::INTEGER, false)]);
+    fn schema_array_nested_invariant() -> StructType {
+        let inner =
+            StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
         StructType::new_unchecked(vec![StructField::new(
             "arr",
             DataType::Array(Box::new(ArrayType::new(
-                DataType::Struct(Box::new(nested)),
+                DataType::Struct(Box::new(inner)),
                 true,
             ))),
             true,
         )])
     }
 
-    fn schema_map_nested_non_null() -> StructType {
-        let nested =
-            StructType::new_unchecked(vec![StructField::new("child", DataType::INTEGER, false)]);
+    fn schema_map_nested_invariant() -> StructType {
+        let inner =
+            StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
         StructType::new_unchecked(vec![StructField::new(
             "map",
             DataType::Map(Box::new(MapType::new(
                 DataType::STRING,
-                DataType::Struct(Box::new(nested)),
+                DataType::Struct(Box::new(inner)),
                 true,
             ))),
             true,
@@ -352,7 +371,7 @@ mod tests {
     #[case::dot_in_name_with_cm(schema_with_dot(), ColumnMappingMode::Name)]
     #[case::different_struct_children(schema_different_struct_children(), ColumnMappingMode::None)]
     fn valid_schema_accepted(#[case] schema: StructType, #[case] cm: ColumnMappingMode) {
-        assert!(validate_schema_for_create(&schema, cm, true).is_ok());
+        assert!(validate_schema_for_create(&schema, cm).is_ok());
     }
 
     // === Invalid schemas ===
@@ -374,7 +393,7 @@ mod tests {
         #[case] cm: ColumnMappingMode,
         #[case] expected_errs: &[&str],
     ) {
-        let result = validate_schema_for_create(&schema, cm, true);
+        let result = validate_schema_for_create(&schema, cm);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         for expected in expected_errs {
@@ -385,63 +404,24 @@ mod tests {
         }
     }
 
+    // === delta.invariants metadata rejection ===
+
     #[rstest]
-    #[case::all_nullable_invariants_disabled(schema_all_nullable(), false, true, None)]
-    #[case::top_level_non_null_invariants_disabled(
-        schema_top_level_non_null(),
-        false,
-        false,
-        Some("id")
-    )]
-    #[case::nested_non_null_invariants_disabled(
-        schema_nested_non_null(),
-        false,
-        false,
-        Some("parent.child")
-    )]
-    #[case::array_nested_non_null_invariants_disabled(
-        schema_array_nested_non_null(),
-        false,
-        false,
-        Some("arr.child")
-    )]
-    #[case::map_nested_non_null_invariants_disabled(
-        schema_map_nested_non_null(),
-        false,
-        false,
-        Some("map.child")
-    )]
-    #[case::top_level_non_null_invariants_enabled(schema_top_level_non_null(), true, true, None)]
-    #[case::nested_non_null_invariants_enabled(schema_nested_non_null(), true, true, None)]
-    fn non_null_columns_require_invariants_feature(
-        #[case] schema: StructType,
-        #[case] invariants_enabled: bool,
-        #[case] expect_ok: bool,
-        #[case] expected_path: Option<&str>,
-    ) {
-        let result =
-            validate_schema_for_create(&schema, ColumnMappingMode::None, invariants_enabled);
-
-        if expect_ok {
-            assert!(result.is_ok(), "expected success, got {result:?}");
-            return;
-        }
-
-        let err = result.expect_err("expected non-null validation error");
+    #[case::top_level(schema_top_level_invariant(), "x")]
+    #[case::nested_struct(schema_nested_invariant(), "parent.child")]
+    #[case::array_nested(schema_array_nested_invariant(), "arr.child")]
+    #[case::map_nested(schema_map_nested_invariant(), "map.child")]
+    fn invariants_metadata_rejected(#[case] schema: StructType, #[case] expected_path: &str) {
+        let result = validate_schema_for_create(&schema, ColumnMappingMode::None);
+        let err = result.expect_err("expected delta.invariants metadata rejection");
         let msg = err.to_string();
         assert!(
-            msg.contains("Non-null column"),
-            "Expected non-null validation error, got: {msg}"
+            msg.contains("delta.invariants"),
+            "Expected delta.invariants mention in error, got: {msg}"
         );
-        if let Some(path) = expected_path {
-            assert!(
-                msg.contains(path),
-                "Expected path '{path}' in error message, got: {msg}"
-            );
-        }
         assert!(
-            msg.contains("writer feature 'invariants'"),
-            "Expected invariants guidance in error message, got: {msg}"
+            msg.contains(expected_path),
+            "Expected path '{expected_path}' in error, got: {msg}"
         );
     }
 }

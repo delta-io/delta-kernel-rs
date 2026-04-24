@@ -38,7 +38,7 @@ fn delta_only_snapshot_emits_expected_metrics() -> DeltaResult<()> {
         .with_data(1, 1)
         .build()?;
 
-    let (engine, reporter) = measuring_engine(table.store().clone());
+    let (engine, reporter, _guard) = measuring_engine(table.store().clone());
     let _snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
@@ -81,7 +81,7 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
     .await?
     .unwrap_committed();
 
-    let (measure_engine, reporter) = measuring_engine(Arc::new(LocalFileSystem::new()));
+    let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
@@ -118,7 +118,7 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
 async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> DeltaResult<()> {
     let (table_url, _setup_engine, _temp_dir) = setup_table_with_v1_checkpoint().await?;
 
-    let (measure_engine, reporter) = measuring_engine(Arc::new(LocalFileSystem::new()));
+    let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
@@ -176,7 +176,7 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()
     // commit 3: tail commit after the compaction
     insert_rows(&table_url, &setup_engine, 3, 1).await?;
 
-    let (engine, reporter) = measuring_engine(store);
+    let (engine, reporter, _guard) = measuring_engine(store);
     let _snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
@@ -209,7 +209,7 @@ async fn snapshot_with_crc_at_target_version_skips_json_replay() -> DeltaResult<
     let table_root =
         Url::from_directory_path(path).map_err(|_| delta_kernel::Error::generic("invalid path"))?;
 
-    let (engine, reporter) = measuring_engine(Arc::new(LocalFileSystem::new()));
+    let (engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_root).build(&engine)?;
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
@@ -283,7 +283,7 @@ async fn crc_at_prior_version_triggers_tail_replay_then_falls_back_to_crc() -> D
     }
 
     // Measurement: build snapshot at latest (v2); CRC is at v0 (two versions behind)
-    let (measure_engine, reporter) = measuring_engine(Arc::new(LocalFileSystem::new()));
+    let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
@@ -328,7 +328,7 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Delta
             .clone();
     }
 
-    let (measure_engine, reporter) = measuring_engine(Arc::new(LocalFileSystem::new()));
+    let (measure_engine, reporter, _guard) = measuring_engine(Arc::new(LocalFileSystem::new()));
     let _snap = Snapshot::builder_for(table_url).build(&measure_engine)?;
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
@@ -367,7 +367,7 @@ fn get_domain_metadata_when_no_latest_crc_incurs_additional_log_replay() -> Delt
         .with_data(1, 1)
         .build()?;
 
-    let (engine, reporter) = measuring_engine(table.store().clone());
+    let (engine, reporter, _guard) = measuring_engine(table.store().clone());
     let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
     // Snapshot build reads both commit files in one JSON call

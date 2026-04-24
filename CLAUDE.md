@@ -61,11 +61,10 @@ cargo +nightly fmt \
 
 ### Feature Flags
 
-- `default-engine` / `default-engine-rustls` / `default-engine-native-tls` -- async
-  Arrow/Tokio engine (pick one TLS backend)
+- `default-engine-rustls` / `default-engine-native-tls` -- async Arrow/Tokio engine (pick a TLS backend)
 - `arrow`, `arrow-XX`, `arrow-YY` -- Arrow version selection (kernel tracks the latest two
   major Arrow releases; `arrow` defaults to latest). Kernel itself does not depend on Arrow,
-  but default-engine does.
+  but the default engine does.
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by default engine)
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `clustered-table` -- clustered table write support (experimental)
@@ -202,6 +201,12 @@ Keep this list updated when new protocol features are added to kernel.
 - Code comments state intent and explain "why" -- don't restate what the code self-documents.
 - Place `use` imports at the top of the file (for non-test code) or at the top of the
   `mod tests` block (for test code) -- never inside function bodies.
+- Prefer `==` over `matches!` for simple single-variant enum comparisons. `matches!` is
+  for patterns with bindings or guards. For example: `self == Variant` not
+  `matches!(self, Variant)`.
+- Prefer `StructField::nullable` / `StructField::not_null` over
+  `StructField::new(name, type, bool)` when nullability is known at compile time.
+  Reserve `StructField::new` for cases where nullability is a runtime value.
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
 

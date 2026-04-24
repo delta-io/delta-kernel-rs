@@ -27,7 +27,7 @@ use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
-    STATS_PARSED_NAME, TAGS_NAME,
+    PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
@@ -177,6 +177,15 @@ pub struct ExistingTable;
 /// invalid for table creation (e.g. file removal, domain metadata removal) are not available.
 #[derive(Debug)]
 pub struct CreateTable;
+
+/// Marker trait for transaction states that support data file operations.
+///
+/// Only transaction types that implement this trait can access methods for adding, removing, or
+/// updating data files. This prevents compile-time misuse by states like `AlterTable` that
+/// only perform metadata-only commits.
+pub trait SupportsDataFiles {}
+impl SupportsDataFiles for ExistingTable {}
+impl SupportsDataFiles for CreateTable {}
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
@@ -756,7 +765,12 @@ impl<S> Transaction<S> {
     pub fn add_files_schema(&self) -> &'static SchemaRef {
         &BASE_ADD_FILES_SCHEMA
     }
+}
 
+// =============================================================================
+// Data file methods -- only available on transaction types that support data files
+// =============================================================================
+impl<S: SupportsDataFiles> Transaction<S> {
     /// Returns the expected schema for file statistics.
     ///
     /// The schema structure is derived from table configuration:
@@ -948,7 +962,12 @@ impl<S> Transaction<S> {
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
     }
+}
 
+// =============================================================================
+// Internal methods available on ALL transaction types (used by commit path)
+// =============================================================================
+impl<S> Transaction<S> {
     /// Validate that add files have required statistics for clustering columns.
     ///
     /// Per the Delta protocol, writers MUST collect per-file statistics for clustering columns
@@ -1271,11 +1290,15 @@ impl<S> Transaction<S> {
 
 /// Builds the transform expression for converting scan row metadata into a Remove action.
 ///
-/// When `coalesce_stats_with_parsed` is true, the `stats` field is replaced with
-/// `COALESCE(stats, TO_JSON(stats_parsed))` and `stats_parsed` is dropped. This handles
-/// scan files produced by predicate-based scans that include a `stats_parsed` column: if
-/// `stats` is null (e.g., because `skip_stats=true` was used), the stats are reconstructed
-/// from the parsed representation before writing the remove action.
+/// Handles two "parsed" columns that predicate-based scans add to scan metadata:
+///
+/// - `stats_parsed`: when `coalesce_stats_with_parsed` is true, the `stats` field is replaced with
+///   `COALESCE(stats, TO_JSON(stats_parsed))` and `stats_parsed` is dropped. The coalesce handles
+///   cases where `stats` is null (e.g., `skip_stats=true` or V2 checkpoints with
+///   `writeStatsAsJson=false`) by reconstructing the JSON from the parsed representation.
+/// - `partitionValues_parsed`: dropped if present. Unlike stats, no reconstruction is needed: the
+///   Remove action's `partitionValues` is sourced from `fileConstantValues.partitionValues`, which
+///   scans always populate from `add.partitionValues`.
 fn build_remove_transform(
     commit_timestamp: i64,
     data_change: bool,
@@ -1327,7 +1350,9 @@ fn build_remove_transform(
             Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into(),
         )
         .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-        .with_dropped_field("modificationTime");
+        .with_dropped_field("modificationTime")
+        // Added to scan output when the predicate touches a partition column.
+        .with_dropped_field_if_exists(PARTITION_VALUES_PARSED_NAME);
 
     for column_to_drop in columns_to_drop {
         transform = transform.with_dropped_field(*column_to_drop);
@@ -1946,7 +1971,7 @@ mod tests {
     // ============================================================================
     // validate_blind_append tests
     // ============================================================================
-    fn add_dummy_file<S>(txn: &mut Transaction<S>) {
+    fn add_dummy_file<S: SupportsDataFiles>(txn: &mut Transaction<S>) {
         let data = string_array_to_engine_data(StringArray::from(vec!["dummy"]));
         txn.add_files(data);
     }

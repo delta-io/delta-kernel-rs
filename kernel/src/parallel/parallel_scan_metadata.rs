@@ -1,9 +1,12 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use tracing::{info_span, Span};
 
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
+use crate::metrics::reporter::emit_scan_metadata_completed;
+use crate::metrics::{MetricId, ScanType};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
@@ -31,13 +34,18 @@ pub enum AfterSequentialScanMetadata {
 /// a distributed phase is needed.
 pub struct SequentialScanMetadata {
     pub(crate) sequential: SequentialPhase<ScanLogReplayProcessor>,
+    operation_id: MetricId,
+    start: Instant,
     span: Span,
 }
 
 impl SequentialScanMetadata {
     pub(crate) fn new(sequential: SequentialPhase<ScanLogReplayProcessor>) -> Self {
+        let operation_id = MetricId::new();
         Self {
             sequential,
+            operation_id,
+            start: Instant::now(),
             // TODO: Associate a unique scan ID with this span to correlate sequential and parallel
             // phases
             span: info_span!("sequential_scan_metadata"),
@@ -48,20 +56,35 @@ impl SequentialScanMetadata {
         let _guard = self.span.enter();
         match self.sequential.finish()? {
             AfterSequential::Done(processor) => {
+                let event = processor.get_metrics().to_event(
+                    self.operation_id,
+                    ScanType::SequentialPhase,
+                    self.start.elapsed(),
+                );
                 processor
                     .get_metrics()
                     .log("Sequential scan metadata completed");
+                emit_scan_metadata_completed(&event);
                 Ok(AfterSequentialScanMetadata::Done)
             }
             AfterSequential::Parallel { processor, files } => {
-                // Log sequential metrics and reset counters for parallel phase
+                let event = processor.get_metrics().to_event(
+                    self.operation_id,
+                    ScanType::SequentialPhase,
+                    self.start.elapsed(),
+                );
                 processor
                     .get_metrics()
                     .log("Sequential scan metadata completed");
+                emit_scan_metadata_completed(&event);
                 processor.get_metrics().reset_counters();
 
                 Ok(AfterSequentialScanMetadata::Parallel {
-                    state: Box::new(ParallelState { inner: processor }),
+                    state: Box::new(ParallelState {
+                        inner: processor,
+                        operation_id: self.operation_id,
+                        parallel_start: Instant::now(),
+                    }),
                     files,
                 })
             }
@@ -84,6 +107,10 @@ impl Iterator for SequentialScanMetadata {
 /// in Arc and shared across threads for local parallel processing.
 pub struct ParallelState {
     inner: ScanLogReplayProcessor,
+    /// Operation ID inherited from the sequential phase for event correlation.
+    operation_id: MetricId,
+    /// Start time for the parallel phase, set when this state is created.
+    parallel_start: Instant,
 }
 
 impl ParallelLogReplayProcessor for Arc<ParallelState> {
@@ -116,9 +143,15 @@ impl ParallelState {
     /// }
     /// ```
     pub fn log_metrics(&self) {
+        let event = self.inner.get_metrics().to_event(
+            self.operation_id,
+            ScanType::ParallelPhase,
+            self.parallel_start.elapsed(),
+        );
         self.inner
             .get_metrics()
             .log("Parallel scan metadata completed");
+        emit_scan_metadata_completed(&event);
     }
 
     /// Get the schema to use for reading checkpoint files.
@@ -154,7 +187,11 @@ impl ParallelState {
         state: SerializableScanState,
     ) -> DeltaResult<Self> {
         let inner = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            operation_id: MetricId::new(),
+            parallel_start: Instant::now(),
+        })
     }
 
     /// Serialize the processor state directly to bytes.

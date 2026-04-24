@@ -2,7 +2,6 @@
 //! files.
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -21,7 +20,7 @@ use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
+use crate::metrics::MetricId;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::compare::SchemaComparison;
@@ -299,19 +298,21 @@ impl LogSegment {
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
     /// Reports metrics: `LogSegmentLoaded`.
-    #[instrument(name = "log_seg.for_snap", skip_all, err)]
+    // Span name must match `SEGMENT_FOR_SNAPSHOT_SPAN` in `metrics::reporter`.
+    #[instrument(
+        name = "segment.for_snapshot",
+        err,
+        skip(storage, time_travel_version),
+        fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files)
+    )]
     #[internal_api]
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
-        reporter: Option<&Arc<dyn MetricsReporter>>,
-        operation_id: Option<MetricId>,
+        operation_id: MetricId,
     ) -> DeltaResult<Self> {
-        let operation_id = operation_id.unwrap_or_default();
-        let start = Instant::now();
-
         let time_travel_version = time_travel_version.into();
         let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
         let result = Self::for_snapshot_impl(
@@ -321,20 +322,21 @@ impl LogSegment {
             checkpoint_hint,
             time_travel_version,
         );
-        let log_segment_loading_duration = start.elapsed();
 
         match result {
             Ok(log_segment) => {
-                reporter.inspect(|r| {
-                    r.report(MetricEvent::LogSegmentLoaded {
-                        operation_id,
-                        duration: log_segment_loading_duration,
-                        num_commit_files: log_segment.listed.ascending_commit_files.len() as u64,
-                        num_checkpoint_files: log_segment.listed.checkpoint_parts.len() as u64,
-                        num_compaction_files: log_segment.listed.ascending_compaction_files.len()
-                            as u64,
-                    });
-                });
+                tracing::Span::current().record(
+                    "num_commit_files",
+                    log_segment.listed.ascending_commit_files.len() as u64,
+                );
+                tracing::Span::current().record(
+                    "num_checkpoint_files",
+                    log_segment.listed.checkpoint_parts.len() as u64,
+                );
+                tracing::Span::current().record(
+                    "num_compaction_files",
+                    log_segment.listed.ascending_compaction_files.len() as u64,
+                );
                 Ok(log_segment)
             }
             Err(e) => Err(e),
@@ -531,6 +533,10 @@ impl LogSegment {
     /// Creates a new LogSegment reflecting a checkpoint written at this segment's version.
     /// The checkpoint must be at `end_version`. Kernel does not write multi-part checkpoints,
     /// so the checkpoint must be a single file (classic parquet or V2 UUID).
+    ///
+    /// If the existing `latest_crc_file` is older than the new checkpoint version, it is
+    /// cleared to preserve the `LogSegmentFiles` invariant that `latest_crc_file.version >=
+    /// checkpoint version`.
     pub(crate) fn try_new_with_checkpoint(&self, checkpoint: ParsedLogPath) -> DeltaResult<Self> {
         require!(
             matches!(
@@ -554,11 +560,19 @@ impl LogSegment {
 
         let mut new_log_segment = self.clone();
         new_log_segment.checkpoint_version = Some(checkpoint.version);
+        let checkpoint_version = checkpoint.version;
         new_log_segment.listed.checkpoint_parts = vec![checkpoint];
         // A snapshot at version N only contains commits and compactions at versions <= N,
         // so a checkpoint at N covers everything and we can clear them entirely.
         new_log_segment.listed.ascending_commit_files.clear();
         new_log_segment.listed.ascending_compaction_files.clear();
+        // Preserve the LogSegmentFiles invariant that `latest_crc_file.version >= checkpoint
+        // version`. A stale CRC is worse than missing: downstream P&M fallbacks (see
+        // `read_protocol_metadata_opt`) would load an older P&M and overwrite the current one.
+        new_log_segment
+            .listed
+            .latest_crc_file
+            .take_if(|crc| crc.version < checkpoint_version);
         // TODO(#839): Once CheckpointWriter exposes the output schema, build a
         // LastCheckpointHintSummary and thread it through here instead of None. Today the
         // schema is computed inside checkpoint_data() but not returned. With None, the next

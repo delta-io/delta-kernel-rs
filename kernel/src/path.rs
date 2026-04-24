@@ -285,6 +285,7 @@ impl ParsedLogPath<FileMeta> {
     ///
     /// Returns the inCommitTimestamp value, or an error if ICT is not found or cannot be read.
     /// Callers should handle enablement version checks before calling this method.
+    #[tracing::instrument(skip(engine), ret, fields(version = self.version, path = %self.location.as_url()))]
     pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         // Only works on commit files
         if !self.is_commit() {

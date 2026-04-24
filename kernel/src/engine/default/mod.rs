@@ -19,7 +19,6 @@ use self::parquet::DefaultParquetHandler;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
-use crate::metrics::MetricsReporter;
 use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
@@ -84,41 +83,41 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
 
-/// Wraps a [`FileDataReadResultIterator`] to emit a [`MetricEvent`] exactly once when the iterator
-/// is either exhausted or dropped. Used by JSON and Parquet handlers to report the number of files
-/// and bytes requested per `read_*_files` call.
+/// Wraps a [`crate::FileDataReadResultIterator`] to emit a metrics event exactly once when the
+/// iterator is either exhausted or dropped.
+///
+/// Used by the JSON and Parquet handlers to report the number of files and bytes requested per
+/// `read_*_files` call. The `emit_fn` is called with `(num_files, bytes_read)` and is expected
+/// to create and immediately drop a tracing span, which triggers the `ReportGeneratorLayer` to
+/// fire the appropriate [`crate::metrics::MetricEvent`] to any registered reporter.
 pub(super) struct ReadMetricsIterator {
     inner: crate::FileDataReadResultIterator,
-    reporter: Arc<dyn crate::metrics::MetricsReporter>,
     num_files: u64,
     bytes_read: u64,
     emitted: bool,
-    make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
+    emit_fn: fn(u64, u64),
 }
 
 impl ReadMetricsIterator {
     pub(super) fn new(
         inner: crate::FileDataReadResultIterator,
-        reporter: Arc<dyn crate::metrics::MetricsReporter>,
         num_files: u64,
         bytes_read: u64,
-        make_event: fn(u64, u64) -> crate::metrics::MetricEvent,
+        emit_fn: fn(u64, u64),
     ) -> Self {
         Self {
             inner,
-            reporter,
             num_files,
             bytes_read,
             emitted: false,
-            make_event,
+            emit_fn,
         }
     }
 
     fn emit_once(&mut self) {
         if !self.emitted {
             self.emitted = true;
-            self.reporter
-                .report((self.make_event)(self.num_files, self.bytes_read));
+            (self.emit_fn)(self.num_files, self.bytes_read);
         }
     }
 }
@@ -149,7 +148,6 @@ pub struct DefaultEngine<E: TaskExecutor> {
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
     evaluation: Arc<ArrowEvaluationHandler>,
-    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 /// Builder for creating [`DefaultEngine`] instances.
@@ -174,7 +172,6 @@ pub struct DefaultEngine<E: TaskExecutor> {
 pub struct DefaultEngineBuilder<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
-    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
@@ -183,18 +180,11 @@ impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
         Self {
             object_store,
             task_executor: Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
-            metrics_reporter: None,
         }
     }
 }
 
 impl<E: TaskExecutor> DefaultEngineBuilder<E> {
-    /// Set the metrics reporter for the engine.
-    pub fn with_metrics_reporter(mut self, reporter: Arc<dyn MetricsReporter>) -> Self {
-        self.metrics_reporter = Some(reporter);
-        self
-    }
-
     /// Set a custom task executor for the engine.
     ///
     /// See [`executor::TaskExecutor`] for more details.
@@ -205,13 +195,12 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
         DefaultEngineBuilder {
             object_store: self.object_store,
             task_executor,
-            metrics_reporter: self.metrics_reporter,
         }
     }
 
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.metrics_reporter)
+        DefaultEngine::new_with_opts(self.object_store, self.task_executor)
     }
 }
 
@@ -229,29 +218,23 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
-    fn new_with_opts(
-        object_store: Arc<DynObjectStore>,
-        task_executor: Arc<E>,
-        metrics_reporter: Option<Arc<dyn MetricsReporter>>,
-    ) -> Self {
+    fn new_with_opts(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
-                metrics_reporter.clone(),
             )),
-            json: Arc::new(
-                DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
-                    .with_reporter(metrics_reporter.clone()),
-            ),
-            parquet: Arc::new(
-                DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
-                    .with_reporter(metrics_reporter.clone()),
-            ),
+            json: Arc::new(DefaultJsonHandler::new(
+                object_store.clone(),
+                task_executor.clone(),
+            )),
+            parquet: Arc::new(DefaultParquetHandler::new(
+                object_store.clone(),
+                task_executor.clone(),
+            )),
             object_store,
             task_executor,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
-            metrics_reporter,
         }
     }
 
@@ -334,10 +317,6 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
     }
-
-    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
-        self.metrics_reporter.clone()
-    }
 }
 
 trait UrlExt {
@@ -374,15 +353,7 @@ impl UrlExt for Url {
 mod tests {
     use super::*;
     use crate::engine::tests::test_arrow_engine;
-    use crate::metrics::MetricEvent;
     use crate::object_store::local::LocalFileSystem;
-
-    #[derive(Debug)]
-    struct TestMetricsReporter;
-
-    impl MetricsReporter for TestMetricsReporter {
-        fn report(&self, _event: MetricEvent) {}
-    }
 
     #[test]
     fn test_default_engine() {
@@ -399,19 +370,6 @@ mod tests {
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
         let engine = DefaultEngineBuilder::new(object_store).build();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_default_engine_builder_with_metrics_reporter() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let reporter = Arc::new(TestMetricsReporter);
-        let engine = DefaultEngineBuilder::new(object_store)
-            .with_metrics_reporter(reporter)
-            .build();
-        assert!(engine.get_metrics_reporter().is_some());
         test_arrow_engine(&engine, &url);
     }
 
@@ -447,13 +405,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let reporter = Arc::new(TestMetricsReporter);
         let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
         let engine = DefaultEngineBuilder::new(object_store)
-            .with_metrics_reporter(reporter)
             .with_task_executor(executor)
             .build();
-        assert!(engine.get_metrics_reporter().is_some());
         test_arrow_engine(&engine, &url);
     }
 
