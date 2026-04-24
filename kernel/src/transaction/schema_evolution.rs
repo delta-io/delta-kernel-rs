@@ -40,6 +40,19 @@ pub(crate) enum SchemaOperation {
     SetNullable { column: ColumnName },
 }
 
+impl SchemaOperation {
+    /// The delta-spark-compatible operation name for this schema change. Used to populate the
+    /// commit's `operation` field. Matches the operation strings in Spark.
+    pub(crate) fn operation_name(&self) -> &'static str {
+        match self {
+            SchemaOperation::AddColumn { .. } => "ADD COLUMNS",
+            SchemaOperation::DropColumn { .. } => "DROP COLUMNS",
+            SchemaOperation::RenameColumn { .. } => "RENAME COLUMNS",
+            SchemaOperation::SetNullable { .. } => "CHANGE COLUMN",
+        }
+    }
+}
+
 /// Signal returned by [`modify_field_at_path`] modifiers describing what to do with the leaf
 /// field after the modifier runs.
 #[must_use]
@@ -213,6 +226,10 @@ pub(crate) struct SchemaEvolutionResult {
     /// If `Some(id)`, `delta.columnMapping.maxColumnId` must be updated to this new value.
     /// `None` means the property should remain unchanged.
     pub new_max_column_id: Option<i64>,
+    /// The delta-spark-compatible operation string derived from the ops (e.g.
+    /// `"ADD COLUMNS"`, `"ADD COLUMNS + CHANGE COLUMN"`). Used as the commit's
+    /// `operation` field.
+    pub operation: String,
 }
 
 /// Applies a sequence of schema operations to the given schema, returning a
@@ -243,7 +260,15 @@ pub(crate) fn apply_schema_operations(
         current_max_column_id
     };
 
+    // Distinct operation names in first-occurrence order; joined into the commit's
+    // operation string at the end.
+    let mut op_names: Vec<&'static str> = Vec::new();
+
     for op in operations {
+        let name = op.operation_name();
+        if !op_names.contains(&name) {
+            op_names.push(name);
+        }
         match op {
             // Protocol feature checks for the field's data type (e.g. `timestampNtz`) happen
             // later when the caller builds a new TableConfiguration from the evolved schema --
@@ -358,6 +383,7 @@ pub(crate) fn apply_schema_operations(
     Ok(SchemaEvolutionResult {
         schema: schema.into(),
         new_max_column_id,
+        operation: op_names.join(" + "),
     })
 }
 
@@ -1600,5 +1626,36 @@ mod tests {
             Some(3),
             "max id advances to cover the added column even though it was renamed"
         );
+    }
+
+    // === operation string tests ===
+
+    #[test]
+    fn apply_dedups_repeated_ops_in_operation_string() {
+        let ops = vec![add_col("a", true), add_col("b", true)];
+        let result = apply_schema_operations(
+            simple_schema(),
+            ops,
+            ColumnMappingMode::None,
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result.operation, "ADD COLUMNS");
+    }
+
+    #[test]
+    fn apply_empty_ops_produces_empty_operation_string() {
+        let result = apply_schema_operations(
+            simple_schema(),
+            vec![],
+            ColumnMappingMode::None,
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result.operation, "");
     }
 }

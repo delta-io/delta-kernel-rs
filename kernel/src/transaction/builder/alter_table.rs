@@ -279,6 +279,7 @@ impl<S: Buildable> AlterTableTransactionBuilder<S> {
         let SchemaEvolutionResult {
             schema: evolved_schema,
             new_max_column_id,
+            operation,
         } = apply_schema_operations(
             schema,
             self.operations,
@@ -304,6 +305,11 @@ impl<S: Buildable> AlterTableTransactionBuilder<S> {
             evolved_schema,
         )?;
 
-        AlterTableTransaction::try_new_alter_table(self.snapshot, evolved_table_config, committer)
+        AlterTableTransaction::try_new_alter_table(
+            self.snapshot,
+            evolved_table_config,
+            committer,
+            operation,
+        )
     }
 }

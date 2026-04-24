@@ -1554,3 +1554,83 @@ async fn chain_add_then_rename_via_builder() -> DeltaResult<()> {
     );
     Ok(())
 }
+
+// ============================================================================
+// OPERATION STRING tests
+// ============================================================================
+
+// Reads `commitInfo.operation` from a commit JSON written to the local filesystem.
+fn read_commit_operation(table_path: &str, version: u64) -> String {
+    let log_file = format!("{table_path}/_delta_log/{version:020}.json");
+    let contents = std::fs::read_to_string(&log_file).expect("read log file");
+    for line in contents.lines() {
+        let action: serde_json::Value = serde_json::from_str(line).expect("parse action");
+        if let Some(ci) = action.get("commitInfo") {
+            return ci
+                .get("operation")
+                .and_then(|v| v.as_str())
+                .expect("operation field")
+                .to_string();
+        }
+    }
+    panic!("no commitInfo in commit {version}");
+}
+
+/// Selector for `alter_commit_operation`. Each variant maps to a different sequence of
+/// builder ops + a different CM requirement.
+enum OpSet {
+    Add,
+    Drop,
+    Rename,
+    SetNullable,
+    AddThenSetNullable,
+}
+
+impl OpSet {
+    /// Drop and Rename require column mapping; the others don't.
+    fn requires_cm(&self) -> bool {
+        matches!(self, OpSet::Drop | OpSet::Rename)
+    }
+}
+
+#[rstest]
+#[case::add_columns(OpSet::Add, "ADD COLUMNS")]
+#[case::drop_columns(OpSet::Drop, "DROP COLUMNS")]
+#[case::rename_columns(OpSet::Rename, "RENAME COLUMNS")]
+#[case::change_column(OpSet::SetNullable, "CHANGE COLUMN")]
+#[case::mixed_add_then_change(OpSet::AddThenSetNullable, "ADD COLUMNS + CHANGE COLUMN")]
+#[tokio::test]
+async fn alter_commit_operation(#[case] op_set: OpSet, #[case] expected: &str) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let properties: &[(&str, &str)] = if op_set.requires_cm() {
+        &[("delta.columnMapping.mode", "name")]
+    } else {
+        &[]
+    };
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), properties)?;
+
+    // Each branch normalizes to the same AlterTableTransaction type via .build().
+    let builder = snapshot.alter_table();
+    let txn = match op_set {
+        OpSet::Add => builder
+            .add_column(StructField::nullable("email", DataType::STRING))
+            .build(engine.as_ref(), committer())?,
+        OpSet::Drop => builder
+            .drop_column(column_name!("name"))
+            .build(engine.as_ref(), committer())?,
+        OpSet::Rename => builder
+            .rename_column(column_name!("name"), "full_name")
+            .build(engine.as_ref(), committer())?,
+        OpSet::SetNullable => builder
+            .set_nullable(column_name!("id"))
+            .build(engine.as_ref(), committer())?,
+        OpSet::AddThenSetNullable => builder
+            .add_column(StructField::nullable("email", DataType::STRING))
+            .set_nullable(column_name!("id"))
+            .build(engine.as_ref(), committer())?,
+    };
+    txn.commit(engine.as_ref())?.unwrap_committed();
+    assert_eq!(read_commit_operation(&table_path, 1), expected);
+    Ok(())
+}
