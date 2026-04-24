@@ -1185,6 +1185,11 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                 // Microseconds since epoch (no timezone)
                 Scalar::TimestampNtz((18000 + seed as i64) * 86_400_000_000)
             }
+            #[cfg(feature = "nanosecond-timestamps")]
+            PrimitiveType::TimestampNanos => {
+                // Nanoseconds since epoch
+                Scalar::TimestampNanos((18000 + seed as i64) * 86_400_000_000_000)
+            }
             PrimitiveType::Decimal(dt) => {
                 let scale_factor = 10i128.pow(dt.scale() as u32);
                 let bits = seed as i128 * scale_factor;
