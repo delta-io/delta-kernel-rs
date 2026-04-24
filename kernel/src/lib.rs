@@ -857,25 +857,34 @@ pub trait ParquetHandler: AsAny {
     /// in a row group. Unlike data file statistics, these aggregates can be misleading when
     /// some files are missing statistics (null stat values are invisible to footer min/max).
     ///
-    /// The `predicate` uses physical column names (e.g. `x > 10`, or `col-abc-123 > 10` under
-    /// column mapping), not checkpoint-internal column paths like `add.stats_parsed.minValues.x`.
-    /// The `partition_columns` set contains the physical names of the table's partition columns,
-    /// used to distinguish partition-value stats (`add.partitionValues_parsed.<col>`) from data
-    /// column stats (`add.stats_parsed.*.<col>`).
+    /// # Parameters
+    /// - `predicate`: user data predicate with physical column names (e.g. `x > 10`, or
+    ///   `col-abc-123 > 10` under column mapping). Evaluated against checkpoint-internal stat
+    ///   columns (`add.stats_parsed.*`, `add.partitionValues_parsed.*`).
+    /// - `action_predicate`: optional predicate referencing only top-level action-identifier
+    ///   columns (e.g. `txn.appId IS NOT NULL`). Evaluated directly against the checkpoint parquet
+    ///   schema to skip row groups that contain no rows of the caller's action types of interest.
+    ///   MUST NOT reference user data columns, since user column paths can alias to Delta action
+    ///   leaves (e.g. user column `protocol.minReaderVersion` would collide with the protocol
+    ///   action's field).
+    /// - `partition_columns`: physical names of the table's partition columns, used to distinguish
+    ///   partition-value stats from data column stats.
     ///
-    /// The default implementation falls back to [`read_parquet_files`](Self::read_parquet_files).
-    /// Because the predicate references bare physical column names that do not match the
-    /// checkpoint's nested stats schema, the fallback performs no row group skipping on
-    /// checkpoint files. Engines that want row group skipping on checkpoints should override
-    /// this method.
+    /// The default implementation falls back to [`read_parquet_files`](Self::read_parquet_files)
+    /// with the user predicate. It performs no data-column row group skipping on checkpoint
+    /// files because the predicate uses bare physical column names that do not match the
+    /// checkpoint's nested stats schema; only the IS NOT NULL guards in the predicate (if any)
+    /// take effect. Engines that want full checkpoint row group skipping should override this
+    /// method.
     fn read_checkpoint_parquet_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
+        action_predicate: Option<PredicateRef>,
         partition_columns: &HashSet<String>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let _ = partition_columns;
+        let _ = (action_predicate, partition_columns);
         self.read_parquet_files(files, physical_schema, predicate)
     }
 

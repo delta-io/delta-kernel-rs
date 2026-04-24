@@ -663,7 +663,7 @@ impl LogSegment {
     ///   Not the query's data predicate, but a hint for skipping irrelevant data. IS NOT NULL
     ///   predicates derived from `checkpoint_read_schema` are AND-combined with this.
     /// - `partition_columns`: physical names of the table's partition columns. Forwarded to
-    ///   [`ParquetHandler::read_checkpoint_parquet_files`] to enable partition-aware row group
+    ///   `ParquetHandler::read_checkpoint_parquet_files` to enable partition-aware row group
     ///   skipping on checkpoint files.
     /// - `stats_schema` / `partition_schema`: augment the checkpoint read schema with
     ///   `stats_parsed` / `partitionValues_parsed` when present, enabling data-skipping on those
@@ -682,13 +682,12 @@ impl LogSegment {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        // Combine schema-derived IS NOT NULL predicate with any caller-supplied predicate so
-        // checkpoint parquet row groups without any relevant action type can be skipped.
-        let is_not_null_pred = schema_to_is_not_null_predicate(&checkpoint_read_schema);
-        let effective_predicate = match (is_not_null_pred, meta_predicate) {
-            (None, x) | (x, None) => x,
-            (Some(a), Some(b)) => Some(Arc::new(Predicate::and((*a).clone(), (*b).clone()))),
-        };
+        // The schema-derived IS NOT NULL predicate references only top-level action-identifier
+        // columns. It is routed to the direct RowGroupFilter so row groups without any relevant
+        // action type can be skipped. The caller-supplied `meta_predicate` (user data predicate)
+        // is routed separately to CheckpointRowGroupFilter -- it must never go through the direct
+        // filter because user column paths can collide with Delta action leaves.
+        let action_predicate = schema_to_is_not_null_predicate(&checkpoint_read_schema);
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
@@ -697,7 +696,8 @@ impl LogSegment {
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
             checkpoint_read_schema,
-            effective_predicate,
+            meta_predicate,
+            action_predicate,
             partition_columns,
             stats_schema,
             partition_schema,
@@ -868,11 +868,13 @@ impl LogSegment {
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
     ///
     /// Returns a tuple of the actions iterator and [`CheckpointReadInfo`].
+    #[allow(clippy::too_many_arguments)]
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
+        action_predicate: Option<PredicateRef>,
         partition_columns: Vec<String>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
@@ -973,10 +975,18 @@ impl LogSegment {
         let partition_columns: HashSet<String> = partition_columns.into_iter().collect();
         let actions = match self.listed.checkpoint_parts.first() {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
+                // JSON checkpoints don't have parquet row group skipping; combine the predicates
+                // so the JSON reader still sees the intent (even though it will likely ignore it).
+                let combined = match (meta_predicate.clone(), action_predicate.clone()) {
+                    (None, x) | (x, None) => x,
+                    (Some(a), Some(b)) => {
+                        Some(Arc::new(Predicate::and((*a).clone(), (*b).clone())))
+                    }
+                };
                 engine.json_handler().read_json_files(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
-                    meta_predicate.clone(),
+                    combined,
                 )?
             }
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
@@ -984,6 +994,7 @@ impl LogSegment {
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
+                    action_predicate.clone(),
                     &partition_columns,
                 )?,
             Some(parsed_log_path) => {
@@ -1006,6 +1017,7 @@ impl LogSegment {
                 &sidecar_files,
                 augmented_checkpoint_read_schema.clone(),
                 meta_predicate,
+                action_predicate,
                 &partition_columns,
             )?
         } else {

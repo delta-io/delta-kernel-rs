@@ -699,7 +699,8 @@ fn checkpoint_filter_apply_keeps_row_group_with_missing_stats() {
     // Without null guarding, footer max=100 < 500 would falsely prune this row group.
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
-        &predicate,
+        Some(&predicate),
+        None,
         &NO_PARTITIONS
     ));
 }
@@ -720,7 +721,8 @@ fn checkpoint_filter_apply_prunes_row_group_with_all_stats_present() {
     let predicate = Predicate::gt(column_name!("x"), Scalar::from(500i64));
     assert!(!CheckpointRowGroupFilter::apply(
         row_group,
-        &predicate,
+        Some(&predicate),
+        None,
         &NO_PARTITIONS
     ));
 }
@@ -742,7 +744,8 @@ fn checkpoint_filter_is_null_with_all_stats_present() {
     let predicate = Predicate::is_null(column_name!("x"));
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
-        &predicate,
+        Some(&predicate),
+        None,
         &NO_PARTITIONS
     ));
 }
@@ -880,7 +883,8 @@ fn checkpoint_filter_mixed_partition_and_data_predicate() {
     );
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
-        &predicate,
+        Some(&predicate),
+        None,
         &partition_columns
     ));
 
@@ -893,7 +897,8 @@ fn checkpoint_filter_mixed_partition_and_data_predicate() {
     );
     assert!(!CheckpointRowGroupFilter::apply(
         row_group,
-        &predicate,
+        Some(&predicate),
+        None,
         &partition_columns,
     ));
 }
@@ -964,7 +969,8 @@ fn checkpoint_filter_opaque_predicate_with_null_guarded_stats() {
     );
     assert!(!CheckpointRowGroupFilter::apply(
         row_group,
-        &predicate,
+        Some(&predicate),
+        None,
         &NO_PARTITIONS
     ));
 
@@ -975,7 +981,8 @@ fn checkpoint_filter_opaque_predicate_with_null_guarded_stats() {
     );
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
-        &predicate,
+        Some(&predicate),
+        None,
         &NO_PARTITIONS
     ));
 }
@@ -1002,7 +1009,8 @@ fn checkpoint_filter_opaque_predicate_with_missing_stats() {
     );
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
-        &predicate,
+        Some(&predicate),
+        None,
         &NO_PARTITIONS
     ));
 }
@@ -1107,7 +1115,8 @@ fn checkpoint_filter_multi_row_group_skipping() {
     assert_eq!(builder.metadata().num_row_groups(), 2);
 
     let predicate = Predicate::gt(column_name!("x"), Scalar::from(500i64));
-    let builder = builder.with_checkpoint_row_group_filter(&predicate, &NO_PARTITIONS, None);
+    let builder =
+        builder.with_checkpoint_row_group_filter(Some(&predicate), None, &NO_PARTITIONS, None);
 
     // Only RG1 (x in [400, 600]) survives: max(x) = 600 > 500.
     let reader = builder.build().unwrap();
@@ -1146,7 +1155,8 @@ fn checkpoint_filter_nested_struct_column_stats() {
     // max(x) = 200 < 500 -> can prune.
     assert!(!CheckpointRowGroupFilter::apply(
         row_group,
-        &predicate,
+        Some(&predicate),
+        None,
         &NO_PARTITIONS
     ));
 }
