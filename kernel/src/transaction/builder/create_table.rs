@@ -17,7 +17,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
-use crate::schema::validation::validate_schema_for_create;
+use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
     normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
@@ -390,7 +390,7 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
 /// compatible with Spark readers/writers.
 ///
 /// Explicit `delta.invariants` metadata annotations are rejected by
-/// `validate_schema_for_create`, so this only flips on the feature for nullability-driven
+/// `validate_schema`, so this only flips on the feature for nullability-driven
 /// invariants. Kernel does not itself enforce the null mask at write time -- it relies on
 /// the engine's `ParquetHandler` to do so. Kernel's default `ParquetHandler` uses
 /// `arrow-rs`, whose `RecordBatch::try_new` rejects null values in fields marked
@@ -799,7 +799,7 @@ impl CreateTableTransactionBuilder {
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
 
         // Validate schema (non-empty, column names, duplicates, no `delta.invariants` metadata)
-        validate_schema_for_create(&effective_schema, column_mapping_mode)?;
+        validate_schema(&effective_schema, column_mapping_mode)?;
 
         // Validate data layout and resolve column names (physical for clustering, logical
         // for partitioning). Adds required table features for clustering.
