@@ -212,8 +212,7 @@ mod tests {
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::expressions::{column_expr, Expression as Expr};
-    use crate::scan::AfterSequentialScanMetadata;
-    use crate::scan::ScanMetadata;
+    use crate::scan::{AfterSequentialScanMetadata, ScanMetadata};
     use crate::schema::DataType;
     use crate::utils::test_utils::{assert_result_error_with_message, load_test_table};
 
