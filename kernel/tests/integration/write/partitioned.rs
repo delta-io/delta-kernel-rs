@@ -35,12 +35,14 @@ use test_utils::{read_scan, test_table_setup_mt, write_batch_to_table};
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_partitioned_normal_values_roundtrip(
     #[case] cm_mode: ColumnMappingMode,
+    #[values(true, false)] write_partition_values_parsed: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ===== Step 1: Create table and write one row with normal partition values. =====
     let (_tmp_dir, table_path, snapshot, engine) = setup_and_write(
         all_types_schema(),
         PARTITION_COLS,
         cm_mode,
+        write_partition_values_parsed,
         normal_arrow_columns(),
         normal_partition_values()?,
     )
@@ -110,6 +112,8 @@ async fn test_write_partitioned_normal_values_roundtrip(
     }
 
     // ===== Step 4: Scan and verify values survive checkpoint + reload. =====
+    // This is the only step affected by `write_partition_values_parsed`: the
+    // post-checkpoint scan reads back through `partitionValues_parsed`.
     verify_and_checkpoint(&snapshot, engine, assert_normal_values)?;
 
     Ok(())
@@ -124,12 +128,14 @@ async fn test_write_partitioned_normal_values_roundtrip(
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_partitioned_null_values_roundtrip(
     #[case] cm_mode: ColumnMappingMode,
+    #[values(true, false)] write_partition_values_parsed: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ===== Step 1: Create table and write one row with all-null partition values. =====
     let (_tmp_dir, table_path, snapshot, engine) = setup_and_write(
         all_types_schema(),
         PARTITION_COLS,
         cm_mode,
+        write_partition_values_parsed,
         null_arrow_columns(),
         null_partition_values()?,
     )
@@ -163,6 +169,8 @@ async fn test_write_partitioned_null_values_roundtrip(
     }
 
     // ===== Step 4: Scan and verify all-null values survive checkpoint + reload. =====
+    // This is the only step affected by `write_partition_values_parsed`: the
+    // post-checkpoint scan reads back through `partitionValues_parsed`.
     verify_and_checkpoint(&snapshot, engine, assert_all_partition_columns_null)?;
 
     Ok(())
@@ -242,6 +250,7 @@ async fn test_write_partitioned_path_encodes_special_chars(
         schema,
         &["p"],
         cm_mode,
+        true, // write_partition_values_parsed
         vec![
             Arc::new(Int32Array::from(vec![1])),
             Arc::new(StringArray::from(vec![value])) as ArrayRef,
@@ -568,9 +577,16 @@ fn create_partitioned_table(
     schema: Arc<StructType>,
     partition_cols: &[&str],
     cm_mode: ColumnMappingMode,
+    write_partition_values_parsed: bool,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut builder = create_table(table_path, schema, "test/1.0")
-        .with_data_layout(DataLayout::partitioned(partition_cols));
+        .with_data_layout(DataLayout::partitioned(partition_cols))
+        .with_table_properties([(
+            // `delta.checkpoint.writeStatsAsStruct` is what turns on `partitionValues_parsed`,
+            // which (per its name) lives only in the checkpoint; commit JSON is unaffected.
+            "delta.checkpoint.writeStatsAsStruct",
+            write_partition_values_parsed.to_string(),
+        )]);
     if cm_mode != ColumnMappingMode::None {
         builder =
             builder.with_table_properties([("delta.columnMapping.mode", cm_mode_str(cm_mode))]);
@@ -636,6 +652,7 @@ async fn setup_and_write(
     schema: Arc<StructType>,
     partition_cols: &[&str],
     cm_mode: ColumnMappingMode,
+    write_partition_values_parsed: bool,
     arrow_columns: Vec<ArrayRef>,
     partition_values: HashMap<String, Scalar>,
 ) -> Result<
@@ -655,6 +672,7 @@ async fn setup_and_write(
         schema,
         partition_cols,
         cm_mode,
+        write_partition_values_parsed,
     )?;
 
     let batch = RecordBatch::try_new(arrow_schema, arrow_columns)?;
