@@ -39,6 +39,7 @@ impl AlterTableTransaction {
         effective_table_config: TableConfiguration,
         committer: Box<dyn Committer>,
         operation: String,
+        is_blind_append: bool,
     ) -> DeltaResult<Self> {
         let span = tracing::info_span!(
             "txn",
@@ -66,10 +67,8 @@ impl AlterTableTransaction {
             data_change: false,
             shared_write_state: OnceLock::new(),
             engine_commit_info: None,
-            // TODO(#2446): match delta-spark's per-op isBlindAppend policy
-            // (ADD/DROP/DROP NOT NULL -> true, SET NOT NULL -> false). Hardcoded false for
-            // now: safe, but misses the true-case optimization delta-spark applies.
-            is_blind_append: false,
+            is_blind_append,
+            reads_files: false,
             dv_matched_files: vec![],
             physical_clustering_columns: None,
             _state: PhantomData,

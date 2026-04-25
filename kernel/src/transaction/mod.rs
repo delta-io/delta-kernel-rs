@@ -197,6 +197,20 @@ pub trait SupportsDataFiles {}
 impl SupportsDataFiles for ExistingTable {}
 impl SupportsDataFiles for CreateTable {}
 
+/// Per-state constants consumed by validation. Implemented by every transaction state marker
+/// (`ExistingTable`, `CreateTable`, `AlterTable`); each supplies its own values, and validation
+/// reads `S::<CONST>` to branch on the current state.
+pub trait TransactionKind {
+    /// Whether the transaction produces only metadata changes (no data files). Metadata-only
+    /// commits have no data-file invariants to check during blind-append validation.
+    const IS_METADATA_ONLY: bool = false;
+}
+impl TransactionKind for ExistingTable {}
+impl TransactionKind for CreateTable {}
+impl TransactionKind for AlterTable {
+    const IS_METADATA_ONLY: bool = true;
+}
+
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
 /// changes to the table.
@@ -258,6 +272,12 @@ pub struct Transaction<S = ExistingTable> {
     data_change: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
+    // Whether this transaction has scanned any of the table's existing data files
+    // during its lifetime. Set true by any code path that reads file contents.
+    // Compared against `is_blind_append` in `validate_blind_append_semantics` to
+    // catch mismatches between a transaction's declared blindness and its actual
+    // runtime behavior.
+    reads_files: bool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
@@ -340,7 +360,10 @@ impl<S> Transaction<S> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
+    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>>
+    where
+        S: TransactionKind,
+    {
         info!(
             num_add_files = self.add_files_metadata.len(),
             num_remove_files = self.remove_files_metadata.len(),
@@ -665,16 +688,35 @@ impl<S> Transaction<S> {
     /// Note: Domain metadata additions/removals are allowed; blind append only constrains
     /// data-file operations and read predicates. Conflict resolution determines whether
     /// metadata changes are problematic.
-    fn validate_blind_append_semantics(&self) -> DeltaResult<()> {
+    fn validate_blind_append_semantics(&self) -> DeltaResult<()>
+    where
+        S: TransactionKind,
+    {
         if !self.is_blind_append {
             return Ok(());
         }
+        // Runtime invariant: a transaction declared `isBlindAppend = true` must not
+        // have read existing data files. If it did, some op's static classification
+        // (e.g. `SchemaOperation::is_data_dependent` for ALTER) disagrees with its
+        // runtime behavior -- a kernel bug.
+        require!(
+            !self.reads_files,
+            Error::internal_error(
+                "Transaction declared `isBlindAppend = true` but read existing data files. \
+                 This indicates a mismatch between an operation's static classification \
+                 and its runtime behavior."
+            )
+        );
         require!(
             !self.is_create_table(),
             Error::invalid_transaction_state(
                 "Blind append is not supported for create-table transactions",
             )
         );
+        // Metadata-only transactions (e.g. ALTER TABLE) have no data-file operations to check
+        if S::IS_METADATA_ONLY {
+            return Ok(());
+        }
         require!(
             !self.add_files_metadata.is_empty(),
             Error::invalid_transaction_state("Blind append requires at least one added data file")

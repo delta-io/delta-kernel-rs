@@ -1559,21 +1559,32 @@ async fn chain_add_then_rename_via_builder() -> DeltaResult<()> {
 // OPERATION STRING tests
 // ============================================================================
 
-// Reads `commitInfo.operation` from a commit JSON written to the local filesystem.
-fn read_commit_operation(table_path: &str, version: u64) -> String {
+// Reads the `commitInfo` object from a commit JSON written to the local filesystem.
+fn read_commit_info(table_path: &str, version: u64) -> serde_json::Value {
     let log_file = format!("{table_path}/_delta_log/{version:020}.json");
     let contents = std::fs::read_to_string(&log_file).expect("read log file");
     for line in contents.lines() {
         let action: serde_json::Value = serde_json::from_str(line).expect("parse action");
         if let Some(ci) = action.get("commitInfo") {
-            return ci
-                .get("operation")
-                .and_then(|v| v.as_str())
-                .expect("operation field")
-                .to_string();
+            return ci.clone();
         }
     }
     panic!("no commitInfo in commit {version}");
+}
+
+fn read_commit_operation(table_path: &str, version: u64) -> String {
+    read_commit_info(table_path, version)
+        .get("operation")
+        .and_then(|v| v.as_str())
+        .expect("operation field")
+        .to_string()
+}
+
+fn read_commit_is_blind_append(table_path: &str, version: u64) -> bool {
+    read_commit_info(table_path, version)
+        .get("isBlindAppend")
+        .and_then(|v| v.as_bool())
+        .expect("isBlindAppend field")
 }
 
 /// Selector for `alter_commit_operation`. Each variant maps to a different sequence of
@@ -1632,5 +1643,55 @@ async fn alter_commit_operation(#[case] op_set: OpSet, #[case] expected: &str) -
     };
     txn.commit(engine.as_ref())?.unwrap_committed();
     assert_eq!(read_commit_operation(&table_path, 1), expected);
+    Ok(())
+}
+
+/// Mirrors `alter_commit_operation` but asserts the recorded `isBlindAppend` flag.
+/// A commit is `isBlindAppend = true` iff every op in it doesn't read existing data.
+/// All currently-supported ALTER ops qualify; future constraint-tightening ops (e.g.
+/// SET NOT NULL) would return `false` and any chained commit containing one of those
+/// must also commit `false`. When that op lands, add a case here for the single op +
+/// a mixed-with-tightening case.
+#[rstest]
+#[case::add_columns(OpSet::Add, true)]
+#[case::drop_columns(OpSet::Drop, true)]
+#[case::rename_columns(OpSet::Rename, true)]
+#[case::change_column_relax(OpSet::SetNullable, true)]
+#[case::mixed_all_blind(OpSet::AddThenSetNullable, true)]
+#[tokio::test]
+async fn alter_commit_is_blind_append(
+    #[case] op_set: OpSet,
+    #[case] expected: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let properties: &[(&str, &str)] = if op_set.requires_cm() {
+        &[("delta.columnMapping.mode", "name")]
+    } else {
+        &[]
+    };
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), properties)?;
+
+    let builder = snapshot.alter_table();
+    let txn = match op_set {
+        OpSet::Add => builder
+            .add_column(StructField::nullable("email", DataType::STRING))
+            .build(engine.as_ref(), committer())?,
+        OpSet::Drop => builder
+            .drop_column(column_name!("name"))
+            .build(engine.as_ref(), committer())?,
+        OpSet::Rename => builder
+            .rename_column(column_name!("name"), "full_name")
+            .build(engine.as_ref(), committer())?,
+        OpSet::SetNullable => builder
+            .set_nullable(column_name!("id"))
+            .build(engine.as_ref(), committer())?,
+        OpSet::AddThenSetNullable => builder
+            .add_column(StructField::nullable("email", DataType::STRING))
+            .set_nullable(column_name!("id"))
+            .build(engine.as_ref(), committer())?,
+    };
+    txn.commit(engine.as_ref())?.unwrap_committed();
+    assert_eq!(read_commit_is_blind_append(&table_path, 1), expected);
     Ok(())
 }

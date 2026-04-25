@@ -51,6 +51,18 @@ impl SchemaOperation {
             SchemaOperation::SetNullable { .. } => "CHANGE COLUMN",
         }
     }
+
+    /// Returns `true` iff the operation's correctness depends on existing table data
+    /// (i.e. requires reading file contents to validate). Aggregated into the commit's
+    /// `isBlindAppend` flag: a commit is blind iff no op in it is data-dependent.
+    pub(crate) fn is_data_dependent(&self) -> bool {
+        match self {
+            SchemaOperation::AddColumn { .. } => false,
+            SchemaOperation::DropColumn { .. } => false,
+            SchemaOperation::RenameColumn { .. } => false,
+            SchemaOperation::SetNullable { .. } => false,
+        }
+    }
 }
 
 /// Signal returned by [`modify_field_at_path`] modifiers describing what to do with the leaf
@@ -230,6 +242,10 @@ pub(crate) struct SchemaEvolutionResult {
     /// `"ADD COLUMNS"`, `"ADD COLUMNS + CHANGE COLUMN"`). Used as the commit's
     /// `operation` field.
     pub operation: String,
+    /// Whether the commit is eligible to be marked `isBlindAppend=true`. Derived as
+    /// `!any op is_data_dependent`: a commit is a blind append iff no op in it
+    /// depends on existing data. See [`SchemaOperation::is_data_dependent`].
+    pub is_blind_append: bool,
 }
 
 /// Applies a sequence of schema operations to the given schema, returning a
@@ -263,12 +279,16 @@ pub(crate) fn apply_schema_operations(
     // Distinct operation names in first-occurrence order; joined into the commit's
     // operation string at the end.
     let mut op_names: Vec<&'static str> = Vec::new();
+    // Set true as soon as any op is data-dependent; the commit is a blind append iff
+    // this stays false. See `SchemaOperation::is_data_dependent`.
+    let mut any_data_dependent = false;
 
     for op in operations {
         let name = op.operation_name();
         if !op_names.contains(&name) {
             op_names.push(name);
         }
+        any_data_dependent |= op.is_data_dependent();
         match op {
             // Protocol feature checks for the field's data type (e.g. `timestampNtz`) happen
             // later when the caller builds a new TableConfiguration from the evolved schema --
@@ -384,6 +404,7 @@ pub(crate) fn apply_schema_operations(
         schema: schema.into(),
         new_max_column_id,
         operation: op_names.join(" + "),
+        is_blind_append: !any_data_dependent,
     })
 }
 

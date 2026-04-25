@@ -280,6 +280,7 @@ impl<S: Buildable> AlterTableTransactionBuilder<S> {
             schema: evolved_schema,
             new_max_column_id,
             operation,
+            is_blind_append,
         } = apply_schema_operations(
             schema,
             self.operations,
@@ -310,6 +311,7 @@ impl<S: Buildable> AlterTableTransactionBuilder<S> {
             evolved_table_config,
             committer,
             operation,
+            is_blind_append,
         )
     }
 }

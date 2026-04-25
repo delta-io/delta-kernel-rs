@@ -169,6 +169,7 @@ impl CreateTableTransaction {
             data_change: true,
             engine_commit_info: None,
             is_blind_append: false,
+            reads_files: false,
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
             shared_write_state: OnceLock::new(),
