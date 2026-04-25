@@ -4,7 +4,7 @@
 //! - Read-side: Mode detection and schema validation
 //! - Write-side: Schema transformation for assigning IDs and physical names
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
@@ -341,6 +341,121 @@ fn process_nested_data_type(data_type: &DataType, max_id: &mut i64) -> DeltaResu
         }
         // Primitive and Variant types don't contain nested struct fields - return as-is
         DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
+    }
+}
+
+/// Assigns `parquet.field.nested.ids` entries for array-element, map-key, and map-value
+/// anonymous fields nested inside Array/Map types.
+///
+/// Must be called AFTER [`assign_column_mapping_metadata`] so each StructField already has a
+/// `physicalName` (used as the root of each nested-id path). `max_id` should be passed in at
+/// the value the column-mapping pass left off so nested IDs continue the same monotonically
+/// increasing sequence — the protocol requires IDs to be unique across column-mapping IDs and
+/// nested IDs.
+pub(crate) fn assign_nested_field_ids(
+    schema: &StructType,
+    max_id: &mut i64,
+) -> DeltaResult<StructType> {
+    let new_fields: Vec<StructField> = schema
+        .fields()
+        .map(|field| assign_nested_field_ids_for_field(field, max_id))
+        .collect::<DeltaResult<Vec<_>>>()?;
+    StructType::try_new(new_fields)
+}
+
+fn assign_nested_field_ids_for_field(
+    field: &StructField,
+    max_id: &mut i64,
+) -> DeltaResult<StructField> {
+    let mut new_field = field.clone();
+    match field.data_type() {
+        DataType::Struct(inner) => {
+            // Struct itself carries no nested.ids; recurse into children for theirs.
+            let new_inner = assign_nested_field_ids(inner, max_id)?;
+            new_field.data_type = DataType::Struct(Box::new(new_inner));
+        }
+        DataType::Array(_) | DataType::Map(_) => {
+            let physical_name = field
+                .metadata
+                .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+                .and_then(|v| match v {
+                    MetadataValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    Error::generic(format!(
+                        "assign_nested_field_ids requires column mapping: field '{}' has no \
+                         {}",
+                        field.name(),
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()
+                    ))
+                })?;
+
+            let mut ids: BTreeMap<String, i64> = BTreeMap::new();
+            let new_dt =
+                allocate_nested_field_ids(field.data_type(), &physical_name, max_id, &mut ids)?;
+            new_field.data_type = new_dt;
+            if !ids.is_empty() {
+                let json_map: serde_json::Map<String, serde_json::Value> = ids
+                    .into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::from(v)))
+                    .collect();
+                new_field.metadata.insert(
+                    ColumnMetadataKey::ParquetFieldNestedIds
+                        .as_ref()
+                        .to_string(),
+                    MetadataValue::Other(serde_json::Value::Object(json_map)),
+                );
+            }
+        }
+        DataType::Primitive(_) | DataType::Variant(_) => {}
+    }
+    Ok(new_field)
+}
+
+/// Recurse through Array/Map types, assigning ids into `ids` keyed by
+/// `<path>.{element|key|value}` and chaining for nesting. A `Struct` inside a type graph resets
+/// the root: its children are re-walked by [`assign_nested_field_ids`] to produce their own
+/// nested-ids maps on their own StructField metadata.
+fn allocate_nested_field_ids(
+    dt: &DataType,
+    path: &str,
+    max_id: &mut i64,
+    ids: &mut BTreeMap<String, i64>,
+) -> DeltaResult<DataType> {
+    match dt {
+        DataType::Array(a) => {
+            *max_id += 1;
+            let element_path = format!("{path}.element");
+            ids.insert(element_path.clone(), *max_id);
+            let new_element =
+                allocate_nested_field_ids(a.element_type(), &element_path, max_id, ids)?;
+            Ok(DataType::Array(Box::new(ArrayType::new(
+                new_element,
+                a.contains_null(),
+            ))))
+        }
+        DataType::Map(m) => {
+            *max_id += 1;
+            let key_path = format!("{path}.key");
+            ids.insert(key_path.clone(), *max_id);
+            *max_id += 1;
+            let value_path = format!("{path}.value");
+            ids.insert(value_path.clone(), *max_id);
+            let new_key = allocate_nested_field_ids(m.key_type(), &key_path, max_id, ids)?;
+            let new_value = allocate_nested_field_ids(m.value_type(), &value_path, max_id, ids)?;
+            Ok(DataType::Map(Box::new(MapType::new(
+                new_key,
+                new_value,
+                m.value_contains_null(),
+            ))))
+        }
+        DataType::Struct(inner) => {
+            // Struct resets the root: inner struct fields build their own nested.ids maps.
+            let new_inner = assign_nested_field_ids(inner, max_id)?;
+            Ok(DataType::Struct(Box::new(new_inner)))
+        }
+        DataType::Primitive(_) | DataType::Variant(_) => Ok(dt.clone()),
     }
 }
 

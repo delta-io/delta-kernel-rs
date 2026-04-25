@@ -25,7 +25,7 @@ use crate::schema::{
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    assign_column_mapping_metadata, get_any_level_column_physical_name,
+    assign_column_mapping_metadata, assign_nested_field_ids, get_any_level_column_physical_name,
     get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
     EnablementCheck, FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
     SET_TABLE_FEATURE_SUPPORTED_VALUE,
@@ -33,7 +33,8 @@ use crate::table_features::{
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
-    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS,
+    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
+    ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
     ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
     MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, SET_TRANSACTION_RETENTION_DURATION,
 };
@@ -75,6 +76,12 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // the feature on an all-nullable table so a later ALTER TABLE ADD COLUMN NOT NULL does
     // not need a protocol upgrade.
     TableFeature::Invariants,
+    // IcebergCompatV3 is a writer-only feature that gates Iceberg V3 conversion compatibility.
+    // Dependent features (ColumnMapping, RowTracking, DomainMetadata) are auto-added by
+    // `maybe_enable_iceberg_compat_v3_dependencies`. Partition-value materialization is
+    // triggered by `TableConfiguration::should_materialize_partition_columns` when V3 is
+    // enabled, so the MaterializePartitionColumns feature flag is not needed on V3 tables.
+    TableFeature::IcebergCompatV3,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
@@ -100,6 +107,8 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     SET_TRANSACTION_RETENTION_DURATION,
     // Parquet format version: controls the Parquet writer version for data files
     PARQUET_FORMAT_VERSION,
+    // IcebergCompatV3 enablement: triggers `maybe_enable_iceberg_compat_v3_dependencies`.
+    ENABLE_ICEBERG_COMPAT_V3,
 ];
 
 /// Ensures that no Delta table exists at the given path.
@@ -497,6 +506,91 @@ fn maybe_enable_ict_for_catalog_managed(
     Ok(())
 }
 
+/// When `delta.enableIcebergCompatV3=true` is set, enforces V3's dependencies by setting the
+/// required properties (defaulting them when absent).
+///
+/// Dependency set:
+///   * `delta.columnMapping.mode` — required to be `name` or `id`; defaults to `name` if absent.
+///   * `delta.enableRowTracking` — required to be `true`; defaults to `true` if absent. This
+///     transitively flips on RowTracking + DomainMetadata via
+///     `maybe_auto_enable_property_driven_features`.
+///
+/// Partition-value materialization is handled by
+/// [`TableConfiguration::should_materialize_partition_columns`], which returns `true` whenever
+/// V3 is enabled; no MaterializePartitionColumns feature flag needs to be added here.
+///
+/// Conflicting user-supplied values are rejected:
+///   * `delta.columnMapping.mode = none` (or any non-name/id value)
+///   * `delta.enableRowTracking = false`
+///   * `delta.enableIcebergCompatV1 = true` or `delta.enableIcebergCompatV2 = true`
+///
+/// Must be called before [`maybe_apply_column_mapping_for_table_create`] so that the CM mode
+/// is in place by the time column mapping is applied.
+///
+/// [`TableConfiguration::should_materialize_partition_columns`]: crate::table_configuration::TableConfiguration::should_materialize_partition_columns
+fn maybe_enable_iceberg_compat_v3_dependencies(
+    validated: &mut ValidatedTableProperties,
+) -> DeltaResult<()> {
+    if validated
+        .properties
+        .get(ENABLE_ICEBERG_COMPAT_V3)
+        .map(String::as_str)
+        != Some("true")
+    {
+        return Ok(());
+    }
+
+    // Column mapping: require name or id mode; default to name.
+    match validated
+        .properties
+        .get(COLUMN_MAPPING_MODE)
+        .map(String::as_str)
+    {
+        None => {
+            validated
+                .properties
+                .insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
+        }
+        Some("name") | Some("id") => {}
+        Some(other) => {
+            return Err(Error::generic(format!(
+                "IcebergCompatV3 requires {COLUMN_MAPPING_MODE} to be 'name' or 'id', got '{other}'"
+            )));
+        }
+    }
+
+    // Row tracking: must be enabled; default to true. Auto-flips RowTracking + DomainMetadata
+    // features via `maybe_auto_enable_property_driven_features` called later in `build()`.
+    match validated
+        .properties
+        .get(ENABLE_ROW_TRACKING)
+        .map(String::as_str)
+    {
+        None => {
+            validated
+                .properties
+                .insert(ENABLE_ROW_TRACKING.to_string(), "true".to_string());
+        }
+        Some("true") => {}
+        Some(other) => {
+            return Err(Error::generic(format!(
+                "IcebergCompatV3 requires {ENABLE_ROW_TRACKING} to be 'true', got '{other}'"
+            )));
+        }
+    }
+
+    // V1/V2 must not be enabled concurrently.
+    for key in [ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2] {
+        if validated.properties.get(key).map(String::as_str) == Some("true") {
+            return Err(Error::generic(format!(
+                "IcebergCompatV3 cannot be enabled together with '{key}'"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Conditionally applies column mapping for table creation based on the mode in properties.
 ///
 /// If `delta.columnMapping.mode` is set to `name` or `id`, this function:
@@ -532,7 +626,19 @@ fn maybe_apply_column_mapping_for_table_create(
 
             // Transform schema: assign IDs and physical names to all fields
             let mut max_id = 0i64;
-            let transformed_schema = assign_column_mapping_metadata(schema, &mut max_id)?;
+            let mut transformed_schema = assign_column_mapping_metadata(schema, &mut max_id)?;
+
+            // When IcebergCompatV3 is enabled, also assign nested field IDs for Array/Map
+            // anonymous element/key/value fields, continuing the same max_id counter so IDs
+            // stay unique across CM ids and nested ids (per protocol).
+            if validated
+                .properties
+                .get(ENABLE_ICEBERG_COMPAT_V3)
+                .map(String::as_str)
+                == Some("true")
+            {
+                transformed_schema = assign_nested_field_ids(&transformed_schema, &mut max_id)?;
+            }
 
             // Add maxColumnId to properties
             validated
@@ -794,6 +900,10 @@ impl CreateTableTransactionBuilder {
         // - Returns reader/writer features to add to protocol
         let mut validated = validate_extract_table_features_and_properties(self.table_properties)?;
 
+        // When IcebergCompatV3 is enabled, fill in / validate required dependencies before
+        // column mapping is applied so the CM mode is in place.
+        maybe_enable_iceberg_compat_v3_dependencies(&mut validated)?;
+
         // Apply column mapping if mode is name or id (must happen BEFORE data layout)
         let (effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
@@ -864,8 +974,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::committer::FileSystemCommitter;
+    use crate::engine::sync::SyncEngine;
     use crate::expressions::ColumnName;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
     use crate::table_features::FeatureType;
     use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V1, PARQUET_FORMAT_VERSION};
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -1647,6 +1759,222 @@ mod tests {
         assert!(
             err.to_string().contains("enableInCommitTimestamps"),
             "expected ICT conflict error, got: {err}"
+        );
+    }
+
+    // ===== IcebergCompatV3 =====
+
+    use crate::table_properties::ENABLE_ICEBERG_COMPAT_V3;
+
+    fn validated_with(props: &[(&str, &str)]) -> ValidatedTableProperties {
+        let properties: HashMap<String, String> = props
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        validate_extract_table_features_and_properties(properties).unwrap()
+    }
+
+    #[test]
+    fn test_v3_dependencies_defaults_when_absent() {
+        let mut validated = validated_with(&[(ENABLE_ICEBERG_COMPAT_V3, "true")]);
+        maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
+
+        assert_eq!(
+            validated.properties.get(COLUMN_MAPPING_MODE),
+            Some(&"name".to_string())
+        );
+        assert_eq!(
+            validated.properties.get(ENABLE_ROW_TRACKING),
+            Some(&"true".to_string())
+        );
+        // Partition materialization is triggered by `should_materialize_partition_columns()`
+        // purely from the V3 flag, so the MPC writer feature is intentionally NOT added here.
+        assert!(
+            !validated
+                .writer_features
+                .contains(&TableFeature::MaterializePartitionColumns),
+            "MaterializePartitionColumns should not be auto-added by V3 dependency step"
+        );
+    }
+
+    #[test]
+    fn test_v3_dependencies_honors_existing_values() {
+        let mut validated = validated_with(&[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (COLUMN_MAPPING_MODE, "id"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ]);
+        maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
+        assert_eq!(
+            validated.properties.get(COLUMN_MAPPING_MODE),
+            Some(&"id".to_string())
+        );
+    }
+
+    #[test]
+    fn test_v3_dependencies_noop_when_not_enabled() {
+        let mut validated = validated_with(&[]);
+        maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
+        assert!(!validated.properties.contains_key(COLUMN_MAPPING_MODE));
+        assert!(!validated.properties.contains_key(ENABLE_ROW_TRACKING));
+        assert!(validated.writer_features.is_empty());
+    }
+
+    #[test]
+    fn test_v3_dependencies_rejects_cm_none() {
+        let mut validated = validated_with(&[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (COLUMN_MAPPING_MODE, "none"),
+        ]);
+        assert_result_error_with_message(
+            maybe_enable_iceberg_compat_v3_dependencies(&mut validated),
+            "IcebergCompatV3 requires delta.columnMapping.mode to be 'name' or 'id'",
+        );
+    }
+
+    #[test]
+    fn test_v3_dependencies_rejects_row_tracking_false() {
+        let mut validated = validated_with(&[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "false"),
+        ]);
+        assert_result_error_with_message(
+            maybe_enable_iceberg_compat_v3_dependencies(&mut validated),
+            "IcebergCompatV3 requires delta.enableRowTracking to be 'true'",
+        );
+    }
+
+    #[test]
+    fn test_v3_allowlist_accepts_property() {
+        // V3 property was explicitly added to ALLOWED_DELTA_PROPERTIES.
+        let properties =
+            HashMap::from([(ENABLE_ICEBERG_COMPAT_V3.to_string(), "true".to_string())]);
+        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        assert_eq!(
+            validated.properties.get(ENABLE_ICEBERG_COMPAT_V3),
+            Some(&"true".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_v3_table_auto_enables_dependencies() {
+        // End-to-end: build a V3 table and verify the resulting Protocol/Metadata carries all
+        // the expected dependent features and properties.
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let txn =
+            CreateTableTransactionBuilder::new(tmp.path().to_str().unwrap(), schema, "test/1.0")
+                .with_table_properties(HashMap::from([(
+                    ENABLE_ICEBERG_COMPAT_V3.to_string(),
+                    "true".to_string(),
+                )]))
+                .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+                .unwrap();
+
+        let protocol = txn.effective_table_config.protocol();
+        // Writer features: V3 + direct dependencies. MaterializePartitionColumns is NOT in the
+        // list -- partition materialization is implied by the V3 flag alone.
+        for f in [
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ] {
+            assert!(
+                protocol.has_table_feature(&f),
+                "V3 table must support {f:?}"
+            );
+        }
+        assert!(
+            !protocol.has_table_feature(&TableFeature::MaterializePartitionColumns),
+            "V3 should not force the MaterializePartitionColumns writer feature flag"
+        );
+        // But partition materialization is still active because V3 triggers it.
+        assert!(txn
+            .effective_table_config
+            .should_materialize_partition_columns());
+        // Properties: CM mode defaulted to `name`; row tracking enabled; materialized column
+        // names assigned.
+        let props = txn.effective_table_config.table_properties();
+        assert_eq!(props.column_mapping_mode, Some(ColumnMappingMode::Name));
+        assert_eq!(props.enable_row_tracking, Some(true));
+        assert!(props.materialized_row_id_column_name.is_some());
+        assert!(props.materialized_row_commit_version_column_name.is_some());
+    }
+
+    #[test]
+    fn test_build_v3_with_array_and_map_writes_nested_ids() {
+        use crate::schema::{ArrayType, MapType};
+        // Schema covering the three protocol examples:
+        //   col1: Array<Array<int>>           → nested.ids on col1
+        //   col2: Map<int, Array<int>>        → nested.ids on col2
+        //   col3: Map<int, Struct<subcol1: Array<int>>> → nested.ids on col3 AND on subcol1
+        let inner_array = ArrayType::new(DataType::INTEGER, true);
+        let col1_type = ArrayType::new(DataType::Array(Box::new(inner_array.clone())), true);
+
+        let col2_type = MapType::new(
+            DataType::INTEGER,
+            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+            true,
+        );
+
+        let subcol1 = StructField::nullable(
+            "subcol1",
+            DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+        );
+        let col3_value_struct =
+            DataType::Struct(Box::new(StructType::try_new(vec![subcol1]).unwrap()));
+        let col3_type = MapType::new(DataType::INTEGER, col3_value_struct, true);
+
+        let schema = Arc::new(
+            StructType::try_new(vec![
+                StructField::nullable("col1", DataType::Array(Box::new(col1_type))),
+                StructField::nullable("col2", DataType::Map(Box::new(col2_type))),
+                StructField::nullable("col3", DataType::Map(Box::new(col3_type))),
+            ])
+            .unwrap(),
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let txn =
+            CreateTableTransactionBuilder::new(tmp.path().to_str().unwrap(), schema, "test/1.0")
+                .with_table_properties(HashMap::from([(
+                    ENABLE_ICEBERG_COMPAT_V3.to_string(),
+                    "true".to_string(),
+                )]))
+                .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))
+                .unwrap();
+
+        let effective = txn.effective_table_config.logical_schema();
+        for name in ["col1", "col2", "col3"] {
+            let field = effective
+                .field(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert!(
+                field
+                    .metadata
+                    .contains_key(ColumnMetadataKey::ParquetFieldNestedIds.as_ref()),
+                "{name} must carry parquet.field.nested.ids"
+            );
+        }
+
+        // Verify col3.value → Struct<subcol1: Array<int>>: the inner subcol1 StructField must
+        // also carry its own nested.ids (struct resets the root).
+        let col3 = effective.field("col3").unwrap();
+        let DataType::Map(map_type) = col3.data_type() else {
+            panic!("col3 is not a Map");
+        };
+        let DataType::Struct(inner_struct) = map_type.value_type() else {
+            panic!("col3.value is not a Struct");
+        };
+        let subcol1_field = inner_struct
+            .field("subcol1")
+            .expect("subcol1 missing inside col3.value");
+        assert!(
+            subcol1_field
+                .metadata
+                .contains_key(ColumnMetadataKey::ParquetFieldNestedIds.as_ref()),
+            "subcol1 must have its own parquet.field.nested.ids after struct reset"
         );
     }
 }

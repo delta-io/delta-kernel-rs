@@ -100,7 +100,9 @@ impl From<bool> for MetadataValue {
 pub enum ColumnMetadataKey {
     ColumnMappingId,
     ColumnMappingPhysicalName,
+    ColumnMappingNestedIds,
     ParquetFieldId,
+    ParquetFieldNestedIds,
     GenerationExpression,
     IdentityStart,
     IdentityStep,
@@ -116,10 +118,12 @@ impl AsRef<str> for ColumnMetadataKey {
         match self {
             Self::ColumnMappingId => "delta.columnMapping.id",
             Self::ColumnMappingPhysicalName => "delta.columnMapping.physicalName",
+            Self::ColumnMappingNestedIds => "delta.columnMapping.nested.ids",
             // "parquet.field.id" is not defined by the Delta protocol, but follows the convention
             // established by delta-spark and other Delta ecosystem implementations for storing
             // Parquet field IDs in StructField metadata.
             Self::ParquetFieldId => "parquet.field.id",
+            Self::ParquetFieldNestedIds => "parquet.field.nested.ids",
             Self::GenerationExpression => "delta.generationExpression",
             Self::IdentityAllowExplicitInsert => "delta.identity.allowExplicitInsert",
             Self::IdentityHighWaterMark => "delta.identity.highWaterMark",
