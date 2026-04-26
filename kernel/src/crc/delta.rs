@@ -151,15 +151,18 @@ impl CrcUpdate {
 }
 
 /// Merge a base histogram with the update's net histogram. Returns `Some(merged)` on
-/// success, `None` to drop the histogram (when the merge would fail or produce stale data).
+/// success, `None` to drop the histogram (when the merge would fail or when partial data
+/// would be misleading).
 ///
 /// Behavior:
 /// - `(Some(base), Some(net))` → merge via [`FileSizeHistogram::try_apply_delta`]; on failure
-///   (boundary mismatch, negative counts), drop and warn.
+///   (boundary mismatch, negative counts after merge), drop and warn.
 /// - `(Some(base), None)` → drop. The base had a histogram but the update could not provide one;
-///   stale data is worse than no data.
-/// - `(None, Some(net))` → adopt the update's histogram. Useful for forward replay starting from a
-///   base with no histogram, or for stale-catchup against a CRC that lacked a histogram.
+///   carrying the base forward without the update's contribution would be stale.
+/// - `(None, Some(_))` → drop. The base lacked a histogram, so the update's net histogram alone (a
+///   delta over an unknown baseline) cannot be turned into an absolute. The right place to seed an
+///   initial histogram is [`CrcUpdate::into_fresh_crc`], which receives an absolute (full-replay)
+///   histogram rather than a delta.
 /// - `(None, None)` → stay `None`.
 fn merge_histogram(
     base: Option<&FileSizeHistogram>,
@@ -173,8 +176,7 @@ fn merge_histogram(
                 None
             }
         },
-        (None, Some(delta_hist)) => Some(delta_hist.clone()),
-        (Some(_), None) | (None, None) => None,
+        _ => None,
     }
 }
 
@@ -191,21 +193,32 @@ impl Crc {
     ///
     /// Field semantics: see the [module-level docs](self).
     pub(crate) fn apply(&mut self, update: CrcUpdate) {
+        let CrcUpdate {
+            file_stats,
+            protocol,
+            metadata,
+            domain_metadata,
+            set_transactions,
+            in_commit_timestamp,
+            operation_safe,
+            has_missing_file_size,
+        } = update;
+
         // Protocol / Metadata: replace if present.
-        if let Some(p) = update.protocol {
+        if let Some(p) = protocol {
             self.protocol = p;
         }
-        if let Some(m) = update.metadata {
+        if let Some(m) = metadata {
             self.metadata = m;
         }
 
         // Domain metadata: upsert from update map, removing tombstones. If base is
         // Untracked but the update has entries (e.g. older CRC didn't track DM but newer
         // commits do), transition to Partial.
-        if !update.domain_metadata.is_empty() {
+        if !domain_metadata.is_empty() {
             match &mut self.domain_metadata {
                 DomainMetadataState::Complete(map) | DomainMetadataState::Partial(map) => {
-                    for (domain, dm) in update.domain_metadata {
+                    for (domain, dm) in domain_metadata {
                         if dm.is_removed() {
                             map.remove(&domain);
                         } else {
@@ -215,8 +228,7 @@ impl Crc {
                 }
                 DomainMetadataState::Untracked => {
                     self.domain_metadata = DomainMetadataState::Partial(
-                        update
-                            .domain_metadata
+                        domain_metadata
                             .into_iter()
                             .filter(|(_, dm)| !dm.is_removed())
                             .collect(),
@@ -227,60 +239,82 @@ impl Crc {
 
         // Set transactions: upsert from update map. No tombstone semantic for txns. Same
         // Untracked → Partial transition.
-        if !update.set_transactions.is_empty() {
+        if !set_transactions.is_empty() {
             match &mut self.set_transactions {
                 SetTransactionState::Complete(map) | SetTransactionState::Partial(map) => {
-                    map.extend(update.set_transactions);
+                    map.extend(set_transactions);
                 }
                 SetTransactionState::Untracked => {
-                    self.set_transactions = SetTransactionState::Partial(update.set_transactions);
+                    self.set_transactions = SetTransactionState::Partial(set_transactions);
                 }
             }
         }
 
         // In-commit timestamp: replace unconditionally. ICT could be disabled (Some →
         // None) or enabled (None → Some) or updated (Some → Some).
-        self.in_commit_timestamp_opt = update.in_commit_timestamp;
+        self.in_commit_timestamp_opt = in_commit_timestamp;
 
-        // File stats: state-machine transition. See the table on FileStatsState.
-        self.file_stats = match &self.file_stats {
-            FileStatsState::Untrackable => {
-                // Terminal: nothing recovers missing file size.
-                return;
-            }
-            _ if update.has_missing_file_size => FileStatsState::Untrackable,
-            FileStatsState::Indeterminate => {
-                // Terminal for incremental tracking (recoverable only via full replay,
-                // which is currently the deferred load_file_stats path).
-                return;
-            }
-            _ if !update.operation_safe => FileStatsState::Indeterminate,
-            FileStatsState::Valid {
-                num_files,
-                table_size_bytes,
-                histogram,
-            } => {
-                let histogram =
-                    merge_histogram(histogram.as_ref(), update.file_stats.net_histogram.as_ref());
-                FileStatsState::Valid {
-                    num_files: num_files + update.file_stats.net_files,
-                    table_size_bytes: table_size_bytes + update.file_stats.net_bytes,
-                    histogram,
-                }
-            }
-            FileStatsState::RequiresCheckpointRead {
-                commit_delta_files,
-                commit_delta_bytes,
-                commit_delta_histogram,
-            } => FileStatsState::RequiresCheckpointRead {
-                commit_delta_files: commit_delta_files + update.file_stats.net_files,
-                commit_delta_bytes: commit_delta_bytes + update.file_stats.net_bytes,
-                commit_delta_histogram: merge_histogram(
-                    commit_delta_histogram.as_ref(),
-                    update.file_stats.net_histogram.as_ref(),
-                ),
-            },
-        };
+        self.file_stats = transition_file_stats(
+            &self.file_stats,
+            &file_stats,
+            operation_safe,
+            has_missing_file_size,
+        );
+    }
+}
+
+/// Compute the next [`FileStatsState`] given the current state and an incoming delta.
+///
+/// Implements the state-machine table on [`FileStatsState`]. Read top-to-bottom:
+///
+/// 1. `Untrackable` is terminal -- nothing recovers missing file size.
+/// 2. Any delta with `has_missing_file_size` poisons the state to `Untrackable`.
+/// 3. `Indeterminate` is terminal except for the `Untrackable` escalation handled above.
+/// 4. Any delta with `!operation_safe` transitions to `Indeterminate`.
+/// 5. Otherwise, the current state is `Valid` or `RequiresCheckpointRead` and we sum counts/bytes
+///    and merge histograms.
+fn transition_file_stats(
+    current: &FileStatsState,
+    delta: &FileStatsDelta,
+    operation_safe: bool,
+    has_missing_file_size: bool,
+) -> FileStatsState {
+    if matches!(current, FileStatsState::Untrackable) {
+        return FileStatsState::Untrackable;
+    }
+    if has_missing_file_size {
+        return FileStatsState::Untrackable;
+    }
+    if matches!(current, FileStatsState::Indeterminate) {
+        return FileStatsState::Indeterminate;
+    }
+    if !operation_safe {
+        return FileStatsState::Indeterminate;
+    }
+    match current {
+        FileStatsState::Valid {
+            num_files,
+            table_size_bytes,
+            histogram,
+        } => FileStatsState::Valid {
+            num_files: num_files + delta.net_files,
+            table_size_bytes: table_size_bytes + delta.net_bytes,
+            histogram: merge_histogram(histogram.as_ref(), delta.net_histogram.as_ref()),
+        },
+        FileStatsState::RequiresCheckpointRead {
+            commit_delta_files,
+            commit_delta_bytes,
+            commit_delta_histogram,
+        } => FileStatsState::RequiresCheckpointRead {
+            commit_delta_files: commit_delta_files + delta.net_files,
+            commit_delta_bytes: commit_delta_bytes + delta.net_bytes,
+            commit_delta_histogram: merge_histogram(
+                commit_delta_histogram.as_ref(),
+                delta.net_histogram.as_ref(),
+            ),
+        },
+        // Untrackable / Indeterminate handled by early returns above.
+        FileStatsState::Untrackable | FileStatsState::Indeterminate => current.clone(),
     }
 }
 
@@ -689,10 +723,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_adopts_histogram_when_base_none_delta_some() {
-        // Forward-replay-friendly: a base CRC without a histogram + an update with a
-        // histogram → CRC adopts the update's histogram. Useful when forward-replaying
-        // onto a base that lacked histogram support.
+    fn apply_drops_histogram_when_base_none_delta_some() {
+        // A base CRC without a histogram + an update with a delta histogram → the
+        // resulting CRC has no histogram. The delta is an *increment* over an unknown
+        // baseline, so adopting it as the absolute histogram would be wrong (it would
+        // describe only this commit's files, not the table's full file set). The right
+        // way to seed an initial histogram is via CrcUpdate::into_fresh_crc when doing a
+        // full replay.
         let mut crc = base_crc();
         crc.file_stats = FileStatsState::Valid {
             num_files: 0,
@@ -713,9 +750,12 @@ mod tests {
         });
 
         let stats = crc.file_stats().unwrap();
-        let adopted = stats.file_size_histogram().unwrap();
-        assert_eq!(adopted.file_counts()[0], 1);
-        assert_eq!(adopted.total_bytes()[0], 500);
+        assert!(
+            stats.file_size_histogram().is_none(),
+            "delta is not an absolute baseline"
+        );
+        assert_eq!(stats.num_files(), 1);
+        assert_eq!(stats.table_size_bytes(), 500);
     }
 
     #[test]

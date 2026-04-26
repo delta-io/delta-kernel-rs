@@ -38,7 +38,11 @@ use crate::actions::{DomainMetadata, SetTransaction};
 /// | RequiresCheckpointRead | RCR       | Indeterminate | Untrackable           |
 /// | Indeterminate          | Indet.    | Indet.        | Untrackable           |
 /// | Untrackable            | Untrack.  | Untrack.      | Untrackable           |
+///
+/// Marked `#[non_exhaustive]` so future variants (e.g. additional recovery states for
+/// priority-5 work) can be added without breaking external matchers.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FileStatsState {
     /// File stats are known-correct absolute totals. Histogram is optional: `Some` when the
     /// base CRC had a histogram (or full replay produced one), `None` when the base CRC lacked
@@ -129,7 +133,11 @@ impl Default for FileStatsState {
 
 /// Simplified validity classification of file stats for cost inspection. Connectors use this
 /// to decide whether to write CRC synchronously, asynchronously, or recover stats first.
+///
+/// Marked `#[non_exhaustive]` so future variants can be added without breaking external
+/// matchers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FileStatsValidity {
     /// Free: file stats are complete. Just call
     /// [`Snapshot::write_checksum`](crate::snapshot::Snapshot::write_checksum).
@@ -156,7 +164,10 @@ pub enum FileStatsValidity {
 ///   [`FileStatsState::is_writable`])
 /// - Deserialisation from `[...]` produces `Complete(map)`, from `null`/absent produces `Untracked`
 ///   (CRC files on disk always have complete data or no data)
+///
+/// `#[non_exhaustive]` so future variants are non-breaking.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DomainMetadataState {
     /// All domain metadata is known. The map is the complete set of active (non-removed)
     /// domains. If a domain is not in the map, it does not exist at this table version.
@@ -196,7 +207,10 @@ impl DomainMetadataState {
 /// The completeness state of set transactions in a CRC. Owns the underlying [`HashMap`].
 ///
 /// Same serde and completeness semantics as [`DomainMetadataState`].
+///
+/// `#[non_exhaustive]` so future variants are non-breaking.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SetTransactionState {
     /// All set transactions are known. If an `app_id` is not in the map, no transaction
     /// exists for it at this table version.

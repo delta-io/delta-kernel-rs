@@ -1194,10 +1194,18 @@ impl<S> Transaction<S> {
         // caller (engine_info / commitInfo). Unknown / unsafe ops produce a CrcUpdate with
         // `operation_safe = false`, which transitions the post-commit Crc's file stats to
         // Indeterminate.
-        let operation_safe = self
-            .operation
-            .as_deref()
-            .is_some_and(FileStatsDelta::is_incremental_safe);
+        //
+        // Special case: CREATE TABLE has no prior file state (it IS the prior state), so
+        // its file stats are trivially safe regardless of the connector-supplied
+        // operation string. Without this carve-out, a CREATE TABLE without
+        // `with_operation(...)` would produce an Indeterminate CRC at v0 -- which then
+        // can't be persisted via write_checksum, defeating the whole post-commit-CRC
+        // feature for the simplest case.
+        let operation_safe = self.is_create_table()
+            || self
+                .operation
+                .as_deref()
+                .is_some_and(FileStatsDelta::is_incremental_safe);
         Ok(CrcUpdate {
             file_stats,
             protocol: self

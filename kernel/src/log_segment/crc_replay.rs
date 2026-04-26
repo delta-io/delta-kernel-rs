@@ -144,23 +144,29 @@ struct CrcReplayAccumulator {
     domain_metadata: HashMap<String, DomainMetadata>,
     set_transactions: HashMap<String, SetTransaction>,
 
-    // Sums
-    add_count: i64,
-    add_bytes: i64,
-    add_histogram: FileSizeHistogram,
-    remove_count: i64,
-    remove_bytes: i64,
-    remove_histogram: FileSizeHistogram,
+    // Net file stats: a single histogram that adds increment and removes decrement (may
+    // contain negative bins for stale-replay ranges where some files were added before
+    // the range and removed within it). The non-negativity check happens in
+    // [`Crc::apply`](crate::crc::Crc::apply) when this delta is merged with the absolute
+    // base histogram, not here.
+    net_count: i64,
+    net_bytes: i64,
+    net_histogram: FileSizeHistogram,
 
     // Flags
     has_missing_remove_size: bool,
     /// Cumulative AND of operation safety across all observed commitInfo rows.
     /// `true` initially; flips to `false` on any unrecognized/unsafe op.
     operation_safe: bool,
-    /// Whether any commitInfo action was seen across all commit batches. If no commit had
-    /// a commitInfo (malformed log or no commits at all), operation safety cannot be
-    /// determined and we must treat file stats as Indeterminate.
+    /// Whether any commitInfo action was seen across all commit batches. Used together
+    /// with `has_log_action_inputs` to decide whether an empty / checkpoint-only segment
+    /// should be classified as safe (no work) or indeterminate (no provenance).
     has_commit_info: bool,
+    /// Whether the segment had any log-batch input that could plausibly carry an
+    /// operation: a commit's add, remove, or commitInfo row. If false, the segment is
+    /// either empty or checkpoint-only, in which case there were no operations to
+    /// evaluate -- a degenerate "trivially safe" case.
+    has_log_action_inputs: bool,
 
     // ICT: first-seen (newest) wins
     in_commit_timestamp: Option<i64>,
@@ -174,38 +180,35 @@ impl CrcReplayAccumulator {
             metadata: None,
             domain_metadata: HashMap::new(),
             set_transactions: HashMap::new(),
-            add_count: 0,
-            add_bytes: 0,
-            add_histogram: FileSizeHistogram::create_default(),
-            remove_count: 0,
-            remove_bytes: 0,
-            remove_histogram: FileSizeHistogram::create_default(),
+            net_count: 0,
+            net_bytes: 0,
+            net_histogram: FileSizeHistogram::create_default(),
             has_missing_remove_size: false,
             operation_safe: true,
             has_commit_info: false,
+            has_log_action_inputs: false,
             in_commit_timestamp: None,
             ict_seen: false,
         }
     }
 
     fn into_crc_update(self) -> CrcUpdate {
-        // If no commitInfo was seen across the entire replay, we cannot determine
-        // operation safety. Conservative: mark as unsafe, transitioning file stats to
-        // Indeterminate.
-        let operation_safe = self.operation_safe && self.has_commit_info;
-
-        // Build the net histogram by subtracting removes from adds. If subtraction fails
-        // (e.g. negative bins from a corrupted log) we drop the histogram. The resulting
-        // CRC is still valid; just the histogram is missing.
-        let net_histogram = negate_histogram(&self.remove_histogram)
-            .and_then(|negated| self.add_histogram.try_apply_delta(&negated))
-            .ok();
+        // Operation-safety classification:
+        // - If we observed log inputs and saw commitInfo: trust `operation_safe`.
+        // - If we observed log inputs but no commitInfo: provenance unknown → unsafe.
+        // - If we observed no log inputs (empty range or checkpoint-only): trivially safe -- there
+        //   were no operations to evaluate.
+        let operation_safe = if self.has_log_action_inputs {
+            self.operation_safe && self.has_commit_info
+        } else {
+            true
+        };
 
         CrcUpdate {
             file_stats: FileStatsDelta {
-                net_files: self.add_count - self.remove_count,
-                net_bytes: self.add_bytes - self.remove_bytes,
-                net_histogram,
+                net_files: self.net_count,
+                net_bytes: self.net_bytes,
+                net_histogram: Some(self.net_histogram),
             },
             protocol: self.protocol,
             metadata: self.metadata,
@@ -216,15 +219,6 @@ impl CrcReplayAccumulator {
             has_missing_file_size: self.has_missing_remove_size,
         }
     }
-}
-
-/// Negate every bin in a histogram (for subtraction via try_apply_delta). Returns an error
-/// if the input histogram fails its structural invariants -- in practice this can't happen
-/// because the input was already validated, but we propagate rather than panic.
-fn negate_histogram(hist: &FileSizeHistogram) -> DeltaResult<FileSizeHistogram> {
-    let counts: Vec<i64> = hist.file_counts().iter().map(|&c| -c).collect();
-    let bytes: Vec<i64> = hist.total_bytes().iter().map(|&b| -b).collect();
-    FileSizeHistogram::try_new(hist.sorted_bin_boundaries().to_vec(), counts, bytes)
 }
 
 // ============================================================================
@@ -286,16 +280,19 @@ impl RowVisitor for CrcReplayVisitor<'_> {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
-            // Add: contributes to file stats sums (commit and checkpoint Adds both).
+            // Add: contributes positively to file stats sums (commit AND checkpoint Adds).
             if let Some(size) = getters[0].get_opt(i, "add.size")? {
                 let size: i64 = size;
-                self.acc.add_count += 1;
-                self.acc.add_bytes += size;
-                self.acc.add_histogram.insert(size)?;
+                self.acc.net_count += 1;
+                self.acc.net_bytes += size;
+                self.acc.net_histogram.insert(size)?;
+                if self.is_log_batch {
+                    self.acc.has_log_action_inputs = true;
+                }
             }
 
-            // Remove: contributes only on commit batches (checkpoint Removes are
-            // tombstones for vacuum, not active state).
+            // Remove: contributes negatively, but only on commit batches (checkpoint
+            // Removes are vacuum tombstones, not active state).
             //
             // remove.path detects remove presence; remove.size is the bytes. If path is
             // set but size is null, that's a "remove with missing size" which transitions
@@ -303,11 +300,16 @@ impl RowVisitor for CrcReplayVisitor<'_> {
             if self.is_log_batch {
                 let remove_path: Option<String> = getters[1].get_opt(i, "remove.path")?;
                 if remove_path.is_some() {
+                    self.acc.has_log_action_inputs = true;
                     let remove_size: Option<i64> = getters[2].get_opt(i, "remove.size")?;
                     if let Some(size) = remove_size {
-                        self.acc.remove_count += 1;
-                        self.acc.remove_bytes += size;
-                        self.acc.remove_histogram.insert(size)?;
+                        self.acc.net_count -= 1;
+                        self.acc.net_bytes -= size;
+                        // FileSizeHistogram::remove correctly produces negative bin
+                        // counts when removes outweigh adds in a bin -- the net
+                        // histogram is a delta, not an absolute. The non-negativity
+                        // check happens later when Crc::apply merges with the base.
+                        self.acc.net_histogram.remove(size)?;
                     } else {
                         self.acc.has_missing_remove_size = true;
                     }
@@ -350,6 +352,7 @@ impl RowVisitor for CrcReplayVisitor<'_> {
                 let operation: Option<String> = getters[9].get_opt(i, "commitInfo.operation")?;
                 if let Some(op) = operation {
                     self.acc.has_commit_info = true;
+                    self.acc.has_log_action_inputs = true;
                     if !FileStatsDelta::is_incremental_safe(&op) {
                         self.acc.operation_safe = false;
                     }
@@ -381,24 +384,41 @@ mod tests {
     }
 
     #[test]
-    fn empty_accumulator_with_no_commit_info_produces_indeterminate_update() {
-        // No commitInfo was ever seen → operation_safe AND has_commit_info → false → !ok.
+    fn empty_accumulator_with_no_log_inputs_is_trivially_safe() {
+        // No log inputs at all = trivially safe (no operations to evaluate). This is the
+        // empty-stale-segment case (CRC at target version + segment_after_crc returns
+        // empty) and the checkpoint-only case (no commits in the segment).
         let acc = empty_acc();
         let update = acc.into_crc_update();
         assert!(update.protocol.is_none());
         assert!(update.metadata.is_none());
         assert!(update.domain_metadata.is_empty());
         assert!(update.set_transactions.is_empty());
-        assert!(!update.operation_safe);
+        assert!(
+            update.operation_safe,
+            "empty/checkpoint-only is trivially safe"
+        );
         assert!(!update.has_missing_file_size);
         assert_eq!(update.file_stats.net_files, 0);
         assert_eq!(update.file_stats.net_bytes, 0);
     }
 
     #[test]
+    fn accumulator_with_log_inputs_but_no_commit_info_is_indeterminate() {
+        // We saw add/remove rows in commit batches but no commitInfo: provenance unknown.
+        // Conservative: mark unsafe → file stats become Indeterminate via Crc::apply.
+        let mut acc = empty_acc();
+        acc.has_log_action_inputs = true;
+        // has_commit_info stays false.
+        let update = acc.into_crc_update();
+        assert!(!update.operation_safe);
+    }
+
+    #[test]
     fn accumulator_with_commit_info_and_safe_op_produces_safe_update() {
         let mut acc = empty_acc();
         acc.has_commit_info = true;
+        acc.has_log_action_inputs = true;
         acc.operation_safe = true;
         let update = acc.into_crc_update();
         assert!(update.operation_safe);
@@ -408,6 +428,7 @@ mod tests {
     fn accumulator_unsafe_op_propagates_to_update() {
         let mut acc = empty_acc();
         acc.has_commit_info = true;
+        acc.has_log_action_inputs = true;
         acc.operation_safe = false;
         let update = acc.into_crc_update();
         assert!(!update.operation_safe);
@@ -417,19 +438,19 @@ mod tests {
     fn accumulator_missing_remove_size_propagates_to_update() {
         let mut acc = empty_acc();
         acc.has_commit_info = true;
+        acc.has_log_action_inputs = true;
         acc.has_missing_remove_size = true;
         let update = acc.into_crc_update();
         assert!(update.has_missing_file_size);
     }
 
     #[test]
-    fn accumulator_sums_file_counts_and_bytes() {
+    fn accumulator_net_file_counts_and_bytes() {
         let mut acc = empty_acc();
         acc.has_commit_info = true;
-        acc.add_count = 5;
-        acc.add_bytes = 1500;
-        acc.remove_count = 2;
-        acc.remove_bytes = 400;
+        acc.has_log_action_inputs = true;
+        acc.net_count = 3;
+        acc.net_bytes = 1100;
         let update = acc.into_crc_update();
         assert_eq!(update.file_stats.net_files, 3);
         assert_eq!(update.file_stats.net_bytes, 1100);
@@ -452,8 +473,9 @@ mod tests {
 
         let mut acc = empty_acc();
         acc.has_commit_info = true;
-        acc.add_count = 1;
-        acc.add_bytes = 400;
+        acc.has_log_action_inputs = true;
+        acc.net_count = 1;
+        acc.net_bytes = 400;
         let update = acc.into_crc_update();
 
         base.apply(update);
@@ -464,12 +486,56 @@ mod tests {
     }
 
     #[test]
-    fn negate_histogram_inverts_signs() {
-        let mut h = FileSizeHistogram::create_default();
-        h.insert(100).unwrap();
-        h.insert(200).unwrap();
-        let neg = negate_histogram(&h).unwrap();
-        assert_eq!(neg.file_counts()[0], -2);
-        assert_eq!(neg.total_bytes()[0], -300);
+    fn accumulator_negative_histogram_bin_when_removes_outweigh_adds_in_range() {
+        // Stale-replay scenario: the segment removes more bytes in some bin than it
+        // adds (e.g. removing files that were added before the CRC base). The accumulator
+        // produces a delta histogram with negative bins; the merge with the base must
+        // result in a non-negative absolute histogram, but the delta itself can be
+        // negative. This test asserts the visitor correctly produces such a delta and
+        // that Crc::apply merges it correctly when the base has matching counts.
+        let mut acc = empty_acc();
+        acc.has_commit_info = true;
+        acc.has_log_action_inputs = true;
+        // Two adds (100, 200) and three removes (100, 100, 200) all fall in bin 0.
+        // Net: -1 file, -100 bytes in bin 0.
+        for sz in [100i64, 200] {
+            acc.net_count += 1;
+            acc.net_bytes += sz;
+            acc.net_histogram.insert(sz).unwrap();
+        }
+        for sz in [100i64, 100, 200] {
+            acc.net_count -= 1;
+            acc.net_bytes -= sz;
+            acc.net_histogram.remove(sz).unwrap();
+        }
+        let update = acc.into_crc_update();
+        assert_eq!(update.file_stats.net_files, -1);
+        assert_eq!(update.file_stats.net_bytes, -100);
+        let net_hist = update.file_stats.net_histogram.as_ref().unwrap();
+        assert_eq!(net_hist.file_counts()[0], -1);
+        assert_eq!(net_hist.total_bytes()[0], -100);
+
+        // Apply onto a base that has enough to absorb the removes.
+        let mut base = Crc {
+            file_stats: crate::crc::FileStatsState::Valid {
+                num_files: 5,
+                table_size_bytes: 1000,
+                histogram: Some({
+                    let mut h = FileSizeHistogram::create_default();
+                    for _ in 0..5 {
+                        h.insert(200).unwrap();
+                    }
+                    h
+                }),
+            },
+            ..Default::default()
+        };
+        base.apply(update);
+        let stats = base.file_stats().unwrap();
+        assert_eq!(stats.num_files(), 4); // 5 - 1
+        assert_eq!(stats.table_size_bytes(), 900); // 1000 - 100
+        let merged = stats.file_size_histogram().unwrap();
+        assert_eq!(merged.file_counts()[0], 4);
+        assert_eq!(merged.total_bytes()[0], 900);
     }
 }
