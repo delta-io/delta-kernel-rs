@@ -478,7 +478,7 @@ impl<S> Transaction<S> {
                 let bin_boundaries = self
                     .read_snapshot_opt
                     .as_ref()
-                    .and_then(|snap| snap.get_file_stats_if_loaded())
+                    .and_then(|snap| snap.get_file_stats())
                     .and_then(|s| s.file_size_histogram)
                     .map(|h| h.sorted_bin_boundaries);
                 let crc_update = self.build_crc_update(
@@ -1155,9 +1155,9 @@ impl<S> Transaction<S> {
                     .table_root()
                     .join("_delta_log/")?;
                 let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
-                let crc = crc_update.into_crc_for_version_zero().ok_or_else(|| {
-                    Error::internal_error("CREATE TABLE CrcUpdate is missing protocol or metadata")
-                })?;
+                // into_fresh_crc preserves the underlying error variant (MissingProtocol /
+                // MissingMetadata) instead of collapsing to a generic message.
+                let crc = crc_update.into_fresh_crc()?;
                 let stats = PostCommitStats {
                     commits_since_checkpoint: 1,
                     commits_since_log_compaction: 1,

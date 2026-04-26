@@ -1,7 +1,13 @@
-//! Lazy CRC loading support.
+//! Lazy CRC loading helper for the protocol+metadata replay shortcut.
 //!
-//! Provides thread-safe lazy loading of CRC files, ensuring they are read at most once and the
-//! result is shared across all consumers.
+//! Used internally by [`LogSegment::read_protocol_metadata_opt`](crate::log_segment::LogSegment)
+//! to read a CRC file at most once and skip log replay if Protocol/Metadata are present.
+//! The `Snapshot`'s eager `Arc<Crc>` (constructed during snapshot load) is unrelated to
+//! this helper -- this exists solely as a "transient cache" for the P&M shortcut path.
+//!
+//! Once the eager-CRC + reverse-replay accumulator handles all snapshot-load paths, this
+//! helper can be folded into the P&M-replay path or removed entirely. Until then, it's
+//! the minimal surface needed to keep that path working.
 
 use std::sync::{Arc, OnceLock};
 
@@ -13,7 +19,7 @@ use crate::{Engine, Version};
 
 /// Result of attempting to load a CRC file.
 ///
-/// The "not yet loaded" state is represented by `OnceLock::get()` returning `None`, not as an enum
+/// "Not yet loaded" is represented by `OnceLock::get()` returning `None`, not as an enum
 /// variant.
 #[derive(Debug, Clone)]
 pub(crate) enum CrcLoadResult {
@@ -25,65 +31,28 @@ pub(crate) enum CrcLoadResult {
     Loaded(Arc<Crc>),
 }
 
-impl CrcLoadResult {
-    /// Returns the CRC if successfully loaded.
-    #[allow(dead_code)] // Used in future phases (domain metadata, ICT)
-    pub(crate) fn get(&self) -> Option<&Arc<Crc>> {
-        match self {
-            CrcLoadResult::Loaded(crc) => Some(crc),
-            _ => None,
-        }
-    }
-}
-
-/// Lazy loader for CRC info that ensures it's only read once.
-///
-/// Uses `OnceLock` to ensure thread-safe initialization that happens at most once.
-/// Can also hold a precomputed CRC (e.g. from post-commit CRC merge) without a backing file.
+/// Lazy loader for a CRC file. Ensures the file is read at most once and the result is
+/// cached for subsequent accesses.
 #[derive(Debug)]
 pub(crate) struct LazyCrc {
     /// The CRC file path, if one exists in the log segment.
     crc_file: Option<ParsedLogPath>,
     /// Cached load result (loaded lazily, at most once).
-    pub(crate) cached: OnceLock<CrcLoadResult>,
-    /// Version of a precomputed CRC (set when CRC was computed rather than read from file).
-    /// When set, this takes priority over `crc_file` for version checks.
-    precomputed_version: Option<Version>,
+    cached: OnceLock<CrcLoadResult>,
 }
 
 impl LazyCrc {
-    /// Create a new lazy CRC loader.
-    ///
-    /// If `crc_file` is `None`, the loader will immediately return `DoesNotExist` when accessed.
+    /// Create a new lazy CRC loader. If `crc_file` is `None`, the loader will return
+    /// [`CrcLoadResult::DoesNotExist`] on access without any I/O.
     pub(crate) fn new(crc_file: Option<ParsedLogPath>) -> Self {
         Self {
             crc_file,
             cached: OnceLock::new(),
-            precomputed_version: None,
         }
     }
 
-    /// Create a `LazyCrc` with a precomputed CRC value (no backing file).
-    ///
-    /// The CRC is immediately available via `get_or_load` without any I/O. The `version`
-    /// parameter records which table version this CRC corresponds to, enabling
-    /// `get_if_loaded_at_version` to work for chained commits.
-    #[allow(dead_code)] // Reserved for future paths that pre-compute CRCs without disk-backed files.
-    pub(crate) fn new_precomputed(crc: Crc, version: Version) -> Self {
-        let cached = OnceLock::new();
-        // OnceLock::set cannot fail here because we just created it
-        let _ = cached.set(CrcLoadResult::Loaded(Arc::new(crc)));
-        Self {
-            crc_file: None,
-            cached,
-            precomputed_version: Some(version),
-        }
-    }
-
-    /// Returns the CRC load result, loading if necessary.
-    ///
-    /// The loading closure is only called once, even across threads. Subsequent calls return the
-    /// cached result.
+    /// Returns the CRC load result, loading from storage if not yet cached. The loading
+    /// closure runs at most once across all callers.
     pub(crate) fn get_or_load(&self, engine: &dyn Engine) -> &CrcLoadResult {
         self.cached.get_or_init(|| match &self.crc_file {
             None => CrcLoadResult::DoesNotExist,
@@ -100,44 +69,9 @@ impl LazyCrc {
         })
     }
 
-    /// Returns the CRC only if the CRC file is at the given version, loading if necessary.
-    #[allow(dead_code)] // Reserved for future paths.
-    pub(crate) fn get_or_load_if_at_version(
-        &self,
-        engine: &dyn Engine,
-        version: Version,
-    ) -> Option<&Arc<Crc>> {
-        if self.crc_version() != Some(version) {
-            return None;
-        }
-        self.get_or_load(engine).get()
-    }
-
-    /// Returns the CRC only if it is already loaded (no I/O) and matches the given version.
-    ///
-    /// This is purely opportunistic: it returns `Some` only when the CRC was previously loaded
-    /// (via `get_or_load`) or precomputed (via `new_precomputed`) AND the version matches.
-    #[allow(dead_code)] // Reserved for future paths.
-    pub(crate) fn get_if_loaded_at_version(&self, version: Version) -> Option<&Arc<Crc>> {
-        if self.crc_version() != Some(version) {
-            return None;
-        }
-        self.cached.get()?.get()
-    }
-
-    /// Check if CRC has been loaded (without triggering loading).
-    #[allow(dead_code)] // Used in future phases (domain metadata, ICT)
-    pub(crate) fn is_loaded(&self) -> bool {
-        self.cached.get().is_some()
-    }
-
-    /// Returns the CRC version, checking precomputed version first, then CRC file version.
-    ///
-    /// This enables chaining: a post-commit snapshot with a precomputed CRC at version N+1
-    /// can serve as the read snapshot for a transaction targeting version N+2.
+    /// Returns the version of the CRC file backing this loader, if any. No I/O.
     pub(crate) fn crc_version(&self) -> Option<Version> {
-        self.precomputed_version
-            .or_else(|| self.crc_file.as_ref().map(|f| f.version))
+        self.crc_file.as_ref().map(|f| f.version)
     }
 }
 
@@ -145,9 +79,8 @@ impl LazyCrc {
 mod tests {
     use std::path::PathBuf;
 
-    use rstest::rstest;
-
     use super::*;
+    use crate::crc::FileStatsState;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
     use crate::object_store::memory::InMemory;
@@ -160,160 +93,73 @@ mod tests {
         DefaultEngineBuilder::new(Arc::new(InMemory::new())).build()
     }
 
-    // ===== CrcLoadResult Tests =====
-
-    #[test]
-    fn test_crc_load_result_loaded() {
-        let crc = Crc {
-            file_stats: crate::crc::FileStatsState::Valid {
-                num_files: 10,
-                table_size_bytes: 100,
-                histogram: None,
-            },
-            ..Default::default()
-        };
-        let loaded = CrcLoadResult::Loaded(Arc::new(crc));
-        assert!(loaded.get().is_some());
-        assert_eq!(
-            loaded
-                .get()
-                .unwrap()
-                .file_stats()
-                .unwrap()
-                .table_size_bytes(),
-            100
-        );
-    }
-
-    #[rstest]
-    #[case::does_not_exist(CrcLoadResult::DoesNotExist)]
-    #[case::corrupt(CrcLoadResult::CorruptOrFailed)]
-    fn test_crc_load_result(#[case] result: CrcLoadResult) {
-        assert!(result.get().is_none());
-    }
-
-    // ===== LazyCrc Tests =====
-
-    #[test]
-    fn test_lazy_crc_no_file() {
-        let engine = test_engine();
-
-        let lazy = LazyCrc::new(None);
-        assert!(!lazy.is_loaded());
-        assert_eq!(lazy.crc_version(), None);
-
-        let result = lazy.get_or_load(&engine);
-        assert!(matches!(result, CrcLoadResult::DoesNotExist));
-        assert!(result.get().is_none());
-        assert!(lazy.is_loaded());
-    }
-
-    #[test]
-    fn test_lazy_crc_missing_file() {
-        let engine = test_engine();
-
-        let lazy = LazyCrc::new(Some(ParsedLogPath::create_parsed_crc(&table_root(), 5)));
-        assert!(!lazy.is_loaded());
-        assert_eq!(lazy.crc_version(), Some(5));
-
-        let result = lazy.get_or_load(&engine);
-        assert!(matches!(result, CrcLoadResult::CorruptOrFailed));
-        assert!(result.get().is_none());
-        assert!(lazy.is_loaded());
-    }
-
     fn test_table_root(dir: &str) -> url::Url {
         let path = std::fs::canonicalize(PathBuf::from(dir)).unwrap();
         url::Url::from_directory_path(path).unwrap()
     }
 
     #[test]
-    fn test_lazy_crc_loads_real_file() {
+    fn lazy_crc_with_no_file_returns_does_not_exist() {
+        let engine = test_engine();
+        let lazy = LazyCrc::new(None);
+        assert_eq!(lazy.crc_version(), None);
+
+        let result = lazy.get_or_load(&engine);
+        assert!(matches!(result, CrcLoadResult::DoesNotExist));
+    }
+
+    #[test]
+    fn lazy_crc_with_missing_file_path_returns_corrupt_or_failed() {
+        let engine = test_engine();
+        let lazy = LazyCrc::new(Some(ParsedLogPath::create_parsed_crc(&table_root(), 5)));
+        assert_eq!(lazy.crc_version(), Some(5));
+
+        let result = lazy.get_or_load(&engine);
+        assert!(matches!(result, CrcLoadResult::CorruptOrFailed));
+    }
+
+    #[test]
+    fn lazy_crc_loads_real_file() {
         let engine = crate::engine::sync::SyncEngine::new();
         let table_root = test_table_root("./tests/data/crc-full/");
-
         let lazy = LazyCrc::new(Some(ParsedLogPath::create_parsed_crc(&table_root, 0)));
-        assert!(!lazy.is_loaded());
         assert_eq!(lazy.crc_version(), Some(0));
 
         let result = lazy.get_or_load(&engine);
-        assert!(lazy.is_loaded());
-
-        let crc = result.get().unwrap();
+        let CrcLoadResult::Loaded(crc) = result else {
+            panic!("expected Loaded, got {result:?}");
+        };
         assert_eq!(crc.file_stats().unwrap().table_size_bytes(), 5259);
     }
 
     #[test]
-    fn test_lazy_crc_malformed_file() {
+    fn lazy_crc_with_malformed_file_returns_corrupt_or_failed() {
         let engine = crate::engine::sync::SyncEngine::new();
         let table_root = test_table_root("./tests/data/crc-malformed/");
-
         let lazy = LazyCrc::new(Some(ParsedLogPath::create_parsed_crc(&table_root, 0)));
-        assert!(!lazy.is_loaded());
-        assert_eq!(lazy.crc_version(), Some(0));
 
         let result = lazy.get_or_load(&engine);
         assert!(matches!(result, CrcLoadResult::CorruptOrFailed));
-        assert!(result.get().is_none());
-        assert!(lazy.is_loaded());
-    }
-
-    // ===== Precomputed LazyCrc Tests =====
-
-    fn test_crc(table_size_bytes: i64) -> Crc {
-        Crc {
-            file_stats: crate::crc::FileStatsState::Valid {
-                num_files: 1,
-                table_size_bytes,
-                histogram: None,
-            },
-            ..Default::default()
-        }
     }
 
     #[test]
-    fn test_lazy_crc_precomputed() {
-        let crc = test_crc(42);
-        let lazy = LazyCrc::new_precomputed(crc, 5);
+    fn lazy_crc_caches_result_across_calls() {
+        // Build a CRC with a real file behind it. Calling get_or_load twice must return
+        // the same Loaded result without doing the I/O twice (covered indirectly: a
+        // second call doesn't error even if the file vanished, because the result was
+        // cached on the first call).
+        let engine = crate::engine::sync::SyncEngine::new();
+        let table_root = test_table_root("./tests/data/crc-full/");
+        let lazy = LazyCrc::new(Some(ParsedLogPath::create_parsed_crc(&table_root, 0)));
+        let first = lazy.get_or_load(&engine);
+        let second = lazy.get_or_load(&engine);
+        // OnceLock returns the same reference both times.
+        assert!(std::ptr::eq(first, second));
 
-        assert!(lazy.is_loaded());
-        assert_eq!(lazy.crc_version(), Some(5));
-
-        // get_if_loaded_at_version should return the CRC at the correct version
-        let loaded = lazy.get_if_loaded_at_version(5);
-        assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().file_stats().unwrap().table_size_bytes(), 42);
-
-        // Wrong version should return None
-        assert!(lazy.get_if_loaded_at_version(4).is_none());
-        assert!(lazy.get_if_loaded_at_version(6).is_none());
-    }
-
-    #[test]
-    fn test_lazy_crc_precomputed_version_takes_priority() {
-        let crc = test_crc(100);
-        let lazy = LazyCrc::new_precomputed(crc, 3);
-        assert_eq!(lazy.crc_version(), Some(3));
-    }
-
-    #[test]
-    fn test_get_if_loaded_at_version_not_loaded() {
-        // CRC file exists but not yet loaded -> should return None (no I/O)
-        let lazy = LazyCrc::new(Some(ParsedLogPath::create_parsed_crc(&table_root(), 5)));
-        assert!(!lazy.is_loaded());
-        assert!(lazy.get_if_loaded_at_version(5).is_none());
-    }
-
-    #[test]
-    fn test_get_if_loaded_at_version_wrong_version() {
-        let crc = test_crc(100);
-        let lazy = LazyCrc::new_precomputed(crc, 5);
-        assert!(lazy.get_if_loaded_at_version(3).is_none());
-    }
-
-    #[test]
-    fn test_get_if_loaded_at_version_no_crc() {
-        let lazy = LazyCrc::new(None);
-        assert!(lazy.get_if_loaded_at_version(0).is_none());
+        // Sanity: still Loaded.
+        let CrcLoadResult::Loaded(crc) = first else {
+            panic!("expected Loaded");
+        };
+        assert!(matches!(crc.file_stats, FileStatsState::Valid { .. }));
     }
 }

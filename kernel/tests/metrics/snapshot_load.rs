@@ -91,14 +91,11 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
     assert_eq!(reporter.compaction_files.get(), 0);
 
     // One JSON read for the tail commit. Two Parquet reads for the checkpoint:
-    //   1. Sidecar extraction probe (the CRC schema includes Add/Remove file actions, so
-    //      `create_checkpoint_stream` triggers `extract_sidecar_refs` to detect potential V2
-    //      sidecars; the kernel-written V1 checkpoint includes an empty `sidecar` column in its
-    //      schema, so the probe reads the file).
+    //   1. Sidecar extraction probe -- the CRC build schema includes Add/Remove, so
+    //      `create_checkpoint_stream` triggers `extract_sidecar_refs` to detect any V2 sidecars.
+    //      Kernel-written V1 checkpoints include an empty `sidecar` column in their schema, so the
+    //      probe reads the file.
     //   2. The full data read for the CRC build.
-    // Pre-eager-Crc, the snapshot loaded only with a P&M-only schema (no Add/Remove), so
-    // step 1 was skipped. The eager-Crc design pays this extra read once per snapshot
-    // load on V1 parquet checkpoints.
     assert_eq!(reporter.json_read_calls.get(), 1);
     assert_eq!(reporter.json_files_read.get(), 1);
     assert_eq!(reporter.parquet_read_calls.get(), 2);
@@ -393,7 +390,7 @@ fn get_domain_metadata_after_snapshot_build_is_served_from_crc_with_no_io() -> D
     assert_eq!(
         reporter.json_read_calls.get(),
         0,
-        "get_domain_metadata serves from CRC's Complete DM state under the eager-Crc design"
+        "get_domain_metadata serves from CRC's Complete DM state without log replay"
     );
 
     Ok(())

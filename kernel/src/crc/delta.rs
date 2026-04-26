@@ -140,14 +140,6 @@ impl CrcUpdate {
             in_commit_timestamp_opt: self.in_commit_timestamp,
         })
     }
-
-    /// Convert this update into a fresh [`Crc`] for version zero (CREATE TABLE).
-    ///
-    /// Returns `None` if protocol or metadata are missing (both are required for a valid
-    /// CRC). Wraps [`into_fresh_crc`] for the version-zero post-commit path.
-    pub(crate) fn into_crc_for_version_zero(self) -> Option<Crc> {
-        self.into_fresh_crc().ok()
-    }
 }
 
 /// Merge a base histogram with the update's net histogram. Returns `Some(merged)` on

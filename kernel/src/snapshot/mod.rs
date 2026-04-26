@@ -996,27 +996,18 @@ impl Snapshot {
         self.log_segment().scan_domain_metadatas(domains, engine)
     }
 
-    /// Returns file-level statistics if the CRC has [`Valid`] file stats at this version,
-    /// otherwise `None`.
-    ///
-    /// The `_engine` parameter is currently unused (the eager `Crc` is already loaded), but
-    /// reserved for future paths that may trigger I/O (e.g. recovery via
-    /// [`load_file_stats`](Self::load_file_stats)).
-    ///
-    /// [`Valid`]: crate::crc::FileStatsState::Valid
-    #[allow(unused)]
-    pub fn get_or_load_file_stats(&self, _engine: &dyn Engine) -> Option<FileStats> {
-        self.crc.file_stats()
-    }
-
     /// Returns file-level statistics if the CRC has [`Valid`] file stats. Performs no I/O.
     ///
-    /// Equivalent to [`get_or_load_file_stats`](Self::get_or_load_file_stats) under the
-    /// eager-`Arc<Crc>` design (the CRC is always already loaded). Kept as a separate
-    /// method for forward-compatibility with future lazy/recovery paths.
+    /// Returns `None` for non-`Valid` states ([`Indeterminate`], [`Untrackable`],
+    /// [`RequiresCheckpointRead`]). Callers that need to recover from a non-`Valid` state
+    /// should call [`load_file_stats`](Self::load_file_stats), which returns a new
+    /// [`SnapshotRef`] with rebuilt stats.
     ///
     /// [`Valid`]: crate::crc::FileStatsState::Valid
-    pub fn get_file_stats_if_loaded(&self) -> Option<FileStats> {
+    /// [`Indeterminate`]: crate::crc::FileStatsState::Indeterminate
+    /// [`Untrackable`]: crate::crc::FileStatsState::Untrackable
+    /// [`RequiresCheckpointRead`]: crate::crc::FileStatsState::RequiresCheckpointRead
+    pub fn get_file_stats(&self) -> Option<FileStats> {
         self.crc.file_stats()
     }
 
