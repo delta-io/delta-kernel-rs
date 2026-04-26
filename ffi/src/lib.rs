@@ -41,6 +41,8 @@ extern crate self as delta_kernel_ffi;
 
 mod domain_metadata;
 pub use domain_metadata::get_domain_metadata;
+#[cfg(feature = "default-engine-base")]
+pub mod callback_engine;
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
@@ -631,7 +633,7 @@ fn get_default_default_engine_impl(
 ///
 /// Caller must free this handle to prevent memory leaks
 #[cfg(feature = "default-engine-base")]
-fn engine_to_handle(
+pub(crate) fn engine_to_handle(
     engine: Arc<dyn Engine>,
     allocate_error: AllocateErrorFn,
 ) -> Handle<SharedExternEngine> {
