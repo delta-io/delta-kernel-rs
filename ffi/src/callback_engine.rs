@@ -215,12 +215,30 @@ impl EngineData for OpaqueJavaEngineData {
 
     fn apply_selection_vector(
         self: Box<Self>,
-        _selection_vector: Vec<bool>,
+        selection_vector: Vec<bool>,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        Err(Error::generic(
-            "OpaqueJavaEngineData::apply_selection_vector is not supported by the \
-             read-path POC; route DV-bearing scans through the JVM backend instead.",
-        ))
+        // Pass-through batches are opaque to the Rust kernel; we cannot
+        // physically drop rows on this side. Accept the trivial case where
+        // every row stays selected (no DVs, no row-level filter) so basic
+        // scans complete without an inner Rust filter pass. Any non-trivial
+        // selection is a sign the engine should be applying its own filter
+        // before handing the batch back -- we surface a clear error rather
+        // than silently misrepresent the row count.
+        let all_selected = selection_vector.iter().all(|&b| b);
+        let len_match = selection_vector.len() == self.len;
+        if all_selected && len_match {
+            Ok(self)
+        } else {
+            Err(Error::generic(format!(
+                "OpaqueJavaEngineData::apply_selection_vector requires an all-true \
+                 selection vector matching the batch row count (sv_len={}, \
+                 batch_len={}, all_true={}); the engine that produced the batch \
+                 must filter on its side.",
+                selection_vector.len(),
+                self.len,
+                all_selected,
+            )))
+        }
     }
 
     fn has_field(&self, _name: &ColumnName) -> bool {
@@ -703,6 +721,83 @@ fn drive_one_file(
     let mut total_rows = 0usize;
     for batch in iter.by_ref() {
         let batch = batch?;
+        batch_count += 1;
+        total_rows += batch.len();
+    }
+    Ok((batch_count, total_rows))
+}
+
+/// Drive an end-to-end log-replay + scan against a real Delta table using
+/// the supplied callback engine. Loads the snapshot (which exercises the
+/// engine's JsonHandler / StorageHandler / EvaluationHandler -- in practice
+/// the inner default engine), iterates scan files, and reads every parquet
+/// file via `engine.parquet_handler().read_parquet_files(...)`. The parquet
+/// reads route through the connector-supplied callbacks.
+///
+/// Returns a `(batch_count, total_rows)` summary for the data files only;
+/// log-replay batches are not counted.
+///
+/// # Safety
+/// - `engine` must be a valid handle returned by [`make_callback_engine`].
+/// - `table_path` must point to UTF-8 bytes valid for the duration of this call.
+/// - `out` must point to writable memory of at least `sizeof(CallbackParquetDriveResult)` bytes.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn test_drive_callback_log_replay(
+    engine: Handle<SharedExternEngine>,
+    table_path: KernelStringSlice,
+    out: *mut CallbackParquetDriveResult,
+) -> ExternResult<bool> {
+    let extern_engine = unsafe { engine.clone_as_arc() };
+    let result = (|| -> DeltaResult<(usize, usize)> {
+        let path_str: &str = unsafe { crate::TryFromStringSlice::try_from_slice(&table_path) }?;
+        let url = delta_kernel::try_parse_uri(path_str)?;
+        let inner_engine = extern_engine.engine();
+        drive_log_replay_impl(inner_engine, url)
+    })();
+    unsafe {
+        match &result {
+            Ok((bc, tr)) => {
+                *out = CallbackParquetDriveResult {
+                    batch_count: *bc,
+                    total_rows: *tr,
+                };
+            }
+            Err(_) => {
+                *out = CallbackParquetDriveResult {
+                    batch_count: 0,
+                    total_rows: 0,
+                };
+            }
+        }
+    }
+    unsafe {
+        result
+            .map(|_| true)
+            .into_extern_result(&extern_engine.as_ref())
+    }
+}
+
+#[cfg(feature = "default-engine-base")]
+fn drive_log_replay_impl(engine: Arc<dyn Engine>, url: url::Url) -> DeltaResult<(usize, usize)> {
+    use delta_kernel::Snapshot;
+
+    // Step 1: log replay. This calls into engine.json_handler(),
+    // engine.storage_handler(), engine.evaluation_handler() -- all of
+    // which our CallbackEngine delegates to the inner default engine.
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    // Step 2: build the scan. No I/O at this stage.
+    let scan = snapshot.scan_builder().build()?;
+
+    // Step 3: execute the scan against the same engine. Internally the
+    // kernel reads each scan file via engine.parquet_handler() -- which
+    // is the connector-supplied vtable.
+    let mut batch_count = 0usize;
+    let mut total_rows = 0usize;
+    let scan_results = scan.execute(engine)?;
+    for result in scan_results {
+        let batch = result?;
         batch_count += 1;
         total_rows += batch.len();
     }
