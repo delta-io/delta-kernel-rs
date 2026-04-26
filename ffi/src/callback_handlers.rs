@@ -54,10 +54,11 @@
 //! discussion and the option-2 deep dive.
 
 use std::ffi::c_void;
+use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use delta_kernel::engine_data::RowVisitor;
+use delta_kernel::engine_data::{GetData, ListItem, MapItem, RowVisitor, StringArrayAccessor};
 use delta_kernel::expressions::{ArrayData, ColumnName};
 use delta_kernel::schema::{DataType, SchemaRef};
 use delta_kernel::{
@@ -533,16 +534,84 @@ impl Drop for JavaEngineData {
 impl EngineData for JavaEngineData {
     fn visit_rows(
         &self,
-        _column_names: &[ColumnName],
-        _visitor: &mut dyn RowVisitor,
+        column_names: &[ColumnName],
+        visitor: &mut dyn RowVisitor,
     ) -> DeltaResult<()> {
-        // SKELETON: production impl materializes columns via the engine-data
-        // callbacks, builds GetData adapters, and invokes the visitor. See
-        // module docs for the full protocol.
-        Err(Error::generic(
-            "JavaEngineData::visit_rows: skeleton -- column-materialization adapters not yet \
-             implemented. Filling in this method is the next milestone for option-2 wire-up.",
-        ))
+        // 1. Encode column paths as KernelStringSlices (dotted form).
+        let path_strings: Vec<String> = column_names.iter().map(|cn| cn.to_string()).collect();
+        let path_slices: Vec<KernelStringSlice> = path_strings
+            .iter()
+            // SAFETY: each `s` is borrowed from `path_strings`, which lives
+            // until the end of this function (which fully encompasses the
+            // synchronous upcall + visitor invocation).
+            .map(|s| unsafe { KernelStringSlice::new_unsafe(s.as_str()) })
+            .collect();
+
+        let request = VisitRowsRequest {
+            batch_handle: self.batch_handle,
+            paths_len: path_slices.len(),
+            paths: path_slices.as_ptr(),
+        };
+        let mut result = VisitRowsResult {
+            columns: std::ptr::null(),
+            columns_len: 0,
+            error: 0,
+        };
+
+        // 2. Upcall.
+        (self.state.callbacks.materialize_columns)(
+            self.state.engine_state,
+            &request as *const _,
+            &mut result as *mut _,
+        );
+
+        if result.error != 0 {
+            return Err(Error::generic(format!(
+                "materialize_columns signalled error code {}",
+                result.error
+            )));
+        }
+        if result.columns_len != path_slices.len() {
+            // Free what we got, surface a clear error.
+            (self.state.callbacks.free_columns)(
+                self.state.engine_state,
+                result.columns,
+                result.columns_len,
+            );
+            return Err(Error::generic(format!(
+                "engine returned {} columns; kernel requested {}",
+                result.columns_len,
+                path_slices.len()
+            )));
+        }
+
+        // 3. Walk columns, build per-type adapters.
+        let columns_slice = if result.columns_len == 0 {
+            &[][..]
+        } else {
+            // SAFETY: engine guarantees `columns` valid for `columns_len`
+            // ColumnBuffers entries until `free_columns` is called.
+            unsafe { std::slice::from_raw_parts(result.columns, result.columns_len) }
+        };
+        let row_count = columns_slice.first().map(|c| c.row_count).unwrap_or(0);
+
+        // Build all adapters, then references to them. We have to scope
+        // the borrow + visit + free carefully so the buffer lifetimes are
+        // honored.
+        let visit_result: DeltaResult<()> = (|| {
+            let adapters = build_get_data_adapters(columns_slice)?;
+            let getter_refs: Vec<&dyn GetData<'_>> =
+                adapters.iter().map(|a| a.as_getter()).collect();
+            visitor.visit(row_count, &getter_refs)
+        })();
+
+        // 4. Free buffers regardless of visit outcome.
+        (self.state.callbacks.free_columns)(
+            self.state.engine_state,
+            result.columns,
+            result.columns_len,
+        );
+        visit_result
     }
 
     fn len(&self) -> usize {
@@ -562,11 +631,24 @@ impl EngineData for JavaEngineData {
 
     fn apply_selection_vector(
         self: Box<Self>,
-        _selection_vector: Vec<bool>,
+        selection_vector: Vec<bool>,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        // Trivial all-true selection passes through (matches the read-path
+        // shortcut for tables without DVs). Non-trivial selections delegate
+        // to the engine's apply_selection_vector callback.
+        let len = self.len();
+        let all_selected = selection_vector.iter().all(|&b| b);
+        if all_selected && selection_vector.len() == len {
+            return Ok(self);
+        }
+        // TODO: pack selection_vector into a byte buffer and call the
+        // engine's apply_selection_vector. Until that's wired we surface a
+        // clear error so any DV-bearing table fails loudly instead of
+        // silently misrepresenting row counts.
         Err(Error::generic(
-            "JavaEngineData::apply_selection_vector: skeleton -- selection-vector marshalling \
-             not yet implemented.",
+            "JavaEngineData::apply_selection_vector: non-trivial selection requires the engine's \
+             apply_selection_vector callback (not yet wired through). The engine that produced \
+             this batch must filter on its side.",
         ))
     }
 
@@ -628,22 +710,75 @@ impl JsonHandler for JavaJsonHandler {
         _json_strings: Box<dyn EngineData>,
         _output_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        // Not used by log replay; only kicks in when the kernel has JSON
+        // strings already in memory (e.g. some commit-info paths). Defer
+        // until a use case lands.
         Err(Error::generic(
-            "JavaJsonHandler::parse_json: skeleton -- input-batch handle marshalling and \
-             column-materialization protocol not yet wired through.",
+            "JavaJsonHandler::parse_json: not yet wired; log replay uses read_json_files instead.",
         ))
     }
 
     fn read_json_files(
         &self,
-        _files: &[KernelFileMeta],
+        files: &[KernelFileMeta],
         _physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        Err(Error::generic(
-            "JavaJsonHandler::read_json_files: skeleton -- file/schema marshalling and \
-             iterator wiring not yet implemented.",
-        ))
+        // Marshal &[KernelFileMeta] -> [FfiFileMeta]; same shape as the
+        // parquet handler.
+        let ffi_files: Vec<FileMeta> = files
+            .iter()
+            .map(|fm| {
+                let url = fm.location.as_str();
+                let size: usize = fm.size.try_into().map_err(|_| {
+                    Error::generic("FileMeta::size does not fit in usize on this platform")
+                })?;
+                Ok(FileMeta {
+                    // SAFETY: `url` borrows `fm.location`, valid for this call.
+                    path: unsafe { KernelStringSlice::new_unsafe(url) },
+                    last_modified: fm.last_modified,
+                    size,
+                })
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        // Schema is currently ignored by the engine side -- the JSON
+        // callback is expected to parse the full action shape and the
+        // kernel asks for specific column paths via visit_rows. Pass a
+        // null path slice as the JSON-form schema for now (engines can
+        // ignore it).
+        let schema_json_slice = unsafe { KernelStringSlice::new_unsafe("") };
+
+        let mut result = crate::callback_engine::JavaParquetReadResult {
+            iter_state: std::ptr::null_mut(),
+            error: 0,
+        };
+        // Predicate: always null in the POC.
+        (self.state.callbacks.read_json_files)(
+            self.state.callbacks.engine_state,
+            ffi_files.as_ptr(),
+            ffi_files.len(),
+            schema_json_slice,
+            std::ptr::null_mut(),
+            &mut result as *mut _,
+        );
+        if result.error != 0 {
+            return Err(Error::generic(format!(
+                "JavaJsonHandler.read_json_files signalled error code {}",
+                result.error
+            )));
+        }
+        if result.iter_state.is_null() {
+            return Err(Error::generic(
+                "JavaJsonHandler.read_json_files returned null iterator on success",
+            ));
+        }
+
+        Ok(Box::new(JavaJsonIter {
+            iter_state: result.iter_state,
+            handler_state: self.state.clone(),
+            done: false,
+        }))
     }
 
     fn write_json_file(
@@ -656,6 +791,64 @@ impl JsonHandler for JavaJsonHandler {
             "JavaJsonHandler::write_json_file: skeleton -- write-side serialization not yet \
              implemented.",
         ))
+    }
+}
+
+/// Iterator over JSON-derived batches. Pumps the engine's `iter_next` and
+/// wraps each returned batch handle in a `JavaEngineData`.
+struct JavaJsonIter {
+    iter_state: *mut c_void,
+    handler_state: Arc<JsonHandlerState>,
+    done: bool,
+}
+
+unsafe impl Send for JavaJsonIter {}
+
+impl Drop for JavaJsonIter {
+    fn drop(&mut self) {
+        if !self.iter_state.is_null() {
+            (self.handler_state.callbacks.iter_free)(
+                self.handler_state.callbacks.engine_state,
+                self.iter_state,
+            );
+        }
+    }
+}
+
+impl Iterator for JavaJsonIter {
+    type Item = DeltaResult<Box<dyn EngineData>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let mut res = crate::callback_engine::JavaEngineDataResult {
+            batch: std::ptr::null_mut(),
+            len: 0,
+            done: false,
+            error: 0,
+        };
+        (self.handler_state.callbacks.iter_next)(
+            self.handler_state.callbacks.engine_state,
+            self.iter_state,
+            &mut res as *mut _,
+        );
+        if res.error != 0 {
+            self.done = true;
+            return Some(Err(Error::generic(format!(
+                "JavaJsonIter::next signalled error code {}",
+                res.error
+            ))));
+        }
+        if res.done {
+            self.done = true;
+            return None;
+        }
+        let batch: Box<dyn EngineData> = Box::new(JavaEngineData {
+            batch_handle: res.batch,
+            state: self.handler_state.engine_data_state.clone(),
+        });
+        Some(Ok(batch))
     }
 }
 
@@ -852,6 +1045,352 @@ impl PredicateEvaluator for NotImplementedEvaluator {
         Err(Error::generic(
             "JavaEvaluationHandler: skeleton -- predicate evaluators not yet implemented.",
         ))
+    }
+}
+
+// ============================================================================
+// GetData adapters -- read engine-materialized column buffers
+// ============================================================================
+
+/// Helper: enum of per-type adapters. Exists so we can hold the adapter
+/// (with its borrowed buffers) in a `Vec` without `Box<dyn>` lifetime
+/// gymnastics; downcasts to the right impl are done via `as_getter`.
+enum ColumnAdapter<'a> {
+    Bool(BoolAdapter<'a>),
+    Int(IntAdapter<'a>),
+    Long(LongAdapter<'a>),
+    Str(StringAdapter<'a>),
+    StringList(StringListAdapter<'a>),
+    StringMap(StringMapAdapter<'a>),
+    Unsupported(u8),
+}
+
+impl<'a> ColumnAdapter<'a> {
+    fn as_getter(&'a self) -> &'a dyn GetData<'a> {
+        match self {
+            ColumnAdapter::Bool(a) => a,
+            ColumnAdapter::Int(a) => a,
+            ColumnAdapter::Long(a) => a,
+            ColumnAdapter::Str(a) => a,
+            ColumnAdapter::StringList(a) => a,
+            ColumnAdapter::StringMap(a) => a,
+            // Unsupported types fall back to `()` which returns null for
+            // every getter -- the kernel will then error if it actually
+            // tried to read this column.
+            ColumnAdapter::Unsupported(_) => &(),
+        }
+    }
+}
+
+fn build_get_data_adapters<'a>(
+    columns: &'a [ColumnBuffers],
+) -> DeltaResult<Vec<ColumnAdapter<'a>>> {
+    columns.iter().map(build_one_adapter).collect()
+}
+
+fn build_one_adapter<'a>(col: &'a ColumnBuffers) -> DeltaResult<ColumnAdapter<'a>> {
+    match col.type_tag {
+        t if t == ColumnTypeTag::Bool as u8 => Ok(ColumnAdapter::Bool(BoolAdapter::new(col)?)),
+        t if t == ColumnTypeTag::Int as u8 => Ok(ColumnAdapter::Int(IntAdapter::new(col)?)),
+        t if t == ColumnTypeTag::Long as u8 => Ok(ColumnAdapter::Long(LongAdapter::new(col)?)),
+        t if t == ColumnTypeTag::String as u8 => Ok(ColumnAdapter::Str(StringAdapter::new(col)?)),
+        t if t == ColumnTypeTag::List as u8 => {
+            // Only list<string> is wired today.
+            let elem = unsafe { resolve_single_child(col)? };
+            if elem.type_tag != ColumnTypeTag::String as u8 {
+                return Ok(ColumnAdapter::Unsupported(col.type_tag));
+            }
+            Ok(ColumnAdapter::StringList(StringListAdapter::new(
+                col, elem,
+            )?))
+        }
+        t if t == ColumnTypeTag::Map as u8 => {
+            // Only map<string,string> is wired today.
+            let (keys, values) = unsafe { resolve_two_children(col)? };
+            if keys.type_tag != ColumnTypeTag::String as u8
+                || values.type_tag != ColumnTypeTag::String as u8
+            {
+                return Ok(ColumnAdapter::Unsupported(col.type_tag));
+            }
+            Ok(ColumnAdapter::StringMap(StringMapAdapter::new(
+                col, keys, values,
+            )?))
+        }
+        // Other types return null on every access -- log replay only
+        // touches the types above for the schemas it cares about.
+        _ => Ok(ColumnAdapter::Unsupported(col.type_tag)),
+    }
+}
+
+/// Resolve a list/array column's single child column.
+unsafe fn resolve_single_child(col: &ColumnBuffers) -> DeltaResult<&ColumnBuffers> {
+    if col.children_len != 1 || col.children.is_null() {
+        return Err(Error::generic(format!(
+            "list column expected 1 child; got children_len={}",
+            col.children_len
+        )));
+    }
+    Ok(unsafe { &*col.children })
+}
+
+/// Resolve a map column's (keys, values) child columns.
+unsafe fn resolve_two_children(
+    col: &ColumnBuffers,
+) -> DeltaResult<(&ColumnBuffers, &ColumnBuffers)> {
+    if col.children_len != 2 || col.children.is_null() {
+        return Err(Error::generic(format!(
+            "map column expected 2 children; got children_len={}",
+            col.children_len
+        )));
+    }
+    let children = unsafe { std::slice::from_raw_parts(col.children, 2) };
+    Ok((&children[0], &children[1]))
+}
+
+/// Read a bit out of a packed null bitmap (`true` = NOT null). When no
+/// bitmap is present (`null_bitmap` is null), every row is non-null.
+fn is_valid(col: &ColumnBuffers, row: usize) -> bool {
+    if col.null_bitmap.is_null() {
+        return true;
+    }
+    // null_bitmap_len bytes; bit `row % 8` in byte `row / 8` -- 1 means
+    // the row is VALID (not null), matching Arrow's convention.
+    let byte_idx = row / 8;
+    if byte_idx >= col.null_bitmap_len {
+        return true;
+    }
+    let byte = unsafe { *col.null_bitmap.add(byte_idx) };
+    (byte >> (row % 8)) & 1 == 1
+}
+
+/// Read primary buffer as a typed slice.
+unsafe fn primary_as<T>(col: &ColumnBuffers) -> &[T] {
+    if col.primary.is_null() || col.row_count == 0 {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(col.primary as *const T, col.row_count) }
+}
+
+/// Read primary buffer as a slice of i32 offsets (length row_count + 1).
+unsafe fn offsets(col: &ColumnBuffers) -> &[i32] {
+    if col.primary.is_null() {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(col.primary as *const i32, col.row_count + 1) }
+}
+
+// -------- Bool / Int / Long primitive adapters --------
+
+struct BoolAdapter<'a> {
+    col: &'a ColumnBuffers,
+    values: &'a [u8],
+}
+impl<'a> BoolAdapter<'a> {
+    fn new(col: &'a ColumnBuffers) -> DeltaResult<Self> {
+        Ok(Self {
+            col,
+            values: unsafe { primary_as::<u8>(col) },
+        })
+    }
+}
+impl<'a> GetData<'a> for BoolAdapter<'a> {
+    fn get_bool(&'a self, row: usize, _field: &str) -> DeltaResult<Option<bool>> {
+        if !is_valid(self.col, row) {
+            return Ok(None);
+        }
+        Ok(Some(self.values[row] != 0))
+    }
+}
+
+struct IntAdapter<'a> {
+    col: &'a ColumnBuffers,
+    values: &'a [i32],
+}
+impl<'a> IntAdapter<'a> {
+    fn new(col: &'a ColumnBuffers) -> DeltaResult<Self> {
+        Ok(Self {
+            col,
+            values: unsafe { primary_as::<i32>(col) },
+        })
+    }
+}
+impl<'a> GetData<'a> for IntAdapter<'a> {
+    fn get_int(&'a self, row: usize, _field: &str) -> DeltaResult<Option<i32>> {
+        if !is_valid(self.col, row) {
+            return Ok(None);
+        }
+        Ok(Some(self.values[row]))
+    }
+}
+
+struct LongAdapter<'a> {
+    col: &'a ColumnBuffers,
+    values: &'a [i64],
+}
+impl<'a> LongAdapter<'a> {
+    fn new(col: &'a ColumnBuffers) -> DeltaResult<Self> {
+        Ok(Self {
+            col,
+            values: unsafe { primary_as::<i64>(col) },
+        })
+    }
+}
+impl<'a> GetData<'a> for LongAdapter<'a> {
+    fn get_long(&'a self, row: usize, _field: &str) -> DeltaResult<Option<i64>> {
+        if !is_valid(self.col, row) {
+            return Ok(None);
+        }
+        Ok(Some(self.values[row]))
+    }
+}
+
+// -------- String adapter --------
+
+struct StringAdapter<'a> {
+    col: &'a ColumnBuffers,
+    offsets: &'a [i32],
+    bytes: &'a [u8],
+}
+impl<'a> StringAdapter<'a> {
+    fn new(col: &'a ColumnBuffers) -> DeltaResult<Self> {
+        let offsets = unsafe { offsets(col) };
+        let bytes = if col.aux.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(col.aux, col.aux_len) }
+        };
+        Ok(Self {
+            col,
+            offsets,
+            bytes,
+        })
+    }
+    fn value_at(&'a self, row: usize) -> DeltaResult<&'a str> {
+        let start = self.offsets[row] as usize;
+        let end = self.offsets[row + 1] as usize;
+        std::str::from_utf8(&self.bytes[start..end])
+            .map_err(|e| Error::generic(format!("invalid utf8 at row {row}: {e}")))
+    }
+}
+impl<'a> GetData<'a> for StringAdapter<'a> {
+    fn get_str(&'a self, row: usize, _field: &str) -> DeltaResult<Option<&'a str>> {
+        if !is_valid(self.col, row) {
+            return Ok(None);
+        }
+        self.value_at(row).map(Some)
+    }
+}
+
+// -------- StringArrayAccessor over a string ColumnBuffers --------
+
+/// Wraps a child string column and exposes it via `StringArrayAccessor` for
+/// `ListItem` / `MapItem`.
+struct StringArrayView<'a> {
+    col: &'a ColumnBuffers,
+    offsets: &'a [i32],
+    bytes: &'a [u8],
+}
+impl<'a> StringArrayView<'a> {
+    fn new(col: &'a ColumnBuffers) -> DeltaResult<Self> {
+        if col.type_tag != ColumnTypeTag::String as u8 {
+            return Err(Error::generic("StringArrayView expects a string column"));
+        }
+        // For a child string column the offset count is row_count + 1.
+        let offsets = if col.primary.is_null() {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(col.primary as *const i32, col.row_count + 1) }
+        };
+        let bytes = if col.aux.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(col.aux, col.aux_len) }
+        };
+        Ok(Self {
+            col,
+            offsets,
+            bytes,
+        })
+    }
+}
+impl<'a> StringArrayAccessor for StringArrayView<'a> {
+    fn len(&self) -> usize {
+        self.col.row_count
+    }
+    fn value(&self, index: usize) -> &str {
+        let start = self.offsets[index] as usize;
+        let end = self.offsets[index + 1] as usize;
+        // SAFETY: engine asserted these are valid utf8 when materializing.
+        unsafe { std::str::from_utf8_unchecked(&self.bytes[start..end]) }
+    }
+    fn is_valid(&self, index: usize) -> bool {
+        is_valid(self.col, index)
+    }
+}
+
+// -------- list<string> adapter --------
+
+struct StringListAdapter<'a> {
+    col: &'a ColumnBuffers,
+    list_offsets: &'a [i32],
+    elements: StringArrayView<'a>,
+}
+impl<'a> StringListAdapter<'a> {
+    fn new(col: &'a ColumnBuffers, child: &'a ColumnBuffers) -> DeltaResult<Self> {
+        let list_offsets = unsafe { offsets(col) };
+        Ok(Self {
+            col,
+            list_offsets,
+            elements: StringArrayView::new(child)?,
+        })
+    }
+}
+impl<'a> GetData<'a> for StringListAdapter<'a> {
+    fn get_list(&'a self, row: usize, _field: &str) -> DeltaResult<Option<ListItem<'a>>> {
+        if !is_valid(self.col, row) {
+            return Ok(None);
+        }
+        let start = self.list_offsets[row] as usize;
+        let end = self.list_offsets[row + 1] as usize;
+        Ok(Some(ListItem::new(&self.elements, Range { start, end })))
+    }
+}
+
+// -------- map<string,string> adapter --------
+
+struct StringMapAdapter<'a> {
+    col: &'a ColumnBuffers,
+    map_offsets: &'a [i32],
+    keys: StringArrayView<'a>,
+    values: StringArrayView<'a>,
+}
+impl<'a> StringMapAdapter<'a> {
+    fn new(
+        col: &'a ColumnBuffers,
+        keys: &'a ColumnBuffers,
+        values: &'a ColumnBuffers,
+    ) -> DeltaResult<Self> {
+        let map_offsets = unsafe { offsets(col) };
+        Ok(Self {
+            col,
+            map_offsets,
+            keys: StringArrayView::new(keys)?,
+            values: StringArrayView::new(values)?,
+        })
+    }
+}
+impl<'a> GetData<'a> for StringMapAdapter<'a> {
+    fn get_map(&'a self, row: usize, _field: &str) -> DeltaResult<Option<MapItem<'a>>> {
+        if !is_valid(self.col, row) {
+            return Ok(None);
+        }
+        let start = self.map_offsets[row] as usize;
+        let end = self.map_offsets[row + 1] as usize;
+        Ok(Some(MapItem::new(
+            &self.keys,
+            &self.values,
+            Range { start, end },
+        )))
     }
 }
 
@@ -1275,25 +1814,32 @@ mod tests {
     /// surfaces a clear error -- proves the routing reaches the stubbed
     /// handler instead of silently using inner.
     #[test]
-    fn composed_engine_json_stub_surfaces_error() {
-        // No-op vtable for the JSON handler. We never actually invoke the
-        // function pointers (the stub impl errors before that), but they
-        // must be valid `extern "C"` items so the struct is well-formed.
-        extern "C" fn unreachable_parse(
-            _: *mut c_void,
-            _: *mut c_void,
-            _: KernelStringSlice,
-            _: *mut JavaBatchResult,
-        ) {
-            unreachable!()
-        }
-        extern "C" fn unreachable_read_files(
+    fn composed_engine_json_routes_through_java_handler() {
+        // The JSON handler now actually upcalls into the vtable. This test
+        // supplies a `read_json_files` callback that signals an engine
+        // error (error=42) and verifies the kernel surfaces it. Catches
+        // routing regressions where the JSON path silently falls through
+        // to the inner default.
+        extern "C" fn read_returns_error(
             _: *mut c_void,
             _: *const FfiFileMeta,
             _: usize,
             _: KernelStringSlice,
             _: *mut c_void,
-            _: *mut JavaParquetReadResult,
+            out: *mut JavaParquetReadResult,
+        ) {
+            unsafe {
+                *out = JavaParquetReadResult {
+                    iter_state: std::ptr::null_mut(),
+                    error: 42,
+                };
+            }
+        }
+        extern "C" fn unreachable_parse(
+            _: *mut c_void,
+            _: *mut c_void,
+            _: KernelStringSlice,
+            _: *mut JavaBatchResult,
         ) {
             unreachable!()
         }
@@ -1361,7 +1907,7 @@ mod tests {
         let json_callbacks = JavaJsonCallbacks {
             engine_state: std::ptr::null_mut(),
             parse_json: unreachable_parse,
-            read_json_files: unreachable_read_files,
+            read_json_files: read_returns_error,
             write_json_file: unreachable_write,
             iter_next: unreachable_iter_next,
             iter_free: unreachable_iter_free,
@@ -1381,11 +1927,11 @@ mod tests {
         let result = json_handler.read_json_files(&[], synthetic_schema(), None);
         let err = match result {
             Err(e) => e,
-            Ok(_) => panic!("Java JSON stub should error before invoking vtable"),
+            Ok(_) => panic!("Java JSON callback returned error 42; should surface"),
         };
         assert!(
-            format!("{err}").contains("not yet implemented"),
-            "expected stub error, got: {err}"
+            format!("{err}").contains("error code 42"),
+            "expected error code 42, got: {err}"
         );
     }
 }
