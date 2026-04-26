@@ -1510,3 +1510,175 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
 
     Ok(())
 }
+
+// ============================================================================
+// Stale CRC: replay newer commits onto older CRC. Covers:
+//   - CRC missing DomainMetadata field   ->  Untracked + Partial transition
+//   - CRC missing setTransactions field  ->  Untracked + Partial transition
+//   - CRC missing fileSizeHistogram      ->  no histogram in result
+//   - Replay encounters non-incremental  ->  Indeterminate
+// ============================================================================
+
+/// Rewrites `<table>/_delta_log/<version>.crc` by mutating its parsed JSON via the given
+/// closure. This is the test helper for "what if the on-disk CRC file lacked field X?"
+/// scenarios.
+fn rewrite_crc_with<F: FnOnce(&mut serde_json::Value)>(table_path: &str, version: u64, mutate: F) {
+    let crc_file = std::path::PathBuf::from(table_path)
+        .join("_delta_log")
+        .join(format!("{version:020}.crc"));
+    let bytes = std::fs::read(&crc_file).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    mutate(&mut value);
+    std::fs::write(&crc_file, serde_json::to_string(&value).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn test_stale_crc_missing_dm_replays_to_partial_with_newer_commit_dm() -> DeltaResult<()> {
+    // GIVEN: table with CRC at v0 (Complete DM), then v1 adds a new domain.
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let committed = create_table_and_commit(&table_path, engine.as_ref())?;
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
+    snapshot_v0.write_checksum(engine.as_ref())?;
+
+    // Strip domainMetadata from 0.crc to simulate an older CRC writer that didn't track DM.
+    rewrite_crc_with(&table_path, 0, |v| {
+        v.as_object_mut().unwrap().remove("domainMetadata");
+    });
+
+    // v1: a new domain "alpha" with a value.
+    let committed = snapshot_v0
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_domain_metadata("alpha".to_string(), "{\"v\": 1}".to_string())
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    assert_eq!(committed.commit_version(), 1);
+    drop(committed);
+
+    // WHEN: load fresh snapshot at v1 (forces stale-CRC + replay path).
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 1);
+
+    // THEN: DM state is Partial — we have alpha from the v1 replay, but the older clustering
+    // domain (set at CREATE TABLE) is unknown to the cache (CRC didn't track it).
+    let crc = snapshot.get_current_crc_if_loaded_for_testing().unwrap();
+    assert!(
+        matches!(crc.domain_metadata, DomainMetadataState::Partial(_)),
+        "expected Partial, got {:?}",
+        crc.domain_metadata
+    );
+    let map = crc.domain_metadata.map().unwrap();
+    assert_eq!(map["alpha"].configuration(), "{\"v\": 1}");
+    // Specific-domain query for a USER (non-internal) domain that's known absent from
+    // both the Partial cache and the log: returns None (cache miss falls through to
+    // replay).
+    let unknown = snapshot.get_domain_metadata("never.set", engine.as_ref())?;
+    assert!(unknown.is_none(), "unknown user domain should be None");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stale_crc_missing_set_transactions_replays_to_partial() -> DeltaResult<()> {
+    // GIVEN: table at v0 with CRC, then v1 adds a setTransaction.
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let committed = create_table_and_commit(&table_path, engine.as_ref())?;
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
+    snapshot_v0.write_checksum(engine.as_ref())?;
+
+    rewrite_crc_with(&table_path, 0, |v| {
+        v.as_object_mut().unwrap().remove("setTransactions");
+    });
+
+    // v1: empty commit with a setTransaction.
+    let committed = snapshot_v0
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_transaction_id("app-1".to_string(), 7)
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    assert_eq!(committed.commit_version(), 1);
+    drop(committed);
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(
+        matches!(
+            snapshot
+                .get_current_crc_if_loaded_for_testing()
+                .unwrap()
+                .set_transactions,
+            SetTransactionState::Partial(_)
+        ),
+        "expected Partial set_transactions"
+    );
+    // Specific app_id query against Partial returns from cache (no log replay).
+    let app_version = snapshot.get_app_id_version("app-1", engine.as_ref())?;
+    assert_eq!(app_version, Some(7));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stale_crc_missing_histogram_replays_with_no_histogram() -> DeltaResult<()> {
+    // When the on-disk CRC at X has no histogram, applying a delta histogram from
+    // commits X+1..N onto a None base must drop the histogram (per the histogram merge
+    // rule (None, Some) -> None: a delta is an increment over an unknown baseline).
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let committed = create_table_and_commit(&table_path, engine.as_ref())?;
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
+    snapshot_v0.write_checksum(engine.as_ref())?;
+
+    rewrite_crc_with(&table_path, 0, |v| {
+        v.as_object_mut().unwrap().remove("fileSizeHistogram");
+    });
+
+    let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+    let _ = insert_data(snapshot_v0, &engine, vec![col])
+        .await?
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let crc = snapshot.get_current_crc_if_loaded_for_testing().unwrap();
+    let stats = crc.file_stats().unwrap();
+    assert_eq!(stats.num_files(), 1);
+    assert!(stats.table_size_bytes() > 0);
+    assert!(
+        stats.file_size_histogram().is_none(),
+        "stale CRC without histogram + delta histogram → no histogram in result"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stale_crc_replay_hits_non_incremental_op_transitions_to_indeterminate(
+) -> DeltaResult<()> {
+    // CRC at v0 is Valid; v1 commit has ANALYZE STATS (non-incremental). The stale-replay
+    // path produces a CrcUpdate with operation_safe=false; Crc::apply transitions file
+    // stats to Indeterminate.
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let committed = create_table_and_commit(&table_path, engine.as_ref())?;
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
+    snapshot_v0.write_checksum(engine.as_ref())?;
+
+    let _committed = snapshot_v0
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("ANALYZE STATS".to_string())
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 1);
+    let crc = snapshot.get_current_crc_if_loaded_for_testing().unwrap();
+    assert_eq!(crc.file_stats_validity(), FileStatsValidity::Indeterminate);
+
+    // Recovery via load_file_stats restores Valid.
+    let recovered = snapshot.load_file_stats(engine.as_ref())?;
+    let crc_recovered = recovered.get_current_crc_if_loaded_for_testing().unwrap();
+    assert_eq!(
+        crc_recovered.file_stats_validity(),
+        FileStatsValidity::Valid
+    );
+
+    Ok(())
+}
