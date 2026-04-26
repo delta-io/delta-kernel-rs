@@ -623,6 +623,92 @@ fn drive_parquet_handler_impl(engine: Arc<dyn Engine>) -> DeltaResult<(usize, us
     Ok((batch_count, total_rows))
 }
 
+/// Drive `engine.parquet_handler().read_parquet_files(...)` against a real
+/// parquet file URL. Counterpart of [`test_drive_callback_parquet_handler`]
+/// for tests that need to verify the Java parquet handler can actually decode
+/// parquet bytes (not just respond with synthetic batches).
+///
+/// Uses a hard-coded schema (`letter: string, number: long, a_float: double`)
+/// matching the `basic_append` test fixture. Real production callers must
+/// build their own schema and call `read_parquet_files` directly.
+///
+/// # Safety
+/// - `engine` must be a valid handle returned by [`make_callback_engine`].
+/// - `path` must point to UTF-8 bytes valid for the duration of this call.
+/// - `out` must point to writable memory of at least `sizeof(CallbackParquetDriveResult)` bytes.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn test_drive_callback_parquet_handler_with_file(
+    engine: Handle<SharedExternEngine>,
+    path: KernelStringSlice,
+    file_size: usize,
+    out: *mut CallbackParquetDriveResult,
+) -> ExternResult<bool> {
+    use delta_kernel::schema::{DataType, StructField, StructType};
+
+    let extern_engine = unsafe { engine.clone_as_arc() };
+    let result = (|| -> DeltaResult<(usize, usize)> {
+        let path_str: &str = unsafe { crate::TryFromStringSlice::try_from_slice(&path) }?;
+        let location = url::Url::parse(path_str)
+            .map_err(|e| Error::generic(format!("bad url '{path_str}': {e}")))?;
+        let schema: SchemaRef = Arc::new(
+            StructType::try_new([
+                StructField::nullable("letter", DataType::STRING),
+                StructField::nullable("number", DataType::LONG),
+                StructField::nullable("a_float", DataType::DOUBLE),
+            ])
+            .map_err(|e| Error::generic(format!("bad schema: {e}")))?,
+        );
+        let file = KernelFileMeta {
+            location,
+            last_modified: 0,
+            size: file_size as u64,
+        };
+        drive_one_file(extern_engine.engine(), file, schema)
+    })();
+    unsafe {
+        match &result {
+            Ok((bc, tr)) => {
+                *out = CallbackParquetDriveResult {
+                    batch_count: *bc,
+                    total_rows: *tr,
+                };
+            }
+            Err(_) => {
+                *out = CallbackParquetDriveResult {
+                    batch_count: 0,
+                    total_rows: 0,
+                };
+            }
+        }
+    }
+    unsafe {
+        result
+            .map(|_| true)
+            .into_extern_result(&extern_engine.as_ref())
+    }
+}
+
+#[cfg(feature = "default-engine-base")]
+fn drive_one_file(
+    engine: Arc<dyn Engine>,
+    file: KernelFileMeta,
+    schema: SchemaRef,
+) -> DeltaResult<(usize, usize)> {
+    let mut iter =
+        engine
+            .parquet_handler()
+            .read_parquet_files(std::slice::from_ref(&file), schema, None)?;
+    let mut batch_count = 0usize;
+    let mut total_rows = 0usize;
+    for batch in iter.by_ref() {
+        let batch = batch?;
+        batch_count += 1;
+        total_rows += batch.len();
+    }
+    Ok((batch_count, total_rows))
+}
+
 // ============================================================================
 // Tests -- pure-Rust shim that simulates the engine side of the vtable
 // ============================================================================
