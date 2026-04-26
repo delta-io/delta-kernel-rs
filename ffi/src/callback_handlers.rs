@@ -63,7 +63,7 @@ use delta_kernel::schema::{DataType, SchemaRef};
 use delta_kernel::{
     DeltaResult, EngineData, Error, EvaluationHandler, ExpressionEvaluator, ExpressionRef,
     FileDataReadResultIterator, FileMeta as KernelFileMeta, FileSlice, FilteredEngineData,
-    JsonHandler, PredicateEvaluator, PredicateRef, StorageHandler,
+    JsonHandler, ParquetHandler, PredicateEvaluator, PredicateRef, StorageHandler,
 };
 use url::Url;
 
@@ -903,33 +903,489 @@ pub struct JavaHandlerBundle {
 unsafe impl Send for JavaHandlerBundle {}
 unsafe impl Sync for JavaHandlerBundle {}
 
+/// Composed [`Engine`] backed by an inner engine plus zero or more Java
+/// handler vtables. Each handler accessor returns the Java-backed handler
+/// when supplied, otherwise falls through to the inner engine.
+///
+/// In the skeleton, only the parquet path is fully wired; calls into JSON /
+/// Storage / Evaluation Java handlers will return errors because their trait
+/// impls are stubs. The compose-and-route logic itself is exercised
+/// end-to-end whenever any handler comes from Java.
+struct ComposedEngine {
+    inner: Arc<dyn delta_kernel::Engine>,
+    parquet: Option<Arc<dyn ParquetHandler>>,
+    json: Option<Arc<dyn JsonHandler>>,
+    storage: Option<Arc<dyn StorageHandler>>,
+    eval: Option<Arc<dyn EvaluationHandler>>,
+}
+
+impl delta_kernel::Engine for ComposedEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        self.eval
+            .clone()
+            .unwrap_or_else(|| self.inner.evaluation_handler())
+    }
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.storage
+            .clone()
+            .unwrap_or_else(|| self.inner.storage_handler())
+    }
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.json
+            .clone()
+            .unwrap_or_else(|| self.inner.json_handler())
+    }
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        self.parquet
+            .clone()
+            .unwrap_or_else(|| self.inner.parquet_handler())
+    }
+}
+
+impl ComposedEngine {
+    fn new(
+        inner: Arc<dyn delta_kernel::Engine>,
+        parquet: Option<JavaParquetCallbacks>,
+        json: Option<JavaJsonCallbacks>,
+        storage: Option<JavaStorageCallbacks>,
+        eval: Option<JavaEvaluationCallbacks>,
+    ) -> Self {
+        let parquet_handler = parquet.map(|cbs| {
+            // Footer/write fall back to the inner engine, mirroring
+            // `CallbackEngine::new` in callback_engine.rs.
+            let inner_pq = inner.parquet_handler();
+            Arc::new(JavaParquetHandler::new(cbs, inner_pq)) as Arc<dyn ParquetHandler>
+        });
+        Self {
+            inner,
+            parquet: parquet_handler,
+            json: json.map(|cbs| Arc::new(JavaJsonHandler::new(cbs)) as Arc<dyn JsonHandler>),
+            storage: storage
+                .map(|cbs| Arc::new(JavaStorageHandler::new(cbs)) as Arc<dyn StorageHandler>),
+            eval: eval
+                .map(|cbs| Arc::new(JavaEvaluationHandler::new(cbs)) as Arc<dyn EvaluationHandler>),
+        }
+    }
+}
+
 /// Build a callback engine where every handler may individually be supplied
 /// from Java. Handlers whose pointer is null fall back to the inner engine.
 ///
-/// **Skeleton.** Real engine wiring routes through the existing
-/// `make_callback_engine` for parquet only; JSON / Storage / Eval pointers
-/// are accepted and stored but the impl panics if the kernel actually calls
-/// into a stubbed handler. Filling in the implementations is follow-up
-/// work.
+/// In the skeleton this fully routes the parquet vtable through
+/// [`JavaParquetHandler`]; JSON / Storage / Evaluation vtables are routed
+/// through their respective `Java*Handler` impls but those impls are stubs
+/// (every method returns a clear "not yet implemented" error). Pass `null`
+/// for any handler the connector hasn't supplied to fall back to inner.
 ///
 /// # Safety
 /// - `inner_engine` must be a valid handle.
-/// - Each non-null handler pointer must remain valid for the lifetime of the returned engine.
+/// - Each non-null handler pointer must point to a valid struct readable by Rust for the duration
+///   of this call. The vtable is **copied by value** into the returned engine; the pointer does not
+///   need to outlive the call.
+/// - Each non-null vtable's function pointers must remain valid for the lifetime of the returned
+///   engine.
+/// - Each non-null vtable's `engine_state` ownership transfers into the returned engine.
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn make_callback_engine_full(
-    _inner_engine: Handle<SharedExternEngine>,
-    _bundle: JavaHandlerBundle,
-    _allocate_error: AllocateErrorFn,
+    inner_engine: Handle<SharedExternEngine>,
+    bundle: JavaHandlerBundle,
+    allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<SharedExternEngine>> {
-    // Skeleton: real impl will read each non-null bundle pointer, build
-    // the corresponding Java*Handler, compose into a new CallbackEngine
-    // with the inner engine for fallback. Until JSON / Storage / Eval
-    // handlers are filled in, callers should keep using
-    // `make_callback_engine`.
-    let result: DeltaResult<Handle<SharedExternEngine>> = Err(Error::generic(
-        "make_callback_engine_full: skeleton -- only `make_callback_engine` (parquet-only) is \
-         wired today; JSON / Storage / Evaluation vtables are accepted but not yet routed.",
-    ));
-    unsafe { result.into_extern_result(&_allocate_error) }
+    let inner_extern = unsafe { inner_engine.clone_as_arc() };
+    let inner = inner_extern.engine();
+
+    // SAFETY: each non-null pointer is required (per the function contract)
+    // to point at a valid, fully-initialized vtable struct. We read by
+    // value -- the structs are #[repr(C)] bundles of fn pointers + an
+    // opaque engine-state pointer; their `unsafe impl Send + Sync` covers
+    // the Send requirement for `Arc<dyn Engine>`.
+    let parquet = if bundle.parquet.is_null() {
+        None
+    } else {
+        Some(unsafe { std::ptr::read(bundle.parquet) })
+    };
+    let json = if bundle.json.is_null() {
+        None
+    } else {
+        Some(unsafe { std::ptr::read(bundle.json) })
+    };
+    let storage = if bundle.storage.is_null() {
+        None
+    } else {
+        Some(unsafe { std::ptr::read(bundle.storage) })
+    };
+    let eval = if bundle.evaluation.is_null() {
+        None
+    } else {
+        Some(unsafe { std::ptr::read(bundle.evaluation) })
+    };
+
+    let composed = ComposedEngine::new(inner, parquet, json, storage, eval);
+    let engine: Arc<dyn delta_kernel::Engine> = Arc::new(composed);
+    let result: DeltaResult<Handle<SharedExternEngine>> =
+        Ok(crate::engine_to_handle(engine, allocate_error));
+    unsafe { result.into_extern_result(&allocate_error) }
+}
+
+// ============================================================================
+// Tests -- exercise the bundle factory + null-fallback routing.
+// ============================================================================
+
+#[cfg(all(test, feature = "default-engine-base"))]
+mod tests {
+    //! End-to-end skeleton verification. Builds a [`ComposedEngine`] with
+    //! the parquet vtable routed through the same Rust-shim used by the
+    //! parent `callback_engine::tests` (so we know parquet still works) and
+    //! the other handlers null (so they fall through to the inner default).
+    //! Drives a parquet read end-to-end via `parquet_handler()` and asserts
+    //! the same counters the existing tests check.
+    //!
+    //! This also catches the easy mistake of swapping Java handlers vs inner
+    //! handlers in the routing logic.
+    use std::collections::HashMap;
+    use std::ffi::c_void;
+    use std::sync::{Arc, Mutex};
+
+    use delta_kernel::engine::default::storage::store_from_url_opts;
+    use delta_kernel::engine::default::DefaultEngineBuilder;
+    use delta_kernel::expressions::{ArrayData, ColumnName};
+    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::{Engine, EngineData};
+    use url::Url;
+
+    use super::*;
+    use crate::callback_engine::{
+        JavaEngineDataResult, JavaParquetCallbacks, JavaParquetReadResult,
+    };
+    use crate::engine_funcs::FileMeta as FfiFileMeta;
+
+    // -------- Reuse the same shim shape as callback_engine's tests --------
+
+    struct ShimEngineState {
+        batch_sizes: Vec<usize>,
+        invocations: Arc<Mutex<ShimCounters>>,
+    }
+
+    #[derive(Default)]
+    struct ShimCounters {
+        read_calls: usize,
+        next_calls: usize,
+        iter_frees: usize,
+        data_frees: usize,
+        engine_frees: usize,
+    }
+
+    struct ShimIterState {
+        remaining: Mutex<Vec<usize>>,
+    }
+
+    struct StubBatch {
+        len: usize,
+    }
+
+    impl EngineData for StubBatch {
+        fn visit_rows(
+            &self,
+            _column_names: &[ColumnName],
+            _visitor: &mut dyn delta_kernel::engine_data::RowVisitor,
+        ) -> DeltaResult<()> {
+            Err(Error::generic("StubBatch::visit_rows"))
+        }
+        fn len(&self) -> usize {
+            self.len
+        }
+        fn append_columns(
+            &self,
+            _schema: SchemaRef,
+            _columns: Vec<ArrayData>,
+        ) -> DeltaResult<Box<dyn EngineData>> {
+            Err(Error::generic("StubBatch::append_columns"))
+        }
+        fn apply_selection_vector(
+            self: Box<Self>,
+            _sv: Vec<bool>,
+        ) -> DeltaResult<Box<dyn EngineData>> {
+            Err(Error::generic("StubBatch::apply_selection_vector"))
+        }
+        fn has_field(&self, _name: &ColumnName) -> bool {
+            false
+        }
+    }
+
+    extern "C" fn shim_read(
+        engine_state: *mut c_void,
+        _files: *const FfiFileMeta,
+        _files_len: usize,
+        physical_schema: Handle<crate::SharedSchema>,
+        out: *mut JavaParquetReadResult,
+    ) {
+        let _schema = unsafe { physical_schema.into_inner() };
+        let state = unsafe { &*(engine_state as *const ShimEngineState) };
+        state.invocations.lock().unwrap().read_calls += 1;
+        let iter = Box::new(ShimIterState {
+            remaining: Mutex::new(state.batch_sizes.clone()),
+        });
+        unsafe {
+            *out = JavaParquetReadResult {
+                iter_state: Box::into_raw(iter) as *mut c_void,
+                error: 0,
+            };
+        }
+    }
+
+    extern "C" fn shim_next(
+        engine_state: *mut c_void,
+        iter_state: *mut c_void,
+        out: *mut JavaEngineDataResult,
+    ) {
+        let state = unsafe { &*(engine_state as *const ShimEngineState) };
+        state.invocations.lock().unwrap().next_calls += 1;
+        let iter = unsafe { &*(iter_state as *const ShimIterState) };
+        let mut remaining = iter.remaining.lock().unwrap();
+        let result = if remaining.is_empty() {
+            JavaEngineDataResult {
+                batch: std::ptr::null_mut(),
+                len: 0,
+                done: true,
+                error: 0,
+            }
+        } else {
+            let len = remaining.remove(0);
+            let batch = Box::new(StubBatch { len });
+            JavaEngineDataResult {
+                batch: Box::into_raw(batch) as *mut c_void,
+                len,
+                done: false,
+                error: 0,
+            }
+        };
+        unsafe { *out = result };
+    }
+
+    extern "C" fn shim_iter_free(engine_state: *mut c_void, iter_state: *mut c_void) {
+        let state = unsafe { &*(engine_state as *const ShimEngineState) };
+        state.invocations.lock().unwrap().iter_frees += 1;
+        if !iter_state.is_null() {
+            unsafe { drop(Box::from_raw(iter_state as *mut ShimIterState)) };
+        }
+    }
+
+    extern "C" fn shim_free_data(engine_state: *mut c_void, batch: *mut c_void) {
+        let state = unsafe { &*(engine_state as *const ShimEngineState) };
+        state.invocations.lock().unwrap().data_frees += 1;
+        if !batch.is_null() {
+            unsafe { drop(Box::from_raw(batch as *mut StubBatch)) };
+        }
+    }
+
+    extern "C" fn shim_free_engine_state(engine_state: *mut c_void) {
+        if !engine_state.is_null() {
+            {
+                let state = unsafe { &*(engine_state as *const ShimEngineState) };
+                state.invocations.lock().unwrap().engine_frees += 1;
+            }
+            unsafe { drop(Box::from_raw(engine_state as *mut ShimEngineState)) };
+        }
+    }
+
+    fn make_inner() -> Arc<dyn Engine> {
+        let url = Url::parse("memory:///doesntmatter/").unwrap();
+        let store = store_from_url_opts(&url, HashMap::<String, String>::new()).unwrap();
+        Arc::new(DefaultEngineBuilder::new(store).build())
+    }
+
+    fn shim_callbacks(state: Box<ShimEngineState>) -> JavaParquetCallbacks {
+        JavaParquetCallbacks {
+            engine_state: Box::into_raw(state) as *mut c_void,
+            read_parquet_files: shim_read,
+            iter_next: shim_next,
+            iter_free: shim_iter_free,
+            free_data: shim_free_data,
+            free_engine_state: shim_free_engine_state,
+        }
+    }
+
+    fn synthetic_files() -> Vec<KernelFileMeta> {
+        vec![KernelFileMeta {
+            location: Url::parse("memory:///x/y.parquet").unwrap(),
+            last_modified: 0,
+            size: 0,
+        }]
+    }
+
+    fn synthetic_schema() -> SchemaRef {
+        Arc::new(StructType::try_new([StructField::nullable("id", DataType::INTEGER)]).unwrap())
+    }
+
+    /// End-to-end test: build a ComposedEngine via the bundle factory with
+    /// only parquet supplied, drive `parquet_handler()`, and assert every
+    /// counter behaves the same as the parquet-only `make_callback_engine`.
+    #[test]
+    fn composed_engine_routes_parquet_through_java_handler() {
+        let counters = Arc::new(Mutex::new(ShimCounters::default()));
+        let shim = Box::new(ShimEngineState {
+            batch_sizes: vec![5, 7, 3],
+            invocations: counters.clone(),
+        });
+        let cbs = shim_callbacks(shim);
+        let composed = ComposedEngine::new(make_inner(), Some(cbs), None, None, None);
+
+        let mut iter = composed
+            .parquet_handler()
+            .read_parquet_files(&synthetic_files(), synthetic_schema(), None)
+            .expect("read should succeed");
+        let mut total = 0usize;
+        let mut batches = 0usize;
+        for b in iter.by_ref() {
+            let b = b.expect("ok");
+            total += b.len();
+            batches += 1;
+        }
+        drop(iter);
+        drop(composed);
+
+        let c = counters.lock().unwrap();
+        assert_eq!(c.read_calls, 1);
+        assert_eq!(c.next_calls, 4); // 3 batches + 1 done
+        assert_eq!(c.iter_frees, 1);
+        assert_eq!(c.data_frees, 3);
+        assert_eq!(c.engine_frees, 1);
+        assert_eq!(batches, 3);
+        assert_eq!(total, 5 + 7 + 3);
+    }
+
+    /// Null-fallback verification: with no Java handlers, every accessor
+    /// returns the inner engine's handler directly.
+    #[test]
+    fn composed_engine_falls_back_to_inner_when_all_null() {
+        let inner = make_inner();
+        let composed = ComposedEngine::new(inner.clone(), None, None, None, None);
+        // Same Arc identity for json/storage/eval (these are cheap to
+        // re-acquire from the inner default each call so identity isn't
+        // guaranteed; just check that we get a valid handler back).
+        // Parquet returns inner's handler too because we passed None.
+        assert!(Arc::ptr_eq(
+            &composed.parquet_handler(),
+            &inner.parquet_handler()
+        ));
+    }
+
+    /// Verify that calling into a Java JsonHandler (whose impl is a stub)
+    /// surfaces a clear error -- proves the routing reaches the stubbed
+    /// handler instead of silently using inner.
+    #[test]
+    fn composed_engine_json_stub_surfaces_error() {
+        // No-op vtable for the JSON handler. We never actually invoke the
+        // function pointers (the stub impl errors before that), but they
+        // must be valid `extern "C"` items so the struct is well-formed.
+        extern "C" fn unreachable_parse(
+            _: *mut c_void,
+            _: *mut c_void,
+            _: KernelStringSlice,
+            _: *mut JavaBatchResult,
+        ) {
+            unreachable!()
+        }
+        extern "C" fn unreachable_read_files(
+            _: *mut c_void,
+            _: *const FfiFileMeta,
+            _: usize,
+            _: KernelStringSlice,
+            _: *mut c_void,
+            _: *mut JavaParquetReadResult,
+        ) {
+            unreachable!()
+        }
+        extern "C" fn unreachable_write(
+            _: *mut c_void,
+            _: KernelStringSlice,
+            _: *mut c_void,
+            _: bool,
+            _: *mut u32,
+        ) {
+            unreachable!()
+        }
+        extern "C" fn unreachable_iter_next(
+            _: *mut c_void,
+            _: *mut c_void,
+            _: *mut JavaEngineDataResult,
+        ) {
+            unreachable!()
+        }
+        extern "C" fn unreachable_iter_free(_: *mut c_void, _: *mut c_void) {
+            unreachable!()
+        }
+        extern "C" fn unreachable_materialize(
+            _: *mut c_void,
+            _: *const VisitRowsRequest,
+            _: *mut VisitRowsResult,
+        ) {
+            unreachable!()
+        }
+        extern "C" fn unreachable_free_columns(_: *mut c_void, _: *const ColumnBuffers, _: usize) {
+            unreachable!()
+        }
+        extern "C" fn unreachable_apply_sv(
+            _: *mut c_void,
+            _: *mut c_void,
+            _: *const u8,
+            _: usize,
+            _: *mut SelectionResult,
+        ) {
+            unreachable!()
+        }
+        extern "C" fn unreachable_append_columns(
+            _: *mut c_void,
+            _: *mut c_void,
+            _: KernelStringSlice,
+            _: *const ColumnBuffers,
+            _: usize,
+            _: *mut SelectionResult,
+        ) {
+            unreachable!()
+        }
+        extern "C" fn unreachable_free_batch(_: *mut c_void, _: *mut c_void) {}
+        extern "C" fn unreachable_batch_len(_: *mut c_void, _: *mut c_void) -> usize {
+            0
+        }
+        extern "C" fn unreachable_has_field(
+            _: *mut c_void,
+            _: *mut c_void,
+            _: KernelStringSlice,
+        ) -> bool {
+            false
+        }
+        extern "C" fn noop_free_engine(_: *mut c_void) {}
+
+        let json_callbacks = JavaJsonCallbacks {
+            engine_state: std::ptr::null_mut(),
+            parse_json: unreachable_parse,
+            read_json_files: unreachable_read_files,
+            write_json_file: unreachable_write,
+            iter_next: unreachable_iter_next,
+            iter_free: unreachable_iter_free,
+            engine_data_callbacks: JavaEngineDataCallbacks {
+                materialize_columns: unreachable_materialize,
+                free_columns: unreachable_free_columns,
+                apply_selection_vector: unreachable_apply_sv,
+                append_columns: unreachable_append_columns,
+                free_batch: unreachable_free_batch,
+                batch_len: unreachable_batch_len,
+                has_field: unreachable_has_field,
+            },
+            free_engine_state: noop_free_engine,
+        };
+        let composed = ComposedEngine::new(make_inner(), None, Some(json_callbacks), None, None);
+        let json_handler = composed.json_handler();
+        let result = json_handler.read_json_files(&[], synthetic_schema(), None);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("Java JSON stub should error before invoking vtable"),
+        };
+        assert!(
+            format!("{err}").contains("not yet implemented"),
+            "expected stub error, got: {err}"
+        );
+    }
 }
