@@ -6,8 +6,8 @@
 //! This satisfies the fundamental invariant of the CRC system:
 //!
 //! ```text
-//! Crc[N] + CrcUpdate(N→N+1) = Crc[N+1]
-//! Crc[N] + CrcUpdate(N→M)   = Crc[M]    (M > N+1)
+//! Crc[N] + CrcUpdate(N->N+1) = Crc[N+1]
+//! Crc[N] + CrcUpdate(N->M)   = Crc[M]    (M > N+1)
 //! ```
 //!
 //! `apply` itself is *forward*: it always reads the equation left-to-right (older + delta =
@@ -156,15 +156,15 @@ impl CrcUpdate {
 /// would be misleading).
 ///
 /// Behavior:
-/// - `(Some(base), Some(net))` → merge via [`FileSizeHistogram::try_apply_delta`]; on failure
+/// - `(Some(base), Some(net))` -> merge via [`FileSizeHistogram::try_apply_delta`]; on failure
 ///   (boundary mismatch, negative counts after merge), drop and warn.
-/// - `(Some(base), None)` → drop. The base had a histogram but the update could not provide one;
+/// - `(Some(base), None)` -> drop. The base had a histogram but the update could not provide one;
 ///   carrying the base forward without the update's contribution would be stale.
-/// - `(None, Some(_))` → drop. The base lacked a histogram, so the update's net histogram alone (a
+/// - `(None, Some(_))` -> drop. The base lacked a histogram, so the update's net histogram alone (a
 ///   delta over an unknown baseline) cannot be turned into an absolute. The right place to seed an
 ///   initial histogram is [`CrcUpdate::into_fresh_crc`], which receives an absolute (full-replay)
 ///   histogram rather than a delta.
-/// - `(None, None)` → stay `None`.
+/// - `(None, None)` -> stay `None`.
 fn merge_histogram(
     base: Option<&FileSizeHistogram>,
     delta: Option<&FileSizeHistogram>,
@@ -188,7 +188,7 @@ fn merge_histogram(
 impl Crc {
     /// Apply a [`CrcUpdate`], advancing this CRC to the new version.
     ///
-    /// Implements the fundamental invariant `Crc[N] + CrcUpdate(N→M) = Crc[M]`. Direction-
+    /// Implements the fundamental invariant `Crc[N] + CrcUpdate(N->M) = Crc[M]`. Direction-
     /// agnostic: works for single-commit deltas (M = N+1) or accumulated multi-commit
     /// deltas (M > N+1) interchangeably.
     ///
@@ -239,7 +239,7 @@ impl Crc {
         }
 
         // Set transactions: upsert from update map. No tombstone semantic for txns. Same
-        // Untracked → Partial transition.
+        // Untracked -> Partial transition.
         if !set_transactions.is_empty() {
             match &mut self.set_transactions {
                 SetTransactionState::Complete(map) | SetTransactionState::Partial(map) => {
@@ -744,7 +744,7 @@ mod tests {
 
     #[test]
     fn apply_drops_histogram_when_base_none_delta_some() {
-        // A base CRC without a histogram + an update with a delta histogram → the
+        // A base CRC without a histogram + an update with a delta histogram -> the
         // resulting CRC has no histogram. The delta is an *increment* over an unknown
         // baseline, so adopting it as the absolute histogram would be wrong (it would
         // describe only this commit's files, not the table's full file set). The right

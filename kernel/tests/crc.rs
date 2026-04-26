@@ -224,7 +224,7 @@ async fn test_post_commit_crc_always_chains_under_eager_arc_crc_design(
     #[case] use_post_commit_snapshot: bool,
 ) -> DeltaResult<()> {
     // Under the eager Arc<Crc> design, every snapshot has a CRC. The post-commit chain
-    // (Crc[N] + CrcUpdate(N→N+1) = Crc[N+1]) works regardless of how Crc[N] was sourced
+    // (Crc[N] + CrcUpdate(N->N+1) = Crc[N+1]) works regardless of how Crc[N] was sourced
     // -- post-commit-from-prior-commit, fresh-from-disk, full replay, etc.
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let create_committed = create_table_and_commit(&table_path, engine.as_ref())?;
@@ -451,7 +451,7 @@ async fn test_load_file_stats_recovers_indeterminate_to_valid() -> DeltaResult<(
     let snapshot_v1 = committed.post_commit_snapshot().unwrap().clone();
     let stats_v1 = snapshot_v1.get_file_stats().unwrap();
 
-    // ANALYZE STATS at v2 → Indeterminate
+    // ANALYZE STATS at v2 -> Indeterminate
     let committed = snapshot_v1
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("ANALYZE STATS".to_string())
@@ -761,7 +761,7 @@ async fn test_incremental_snapshot_old_crc_only_builds_crc_via_stale_replay() ->
 
     // Incrementally update from v0 -> v1. The new listing finds no v1 CRC file but the
     // old segment's 0.crc is preserved. The new snapshot's CRC is built by:
-    //   load 0.crc → Crc[0] → reverse-replay commit v1 → apply → Crc[1].
+    //   load 0.crc -> Crc[0] -> reverse-replay commit v1 -> apply -> Crc[1].
     let incremental_v1 = Snapshot::builder_from(fresh_v0).build(engine.as_ref())?;
     assert_eq!(incremental_v1.version(), 1);
     let crc_v1 = incremental_v1
@@ -1644,7 +1644,7 @@ async fn test_stale_crc_missing_histogram_replays_with_no_histogram() -> DeltaRe
     assert!(stats.table_size_bytes() > 0);
     assert!(
         stats.file_size_histogram().is_none(),
-        "stale CRC without histogram + delta histogram → no histogram in result"
+        "stale CRC without histogram + delta histogram -> no histogram in result"
     );
 
     Ok(())

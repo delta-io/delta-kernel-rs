@@ -70,8 +70,8 @@ pub enum FileStatsState {
 
     /// A non-incremental operation (like ANALYZE STATS) was encountered during replay. File
     /// stats cannot be determined incrementally because files may have been re-added without
-    /// corresponding removes. Recovery: full add/remove deduplication (deferred --
-    /// [`Snapshot::load_file_stats`](crate::snapshot::Snapshot::load_file_stats) stub).
+    /// corresponding removes. Recovery: full add/remove deduplication via
+    /// [`Snapshot::load_file_stats`](crate::snapshot::Snapshot::load_file_stats).
     Indeterminate,
 
     /// A remove action had a missing `size` field. Byte-level file stats are permanently

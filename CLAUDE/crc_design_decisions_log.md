@@ -1,12 +1,13 @@
 # CRC Prototype 4 — Design Decisions Log
 
-Running log of decisions made while implementing the CRC redesign on `stack/crc_prototype_4` (branched off `main`), with code copied/adapted from the stale `stack/crc_replay_prototype_3` per `~/claude_plans/2026_04_25_crc_design_plan.md`.
+Running log of decisions made while implementing the CRC redesign on `stack/crc_prototype_4`
+(branched off `main`), with code copied/adapted from the stale `stack/crc_replay_prototype_3`.
 
 ## Source-of-truth pointers
 
-- Plan: `~/claude_plans/2026_04_25_crc_design_plan.md`
 - Stale prototype: `origin/stack/crc_replay_prototype_3` (10 commits, diverged at `f5b7b5af`)
 - Current base: `main` (HEAD `6486bd26`, post #2387)
+- Design doc shipped in tree: [`CLAUDE/crc_design.md`](./crc_design.md)
 
 ## Decision log
 
@@ -75,7 +76,7 @@ The Snapshot fast-path branches on the variant:
 
 ### Decision E — Defer connector-hint API
 
-`SnapshotBuilder::with_eager_file_stats(bool)` is in the plan's "deferred" bucket. Skip for now. We always do the cheap path (load CRC file, replay if stale). Reyden / Untrackable recovery comes via `Snapshot::load_file_stats(engine)` (stubbed `Err`).
+`SnapshotBuilder::with_eager_file_stats(bool)` is in the plan's "deferred" bucket. Skip for now. We always do the cheap path (load CRC file, replay if stale). Recovery from `Indeterminate` / `RequiresCheckpointRead` is implemented via `Snapshot::load_file_stats(engine)`.
 
 ### Decision F — Keep the existing `LazyCrc` plumbing for P&M-only replay
 

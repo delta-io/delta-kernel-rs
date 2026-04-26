@@ -86,7 +86,7 @@ fn recovery_schema() -> DeltaResult<SchemaRef> {
 /// for that key was an Add (file is active and counted). When `false`, the first-seen action
 /// was a Remove (file is tombstoned and any older Add for the same key must be ignored).
 struct ReconciliationAccumulator {
-    /// Map of `(path, dv_unique_id)` → was-first-seen-an-add (true) or remove (false).
+    /// Map of `(path, dv_unique_id)` -> was-first-seen-an-add (true) or remove (false).
     /// Using a HashMap (not a HashSet) lets us assert the dedup invariant:
     /// the same key should never be inserted twice.
     seen: HashMap<FileKey, bool>,

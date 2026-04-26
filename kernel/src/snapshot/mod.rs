@@ -398,9 +398,9 @@ impl Snapshot {
     /// Create a new [`Snapshot`] instance.
     ///
     /// Eagerly builds the [`Crc`] from disk:
-    /// - CRC at target version → load directly, P&M from the CRC.
-    /// - CRC at an older version (stale) → load + reverse-replay newer commits + apply.
-    /// - No CRC, or CRC failed → reverse-replay the entire segment (checkpoint + commits) to build
+    /// - CRC at target version -> load directly, P&M from the CRC.
+    /// - CRC at an older version (stale) -> load + reverse-replay newer commits + apply.
+    /// - No CRC, or CRC failed -> reverse-replay the entire segment (checkpoint + commits) to build
     ///   a fresh `Crc` from scratch.
     #[instrument(err, fields(version, operation_id = %operation_id), skip(engine))]
     fn try_new_from_log_segment(
@@ -514,7 +514,7 @@ impl Snapshot {
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
     ///
-    /// Implements the universal invariant `Crc[N] + CrcUpdate(N→N+1) = Crc[N+1]`:
+    /// Implements the universal invariant `Crc[N] + CrcUpdate(N->N+1) = Crc[N+1]`:
     /// 1. Append the new commit to the log segment, bumping version to N+1.
     /// 2. Clone this snapshot's CRC (which is `Crc[N]`).
     /// 3. Apply the `crc_update` produced by the transaction.
@@ -557,7 +557,7 @@ impl Snapshot {
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
-        // Crc[N] + CrcUpdate(N→N+1) = Crc[N+1].
+        // Crc[N] + CrcUpdate(N->N+1) = Crc[N+1].
         let mut new_crc = (*self.crc).clone();
         new_crc.apply(crc_update);
 
@@ -802,8 +802,8 @@ impl Snapshot {
     ///   such txn exists at this version. Return directly.
     /// - [`Partial`](SetTransactionState::Partial): the cache has known-correct entries from newer
     ///   commits. On hit, return; on miss, the txn might exist in older commits not covered by the
-    ///   cache → fall through to log replay.
-    /// - [`Untracked`](SetTransactionState::Untracked): no cache → fall through to log replay.
+    ///   cache -> fall through to log replay.
+    /// - [`Untracked`](SetTransactionState::Untracked): no cache -> fall through to log replay.
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
     #[instrument(parent = &self.span, name = "snap.get_app_id_version", skip_all, err)]
     pub fn get_app_id_version(
@@ -946,7 +946,7 @@ impl Snapshot {
     ///   commits. For specific-domain queries, check cache; on miss, replay only the missing
     ///   domains. For "all domains" queries, must fully replay (cache might be missing older
     ///   domains).
-    /// - [`Untracked`](DomainMetadataState::Untracked): no cache → log replay.
+    /// - [`Untracked`](DomainMetadataState::Untracked): no cache -> log replay.
     ///
     /// This is the single entry point for all domain metadata reads on a snapshot.
     #[internal_api]
@@ -1106,11 +1106,11 @@ impl Snapshot {
     ///   ([`Valid`](crate::crc::FileStatsState::Valid)). Non-Valid states arise from: (a) a
     ///   non-incremental operation like `ANALYZE STATS`
     ///   ([`Indeterminate`](crate::crc::FileStatsState::Indeterminate)) -- recoverable via
-    ///   [`load_file_stats`](Self::load_file_stats) (priority 5, currently stubbed); (b) a file
-    ///   action had a missing size ([`Untrackable`](crate::crc::FileStatsState::Untrackable)) --
-    ///   permanently unrecoverable; (c) the snapshot was built without a checkpoint read
+    ///   [`load_file_stats`](Self::load_file_stats); (b) a file action had a missing size
+    ///   ([`Untrackable`](crate::crc::FileStatsState::Untrackable)) -- permanently
+    ///   unrecoverable; (c) the snapshot was built without a checkpoint read
     ///   ([`RequiresCheckpointRead`](crate::crc::FileStatsState::RequiresCheckpointRead)) --
-    ///   recoverable via the same path.
+    ///   recoverable via [`load_file_stats`](Self::load_file_stats).
     /// - I/O errors from the engine's storage handler if the write fails.
     ///
     /// [`CommittedTransaction::post_commit_snapshot`]: crate::transaction::CommittedTransaction::post_commit_snapshot

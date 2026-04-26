@@ -51,23 +51,33 @@ let zip = snap.get_domain_metadata("zip", &engine)?;
 **Cost:** for the common case (CRC at target on disk OR full-replay produces Complete DM),
 the second call is **zero I/O** — DM is in memory.
 
-### CUJ 2: Query file stats (Reyden, vacuum, etc.)
+### CUJ 2: Query file stats (vacuum-style readers, etc.)
 
 ```rust
-let stats = snap.get_file_stats_if_loaded();   // no I/O
-// or
-let stats = snap.get_or_load_file_stats(&engine);
+// No I/O. Returns Some(FileStats) only when CRC's FileStatsState is Valid.
+let stats = snap.get_file_stats();
 ```
 
-**Flow:** both methods read `crc.file_stats()`, which returns `Some(FileStats)` only when
-`FileStatsState` is `Valid`. For other states (Indeterminate, Untrackable, RequiresCheckpointRead),
-returns `None`.
+**Flow:** reads `crc.file_stats()`, which returns `Some(FileStats)` only when
+`FileStatsState` is `Valid`. For other states (`Indeterminate`, `Untrackable`,
+`RequiresCheckpointRead`), returns `None`.
 
 **Cost:** zero I/O — file stats are precomputed during snapshot load.
 
-**Recovery (deferred):** if `crc.file_stats_validity()` is `Indeterminate` (e.g. ANALYZE STATS
-ran), call `snap.load_file_stats(&engine)` to trigger a full action-reconciliation pass that
-recovers absolute file stats. Currently stubbed; lands with priority 5.
+**Recovery:** if `crc.file_stats_validity()` is `Indeterminate` or
+`RequiresCheckpointRead`, call
+
+```rust
+let recovered: SnapshotRef = snap.load_file_stats(&engine)?;
+```
+
+to perform a full action-reconciliation pass and rebuild absolute file stats. The
+recovered snapshot has `Valid` file stats (or `Untrackable` if a remove with missing
+size was found during recovery, in which case byte-level stats are permanently
+impossible). All other CRC fields (P/M, DM, txns, ICT) are preserved.
+
+If `crc.file_stats_validity()` is already `Untrackable`, `load_file_stats` returns
+`Error::ChecksumWriteUnsupported` — there is no recovery path.
 
 ### CUJ 3: Commit a transaction
 
@@ -159,7 +169,7 @@ tombstones remove the entry).
 Repeated apply composes: `Crc[N].apply(δ₁); .apply(δ₂); ...` is equivalent to
 `Crc[N].apply(δ₁ ⊕ δ₂ ⊕ ...)` where `⊕` is delta-merge.
 
-### Three production strategies
+### Production strategies
 
 The four ways to produce a `CrcUpdate`:
 
@@ -171,15 +181,19 @@ The four ways to produce a `CrcUpdate`:
    stats; finalize → one `CrcUpdate`. Used for:
    - Stale-CRC catchup (apply the update onto the loaded base CRC).
    - No-CRC bootstrap (call `into_fresh_crc()` to construct a fresh `Crc`).
-3. **Forward per-commit** *(future)*: rebase / row-level concurrency. Each winning commit's
+3. **Action reconciliation** (`LogSegment::recover_file_stats`, called by
+   `Snapshot::load_file_stats`): a dedicated `ReconciliationVisitor` reads the entire
+   segment with `(path, dv_unique_id)` deduplication, building absolute file stats
+   from scratch. The result is a `FileStatsState` that replaces the snapshot's CRC
+   `file_stats` field; other CRC fields are preserved.
+4. **Forward per-commit** *(future)*: rebase / row-level concurrency. Each winning commit's
    actions → one `CrcUpdate`, applied per-commit with conflict checks interleaved. Same
    `CrcUpdate` shape, same `Crc::apply`.
-4. **Action reconciliation** *(future, priority 5)*: forked visitor with wider schema +
-   `FileActionDeduplicator` recovers absolute file stats from `Indeterminate`. Same
-   `CrcUpdate` output, same `Crc::apply`.
 
-All four feed the same mutator. Direction (forward vs reverse) is a per-strategy
-implementation choice; the `CrcUpdate` shape is direction-agnostic.
+The first three are implemented today. Strategies 1, 2, and 4 feed the same `Crc::apply`
+mutator; strategy 3 directly produces a `FileStatsState` and patches the CRC field.
+Direction (forward vs reverse) is a per-strategy implementation choice; the `CrcUpdate`
+shape is direction-agnostic.
 
 ### State enums
 
@@ -264,7 +278,7 @@ The following scenarios are handled by the implementation. Test coverage is in
 
 | # | Scenario | Transition |
 |---|----------|------------|
-| P1 | CREATE TABLE | Crc[0] built via `into_crc_for_version_zero` |
+| P1 | CREATE TABLE | Crc[0] built via `CrcUpdate::into_fresh_crc` |
 | P2 | Blind append | Valid → Valid (sums + histogram bins inserted) |
 | P3 | MERGE / UPDATE / DELETE | Valid → Valid |
 | P4 | OPTIMIZE | Valid → Valid (many adds + many removes; net file count drops) |
@@ -317,16 +331,17 @@ The following scenarios are handled by the implementation. Test coverage is in
 | C3 | CRC written but `_last_checkpoint` not updated | Independent — CRC is just a hint |
 | C4 | Reader loads snapshot during concurrent commit | Sees consistent state at its version (snapshots are immutable) |
 
-### Recovery (deferred, priority 5)
+### Recovery via `Snapshot::load_file_stats`
 
-| # | Scenario | Future behavior |
-|---|----------|-----------------|
-| Rec1 | Indeterminate Crc, caller calls `load_file_stats` | Trigger reverse reconciliation, recover Valid |
-| Rec2 | Untrackable Crc, caller calls `load_file_stats` | Error (permanently unrecoverable) |
-| Rec3 | RequiresCheckpointRead, caller calls `load_file_stats` | Read checkpoint adds, merge with deltas, transition to Valid |
+| # | Scenario | Behavior |
+|---|----------|----------|
+| Rec1 | Indeterminate Crc, caller calls `load_file_stats` | Full reverse-replay with `(path, dv_unique_id)` deduplication; transitions to Valid (or Untrackable if a Remove with missing size is observed). |
+| Rec2 | Untrackable Crc, caller calls `load_file_stats` | Returns `Error::ChecksumWriteUnsupported` (permanently unrecoverable). |
+| Rec3 | RequiresCheckpointRead, caller calls `load_file_stats` | Same full-replay pass: reads commits + checkpoint together, dedups by `(path, dv_unique_id)`, transitions to Valid. |
+| Rec4 | Valid Crc, caller calls `load_file_stats` | No-op fast path; returns `Arc::clone(self)`. |
 
-Today: `Snapshot::load_file_stats(engine)` is stubbed as `Err`. The API surface is locked
-in for connectors.
+All other CRC fields (P/M, DM, txns, ICT) are preserved through recovery; only
+`file_stats` is rebuilt.
 
 ---
 
@@ -341,7 +356,7 @@ No write_checksum unless writing.
 
 Cost: one snapshot load (one batched read). Subsequent queries are zero I/O.
 
-### "Eager" writer (Reyden, Zerobus)
+### "Eager" streaming writer
 
 ```
 Loop:
@@ -427,7 +442,8 @@ For a stale or corrupt CRC that fails to load: warn and fall back to the no-CRC 
    queries against Partial that hit the cache return without I/O, but the cache is not
    exhaustive — callers requesting "all domains" trigger a full log replay.
 3. **Histogram dropped on degraded state.** Indeterminate and Untrackable have no histogram
-   field. Recovery via `load_file_stats` (priority 5) will rebuild it.
+   field. Recovery via `load_file_stats` rebuilds the histogram from active files (using
+   default bin boundaries).
 4. **Operation safety whitelist is conservative.** `INCREMENTAL_SAFE_OPS` lists
    `WRITE`, `MERGE`, `UPDATE`, `DELETE`, `OPTIMIZE`, `CREATE TABLE`, `REPLACE TABLE`,
    `CREATE TABLE AS SELECT`, `REPLACE TABLE AS SELECT`, `CREATE OR REPLACE TABLE AS SELECT`.
@@ -464,7 +480,7 @@ For a stale or corrupt CRC that fails to load: warn and fall back to the no-CRC 
 |------|---------|
 | `kernel/src/crc/mod.rs` | `Crc` struct, `CrcRaw` serde intermediate, `minimal_from_pm` |
 | `kernel/src/crc/state.rs` | `FileStatsState`, `DomainMetadataState`, `SetTransactionState`, `FileStatsValidity` |
-| `kernel/src/crc/delta.rs` | `CrcUpdate`, `Crc::apply`, `into_fresh_crc`, `into_crc_for_version_zero`, histogram merge |
+| `kernel/src/crc/delta.rs` | `CrcUpdate`, `Crc::apply`, `into_fresh_crc`, `transition_file_stats`, histogram merge |
 | `kernel/src/crc/file_stats.rs` | `FileStats`, `FileStatsDelta`, `try_compute_for_txn`, `is_incremental_safe` whitelist |
 | `kernel/src/crc/file_size_histogram.rs` | `FileSizeHistogram`, default bins, `try_apply_delta`, `try_add`, `try_sub` |
 | `kernel/src/crc/reader.rs` | `try_read_crc_file` (storage handler) |

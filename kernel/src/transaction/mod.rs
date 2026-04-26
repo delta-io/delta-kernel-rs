@@ -1136,7 +1136,7 @@ impl<S> Transaction<S> {
 
         let (post_commit_stats, post_commit_snapshot) = match &self.read_snapshot_opt {
             Some(snap) => {
-                // Existing table path: Crc[N] + CrcUpdate(N→N+1) = Crc[N+1].
+                // Existing table path: Crc[N] + CrcUpdate(N->N+1) = Crc[N+1].
                 let stats = PostCommitStats {
                     commits_since_checkpoint: snap.log_segment().commits_since_checkpoint() + 1,
                     commits_since_log_compaction: snap

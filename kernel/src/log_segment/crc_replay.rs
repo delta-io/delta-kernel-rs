@@ -41,7 +41,8 @@ use crate::{DeltaResult, Engine, RowVisitor};
 /// transitions file stats to [`Untrackable`](crate::crc::FileStatsState::Untrackable).
 ///
 /// Does NOT include `add.path` or DV columns -- the accumulator does no deduplication
-/// (Incremental strategy). Action reconciliation (priority 5) will need a wider schema.
+/// (Incremental strategy). Action reconciliation (`Snapshot::load_file_stats`) uses a
+/// separate visitor with a wider schema (see `file_stats_recovery.rs`).
 fn crc_replay_schema() -> DeltaResult<SchemaRef> {
     get_commit_schema().project(&[
         ADD_NAME,
@@ -62,7 +63,7 @@ impl LogSegment {
     /// to contain only commits in `(crc_version, end_version]`. The base CRC is the loaded
     /// value of `{crc_version}.crc` from disk.
     ///
-    /// Implements the universal invariant `Crc[X] + CrcUpdate(X→M) = Crc[M]`. The update
+    /// Implements the universal invariant `Crc[X] + CrcUpdate(X->M) = Crc[M]`. The update
     /// is produced via reverse iteration with first-seen-wins semantics; the apply is
     /// forward (last-write-wins, but the update has already pre-merged via first-seen).
     #[instrument(name = "log_seg.build_crc_from_stale", skip_all, err)]
@@ -205,7 +206,7 @@ impl CrcReplayAccumulator {
     fn into_crc_update(self) -> CrcUpdate {
         // Operation-safety classification:
         // - If we observed log inputs and saw commitInfo: trust `operation_safe`.
-        // - If we observed log inputs but no commitInfo: provenance unknown → unsafe.
+        // - If we observed log inputs but no commitInfo: provenance unknown -> unsafe.
         // - If we observed no log inputs (empty range or checkpoint-only): trivially safe -- there
         //   were no operations to evaluate.
         let operation_safe = if self.has_log_action_inputs {
@@ -430,7 +431,7 @@ mod tests {
     #[test]
     fn accumulator_with_log_inputs_but_no_commit_info_is_indeterminate() {
         // We saw add/remove rows in commit batches but no commitInfo: provenance unknown.
-        // Conservative: mark unsafe → file stats become Indeterminate via Crc::apply.
+        // Conservative: mark unsafe -> file stats become Indeterminate via Crc::apply.
         let mut acc = empty_acc();
         acc.has_log_action_inputs = true;
         // has_commit_info stays false.
