@@ -1037,24 +1037,66 @@ impl Snapshot {
         Some(self.version())
     }
 
-    /// Recover file stats for an [`Indeterminate`](crate::crc::FileStatsState::Indeterminate)
-    /// or [`RequiresCheckpointRead`](crate::crc::FileStatsState::RequiresCheckpointRead)
-    /// CRC by performing a full action reconciliation pass over the log.
+    /// Recover file stats by performing full action reconciliation across the log.
     ///
-    /// Returns a new [`SnapshotRef`] whose CRC has [`Valid`](crate::crc::FileStatsState::Valid)
-    /// file stats (or [`Untrackable`](crate::crc::FileStatsState::Untrackable) if a remove
-    /// with missing size was found during recovery).
+    /// Returns a new [`SnapshotRef`] whose CRC has either:
+    /// - [`Valid`](crate::crc::FileStatsState::Valid) absolute counts, byte totals, and a
+    ///   histogram, OR
+    /// - [`Untrackable`](crate::crc::FileStatsState::Untrackable) if any Remove action in the
+    ///   reachable history had a missing `size` field (byte totals are then permanently impossible
+    ///   to compute).
     ///
-    /// **Currently stubbed** as `Err(Error::FileStatsRecoveryNotImplemented)`. Locks in the
-    /// recovery API surface for connectors; the implementation lands when priority 5
-    /// (action reconciliation) is built. See `~/claude_plans/2026_04_25_crc_design_plan.md`.
-    #[allow(unused)]
-    pub fn load_file_stats(self: &SnapshotRef, _engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
-        Err(Error::generic(
-            "Snapshot::load_file_stats is not yet implemented. \
-             File stats recovery for Indeterminate/RequiresCheckpointRead CRCs lands with \
-             priority 5 (action reconciliation).",
-        ))
+    /// Behavior by current CRC state:
+    /// - [`Valid`](crate::crc::FileStatsState::Valid): returns the same snapshot. No work.
+    /// - [`Indeterminate`](crate::crc::FileStatsState::Indeterminate) /
+    ///   [`RequiresCheckpointRead`](crate::crc::FileStatsState::RequiresCheckpointRead):
+    ///   reverse-replays the entire log segment with `(path, dv_unique_id)` deduplication and
+    ///   rebuilds file stats from scratch.
+    /// - [`Untrackable`](crate::crc::FileStatsState::Untrackable): returns
+    ///   [`Error::ChecksumWriteUnsupported`]. There is no recovery for this state -- a Remove
+    ///   action committed without a `size` permanently destroys byte-level tracking.
+    ///
+    /// All other CRC fields (P&M, DM, txns, ICT) are preserved.
+    ///
+    /// # Cost
+    ///
+    /// Reads every commit in the log segment plus the checkpoint (if any), with a wider
+    /// schema than ordinary snapshot loads (includes Add/Remove `path`, `size`, and DV
+    /// descriptor columns for deduplication). Connectors should call this only when
+    /// [`Crc::file_stats_validity`](crate::crc::Crc::file_stats_validity) indicates a
+    /// non-`Valid` state.
+    ///
+    /// # Errors
+    ///
+    /// - I/O errors from the engine while reading commits and checkpoint.
+    /// - [`Error::ChecksumWriteUnsupported`] when the current state is `Untrackable`.
+    #[instrument(parent = &self.span, name = "snap.load_file_stats", skip_all, err)]
+    pub fn load_file_stats(self: &SnapshotRef, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+        use crate::crc::FileStatsValidity;
+
+        match self.crc.file_stats_validity() {
+            FileStatsValidity::Valid => return Ok(Arc::clone(self)),
+            FileStatsValidity::Untrackable => {
+                return Err(Error::ChecksumWriteUnsupported(
+                    "File stats are Untrackable -- a Remove action with a missing size \
+                     was encountered. Byte-level statistics are permanently unrecoverable."
+                        .to_string(),
+                ));
+            }
+            FileStatsValidity::Indeterminate | FileStatsValidity::RequiresCheckpointRead => {}
+        }
+
+        let recovered = self.log_segment().recover_file_stats(engine)?;
+
+        // Preserve all other CRC fields; only file_stats is rebuilt.
+        let mut new_crc = (*self.crc).clone();
+        new_crc.file_stats = recovered;
+
+        Ok(Arc::new(Snapshot::new_with_crc(
+            self.log_segment().clone(),
+            self.table_configuration().clone(),
+            Arc::new(new_crc),
+        )))
     }
 
     /// Writes a version checksum (CRC) file for this snapshot. Writers should call this

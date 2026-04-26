@@ -432,6 +432,131 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
     Ok(())
 }
 
+#[tokio::test]
+async fn test_load_file_stats_recovers_indeterminate_to_valid() -> DeltaResult<()> {
+    // Given a snapshot whose CRC has Indeterminate file stats (because an unsafe op was
+    // applied), load_file_stats performs full action reconciliation and returns a new
+    // snapshot with Valid stats. All other CRC fields (P/M, DM, txns) are preserved.
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // Build a table with two inserts then an ANALYZE STATS, putting the post-commit CRC
+    // into Indeterminate.
+    let committed = create_table_and_commit(&table_path, engine.as_ref())?;
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
+
+    let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+    let committed = insert_data(snapshot_v0, &engine, vec![col])
+        .await?
+        .unwrap_committed();
+    let snapshot_v1 = committed.post_commit_snapshot().unwrap().clone();
+    let stats_v1 = snapshot_v1.get_or_load_file_stats(engine.as_ref()).unwrap();
+
+    // ANALYZE STATS at v2 → Indeterminate
+    let committed = snapshot_v1
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("ANALYZE STATS".to_string())
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let snapshot_v2 = committed.post_commit_snapshot().unwrap().clone();
+    assert_eq!(
+        snapshot_v2
+            .get_current_crc_if_loaded_for_testing()
+            .unwrap()
+            .file_stats_validity(),
+        FileStatsValidity::Indeterminate
+    );
+
+    // ===== WHEN =====
+    let recovered = snapshot_v2.load_file_stats(engine.as_ref())?;
+
+    // ===== THEN: file stats are Valid and match what they were before the unsafe op =====
+    assert_eq!(
+        recovered
+            .get_current_crc_if_loaded_for_testing()
+            .unwrap()
+            .file_stats_validity(),
+        FileStatsValidity::Valid
+    );
+    let stats_recovered = recovered.get_or_load_file_stats(engine.as_ref()).unwrap();
+    assert_eq!(stats_recovered.num_files(), stats_v1.num_files());
+    assert_eq!(
+        stats_recovered.table_size_bytes(),
+        stats_v1.table_size_bytes()
+    );
+    // Histogram is rebuilt during recovery.
+    assert!(stats_recovered.file_size_histogram().is_some());
+
+    // Other CRC fields preserved.
+    let recovered_crc = recovered.get_current_crc_if_loaded_for_testing().unwrap();
+    let original_crc = snapshot_v2.get_current_crc_if_loaded_for_testing().unwrap();
+    assert_eq!(recovered_crc.protocol, original_crc.protocol);
+    assert_eq!(recovered_crc.metadata, original_crc.metadata);
+    assert_eq!(
+        recovered_crc.domain_metadata.map(),
+        original_crc.domain_metadata.map()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_load_file_stats_recovered_crc_can_be_written_to_disk() -> DeltaResult<()> {
+    // After recovery, the snapshot's CRC is Valid, so write_checksum succeeds. This is the
+    // end-to-end win for connectors: ANALYZE STATS no longer permanently blocks CRC writes.
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let committed = create_table_and_commit(&table_path, engine.as_ref())?;
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
+
+    let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+    let committed = insert_data(snapshot_v0, &engine, vec![col])
+        .await?
+        .unwrap_committed();
+    let snapshot_v1 = committed.post_commit_snapshot().unwrap().clone();
+
+    let committed = snapshot_v1
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation("ANALYZE STATS".to_string())
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let snapshot_v2 = committed.post_commit_snapshot().unwrap().clone();
+
+    // Before recovery: write_checksum errors with ChecksumWriteUnsupported.
+    let err = snapshot_v2.write_checksum(engine.as_ref()).unwrap_err();
+    assert!(matches!(
+        err,
+        delta_kernel::Error::ChecksumWriteUnsupported(_)
+    ));
+
+    // Recover and write succeeds.
+    let recovered = snapshot_v2.load_file_stats(engine.as_ref())?;
+    let (result, _) = recovered.write_checksum(engine.as_ref())?;
+    assert_eq!(result, ChecksumWriteResult::Written);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_load_file_stats_on_valid_snapshot_returns_same_snapshot() -> DeltaResult<()> {
+    // load_file_stats short-circuits when the CRC is already Valid: returns Arc::clone(self).
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let committed = create_table_and_commit(&table_path, engine.as_ref())?;
+    let snapshot = committed.post_commit_snapshot().unwrap().clone();
+    assert_eq!(
+        snapshot
+            .get_current_crc_if_loaded_for_testing()
+            .unwrap()
+            .file_stats_validity(),
+        FileStatsValidity::Valid
+    );
+
+    let recovered = snapshot.load_file_stats(engine.as_ref())?;
+
+    // Same Arc.
+    assert!(Arc::ptr_eq(&snapshot, &recovered));
+
+    Ok(())
+}
+
 // ============================================================================
 // Write checksum to disk
 // ============================================================================
