@@ -65,9 +65,18 @@ pub(crate) struct CrcUpdate {
     pub(crate) domain_metadata: HashMap<String, DomainMetadata>,
     /// Set transaction changes keyed by `app_id`. Pre-keyed for direct upsert.
     pub(crate) set_transactions: HashMap<String, SetTransaction>,
-    /// In-commit timestamp from the latest commit covered by this update. `None` clears,
-    /// `Some` sets.
-    pub(crate) in_commit_timestamp: Option<i64>,
+    /// In-commit timestamp observed by the producer. The outer `Option` is "did the
+    /// producer observe ICT data" (None = no observation; the apply leaves the base CRC's
+    /// ICT untouched). The inner `Option` is the ICT value itself: `Some(v)` sets the new
+    /// ICT, `None` clears it (e.g. ICT was disabled).
+    ///
+    /// In practice:
+    /// - Commit-time path: always `Some(maybe_ict)` -- the transaction either has ICT enabled
+    ///   (`Some(Some(v))`) or doesn't (`Some(None)`).
+    /// - Reverse-replay accumulator: `Some(maybe_ict)` only when at least one commit's
+    ///   `commitInfo.inCommitTimestamp` was observed; `None` when the segment was empty or
+    ///   contained no commitInfo (trivially safe / checkpoint-only branches).
+    pub(crate) in_commit_timestamp: Option<Option<i64>>,
     /// `true` iff every observed commit had an incremental-safe operation. `false` if any
     /// commit's `commitInfo.operation` was unrecognized, missing, or known-unsafe (e.g.
     /// `ANALYZE STATS`). Producers compute this once.
@@ -137,7 +146,7 @@ impl CrcUpdate {
             file_stats,
             domain_metadata,
             set_transactions,
-            in_commit_timestamp_opt: self.in_commit_timestamp,
+            in_commit_timestamp_opt: self.in_commit_timestamp.flatten(),
         })
     }
 }
@@ -242,9 +251,14 @@ impl Crc {
             }
         }
 
-        // In-commit timestamp: replace unconditionally. ICT could be disabled (Some →
-        // None) or enabled (None → Some) or updated (Some → Some).
-        self.in_commit_timestamp_opt = in_commit_timestamp;
+        // In-commit timestamp: replace ONLY when the producer observed it (Some(_)).
+        // `None` means "no observation" -- leave base CRC's ICT untouched (this is the
+        // empty-segment / checkpoint-only / no-commitInfo trivially-safe path). When the
+        // producer did observe ICT, the inner Option is the new value (Some = enabled,
+        // None = ICT disabled).
+        if let Some(observed_ict) = in_commit_timestamp {
+            self.in_commit_timestamp_opt = observed_ict;
+        }
 
         self.file_stats = transition_file_stats(
             &self.file_stats,
@@ -564,20 +578,34 @@ mod tests {
     }
 
     #[test]
-    fn apply_ict_replaces_unconditionally() {
+    fn apply_ict_observation_semantics() {
         let mut crc = base_crc();
         crc.in_commit_timestamp_opt = Some(1000);
 
-        // None clears
+        // None outer = "did not observe ICT" -- leave base alone.
         crc.apply(CrcUpdate {
             in_commit_timestamp: None,
             ..write_update(0, 0)
         });
-        assert_eq!(crc.in_commit_timestamp_opt, None);
+        assert_eq!(
+            crc.in_commit_timestamp_opt,
+            Some(1000),
+            "None means 'no observation'; base is preserved"
+        );
 
-        // Some sets
+        // Some(None) = "observed: ICT disabled" -- clears base.
         crc.apply(CrcUpdate {
-            in_commit_timestamp: Some(2000),
+            in_commit_timestamp: Some(None),
+            ..write_update(0, 0)
+        });
+        assert_eq!(
+            crc.in_commit_timestamp_opt, None,
+            "Some(None) clears the ICT (observed disabled)"
+        );
+
+        // Some(Some(v)) sets.
+        crc.apply(CrcUpdate {
+            in_commit_timestamp: Some(Some(2000)),
             ..write_update(0, 0)
         });
         assert_eq!(crc.in_commit_timestamp_opt, Some(2000));

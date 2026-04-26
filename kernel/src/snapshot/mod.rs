@@ -77,8 +77,8 @@ pub struct Snapshot {
     /// - Loading a stale CRC file + reverse-replaying commits after it (yields the same `Crc[N]`
     ///   as if it had been written at version N), OR
     /// - Building from scratch via full reverse log replay (no CRC file on disk), OR
-    /// - For the incremental fallback path: a [`Crc::minimal_from_pm`] with
-    ///   `RequiresCheckpointRead` file stats.
+    /// - For the incremental fallback path: a minimal CRC with `RequiresCheckpointRead` file
+    ///   stats.
     ///
     /// Mutated only via [`Crc::apply`] (see the post-commit
     /// [`new_post_commit`](Self::new_post_commit) flow).
@@ -147,7 +147,8 @@ impl Snapshot {
 
     /// Create a new [`Snapshot`] from a [`LogSegment`] and [`TableConfiguration`].
     ///
-    /// Builds a minimal CRC from the table configuration's P&M via [`Crc::minimal_from_pm`].
+    /// Builds a minimal CRC from the table configuration's P&M (via the kernel-internal
+    /// `Crc::minimal_from_pm`).
     /// File stats are
     /// [`RequiresCheckpointRead`](crate::crc::FileStatsState::RequiresCheckpointRead),
     /// DM/txns are [`Untracked`](crate::crc::DomainMetadataState::Untracked).

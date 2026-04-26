@@ -10,27 +10,24 @@
 //! accidentally read an absolute file count from a relative delta because they live in
 //! different variants of [`FileStatsState`].
 //!
-//! On-disk JSON serialization goes through [`CrcRaw`], a flat 1:1 mirror of the Delta protocol
+//! On-disk JSON serialization goes through `CrcRaw`, a flat 1:1 mirror of the Delta protocol
 //! [CRC file] format. The mapping is mediated by `#[serde(from, into)]` on [`Crc`].
 //!
-//! [`CrcUpdate`] is the universal delta type. Every CRC mutation flows through
-//! [`Crc::apply`]. There are four ways to produce a `CrcUpdate`:
+//! `CrcUpdate` is the universal delta type. Every CRC mutation flows through `Crc::apply`.
+//! There are four ways to produce a `CrcUpdate`:
 //!
 //! 1. **Commit-time** ([`Transaction::commit`]): build from staged add/remove metadata + the
 //!    transaction's own commitInfo / DM / txn changes. Apply once to the read snapshot's CRC.
 //! 2. **Stale-CRC catch-up**: reverse-replay commits after the CRC version, accumulate, apply once.
 //!    The accumulator does first-seen-wins for per-key fields (DM/txn/P/M).
 //! 3. **No-CRC bootstrap**: same shape as (2) but the segment includes a checkpoint and the base is
-//!    built via [`CrcUpdate::into_fresh_crc`].
-//! 4. **Future: forward rebase / action reconciliation** (priorities 4 and 5 in the design plan):
-//!    different production strategies, same `Crc::apply`.
+//!    built via `CrcUpdate::into_fresh_crc`.
+//! 4. **Action reconciliation** for
+//!    [`Snapshot::load_file_stats`](crate::snapshot::Snapshot::load_file_stats): a wider visitor
+//!    with `(path, dv_unique_id)` deduplication recovers absolute file stats.
 //!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 //! [`Transaction::commit`]: crate::transaction::Transaction::commit
-
-// Allow unreachable_pub because this module is pub when test-utils is enabled
-// but pub(crate) otherwise. The items need to be pub for integration tests.
-#![allow(unreachable_pub)]
 
 mod delta;
 mod file_size_histogram;
@@ -59,9 +56,9 @@ use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 /// completeness-tracked maps for domain metadata and set transactions
 /// ([`DomainMetadataState`] / [`SetTransactionState`]), and an optional in-commit timestamp.
 ///
-/// Mutated only via [`Crc::apply`]. Constructed either by deserializing from disk (via the
-/// [`CrcRaw`] serde intermediate), by [`Crc::minimal_from_pm`], or by
-/// [`CrcUpdate::into_fresh_crc`] (when there is no base CRC to apply onto).
+/// Mutated only via the kernel-internal `Crc::apply` mutator. Constructed either by
+/// deserializing from disk (via the `CrcRaw` serde intermediate), by `Crc::minimal_from_pm`,
+/// or by `CrcUpdate::into_fresh_crc` (when there is no base CRC to apply onto).
 ///
 /// This struct and its fields are `pub` so integration tests under the `test-utils` feature
 /// can inspect them; without `test-utils` the `crc` module is `pub(crate)`. See
@@ -143,7 +140,7 @@ impl Crc {
 /// The Delta protocol always writes complete data (or omits the field entirely): a CRC file
 /// on disk is `Valid` for file stats, and `Complete` (or absent) for DM and txns. The serde
 /// intermediate enforces this via deserialization (always to `Valid` / `Complete`) and via
-/// [`try_write_crc_file`] (which gates on [`FileStatsState::is_writable`]).
+/// `try_write_crc_file` (which gates on [`FileStatsState::is_writable`]).
 ///
 /// Fields with `#[serde(default)]` produce the appropriate "absent" state when missing or
 /// `null`: `set_transactions` and `domain_metadata` map to `Untracked`, `file_size_histogram`

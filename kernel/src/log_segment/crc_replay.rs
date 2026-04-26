@@ -115,12 +115,22 @@ impl LogSegment {
                 accumulator.metadata = Metadata::try_new_from_data(data)?;
             }
 
-            // DM, txn, file stats, commitInfo via visitor.
+            // DM, txn, file stats, commitInfo via visitor. The visitor tracks per-batch
+            // "saw file actions" and "saw commitInfo" flags so we can detect commit
+            // batches that had file actions but no commitInfo (provenance unknown).
             let mut visitor = CrcReplayVisitor {
                 is_log_batch: batch.is_log_batch,
+                batch_saw_file_action: false,
+                batch_saw_commit_info: false,
                 acc: &mut accumulator,
             };
             visitor.visit_rows_of(data)?;
+            // After this batch: if it was a commit batch, had file actions, but no
+            // commitInfo, the operation is unknown for that commit.
+            if batch.is_log_batch && visitor.batch_saw_file_action && !visitor.batch_saw_commit_info
+            {
+                accumulator.operation_safe = false;
+            }
         }
 
         Ok(accumulator.into_crc_update())
@@ -214,7 +224,9 @@ impl CrcReplayAccumulator {
             metadata: self.metadata,
             domain_metadata: self.domain_metadata,
             set_transactions: self.set_transactions,
-            in_commit_timestamp: self.in_commit_timestamp,
+            // Outer Some only if we actually saw a commitInfo with ICT data; otherwise
+            // None tells `Crc::apply` "I didn't observe ICT, leave the base alone."
+            in_commit_timestamp: self.ict_seen.then_some(self.in_commit_timestamp),
             operation_safe,
             has_missing_file_size: self.has_missing_remove_size,
         }
@@ -235,6 +247,14 @@ impl CrcReplayAccumulator {
 /// for vacuum and commitInfo is absent).
 struct CrcReplayVisitor<'a> {
     is_log_batch: bool,
+    /// Set to true if this batch contained any add or remove row. Used together with
+    /// `batch_saw_commit_info` to detect "commit batch with file actions but no
+    /// commitInfo" -- a configuration with unknown operation provenance, treated as
+    /// unsafe.
+    batch_saw_file_action: bool,
+    /// Set to true if this batch contained a commitInfo row. (Per protocol every commit
+    /// has at most one commitInfo, but a batch might span any subset of a commit's rows.)
+    batch_saw_commit_info: bool,
     acc: &'a mut CrcReplayAccumulator,
 }
 
@@ -288,6 +308,7 @@ impl RowVisitor for CrcReplayVisitor<'_> {
                 self.acc.net_histogram.insert(size)?;
                 if self.is_log_batch {
                     self.acc.has_log_action_inputs = true;
+                    self.batch_saw_file_action = true;
                 }
             }
 
@@ -301,6 +322,7 @@ impl RowVisitor for CrcReplayVisitor<'_> {
                 let remove_path: Option<String> = getters[1].get_opt(i, "remove.path")?;
                 if remove_path.is_some() {
                     self.acc.has_log_action_inputs = true;
+                    self.batch_saw_file_action = true;
                     let remove_size: Option<i64> = getters[2].get_opt(i, "remove.size")?;
                     if let Some(size) = remove_size {
                         self.acc.net_count -= 1;
@@ -346,13 +368,15 @@ impl RowVisitor for CrcReplayVisitor<'_> {
             }
 
             // commitInfo: only on commit batches. Operation safety + ICT.
-            // We use the operation column to detect commitInfo presence (every commitInfo
-            // action has an operation per protocol spec).
+            // We use the operation column to detect commitInfo presence (in practice
+            // every commitInfo action has an operation; missing operation is treated as
+            // 'no provenance' and flips operation_safe via the per-batch heuristic below).
             if self.is_log_batch {
                 let operation: Option<String> = getters[9].get_opt(i, "commitInfo.operation")?;
                 if let Some(op) = operation {
                     self.acc.has_commit_info = true;
                     self.acc.has_log_action_inputs = true;
+                    self.batch_saw_commit_info = true;
                     if !FileStatsDelta::is_incremental_safe(&op) {
                         self.acc.operation_safe = false;
                     }

@@ -1223,7 +1223,9 @@ impl<S> Transaction<S> {
                 .iter()
                 .map(|txn| (txn.app_id.clone(), txn.clone()))
                 .collect(),
-            in_commit_timestamp,
+            // Commit-time always observes ICT (the transaction either has ICT enabled
+            // and computed a value, or doesn't). Wrap in outer Some to signal "observed".
+            in_commit_timestamp: Some(in_commit_timestamp),
             operation_safe,
             has_missing_file_size: false, // writes always include file sizes
         })

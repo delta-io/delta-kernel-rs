@@ -30,7 +30,7 @@ use crate::actions::{DomainMetadata, SetTransaction};
 /// accidentally use a commit delta as an absolute file count because they live in different
 /// variants with different field names.
 ///
-/// State transitions during [`Crc::apply`](super::Crc::apply):
+/// State transitions during the kernel-internal `Crc::apply` mutator:
 ///
 /// | Current                | + safe op | + unsafe op   | + missing remove.size |
 /// |------------------------|-----------|---------------|-----------------------|
@@ -160,8 +160,7 @@ pub enum FileStatsValidity {
 /// Serde behaviour for CRC JSON files (handled at the [`Crc`](super::Crc) struct level):
 /// - `Complete(map)` serialises as `[...]` (array of DM entries)
 /// - `Partial` and `Untracked` both serialise as the field being absent (writers can only write
-///   `Complete` -- enforced in [`try_write_crc_file`](super::try_write_crc_file) indirectly via
-///   [`FileStatsState::is_writable`])
+///   `Complete` -- enforced by the writer via [`FileStatsState::is_writable`])
 /// - Deserialisation from `[...]` produces `Complete(map)`, from `null`/absent produces `Untracked`
 ///   (CRC files on disk always have complete data or no data)
 ///
