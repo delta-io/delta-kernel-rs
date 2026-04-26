@@ -2,23 +2,24 @@
 
 use url::Url;
 
-use super::{Crc, FileStatsValidity};
+use super::Crc;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error};
 
 /// Serialize and write a CRC file to storage.
 ///
-/// Serializes the [`Crc`] struct to JSON via serde and writes the raw bytes using the storage
-/// handler. Returns [`Error::ChecksumWriteUnsupported`] if file stats are not valid (a CRC file
-/// on disk must have correct stats). Per the Delta protocol, writers MUST NOT overwrite existing
-/// CRC files, so this always writes with `overwrite = false`. If the file already exists, returns
+/// Serializes the [`Crc`] struct to JSON via serde and writes the raw bytes using the
+/// storage handler. Returns [`Error::ChecksumWriteUnsupported`] if file stats are not in a
+/// writable state -- a CRC file on disk must have correct, complete file stats. Per the
+/// Delta protocol, writers MUST NOT overwrite existing CRC files, so this always writes
+/// with `overwrite = false`. If the file already exists, returns
 /// `Err(Error::FileAlreadyExists)`.
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
     require!(
-        crc.file_stats_validity == FileStatsValidity::Valid,
+        crc.file_stats.is_writable(),
         Error::ChecksumWriteUnsupported(format!(
             "Cannot write CRC file with {:?} file stats",
-            crc.file_stats_validity
+            crc.file_stats_validity()
         ))
     );
     let data = serde_json::to_vec(crc)?;
@@ -35,7 +36,7 @@ mod tests {
     use super::*;
     use crate::actions::{DomainMetadata, Protocol, SetTransaction};
     use crate::crc::reader::try_read_crc_file;
-    use crate::crc::{FileSizeHistogram, FileStatsValidity};
+    use crate::crc::{DomainMetadataState, FileSizeHistogram, FileStatsState, SetTransactionState};
     use crate::engine::default::DefaultEngineBuilder;
     use crate::object_store::memory::InMemory;
     use crate::path::{AsUrl, ParsedLogPath};
@@ -67,22 +68,21 @@ mod tests {
         let app_id = "testAppId".to_string();
         let set_transactions =
             HashMap::from([(app_id.clone(), SetTransaction::new(app_id, 1, Some(ict)))]);
-        // Build a histogram with 5 files totaling 1024 bytes, all in the first bin (< 8KB).
+        // 5 files totaling 1024 bytes, all in the first bin (< 8KB).
         let mut histogram = FileSizeHistogram::create_default();
         for size in [100, 200, 300, 150, 274] {
-            histogram.insert(size).unwrap(); // 5 files, 1024 bytes total
+            histogram.insert(size).unwrap();
         }
         Crc {
-            table_size_bytes: 1024,
-            num_files: 5,
-            num_metadata: 1,
-            num_protocol: 1,
             protocol,
-            txn_id: None,
             in_commit_timestamp_opt: Some(ict),
-            set_transactions: Some(set_transactions),
-            domain_metadata: Some(domain_metadata),
-            file_size_histogram: Some(histogram),
+            set_transactions: SetTransactionState::Complete(set_transactions),
+            domain_metadata: DomainMetadataState::Complete(domain_metadata),
+            file_stats: FileStatsState::Valid {
+                num_files: 5,
+                table_size_bytes: 1024,
+                histogram: Some(histogram),
+            },
             ..Default::default()
         }
     }
@@ -92,7 +92,6 @@ mod tests {
         let crc = test_crc();
         let json_bytes = serde_json::to_vec(&crc).unwrap();
         let round_tripped: Crc = serde_json::from_slice(&json_bytes).unwrap();
-
         assert_eq!(round_tripped, crc);
     }
 
@@ -201,23 +200,27 @@ mod tests {
     }
 
     #[test]
-    fn test_write_rejects_invalid_file_stats_with_checksum_write_unsupported() {
+    fn test_write_rejects_non_writable_file_stats_state() {
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store).build();
         let table_root = url::Url::parse("memory:///test_table/").unwrap();
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
-        for invalid_validity in [
-            FileStatsValidity::RequiresCheckpointRead,
-            FileStatsValidity::Indeterminate,
-            FileStatsValidity::Untrackable,
+        for non_writable in [
+            FileStatsState::RequiresCheckpointRead {
+                commit_delta_files: 0,
+                commit_delta_bytes: 0,
+                commit_delta_histogram: None,
+            },
+            FileStatsState::Indeterminate,
+            FileStatsState::Untrackable,
         ] {
             let mut crc = test_crc();
-            crc.file_stats_validity = invalid_validity;
+            crc.file_stats = non_writable.clone();
             let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
             assert!(
                 matches!(result, Err(Error::ChecksumWriteUnsupported(_))),
-                "should reject {invalid_validity:?} with ChecksumWriteUnsupported"
+                "should reject {non_writable:?} with ChecksumWriteUnsupported"
             );
         }
     }

@@ -20,6 +20,7 @@ impl LogSegment {
     /// fresh snapshot creation where both Protocol and Metadata must exist.
     // Span name must match `SEGMENT_READ_METADATA_SPAN` in `metrics::reporter`.
     #[instrument(name = "segment.read_metadata", fields(report, operation_id = %operation_id), skip(engine))]
+    #[allow(dead_code)] // Used by tests; live code paths use read_protocol_metadata_opt
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,

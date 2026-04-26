@@ -1,205 +1,292 @@
-//! Incremental CRC state updates via commit deltas.
+//! Incremental CRC state updates.
 //!
-//! A [`CrcDelta`] captures CRC-relevant changes from a single commit (produced by reading a
-//! `.json` commit file during log replay, or from in-memory transaction state during writes).
-//! [`Crc::apply`] advances a CRC forward one commit at a time by applying a delta.
+//! A [`CrcUpdate`] captures CRC-relevant changes from a single commit OR from a multi-commit
+//! replay. [`Crc::apply`] is the universal mutator, applying an update onto a base CRC.
 //!
-//! A CRC tracks two categories of fields, updated differently:
-//! - **Metadata fields** (protocol, metadata, domain metadata, set transactions, in-commit
-//!   timestamp): always kept up-to-date -- every `apply` unconditionally merges these from the
-//!   delta.
-//! - **File stats** (`num_files`, `table_size_bytes`): only updated when the current
-//!   [`FileStatsValidity`] is not terminal and the commit's operation is incremental-safe. Once
-//!   validity degrades (e.g. a non-incremental operation like ANALYZE STATS, or a missing file
-//!   size), file stats stop updating for the lifetime of that CRC.
+//! This satisfies the fundamental invariant of the CRC system:
+//!
+//! ```text
+//! Crc[N] + CrcUpdate(N→N+1) = Crc[N+1]
+//! Crc[N] + CrcUpdate(N→M)   = Crc[M]    (M > N+1)
+//! ```
+//!
+//! `apply` itself is *forward*: it always reads the equation left-to-right (older + delta =
+//! newer). The update can be *produced* by either direction:
+//!
+//! - **Commit-time**: a single commit's actions are turned into one update; apply once.
+//! - **Stale-CRC reverse-replay**: commits N+1..M read in reverse, accumulated into one update via
+//!   [`ReverseCrcAccumulator`](crate::log_segment::CrcReplayAccumulator); apply once. (Reverse uses
+//!   first-seen-wins per key; the resulting update is equivalent to `δ_{N+1} + δ_{N+2} + ... + δ_M`
+//!   produced forward.)
+//! - **Future: forward per-commit replay** (used by rebase): each commit produces an update,
+//!   applied repeatedly. No accumulator needed.
+//! - **Future: action reconciliation**: a wider visitor with deduplication produces one update,
+//!   applied once. Same shape, different production.
+//!
+//! All four producers share `CrcUpdate` and feed `Crc::apply`.
+//!
+//! # Field semantics on apply
+//!
+//! - **Protocol / Metadata**: replace if `Some` (last-write-wins).
+//! - **Domain metadata / Set transactions**: upsert from update map; tombstones (DM with
+//!   `removed=true`) remove the entry. If base is [`Untracked`](super::DomainMetadataState),
+//!   transition to [`Partial`](super::DomainMetadataState) when update has entries.
+//! - **In-commit timestamp**: replace unconditionally (`None` clears, `Some` sets).
+//! - **File stats**: state-machine transition based on update flags and base variant. See the table
+//!   on [`FileStatsState`].
+
+use std::collections::HashMap;
 
 use tracing::warn;
 
 use super::file_stats::FileStatsDelta;
-use super::{Crc, FileStatsValidity};
+use super::{Crc, DomainMetadataState, FileSizeHistogram, FileStatsState, SetTransactionState};
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
+use crate::{DeltaResult, Error};
 
-/// The CRC-relevant changes ("delta") from a single commit. Produced either by reading a
-/// `.json` commit file during log replay, or from in-memory transaction state during writes.
+/// CRC-relevant changes ("delta") to apply to a base [`Crc`]. Universal type used by
+/// commit-time, log-replay, and (future) rebase paths.
+///
+/// **Last-write-wins semantics**: every field in this struct represents "what should be set
+/// on the resulting CRC at the new version." The producer is responsible for ensuring the
+/// values are correct for the target version (e.g. reverse-replay producers use first-seen
+/// wins to capture the newest values).
 #[derive(Debug, Clone, Default)]
-pub(crate) struct CrcDelta {
-    /// Net file count, size changes and histograms.
+pub(crate) struct CrcUpdate {
+    /// Net file count, size changes, and optional histogram (see [`FileStatsDelta`]).
     pub(crate) file_stats: FileStatsDelta,
-    /// New protocol action, if this commit changed it.
+    /// New protocol action, if changed in this update. `None` means "no change."
     pub(crate) protocol: Option<Protocol>,
-    /// New metadata action, if this commit changed it.
+    /// New metadata action, if changed. `None` means "no change."
     pub(crate) metadata: Option<Metadata>,
-    /// All DM actions in this commit (additions and removals). `apply()` only processes these
-    /// when the base CRC's `domain_metadata` is `Some` (tracked).
-    pub(crate) domain_metadata_changes: Vec<DomainMetadata>,
-    /// All SetTransaction actions in this commit. `apply()` only processes these when the base
-    /// CRC's `set_transactions` is `Some` (tracked).
-    pub(crate) set_transaction_changes: Vec<SetTransaction>,
-    /// In-commit timestamp, if present in this commit.
+    /// Domain metadata changes keyed by domain name. Tombstones (DM with `removed=true`)
+    /// remove the entry on apply. Pre-keyed for direct upsert -- producers (commit-time
+    /// path, reverse-replay accumulator) own the dedup logic.
+    pub(crate) domain_metadata: HashMap<String, DomainMetadata>,
+    /// Set transaction changes keyed by `app_id`. Pre-keyed for direct upsert.
+    pub(crate) set_transactions: HashMap<String, SetTransaction>,
+    /// In-commit timestamp from the latest commit covered by this update. `None` clears,
+    /// `Some` sets.
     pub(crate) in_commit_timestamp: Option<i64>,
-    /// Must be `Some` with an incremental-safe value for file stats to update. `None` or
-    /// unrecognized values transition validity to `Indeterminate`.
-    pub(crate) operation: Option<String>,
-    /// A file action in this commit had a missing `size` field, making byte-level file stats
-    /// impossible to compute.
+    /// `true` iff every observed commit had an incremental-safe operation. `false` if any
+    /// commit's `commitInfo.operation` was unrecognized, missing, or known-unsafe (e.g.
+    /// `ANALYZE STATS`). Producers compute this once.
+    pub(crate) operation_safe: bool,
+    /// `true` iff any observed file action had a missing `size` field. Permanent: an update
+    /// with this flag transitions file stats to [`Untrackable`](FileStatsState::Untrackable).
     pub(crate) has_missing_file_size: bool,
 }
 
-impl CrcDelta {
-    /// Convert this delta into a fresh [`Crc`]. Used when the delta represents the entire table
-    /// state (e.g. CREATE TABLE or the first commit in a forward replay from version zero).
+impl CrcUpdate {
+    /// Convert this update into a fresh [`Crc`].
     ///
-    /// Returns `None` if protocol or metadata are missing (both are required for a valid CRC).
-    pub(crate) fn into_crc_for_version_zero(self) -> Option<Crc> {
-        let protocol = self.protocol?;
-        let metadata = self.metadata?;
-        // For CREATE TABLE we always know the full domain metadata state: the transaction
-        // either included domain metadata actions or it didn't. So this is always `Some` --
-        // an empty map means "no domain metadata", not "unknown".
-        let domain_metadata = Some(
-            self.domain_metadata_changes
+    /// Used when the update represents the *complete* table state (no base CRC to apply
+    /// onto). Specifically: full log replay from version 0, or no-CRC bootstrap from a
+    /// checkpoint + commits where the accumulator captured everything.
+    ///
+    /// Returns:
+    /// - `FileStatsState::Untrackable` if `has_missing_file_size`
+    /// - `FileStatsState::Indeterminate` if `!operation_safe`
+    /// - `FileStatsState::Valid { ... }` otherwise (with histogram if present)
+    /// - DM and txns: [`Complete`](DomainMetadataState::Complete) (full state was captured)
+    /// - Filters DM tombstones from the resulting map
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `protocol` or `metadata` is missing -- both are required to
+    /// construct a valid CRC.
+    pub(crate) fn into_fresh_crc(self) -> DeltaResult<Crc> {
+        let protocol = self.protocol.ok_or(Error::MissingProtocol)?;
+        let metadata = self.metadata.ok_or(Error::MissingMetadata)?;
+
+        let domain_metadata = DomainMetadataState::Complete(
+            self.domain_metadata
                 .into_iter()
-                .filter(|dm| !dm.is_removed())
-                .map(|dm| (dm.domain().to_string(), dm))
+                .filter(|(_, dm)| !dm.is_removed())
                 .collect(),
         );
-        // CREATE TABLE starts with a known-complete set of transactions (possibly empty),
-        // so we always track them.
-        let set_transactions = Some(
-            self.set_transaction_changes
-                .into_iter()
-                .map(|txn| (txn.app_id.clone(), txn))
-                .collect(),
-        );
-        // For version zero the delta IS the full table histogram. Validate that all bins
-        // are non-negative (a real table can't have negative file counts). If validation
-        // fails, drop the histogram.
-        let initial_histogram = self.file_stats.net_histogram.and_then(|delta| {
-            delta
-                .check_non_negative()
-                .inspect_err(|e| {
-                    warn!("Non-negative file count check failed, dropping file size histogram for version zero: {e}");
-                })
-                .ok()
-        });
-        Some(Crc {
-            table_size_bytes: self.file_stats.net_bytes,
-            num_files: self.file_stats.net_files,
-            num_metadata: 1,
-            num_protocol: 1,
+        let set_transactions = SetTransactionState::Complete(self.set_transactions);
+
+        let file_stats = if self.has_missing_file_size {
+            FileStatsState::Untrackable
+        } else if !self.operation_safe {
+            FileStatsState::Indeterminate
+        } else {
+            // For a full-replay update, file_stats.net_files / net_bytes / net_histogram are
+            // the absolute totals (no negatives possible since we're summing checkpoint
+            // adds + commit adds - commit removes from a complete history). If for any
+            // reason the histogram has negative bins (corrupted log), drop it rather than
+            // emit a Valid CRC with a bad histogram.
+            let histogram = self.file_stats.net_histogram.and_then(|hist| {
+                hist.check_non_negative()
+                    .inspect_err(|e| {
+                        warn!("into_fresh_crc: dropping histogram due to negative bins: {e}");
+                    })
+                    .ok()
+            });
+            FileStatsState::Valid {
+                num_files: self.file_stats.net_files,
+                table_size_bytes: self.file_stats.net_bytes,
+                histogram,
+            }
+        };
+
+        Ok(Crc {
             protocol,
             metadata,
+            file_stats,
             domain_metadata,
             set_transactions,
             in_commit_timestamp_opt: self.in_commit_timestamp,
-            file_size_histogram: initial_histogram,
-            ..Default::default()
         })
+    }
+
+    /// Convert this update into a fresh [`Crc`] for version zero (CREATE TABLE).
+    ///
+    /// Returns `None` if protocol or metadata are missing (both are required for a valid
+    /// CRC). Wraps [`into_fresh_crc`] for the version-zero post-commit path.
+    pub(crate) fn into_crc_for_version_zero(self) -> Option<Crc> {
+        self.into_fresh_crc().ok()
     }
 }
 
-/// Commit delta application for [`Crc`]. See the [module-level docs](self) for details.
+/// Merge a base histogram with the update's net histogram. Returns `Some(merged)` on
+/// success, `None` to drop the histogram (when the merge would fail or produce stale data).
+///
+/// Behavior:
+/// - `(Some(base), Some(net))` → merge via [`FileSizeHistogram::try_apply_delta`]; on failure
+///   (boundary mismatch, negative counts), drop and warn.
+/// - `(Some(base), None)` → drop. The base had a histogram but the update could not provide one;
+///   stale data is worse than no data.
+/// - `(None, Some(net))` → adopt the update's histogram. Useful for forward replay starting from a
+///   base with no histogram, or for stale-catchup against a CRC that lacked a histogram.
+/// - `(None, None)` → stay `None`.
+fn merge_histogram(
+    base: Option<&FileSizeHistogram>,
+    delta: Option<&FileSizeHistogram>,
+) -> Option<FileSizeHistogram> {
+    match (base, delta) {
+        (Some(base_hist), Some(delta_hist)) => match base_hist.try_apply_delta(delta_hist) {
+            Ok(merged) => Some(merged),
+            Err(e) => {
+                warn!("Histogram merge failed, dropping file size histogram: {e}");
+                None
+            }
+        },
+        (None, Some(delta_hist)) => Some(delta_hist.clone()),
+        (Some(_), None) | (None, None) => None,
+    }
+}
+
+// ============================================================================
+// Crc::apply -- the universal mutator
+// ============================================================================
+
 impl Crc {
-    /// Apply a commit delta, updating all CRC fields and adjusting file stats validity.
+    /// Apply a [`CrcUpdate`], advancing this CRC to the new version.
     ///
-    /// Metadata fields are always updated. File stats are only updated when:
-    /// - Validity is not already terminal ([`Untrackable`](FileStatsValidity::Untrackable) or
-    ///   [`Indeterminate`](FileStatsValidity::Indeterminate))
-    /// - The delta has no missing file sizes
-    /// - The operation is incremental-safe
-    pub(crate) fn apply(&mut self, delta: CrcDelta) {
-        // Protocol and metadata: replace if present.
-        if let Some(p) = delta.protocol {
+    /// Implements the fundamental invariant `Crc[N] + CrcUpdate(N→M) = Crc[M]`. Direction-
+    /// agnostic: works for single-commit deltas (M = N+1) or accumulated multi-commit
+    /// deltas (M > N+1) interchangeably.
+    ///
+    /// Field semantics: see the [module-level docs](self).
+    pub(crate) fn apply(&mut self, update: CrcUpdate) {
+        // Protocol / Metadata: replace if present.
+        if let Some(p) = update.protocol {
             self.protocol = p;
         }
-        if let Some(m) = delta.metadata {
+        if let Some(m) = update.metadata {
             self.metadata = m;
         }
 
-        // Domain metadata: insert or remove by domain name. Only update if the base CRC
-        // tracks domain metadata (Some). If None ("not tracked"), leave it as None --
-        // applying partial changes would create an incomplete map.
-        if !delta.domain_metadata_changes.is_empty() {
-            if let Some(map) = &mut self.domain_metadata {
-                for dm in delta.domain_metadata_changes {
-                    if dm.is_removed() {
-                        map.remove(dm.domain());
-                    } else {
-                        let domain = dm.domain().to_string();
-                        map.insert(domain, dm);
+        // Domain metadata: upsert from update map, removing tombstones. If base is
+        // Untracked but the update has entries (e.g. older CRC didn't track DM but newer
+        // commits do), transition to Partial.
+        if !update.domain_metadata.is_empty() {
+            match &mut self.domain_metadata {
+                DomainMetadataState::Complete(map) | DomainMetadataState::Partial(map) => {
+                    for (domain, dm) in update.domain_metadata {
+                        if dm.is_removed() {
+                            map.remove(&domain);
+                        } else {
+                            map.insert(domain, dm);
+                        }
                     }
                 }
-            }
-        }
-
-        // Set transactions: upsert by app_id. Only update if the base CRC tracks set
-        // transactions (Some). If None ("not tracked"), leave it as None.
-        if let Some(map) = &mut self.set_transactions {
-            map.extend(
-                delta
-                    .set_transaction_changes
-                    .into_iter()
-                    .map(|txn| (txn.app_id.clone(), txn)),
-            );
-        }
-
-        // In-commit timestamp: unconditional replace (not guarded by `if let Some`).
-        // If ICT was disabled after being enabled, the delta carries None, which correctly
-        // clears the previous value.
-        self.in_commit_timestamp_opt = delta.in_commit_timestamp;
-
-        // Bail if already Untrackable -- nothing can recover missing file stats or histograms.
-        if self.file_stats_validity == FileStatsValidity::Untrackable {
-            return;
-        }
-
-        // Missing file size poisons stats permanently. Checked after the Untrackable bail-out
-        // so that Untrackable can never transition to Indeterminate below.
-        if delta.has_missing_file_size {
-            self.file_stats_validity = FileStatsValidity::Untrackable;
-            self.file_size_histogram = None;
-            return;
-        }
-
-        // Bail if already Indeterminate (theoretically recoverable via full replay).
-        if self.file_stats_validity == FileStatsValidity::Indeterminate {
-            return;
-        }
-
-        let is_incremental_safe = delta
-            .operation
-            .as_deref()
-            .is_some_and(FileStatsDelta::is_incremental_safe);
-        if !is_incremental_safe {
-            self.file_stats_validity = FileStatsValidity::Indeterminate;
-            self.file_size_histogram = None;
-            return;
-        }
-        self.num_files += delta.file_stats.net_files;
-        self.table_size_bytes += delta.file_stats.net_bytes;
-
-        // Histogram: merge base and delta.
-        // Only update if the base CRC has a histogram AND the delta provides one.
-        // If the merge fails (e.g. negative counts from corrupted data) or the delta is
-        // missing a histogram, drop it rather than leaving stale data.
-        if let (Some(base_hist), Some(delta_hist)) = (
-            self.file_size_histogram.as_ref(),
-            &delta.file_stats.net_histogram,
-        ) {
-            match base_hist.try_apply_delta(delta_hist) {
-                Ok(merged) => self.file_size_histogram = Some(merged),
-                Err(e) => {
-                    warn!("Histogram merge failed, dropping file size histogram: {e}");
-                    self.file_size_histogram = None;
+                DomainMetadataState::Untracked => {
+                    self.domain_metadata = DomainMetadataState::Partial(
+                        update
+                            .domain_metadata
+                            .into_iter()
+                            .filter(|(_, dm)| !dm.is_removed())
+                            .collect(),
+                    );
                 }
             }
-        } else if self.file_size_histogram.is_some() {
-            // The base had a histogram but the delta couldn't provide one. Drop it rather than
-            // leaving a stale value.
-            self.file_size_histogram = None;
         }
+
+        // Set transactions: upsert from update map. No tombstone semantic for txns. Same
+        // Untracked → Partial transition.
+        if !update.set_transactions.is_empty() {
+            match &mut self.set_transactions {
+                SetTransactionState::Complete(map) | SetTransactionState::Partial(map) => {
+                    map.extend(update.set_transactions);
+                }
+                SetTransactionState::Untracked => {
+                    self.set_transactions = SetTransactionState::Partial(update.set_transactions);
+                }
+            }
+        }
+
+        // In-commit timestamp: replace unconditionally. ICT could be disabled (Some →
+        // None) or enabled (None → Some) or updated (Some → Some).
+        self.in_commit_timestamp_opt = update.in_commit_timestamp;
+
+        // File stats: state-machine transition. See the table on FileStatsState.
+        self.file_stats = match &self.file_stats {
+            FileStatsState::Untrackable => {
+                // Terminal: nothing recovers missing file size.
+                return;
+            }
+            _ if update.has_missing_file_size => FileStatsState::Untrackable,
+            FileStatsState::Indeterminate => {
+                // Terminal for incremental tracking (recoverable only via full replay,
+                // which is currently the deferred load_file_stats path).
+                return;
+            }
+            _ if !update.operation_safe => FileStatsState::Indeterminate,
+            FileStatsState::Valid {
+                num_files,
+                table_size_bytes,
+                histogram,
+            } => {
+                let histogram =
+                    merge_histogram(histogram.as_ref(), update.file_stats.net_histogram.as_ref());
+                FileStatsState::Valid {
+                    num_files: num_files + update.file_stats.net_files,
+                    table_size_bytes: table_size_bytes + update.file_stats.net_bytes,
+                    histogram,
+                }
+            }
+            FileStatsState::RequiresCheckpointRead {
+                commit_delta_files,
+                commit_delta_bytes,
+                commit_delta_histogram,
+            } => FileStatsState::RequiresCheckpointRead {
+                commit_delta_files: commit_delta_files + update.file_stats.net_files,
+                commit_delta_bytes: commit_delta_bytes + update.file_stats.net_bytes,
+                commit_delta_histogram: merge_histogram(
+                    commit_delta_histogram.as_ref(),
+                    update.file_stats.net_histogram.as_ref(),
+                ),
+            },
+        };
     }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -209,299 +296,30 @@ mod tests {
 
     use super::*;
     use crate::actions::{DomainMetadata, Metadata, Protocol};
-    use crate::crc::FileSizeHistogram;
+    use crate::crc::FileStatsValidity;
 
-    fn base_crc() -> Crc {
-        Crc {
-            table_size_bytes: 1000,
-            num_files: 10,
-            num_metadata: 1,
-            num_protocol: 1,
-            ..Default::default()
-        }
-    }
-
-    fn write_delta(net_files: i64, net_bytes: i64) -> CrcDelta {
-        CrcDelta {
+    fn write_update(net_files: i64, net_bytes: i64) -> CrcUpdate {
+        CrcUpdate {
             file_stats: FileStatsDelta {
                 net_files,
                 net_bytes,
-                ..Default::default()
+                net_histogram: None,
             },
-            operation: Some("WRITE".to_string()),
+            operation_safe: true,
             ..Default::default()
         }
     }
 
-    // ===== is_incremental_safe tests =====
-
-    #[test]
-    fn test_incremental_safe_operations() {
-        for op in [
-            "WRITE",
-            "MERGE",
-            "UPDATE",
-            "DELETE",
-            "OPTIMIZE",
-            "CREATE TABLE",
-            "REPLACE TABLE",
-            "CREATE TABLE AS SELECT",
-            "REPLACE TABLE AS SELECT",
-            "CREATE OR REPLACE TABLE AS SELECT",
-        ] {
-            assert!(
-                FileStatsDelta::is_incremental_safe(op),
-                "{op} should be incremental-safe"
-            );
+    fn base_crc() -> Crc {
+        Crc {
+            file_stats: FileStatsState::Valid {
+                num_files: 10,
+                table_size_bytes: 1000,
+                histogram: None,
+            },
+            ..Default::default()
         }
     }
-
-    #[test]
-    fn test_non_incremental_safe_operations() {
-        assert!(!FileStatsDelta::is_incremental_safe("ANALYZE STATS"));
-        assert!(!FileStatsDelta::is_incremental_safe("UNKNOWN"));
-    }
-
-    // ===== Crc deserialized from CRC file (default validity) =====
-
-    #[test]
-    fn test_deserialized_crc_has_valid_stats() {
-        let crc = base_crc();
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
-        assert_eq!(crc.num_files, 10);
-        assert_eq!(crc.table_size_bytes, 1000);
-    }
-
-    // ===== Crc::apply tests =====
-
-    #[test]
-    fn test_apply_updates_file_stats() {
-        let mut crc = base_crc();
-        crc.apply(write_delta(3, 600));
-        assert_eq!(crc.num_files, 13); // 10 + 3
-        assert_eq!(crc.table_size_bytes, 1600); // 1000 + 600
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
-    }
-
-    /// Applies multiple commit deltas sequentially.
-    #[test]
-    fn test_apply_multiple_deltas() {
-        let mut crc = base_crc();
-        crc.apply(write_delta(3, 600));
-        crc.apply(write_delta(-2, -400));
-        assert_eq!(crc.num_files, 11); // 10 + 3 - 2
-        assert_eq!(crc.table_size_bytes, 1200); // 1000 + 600 - 400
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
-    }
-
-    #[test]
-    fn test_apply_unsafe_op_transitions_to_indeterminate() {
-        let mut crc = base_crc();
-        let unsafe_change = CrcDelta {
-            operation: Some("ANALYZE STATS".to_string()),
-            ..write_delta(1, 100)
-        };
-        crc.apply(unsafe_change);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
-    }
-
-    #[test]
-    fn test_apply_none_op_transitions_to_indeterminate() {
-        let mut crc = base_crc();
-        let unknown_delta = CrcDelta {
-            operation: None,
-            ..write_delta(1, 100)
-        };
-        crc.apply(unknown_delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
-    }
-
-    #[test]
-    fn test_indeterminate_stays_indeterminate() {
-        let mut crc = base_crc();
-        let unsafe_change = CrcDelta {
-            operation: Some("ANALYZE STATS".to_string()),
-            ..write_delta(1, 100)
-        };
-        crc.apply(unsafe_change);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
-
-        // Subsequent safe op doesn't recover validity.
-        crc.apply(write_delta(5, 500));
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
-    }
-
-    // ===== apply: Untrackable (missing file size) tests =====
-
-    #[test]
-    fn test_missing_file_size_transitions_to_untrackable() {
-        let mut crc = base_crc();
-        let delta = CrcDelta {
-            has_missing_file_size: true,
-            ..write_delta(1, 100)
-        };
-        crc.apply(delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
-    }
-
-    #[test]
-    fn test_untrackable_stays_untrackable() {
-        let mut crc = base_crc();
-        let delta = CrcDelta {
-            has_missing_file_size: true,
-            ..write_delta(1, 100)
-        };
-        crc.apply(delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
-
-        // Applying a safe delta does not recover from Untrackable.
-        crc.apply(write_delta(5, 500));
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
-
-        // Applying an unsafe delta also stays Untrackable (does not downgrade to Indeterminate).
-        crc.apply(CrcDelta {
-            operation: None,
-            ..write_delta(1, 100)
-        });
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
-    }
-
-    #[test]
-    fn test_indeterminate_transitions_to_untrackable_on_missing_size() {
-        let mut crc = base_crc();
-        let unsafe_change = CrcDelta {
-            operation: Some("ANALYZE STATS".to_string()),
-            ..write_delta(1, 100)
-        };
-        crc.apply(unsafe_change);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
-
-        // Missing size escalates Indeterminate to Untrackable.
-        let delta = CrcDelta {
-            has_missing_file_size: true,
-            ..write_delta(1, 100)
-        };
-        crc.apply(delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
-    }
-
-    // ===== apply: non-file-stats field updates =====
-
-    #[test]
-    fn test_apply_replaces_protocol() {
-        let mut crc = base_crc();
-        let new_protocol = Protocol::try_new(
-            2,
-            5,
-            None::<Vec<crate::table_features::TableFeature>>,
-            None::<Vec<crate::table_features::TableFeature>>,
-        )
-        .unwrap();
-        let delta = CrcDelta {
-            protocol: Some(new_protocol.clone()),
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-        assert_eq!(crc.protocol, new_protocol);
-        assert_eq!(crc.metadata, Metadata::default()); // unchanged
-    }
-
-    #[test]
-    fn test_apply_adds_domain_metadata_to_tracked_map() {
-        let mut crc = base_crc();
-        crc.domain_metadata = Some(HashMap::new());
-        let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
-        let delta = CrcDelta {
-            domain_metadata_changes: vec![dm],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        let map = crc.domain_metadata.as_ref().unwrap();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["my.domain"].configuration(), "config1");
-    }
-
-    #[test]
-    fn test_apply_with_untracked_domain_metadata_skips_changes() {
-        let mut crc = base_crc();
-        assert!(crc.domain_metadata.is_none()); // Not tracked (default)
-        let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
-        let delta = CrcDelta {
-            domain_metadata_changes: vec![dm],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        // domain_metadata stays None -- apply() must not create a partial map.
-        assert!(crc.domain_metadata.is_none());
-    }
-
-    #[test]
-    fn test_apply_upserts_domain_metadata() {
-        let mut crc = base_crc();
-        crc.domain_metadata = Some(HashMap::from([(
-            "my.domain".to_string(),
-            DomainMetadata::new("my.domain".to_string(), "old_config".to_string()),
-        )]));
-
-        let dm = DomainMetadata::new("my.domain".to_string(), "new_config".to_string());
-        let delta = CrcDelta {
-            domain_metadata_changes: vec![dm],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        let map = crc.domain_metadata.as_ref().unwrap();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["my.domain"].configuration(), "new_config");
-    }
-
-    #[test]
-    fn test_apply_removes_domain_metadata() {
-        let mut crc = base_crc();
-        crc.domain_metadata = Some(HashMap::from([(
-            "my.domain".to_string(),
-            DomainMetadata::new("my.domain".to_string(), "config1".to_string()),
-        )]));
-
-        let dm = DomainMetadata::remove("my.domain".to_string(), "config1".to_string());
-        let delta = CrcDelta {
-            domain_metadata_changes: vec![dm],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        let map = crc.domain_metadata.as_ref().unwrap();
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn test_apply_replaces_in_commit_timestamp() {
-        let mut crc = base_crc();
-        let delta = CrcDelta {
-            in_commit_timestamp: Some(9999),
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-        assert_eq!(crc.in_commit_timestamp_opt, Some(9999));
-    }
-
-    #[test]
-    fn test_apply_clears_in_commit_timestamp_when_ict_disabled() {
-        let mut crc = base_crc();
-        crc.in_commit_timestamp_opt = Some(1000);
-
-        // Delta without ICT (e.g. ICT was disabled) clears the previous value.
-        let delta = CrcDelta {
-            in_commit_timestamp: None,
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-        assert_eq!(crc.in_commit_timestamp_opt, None);
-    }
-
-    // ===== CrcDelta::into_crc_for_version_zero tests =====
 
     fn test_protocol() -> Protocol {
         Protocol::try_new(
@@ -513,367 +331,438 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn test_into_crc_for_version_zero_with_protocol_and_metadata() {
-        let protocol = test_protocol();
-        let metadata = Metadata::default();
-        let delta = CrcDelta {
-            protocol: Some(protocol.clone()),
-            metadata: Some(metadata.clone()),
-            ..write_delta(5, 1000)
-        };
-        let crc = delta.into_crc_for_version_zero().unwrap();
-        assert_eq!(crc.protocol, protocol);
-        assert_eq!(crc.metadata, metadata);
-        assert_eq!(crc.num_files, 5);
-        assert_eq!(crc.table_size_bytes, 1000);
-        assert_eq!(crc.num_metadata, 1);
-        assert_eq!(crc.num_protocol, 1);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
-        assert_eq!(crc.domain_metadata, Some(HashMap::new()));
-        assert_eq!(crc.in_commit_timestamp_opt, None);
-    }
+    // ===== Crc::apply: file stats state machine =====
 
     #[test]
-    fn test_into_crc_for_version_zero_returns_none_without_protocol() {
-        let delta = CrcDelta {
-            metadata: Some(Metadata::default()),
-            ..write_delta(5, 1000)
-        };
-        assert!(delta.into_crc_for_version_zero().is_none());
-    }
-
-    #[test]
-    fn test_into_crc_for_version_zero_returns_none_without_metadata() {
-        let delta = CrcDelta {
-            protocol: Some(test_protocol()),
-            ..write_delta(5, 1000)
-        };
-        assert!(delta.into_crc_for_version_zero().is_none());
-    }
-
-    #[test]
-    fn test_into_crc_for_version_zero_with_domain_metadata() {
-        let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
-        let delta = CrcDelta {
-            protocol: Some(test_protocol()),
-            metadata: Some(Metadata::default()),
-            domain_metadata_changes: vec![dm],
-            ..write_delta(0, 0)
-        };
-        let crc = delta.into_crc_for_version_zero().unwrap();
-        let map = crc.domain_metadata.as_ref().unwrap();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["my.domain"].configuration(), "config1");
-    }
-
-    #[test]
-    fn test_into_crc_for_version_zero_with_in_commit_timestamp() {
-        let delta = CrcDelta {
-            protocol: Some(test_protocol()),
-            metadata: Some(Metadata::default()),
-            in_commit_timestamp: Some(12345),
-            ..write_delta(0, 0)
-        };
-        let crc = delta.into_crc_for_version_zero().unwrap();
-        assert_eq!(crc.in_commit_timestamp_opt, Some(12345));
-    }
-
-    // ===== apply: set transaction tests =====
-
-    #[test]
-    fn test_apply_adds_set_transaction_to_tracked_map() {
+    fn apply_safe_op_keeps_valid_and_sums() {
         let mut crc = base_crc();
-        crc.set_transactions = Some(HashMap::new());
-        let txn = SetTransaction::new("my-app".to_string(), 1, Some(1000));
-        let delta = CrcDelta {
-            set_transaction_changes: vec![txn],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        let map = crc.set_transactions.as_ref().unwrap();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["my-app"].version, 1);
-        assert_eq!(map["my-app"].last_updated, Some(1000));
+        crc.apply(write_update(3, 600));
+        let stats = crc.file_stats().unwrap();
+        assert_eq!(stats.num_files(), 13);
+        assert_eq!(stats.table_size_bytes(), 1600);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Valid);
     }
 
     #[test]
-    fn test_apply_with_untracked_set_transactions_skips_changes() {
+    fn apply_multiple_safe_updates_sums_correctly() {
+        // Demonstrates Crc[N] + δ + δ + δ = Crc[N+3] composition.
         let mut crc = base_crc();
-        assert!(crc.set_transactions.is_none()); // Not tracked (default)
-        let txn = SetTransaction::new("my-app".to_string(), 1, Some(1000));
-        let delta = CrcDelta {
-            set_transaction_changes: vec![txn],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        // set_transactions stays None -- apply() must not create a partial map.
-        assert!(crc.set_transactions.is_none());
+        crc.apply(write_update(3, 600));
+        crc.apply(write_update(-2, -400));
+        crc.apply(write_update(1, 100));
+        let stats = crc.file_stats().unwrap();
+        assert_eq!(stats.num_files(), 12); // 10 + 3 - 2 + 1
+        assert_eq!(stats.table_size_bytes(), 1300); // 1000 + 600 - 400 + 100
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Valid);
     }
 
     #[test]
-    fn test_apply_upserts_set_transaction() {
+    fn apply_unsafe_op_transitions_valid_to_indeterminate() {
         let mut crc = base_crc();
-        crc.set_transactions = Some(HashMap::from([(
-            "my-app".to_string(),
-            SetTransaction::new("my-app".to_string(), 1, Some(1000)),
-        )]));
-
-        let txn = SetTransaction::new("my-app".to_string(), 2, Some(2000));
-        let delta = CrcDelta {
-            set_transaction_changes: vec![txn],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        let map = crc.set_transactions.as_ref().unwrap();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["my-app"].version, 2);
-        assert_eq!(map["my-app"].last_updated, Some(2000));
-    }
-
-    // ===== into_crc_for_version_zero: set transaction tests =====
-
-    #[test]
-    fn test_into_crc_for_version_zero_with_set_transactions() {
-        let txn = SetTransaction::new("my-app".to_string(), 5, Some(3000));
-        let delta = CrcDelta {
-            protocol: Some(test_protocol()),
-            metadata: Some(Metadata::default()),
-            set_transaction_changes: vec![txn],
-            ..write_delta(0, 0)
-        };
-        let crc = delta.into_crc_for_version_zero().unwrap();
-        let map = crc.set_transactions.as_ref().unwrap();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["my-app"].version, 5);
-        assert_eq!(map["my-app"].last_updated, Some(3000));
+        crc.apply(CrcUpdate {
+            operation_safe: false,
+            ..write_update(1, 100)
+        });
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Indeterminate);
     }
 
     #[test]
-    fn test_into_crc_for_version_zero_with_no_set_transactions() {
-        let delta = CrcDelta {
-            protocol: Some(test_protocol()),
-            metadata: Some(Metadata::default()),
-            ..write_delta(0, 0)
-        };
-        let crc = delta.into_crc_for_version_zero().unwrap();
-        // Empty map, not None -- we always know the full state at version zero.
-        assert_eq!(crc.set_transactions, Some(HashMap::new()));
-    }
-
-    // ===== Histogram tests =====
-
-    /// Helper: creates a default-boundary histogram populated with the given file sizes.
-    fn histogram_from_sizes(sizes: &[i64]) -> FileSizeHistogram {
-        let mut hist = FileSizeHistogram::create_default();
-        for &size in sizes {
-            hist.insert(size).unwrap();
-        }
-        hist
-    }
-
-    /// Helper: creates a CRC with a histogram containing the given file sizes.
-    fn base_crc_with_histogram(file_sizes: &[i64]) -> Crc {
-        let hist = histogram_from_sizes(file_sizes);
-        Crc {
-            table_size_bytes: file_sizes.iter().sum(),
-            num_files: file_sizes.len() as i64,
-            num_metadata: 1,
-            num_protocol: 1,
-            file_size_histogram: Some(hist),
-            ..Default::default()
-        }
-    }
-
-    /// Helper: creates a CrcDelta with a delta histogram built from adds and removes.
-    fn write_delta_with_histograms(add_sizes: &[i64], remove_sizes: &[i64]) -> CrcDelta {
-        let mut hist = FileSizeHistogram::create_default();
-        for &s in add_sizes {
-            hist.insert(s).unwrap();
-        }
-        for &s in remove_sizes {
-            hist.remove(s).unwrap();
-        }
-        let net_files = add_sizes.len() as i64 - remove_sizes.len() as i64;
-        let net_bytes: i64 = add_sizes.iter().sum::<i64>() - remove_sizes.iter().sum::<i64>();
-        CrcDelta {
-            file_stats: FileStatsDelta {
-                net_files,
-                net_bytes,
-                net_histogram: Some(hist),
-            },
-            operation: Some("WRITE".to_string()),
-            ..Default::default()
-        }
-    }
-
-    /// Histogram bins used in tests (default boundaries):
-    ///   Bin 0: [0, 8KB)     -- e.g. 100, 200, 300, 500
-    ///   Bin 1: [8KB, 16KB)  -- e.g. 10_000
-    ///   Bin 2: [16KB, 32KB) -- e.g. 20_000
-    ///   Bin 10: [4MB, 8MB)  -- e.g. 5_000_000
-    #[rstest]
-    #[case::single_bin(&[100, 200, 300], &[500], &[200], &[(0, 3, 900)])]
-    #[case::adds_only(&[100], &[200, 300], &[], &[(0, 3, 600)])]
-    #[case::removes_only(&[100, 200, 300], &[], &[100, 200], &[(0, 1, 300)])]
-    #[case::empty_delta(&[100, 10_000], &[], &[], &[(0, 1, 100), (1, 1, 10_000)])]
-    #[case::multi_bin(
-        &[100, 10_000, 20_000],
-        &[200, 10_500],
-        &[100, 20_000],
-        &[(0, 1, 200), (1, 2, 20_500), (2, 0, 0)]
-    )]
-    #[case::large_files(
-        &[100, 5_000_000],
-        &[10_000, 5_500_000],
-        &[100],
-        &[(0, 0, 0), (1, 1, 10_000), (10, 2, 10_500_000)]
-    )]
-    fn apply_merges_histogram(
-        #[case] base: &[i64],
-        #[case] add: &[i64],
-        #[case] remove: &[i64],
-        #[case] expected_bins: &[(usize, i64, i64)],
-    ) {
-        let mut crc = base_crc_with_histogram(base);
-        let delta = write_delta_with_histograms(add, remove);
-        crc.apply(delta);
-
-        let hist = crc.file_size_histogram.as_ref().unwrap();
-        for &(bin, count, bytes) in expected_bins {
-            assert_eq!(hist.file_counts[bin], count, "file_counts[{bin}]");
-            assert_eq!(hist.total_bytes[bin], bytes, "total_bytes[{bin}]");
-        }
-    }
-
-    #[rstest]
-    #[case::base_none_delta_none(None)]
-    #[case::base_some_delta_none(Some(vec![100i64, 200]))]
-    fn apply_drops_histogram_when_delta_missing_histogram(#[case] base_files: Option<Vec<i64>>) {
-        let mut crc = match &base_files {
-            Some(sizes) => base_crc_with_histogram(sizes),
-            None => base_crc(),
-        };
-        let delta = CrcDelta {
-            file_stats: FileStatsDelta {
-                net_files: 1,
-                net_bytes: 100,
-                net_histogram: None,
-            },
-            operation: Some("WRITE".to_string()),
-            ..Default::default()
-        };
-        crc.apply(delta);
-        assert!(
-            crc.file_size_histogram.is_none(),
-            "histogram should be None when delta doesn't provide a histogram"
-        );
+    fn apply_indeterminate_stays_indeterminate_on_safe_update() {
+        let mut crc = base_crc();
+        crc.apply(CrcUpdate {
+            operation_safe: false,
+            ..write_update(1, 100)
+        });
+        crc.apply(write_update(5, 500));
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Indeterminate);
     }
 
     #[test]
-    fn apply_drops_histogram_on_indeterminate() {
-        let mut crc = base_crc_with_histogram(&[100, 200]);
-        let unsafe_delta = CrcDelta {
-            operation: Some("ANALYZE STATS".to_string()),
-            ..write_delta(1, 100)
-        };
-        crc.apply(unsafe_delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
-        assert!(crc.file_size_histogram.is_none());
-    }
-
-    #[test]
-    fn apply_drops_histogram_on_untrackable() {
-        let mut crc = base_crc_with_histogram(&[100, 200]);
-        // A missing file size makes byte-level stats impossible, so the histogram is dropped.
-        let delta = CrcDelta {
+    fn apply_missing_file_size_transitions_valid_to_untrackable() {
+        let mut crc = base_crc();
+        crc.apply(CrcUpdate {
             has_missing_file_size: true,
-            ..write_delta(1, 100)
-        };
-        crc.apply(delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
-        assert!(crc.file_size_histogram.is_none());
+            ..write_update(1, 100)
+        });
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Untrackable);
     }
 
     #[test]
-    fn into_crc_for_version_zero_includes_histogram() {
-        let delta_hist = histogram_from_sizes(&[500, 1000]);
-        let delta = CrcDelta {
-            protocol: Some(test_protocol()),
-            metadata: Some(Metadata::default()),
-            file_stats: FileStatsDelta {
-                net_files: 2,
-                net_bytes: 1500,
-                net_histogram: Some(delta_hist),
-            },
-            operation: Some("WRITE".to_string()),
-            ..Default::default()
-        };
-        let crc = delta.into_crc_for_version_zero().unwrap();
-        let hist = crc.file_size_histogram.as_ref().unwrap();
-        assert_eq!(hist.file_counts[0], 2);
-        assert_eq!(hist.total_bytes[0], 1500);
+    fn apply_untrackable_stays_untrackable() {
+        let mut crc = base_crc();
+        crc.apply(CrcUpdate {
+            has_missing_file_size: true,
+            ..write_update(1, 100)
+        });
+        crc.apply(write_update(5, 500));
+        crc.apply(CrcUpdate {
+            operation_safe: false,
+            ..write_update(1, 100)
+        });
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Untrackable);
     }
 
     #[test]
-    fn into_crc_for_version_zero_without_histogram() {
-        // write_delta() produces a CrcDelta with no histogram delta, so
-        // into_crc_for_version_zero cannot construct a file size histogram.
-        let delta = CrcDelta {
-            protocol: Some(test_protocol()),
-            metadata: Some(Metadata::default()),
-            ..write_delta(0, 0)
-        };
-        let crc = delta.into_crc_for_version_zero().unwrap();
-        assert!(crc.file_size_histogram.is_none());
+    fn apply_indeterminate_transitions_to_untrackable_on_missing_size() {
+        let mut crc = base_crc();
+        crc.apply(CrcUpdate {
+            operation_safe: false,
+            ..write_update(1, 100)
+        });
+        crc.apply(CrcUpdate {
+            has_missing_file_size: true,
+            ..write_update(1, 100)
+        });
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Untrackable);
     }
 
+    // ===== Crc::apply: P&M, DM, txn, ICT =====
+
     #[test]
-    fn apply_merges_histogram_with_non_default_boundaries() {
-        // Base CRC with custom 3-bin histogram: [0, 200) [200, 1000) [1000, inf)
-        let boundaries = vec![0, 200, 1000];
-        let base_hist = FileSizeHistogram::try_new(
-            boundaries.clone(),
-            vec![2, 1, 0], // 2 files in bin 0, 1 in bin 1
-            vec![300, 500, 0],
+    fn apply_replaces_protocol_and_metadata_when_present() {
+        let mut crc = base_crc();
+        let new_protocol = Protocol::try_new(
+            2,
+            5,
+            None::<Vec<crate::table_features::TableFeature>>,
+            None::<Vec<crate::table_features::TableFeature>>,
         )
         .unwrap();
-        let mut crc = Crc {
-            table_size_bytes: 800,
-            num_files: 3,
-            num_metadata: 1,
-            num_protocol: 1,
-            file_size_histogram: Some(base_hist),
+        crc.apply(CrcUpdate {
+            protocol: Some(new_protocol.clone()),
+            ..write_update(0, 0)
+        });
+        assert_eq!(crc.protocol, new_protocol);
+        assert_eq!(crc.metadata, Metadata::default()); // unchanged
+    }
+
+    #[test]
+    fn apply_dm_to_complete_upserts_and_removes_tombstones() {
+        let mut crc = base_crc();
+        let mut dms = HashMap::new();
+        dms.insert(
+            "old".to_string(),
+            DomainMetadata::new("old".to_string(), "v1".to_string()),
+        );
+        crc.domain_metadata = DomainMetadataState::Complete(dms);
+
+        let mut update_map = HashMap::new();
+        update_map.insert(
+            "old".to_string(),
+            DomainMetadata::new("old".to_string(), "v2".to_string()),
+        ); // upsert
+        update_map.insert(
+            "new".to_string(),
+            DomainMetadata::new("new".to_string(), "config".to_string()),
+        ); // add
+        crc.apply(CrcUpdate {
+            domain_metadata: update_map,
+            ..write_update(0, 0)
+        });
+
+        let map = crc.domain_metadata.map().unwrap();
+        assert_eq!(map["old"].configuration(), "v2");
+        assert_eq!(map["new"].configuration(), "config");
+        assert!(crc.domain_metadata.is_complete());
+    }
+
+    #[test]
+    fn apply_dm_tombstone_removes_from_complete_map() {
+        let mut crc = base_crc();
+        let mut dms = HashMap::new();
+        dms.insert(
+            "d".to_string(),
+            DomainMetadata::new("d".to_string(), "v".to_string()),
+        );
+        crc.domain_metadata = DomainMetadataState::Complete(dms);
+
+        let mut update_map = HashMap::new();
+        update_map.insert(
+            "d".to_string(),
+            DomainMetadata::remove("d".to_string(), "v".to_string()),
+        );
+        crc.apply(CrcUpdate {
+            domain_metadata: update_map,
+            ..write_update(0, 0)
+        });
+
+        let map = crc.domain_metadata.map().unwrap();
+        assert!(map.is_empty());
+        assert!(crc.domain_metadata.is_complete()); // stays Complete
+    }
+
+    #[test]
+    fn apply_dm_to_untracked_transitions_to_partial() {
+        // Crucial: a CRC missing DM (Untracked) gets DM entries from newer commits via
+        // apply. The result is Partial — entries are correct but the cache is incomplete.
+        let mut crc = base_crc();
+        assert!(matches!(
+            crc.domain_metadata,
+            DomainMetadataState::Untracked
+        ));
+        let mut update_map = HashMap::new();
+        update_map.insert(
+            "d".to_string(),
+            DomainMetadata::new("d".to_string(), "v".to_string()),
+        );
+        crc.apply(CrcUpdate {
+            domain_metadata: update_map,
+            ..write_update(0, 0)
+        });
+        assert!(matches!(
+            crc.domain_metadata,
+            DomainMetadataState::Partial(_)
+        ));
+        let map = crc.domain_metadata.map().unwrap();
+        assert_eq!(map["d"].configuration(), "v");
+    }
+
+    #[test]
+    fn apply_txn_to_untracked_transitions_to_partial() {
+        let mut crc = base_crc();
+        let mut update_map = HashMap::new();
+        update_map.insert(
+            "app".to_string(),
+            SetTransaction::new("app".to_string(), 5, None),
+        );
+        crc.apply(CrcUpdate {
+            set_transactions: update_map,
+            ..write_update(0, 0)
+        });
+        assert!(matches!(
+            crc.set_transactions,
+            SetTransactionState::Partial(_)
+        ));
+        let map = crc.set_transactions.map().unwrap();
+        assert_eq!(map["app"].version, 5);
+    }
+
+    #[test]
+    fn apply_ict_replaces_unconditionally() {
+        let mut crc = base_crc();
+        crc.in_commit_timestamp_opt = Some(1000);
+
+        // None clears
+        crc.apply(CrcUpdate {
+            in_commit_timestamp: None,
+            ..write_update(0, 0)
+        });
+        assert_eq!(crc.in_commit_timestamp_opt, None);
+
+        // Some sets
+        crc.apply(CrcUpdate {
+            in_commit_timestamp: Some(2000),
+            ..write_update(0, 0)
+        });
+        assert_eq!(crc.in_commit_timestamp_opt, Some(2000));
+    }
+
+    // ===== into_fresh_crc =====
+
+    #[test]
+    fn into_fresh_crc_with_protocol_and_metadata_succeeds() {
+        let update = CrcUpdate {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            ..write_update(5, 1000)
+        };
+        let crc = update.into_fresh_crc().unwrap();
+        assert_eq!(crc.file_stats().unwrap().num_files(), 5);
+        assert_eq!(crc.file_stats().unwrap().table_size_bytes(), 1000);
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Valid);
+        assert!(crc.domain_metadata.is_complete());
+        assert!(crc.set_transactions.is_complete());
+    }
+
+    #[rstest]
+    #[case::missing_protocol(None, Some(Metadata::default()))]
+    #[case::missing_metadata(Some(test_protocol()), None)]
+    #[case::missing_both(None, None)]
+    fn into_fresh_crc_requires_both_protocol_and_metadata(
+        #[case] protocol: Option<Protocol>,
+        #[case] metadata: Option<Metadata>,
+    ) {
+        let update = CrcUpdate {
+            protocol,
+            metadata,
+            ..write_update(0, 0)
+        };
+        assert!(update.into_fresh_crc().is_err());
+    }
+
+    #[test]
+    fn into_fresh_crc_unsafe_op_produces_indeterminate() {
+        let update = CrcUpdate {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            operation_safe: false,
             ..Default::default()
         };
+        let crc = update.into_fresh_crc().unwrap();
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Indeterminate);
+    }
 
-        // Delta with matching non-default boundaries: +100 and +1500, -150
-        let mut delta_hist = FileSizeHistogram::create_empty_with_boundaries(boundaries).unwrap();
-        delta_hist.insert(100).unwrap(); // bin 0
-        delta_hist.insert(1500).unwrap(); // bin 2
-        delta_hist.remove(150).unwrap(); // bin 0
+    #[test]
+    fn into_fresh_crc_missing_size_produces_untrackable() {
+        let update = CrcUpdate {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            has_missing_file_size: true,
+            operation_safe: true,
+            ..Default::default()
+        };
+        let crc = update.into_fresh_crc().unwrap();
+        assert_eq!(crc.file_stats_validity(), FileStatsValidity::Untrackable);
+    }
 
-        let delta = CrcDelta {
+    #[test]
+    fn into_fresh_crc_filters_dm_tombstones() {
+        let mut dms = HashMap::new();
+        dms.insert(
+            "alive".to_string(),
+            DomainMetadata::new("alive".to_string(), "v".to_string()),
+        );
+        dms.insert(
+            "dead".to_string(),
+            DomainMetadata::remove("dead".to_string(), "v".to_string()),
+        );
+        let update = CrcUpdate {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            domain_metadata: dms,
+            operation_safe: true,
+            ..Default::default()
+        };
+        let crc = update.into_fresh_crc().unwrap();
+        let map = crc.domain_metadata.map().unwrap();
+        assert!(map.contains_key("alive"));
+        assert!(!map.contains_key("dead"));
+    }
+
+    // ===== histogram merge =====
+
+    #[test]
+    fn apply_merges_histogram_when_both_present() {
+        let mut hist = FileSizeHistogram::create_default();
+        hist.insert(100).unwrap();
+        hist.insert(200).unwrap();
+        let mut crc = base_crc();
+        crc.file_stats = FileStatsState::Valid {
+            num_files: 2,
+            table_size_bytes: 300,
+            histogram: Some(hist),
+        };
+
+        let mut delta_hist = FileSizeHistogram::create_default();
+        delta_hist.insert(500).unwrap();
+        crc.apply(CrcUpdate {
             file_stats: FileStatsDelta {
-                net_files: 1,    // +2 - 1
-                net_bytes: 1450, // (100 + 1500) - 150
+                net_files: 1,
+                net_bytes: 500,
                 net_histogram: Some(delta_hist),
             },
-            operation: Some("WRITE".to_string()),
+            operation_safe: true,
             ..Default::default()
+        });
+
+        let stats = crc.file_stats().unwrap();
+        let merged = stats.file_size_histogram().unwrap();
+        assert_eq!(merged.file_counts()[0], 3); // bin 0: 100, 200, 500
+        assert_eq!(merged.total_bytes()[0], 800);
+    }
+
+    #[test]
+    fn apply_drops_histogram_when_base_some_delta_none() {
+        let mut hist = FileSizeHistogram::create_default();
+        hist.insert(100).unwrap();
+        let mut crc = base_crc();
+        crc.file_stats = FileStatsState::Valid {
+            num_files: 1,
+            table_size_bytes: 100,
+            histogram: Some(hist),
         };
 
-        crc.apply(delta);
+        crc.apply(write_update(0, 0)); // delta has no histogram
 
-        // Histogram should be preserved (boundaries match)
-        let hist = crc.file_size_histogram.as_ref().unwrap();
-        assert_eq!(hist.sorted_bin_boundaries, vec![0, 200, 1000]);
-        assert_eq!(hist.file_counts, vec![2, 1, 1]); // (2+1-1), (1+0-0), (0+1-0)
-        assert_eq!(hist.total_bytes, vec![250, 500, 1500]); // (300+100-150), (500+0-0), (0+1500-0)
-        assert_eq!(crc.num_files, 4);
-        assert_eq!(crc.table_size_bytes, 2250);
+        let stats = crc.file_stats().unwrap();
+        assert!(stats.file_size_histogram().is_none());
+    }
+
+    #[test]
+    fn apply_adopts_histogram_when_base_none_delta_some() {
+        // Forward-replay-friendly: a base CRC without a histogram + an update with a
+        // histogram → CRC adopts the update's histogram. Useful when forward-replaying
+        // onto a base that lacked histogram support.
+        let mut crc = base_crc();
+        crc.file_stats = FileStatsState::Valid {
+            num_files: 0,
+            table_size_bytes: 0,
+            histogram: None,
+        };
+
+        let mut delta_hist = FileSizeHistogram::create_default();
+        delta_hist.insert(500).unwrap();
+        crc.apply(CrcUpdate {
+            file_stats: FileStatsDelta {
+                net_files: 1,
+                net_bytes: 500,
+                net_histogram: Some(delta_hist),
+            },
+            operation_safe: true,
+            ..Default::default()
+        });
+
+        let stats = crc.file_stats().unwrap();
+        let adopted = stats.file_size_histogram().unwrap();
+        assert_eq!(adopted.file_counts()[0], 1);
+        assert_eq!(adopted.total_bytes()[0], 500);
+    }
+
+    #[test]
+    fn apply_drops_histogram_on_indeterminate_transition() {
+        let mut hist = FileSizeHistogram::create_default();
+        hist.insert(100).unwrap();
+        let mut crc = base_crc();
+        crc.file_stats = FileStatsState::Valid {
+            num_files: 1,
+            table_size_bytes: 100,
+            histogram: Some(hist),
+        };
+
+        crc.apply(CrcUpdate {
+            operation_safe: false,
+            ..write_update(0, 0)
+        });
+
+        // Indeterminate has no histogram field — the data is gone.
+        assert!(matches!(crc.file_stats, FileStatsState::Indeterminate));
+        assert!(crc.file_stats().is_none());
+    }
+
+    #[test]
+    fn apply_to_requires_checkpoint_read_accumulates_deltas() {
+        let mut crc = Crc::minimal_from_pm(Protocol::default(), Metadata::default());
+        assert_eq!(
+            crc.file_stats_validity(),
+            FileStatsValidity::RequiresCheckpointRead
+        );
+        crc.apply(write_update(3, 600));
+        crc.apply(write_update(-1, -200));
+
+        // Stays RequiresCheckpointRead, with accumulated deltas.
+        assert_eq!(
+            crc.file_stats_validity(),
+            FileStatsValidity::RequiresCheckpointRead
+        );
+        let FileStatsState::RequiresCheckpointRead {
+            commit_delta_files,
+            commit_delta_bytes,
+            ..
+        } = &crc.file_stats
+        else {
+            panic!("expected RequiresCheckpointRead, got {:?}", crc.file_stats);
+        };
+        assert_eq!(*commit_delta_files, 2); // 3 - 1
+        assert_eq!(*commit_delta_bytes, 400); // 600 - 200
     }
 }

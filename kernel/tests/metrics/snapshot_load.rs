@@ -90,11 +90,19 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
     assert_eq!(reporter.checkpoint_files.get(), 1);
     assert_eq!(reporter.compaction_files.get(), 0);
 
-    // One JSON read for the tail commit; one Parquet read for the checkpoint
+    // One JSON read for the tail commit. Two Parquet reads for the checkpoint:
+    //   1. Sidecar extraction probe (the CRC schema includes Add/Remove file actions, so
+    //      `create_checkpoint_stream` triggers `extract_sidecar_refs` to detect potential V2
+    //      sidecars; the kernel-written V1 checkpoint includes an empty `sidecar` column in its
+    //      schema, so the probe reads the file).
+    //   2. The full data read for the CRC build.
+    // Pre-eager-Crc, the snapshot loaded only with a P&M-only schema (no Add/Remove), so
+    // step 1 was skipped. The eager-Crc design pays this extra read once per snapshot
+    // load on V1 parquet checkpoints.
     assert_eq!(reporter.json_read_calls.get(), 1);
     assert_eq!(reporter.json_files_read.get(), 1);
-    assert_eq!(reporter.parquet_read_calls.get(), 1);
-    assert_eq!(reporter.parquet_files_read.get(), 1);
+    assert_eq!(reporter.parquet_read_calls.get(), 2);
+    assert_eq!(reporter.parquet_files_read.get(), 2);
     // On Windows (NTFS), listing a file written moments earlier can return size=0 because
     // the OS has not yet flushed size metadata to the directory entry. bytes_read is sourced
     // from these FileMeta::size values, so it can be 0 even when real I/O occurred.
@@ -127,11 +135,12 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> DeltaResult<()> 
     assert_eq!(reporter.checkpoint_files.get(), 1);
     assert_eq!(reporter.compaction_files.get(), 0);
 
-    // JSON handler is called with zero files; Parquet reads the checkpoint
+    // JSON handler is called once with zero files (empty commit cover). Parquet handler
+    // is called twice: sidecar probe (see comment in scenario 2 above) + full data read.
     assert_eq!(reporter.json_read_calls.get(), 1);
     assert_eq!(reporter.json_files_read.get(), 0);
-    assert_eq!(reporter.parquet_read_calls.get(), 1);
-    assert_eq!(reporter.parquet_files_read.get(), 1);
+    assert_eq!(reporter.parquet_read_calls.get(), 2);
+    assert_eq!(reporter.parquet_files_read.get(), 2);
 
     Ok(())
 }
@@ -336,10 +345,11 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Delta
     // Checkpoint at v1 -- listing starts from v2; tail is v2, v3, v4
     assert_eq!(reporter.commit_files.get(), 3);
     assert_eq!(reporter.checkpoint_files.get(), 1);
-    // All 3 tail commits read in a single JSON call; checkpoint in a single Parquet call
+    // All 3 tail commits read in a single JSON call. Checkpoint reads twice: sidecar
+    // probe + full data read (see Scenario 2 comment).
     assert_eq!(reporter.json_read_calls.get(), 1);
     assert_eq!(reporter.json_files_read.get(), 3);
-    assert_eq!(reporter.parquet_read_calls.get(), 1);
+    assert_eq!(reporter.parquet_read_calls.get(), 2);
     // See Scenario 2 comment: Windows NTFS may report stale size=0 for recently written files.
     #[cfg(not(windows))]
     assert!(reporter.json_bytes_read.get() > 0);
@@ -353,15 +363,16 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Delta
 // Scenario 8: on-demand domain metadata query incurs additional log replay
 // ============================================================================
 
-/// `snapshot.get_domain_metadata()` always performs a full log replay when no CRC is
-/// present at the target version. Calling it after a snapshot is already built generates
-/// a second round of JSON reads, demonstrating that on-demand metadata queries carry
-/// their own I/O cost.
+/// Under the eager-Crc design, snapshot build captures `Complete` domain metadata as part
+/// of the same reverse log replay used to construct `Crc[N]`. Subsequent
+/// `snapshot.get_domain_metadata()` calls serve from the in-memory `DomainMetadataState::Complete`
+/// map without any additional log replay.
 ///
-/// The specific count (`json_read_calls = 1`) reflects this test's table: 2 commits, no
-/// checkpoint, no CRC. Tables with different log structures will produce different counts.
+/// This is a fast-path win: the OLD design did P&M-only replay during snapshot build and
+/// had to do a separate (full) log replay on first DM query. The new design does ONE
+/// reverse replay total.
 #[test]
-fn get_domain_metadata_when_no_latest_crc_incurs_additional_log_replay() -> DeltaResult<()> {
+fn get_domain_metadata_after_snapshot_build_is_served_from_crc_with_no_io() -> DeltaResult<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_commits(2))
         .with_data(1, 1)
@@ -370,19 +381,20 @@ fn get_domain_metadata_when_no_latest_crc_incurs_additional_log_replay() -> Delt
     let (engine, reporter, _guard) = measuring_engine(table.store().clone());
     let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
-    // Snapshot build reads both commit files in one JSON call
+    // Snapshot build reads both commit files in one JSON call (the reverse-replay pass
+    // that builds `Crc[N]` and captures `Complete` DM state).
     assert_eq!(reporter.json_read_calls.get(), 1);
 
-    // Reset so the domain metadata query cost is isolated
+    // Reset so the domain metadata query cost is isolated.
     reporter.reset();
     let _ = snap.get_domain_metadata("myapp.config", &engine)?;
 
+    // Under the eager-Crc design, DM is served from the CRC -- no additional log replay.
     assert_eq!(
         reporter.json_read_calls.get(),
-        1,
-        "get_domain_metadata replays the log, incurring one additional JSON read call"
+        0,
+        "get_domain_metadata serves from CRC's Complete DM state under the eager-Crc design"
     );
-    assert!(reporter.json_files_read.get() > 0);
 
     Ok(())
 }

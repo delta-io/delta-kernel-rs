@@ -14,7 +14,7 @@ use crate::actions::{
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
-use crate::crc::{CrcDelta, FileStatsDelta, LazyCrc};
+use crate::crc::{CrcUpdate, FileStatsDelta};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
@@ -481,13 +481,13 @@ impl<S> Transaction<S> {
                     .and_then(|snap| snap.get_file_stats_if_loaded())
                     .and_then(|s| s.file_size_histogram)
                     .map(|h| h.sorted_bin_boundaries);
-                let crc_delta = self.build_crc_delta(
+                let crc_update = self.build_crc_update(
                     in_commit_timestamp,
                     dm_changes,
                     bin_boundaries.as_deref(),
                 )?;
                 Ok(CommitResult::CommittedTransaction(
-                    self.into_committed(file_meta, crc_delta)?,
+                    self.into_committed(file_meta, crc_update)?,
                 ))
             }
             Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
@@ -1128,7 +1128,7 @@ impl<S> Transaction<S> {
     fn into_committed(
         self,
         file_meta: FileMeta,
-        crc_delta: CrcDelta,
+        crc_update: CrcUpdate,
     ) -> DeltaResult<CommittedTransaction> {
         let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
 
@@ -1136,7 +1136,7 @@ impl<S> Transaction<S> {
 
         let (post_commit_stats, post_commit_snapshot) = match &self.read_snapshot_opt {
             Some(snap) => {
-                // Existing table path: use the read snapshot to compute post-commit state.
+                // Existing table path: Crc[N] + CrcUpdate(N→N+1) = Crc[N+1].
                 let stats = PostCommitStats {
                     commits_since_checkpoint: snap.log_segment().commits_since_checkpoint() + 1,
                     commits_since_log_compaction: snap
@@ -1144,28 +1144,26 @@ impl<S> Transaction<S> {
                         .commits_since_log_compaction_or_checkpoint()
                         + 1,
                 };
-                let snapshot = snap.new_post_commit(parsed_commit, crc_delta)?;
+                let snapshot = snap.new_post_commit(parsed_commit, crc_update)?;
                 (stats, Arc::new(snapshot))
             }
             None => {
-                // CREATE TABLE path: build a fresh Snapshot at version 0.
+                // CREATE TABLE path: no read snapshot, no Crc[N] to apply onto. Build a
+                // fresh Crc[0] directly via CrcUpdate::into_fresh_crc.
                 let log_root = self
                     .effective_table_config
                     .table_root()
                     .join("_delta_log/")?;
                 let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
-                let crc = crc_delta.into_crc_for_version_zero().ok_or_else(|| {
-                    Error::internal_error("CREATE TABLE CRC delta is missing protocol or metadata")
+                let crc = crc_update.into_crc_for_version_zero().ok_or_else(|| {
+                    Error::internal_error("CREATE TABLE CrcUpdate is missing protocol or metadata")
                 })?;
                 let stats = PostCommitStats {
                     commits_since_checkpoint: 1,
                     commits_since_log_compaction: 1,
                 };
-                let snapshot = Snapshot::new_with_crc(
-                    log_segment,
-                    self.effective_table_config,
-                    Arc::new(LazyCrc::new_precomputed(crc, 0)),
-                );
+                let snapshot =
+                    Snapshot::new_with_crc(log_segment, self.effective_table_config, Arc::new(crc));
                 (stats, Arc::new(snapshot))
             }
         };
@@ -1177,19 +1175,30 @@ impl<S> Transaction<S> {
         })
     }
 
-    /// Build a [`CrcDelta`] from the transaction's staged file metadata and commit state.
-    fn build_crc_delta(
+    /// Build a [`CrcUpdate`] from the transaction's staged file metadata and commit state.
+    ///
+    /// Produces the universal delta type. The post-commit path applies it onto the read
+    /// snapshot's [`Crc`] (or builds a fresh Crc for CREATE TABLE).
+    fn build_crc_update(
         &self,
         in_commit_timestamp: Option<i64>,
         dm_changes: Vec<DomainMetadata>,
         bin_boundaries: Option<&[i64]>,
-    ) -> DeltaResult<CrcDelta> {
+    ) -> DeltaResult<CrcUpdate> {
         let file_stats = FileStatsDelta::try_compute_for_txn(
             &self.add_files_metadata,
             &self.remove_files_metadata,
             bin_boundaries,
         )?;
-        Ok(CrcDelta {
+        // Operation safety: precomputed once. The transaction's operation comes from the
+        // caller (engine_info / commitInfo). Unknown / unsafe ops produce a CrcUpdate with
+        // `operation_safe = false`, which transitions the post-commit Crc's file stats to
+        // Indeterminate.
+        let operation_safe = self
+            .operation
+            .as_deref()
+            .is_some_and(FileStatsDelta::is_incremental_safe);
+        Ok(CrcUpdate {
             file_stats,
             protocol: self
                 .should_emit_protocol
@@ -1197,11 +1206,18 @@ impl<S> Transaction<S> {
             metadata: self
                 .should_emit_metadata
                 .then(|| self.effective_table_config.metadata().clone()),
-            domain_metadata_changes: dm_changes,
-            set_transaction_changes: self.set_transactions.clone(),
+            domain_metadata: dm_changes
+                .into_iter()
+                .map(|dm| (dm.domain().to_string(), dm))
+                .collect(),
+            set_transactions: self
+                .set_transactions
+                .iter()
+                .map(|txn| (txn.app_id.clone(), txn.clone()))
+                .collect(),
             in_commit_timestamp,
-            operation: self.operation.clone(),
-            has_missing_file_size: false, // writes always have sizes
+            operation_safe,
+            has_missing_file_size: false, // writes always include file sizes
         })
     }
 

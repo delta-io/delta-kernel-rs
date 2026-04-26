@@ -68,6 +68,7 @@ impl LazyCrc {
     /// The CRC is immediately available via `get_or_load` without any I/O. The `version`
     /// parameter records which table version this CRC corresponds to, enabling
     /// `get_if_loaded_at_version` to work for chained commits.
+    #[allow(dead_code)] // Reserved for future paths that pre-compute CRCs without disk-backed files.
     pub(crate) fn new_precomputed(crc: Crc, version: Version) -> Self {
         let cached = OnceLock::new();
         // OnceLock::set cannot fail here because we just created it
@@ -100,6 +101,7 @@ impl LazyCrc {
     }
 
     /// Returns the CRC only if the CRC file is at the given version, loading if necessary.
+    #[allow(dead_code)] // Reserved for future paths.
     pub(crate) fn get_or_load_if_at_version(
         &self,
         engine: &dyn Engine,
@@ -115,6 +117,7 @@ impl LazyCrc {
     ///
     /// This is purely opportunistic: it returns `Some` only when the CRC was previously loaded
     /// (via `get_or_load`) or precomputed (via `new_precomputed`) AND the version matches.
+    #[allow(dead_code)] // Reserved for future paths.
     pub(crate) fn get_if_loaded_at_version(&self, version: Version) -> Option<&Arc<Crc>> {
         if self.crc_version() != Some(version) {
             return None;
@@ -162,15 +165,24 @@ mod tests {
     #[test]
     fn test_crc_load_result_loaded() {
         let crc = Crc {
-            table_size_bytes: 100,
-            num_files: 10,
-            num_metadata: 1,
-            num_protocol: 1,
+            file_stats: crate::crc::FileStatsState::Valid {
+                num_files: 10,
+                table_size_bytes: 100,
+                histogram: None,
+            },
             ..Default::default()
         };
         let loaded = CrcLoadResult::Loaded(Arc::new(crc));
         assert!(loaded.get().is_some());
-        assert_eq!(loaded.get().unwrap().table_size_bytes, 100);
+        assert_eq!(
+            loaded
+                .get()
+                .unwrap()
+                .file_stats()
+                .unwrap()
+                .table_size_bytes(),
+            100
+        );
     }
 
     #[rstest]
@@ -228,7 +240,7 @@ mod tests {
         assert!(lazy.is_loaded());
 
         let crc = result.get().unwrap();
-        assert_eq!(crc.table_size_bytes, 5259);
+        assert_eq!(crc.file_stats().unwrap().table_size_bytes(), 5259);
     }
 
     #[test]
@@ -250,10 +262,11 @@ mod tests {
 
     fn test_crc(table_size_bytes: i64) -> Crc {
         Crc {
-            table_size_bytes,
-            num_files: 1,
-            num_metadata: 1,
-            num_protocol: 1,
+            file_stats: crate::crc::FileStatsState::Valid {
+                num_files: 1,
+                table_size_bytes,
+                histogram: None,
+            },
             ..Default::default()
         }
     }
@@ -269,7 +282,7 @@ mod tests {
         // get_if_loaded_at_version should return the CRC at the correct version
         let loaded = lazy.get_if_loaded_at_version(5);
         assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().table_size_bytes, 42);
+        assert_eq!(loaded.unwrap().file_stats().unwrap().table_size_bytes(), 42);
 
         // Wrong version should return None
         assert!(lazy.get_if_loaded_at_version(4).is_none());

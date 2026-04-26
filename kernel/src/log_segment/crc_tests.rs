@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::json;
-use test_utils::{assert_result_error_with_message, delta_path_for_version};
+use test_utils::delta_path_for_version;
 use url::Url;
 
 use crate::actions::{CommitInfo, Format, Metadata, Protocol};
@@ -577,7 +577,12 @@ async fn test_ict_from_crc_at_snapshot_version() {
 }
 
 #[tokio::test]
-async fn test_ict_errors_when_crc_has_no_ict() {
+async fn test_ict_falls_back_to_commit_file_when_crc_has_no_ict() {
+    // Under the eager Arc<Crc> design, a snapshot's CRC always exists. If the loaded CRC
+    // happens to have no ICT (None), get_in_commit_timestamp falls back to reading the
+    // commit file directly rather than erroring. This is more lenient than the old
+    // behaviour but better matches user expectations -- an absent ICT in the CRC is not a
+    // hard error if the commit file has the data.
     let setup = CrcReadTest::new()
         .v2_checkpoint(0, protocol_v2_ict(), metadata_ict())
         .delta_with_ict(1, 2000)
@@ -589,10 +594,6 @@ async fn test_ict_errors_when_crc_has_no_ict() {
         .build(&setup.engine)
         .unwrap();
 
-    let result = snapshot.get_in_commit_timestamp(&setup.engine);
-
-    assert_result_error_with_message(
-        result,
-        "In-Commit Timestamp not found in CRC file at version 1",
-    );
+    let ict = snapshot.get_in_commit_timestamp(&setup.engine).unwrap();
+    assert_eq!(ict, Some(2000));
 }
