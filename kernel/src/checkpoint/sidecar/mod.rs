@@ -1,13 +1,106 @@
 use std::sync::{Arc, Mutex};
 
+use itertools::Itertools;
+
 use crate::action_reconciliation::ActionReconciliationIterator;
-use crate::actions::{ADD_NAME, REMOVE_NAME};
+use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::filter_by_predicate;
-use crate::expressions::{Expression, Predicate, Scalar, Transform};
-use crate::schema::{SchemaRef, StructType};
+use crate::expressions::{Expression, Predicate, Scalar, StructData, Transform};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{
-    DeltaResult, EngineData, Error, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator,
+    DeltaResult, Engine, EngineData, Error, EvaluationHandler, ExpressionEvaluator, FileMeta,
+    PredicateEvaluator,
 };
+
+/// Field names of the `sidecar` action struct.
+const SIDECAR_SCHEMA_PATH: &str = "path";
+const SIDECAR_SCHEMA_SIZE_IN_BYTES: &str = "sizeInBytes";
+const SIDECAR_SCHEMA_MODIFICATION_TIME: &str = "modificationTime";
+const SIDECAR_SCHEMA_TAGS: &str = "tags";
+
+/// Creates a single [`EngineData`] batch containing one row per sidecar file.
+///
+/// Each row has the `sidecar` field populated and all other fields set to null.
+/// All rows are created in one batch via [`EvaluationHandler::create_many`].
+///
+/// Returns an empty `Vec` when there are no sidecars.
+///
+/// # Parameters
+/// - `engine`: Implementation of [`Engine`] apis.
+/// - `checkpoint_data_schema`: The checkpoint data schema.
+/// - `sidecar_metas`: Pairs of (sidecar filename, FileMeta) for each sidecar file.
+pub(super) fn create_sidecar_action_batches(
+    engine: &dyn Engine,
+    checkpoint_data_schema: &SchemaRef,
+    sidecar_metas: &[(String, FileMeta)],
+) -> DeltaResult<Vec<Box<dyn EngineData>>> {
+    if sidecar_metas.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Derive the sidecar struct schema from the checkpoint data schema.
+    let sidecar_field = checkpoint_data_schema
+        .field(SIDECAR_NAME)
+        .ok_or_else(|| Error::internal_error("checkpoint schema missing sidecar field"))?;
+    let DataType::Struct(sidecar_struct) = sidecar_field.data_type() else {
+        return Err(Error::internal_error(format!(
+            "expected sidecar field to be struct, got {:?}",
+            sidecar_field.data_type()
+        )));
+    };
+    let sidecar_fields: Vec<StructField> = sidecar_struct.fields().cloned().collect();
+
+    let checkpoint_data_fields: Vec<&StructField> = checkpoint_data_schema.fields().collect();
+    let sidecar_col_idx = checkpoint_data_fields
+        .iter()
+        .position(|f| f.name() == SIDECAR_NAME)
+        .ok_or_else(|| Error::internal_error("checkpoint schema missing sidecar field"))?;
+    // Per-row data template (follows checkpoint data schema, all fields null). Each sidecar row is
+    // built by cloning this and populating only the `sidecar` field.
+    let null_template: Vec<Scalar> = checkpoint_data_fields
+        .iter()
+        .map(|f| Scalar::Null(f.data_type().clone()))
+        .collect();
+
+    // Build one row per sidecar.
+    let rows: Vec<Vec<Scalar>> = sidecar_metas
+        .iter()
+        .map(|(filename, meta)| -> DeltaResult<Vec<Scalar>> {
+            let size_in_bytes = meta.size_as_i64()?;
+
+            // Sidecar struct values, ordered to match `sidecar_fields`.
+            let values: Vec<Scalar> = sidecar_fields
+                .iter()
+                .map(|field| match field.name().as_str() {
+                    // Per the protocol, implementations are encouraged to store only
+                    // the file's name for the `path` field.
+                    SIDECAR_SCHEMA_PATH => Ok(Scalar::from(filename.clone())),
+                    SIDECAR_SCHEMA_SIZE_IN_BYTES => Ok(Scalar::from(size_in_bytes)),
+                    SIDECAR_SCHEMA_MODIFICATION_TIME => Ok(Scalar::from(meta.last_modified)),
+                    // Sidecar tags are protocol details; we can let connectors specify them
+                    // in the future if there is a need. For now we leave it as null.
+                    // We explicitly fill it with `Scalar::Null` here, since
+                    // `StructData::try_new` requires one value per schema field.
+                    SIDECAR_SCHEMA_TAGS => Ok(Scalar::Null(field.data_type().clone())),
+                    other => Err(Error::CheckpointWrite(format!(
+                        "Unexpected sidecar field: {other}"
+                    ))),
+                })
+                .try_collect()?;
+
+            let mut row = null_template.clone();
+            row[sidecar_col_idx] =
+                Scalar::Struct(StructData::try_new(sidecar_fields.clone(), values)?);
+            Ok(row)
+        })
+        .try_collect()?;
+
+    let row_refs: Vec<&[Scalar]> = rows.iter().map(Vec::as_slice).collect();
+    let batch = engine
+        .evaluation_handler()
+        .create_many(checkpoint_data_schema.clone(), &row_refs)?;
+    Ok(vec![batch])
+}
 
 /// Transforms [`EngineData`] and filters out all-null rows.
 struct NonNullRowsPicker {

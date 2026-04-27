@@ -237,7 +237,7 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
         .expect("post-commit snapshot at v1");
 
     // Checkpoint at v1.
-    let (_, v1_ckpt) = v1_snap.clone().checkpoint(engine.as_ref())?;
+    let (_, v1_ckpt) = v1_snap.clone().checkpoint(engine.as_ref(), None)?;
 
     // v2: add column "b" on top of the checkpointed snapshot.
     let v2 = v1_ckpt

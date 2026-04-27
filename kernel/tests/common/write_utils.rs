@@ -32,6 +32,20 @@ use uuid::Uuid;
 /// Deterministic placeholder for test commit JSON comparisons.
 pub const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
+/// Single-column nullable `id: int` schema.
+pub fn get_simple_schema() -> SchemaRef {
+    Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap())
+}
+
+/// Builds a `RecordBatch` matching [`get_simple_schema`] from a vector of `id` values.
+pub fn simple_id_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow().unwrap()),
+        vec![Arc::new(Int32Array::from(values))],
+    )
+    .unwrap()
+}
+
 /// Returns the native parquet `field_id` for a field at the given physical path in a parquet file,
 /// or `None` if the field has no `field_id` set.
 ///

@@ -11,7 +11,9 @@ use url::Url;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::{is_set_txn_expired, SetTransactionScanner};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
-use crate::checkpoint::{CheckpointWriter, LastCheckpointHintStats};
+use crate::checkpoint::{
+    CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
+};
 use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 #[cfg(any(test, feature = "test-utils"))]
@@ -483,6 +485,20 @@ impl Snapshot {
     /// reflects the new checkpoint. Commits and compaction files subsumed by the checkpoint are
     /// dropped from the returned snapshot.
     ///
+    /// # Parameters
+    /// - `engine`: Engine for data processing and I/O
+    /// - `spec`: Checkpoint format specification. `None` uses the default checkpoint settings
+    ///   (auto-detecting V1/V2 from table features). For V2 checkpoints, the default is to not
+    ///   write sidecar files.
+    ///
+    /// # Errors
+    /// - If `CheckpointSpec::V2` is used but the table does not support the `v2Checkpoint` feature.
+    /// - If `CheckpointSpec::V1` is used but the table supports `v2Checkpoint` feature. Note: the
+    ///   Delta protocol permits writing V1 checkpoints to such tables; this is a kernel limitation.
+    /// - If `file_actions_per_sidecar_hint` is `Some(0)`.
+    /// - If the checkpoint write fails (e.g. I/O, parquet write). A `FileAlreadyExists` error is
+    ///   not propagated; it returns [`CheckpointWriteResult::AlreadyExists`] instead.
+    ///
     /// Note:
     ///     - It is still possible that an existing checkpoint gets overwritten if that checkpoint
     ///       was written by a concurrent writer.
@@ -490,10 +506,16 @@ impl Snapshot {
     ///       [`crate::StorageHandler::head`], which may not be implemented by all engines. If you
     ///       are using the default engine, make sure to build it with the multi-threaded executor
     ///       if you want to use this method.
+    ///
+    /// [`CheckpointSpec`]: crate::checkpoint::CheckpointSpec
+    ///
+    /// Note: There is currently no public api for callers to determine whether a table supports V2
+    /// checkpoints directly. Tracked in <https://github.com/delta-io/delta-kernel-rs/issues/2450>.
     #[instrument(parent = &self.span, name = "snap.checkpoint", skip_all, err)]
     pub fn checkpoint(
         self: &SnapshotRef,
         engine: &dyn Engine,
+        spec: Option<&CheckpointSpec>,
     ) -> DeltaResult<(CheckpointWriteResult, SnapshotRef)> {
         if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
             info!(
@@ -502,21 +524,49 @@ impl Snapshot {
             );
             return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
         }
+        info!(
+            "Writing checkpoint for snapshot version {} with spec {:?}",
+            self.version(),
+            spec
+        );
+
+        let v2_supported = self
+            .table_configuration()
+            .is_feature_supported(&TableFeature::V2Checkpoint);
+        match spec {
+            Some(CheckpointSpec::V2(_)) if !v2_supported => {
+                return Err(Error::checkpoint_write(
+                    "CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
+                ));
+            }
+            Some(CheckpointSpec::V1) if v2_supported => {
+                // TODO: remove this once we support writing V1 checkpoints when the table supports
+                // v2Checkpoint See <https://github.com/delta-io/delta-kernel-rs/issues/2454>.
+                return Err(Error::unsupported(
+                    "Kernel does not support writing V1 checkpoints when the table supports v2Checkpoint",
+                ));
+            }
+            _ => {}
+        }
 
         let writer = Arc::clone(self).create_checkpoint_writer()?;
-        let checkpoint_path = writer.checkpoint_path()?;
-        let data_iter = writer.checkpoint_data(engine)?;
-        let state = data_iter.state();
-        let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
-        match engine
-            .parquet_handler()
-            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))
-        {
-            Ok(()) => (),
+
+        let write_result = match spec {
+            Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+                file_actions_per_sidecar_hint,
+            })) => {
+                let hint =
+                    file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
+                writer.write_v2_checkpoint_with_sidecars(engine, hint)
+            }
+            _ => writer.write_checkpoint_without_sidecars(engine),
+        };
+
+        let info = match write_result {
+            Ok(info) => info,
             Err(Error::FileAlreadyExists(_)) => {
                 // NOTE: Per write_parquet_file's documentation, it should silently overwrite
-                // existing files, so we log a warning but still return the correct
-                // result.
+                // existing files, so we log a warning but still return the correct result.
                 warn!(
                     "ParquetHandler::write_parquet_file unexpectedly failed on \
                     FileAlreadyExists for version {}",
@@ -525,24 +575,11 @@ impl Snapshot {
                 return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
             }
             Err(e) => return Err(e),
-        }
+        };
 
-        let file_meta = engine.storage_handler().head(&checkpoint_path)?;
+        writer.finalize(engine, &info.last_checkpoint_stats)?;
 
-        // Build last-checkpoint stats from the iterator state, then finalize
-        // (writes `_last_checkpoint`).
-        let state = Arc::into_inner(state).ok_or_else(|| {
-            Error::internal_error("ActionReconciliationIteratorState Arc has other references")
-        })?;
-        // V1 checkpoint: no sidecars are written.
-        let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
-            state,
-            file_meta.size,
-            0, /* num_sidecars */
-        )?;
-        writer.finalize(engine, &last_checkpoint_stats)?;
-
-        let checkpoint_log_path = ParsedLogPath::try_from(file_meta)?.ok_or_else(|| {
+        let checkpoint_log_path = ParsedLogPath::try_from(info.file_meta)?.ok_or_else(|| {
             Error::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
         let checkpoint_version = checkpoint_log_path.version;
@@ -2711,7 +2748,7 @@ mod tests {
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
 
-        snapshot_v1.clone().checkpoint(ctx.engine.as_ref())?;
+        snapshot_v1.clone().checkpoint(ctx.engine.as_ref(), None)?;
 
         let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         assert_eq!(fresh.version(), 1);
@@ -2735,7 +2772,7 @@ mod tests {
         Snapshot::builder_for(ctx.url.as_str())
             .at_version(1)
             .build(ctx.engine.as_ref())?
-            .checkpoint(ctx.engine.as_ref())?;
+            .checkpoint(ctx.engine.as_ref(), None)?;
 
         let snapshot_v3 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(3)
@@ -2745,7 +2782,7 @@ mod tests {
         Snapshot::builder_for(ctx.url.as_str())
             .at_version(2)
             .build(ctx.engine.as_ref())?
-            .checkpoint(ctx.engine.as_ref())?;
+            .checkpoint(ctx.engine.as_ref(), None)?;
 
         let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         assert_eq!(fresh.version(), 3);
@@ -2771,7 +2808,7 @@ mod tests {
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
 
-        snapshot_v1.clone().checkpoint(ctx.engine.as_ref())?;
+        snapshot_v1.clone().checkpoint(ctx.engine.as_ref(), None)?;
 
         let refreshed = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         assert_eq!(refreshed.log_segment.checkpoint_version, Some(1));
