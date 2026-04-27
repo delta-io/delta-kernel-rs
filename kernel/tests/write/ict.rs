@@ -18,9 +18,7 @@ use tempfile::TempDir;
 use test_utils::engine_store_setup;
 use url::Url;
 
-mod common;
-
-use common::write_utils::get_simple_int_schema;
+use crate::common::write_utils::get_simple_int_schema;
 
 async fn get_ict_at_version(
     store: Arc<DynObjectStore>,

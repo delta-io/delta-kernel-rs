@@ -22,9 +22,7 @@ use test_utils::{
 };
 use url::Url;
 
-mod common;
-
-use common::write_utils::{
+use crate::common::write_utils::{
     assert_column_mapping_mode, assert_min_max_stats, resolve_json_path, resolve_struct_field,
     set_table_properties,
 };

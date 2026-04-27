@@ -25,9 +25,7 @@ use test_utils::{
 };
 use url::Url;
 
-mod common;
-
-use common::write_utils::{
+use crate::common::write_utils::{
     assert_min_max_stats, get_parquet_field_id, resolve_struct_field, set_table_properties,
 };
 

@@ -20,9 +20,7 @@ use test_utils::{
 };
 use url::Url;
 
-mod common;
-
-use common::write_utils::set_table_properties;
+use crate::common::write_utils::set_table_properties;
 
 /// Builds a RecordBatch with schema (id: long, tags: array<string>, props: map<string, long>,
 /// v: variant). Each row gets one entry in tags, one entry in props, and a simple integer variant.
