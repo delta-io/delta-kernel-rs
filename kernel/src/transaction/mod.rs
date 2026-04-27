@@ -15,7 +15,7 @@ use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
 };
 use crate::crc::{CrcDelta, FileStatsDelta, LazyCrc};
-use crate::engine_data::FilteredEngineData;
+use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{ArrayData, ColumnName, Scalar, Transform};
@@ -30,7 +30,9 @@ use crate::scan::log_replay::{
     PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
+use crate::schema::{
+    ArrayType, ColumnNamesAndTypes, MapType, SchemaRef, StructField, StructType, StructTypeBuilder,
+};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
@@ -139,6 +141,43 @@ static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(||
     fields.insert(insert_position + 1, &DATA_CHANGE_COLUMN);
     Arc::new(StructType::new_unchecked(fields.into_iter().cloned()))
 });
+
+/// Row visitor used to enforce the IcebergCompatV3 requirement that every new AddFile has
+/// `numRecords` populated in its `stats` field. Errors on the first missing value.
+struct NumRecordsPresentVisitor;
+
+impl RowVisitor for NumRecordsPresentVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            (
+                vec![ColumnName::new(["stats", "numRecords"])],
+                vec![DataType::LONG],
+            )
+                .into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 1,
+            Error::generic(format!(
+                "Wrong number of NumRecordsPresentVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        for i in 0..row_count {
+            let value: Option<i64> = getters[0].get_opt(i, "numRecords")?;
+            if value.is_none() {
+                return Err(Error::generic(
+                    "IcebergCompatV3 requires every AddFile to have numRecords populated \
+                     in its stats field",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Extend a schema with a statistics column and return a new SchemaRef.
 ///
@@ -373,6 +412,14 @@ impl<S> Transaction<S> {
 
         // Validate clustering column stats if ClusteredTable feature is enabled
         self.validate_add_files_stats(&self.add_files_metadata)?;
+
+        // IcebergCompatV3 requires every AddFile to have `numRecords` populated in its stats.
+        if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::IcebergCompatV3)
+        {
+            self.validate_add_files_num_records(&self.add_files_metadata)?;
+        }
 
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
@@ -947,6 +994,25 @@ impl<S> Transaction<S> {
     /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
+    }
+
+    /// Validate that every add file committed under an IcebergCompatV3 table has a non-null
+    /// `stats.numRecords`. Per the V3 writer requirements:
+    ///
+    /// > Require that all new `AddFile`s committed to the table have the `numRecords` statistic
+    /// > populated in their `stats` field
+    fn validate_add_files_num_records(
+        &self,
+        add_files: &[Box<dyn EngineData>],
+    ) -> DeltaResult<()> {
+        if add_files.is_empty() {
+            return Ok(());
+        }
+        let mut visitor = NumRecordsPresentVisitor;
+        for batch in add_files {
+            visitor.visit_rows_of(batch.deref())?;
+        }
+        Ok(())
     }
 
     /// Validate that add files have required statistics for clustering columns.
@@ -2635,5 +2701,55 @@ mod tests {
              not the wall-clock time"
         );
         Ok(())
+    }
+
+    // ===== IcebergCompatV3: NumRecordsPresentVisitor =====
+
+    /// Minimal GetData mock exposing just `stats.numRecords`.
+    struct NumRecordsMock {
+        values: Vec<Option<i64>>,
+    }
+
+    impl<'a> GetData<'a> for NumRecordsMock {
+        fn get_long(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
+            if field_name == "numRecords" {
+                Ok(self.values.get(row_index).copied().flatten())
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    #[test]
+    fn test_num_records_visitor_accepts_all_populated() -> DeltaResult<()> {
+        let mut visitor = NumRecordsPresentVisitor;
+        let mock = NumRecordsMock {
+            values: vec![Some(0), Some(5), Some(12345)],
+        };
+        let getters: Vec<&dyn GetData<'_>> = vec![&mock];
+        visitor.visit(3, &getters)
+    }
+
+    #[test]
+    fn test_num_records_visitor_rejects_null() {
+        let mut visitor = NumRecordsPresentVisitor;
+        let mock = NumRecordsMock {
+            values: vec![Some(1), None, Some(2)],
+        };
+        let getters: Vec<&dyn GetData<'_>> = vec![&mock];
+        let err = visitor.visit(3, &getters).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("IcebergCompatV3 requires every AddFile to have numRecords"),
+            "expected V3-specific error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_num_records_visitor_empty_batch() -> DeltaResult<()> {
+        let mut visitor = NumRecordsPresentVisitor;
+        let mock = NumRecordsMock { values: vec![] };
+        let getters: Vec<&dyn GetData<'_>> = vec![&mock];
+        visitor.visit(0, &getters)
     }
 }

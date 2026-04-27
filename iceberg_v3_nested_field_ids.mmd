@@ -1,0 +1,15 @@
+flowchart TD
+    A[Writing an Array/Map field] --> B[Compute path: nearest ancestor StructField name + .element / .key / .value]
+    B --> C[Look up id at that path in nearest ancestor's<br/>delta.columnMapping.nested.ids OR parquet.field.nested.ids<br/>delta.columnMapping.nested.ids takes precedence if both present]
+    C --> D[Set PARQUET:field_id in the field metadata]
+    D --> E{Inner type?}
+    E -->|Array or Map| F[Extend path<br/>same nearest ancestor StructField]
+    F --> C
+    E -->|Struct| G[Iterate struct fields]
+    G --> K{Field type?}
+    K -->|Array or Map| A
+    K -->|Struct| G
+    K -->|Primitive or Variant| H[Done]
+    E -->|Primitive or Variant| H
+    H --> I[Arrow schema to ArrowWriter]
+    I --> J[Write field_id according to PARQUET:field_id]
