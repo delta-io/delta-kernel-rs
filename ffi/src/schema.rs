@@ -328,6 +328,9 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             &DataType::DATE => call!(visit_date),
             &DataType::TIMESTAMP => call!(visit_timestamp),
             &DataType::TIMESTAMP_NTZ => call!(visit_timestamp_ntz),
+            DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+                call!(visit_binary)
+            }
         }
     }
 

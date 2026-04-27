@@ -11,7 +11,7 @@ use itertools::Itertools;
 use super::arrow_conversion::TryIntoArrow as _;
 use crate::{
     engine::arrow_utils::make_arrow_error,
-    schema::{DataType, MetadataValue, StructField},
+    schema::{DataType, MetadataValue, PrimitiveType, StructField},
     utils::require,
     DeltaResult, Error,
 };
@@ -77,6 +77,12 @@ impl EnsureDataTypes {
             | (&DataType::BINARY, ArrowDataType::LargeBinary)
             | (&DataType::BINARY, ArrowDataType::BinaryView)
             | (&DataType::BINARY, ArrowDataType::Binary) => Ok(DataTypeCompat::Identical),
+            // Geometry and Geography values are transported as WKB bytes in a Binary array.
+            // The kernel schema carries the geo annotation; the physical Arrow type is Binary.
+            (
+                DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)),
+                ArrowDataType::Binary | ArrowDataType::LargeBinary | ArrowDataType::BinaryView,
+            ) => Ok(DataTypeCompat::Identical),
             (DataType::Array(inner_type), ArrowDataType::List(arrow_list_field))
             | (DataType::Array(inner_type), ArrowDataType::LargeList(arrow_list_field))
             | (DataType::Array(inner_type), ArrowDataType::ListView(arrow_list_field))
@@ -564,5 +570,48 @@ mod tests {
             ensure_data_types(&DataType::BINARY, &ArrowDataType::LargeBinary, true).unwrap(),
             DataTypeCompat::Identical
         );
+    }
+
+    #[test]
+    fn ensure_geo_types_against_binary_variants() {
+        use crate::schema::{
+            EdgeInterpolationAlgorithm, GeographyType, GeometryType, PrimitiveType,
+        };
+        let geometry = DataType::Primitive(PrimitiveType::Geometry(GeometryType::default()));
+        let geography = DataType::Primitive(PrimitiveType::Geography(GeographyType::default()));
+        let geography_vincenty = DataType::Primitive(PrimitiveType::Geography(
+            GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Vincenty).unwrap(),
+        ));
+
+        for arrow_type in [
+            ArrowDataType::Binary,
+            ArrowDataType::LargeBinary,
+            ArrowDataType::BinaryView,
+        ] {
+            assert_eq!(
+                ensure_data_types(&geometry, &arrow_type, true).unwrap(),
+                DataTypeCompat::Identical,
+                "Geometry vs {arrow_type:?}"
+            );
+            assert_eq!(
+                ensure_data_types(&geography, &arrow_type, true).unwrap(),
+                DataTypeCompat::Identical,
+                "Geography (default) vs {arrow_type:?}"
+            );
+            assert_eq!(
+                ensure_data_types(&geography_vincenty, &arrow_type, true).unwrap(),
+                DataTypeCompat::Identical,
+                "Geography (Vincenty) vs {arrow_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_geo_types_reject_non_binary() {
+        use crate::schema::{GeometryType, PrimitiveType};
+        let geometry = DataType::Primitive(PrimitiveType::Geometry(GeometryType::default()));
+        // String / integer / struct targets are not valid for geo -- should error.
+        assert!(ensure_data_types(&geometry, &ArrowDataType::Utf8, true).is_err());
+        assert!(ensure_data_types(&geometry, &ArrowDataType::Int64, true).is_err());
     }
 }

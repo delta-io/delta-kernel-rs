@@ -593,6 +593,32 @@ fn visit_expression_scalar(
         }
         Scalar::Array(array) => visit_expression_array(visitor, array, sibling_list_id),
         Scalar::Map(map_data) => visit_expression_map(visitor, map_data, sibling_list_id),
+        // v1: geo scalars are not exposed over FFI. There is no `visit_literal_geometry` /
+        // `visit_literal_geography` callback in `EngineExpressionVisitor`, and no corresponding
+        // `visit_expression_literal_geometry` / `_geography` FFI entry point exists in
+        // `kernel_visitor.rs`, so engines cannot construct these variants from C. Hitting this
+        // path means an expression containing a geo literal was built in Rust-only code and is
+        // being walked across the FFI boundary -- the CRS information carried on the Scalar is
+        // dropped here and a null literal is substituted so the sibling list stays well-formed.
+        //
+        // Upgrade path (see plan doc appendix): add nullable
+        // `visit_literal_geometry: Option<extern "C" fn(...)>` fields to
+        // `EngineExpressionVisitor` and sibling `extern "C" fn visit_expression_literal_geometry`
+        // kernel-side entries. Keep this arm as a fallback when the nullable field is None.
+        Scalar::Geometry(_) => {
+            tracing::error!(
+                "FFI does not yet support Scalar::Geometry; routing to null literal. \
+                 Add visit_literal_geometry callbacks to support round-tripping CRS."
+            );
+            call!(visitor, visit_literal_null, sibling_list_id)
+        }
+        Scalar::Geography(_) => {
+            tracing::error!(
+                "FFI does not yet support Scalar::Geography; routing to null literal. \
+                 Add visit_literal_geography callbacks to support round-tripping CRS."
+            );
+            call!(visitor, visit_literal_null, sibling_list_id)
+        }
     }
 }
 

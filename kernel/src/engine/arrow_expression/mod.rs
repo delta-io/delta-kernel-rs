@@ -9,8 +9,10 @@ use crate::arrow::datatypes::{
 use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
-use crate::schema::{DataType, PrimitiveType, SchemaRef};
+use crate::expressions::{
+    ArrayData, Expression, ExpressionRef, GeographyData, GeometryData, PredicateRef, Scalar,
+};
+use crate::schema::{DataType, GeographyType, GeometryType, PrimitiveType, SchemaRef};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
 
@@ -23,6 +25,7 @@ use evaluate_expression::{evaluate_expression, evaluate_predicate, extract_colum
 mod apply_schema;
 pub mod evaluate_expression;
 pub mod opaque;
+pub mod st_intersects;
 
 #[cfg(test)]
 mod tests;
@@ -141,6 +144,13 @@ impl Scalar {
                     builder.append(true)?;
                 }
             }
+            // Geo scalars materialize as their encoded byte payload pushed into a BinaryBuilder.
+            // The declared CRS on the Scalar is dropped during broadcast -- the Arrow builder is
+            // unparameterized (plain Binary), and field-level GeoArrow metadata would live on the
+            // ArrowField in a schema, not on an ArrayRef produced here. CRS is expected to be read
+            // directly off the Scalar by any opaque op that cares (see st_intersects.rs).
+            Geometry(data) => append_val_as!(array::BinaryBuilder, data.bytes()),
+            Geography(data) => append_val_as!(array::BinaryBuilder, data.bytes()),
             Null(data_type) => Self::append_null(builder, data_type, num_rows)?,
         }
 
@@ -215,9 +225,67 @@ impl Scalar {
                     "Variant is not supported as scalar yet.",
                 ));
             }
+            DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+                append_nulls_as!(array::BinaryBuilder)
+            }
         }
         Ok(())
     }
+}
+
+// Format-aware geo scalar constructors. These live in default-engine-gated code so core kernel
+// does not depend on the `wkt` / `wkb` crates. The bundled default engine uses ISO WKB as the
+// on-wire encoding for geometry and geography values; these constructors either parse WKT into
+// WKB or validate WKB bytes before wrapping them in a [`Scalar::Geometry`] / [`Scalar::Geography`].
+impl Scalar {
+    /// Parses the given WKT string and returns a geometry scalar whose payload is the
+    /// corresponding ISO WKB bytes.
+    ///
+    /// # Parameters
+    /// - `ty`: the declared [`GeometryType`] (including CRS) carried on the resulting scalar.
+    /// - `wkt_str`: a WKT literal, e.g. `"POINT(1 2)"`.
+    pub fn geometry_from_wkt(ty: GeometryType, wkt_str: &str) -> DeltaResult<Self> {
+        let wkb = wkt_to_wkb(wkt_str)?;
+        Ok(Self::Geometry(GeometryData::new(ty, wkb)))
+    }
+
+    /// Parses the given WKT string and returns a geography scalar whose payload is the
+    /// corresponding ISO WKB bytes. See [`Scalar::geometry_from_wkt`].
+    pub fn geography_from_wkt(ty: GeographyType, wkt_str: &str) -> DeltaResult<Self> {
+        let wkb = wkt_to_wkb(wkt_str)?;
+        Ok(Self::Geography(GeographyData::new(ty, wkb)))
+    }
+
+    /// Validates the given WKB bytes and returns a geometry scalar wrapping them. Returns
+    /// `Err` if the bytes do not parse as ISO WKB.
+    pub fn geometry_from_wkb(ty: GeometryType, wkb: Vec<u8>) -> DeltaResult<Self> {
+        validate_wkb(&wkb)?;
+        Ok(Self::Geometry(GeometryData::new(ty, wkb)))
+    }
+
+    /// Validates the given WKB bytes and returns a geography scalar wrapping them.
+    pub fn geography_from_wkb(ty: GeographyType, wkb: Vec<u8>) -> DeltaResult<Self> {
+        validate_wkb(&wkb)?;
+        Ok(Self::Geography(GeographyData::new(ty, wkb)))
+    }
+}
+
+/// Parses a WKT string into ISO WKB bytes using the `wkt` + `wkb` crates.
+fn wkt_to_wkb(wkt_str: &str) -> DeltaResult<Vec<u8>> {
+    let geom: wkt::Wkt<f64> = wkt_str
+        .parse()
+        .map_err(|e| Error::invalid_expression(format!("invalid WKT: {e}")))?;
+    let mut buf = Vec::new();
+    wkb::writer::write_geometry(&mut buf, &geom, &wkb::writer::WriteOptions::default())
+        .map_err(|e| Error::invalid_expression(format!("WKT->WKB conversion failed: {e}")))?;
+    Ok(buf)
+}
+
+/// Sanity-checks that `bytes` parse as ISO WKB. Returns `Err` otherwise.
+fn validate_wkb(bytes: &[u8]) -> DeltaResult<()> {
+    wkb::reader::read_wkb(bytes)
+        .map(|_| ())
+        .map_err(|e| Error::invalid_expression(format!("invalid WKB bytes: {e}")))
 }
 
 impl ArrayData {

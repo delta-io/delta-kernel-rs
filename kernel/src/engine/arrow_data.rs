@@ -461,6 +461,16 @@ impl ArrowEngineData {
                     .map(|a| a as _)
                     .ok_or("decimal")
             }
+            // Geometry and Geography values are WKB-encoded bytes in a Binary array.
+            DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+                debug!("Pushing geo binary array for {}", ColumnName::new(path));
+                col.as_binary_opt::<i32>()
+                    .map(|a| a as _)
+                    .or_else(|| col.as_binary_opt::<i64>().map(|a| a as _))
+                    .or_else(|| col.as_binary_view_opt().map(|a| a as _))
+                    .or_else(|| Self::try_extract_with_ree(col))
+                    .ok_or("binary")
+            }
             DataType::Array(_) => {
                 debug!("Pushing list for {}", ColumnName::new(path));
                 col_as_list().ok_or("array<string>")
@@ -944,6 +954,65 @@ mod tests {
             Some(b"\x00\x01\x02\x03".as_ref())
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_geo_column_extracted_as_binary() -> DeltaResult<()> {
+        use crate::schema::{GeometryType, PrimitiveType};
+
+        // A Binary column physically, treated as Geometry at the kernel schema level.
+        let wkb_point = vec![
+            0x01u8, // little-endian
+            0x01, 0x00, 0x00, 0x00, // WKB type: Point = 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F, // x = 1.0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // y = 2.0
+        ];
+        let binary_data: Vec<Option<&[u8]>> = vec![Some(&wkb_point), None];
+        let binary_array = BinaryArray::from(binary_data);
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "geom",
+            ArrowDataType::Binary,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(binary_array)])?;
+        let arrow_data = ArrowEngineData::new(batch);
+
+        struct GeoVisitor {
+            values: Vec<Option<Vec<u8>>>,
+        }
+        impl RowVisitor for GeoVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> =
+                    LazyLock::new(|| vec![ColumnName::new(["geom"])]);
+                static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| {
+                    vec![DataType::Primitive(PrimitiveType::Geometry(
+                        GeometryType::default(),
+                    ))]
+                });
+                (&NAMES, &TYPES)
+            }
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    self.values
+                        .push(getters[0].get_binary(i, "geom")?.map(|b| b.to_vec()));
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = GeoVisitor { values: vec![] };
+        arrow_data.visit_rows(&[ColumnName::new(["geom"])], &mut visitor)?;
+        assert_eq!(visitor.values.len(), 2);
+        assert_eq!(visitor.values[0].as_deref(), Some(wkb_point.as_slice()));
+        assert_eq!(visitor.values[1], None);
         Ok(())
     }
 

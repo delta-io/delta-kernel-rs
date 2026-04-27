@@ -16,6 +16,13 @@ use crate::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
 };
+#[cfg(feature = "arrow-57")]
+use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
+
+#[cfg(feature = "arrow-57")]
+use geoarrow_schema::crs::Crs;
+#[cfg(feature = "arrow-57")]
+use geoarrow_schema::{Edges, GeoArrowType, Metadata, WkbType};
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "element";
 pub(crate) const MAP_ROOT_DEFAULT: &str = "key_value";
@@ -103,11 +110,116 @@ impl TryFromKernel<&StructType> for ArrowSchema {
     }
 }
 
+/// Maps a kernel [`EdgeInterpolationAlgorithm`] to a geoarrow-schema [`Edges`] value.
+#[cfg(feature = "arrow-57")]
+fn algorithm_to_edges(algo: &EdgeInterpolationAlgorithm) -> Edges {
+    match algo {
+        EdgeInterpolationAlgorithm::Spherical => Edges::Spherical,
+        EdgeInterpolationAlgorithm::Vincenty => Edges::Vincenty,
+        EdgeInterpolationAlgorithm::Thomas => Edges::Thomas,
+        EdgeInterpolationAlgorithm::Andoyer => Edges::Andoyer,
+        EdgeInterpolationAlgorithm::Karney => Edges::Karney,
+    }
+}
+
+/// Maps a geoarrow-schema [`Edges`] value to a kernel [`EdgeInterpolationAlgorithm`].
+#[cfg(feature = "arrow-57")]
+fn edges_to_algorithm(edges: Edges) -> EdgeInterpolationAlgorithm {
+    match edges {
+        Edges::Spherical => EdgeInterpolationAlgorithm::Spherical,
+        Edges::Vincenty => EdgeInterpolationAlgorithm::Vincenty,
+        Edges::Thomas => EdgeInterpolationAlgorithm::Thomas,
+        Edges::Andoyer => EdgeInterpolationAlgorithm::Andoyer,
+        Edges::Karney => EdgeInterpolationAlgorithm::Karney,
+    }
+}
+
+/// Builds an Arrow [`ArrowField`] for a WKB-encoded geospatial column with GeoArrow extension
+/// metadata encoding the CRS and (for geography) the edge interpolation algorithm.
+///
+/// The resulting field has physical type `Binary` and carries:
+/// - `ARROW:extension:name` = `"geoarrow.wkb"`
+/// - `ARROW:extension:metadata` = the CRS (and optional `"edges"` key) serialized by
+///   `geoarrow-schema`
+///
+/// Any `extra_metadata` (e.g. Parquet field IDs from the kernel schema) is merged on top
+/// of the GeoArrow extension metadata, so both are preserved.
+#[cfg(feature = "arrow-57")]
+fn geo_wkb_arrow_field(
+    name: &str,
+    srid: &str,
+    edges: Option<Edges>,
+    nullable: bool,
+    extra_metadata: HashMap<String, String>,
+) -> ArrowField {
+    let geoarrow_metadata = Arc::new(Metadata::new(Crs::from_srid(srid.to_string()), edges));
+    let wkb_type = WkbType::new(geoarrow_metadata);
+    let field = GeoArrowType::Wkb(wkb_type).to_field(name, nullable);
+    if extra_metadata.is_empty() {
+        field
+    } else {
+        let mut merged = field.metadata().clone();
+        merged.extend(extra_metadata);
+        field.with_metadata(merged)
+    }
+}
+
+/// Attempts to recover a kernel geo [`DataType`] (Geometry or Geography) from an Arrow field
+/// that carries the `geoarrow.wkb` extension metadata.
+///
+/// Returns `Some(DataType)` if the field is a GeoArrow WKB extension field; `None` otherwise
+/// (including for non-geo fields and for geo variants other than WKB).
+///
+/// Distinguishes Geography from Geometry via the presence of the `"edges"` metadata key.
+#[cfg(feature = "arrow-57")]
+fn geo_field_to_kernel_type(arrow_field: &ArrowField) -> Option<DataType> {
+    let GeoArrowType::Wkb(wkb) = GeoArrowType::try_from(arrow_field).ok()? else {
+        return None;
+    };
+    let metadata = wkb.metadata();
+    // Extract an SRID string from the CRS. For now we treat the CRS JSON value as the
+    // SRID string when it is a plain JSON string (the common case for `Crs::from_srid`);
+    // richer CRS representations (PROJJSON objects) fall back to the default SRID.
+    let srid = match metadata.crs().crs_value() {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        _ => crate::schema::DEFAULT_GEO_SRID.to_string(),
+    };
+    let data_type = match metadata.edges() {
+        Some(edges) => {
+            let algo = edges_to_algorithm(edges);
+            DataType::Primitive(PrimitiveType::Geography(
+                GeographyType::try_new(srid, algo).ok()?,
+            ))
+        }
+        None => DataType::Primitive(PrimitiveType::Geometry(GeometryType::try_new(srid).ok()?)),
+    };
+    Some(data_type)
+}
+
 impl TryFromKernel<&StructField> for ArrowField {
     fn try_from_kernel(f: &StructField) -> Result<Self, ArrowError> {
-        let metadata = kernel_metadata_to_arrow_metadata(f)?;
-        let field = ArrowField::new(f.name(), f.data_type().try_into_arrow()?, f.is_nullable())
-            .with_metadata(metadata);
+        let kernel_metadata = kernel_metadata_to_arrow_metadata(f)?;
+
+        let field = match f.data_type() {
+            #[cfg(feature = "arrow-57")]
+            DataType::Primitive(PrimitiveType::Geometry(geo_type)) => geo_wkb_arrow_field(
+                f.name(),
+                geo_type.srid(),
+                None,
+                f.is_nullable(),
+                kernel_metadata,
+            ),
+            #[cfg(feature = "arrow-57")]
+            DataType::Primitive(PrimitiveType::Geography(geo_type)) => geo_wkb_arrow_field(
+                f.name(),
+                geo_type.srid(),
+                Some(algorithm_to_edges(geo_type.algorithm())),
+                f.is_nullable(),
+                kernel_metadata,
+            ),
+            _ => ArrowField::new(f.name(), f.data_type().try_into_arrow()?, f.is_nullable())
+                .with_metadata(kernel_metadata),
+        };
 
         Ok(field)
     }
@@ -174,6 +286,12 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
+                    // Geometry and geography values are WKB-encoded binary bytes.
+                    // GeoArrow extension metadata is attached at the field level
+                    // (see TryFromKernel<&StructField>).
+                    PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
+                        Ok(ArrowDataType::Binary)
+                    }
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
@@ -238,9 +356,18 @@ impl TryFromArrow<&ArrowField> for StructField {
                 )));
             }
         }
+        // If the field carries `geoarrow.wkb` extension metadata, recover the kernel geo type
+        // (Geometry or Geography) from that metadata. Otherwise fall back to plain data-type
+        // conversion.
+        #[cfg(feature = "arrow-57")]
+        let data_type = geo_field_to_kernel_type(arrow_field)
+            .map(Ok)
+            .unwrap_or_else(|| DataType::try_from_arrow(arrow_field.data_type()))?;
+        #[cfg(not(feature = "arrow-57"))]
+        let data_type = DataType::try_from_arrow(arrow_field.data_type())?;
         Ok(StructField::new(
             arrow_field.name().clone(),
-            DataType::try_from_arrow(arrow_field.data_type())?,
+            data_type,
             arrow_field.is_nullable(),
         )
         .with_metadata(metadata.iter().map(|(k, v)| {
@@ -635,5 +762,156 @@ mod tests {
             StructField::try_from_arrow(&arrow_field),
             "conflicting parquet field IDs",
         );
+    }
+
+    #[cfg(feature = "arrow-57")]
+    #[test]
+    fn test_geometry_field_produces_geoarrow_wkb_extension_metadata() -> DeltaResult<()> {
+        use crate::schema::GeometryType;
+
+        let geo_type = GeometryType::try_new("EPSG:4326")?;
+        let kernel_schema = StructType::try_new(vec![StructField::nullable(
+            "geom",
+            DataType::Primitive(PrimitiveType::Geometry(geo_type)),
+        )])?;
+        let arrow_schema = ArrowSchema::try_from_kernel(&kernel_schema)?;
+        let field = arrow_schema.field(0);
+
+        assert_eq!(*field.data_type(), ArrowDataType::Binary);
+        assert_eq!(
+            field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(|s| s.as_str()),
+            Some("geoarrow.wkb"),
+        );
+        assert!(
+            field.metadata().contains_key("ARROW:extension:metadata"),
+            "GeoArrow extension metadata should be present"
+        );
+
+        // Verify CRS is encoded in the metadata JSON
+        let ext_meta = field.metadata().get("ARROW:extension:metadata").unwrap();
+        assert!(
+            ext_meta.contains("EPSG:4326"),
+            "Extension metadata should contain the SRID: {ext_meta}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow-57")]
+    #[test]
+    fn test_geography_field_produces_geoarrow_wkb_extension_metadata() -> DeltaResult<()> {
+        use crate::schema::{EdgeInterpolationAlgorithm, GeographyType};
+
+        let geo_type = GeographyType::try_new("OGC:CRS84", EdgeInterpolationAlgorithm::Spherical)?;
+        let kernel_schema = StructType::try_new(vec![StructField::nullable(
+            "geog",
+            DataType::Primitive(PrimitiveType::Geography(geo_type)),
+        )])?;
+        let arrow_schema = ArrowSchema::try_from_kernel(&kernel_schema)?;
+        let field = arrow_schema.field(0);
+
+        assert_eq!(*field.data_type(), ArrowDataType::Binary);
+        assert_eq!(
+            field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(|s| s.as_str()),
+            Some("geoarrow.wkb"),
+        );
+        let ext_meta = field.metadata().get("ARROW:extension:metadata").unwrap();
+        assert!(
+            ext_meta.contains("OGC:CRS84"),
+            "Extension metadata should contain the SRID: {ext_meta}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow-57")]
+    #[test]
+    fn test_geo_field_preserves_kernel_metadata_alongside_geoarrow() -> DeltaResult<()> {
+        use crate::schema::GeometryType;
+
+        let geo_type = GeometryType::try_new("EPSG:4326")?;
+        let field = StructField::nullable(
+            "geom",
+            DataType::Primitive(PrimitiveType::Geometry(geo_type)),
+        )
+        .with_metadata([(
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            MetadataValue::Number(42),
+        )]);
+
+        let arrow_field = ArrowField::try_from_kernel(&field)?;
+
+        // GeoArrow metadata is present
+        assert_eq!(
+            arrow_field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(|s| s.as_str()),
+            Some("geoarrow.wkb"),
+        );
+        // Kernel metadata (parquet field ID) is also present
+        assert_eq!(
+            arrow_field
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .map(|s| s.as_str()),
+            Some("42"),
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow-57")]
+    #[test]
+    fn test_geometry_field_kernel_arrow_roundtrip() -> DeltaResult<()> {
+        use crate::schema::GeometryType;
+
+        let geo_type = GeometryType::try_new("EPSG:4326")?;
+        let original = StructField::nullable(
+            "geom",
+            DataType::Primitive(PrimitiveType::Geometry(geo_type.clone())),
+        );
+        let arrow_field = ArrowField::try_from_kernel(&original)?;
+        let recovered = StructField::try_from_arrow(&arrow_field)?;
+
+        assert_eq!(recovered.name(), "geom");
+        assert_eq!(
+            recovered.data_type(),
+            &DataType::Primitive(PrimitiveType::Geometry(geo_type))
+        );
+        assert!(recovered.is_nullable());
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow-57")]
+    #[test]
+    fn test_geography_field_kernel_arrow_roundtrip() -> DeltaResult<()> {
+        use crate::schema::{EdgeInterpolationAlgorithm, GeographyType};
+
+        // Roundtrip each supported edge algorithm to prove edges are preserved.
+        for algo in [
+            EdgeInterpolationAlgorithm::Spherical,
+            EdgeInterpolationAlgorithm::Vincenty,
+            EdgeInterpolationAlgorithm::Thomas,
+            EdgeInterpolationAlgorithm::Andoyer,
+            EdgeInterpolationAlgorithm::Karney,
+        ] {
+            let geo_type = GeographyType::try_new("OGC:CRS84", algo.clone())?;
+            let original = StructField::nullable(
+                "geog",
+                DataType::Primitive(PrimitiveType::Geography(geo_type.clone())),
+            );
+            let arrow_field = ArrowField::try_from_kernel(&original)?;
+            let recovered = StructField::try_from_arrow(&arrow_field)?;
+            assert_eq!(
+                recovered.data_type(),
+                &DataType::Primitive(PrimitiveType::Geography(geo_type)),
+                "roundtrip failed for edge algorithm {algo:?}"
+            );
+        }
+        Ok(())
     }
 }

@@ -10,12 +10,12 @@ use crate::arrow::array::{
 use crate::arrow::datatypes::Schema as ArrowSchema;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 
-use super::super::arrow_conversion::kernel_metadata_to_arrow_metadata;
+use super::super::arrow_conversion::{kernel_metadata_to_arrow_metadata, TryIntoArrow as _};
 use super::super::arrow_utils::make_arrow_error;
 use crate::engine::ensure_data_types::ensure_data_types;
 use crate::error::{DeltaResult, Error};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use crate::schema::{ArrayType, DataType, MapType, Schema, StructField};
+use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, Schema, StructField};
 
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch` where
 // the names of fields, nullable, and metadata in the struct have been transformed to match those
@@ -88,12 +88,28 @@ fn transform_struct(
                     )));
                 }
             }
-            let transformed_field = new_field_with_metadata(
-                &target_field.name,
-                transformed_col.data_type(),
-                target_field.nullable,
-                Some(arrow_metadata),
-            );
+            // Special case: Geometry/Geography carry their CRS (and, for Geography, the
+            // edge-interpolation algorithm) on the kernel *type*, not in
+            // `StructField::metadata()`. The generic `new_field_with_metadata` path only
+            // sees the kernel field's metadata HashMap and would drop those geoarrow
+            // extension keys. Route geo targets through the full
+            // `TryFromKernel<&StructField> for ArrowField` conversion, which attaches
+            // `ARROW:extension:name` / `ARROW:extension:metadata` via `geo_wkb_arrow_field`.
+            // The data type is then overridden with the transformed column's physical
+            // type, since `ensure_data_types` accepts Binary / LargeBinary / BinaryView
+            // for geo columns and the field must match the column it accompanies.
+            let transformed_field = match target_field.data_type() {
+                DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+                    let field: ArrowField = target_field.try_into_arrow()?;
+                    field.with_data_type(transformed_col.data_type().clone())
+                }
+                _ => new_field_with_metadata(
+                    &target_field.name,
+                    transformed_col.data_type(),
+                    target_field.nullable,
+                    Some(arrow_metadata),
+                ),
+            };
             Ok((transformed_field, transformed_col))
         });
     let (transformed_fields, transformed_cols): (Vec<ArrowField>, Vec<ArrayRef>) =

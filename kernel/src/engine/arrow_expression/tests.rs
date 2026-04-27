@@ -1106,3 +1106,81 @@ fn test_to_json_with_nested_struct() {
         r#"{"outer_int":200,"nested_struct":{"inner_string":"value"}}"#
     );
 }
+
+mod geo {
+    use super::*;
+    use crate::arrow::array::BinaryArray;
+    use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
+
+    #[test]
+    fn geometry_from_wkt_parses_point() {
+        let ty = GeometryType::try_new("EPSG:4326").unwrap();
+        let s = Scalar::geometry_from_wkt(ty.clone(), "POINT(1 2)").unwrap();
+        match &s {
+            Scalar::Geometry(g) => {
+                assert_eq!(g.ty(), &ty);
+                // WKB for POINT(1 2) is 21 bytes: 1 endian + 4 type + 8+8 coords.
+                assert_eq!(g.bytes().len(), 21);
+                assert_eq!(g.bytes()[0], 0x01); // little-endian
+                assert_eq!(
+                    u32::from_le_bytes(g.bytes()[1..5].try_into().unwrap()),
+                    1, // Point WKB type
+                );
+            }
+            _ => panic!("expected Scalar::Geometry"),
+        }
+    }
+
+    #[test]
+    fn geometry_from_wkt_rejects_garbage() {
+        let ty = GeometryType::default();
+        assert!(Scalar::geometry_from_wkt(ty, "NOT A POLYGON").is_err());
+    }
+
+    #[test]
+    fn geography_from_wkt_carries_algorithm() {
+        let ty = GeographyType::try_new("OGC:CRS84", EdgeInterpolationAlgorithm::Vincenty).unwrap();
+        let s = Scalar::geography_from_wkt(ty.clone(), "POINT(-120 40)").unwrap();
+        match s {
+            Scalar::Geography(g) => {
+                assert_eq!(g.ty(), &ty);
+                assert_eq!(g.bytes().len(), 21);
+            }
+            _ => panic!("expected Scalar::Geography"),
+        }
+    }
+
+    #[test]
+    fn geometry_from_wkb_validates_bytes() {
+        let ty = GeometryType::default();
+        // Valid little-endian Point(1,2) WKB.
+        let mut valid = Vec::with_capacity(21);
+        valid.push(0x01);
+        valid.extend_from_slice(&1u32.to_le_bytes());
+        valid.extend_from_slice(&1.0f64.to_le_bytes());
+        valid.extend_from_slice(&2.0f64.to_le_bytes());
+        assert!(Scalar::geometry_from_wkb(ty.clone(), valid).is_ok());
+
+        // Garbage bytes should fail.
+        assert!(Scalar::geometry_from_wkb(ty, vec![0x99, 0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn geometry_scalar_materializes_as_binary_array() {
+        let ty = GeometryType::try_new("EPSG:4326").unwrap();
+        let s = Scalar::geometry_from_wkt(ty, "POINT(1 2)").unwrap();
+        let wkb_bytes = match &s {
+            Scalar::Geometry(g) => g.bytes().to_vec(),
+            _ => panic!(),
+        };
+        let arr = s.to_array(3).unwrap();
+        let bin = arr
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("geo scalar should materialize as BinaryArray");
+        assert_eq!(bin.len(), 3);
+        for i in 0..3 {
+            assert_eq!(bin.value(i), wkb_bytes.as_slice());
+        }
+    }
+}

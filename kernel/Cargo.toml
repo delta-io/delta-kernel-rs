@@ -58,6 +58,19 @@ z85 = "3.0.6"
 
 # optional deps
 futures = { version = "0.3", optional = true }
+# GeoArrow schema-only crate; provides geoarrow_schema::{Metadata, Crs, Edges, WkbType,
+# GeoArrowType} for type-safe Arrow extension metadata on geometry/geography columns in
+# arrow_conversion.rs. Pinned to 0.7 because geoarrow-schema 0.7 uses arrow-schema 57,
+# matching kernel's arrow_57 dep.
+geoarrow-array = { version = "0.7", optional = true }
+geoarrow-expr-geo = { version = "0.7", optional = true }
+geoarrow-schema = { version = "0.7", optional = true }
+geo = { version = "0.32", optional = true }
+geo-traits = { version = "0.3", optional = true }
+wkb = { version = "0.9", optional = true }
+# WKT parser used by Scalar::geometry_from_wkt / geography_from_wkt. Already in Cargo.lock
+# transitively via geo-traits; promoting to an explicit dep keeps the version pinned.
+wkt = { version = "0.14", optional = true, default-features = false }
 # Used for fetching direct urls (like pre-signed urls)
 reqwest = { version = "0.13", optional = true }
 # optionally used with default engine (though not required)
@@ -105,7 +118,7 @@ need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
 arrow-56 = ["dep:arrow_56", "dep:parquet_56", "dep:object_store_12"]
 arrow-57 = ["dep:arrow_57", "dep:parquet_57", "dep:object_store_12"]
-arrow-conversion = ["need-arrow"]
+arrow-conversion = ["need-arrow", "dep:geoarrow-array", "dep:geoarrow-schema"]
 arrow-expression = ["need-arrow"]
 
 # WARNING: experimental feature, still under active development
@@ -123,6 +136,11 @@ default-engine-base = [
   "futures",
   "need-arrow",
   "tokio",
+  "dep:geo",
+  "dep:geo-traits",
+  "dep:geoarrow-expr-geo",
+  "dep:wkb",
+  "dep:wkt",
 ]
 # the default-engine-native-tls use the reqwest crate with default features which uses native-tls. if you want
 # to instead use rustls, use 'default-engine-rustls' which has no native-tls dependency

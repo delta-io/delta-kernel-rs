@@ -1390,6 +1390,142 @@ fn default_true() -> bool {
     true
 }
 
+/// The default spatial reference identifier for geometry and geography types.
+pub const DEFAULT_GEO_SRID: &str = "OGC:CRS84";
+
+/// The algorithm used to interpolate edges between two vertices of a geography path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EdgeInterpolationAlgorithm {
+    /// Great circle paths on a sphere.
+    Spherical,
+    /// Vincenty's inverse formula on an ellipsoid.
+    Vincenty,
+    /// Thomas's formula on an ellipsoid.
+    Thomas,
+    /// Andoyer's method on an ellipsoid.
+    Andoyer,
+    /// Karney's method on an ellipsoid.
+    Karney,
+}
+
+impl Display for EdgeInterpolationAlgorithm {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spherical => write!(f, "spherical"),
+            Self::Vincenty => write!(f, "vincenty"),
+            Self::Thomas => write!(f, "thomas"),
+            Self::Andoyer => write!(f, "andoyer"),
+            Self::Karney => write!(f, "karney"),
+        }
+    }
+}
+
+impl std::str::FromStr for EdgeInterpolationAlgorithm {
+    type Err = Error;
+    fn from_str(s: &str) -> DeltaResult<Self> {
+        match s.trim() {
+            "spherical" => Ok(Self::Spherical),
+            "vincenty" => Ok(Self::Vincenty),
+            "thomas" => Ok(Self::Thomas),
+            "andoyer" => Ok(Self::Andoyer),
+            "karney" => Ok(Self::Karney),
+            other => Err(Error::generic(format!(
+                "Unknown edge interpolation algorithm: '{other}'"
+            ))),
+        }
+    }
+}
+
+/// A geometry column type with an associated spatial reference identifier (SRID).
+///
+/// Geometry values are encoded as WKB (Well-Known Binary) bytes in the Arrow layer,
+/// represented as a `Binary` physical array with GeoArrow field metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GeometryType {
+    srid: String,
+}
+
+impl GeometryType {
+    /// Creates a new [`GeometryType`] with the given SRID.
+    ///
+    /// # Parameters
+    /// - `srid`: The spatial reference identifier (e.g. `"OGC:CRS84"`, `"EPSG:4326"`).
+    pub fn try_new(srid: impl Into<String>) -> DeltaResult<Self> {
+        Ok(Self { srid: srid.into() })
+    }
+
+    /// Returns the SRID associated with this geometry type.
+    pub fn srid(&self) -> &str {
+        &self.srid
+    }
+}
+
+impl Default for GeometryType {
+    fn default() -> Self {
+        Self {
+            srid: DEFAULT_GEO_SRID.to_string(),
+        }
+    }
+}
+
+impl Display for GeometryType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "geometry({})", self.srid)
+    }
+}
+
+/// A geography column type with an associated SRID and edge interpolation algorithm.
+///
+/// Geography values are encoded as WKB bytes in the Arrow layer,
+/// represented as a `Binary` physical array with GeoArrow field metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GeographyType {
+    srid: String,
+    algorithm: EdgeInterpolationAlgorithm,
+}
+
+impl GeographyType {
+    /// Creates a new [`GeographyType`] with the given SRID and edge interpolation algorithm.
+    ///
+    /// # Parameters
+    /// - `srid`: The spatial reference identifier (e.g. `"OGC:CRS84"`).
+    /// - `algorithm`: The edge interpolation algorithm to use.
+    pub fn try_new(
+        srid: impl Into<String>,
+        algorithm: EdgeInterpolationAlgorithm,
+    ) -> DeltaResult<Self> {
+        Ok(Self {
+            srid: srid.into(),
+            algorithm,
+        })
+    }
+
+    /// Returns the SRID associated with this geography type.
+    pub fn srid(&self) -> &str {
+        &self.srid
+    }
+
+    /// Returns the edge interpolation algorithm for this geography type.
+    pub fn algorithm(&self) -> &EdgeInterpolationAlgorithm {
+        &self.algorithm
+    }
+}
+
+impl Default for GeographyType {
+    fn default() -> Self {
+        Self {
+            srid: DEFAULT_GEO_SRID.to_string(),
+            algorithm: EdgeInterpolationAlgorithm::Spherical,
+        }
+    }
+}
+
+impl Display for GeographyType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "geography({}, {})", self.srid, self.algorithm)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DecimalType {
     precision: u8,
@@ -1450,6 +1586,14 @@ pub enum PrimitiveType {
     TimestampNtz,
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
+    /// A geometry type with an associated spatial reference identifier.
+    /// Values are stored as WKB (Well-Known Binary) bytes.
+    #[serde(serialize_with = "serialize_geometry", untagged)]
+    Geometry(GeometryType),
+    /// A geography type with an associated SRID and edge interpolation algorithm.
+    /// Values are stored as WKB bytes.
+    #[serde(serialize_with = "serialize_geography", untagged)]
+    Geography(GeographyType),
 }
 
 impl PrimitiveType {
@@ -1489,6 +1633,20 @@ fn serialize_decimal<S: serde::Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&format!("decimal({},{})", dtype.precision(), dtype.scale()))
+}
+
+fn serialize_geometry<S: serde::Serializer>(
+    gtype: &GeometryType,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&gtype.to_string())
+}
+
+fn serialize_geography<S: serde::Serializer>(
+    gtype: &GeographyType,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&gtype.to_string())
 }
 
 fn serialize_variant<S: serde::Serializer>(
@@ -1548,6 +1706,35 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                     .map(PrimitiveType::Decimal)
                     .map_err(serde::de::Error::custom)
             }
+            "geometry" => Ok(PrimitiveType::Geometry(GeometryType::default())),
+            geo_str if geo_str.starts_with("geometry(") && geo_str.ends_with(')') => {
+                let srid = &geo_str[9..geo_str.len() - 1];
+                GeometryType::try_new(srid.trim())
+                    .map(PrimitiveType::Geometry)
+                    .map_err(serde::de::Error::custom)
+            }
+            "geography" => Ok(PrimitiveType::Geography(GeographyType::default())),
+            geo_str if geo_str.starts_with("geography(") && geo_str.ends_with(')') => {
+                let inner = &geo_str[10..geo_str.len() - 1];
+                // Split on the last comma to separate SRID from algorithm
+                match inner.rfind(',') {
+                    Some(pos) => {
+                        let srid = inner[..pos].trim();
+                        let algo_str = inner[pos + 1..].trim();
+                        let algorithm: EdgeInterpolationAlgorithm =
+                            algo_str.parse().map_err(serde::de::Error::custom)?;
+                        GeographyType::try_new(srid, algorithm)
+                            .map(PrimitiveType::Geography)
+                            .map_err(serde::de::Error::custom)
+                    }
+                    None => {
+                        // No comma -- treat entire inner as SRID with default algorithm
+                        GeographyType::try_new(inner.trim(), EdgeInterpolationAlgorithm::Spherical)
+                            .map(PrimitiveType::Geography)
+                            .map_err(serde::de::Error::custom)
+                    }
+                }
+            }
             unsupported => Err(serde::de::Error::custom(format!(
                 "Unsupported Delta table type: '{unsupported}'"
             ))),
@@ -1573,6 +1760,8 @@ impl Display for PrimitiveType {
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
+            PrimitiveType::Geometry(t) => write!(f, "{t}"),
+            PrimitiveType::Geography(t) => write!(f, "{t}"),
         }
     }
 }
@@ -1604,6 +1793,26 @@ impl From<DecimalType> for PrimitiveType {
 impl From<DecimalType> for DataType {
     fn from(dtype: DecimalType) -> Self {
         PrimitiveType::from(dtype).into()
+    }
+}
+impl From<GeometryType> for PrimitiveType {
+    fn from(gtype: GeometryType) -> Self {
+        PrimitiveType::Geometry(gtype)
+    }
+}
+impl From<GeometryType> for DataType {
+    fn from(gtype: GeometryType) -> Self {
+        PrimitiveType::from(gtype).into()
+    }
+}
+impl From<GeographyType> for PrimitiveType {
+    fn from(gtype: GeographyType) -> Self {
+        PrimitiveType::Geography(gtype)
+    }
+}
+impl From<GeographyType> for DataType {
+    fn from(gtype: GeographyType) -> Self {
+        PrimitiveType::from(gtype).into()
     }
 }
 impl From<PrimitiveType> for DataType {

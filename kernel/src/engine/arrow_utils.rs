@@ -29,6 +29,16 @@ use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use delta_kernel_derive::internal_api;
+#[cfg(feature = "arrow-57")]
+use geoarrow_array::array::WktArray;
+#[cfg(feature = "arrow-57")]
+use geoarrow_array::cast as geo_cast;
+#[cfg(feature = "arrow-57")]
+use geoarrow_array::GeoArrowArray;
+#[cfg(feature = "arrow-57")]
+use geoarrow_schema::crs::Crs;
+#[cfg(feature = "arrow-57")]
+use geoarrow_schema::{GeoArrowType, Metadata, WktType};
 use itertools::Itertools;
 use tracing::debug;
 
@@ -385,7 +395,20 @@ pub(crate) fn coerce_batch_nullability(
                             )));
                         }
                     }
-                    let coerced_field = if src_field.is_nullable() == target_field.is_nullable() {
+                    // Special case: if the target declares a GeoArrow extension type, the
+                    // extension metadata (geoarrow.wkb name + CRS/edges payload) exists only
+                    // on the kernel-derived target. The parquet reader strips Arrow IPC
+                    // metadata via `with_skip_arrow_metadata(true)`, so `src_field` has an
+                    // empty metadata map and cloning it would drop the CRS. Use the target
+                    // field directly to preserve the kernel-declared metadata.
+                    #[cfg(feature = "arrow-57")]
+                    let target_is_geoarrow = GeoArrowType::try_from(target_field.as_ref()).is_ok();
+                    #[cfg(not(feature = "arrow-57"))]
+                    let target_is_geoarrow = false;
+
+                    let coerced_field = if target_is_geoarrow {
+                        target_field.clone()
+                    } else if src_field.is_nullable() == target_field.is_nullable() {
                         src_field.clone()
                     } else {
                         Arc::new(
@@ -1306,6 +1329,163 @@ pub(crate) fn parse_json(
     Ok(Box::new(ArrowEngineData::new(result)))
 }
 
+// --- GeoArrow WKT-to-WKB conversion helpers for JSON stats parsing ---
+//
+// Delta JSON stats store geometry bounds as WKT strings (e.g. "POINT(1.0 2.0)"), but GeoArrow
+// WKB fields have DataType::Binary. The Arrow JSON reader cannot parse WKT into binary, so we
+// temporarily replace geo fields with Utf8 for parsing, then convert the resulting WKT strings
+// back to WKB binary afterward.
+//
+// The schema-replacement pass (pass 1) simultaneously records the index paths to all geo fields.
+// The conversion pass (pass 2) navigates directly to those columns rather than re-walking the
+// entire schema. Tables with no geo columns skip both passes entirely.
+
+/// Index path from a `RecordBatch` root to a GeoArrow leaf field.
+/// Each element is a positional index within its parent container:
+/// the first element indexes into batch columns; subsequent elements index into struct children.
+/// Examples:
+///   [2]    -- batch column 2 is itself a geo field
+///   [1, 0] -- batch column 1 is a struct, its child 0 is a geo field
+#[cfg(feature = "arrow-57")]
+type GeoFieldPath = Vec<usize>;
+
+/// Returns true if `field` is recognized as a GeoArrow extension type (e.g. geoarrow.wkb).
+#[cfg(feature = "arrow-57")]
+fn is_geoarrow_field(field: &ArrowField) -> bool {
+    GeoArrowType::try_from(field).is_ok()
+}
+
+/// Builds a copy of `schema` where every GeoArrow field is replaced with plain `Utf8`, and
+/// collects the index paths to all geo fields found. The paths drive the conversion pass so it
+/// navigates directly to geo columns without re-walking the full schema.
+///
+/// Returns `(temp_schema, geo_paths)`. If `geo_paths` is empty, no geo fields exist and the
+/// caller may skip both the temp schema and the conversion pass entirely.
+#[cfg(feature = "arrow-57")]
+fn replace_geo_fields_with_utf8(schema: &ArrowSchema) -> (ArrowSchema, Vec<GeoFieldPath>) {
+    let mut geo_paths = Vec::new();
+    let fields = collect_and_replace_geo_fields(schema.fields(), &mut Vec::new(), &mut geo_paths);
+    (
+        ArrowSchema::new_with_metadata(fields, schema.metadata().clone()),
+        geo_paths,
+    )
+}
+
+/// Recursively replaces GeoArrow fields with `Utf8` and records their index paths into
+/// `geo_paths`. `path_prefix` is a reusable stack: each level pushes its index before
+/// descending and pops after, so only one allocation per geo field found (the `.clone()`
+/// that records the complete path).
+#[cfg(feature = "arrow-57")]
+fn collect_and_replace_geo_fields(
+    fields: &ArrowFields,
+    path_prefix: &mut Vec<usize>,
+    geo_paths: &mut Vec<GeoFieldPath>,
+) -> ArrowFields {
+    ArrowFields::from(
+        fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                path_prefix.push(i);
+                let new_field = if is_geoarrow_field(f) {
+                    geo_paths.push(path_prefix.clone());
+                    Arc::new(ArrowField::new(
+                        f.name(),
+                        ArrowDataType::Utf8,
+                        f.is_nullable(),
+                    ))
+                } else if let ArrowDataType::Struct(children) = f.data_type() {
+                    let new_children =
+                        collect_and_replace_geo_fields(children, path_prefix, geo_paths);
+                    Arc::new(
+                        ArrowField::new(
+                            f.name(),
+                            ArrowDataType::Struct(new_children),
+                            f.is_nullable(),
+                        )
+                        .with_metadata(f.metadata().clone()),
+                    )
+                } else {
+                    Arc::clone(f)
+                };
+                path_prefix.pop();
+                new_field
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Converts a `Utf8` array of WKT strings to a `Binary` array of WKB bytes. The CRS is
+/// extracted from `original_field`'s GeoArrow extension metadata so the conversion preserves
+/// the field's declared coordinate reference system.
+#[cfg(feature = "arrow-57")]
+fn convert_wkt_array_to_wkb(
+    array: &Arc<dyn ArrowArray>,
+    original_field: &ArrowField,
+) -> DeltaResult<Arc<dyn ArrowArray>> {
+    let metadata = match GeoArrowType::try_from(original_field) {
+        Ok(GeoArrowType::Wkb(wkb_type)) => wkb_type.metadata().clone(),
+        _ => Arc::new(Metadata::new(Crs::from_srid("OGC:CRS84".to_string()), None)),
+    };
+    let wkt_array = WktArray::from((array.as_string::<i32>().clone(), WktType::new(metadata)));
+    let wkb_array = geo_cast::to_wkb::<i32>(&wkt_array)
+        .map_err(|e| Error::generic(format!("WKT to WKB conversion failed: {e}")))?;
+    Ok(wkb_array.into_array_ref())
+}
+
+/// Navigates to the geo leaf at `remaining_path` within `array` and converts it from WKT to WKB.
+/// An empty `remaining_path` means this array is the geo leaf; otherwise the function descends
+/// into the struct child at `remaining_path[0]` and recurses with the rest of the path.
+#[cfg(feature = "arrow-57")]
+fn convert_nested_wkt_to_wkb(
+    array: &Arc<dyn ArrowArray>,
+    original_field: &ArrowField,
+    remaining_path: &[usize],
+) -> DeltaResult<Arc<dyn ArrowArray>> {
+    if remaining_path.is_empty() {
+        return convert_wkt_array_to_wkb(array, original_field);
+    }
+    let ArrowDataType::Struct(original_children) = original_field.data_type() else {
+        return Err(Error::generic("geo path traverses a non-struct field"));
+    };
+    let child_idx = remaining_path[0];
+    let struct_array = array.as_struct();
+    let (_, mut arrays, nulls) = struct_array.clone().into_parts();
+    arrays[child_idx] = convert_nested_wkt_to_wkb(
+        &arrays[child_idx],
+        &original_children[child_idx],
+        &remaining_path[1..],
+    )?;
+    Ok(Arc::new(StructArray::try_new(
+        original_children.clone(),
+        arrays,
+        nulls,
+    )?))
+}
+
+/// Converts WKT columns to WKB in `batch` by navigating directly to each geo field using
+/// the pre-collected `geo_paths`, avoiding a full schema walk.
+#[cfg(feature = "arrow-57")]
+fn convert_wkt_to_wkb_at_paths(
+    batch: RecordBatch,
+    original_schema: &ArrowSchema,
+    geo_paths: &[GeoFieldPath],
+) -> DeltaResult<RecordBatch> {
+    let (_, mut columns, _) = batch.into_parts();
+    for path in geo_paths {
+        let col_idx = path[0];
+        columns[col_idx] = convert_nested_wkt_to_wkb(
+            &columns[col_idx],
+            original_schema.field(col_idx),
+            &path[1..],
+        )?;
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(original_schema.clone()),
+        columns,
+    )?)
+}
+
 // Raw arrow implementation of the json parsing. Separate from the public function for testing.
 // Also used by ParseJson expression evaluation.
 pub(crate) fn parse_json_impl(
@@ -1316,7 +1496,25 @@ pub(crate) fn parse_json_impl(
         return Ok(RecordBatch::new_empty(schema));
     }
 
-    let mut decoder = ReaderBuilder::new(schema.clone())
+    // Under arrow-57: geo fields use DataType::Binary (GeoArrow WKB) in the schema, but JSON
+    // stats store geometry bounds as WKT strings. Parse with a temporary schema that replaces
+    // geo fields with Utf8, then convert WKT -> WKB after parsing.
+    // The schema-replacement pass also records geo field paths; tables with no geo columns skip
+    // both the temp schema and the conversion pass entirely.
+    #[cfg(feature = "arrow-57")]
+    let (temp_schema, geo_paths) = {
+        let (temp, paths) = replace_geo_fields_with_utf8(&schema);
+        let temp_schema = if paths.is_empty() {
+            schema.clone()
+        } else {
+            Arc::new(temp)
+        };
+        (temp_schema, paths)
+    };
+    #[cfg(not(feature = "arrow-57"))]
+    let temp_schema = schema.clone();
+
+    let mut decoder = ReaderBuilder::new(temp_schema)
         .with_batch_size(json_strings.len())
         .with_coerce_primitive(true)
         .build_decoder()?;
@@ -1346,6 +1544,12 @@ pub(crate) fn parse_json_impl(
                 json_strings.len()
             )));
         }
+        #[cfg(feature = "arrow-57")]
+        let batch = if geo_paths.is_empty() {
+            batch
+        } else {
+            convert_wkt_to_wkb_at_paths(batch, &schema, &geo_paths)?
+        };
         return Ok(batch);
     }
     Err(Error::generic(
@@ -4205,6 +4409,69 @@ mod tests {
         assert_eq!(
             json,
             "{\"str_col\":\"foo\",\"map_col\":{\"bar\":null}}\n".as_bytes()
+        );
+    }
+
+    #[cfg(feature = "arrow-57")]
+    #[test]
+    fn test_parse_json_impl_converts_wkt_to_wkb_for_geo_fields() {
+        use geoarrow_schema::{GeoArrowType, Metadata, WkbType};
+
+        // Build a GeoArrow WKB field via geoarrow-schema (matches how stats_schema builds it)
+        let geo_metadata = Arc::new(Metadata::new(
+            geoarrow_schema::crs::Crs::from_srid("OGC:CRS84".to_string()),
+            None,
+        ));
+        let wkb_field = GeoArrowType::Wkb(WkbType::new(geo_metadata)).to_field("geom", true);
+
+        // Stats schema shape: { minValues: { geom: geoarrow.wkb } }
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "minValues",
+            ArrowDataType::Struct(ArrowFields::from(vec![wkb_field])),
+            true,
+        )]));
+
+        // Case 1: valid WKT string produces non-null WKB binary
+        let input: Vec<Option<&str>> = vec![Some(r#"{"minValues":{"geom":"POINT(1.0 2.0)"}}"#)];
+        let batch = parse_json_impl(&input.into(), schema.clone()).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let min_values = batch.column(0).as_struct();
+        let geom_col = min_values.column(0);
+        assert_eq!(
+            *geom_col.data_type(),
+            ArrowDataType::Binary,
+            "geo field should be Binary (WKB), not Utf8"
+        );
+        assert!(!geom_col.is_null(0), "WKB value should not be null");
+        let binary_array = geom_col
+            .as_any()
+            .downcast_ref::<crate::arrow::array::BinaryArray>()
+            .expect("should be BinaryArray");
+        assert!(
+            !binary_array.value(0).is_empty(),
+            "WKB bytes should be non-empty"
+        );
+
+        // Case 2: missing geom field produces a null entry
+        let input: Vec<Option<&str>> = vec![Some(r#"{"minValues":{}}"#)];
+        let batch = parse_json_impl(&input.into(), schema.clone()).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let min_values = batch.column(0).as_struct();
+        let geom_col = min_values.column(0);
+        assert_eq!(*geom_col.data_type(), ArrowDataType::Binary);
+        assert!(geom_col.is_null(0), "missing geom should produce null");
+
+        // Case 3: null JSON row produces null entry
+        let input: Vec<Option<&str>> = vec![None];
+        let batch = parse_json_impl(&input.into(), schema).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let min_values = batch.column(0).as_struct();
+        let geom_col = min_values.column(0);
+        assert_eq!(*geom_col.data_type(), ArrowDataType::Binary);
+        assert!(
+            geom_col.is_null(0),
+            "null JSON row should produce null geom"
         );
     }
 }

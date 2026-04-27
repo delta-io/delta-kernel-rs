@@ -7,7 +7,10 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::{ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField};
+use crate::schema::{
+    ArrayType, DataType, DecimalType, GeographyType, GeometryType, MapType, PrimitiveType,
+    StructField,
+};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -53,6 +56,64 @@ impl DecimalData {
 fn get_decimal_precision(value: i128) -> u8 {
     // Not sure why checked_ilog10 returns u32 when log10(2**127) = 38 fits easily in u8??
     value.unsigned_abs().checked_ilog10().map_or(0, |p| p + 1) as _
+}
+
+/// A geometry scalar value carrying its declared [`GeometryType`] (including CRS) alongside
+/// an encoded byte payload.
+///
+/// The byte encoding is engine-defined: the bundled default engine uses ISO WKB, but core
+/// kernel does not interpret the bytes and makes no format commitment. Construct via
+/// [`GeometryData::new`] (encoding-neutral) or via the default-engine-gated convenience
+/// constructors on [`Scalar`] ([`Scalar::geometry_from_wkt`], [`Scalar::geometry_from_wkb`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeometryData {
+    ty: GeometryType,
+    bytes: Vec<u8>,
+}
+
+impl GeometryData {
+    /// Construct a geometry value from its declared type and encoded bytes. The byte encoding
+    /// is engine-defined; the bundled default engine uses ISO WKB.
+    pub fn new(ty: GeometryType, bytes: Vec<u8>) -> Self {
+        Self { ty, bytes }
+    }
+
+    /// Returns the declared [`GeometryType`] of this value, including its CRS.
+    pub fn ty(&self) -> &GeometryType {
+        &self.ty
+    }
+
+    /// Returns the encoded byte payload. The encoding is engine-defined.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// A geography scalar value carrying its declared [`GeographyType`] (including CRS and edge
+/// interpolation algorithm) alongside an encoded byte payload.
+///
+/// See [`GeometryData`] for the encoding convention — identical, just wraps [`GeographyType`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeographyData {
+    ty: GeographyType,
+    bytes: Vec<u8>,
+}
+
+impl GeographyData {
+    /// Construct a geography value from its declared type and encoded bytes.
+    pub fn new(ty: GeographyType, bytes: Vec<u8>) -> Self {
+        Self { ty, bytes }
+    }
+
+    /// Returns the declared [`GeographyType`] of this value.
+    pub fn ty(&self) -> &GeographyType {
+        &self.ty
+    }
+
+    /// Returns the encoded byte payload. The encoding is engine-defined.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -247,6 +308,10 @@ pub enum Scalar {
     Binary(Vec<u8>),
     /// Decimal value with a given precision and scale.
     Decimal(DecimalData),
+    /// Geometry value carrying its declared CRS and an encoded byte payload.
+    Geometry(GeometryData),
+    /// Geography value carrying its declared CRS, edge algorithm, and an encoded byte payload.
+    Geography(GeographyData),
     /// Null value with a given data type.
     Null(DataType),
     /// Struct value
@@ -273,6 +338,8 @@ impl Scalar {
             Self::Date(_) => DataType::DATE,
             Self::Binary(_) => DataType::BINARY,
             Self::Decimal(d) => DataType::from(*d.ty()),
+            Self::Geometry(d) => DataType::Primitive(PrimitiveType::Geometry(d.ty().clone())),
+            Self::Geography(d) => DataType::Primitive(PrimitiveType::Geography(d.ty().clone())),
             Self::Null(data_type) => data_type.clone(),
             Self::Struct(data) => DataType::struct_type_unchecked(data.fields.clone()),
             Self::Array(data) => data.tpe.clone().into(),
@@ -290,6 +357,22 @@ impl Scalar {
         let dtype = DecimalType::try_new(precision, scale)?;
         let dval = DecimalData::try_new(bits, dtype)?;
         Ok(Self::Decimal(dval))
+    }
+
+    /// Constructs a geometry scalar from a declared [`GeometryType`] and encoded byte payload.
+    ///
+    /// The byte encoding is engine-defined — this constructor makes no format commitment and
+    /// performs no validation. For format-aware constructors that parse WKT or validate WKB,
+    /// see [`Scalar::geometry_from_wkt`] and [`Scalar::geometry_from_wkb`] (available with the
+    /// default engine).
+    pub fn geometry(ty: GeometryType, bytes: Vec<u8>) -> Self {
+        Self::Geometry(GeometryData::new(ty, bytes))
+    }
+
+    /// Constructs a geography scalar from a declared [`GeographyType`] and encoded byte
+    /// payload. Same contract as [`Scalar::geometry`].
+    pub fn geography(ty: GeographyType, bytes: Vec<u8>) -> Self {
+        Self::Geography(GeographyData::new(ty, bytes))
     }
 
     /// Constructs a Scalar timestamp (in UTC) from an `i64` millisecond since unix epoch
@@ -395,6 +478,21 @@ impl Display for Scalar {
                     Ok(())
                 }
             },
+            Self::Geometry(d) => {
+                write!(
+                    f,
+                    "geometry({}, <{} bytes>)",
+                    d.ty().srid(),
+                    d.bytes().len()
+                )
+            }
+            Self::Geography(d) => write!(
+                f,
+                "geography({}, {}, <{} bytes>)",
+                d.ty().srid(),
+                d.ty().algorithm(),
+                d.bytes().len()
+            ),
             Self::Null(_) => write!(f, "null"),
             Self::Struct(data) => {
                 write!(f, "{{")?;
@@ -493,6 +591,19 @@ impl Scalar {
                 .then(|| d1.bits().partial_cmp(&d2.bits()))
                 .flatten(),
             (Decimal(_), _) => None,
+            // Geo comparison: only meaningful when CRS matches. Cross-CRS comparison returns None
+            // because the byte payloads describe coordinates in different reference systems and
+            // cannot be meaningfully ordered. When CRS matches, we fall back to a bytewise
+            // comparison of the encoded payloads — this defines structural equality, not spatial
+            // equality (two different WKB encodings of the same geometry will compare unequal).
+            (Geometry(g1), Geometry(g2)) => (g1.ty() == g2.ty())
+                .then(|| g1.bytes().partial_cmp(g2.bytes()))
+                .flatten(),
+            (Geometry(_), _) => None,
+            (Geography(g1), Geography(g2)) => (g1.ty() == g2.ty())
+                .then(|| g1.bytes().partial_cmp(g2.bytes()))
+                .flatten(),
+            (Geography(_), _) => None,
             (Null(_), _) => None, // NOTE: NULL values are incomparable by definition (SQL NULL semantics)
             (Struct(_), _) => None, // TODO: Support Struct?
             (Array(_), _) => None, // TODO: Support Array?
@@ -546,6 +657,18 @@ impl From<bool> for Scalar {
 impl From<DecimalData> for Scalar {
     fn from(d: DecimalData) -> Self {
         Self::Decimal(d)
+    }
+}
+
+impl From<GeometryData> for Scalar {
+    fn from(g: GeometryData) -> Self {
+        Self::Geometry(g)
+    }
+}
+
+impl From<GeographyData> for Scalar {
+    fn from(g: GeographyData) -> Self {
+        Self::Geography(g)
     }
 }
 
@@ -755,6 +878,9 @@ impl PrimitiveType {
                     _ => unreachable!(),
                 }
             }
+            Geometry(_) | Geography(_) => Err(Error::generic(
+                "geo types cannot be partition column values",
+            )),
         }
     }
 
@@ -820,13 +946,118 @@ impl PrimitiveType {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
     use std::f32::consts::PI;
 
     use crate::expressions::{column_expr, BinaryPredicateOp};
+    use crate::schema::EdgeInterpolationAlgorithm;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{Expression as Expr, Predicate as Pred};
 
     use super::*;
+
+    #[test]
+    fn test_geometry_data_roundtrip() {
+        let ty = GeometryType::try_new("EPSG:4326").unwrap();
+        let bytes = vec![0x01, 0x01, 0x00, 0x00, 0x00];
+        let g = GeometryData::new(ty.clone(), bytes.clone());
+        assert_eq!(g.ty(), &ty);
+        assert_eq!(g.bytes(), bytes.as_slice());
+
+        let s = Scalar::geometry(ty.clone(), bytes.clone());
+        assert_eq!(
+            s.data_type(),
+            DataType::Primitive(PrimitiveType::Geometry(ty))
+        );
+        match s {
+            Scalar::Geometry(g) => assert_eq!(g.bytes(), bytes.as_slice()),
+            _ => panic!("expected Scalar::Geometry"),
+        }
+    }
+
+    #[test]
+    fn test_geography_data_roundtrip() {
+        let ty =
+            GeographyType::try_new("OGC:CRS84", EdgeInterpolationAlgorithm::Spherical).unwrap();
+        let bytes = vec![0x01, 0x02, 0x03];
+        let s = Scalar::geography(ty.clone(), bytes.clone());
+        assert_eq!(
+            s.data_type(),
+            DataType::Primitive(PrimitiveType::Geography(ty))
+        );
+        match s {
+            Scalar::Geography(g) => assert_eq!(g.bytes(), bytes.as_slice()),
+            _ => panic!("expected Scalar::Geography"),
+        }
+    }
+
+    #[test]
+    fn test_geometry_display_format() {
+        let ty = GeometryType::try_new("EPSG:4326").unwrap();
+        let s = Scalar::geometry(ty, vec![0u8; 21]);
+        assert_eq!(s.to_string(), "geometry(EPSG:4326, <21 bytes>)");
+
+        let ty = GeographyType::try_new("OGC:CRS84", EdgeInterpolationAlgorithm::Vincenty).unwrap();
+        let s = Scalar::geography(ty, vec![0u8; 42]);
+        assert_eq!(s.to_string(), "geography(OGC:CRS84, vincenty, <42 bytes>)");
+    }
+
+    #[test]
+    fn test_geometry_logical_partial_cmp_matching_crs() {
+        let ty = GeometryType::try_new("OGC:CRS84").unwrap();
+        let a = Scalar::geometry(ty.clone(), vec![1, 2, 3]);
+        let b = Scalar::geometry(ty.clone(), vec![1, 2, 3]);
+        let c = Scalar::geometry(ty, vec![4, 5, 6]);
+        assert_eq!(a.logical_partial_cmp(&b), Some(Ordering::Equal));
+        assert_eq!(a.logical_partial_cmp(&c), Some(Ordering::Less));
+    }
+
+    #[test]
+    fn test_geometry_logical_partial_cmp_mismatched_crs() {
+        let a = Scalar::geometry(GeometryType::try_new("OGC:CRS84").unwrap(), vec![1, 2, 3]);
+        let b = Scalar::geometry(GeometryType::try_new("EPSG:4326").unwrap(), vec![1, 2, 3]);
+        // Mismatched CRS -> incomparable (None), even though byte payloads are identical.
+        assert_eq!(a.logical_partial_cmp(&b), None);
+    }
+
+    #[test]
+    fn test_geometry_logical_partial_cmp_cross_variant() {
+        let g = Scalar::geometry(GeometryType::default(), vec![1, 2, 3]);
+        let b = Scalar::Binary(vec![1, 2, 3]);
+        let i = Scalar::Integer(0);
+        assert_eq!(g.logical_partial_cmp(&b), None);
+        assert_eq!(g.logical_partial_cmp(&i), None);
+        assert_eq!(b.logical_partial_cmp(&g), None);
+    }
+
+    #[test]
+    fn test_geometry_from_impls() {
+        let ty = GeometryType::try_new("EPSG:3857").unwrap();
+        let g = GeometryData::new(ty.clone(), vec![0xff]);
+        let s: Scalar = g.into();
+        assert!(matches!(s, Scalar::Geometry(_)));
+
+        let ty = GeographyType::default();
+        let g = GeographyData::new(ty, vec![0xaa]);
+        let s: Scalar = g.into();
+        assert!(matches!(s, Scalar::Geography(_)));
+    }
+
+    #[test]
+    fn test_geo_serde_roundtrip() {
+        let g = Scalar::geometry(GeometryType::try_new("EPSG:4326").unwrap(), vec![1, 2, 3]);
+        let json = serde_json::to_string(&g).unwrap();
+        let back: Scalar = serde_json::from_str(&json).unwrap();
+        assert_eq!(g, back);
+
+        let g = Scalar::geography(
+            GeographyType::try_new("OGC:CRS84", EdgeInterpolationAlgorithm::Karney).unwrap(),
+            vec![4, 5, 6],
+        );
+        let json = serde_json::to_string(&g).unwrap();
+        let back: Scalar = serde_json::from_str(&json).unwrap();
+        assert_eq!(g, back);
+    }
 
     #[test]
     fn test_bad_decimal() {

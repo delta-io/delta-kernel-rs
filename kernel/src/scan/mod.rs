@@ -42,6 +42,11 @@ pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;
 
+// Re-export the stats-skipping predicate rewrite under the `internal-api` feature so
+// integration tests can inspect the lowered form of an opaque predicate.
+#[cfg(feature = "internal-api")]
+pub use self::data_skipping::as_data_skipping_predicate;
+
 #[cfg(test)]
 pub(crate) mod test_utils;
 
