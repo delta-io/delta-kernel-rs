@@ -451,8 +451,8 @@ static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
             Ok(())
         }),
         FeatureRequirement::Enabled(TableFeature::RowTracking),
-        // Per the protocol, require that IcebergCompatV1 and IcebergCompatV2 are not active on the table
-        // So we used `NotEnabled` instead of `NotSupported`
+        // Per the protocol, require that IcebergCompatV1 and IcebergCompatV2 are not active on the
+        // table So we used `NotEnabled` instead of `NotSupported`
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV2),
     ],

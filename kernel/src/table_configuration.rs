@@ -854,7 +854,9 @@ mod test {
         TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::{
-        TableProperties, COLUMN_MAPPING_MODE, ENABLE_IN_COMMIT_TIMESTAMPS,
+        TableProperties, COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
+        ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+        ROW_TRACKING_SUSPENDED,
     };
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
@@ -2212,5 +2214,163 @@ mod test {
             config.ensure_operation_supported(Operation::Write).is_ok(),
             "ClusteredTable with DomainMetadata should be supported for writes"
         );
+    }
+
+    /// Like `create_mock_table_config`, but also accepts an optional `column_mapping.mode`.
+    /// When the mode is `name` or `id`, a column-mapping-annotated schema is used so that
+    /// `TableConfiguration::try_new` does not reject the metadata for missing field
+    /// annotations. Otherwise behaves identically to `create_mock_table_config`.
+    fn create_mock_table_config_with_cm(
+        extra_props: &[(&str, &str)],
+        cm_mode: Option<&str>,
+        features: &[TableFeature],
+    ) -> TableConfiguration {
+        let schema: SchemaRef = match cm_mode {
+            Some("name") | Some("id") => schema_with_column_mapping(),
+            _ => Arc::new(StructType::new_unchecked([StructField::nullable(
+                "value",
+                DataType::INTEGER,
+            )])),
+        };
+        let mut props: HashMap<String, String> = extra_props
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        if let Some(mode) = cm_mode {
+            props.insert(COLUMN_MAPPING_MODE.to_string(), mode.to_string());
+        }
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
+
+        let reader_features: Vec<TableFeature> = features
+            .iter()
+            .filter(|f| f.feature_type() == FeatureType::ReaderWriter)
+            .cloned()
+            .collect();
+        let protocol = Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(reader_features),
+            Some(features.to_vec()),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
+    }
+
+    #[rstest]
+    #[case::column_mapping_not_supported(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        None,
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'columnMapping'"),
+    )]
+    #[case::column_mapping_mode_none(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some("none"),
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'columnMapping'"),
+    )]
+    // RowTracking feature supported but `delta.enableRowTracking` is unset, so it's not enabled.
+    #[case::row_tracking_not_enabled(
+        &[(ENABLE_ICEBERG_COMPAT_V3, "true")],
+        Some("name"),
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'rowTracking' to be enabled"),
+    )]
+    // RowTracking is enabled in props, but explicitly suspended -- counts as not enabled.
+    #[case::row_tracking_suspended(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+            (ROW_TRACKING_SUSPENDED, "true"),
+        ],
+        Some("name"),
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'rowTracking' to be enabled"),
+    )]
+    #[case::with_iceberg_compat_v1_enabled(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ICEBERG_COMPAT_V1, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some("name"),
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::IcebergCompatV1,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'icebergCompatV1' to not be enabled"),
+    )]
+    // V3 cannot coexist with V2.
+    #[case::with_iceberg_compat_v2_enabled(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ICEBERG_COMPAT_V2, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some("name"),
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::IcebergCompatV2,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'icebergCompatV2' to not be enabled"),
+    )]
+    #[case::all_satisfied(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some("name"),
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        None,
+    )]
+    fn test_iceberg_compat_v3_feature_requirements(
+        #[case] props: &[(&str, &str)],
+        #[case] cm_mode: Option<&str>,
+        #[case] features: Vec<TableFeature>,
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        let config = create_mock_table_config_with_cm(props, cm_mode, &features);
+        let result = config.validate_feature_requirements(&TableFeature::IcebergCompatV3);
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
     }
 }
