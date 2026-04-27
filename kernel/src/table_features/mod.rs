@@ -438,18 +438,6 @@ static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
-        FeatureRequirement::Custom(|_protocol, properties| {
-            let mode = properties.column_mapping_mode;
-            if !matches!(
-                mode,
-                Some(ColumnMappingMode::Name) | Some(ColumnMappingMode::Id)
-            ) {
-                return Err(Error::generic(
-                    "IcebergCompatV3 requires Column Mapping in 'name' or 'id' mode",
-                ));
-            }
-            Ok(())
-        }),
         FeatureRequirement::Enabled(TableFeature::RowTracking),
         // V1/V2 may remain in `writerFeatures` (supported) as long as they are not active --
         // hence `NotEnabled` rather than `NotSupported`.

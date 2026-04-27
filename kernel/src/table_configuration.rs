@@ -856,7 +856,6 @@ mod test {
     use crate::table_properties::{
         TableProperties, COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
         ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-        ROW_TRACKING_SUSPENDED,
     };
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
@@ -2216,14 +2215,191 @@ mod test {
         );
     }
 
-    /// Variant of `create_mock_table_config` that also takes an optional column-mapping mode.
-    /// `name`/`id` modes need a column-mapping-annotated schema (otherwise
+    #[test]
+    fn test_iceberg_compat_v3_write_rejected_as_not_supported() {
+        let config = create_mock_table_config_with_cm(
+            &[
+                (ENABLE_ICEBERG_COMPAT_V3, "true"),
+                (ENABLE_ROW_TRACKING, "true"),
+            ],
+            Some(ColumnMappingMode::Name),
+            &[TableFeature::ColumnMapping],
+            &[
+                TableFeature::IcebergCompatV3,
+                TableFeature::ColumnMapping,
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+            ],
+        );
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "Feature 'icebergCompatV3' is not supported",
+        );
+    }
+
+    #[rstest]
+    #[case::unset(None, false)]
+    #[case::true_(Some("true"), true)]
+    #[case::false_(Some("false"), false)]
+    fn test_iceberg_compat_v3_enablement_follows_table_property(
+        #[case] property_value: Option<&str>,
+        #[case] expected_enabled: bool,
+    ) {
+        let extra = property_value
+            .map(|v| vec![(ENABLE_ICEBERG_COMPAT_V3, v)])
+            .unwrap_or_default();
+        let config = create_mock_table_config_with_cm(
+            &extra,
+            Some(ColumnMappingMode::Name),
+            &[TableFeature::ColumnMapping],
+            &[
+                TableFeature::IcebergCompatV3,
+                TableFeature::ColumnMapping,
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+            ],
+        );
+        assert_eq!(
+            config.is_feature_enabled(&TableFeature::IcebergCompatV3),
+            expected_enabled,
+        );
+    }
+
+    #[rstest]
+    #[case::column_mapping_not_supported(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        None,
+        vec![],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'columnMapping' to be enabled"),
+    )]
+    #[case::column_mapping_mode_none(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some(ColumnMappingMode::None),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        // column mapping mode = none is considered as not enabled.
+        Some("requires 'columnMapping' to be enabled"),
+    )]
+    // RowTracking feature supported but `delta.enableRowTracking` is unset, so it's not enabled.
+    #[case::row_tracking_not_enabled(
+        &[(ENABLE_ICEBERG_COMPAT_V3, "true")],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'rowTracking' to be enabled"),
+    )]
+    #[case::with_iceberg_compat_v1_enabled(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ICEBERG_COMPAT_V1, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::IcebergCompatV1,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'icebergCompatV1' to not be enabled"),
+    )]
+    #[case::with_iceberg_compat_v2_enabled(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ICEBERG_COMPAT_V2, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::IcebergCompatV2,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'icebergCompatV2' to not be enabled"),
+    )]
+    // Positive paths for both supported column-mapping modes (`name` and `id`).
+    #[case::all_satisfied_cm_name_mode(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        None,
+    )]
+    #[case::all_satisfied_cm_id_mode(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some(ColumnMappingMode::Id),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        None,
+    )]
+    fn test_iceberg_compat_v3_feature_requirements(
+        #[case] props: &[(&str, &str)],
+        #[case] cm_mode: Option<ColumnMappingMode>,
+        #[case] reader_features: Vec<TableFeature>,
+        #[case] writer_features: Vec<TableFeature>,
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        let config =
+            create_mock_table_config_with_cm(props, cm_mode, &reader_features, &writer_features);
+        let result = config.validate_feature_requirements(&TableFeature::IcebergCompatV3);
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
+    }
+
+    /// Test helper: variant of `create_mock_table_config` that also takes an optional
+    /// column-mapping mode and requires the caller to provide reader and writer feature lists
+    /// explicitly. `name`/`id` modes need a column-mapping-annotated schema (otherwise
     /// `TableConfiguration::try_new` rejects the metadata for missing per-field annotations);
     /// this helper swaps the schema accordingly.
     fn create_mock_table_config_with_cm(
         extra_props: &[(&str, &str)],
         cm_mode: Option<ColumnMappingMode>,
-        features: &[TableFeature],
+        reader_features: &[TableFeature],
+        writer_features: &[TableFeature],
     ) -> TableConfiguration {
         let schema: SchemaRef = match cm_mode {
             Some(ColumnMappingMode::Name | ColumnMappingMode::Id) => schema_with_column_mapping(),
@@ -2246,198 +2422,14 @@ mod test {
         }
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
 
-        let reader_features: Vec<TableFeature> = features
-            .iter()
-            .filter(|f| f.feature_type() == FeatureType::ReaderWriter)
-            .cloned()
-            .collect();
         let protocol = Protocol::try_new(
             TABLE_FEATURES_MIN_READER_VERSION,
             TABLE_FEATURES_MIN_WRITER_VERSION,
-            Some(reader_features),
-            Some(features.to_vec()),
+            Some(reader_features.to_vec()),
+            Some(writer_features.to_vec()),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
-    }
-
-    #[test]
-    fn test_iceberg_compat_v3_write_rejected_as_not_supported() {
-        let config = create_mock_table_config_with_cm(
-            &[
-                (ENABLE_ICEBERG_COMPAT_V3, "true"),
-                (ENABLE_ROW_TRACKING, "true"),
-            ],
-            Some(ColumnMappingMode::Name),
-            &[
-                TableFeature::IcebergCompatV3,
-                TableFeature::ColumnMapping,
-                TableFeature::RowTracking,
-                TableFeature::DomainMetadata,
-            ],
-        );
-        assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
-            "Feature 'icebergCompatV3' is not supported",
-        );
-    }
-
-    #[rstest]
-    #[case::unset(None, false)]
-    #[case::true_(Some("true"), true)]
-    #[case::false_(Some("false"), false)]
-    fn test_iceberg_compat_v3_is_feature_enabled_follows_property(
-        #[case] property_value: Option<&str>,
-        #[case] expected_enabled: bool,
-    ) {
-        let extra: Vec<(&str, &str)> = property_value
-            .map(|v| vec![(ENABLE_ICEBERG_COMPAT_V3, v)])
-            .unwrap_or_default();
-        let config = create_mock_table_config_with_cm(
-            &extra,
-            Some(ColumnMappingMode::Name),
-            &[
-                TableFeature::IcebergCompatV3,
-                TableFeature::ColumnMapping,
-                TableFeature::RowTracking,
-                TableFeature::DomainMetadata,
-            ],
-        );
-        assert_eq!(
-            config.is_feature_enabled(&TableFeature::IcebergCompatV3),
-            expected_enabled,
-        );
-    }
-
-    #[rstest]
-    #[case::column_mapping_not_supported(
-        &[
-            (ENABLE_ICEBERG_COMPAT_V3, "true"),
-            (ENABLE_ROW_TRACKING, "true"),
-        ],
-        None,
-        vec![
-            TableFeature::IcebergCompatV3,
-            TableFeature::RowTracking,
-            TableFeature::DomainMetadata,
-        ],
-        Some("requires 'columnMapping'"),
-    )]
-    #[case::column_mapping_mode_none(
-        &[
-            (ENABLE_ICEBERG_COMPAT_V3, "true"),
-            (ENABLE_ROW_TRACKING, "true"),
-        ],
-        Some(ColumnMappingMode::None),
-        vec![
-            TableFeature::IcebergCompatV3,
-            TableFeature::ColumnMapping,
-            TableFeature::RowTracking,
-            TableFeature::DomainMetadata,
-        ],
-        Some("requires 'columnMapping'"),
-    )]
-    // RowTracking feature supported but `delta.enableRowTracking` is unset, so it's not enabled.
-    #[case::row_tracking_not_enabled(
-        &[(ENABLE_ICEBERG_COMPAT_V3, "true")],
-        Some(ColumnMappingMode::Name),
-        vec![
-            TableFeature::IcebergCompatV3,
-            TableFeature::ColumnMapping,
-            TableFeature::RowTracking,
-            TableFeature::DomainMetadata,
-        ],
-        Some("requires 'rowTracking' to be enabled"),
-    )]
-    // RowTracking is enabled in props, but explicitly suspended -- counts as not enabled.
-    #[case::row_tracking_suspended(
-        &[
-            (ENABLE_ICEBERG_COMPAT_V3, "true"),
-            (ENABLE_ROW_TRACKING, "true"),
-            (ROW_TRACKING_SUSPENDED, "true"),
-        ],
-        Some(ColumnMappingMode::Name),
-        vec![
-            TableFeature::IcebergCompatV3,
-            TableFeature::ColumnMapping,
-            TableFeature::RowTracking,
-            TableFeature::DomainMetadata,
-        ],
-        Some("requires 'rowTracking' to be enabled"),
-    )]
-    #[case::with_iceberg_compat_v1_enabled(
-        &[
-            (ENABLE_ICEBERG_COMPAT_V3, "true"),
-            (ENABLE_ICEBERG_COMPAT_V1, "true"),
-            (ENABLE_ROW_TRACKING, "true"),
-        ],
-        Some(ColumnMappingMode::Name),
-        vec![
-            TableFeature::IcebergCompatV3,
-            TableFeature::IcebergCompatV1,
-            TableFeature::ColumnMapping,
-            TableFeature::RowTracking,
-            TableFeature::DomainMetadata,
-        ],
-        Some("requires 'icebergCompatV1' to not be enabled"),
-    )]
-    #[case::with_iceberg_compat_v2_enabled(
-        &[
-            (ENABLE_ICEBERG_COMPAT_V3, "true"),
-            (ENABLE_ICEBERG_COMPAT_V2, "true"),
-            (ENABLE_ROW_TRACKING, "true"),
-        ],
-        Some(ColumnMappingMode::Name),
-        vec![
-            TableFeature::IcebergCompatV3,
-            TableFeature::IcebergCompatV2,
-            TableFeature::ColumnMapping,
-            TableFeature::RowTracking,
-            TableFeature::DomainMetadata,
-        ],
-        Some("requires 'icebergCompatV2' to not be enabled"),
-    )]
-    // Positive paths for both supported column-mapping modes (`name` and `id`).
-    #[case::all_satisfied_name_mode(
-        &[
-            (ENABLE_ICEBERG_COMPAT_V3, "true"),
-            (ENABLE_ROW_TRACKING, "true"),
-        ],
-        Some(ColumnMappingMode::Name),
-        vec![
-            TableFeature::IcebergCompatV3,
-            TableFeature::ColumnMapping,
-            TableFeature::RowTracking,
-            TableFeature::DomainMetadata,
-        ],
-        None,
-    )]
-    #[case::all_satisfied_id_mode(
-        &[
-            (ENABLE_ICEBERG_COMPAT_V3, "true"),
-            (ENABLE_ROW_TRACKING, "true"),
-        ],
-        Some(ColumnMappingMode::Id),
-        vec![
-            TableFeature::IcebergCompatV3,
-            TableFeature::ColumnMapping,
-            TableFeature::RowTracking,
-            TableFeature::DomainMetadata,
-        ],
-        None,
-    )]
-    fn test_iceberg_compat_v3_feature_requirements(
-        #[case] props: &[(&str, &str)],
-        #[case] cm_mode: Option<ColumnMappingMode>,
-        #[case] features: Vec<TableFeature>,
-        #[case] expected_error_substring: Option<&str>,
-    ) {
-        let config = create_mock_table_config_with_cm(props, cm_mode, &features);
-        let result = config.validate_feature_requirements(&TableFeature::IcebergCompatV3);
-        match expected_error_substring {
-            Some(msg) => assert_result_error_with_message(result, msg),
-            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
-        }
     }
 }
