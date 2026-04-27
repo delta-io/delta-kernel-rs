@@ -267,7 +267,7 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
     )])?);
     let _ = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     // Commit an add action via the transaction API so the checkpoint has action batches

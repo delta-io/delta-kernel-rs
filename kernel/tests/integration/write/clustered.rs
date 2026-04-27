@@ -120,7 +120,7 @@ fn setup_clustered_table(
         .with_data_layout(DataLayout::Clustered {
             columns: clustering_cols,
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let snapshot = set_table_properties(

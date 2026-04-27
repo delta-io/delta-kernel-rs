@@ -20,7 +20,7 @@
 //!
 //! let result = create_table("/path/to/table", schema, "MyApp/1.0")
 //!     .with_table_properties([("myapp.version", "1.0")])
-//!     .build(engine, Box::new(FileSystemCommitter::new()))?
+//!     .build(engine, Arc::new(FileSystemCommitter::new()))?
 //!     .commit(engine)?;
 //! # Ok(())
 //! # }
@@ -32,7 +32,7 @@
 #![allow(unreachable_pub, dead_code)]
 
 use std::marker::PhantomData;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 // Re-export the builder so callers can still access it from this module path.
 pub use super::builder::create_table::CreateTableTransactionBuilder;
@@ -76,7 +76,7 @@ use crate::DeltaResult;
 /// ])?);
 ///
 /// let result = create_table("/path/to/table", schema, "MyApp/1.0")
-///     .build(engine, Box::new(FileSystemCommitter::new()))?
+///     .build(engine, Arc::new(FileSystemCommitter::new()))?
 ///     .commit(engine)?;
 /// # Ok(())
 /// # }
@@ -114,7 +114,7 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 ///
 /// let transaction = create_table("/tmp/my_table", schema, "MyApp/1.0")
-///     .build(&engine, Box::new(FileSystemCommitter::new()))?;
+///     .build(&engine, Arc::new(FileSystemCommitter::new()))?;
 ///
 /// // Commit the transaction to create the table
 /// transaction.commit(&engine)?;
@@ -140,7 +140,7 @@ impl CreateTableTransaction {
     pub(crate) fn try_new_create_table(
         effective_table_config: TableConfiguration,
         engine_info: String,
-        committer: Box<dyn Committer>,
+        committer: Arc<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
     ) -> DeltaResult<Self> {

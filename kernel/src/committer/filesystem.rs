@@ -119,7 +119,7 @@ mod tests {
             .build(&engine)
             .unwrap();
         // Try to commit a transaction with FileSystemCommitter
-        let committer = Box::new(FileSystemCommitter::new());
+        let committer = Arc::new(FileSystemCommitter::new());
         let err = snapshot
             .transaction(committer, &engine)
             .unwrap()

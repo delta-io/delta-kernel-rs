@@ -29,7 +29,7 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
 
     // Create table and verify post_commit_snapshot
     let create_result = create_table_txn(table_url.as_str(), schema, env!("CARGO_PKG_VERSION"))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let mut current_snapshot = match create_result {
@@ -56,7 +56,7 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
 
         let txn = current_snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_engine_info("test");
 
         match txn.commit(engine.as_ref())? {
@@ -133,7 +133,7 @@ async fn test_write_parquet_rejects_partitioned_write_context_on_unpartitioned_t
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("test");
 
         let result = txn.partitioned_write_context(HashMap::from([(

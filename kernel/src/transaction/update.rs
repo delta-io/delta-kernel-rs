@@ -50,7 +50,7 @@ impl Transaction {
     /// a snapshot.
     pub(crate) fn try_new_existing_table(
         snapshot: impl Into<SnapshotRef>,
-        committer: Box<dyn Committer>,
+        committer: Arc<dyn Committer>,
         engine: &dyn Engine,
     ) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
@@ -152,7 +152,7 @@ impl Transaction {
     /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::DeltaResult<()> {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    /// let mut txn = snapshot.clone().transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?;
     ///
     /// // Get file metadata from a scan
     /// let scan = snapshot.scan_builder().build()?;
@@ -225,7 +225,7 @@ impl Transaction {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()))?
+    /// let mut txn = snapshot.clone().transaction(Arc::new(FileSystemCommitter::new()))?
     ///     .with_operation("UPDATE".to_string());
     ///
     /// let scan = snapshot.scan_builder().build()?;
