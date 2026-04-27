@@ -106,39 +106,38 @@ impl Snapshot {
     }
 
     /// Create a new [`SnapshotBuilder`] to incrementally update a [`Snapshot`] to a more recent
-    /// version.
+    /// version. Variables used below:
     ///
-    /// `target_version` is the effective requested version: the time-travel version from
-    /// [`SnapshotBuilder::at_version`] when set, otherwise the `max_catalog_version` from
-    /// [`SnapshotBuilder::with_max_catalog_version`] for catalog-managed tables, otherwise
-    /// unset (defaults to latest).
+    /// - `T` = effective target version: the time-travel version from
+    ///   [`SnapshotBuilder::at_version`] when set, otherwise the `max_catalog_version` from
+    ///   [`SnapshotBuilder::with_max_catalog_version`] for catalog-managed tables, otherwise unset
+    ///   (defaults to latest).
+    /// - `S1` = existing snapshot version.
+    /// - `S2` = end version of the new listing.
+    /// - `C1` = existing checkpoint version (if any).
+    /// - `C2` = new checkpoint version (if found in the listing).
     ///
-    /// The log listing performed below is catalog-log-tail aware: any `log_tail` provided to
-    /// the builder is merged with filesystem listings.
+    /// The log listing is catalog-log-tail aware: any `log_tail` provided to the builder is
+    /// merged with filesystem listings.
     ///
-    /// Given an existing snapshot and `target_version`, the update proceeds by case:
-    ///
-    /// - **A.** `target_version == existing_version`: return the existing snapshot unchanged.
-    /// - **B.** `target_version < existing_version`: error. The incremental path only moves
-    ///   forward.
-    /// - Otherwise, `target_version` is unset or `target_version > existing_version`. List the log
-    ///   from (existing checkpoint version + 1) onward (or from version 1 if there is no checkpoint
-    ///   yet), and then one of the following applies:
+    /// - **A.** `T == S1`: return the existing snapshot unchanged.
+    /// - **B.** `T < S1`: error. The incremental path only moves forward.
+    /// - Otherwise (`T` unset or `T > S1`), list the log from `C1+1` (or from version 1 if there is
+    ///   no existing checkpoint), and one of the following applies:
     ///   - **C.** Listing is empty:
-    ///     - **C.1.** `target_version` is set: error (the target is newer than anything in the
-    ///       log).
-    ///     - **C.2.** `target_version` is unset: return the existing snapshot.
-    ///   - **D.1.** Listing contains a checkpoint *ahead of* the existing snapshot version: commits
-    ///     between existing_snapshot_version+1 and the new checkpoint were not listed, so build a
-    ///     fresh snapshot starting from that checkpoint.
-    ///   - **D.2.** Listing contains a checkpoint *at or below* the existing snapshot version: the
-    ///     existing snapshot's P+M already covers the checkpoint; fall through to case F to replay
-    ///     only the new commits and advance the checkpoint base.
-    ///   - **E.** Listing contains commits but no new checkpoint and no version advance: return the
+    ///     - **C.1.** `T` is set: error (target is newer than anything in the log).
+    ///     - **C.2.** `T` is unset: return the existing snapshot.
+    ///   - **D.** Listing contains a checkpoint:
+    ///     - **D.1.** `C2 > S1`: the new checkpoint at `C2` already captures the table state
+    ///       through version `C2`, including changes in `(S1, C2]`, so we can use it as the new
+    ///       base instead of replaying those commits. Build a fresh snapshot from `C2`.
+    ///     - **D.2.** `C2 <= S1`: the existing snapshot already covers the checkpoint's P+M; fall
+    ///       through to case F to replay only the new commits and advance the checkpoint base.
+    ///   - **E.** Listing contains commits but no new checkpoint, and `S2 == S1`: return the
     ///     existing snapshot.
-    ///   - **F.** Listing contains new commits (and either no new checkpoint or a checkpoint at or
-    ///     below the existing snapshot version): run lightweight P+M replay on the new commits and
-    ///     merge them into the existing log segment.
+    ///   - **F.** Listing contains new commits (and either no new checkpoint or a checkpoint with
+    ///     `C2 <= S1`): run lightweight P+M replay on commits `> S1` and merge them into the
+    ///     existing log segment.
     ///
     /// Each case is marked with `// Case X` in `Snapshot::try_new_from`. The engine is passed
     /// to [`SnapshotBuilder::build`].
