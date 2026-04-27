@@ -224,6 +224,17 @@ impl LogSegment {
             end_version,
         )?;
 
+        // Invariant: when `latest_commit_file` is set, its version must equal the segment's
+        // end_version.
+        debug_assert!(
+            listed_files
+                .latest_commit_file
+                .as_ref()
+                .is_none_or(|c| c.version == effective_version),
+            "latest_commit_file version {:?} does not match end_version {effective_version}",
+            listed_files.latest_commit_file.as_ref().map(|c| c.version),
+        );
+
         let log_segment = LogSegment {
             end_version: effective_version,
             checkpoint_version,

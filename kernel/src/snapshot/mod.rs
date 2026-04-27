@@ -105,27 +105,39 @@ impl Snapshot {
     /// Create a new [`SnapshotBuilder`] to incrementally update a [`Snapshot`] to a more recent
     /// version.
     ///
-    /// Given an existing snapshot and an optional `target_version`, the update proceeds by case:
+    /// `target_version` is the effective requested version: the time-travel version from
+    /// [`SnapshotBuilder::at_version`] when set, otherwise the `max_catalog_version` from
+    /// [`SnapshotBuilder::with_max_catalog_version`] for catalog-managed tables, otherwise
+    /// unset (defaults to latest).
+    ///
+    /// The log listing performed below is catalog-log-tail aware: any `log_tail` provided to
+    /// the builder is merged with filesystem listings.
+    ///
+    /// Given an existing snapshot and `target_version`, the update proceeds by case:
     ///
     /// - **A.** `target_version == existing_version`: return the existing snapshot unchanged.
     /// - **B.** `target_version < existing_version`: error. The incremental path only moves
     ///   forward.
-    /// - Otherwise, list the log from (existing checkpoint version + 1) onward (or from version 1
-    ///   if there is no checkpoint yet), and then one of the following applies:
-    ///   - **C.1.** Listing is empty and `target_version` is set: error (the target is newer than
-    ///     anything in the log).
-    ///   - **C.2.** Listing is empty and no `target_version`: return the existing snapshot.
+    /// - Otherwise, `target_version` is unset or `target_version > existing_version`. List the log
+    ///   from (existing checkpoint version + 1) onward (or from version 1 if there is no checkpoint
+    ///   yet), and then one of the following applies:
+    ///   - **C.** Listing is empty:
+    ///     - **C.1.** `target_version` is set: error (the target is newer than anything in the
+    ///       log).
+    ///     - **C.2.** `target_version` is unset: return the existing snapshot.
     ///   - **D.** Listing contains a checkpoint: build a fresh snapshot from that checkpoint (and
-    ///     any commits after it), reusing the existing CRC if its version matches.
+    ///     any commits after it), reusing the existing CRC if its version matches. TODO(#2351):
+    ///     when the new checkpoint is at or below `existing_version`, the existing snapshot already
+    ///     covers its P+M, so a full rebuild is wasted work. PR #2351 splits this into D.1
+    ///     (checkpoint > `existing_version`: rebuild) and D.2 (checkpoint <= `existing_version`:
+    ///     take the incremental path and advance the checkpoint base).
     ///   - **E.** Listing contains commits but no new checkpoint and no version advance: return the
     ///     existing snapshot.
     ///   - **F.** Listing contains new commits (and no new checkpoint): run lightweight P+M replay
     ///     on the new commits and merge them into the existing log segment.
     ///
-    /// Each case is marked with `// case X` in `Snapshot::try_new_from`.
-    ///
-    /// The target version (default: latest) is set via [`SnapshotBuilder::at_version`], and the
-    /// engine is passed to [`SnapshotBuilder::build`].
+    /// Each case is marked with `// Case X` in `Snapshot::try_new_from`. The engine is passed
+    /// to [`SnapshotBuilder::build`].
     pub fn builder_from(existing_snapshot: SnapshotRef) -> SnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
     }
@@ -178,11 +190,11 @@ impl Snapshot {
         let requested_version = target_version.into();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
-            // case A: re-requesting the same version.
+            // Case A: re-requesting the same version.
             if requested_version == existing_snapshot_version {
                 return Ok(existing_snapshot.clone());
             }
-            // case B: incremental path only moves forward.
+            // Case B: incremental path only moves forward.
             if requested_version < existing_snapshot_version {
                 return Err(Error::Generic(format!(
                     "Requested snapshot version {requested_version} is older than snapshot \
@@ -215,7 +227,7 @@ impl Snapshot {
             && new_listed_files.checkpoint_parts().is_empty()
         {
             match requested_version {
-                // case C.1: caller requested a specific version (necessarily >
+                // Case C.1: caller requested a specific version (necessarily >
                 // existing_snapshot_version since cases A and B were handled above), but
                 // no such commit exists in the log.
                 Some(requested_version) => {
@@ -225,7 +237,7 @@ impl Snapshot {
                          {existing_snapshot_version}"
                     )));
                 }
-                // case C.2: no new commits and no explicit target; latest is existing.
+                // Case C.2: no new commits and no explicit target; latest is existing.
                 None => {
                     return Ok(existing_snapshot.clone());
                 }
@@ -253,7 +265,7 @@ impl Snapshot {
             )));
         }
         if new_log_segment.checkpoint_version.is_some() {
-            // case D: listing contains a checkpoint; build a fresh snapshot from it.
+            // Case D: listing contains a checkpoint; build a fresh snapshot from it.
             // TODO(#2218): consider incremental P&M replay instead of full rebuild.
             // `resolve_crc` reuses the existing `LazyCrc` when the resolved CRC version
             // matches, avoiding redundant I/O.
@@ -272,12 +284,12 @@ impl Snapshot {
             return Ok(Arc::new(snapshot?));
         }
 
-        // case E: no new checkpoint, version did not advance; return existing.
+        // Case E: no new checkpoint, version did not advance; return existing.
         if new_end_version == existing_snapshot_version {
             return Ok(existing_snapshot.clone());
         }
 
-        // case F: new commits, no new checkpoint; lightweight P+M replay + merge.
+        // Case F: new commits, no new checkpoint; lightweight P+M replay + merge.
         // First we remove the 'overlap' in commits, example:
         //
         //    existing logsegment checkpoint1-commit1-commit2-commit3
@@ -330,11 +342,7 @@ impl Snapshot {
             .clone();
         ascending_compaction_files.extend(new_log_segment.listed.ascending_compaction_files);
 
-        // Use the new latest_commit if available, otherwise use the existing one.
-        // This handles the case where the new listing returned no commits
-        let latest_commit_file = new_latest_commit_file
-            .or_else(|| existing_log_segment.listed.latest_commit_file.clone());
-        // we can pass in just the existing checkpoint parts since by the time we reach this
+        // We can pass in just the existing checkpoint parts since by the time we reach this
         // line, we know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
             LogSegmentFiles {
@@ -342,7 +350,10 @@ impl Snapshot {
                 ascending_compaction_files,
                 checkpoint_parts: existing_log_segment.listed.checkpoint_parts.clone(),
                 latest_crc_file: crc_file,
-                latest_commit_file,
+                // In Case F there are new commits (new_end_version > existing_snapshot_version
+                // with no new checkpoint), so the new listing's `latest_commit_file` is always
+                // `Some(commit @ new_end_version)` and matches the combined snapshot version.
+                latest_commit_file: new_latest_commit_file,
                 max_published_version: new_log_segment
                     .listed
                     .max_published_version

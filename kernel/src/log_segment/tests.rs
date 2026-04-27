@@ -1382,7 +1382,6 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
-            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
         },
         log_root,
@@ -2906,7 +2905,6 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
                 create_log_path_with_size(&cp1_file, cp1_size),
                 create_log_path_with_size(&cp2_file, cp2_size),
             ],
-            latest_commit_file: Some(create_log_path("file:///00000000000000000002.json")),
             ..Default::default()
         },
         log_root,
