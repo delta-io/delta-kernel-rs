@@ -49,7 +49,7 @@ async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
     ])?);
 
     let _ = create_table(&table_path, schema, "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -80,7 +80,7 @@ async fn test_get_file_stats_crc_not_at_snapshot_version() -> DeltaResult<()> {
 
     // ===== WHEN =====
     // Empty commit to advance to version 1 (no new CRC file written)
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = snapshot.transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?;
     let _ = txn.commit(engine.as_ref())?;
 
     // ===== THEN =====
@@ -145,7 +145,7 @@ async fn test_get_current_crc_if_loaded_returns_none_when_no_crc() -> DeltaResul
     )])?);
 
     let _ = create_table(&table_path, schema, "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -172,7 +172,7 @@ fn create_table_and_commit(
     )])?);
     let txn = create_table(table_path, schema, "test_engine")
         .with_data_layout(DataLayout::clustered(["id"]))
-        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .build(engine, Arc::new(FileSystemCommitter::new()))?
         .with_domain_metadata("zip".to_string(), "zap0".to_string());
 
     Ok(txn.commit(engine)?.unwrap_committed())
@@ -227,7 +227,7 @@ async fn test_post_commit_crc_chains_only_if_read_snapshot_has_crc(
     );
 
     let committed = read_snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_domain_metadata("zip".to_string(), "zap1".to_string())
         .commit(engine.as_ref())?
@@ -309,7 +309,7 @@ async fn test_post_commit_crc_tracks_file_stats_across_inserts() -> DeltaResult<
     let scan = snapshot_v2.clone().scan_builder().build()?;
     let mut txn = snapshot_v2
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("DELETE".to_string())
         .with_data_change(true);
     for sm in scan.scan_metadata(engine.as_ref())? {
@@ -344,7 +344,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
     // ===== WHEN: update zip -> zap1, add foo -> bar =====
     let txn = snapshot_v0
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_domain_metadata("zip".to_string(), "zap1".to_string()) // <-- set to zap1
         .with_domain_metadata("foo".to_string(), "bar".to_string()); // <-- add foo
@@ -360,7 +360,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
     // ===== WHEN: remove zip, keep foo =====
     let txn = snapshot_v1
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_domain_metadata_removed("zip".to_string()); // <-- remove zip
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
@@ -393,7 +393,7 @@ async fn test_post_commit_crc_non_incremental_op_makes_file_stats_indeterminate(
     // ===== WHEN: Commit a non-incremental operation (ANALYZE STATS) =====
     let committed = snapshot_v1
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("ANALYZE STATS".to_string())
         .commit(engine.as_ref())?
         .unwrap_committed();
@@ -644,7 +644,7 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
         builder = builder.with_table_properties(properties);
     }
     let committed = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -691,7 +691,7 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
     // v1: update zip -> zap1, add foo -> bar
     let committed = snapshot_v0
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_domain_metadata("zip".to_string(), "zap1".to_string())
         .with_domain_metadata("foo".to_string(), "bar".to_string())
@@ -781,7 +781,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
     // -- v1: commit with my-app=1 --
     let committed = snapshot_v0
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_transaction_id("my-app".to_string(), 1)
         .commit(engine.as_ref())?
@@ -826,7 +826,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> DeltaResult<()> {
     // -- v2: commit with my-app=2 (upsert) + other-app=1 (new) --
     let committed = snapshot_v1
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_transaction_id("my-app".to_string(), 2)
         .with_transaction_id("other-app".to_string(), 1)
@@ -899,14 +899,14 @@ async fn test_set_txn_expiration_via_crc_fast_path(
         builder = builder.with_table_properties([("delta.setTransactionRetentionDuration", r)]);
     }
     let committed = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
     // v1: commit a set transaction for "my-app" (lastUpdated = now)
     let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
     let committed = snapshot_v0
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_transaction_id("my-app".to_string(), 1)
         .commit(engine.as_ref())?
@@ -949,7 +949,7 @@ async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> DeltaR
             "delta.setTransactionRetentionDuration",
             "interval 0 seconds",
         )])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_committed();
 
@@ -1070,7 +1070,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
 
     // ===== v0: empty table =====
     let committed = create_table(&table_path, schema, "test_engine")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_committed();
     let snapshot = committed.post_commit_snapshot().unwrap();
@@ -1144,7 +1144,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
     let scan = snapshot.clone().scan_builder().build()?;
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("DELETE".to_string())
         .with_data_change(true);
     for sm in scan.scan_metadata(engine.as_ref())? {
@@ -1287,7 +1287,7 @@ async fn test_file_histogram_with_bin_type_and_operation_type(
         committed.post_commit_snapshot().unwrap().clone()
     } else {
         let committed = fresh_v1
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_operation("ANALYZE STATS".to_string())
             .commit(engine.as_ref())?
             .unwrap_committed();

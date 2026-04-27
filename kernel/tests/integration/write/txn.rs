@@ -1,5 +1,7 @@
 //! Integration tests for transaction-identifier write paths.
 
+use std::sync::Arc;
+
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
@@ -25,7 +27,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         assert!(matches!(
             snapshot
-                .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+                .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
                 .commit(&engine),
@@ -34,7 +36,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
 
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine")
             .with_transaction_id("app_id1".to_string(), 1)
             .with_transaction_id("app_id2".to_string(), 2);

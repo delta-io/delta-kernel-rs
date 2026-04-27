@@ -783,7 +783,7 @@ impl CreateTableTransactionBuilder {
     pub fn build(
         self,
         engine: &dyn Engine,
-        committer: Box<dyn Committer>,
+        committer: Arc<dyn Committer>,
     ) -> DeltaResult<CreateTableTransaction> {
         // Validate path
         let table_url = try_parse_uri(&self.path)?;

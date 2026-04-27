@@ -18,7 +18,7 @@ use unity_catalog_delta_client_api::{
 };
 
 use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult as _};
-use crate::transaction::MutableCommitter;
+use crate::transaction::SharedCommitter;
 use crate::{ExclusiveRustString, NullableCvoid};
 
 /// Data representing a commit.
@@ -59,8 +59,11 @@ pub struct FfiUCCommitClient {
     commit_callback: CCommit,
 }
 
-// NullableCvoid is NOT `Send` by itself. Here we declare our struct to be Send as it's up to the
-// caller to ensure they pass a thread safe pointer that remains valid
+// NullableCvoid is NOT `Send + Sync` by itself. Here we declare our struct to be Send + Sync, and
+// it's up to the caller to ensure the context pointer is safe for concurrent access from multiple
+// threads. Because committers are shared via `Arc<dyn Committer>`, `commit_callback(self.context,
+// ...)` below can be invoked concurrently on the same context from different threads driving
+// different transactions.
 unsafe impl Send for FfiUCCommitClient {}
 unsafe impl Sync for FfiUCCommitClient {}
 
@@ -119,9 +122,11 @@ pub struct SharedFfiUCCommitClient;
 /// Get a commit client that will call the passed callbacks when it wants to make a commit. The
 /// context will be passed back to the callback when called.
 ///
-/// IMPORTANT: The pointer passed for the context MUST be thread-safe (i.e. be able to be sent
-/// between threads safely) and MUST remain valid for as long as the client is used. It is valid to
-/// pass NULL as the context.
+/// IMPORTANT: The pointer passed for the context MUST be safe for **concurrent access from
+/// multiple threads** (i.e. `Sync`, not merely `Send`) and MUST remain valid for as long as the
+/// client is used. Because the returned commit client is wrapped in a shared committer handle
+/// (`SharedCommitter`), its callback can be invoked concurrently on the same context from
+/// multiple threads driving independent transactions. It is valid to pass NULL as the context.
 ///
 /// # Safety
 ///
@@ -195,7 +200,12 @@ impl<C: CommitClient + 'static> Committer for FfiUCCommitter<C> {
     }
 }
 
-/// Get a commit client that will call the passed callbacks when it wants to make a commit.
+/// Construct a Unity Catalog [`Committer`] bound to the given `commit_client` and `table_id`.
+///
+/// The returned handle wraps a shared `Arc<dyn Committer>` and may be passed to
+/// `transaction_with_committer` or `create_table_builder_build_with_committer` multiple times
+/// (both functions clone the underlying `Arc` rather than consuming the handle). The handle must
+/// ultimately be freed by calling [`free_uc_committer`].
 ///
 /// # Safety
 ///
@@ -207,33 +217,37 @@ pub unsafe extern "C" fn get_uc_committer(
     commit_client: Handle<SharedFfiUCCommitClient>,
     table_id: KernelStringSlice,
     error_fn: AllocateErrorFn,
-) -> ExternResult<Handle<MutableCommitter>> {
+) -> ExternResult<Handle<SharedCommitter>> {
     get_uc_committer_impl(commit_client, table_id).into_extern_result(&error_fn)
 }
 
 fn get_uc_committer_impl(
     commit_client: Handle<SharedFfiUCCommitClient>,
     table_id: KernelStringSlice,
-) -> DeltaResult<Handle<MutableCommitter>> {
+) -> DeltaResult<Handle<SharedCommitter>> {
     let client: Arc<FfiUCCommitClient> = unsafe { commit_client.clone_as_arc() };
     let table_id_str: String = unsafe { TryFromStringSlice::try_from_slice(&table_id) }?;
-    let committer: Box<dyn Committer> = Box::new(FfiUCCommitter {
+    let committer: Arc<dyn Committer> = Arc::new(FfiUCCommitter {
         inner: UCCommitter::new(client, table_id_str),
     });
     Ok(committer.into())
 }
 
-/// Free a committer obtained via get_uc_committer. Warning! Normally the value returned here will
-/// be consumed when creating a transaction via [`crate::transaction::transaction_with_committer`]
-/// and will NOT need to be freed.
+/// Release a committer handle obtained via [`get_uc_committer`].
+///
+/// Must be called exactly once per handle returned by `get_uc_committer`. The committer's
+/// underlying `Arc<dyn Committer>` is shared with any transactions started via
+/// [`crate::transaction::transaction_with_committer`] or
+/// [`crate::transaction::create_table_builder_build_with_committer`]; the underlying object is
+/// only dropped when all outstanding Arc references are released.
 ///
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle obtained via `get_uc_committer`
 #[no_mangle]
-pub unsafe extern "C" fn free_uc_committer(commit_client: Handle<MutableCommitter>) {
+pub unsafe extern "C" fn free_uc_committer(committer: Handle<SharedCommitter>) {
     debug!("released uc committer");
-    commit_client.drop_handle();
+    committer.drop_handle();
 }
 
 #[cfg(test)]
@@ -415,5 +429,15 @@ pub(crate) mod tests {
             free_uc_commit_client(client);
             free_uc_committer(committer);
         }
+    }
+
+    // Lock in that `FfiUCCommitter` (and therefore `UCCommitter<FfiUCCommitClient>`) satisfies
+    // the `Send + Sync` bound required by `Committer`. A future change to `UCCommitter` or
+    // `CommitClient` that silently drops `Sync` would otherwise only fail at the cast site in
+    // `get_uc_committer_impl`, with a confusing error.
+    #[test]
+    fn ffi_uc_committer_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FfiUCCommitter<FfiUCCommitClient>>();
     }
 }

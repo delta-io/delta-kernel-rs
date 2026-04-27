@@ -4,6 +4,7 @@
 //! `inCommitTimestamp` feature to the protocol (writer-only) and that the snapshot exposes a
 //! valid `inCommitTimestamp` value.
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use delta_kernel::committer::FileSystemCommitter;
@@ -83,7 +84,7 @@ fn test_create_table_ict(
 
     let committed = create_table(&table_path, super::simple_schema()?, "Test/1.0")
         .with_table_properties(properties.iter().copied())
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_committed();
 

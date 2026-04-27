@@ -59,7 +59,7 @@ async fn write_data_to_table(
     data: Vec<ArrowEngineData>,
 ) -> DeltaResult<CommitResult> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let committer = Box::new(FileSystemCommitter::new());
+    let committer = Arc::new(FileSystemCommitter::new());
     let mut txn = snapshot
         .transaction(committer, engine.as_ref())?
         .with_data_change(true);
@@ -580,7 +580,7 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
     let (_schema, table_url, engine, store) =
         setup_number_table(&tmp_test_dir, "test_consecutive_commits").await?;
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = snapshot.transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?;
 
     // Commit without adding any add files
     assert!(txn.commit(engine.as_ref())?.is_committed());
@@ -619,11 +619,11 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
 
     // Create two transactions from the same snapshot (simulating parallel transactions)
     let mut txn1 = snapshot1
-        .transaction(Box::new(FileSystemCommitter::new()), engine1.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine1.as_ref())?
         .with_engine_info("transaction 1")
         .with_data_change(true);
     let mut txn2 = snapshot2
-        .transaction(Box::new(FileSystemCommitter::new()), engine2.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine2.as_ref())?
         .with_engine_info("transaction 2")
         .with_data_change(true);
 

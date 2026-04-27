@@ -669,7 +669,7 @@ pub async fn insert_data<E: TaskExecutor>(
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
@@ -1013,7 +1013,7 @@ pub async fn write_batch_to_table(
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
     let write_context = if txn.logical_partition_columns().is_empty() {
@@ -1111,7 +1111,7 @@ pub fn create_table_and_load_snapshot(
 
     let _ = create_table(table_path, schema, "Test/1.0")
         .with_table_properties(properties.to_vec())
-        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .build(engine, Arc::new(FileSystemCommitter::new()))?
         .commit(engine)?;
 
     let table_url = delta_kernel::try_parse_uri(table_path)?;
@@ -1249,7 +1249,7 @@ pub fn remove_all_and_get_remove_actions(
 
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
     for sm in all_scan_metadata {

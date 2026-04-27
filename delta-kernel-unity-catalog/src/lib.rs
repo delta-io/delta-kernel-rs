@@ -250,7 +250,7 @@ mod tests {
         let store = Arc::new(store);
 
         let engine = DefaultEngineBuilder::new(store.clone()).build();
-        let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
+        let committer = Arc::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
         let snapshot = catalog
             .load_snapshot(&table_id, &table_uri, &engine)
             .await?;

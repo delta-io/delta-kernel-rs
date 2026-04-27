@@ -762,7 +762,7 @@ impl TestTableBuilder {
             ));
         }
         let committed = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?
             .unwrap_committed();
         let mut snapshot = committed.post_commit_snapshot().unwrap().clone();
@@ -823,7 +823,7 @@ async fn write_data_commit(
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine)?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 

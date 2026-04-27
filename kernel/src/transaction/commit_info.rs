@@ -248,7 +248,7 @@ mod tests {
     ) -> DeltaResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_operation("WRITE".to_string());
         if let Some((engine_commit_info_data, engine_commit_info_schema)) = engine_commit_info {
             txn = txn.with_commit_info(engine_commit_info_data, engine_commit_info_schema);

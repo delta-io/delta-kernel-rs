@@ -576,7 +576,7 @@ fn create_partitioned_table(
             builder.with_table_properties([("delta.columnMapping.mode", cm_mode_str(cm_mode))]);
     }
     let _ = builder
-        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .build(engine, Arc::new(FileSystemCommitter::new()))?
         .commit(engine)?;
     Ok(Snapshot::builder_for(table_path).build(engine)?)
 }
@@ -756,12 +756,12 @@ async fn test_materialized_partition_columns_excluded_from_stats(
     let _ = create_table(&table_path, table_schema.clone(), "test/1.0")
         .with_data_layout(DataLayout::partitioned([partition_col]))
         .with_table_properties([("delta.feature.materializePartitionColumns", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("default engine");
 
     // Build the input logical batch with all schema columns, including the partition column.

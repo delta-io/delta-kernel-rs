@@ -254,7 +254,7 @@ async fn crc_at_prior_version_triggers_tail_replay_then_falls_back_to_crc() -> D
     // commit 0: create table; write CRC from the post-commit snapshot.
     // `write_checksum` requires an in-memory CRC computed during the transaction.
     let create_committed = create_table(&table_path, simple_schema(), "Test/1.0")
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(setup_engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(setup_engine.as_ref())?
         .unwrap_committed();
     create_committed

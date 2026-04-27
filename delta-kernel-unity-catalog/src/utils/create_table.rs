@@ -182,7 +182,7 @@ mod tests {
         let _ = create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
             .with_data_layout(DataLayout::clustered(["region"]))
-            .build(&engine, Box::new(MockCatalogCommitter))
+            .build(&engine, Arc::new(MockCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap();
@@ -250,7 +250,7 @@ mod tests {
                     ColumnName::new(["address", "city"]),
                 ],
             })
-            .build(&engine, Box::new(MockCatalogCommitter))
+            .build(&engine, Arc::new(MockCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap();
@@ -285,7 +285,7 @@ mod tests {
         let disk_props = get_required_properties_for_disk("test-table-id");
         let _ = create_table(table_path, schema, "Test/1.0")
             .with_table_properties(disk_props)
-            .build(&engine, Box::new(MockCatalogCommitter))
+            .build(&engine, Arc::new(MockCatalogCommitter))
             .unwrap()
             .commit(&engine)
             .unwrap();
@@ -294,7 +294,7 @@ mod tests {
             .build(&engine)
             .unwrap();
         let result = v0_snapshot
-            .transaction(Box::new(MockCatalogCommitter), &engine)
+            .transaction(Arc::new(MockCatalogCommitter), &engine)
             .unwrap()
             .commit(&engine)
             .unwrap();

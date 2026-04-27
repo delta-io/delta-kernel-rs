@@ -125,7 +125,7 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
         // Commit without adding any add files
@@ -201,7 +201,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine")
             .with_data_change(false);
 
@@ -347,7 +347,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
         // create two new arrow record batches to append

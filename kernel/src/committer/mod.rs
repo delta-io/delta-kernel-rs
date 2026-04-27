@@ -46,14 +46,17 @@ use crate::{DeltaResult, Engine, FilteredEngineData};
 /// actions (as [`EngineData`] batches) to commit to the table at the given version
 /// ([`CommitMetadata::version`]).
 ///
+/// # Sharing and concurrency
+///
+/// Committers are passed as `Arc<dyn Committer>` so a single instance (e.g. a `UCCommitter`
+/// wrapping a shared catalog client) can be constructed once and reused across many transactions.
+/// The `Send + Sync` bound means implementations must be safe to call [`commit`] and [`publish`]
+/// concurrently from multiple threads on the same instance.
+///
 /// [`commit`]: Committer::commit
+/// [`publish`]: Committer::publish
 /// [`EngineData`]: crate::EngineData
-//
-// Note: While we could omit the Send bound, we keep it here for simplicity - so usage can be
-// Arc<dyn Committer> (instead of Arc<dyn Committer + Send>). If there is a strong case for a !Send
-// Committer then we can remove this bound and possibly just do an alias like CommitterRef =
-// Arc<dyn Committer + Send>.
-pub trait Committer: Send {
+pub trait Committer: Send + Sync {
     /// Commits actions to the table at the version specified in [`CommitMetadata`].
     ///
     /// Implementations must ensure that actions are committed atomically and either:

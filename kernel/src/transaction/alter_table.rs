@@ -7,7 +7,7 @@
 #![allow(unreachable_pub)]
 
 use std::marker::PhantomData;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::committer::Committer;
 use crate::snapshot::SnapshotRef;
@@ -37,7 +37,7 @@ impl AlterTableTransaction {
     pub(crate) fn try_new_alter_table(
         read_snapshot: SnapshotRef,
         effective_table_config: TableConfiguration,
-        committer: Box<dyn Committer>,
+        committer: Arc<dyn Committer>,
     ) -> DeltaResult<Self> {
         let span = tracing::info_span!(
             "txn",
