@@ -16,9 +16,7 @@ use tempfile::tempdir;
 use test_utils::{create_default_engine, setup_test_tables, write_batch_to_table};
 use url::Url;
 
-mod common;
-
-use common::write_utils::get_simple_int_schema;
+use crate::common::write_utils::get_simple_int_schema;
 
 #[tokio::test]
 async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {

@@ -19,9 +19,7 @@ use itertools::Itertools;
 use serde_json::{json, Deserializer};
 use test_utils::{create_table, engine_store_setup, set_json_value, setup_test_tables, test_read};
 
-mod common;
-
-use common::write_utils::{
+use crate::common::write_utils::{
     check_action_timestamps, get_and_check_all_parquet_sizes, get_simple_int_schema,
     validate_txn_id, write_data_and_check_result_and_stats, ZERO_UUID,
 };

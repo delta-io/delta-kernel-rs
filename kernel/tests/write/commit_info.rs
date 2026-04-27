@@ -14,9 +14,9 @@ use itertools::Itertools;
 use serde_json::{json, Deserializer};
 use test_utils::{set_json_value, setup_test_tables};
 
-mod common;
-
-use common::write_utils::{get_simple_int_schema, validate_timestamp, validate_txn_id, ZERO_UUID};
+use crate::common::write_utils::{
+    get_simple_int_schema, validate_timestamp, validate_txn_id, ZERO_UUID,
+};
 
 #[tokio::test]
 async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {

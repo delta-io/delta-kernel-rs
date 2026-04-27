@@ -24,9 +24,7 @@ use test_utils::{
 };
 use url::Url;
 
-mod common;
-
-use common::write_utils::{
+use crate::common::write_utils::{
     create_dv_table_with_files, get_scan_files, get_simple_int_schema, set_table_properties,
     write_data_and_check_result_and_stats,
 };

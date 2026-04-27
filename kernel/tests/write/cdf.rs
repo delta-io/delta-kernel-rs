@@ -17,9 +17,7 @@ use tempfile::{tempdir, TempDir};
 use test_utils::{assert_result_error_with_message, create_table, engine_store_setup};
 use url::Url;
 
-mod common;
-
-use common::write_utils::get_simple_int_schema;
+use crate::common::write_utils::get_simple_int_schema;
 
 // Helper function to create a table with CDF enabled
 async fn create_cdf_table(
