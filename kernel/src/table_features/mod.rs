@@ -108,9 +108,9 @@ pub(crate) enum TableFeature {
     RowTracking,
     /// domain specific metadata
     DomainMetadata,
-    /// Iceberg compatibility support
+    /// Iceberg V1 compatibility support
     IcebergCompatV1,
-    /// Iceberg compatibility support
+    /// Iceberg V2 compatibility support
     IcebergCompatV2,
     /// Iceberg V3 compatibility support
     IcebergCompatV3,
@@ -427,18 +427,18 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-// IcebergCompatV3 ensures tables can be converted to Apache Iceberg V3. IcebergCompatV3
-// feature spec:
-// `https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-compat-v3.md`
+// IcebergCompatV3 ensures tables can be converted to Apache Iceberg V3.
+// Spec: <https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-compat-v3.md>
 //
-// Marked as NotSupported until write-side implementation lands.
+// TODO: Implement the write-side requirements for IcebergCompatV3.
+// Note: unlike V1/V2, V3 intentionally permits DeletionVectors per the RFC -- no
+// `NotEnabled(DeletionVectors)` requirement is needed.
 static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
         FeatureRequirement::Custom(|_protocol, properties| {
-            // The column mapping mode must be in 'name' or 'id' mode to support IcebergCompatV3.
             let mode = properties.column_mapping_mode;
             if !matches!(
                 mode,
@@ -451,8 +451,8 @@ static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
             Ok(())
         }),
         FeatureRequirement::Enabled(TableFeature::RowTracking),
-        // Per the protocol, require that IcebergCompatV1 and IcebergCompatV2 are not active on the
-        // table So we used `NotEnabled` instead of `NotSupported`
+        // V1/V2 may remain in `writerFeatures` (supported) as long as they are not active --
+        // hence `NotEnabled` rather than `NotSupported`.
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV2),
     ],
