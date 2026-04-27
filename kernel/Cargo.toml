@@ -162,11 +162,18 @@ harness = false
 name = "expression_bench"
 harness = false
 
-# Consolidated write-path integration tests. Linking each integration test as a
+# Consolidated integration test binaries. Linking each integration test as a
 # separate binary is expensive (every binary re-links Arrow, Parquet, and the
-# default engine), so all write tests share a single binary whose entry point
-# is `tests/write/main.rs` and whose topics live as modules under that
-# directory.
+# default engine), so related tests share a single binary whose entry point is
+# `tests/<group>/main.rs` and whose topics live as modules under that directory.
 [[test]]
 name = "write"
 path = "tests/write/main.rs"
+
+[[test]]
+name = "log"
+path = "tests/log/main.rs"
+
+[[test]]
+name = "features"
+path = "tests/features/main.rs"

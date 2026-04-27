@@ -7,9 +7,6 @@ use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
 use itertools::Itertools;
-
-mod common;
-
 use test_utils::load_test_data;
 
 fn read_cdf_for_table(

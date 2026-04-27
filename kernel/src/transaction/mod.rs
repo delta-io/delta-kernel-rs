@@ -2121,7 +2121,7 @@ mod tests {
 
     // Note: Additional test coverage for partial file matching (where some files in a scan
     // have DV updates but others don't) is provided by the end-to-end integration test
-    // kernel/tests/dv.rs and kernel/tests/write/remove_dv.rs, which exercise
+    // kernel/tests/features/dv.rs and kernel/tests/write/remove_dv.rs, which exercise
     // the full deletion vector write workflow including the DvMatchVisitor logic.
 
     #[test]
