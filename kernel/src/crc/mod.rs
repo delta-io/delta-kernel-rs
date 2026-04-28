@@ -133,8 +133,16 @@ pub struct Crc {
     )]
     pub domain_metadata: Option<HashMap<String, DomainMetadata>>,
     /// Size distribution information of files remaining after action reconciliation.
+    ///
+    /// The Delta protocol spec names this field `fileSizeHistogram`, but Delta-Spark writers
+    /// historically emit it as `histogramOpt`. To remain compatible with CRC files written by
+    /// those tools, deserialization accepts either name, but not both. If both are present
+    /// deserialization will throw an error. Serialization always emits the spec-correct
+    /// `fileSizeHistogram`. Mirrors the kernel-java fix in
+    /// <https://github.com/delta-io/delta/pull/6281>.
     #[serde(
         default,
+        alias = "histogramOpt",
         deserialize_with = "de_validated_file_size_histogram",
         skip_serializing_if = "Option::is_none"
     )]
@@ -506,8 +514,10 @@ mod tests {
 
     // ===== File size histogram validation =====
 
-    /// Minimal CRC JSON with a file size histogram field spliced in.
-    fn crc_json_with_histogram(histogram_json: &str) -> String {
+    /// Minimal CRC JSON with a file size histogram field spliced in under the given field name
+    /// (`fileSizeHistogram` per the Delta spec, or `histogramOpt` for legacy Delta-Spark
+    /// compatibility).
+    fn crc_json_with_histogram(field_name: &str, histogram_json: &str) -> String {
         format!(
             r#"{{
                 "tableSizeBytes": 0,
@@ -523,29 +533,37 @@ mod tests {
                     "createdTime": 0
                 }},
                 "protocol": {{"minReaderVersion": 1, "minWriterVersion": 1}},
-                "fileSizeHistogram": {histogram_json}
+                "{field_name}": {histogram_json}
             }}"#
         )
     }
 
-    #[test]
-    fn de_valid_file_size_histogram_succeeds() {
+    use rstest::rstest;
+
+    /// Both the Delta spec field name and the legacy Delta-Spark name must deserialize.
+    #[rstest]
+    #[case::spec_name("fileSizeHistogram")]
+    #[case::legacy_name("histogramOpt")]
+    fn de_valid_file_size_histogram_succeeds(#[case] field_name: &str) {
         let json = crc_json_with_histogram(
+            field_name,
             r#"{"sortedBinBoundaries": [0, 100, 200], "fileCounts": [1, 2, 3], "totalBytes": [10, 200, 300]}"#,
         );
         let crc: Crc = serde_json::from_str(&json).unwrap();
         assert!(crc.file_size_histogram.is_some());
     }
 
-    #[test]
-    fn de_null_file_size_histogram_deserializes_to_none() {
-        let json = crc_json_with_histogram("null");
+    #[rstest]
+    #[case::spec_name("fileSizeHistogram")]
+    #[case::legacy_name("histogramOpt")]
+    fn de_null_file_size_histogram_deserializes_to_none(#[case] field_name: &str) {
+        let json = crc_json_with_histogram(field_name, "null");
         let crc: Crc = serde_json::from_str(&json).unwrap();
         assert!(crc.file_size_histogram.is_none());
     }
 
-    use rstest::rstest;
-
+    /// Validation must reject malformed histograms regardless of which field name they arrived
+    /// under. Cartesian product across malformed payloads x both accepted field names.
     #[rstest]
     #[case::unsorted_boundaries(
         r#"{"sortedBinBoundaries": [0, 200, 100], "fileCounts": [0, 0, 0], "totalBytes": [0, 0, 0]}"#
@@ -559,8 +577,89 @@ mod tests {
     #[case::single_boundary(
         r#"{"sortedBinBoundaries": [0], "fileCounts": [0], "totalBytes": [0]}"#
     )]
-    fn de_malformed_file_size_histogram_returns_error(#[case] histogram_json: &str) {
-        let json = crc_json_with_histogram(histogram_json);
+    fn de_malformed_file_size_histogram_returns_error(
+        #[case] histogram_json: &str,
+        #[values("fileSizeHistogram", "histogramOpt")] field_name: &str,
+    ) {
+        let json = crc_json_with_histogram(field_name, histogram_json);
         assert!(serde_json::from_str::<Crc>(&json).is_err());
+    }
+
+    /// CRC files written by kernel always use the spec-correct field name `fileSizeHistogram`,
+    /// even when the input JSON used the legacy `histogramOpt` alias. This matches kernel-java
+    /// (delta-io/delta#6281) and ensures kernel-written CRCs are protocol-compliant.
+    #[test]
+    fn ser_uses_spec_field_name_after_deserializing_legacy_alias() {
+        let legacy_json = crc_json_with_histogram(
+            "histogramOpt",
+            r#"{"sortedBinBoundaries": [0, 100], "fileCounts": [1, 0], "totalBytes": [50, 0]}"#,
+        );
+        let crc: Crc = serde_json::from_str(&legacy_json).unwrap();
+
+        let serialized = serde_json::to_value(&crc).unwrap();
+        assert!(serialized.get("fileSizeHistogram").is_some());
+        assert!(serialized.get("histogramOpt").is_none());
+    }
+
+    /// A CRC that contains both `fileSizeHistogram` and `histogramOpt` is rejected with a
+    /// "duplicate field" error -- serde's `#[serde(alias)]` treats both names as the same
+    /// logical field and refuses to deserialize repeated sets. No real producer emits both
+    /// fields today (Delta-Spark writes only `histogramOpt` or only `fileSizeHistogram`,
+    /// kernel-java / kernel-rust write only `fileSizeHistogram`), so this is a defensive guard  
+    /// against malformed CRCs. The error fires regardless of the data carried under each name.
+    /// The cases below exercise both matching and mismatched payloads, in both JSON orderings.
+    #[rstest]
+    #[case::matching_payloads(
+        r#"{"sortedBinBoundaries": [0, 100], "fileCounts": [1, 0], "totalBytes": [50, 0]}"#,
+        r#"{"sortedBinBoundaries": [0, 100], "fileCounts": [1, 0], "totalBytes": [50, 0]}"#
+    )]
+    #[case::mismatched_payloads(
+        r#"{"sortedBinBoundaries": [0, 100], "fileCounts": [1, 0], "totalBytes": [50, 0]}"#,
+        r#"{"sortedBinBoundaries": [0, 200], "fileCounts": [9, 9], "totalBytes": [99, 99]}"#
+    )]
+    fn de_both_field_names_present_returns_duplicate_field_error(
+        #[case] histogram_opt_payload: &str,
+        #[case] file_size_histogram_payload: &str,
+        #[values(true, false)] spec_listed_last: bool,
+    ) {
+        let (first_name, first_payload, second_name, second_payload) = if spec_listed_last {
+            (
+                "histogramOpt",
+                histogram_opt_payload,
+                "fileSizeHistogram",
+                file_size_histogram_payload,
+            )
+        } else {
+            (
+                "fileSizeHistogram",
+                file_size_histogram_payload,
+                "histogramOpt",
+                histogram_opt_payload,
+            )
+        };
+        let json = format!(
+            r#"{{
+                "tableSizeBytes": 0,
+                "numFiles": 0,
+                "numMetadata": 1,
+                "numProtocol": 1,
+                "metadata": {{
+                    "id": "test",
+                    "format": {{"provider": "parquet", "options": {{}}}},
+                    "schemaString": "{{\"type\":\"struct\",\"fields\":[]}}",
+                    "partitionColumns": [],
+                    "configuration": {{}},
+                    "createdTime": 0
+                }},
+                "protocol": {{"minReaderVersion": 1, "minWriterVersion": 1}},
+                "{first_name}": {first_payload},
+                "{second_name}": {second_payload}
+            }}"#
+        );
+        let err = serde_json::from_str::<Crc>(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "expected duplicate-field error, got: {err}"
+        );
     }
 }
