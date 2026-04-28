@@ -75,6 +75,14 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // the feature on an all-nullable table so a later ALTER TABLE ADD COLUMN NOT NULL does
     // not need a protocol upgrade.
     TableFeature::Invariants,
+    // MaterializePartitionColumns keeps partition columns in the data files (rather than
+    // dropping them via the logical-to-physical transform). The feature is fully wired in
+    // kernel (write: `Transaction::generate_logical_to_physical` and
+    // `TableConfiguration::physical_write_schema`; read: scan reconstructs from
+    // `add.partitionValues` regardless), and `KernelSupport::Supported`. There is no
+    // `delta.*` enablement property for it, so the only opt-in at create time is the
+    // explicit feature signal `delta.feature.materializePartitionColumns=supported`.
+    TableFeature::MaterializePartitionColumns,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
