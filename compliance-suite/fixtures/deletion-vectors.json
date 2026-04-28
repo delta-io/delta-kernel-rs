@@ -1,0 +1,253 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "dv_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["deletionVectors"],
+      "writerFeatures": ["deletionVectors"]
+    },
+    "modern_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    },
+    "legacy_1_2": {"minReaderVersion": 1, "minWriterVersion": 2}
+  },
+  "$notes": {},
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "deletion_vectors_create_table_3_7_feature_listed_succeeds",
+      "feature": "deletionVectors",
+      "description": "Creating a (3,7)+[deletionVectors] table with delta.enableDeletionVectors=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.dv_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableDeletionVectors": "true"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "deletion_vectors_create_table_1_2_fails",
+      "feature": "deletionVectors",
+      "flavor": "insufficient_protocol",
+      "description": "Creating a (1,2) table with delta.enableDeletionVectors=true fails; deletionVectors requires (3,7) with the feature listed in both feature arrays.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_2",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableDeletionVectors": "true"}
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 3,
+      "name": "deletion_vectors_create_table_3_7_orphan_property_succeeds",
+      "feature": "deletionVectors",
+      "flavor": "orphan",
+      "description": "Creating a (3,7) table with delta.enableDeletionVectors=true but deletionVectors absent from both feature lists succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableDeletionVectors": "true"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 4,
+      "name": "deletion_vectors_read_snapshot_3_7_feature_listed_succeeds",
+      "feature": "deletionVectors",
+      "description": "Reading a (3,7)+[deletionVectors] table with delta.enableDeletionVectors=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.dv_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableDeletionVectors": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "deletion_vectors_read_snapshot_supported_not_active_succeeds",
+      "feature": "deletionVectors",
+      "flavor": "supported_not_active",
+      "description": "Reading a (3,7)+[deletionVectors] table without delta.enableDeletionVectors property succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.dv_3_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "deletion_vectors_read_snapshot_3_7_orphan_property_succeeds",
+      "feature": "deletionVectors",
+      "flavor": "orphan",
+      "description": "Reading a (3,7) table with delta.enableDeletionVectors=true but deletionVectors absent from both feature lists succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableDeletionVectors": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "deletion_vectors_empty_commit_3_7_feature_listed_succeeds",
+      "feature": "deletionVectors",
+      "description": "Committing to a (3,7)+[deletionVectors] table with delta.enableDeletionVectors=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.dv_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableDeletionVectors": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 8,
+      "name": "deletion_vectors_empty_commit_supported_not_active_succeeds",
+      "feature": "deletionVectors",
+      "flavor": "supported_not_active",
+      "description": "Committing to a (3,7)+[deletionVectors] table without delta.enableDeletionVectors=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.dv_3_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 9,
+      "name": "deletion_vectors_empty_commit_3_7_orphan_property_succeeds",
+      "feature": "deletionVectors",
+      "flavor": "orphan",
+      "description": "Committing to a (3,7) table with delta.enableDeletionVectors=true but deletionVectors absent from both feature lists succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableDeletionVectors": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 10,
+      "name": "deletion_vectors_create_table_supported_not_active_succeeds",
+      "feature": "deletionVectors",
+      "flavor": "supported_not_active",
+      "description": "Creating a (3,7)+[deletionVectors] table without delta.enableDeletionVectors=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.dv_3_7",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 11,
+      "name": "deletion_vectors_create_table_supported_not_active_false_property_succeeds",
+      "feature": "deletionVectors",
+      "flavor": "supported_not_active",
+      "description": "Creating a (3,7)+[deletionVectors] table with delta.enableDeletionVectors=false succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.dv_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableDeletionVectors": "false"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "deletion_vectors_read_snapshot_supported_not_active_false_property_succeeds",
+      "feature": "deletionVectors",
+      "flavor": "supported_not_active",
+      "description": "Reading a (3,7)+[deletionVectors] table with delta.enableDeletionVectors=false succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.dv_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableDeletionVectors": "false"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 13,
+      "name": "deletion_vectors_empty_commit_supported_not_active_false_property_succeeds",
+      "feature": "deletionVectors",
+      "flavor": "supported_not_active",
+      "description": "Committing to a (3,7)+[deletionVectors] table with delta.enableDeletionVectors=false succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.dv_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableDeletionVectors": "false"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    }
+  ]
+}

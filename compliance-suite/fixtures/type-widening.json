@@ -1,0 +1,320 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    },
+    "type_widened_int": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.typeChanges": [{"fromType": "short", "toType": "integer"}]}
+        }
+      ]
+    },
+    "type_narrowed_int": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.typeChanges": [{"fromType": "long", "toType": "integer"}]}
+        }
+      ]
+    }
+  },
+  "$protocols": {
+    "type_widening_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["typeWidening"],
+      "writerFeatures": ["typeWidening"]
+    },
+    "type_widening_preview_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["typeWidening-preview"],
+      "writerFeatures": ["typeWidening-preview"]
+    },
+    "type_widening_writer_only_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["typeWidening"]
+    },
+    "modern_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    }
+  },
+  "$notes": {
+    "type_changes_independent_of_property": "delta.typeChanges in the schema records the history of type changes already applied and is independent of the delta.enableTypeWidening property. When typeWidening is listed in readerFeatures, readers must validate and accept or reject all delta.typeChanges entries regardless of whether the property is currently set.",
+    "preview_is_preratification_name": "typeWidening-preview was the feature name used in implementations during the RFC development phase (delta-io/delta#4094). The final RFC draft matched the ratified spec; implementations tracking the RFC used the same semantics as typeWidening. Tables created with typeWidening-preview use the same protocol semantics as typeWidening."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "type_widening_create_table_3_7_feature_listed_succeeds",
+      "feature": "typeWidening",
+      "description": "Creating a (3,7)+[typeWidening] table with delta.enableTypeWidening=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.type_widening_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableTypeWidening": "true"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "type_widening_create_table_3_7_no_feature_listed_with_property_succeeds",
+      "feature": "typeWidening",
+      "flavor": "orphan",
+      "description": "Creating a (3,7) table with delta.enableTypeWidening=true but typeWidening absent from both feature lists succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableTypeWidening": "true"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "type_widening_create_table_writer_only_feature_listed_fails",
+      "feature": "typeWidening",
+      "flavor": "missing_dependency",
+      "description": "Creating a (3,7)+[typeWidening in writerFeatures only] table fails; typeWidening requires the feature in both readerFeatures and writerFeatures.",
+      "note": "$errata.protocol_structural_validity_should_vs_must",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.type_widening_writer_only_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableTypeWidening": "true"}
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 4,
+      "name": "type_widening_read_snapshot_3_7_no_feature_listed_with_property_succeeds",
+      "feature": "typeWidening",
+      "flavor": "orphan",
+      "description": "Reading a (3,7) table with delta.enableTypeWidening=true but typeWidening absent from both feature lists succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableTypeWidening": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "type_widening_supported_not_enabled_no_type_changes_read_snapshot_succeeds",
+      "feature": "typeWidening",
+      "flavor": "supported_not_active",
+      "description": "Reading a (3,7)+[typeWidening] table with delta.enableTypeWidening absent and no delta.typeChanges in the schema succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.type_widening_3_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "type_widening_supported_enabled_no_type_changes_read_snapshot_succeeds",
+      "feature": "typeWidening",
+      "flavor": "supported_not_active",
+      "description": "Reading a (3,7)+[typeWidening] table with delta.enableTypeWidening=true but no delta.typeChanges in the schema succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.type_widening_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableTypeWidening": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "type_widening_supported_has_supported_type_change_read_snapshot_succeeds",
+      "feature": "typeWidening",
+      "description": "Reading a (3,7)+[typeWidening] table with a supported delta.typeChanges entry (short to integer) in the schema succeeds.",
+      "note": "$notes.type_changes_independent_of_property",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.type_widening_3_7"},
+          {"metaData": {"schemaString": "$schemas.type_widened_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 8,
+      "name": "type_widening_read_snapshot_unsupported_type_change_in_schema_fails",
+      "feature": "typeWidening",
+      "description": "Reading a (3,7)+[typeWidening] table with an unsupported delta.typeChanges entry (long to integer, a narrowing) in the schema fails; readers must reject unsupported type changes.",
+      "note": "The setup injects a delta.typeChanges entry recording long->integer (a narrowing, not a valid widening) directly via the log, bypassing writer validation. The spec requires readers to fail on any unsupported type change found in delta.typeChanges when typeWidening is in readerFeatures.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.type_widening_3_7"},
+          {"metaData": {"schemaString": "$schemas.type_narrowed_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 9,
+      "name": "type_widening_orphan_type_changes_annotation_read_snapshot_succeeds",
+      "feature": "typeWidening",
+      "flavor": "orphan",
+      "description": "Reading a (3,7) table with delta.typeChanges in the schema but typeWidening absent from both feature lists succeeds; the spec only requires readers to validate delta.typeChanges when typeWidening is in readerFeatures.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {"metaData": {"schemaString": "$schemas.type_widened_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 10,
+      "name": "type_widening_read_snapshot_type_changes_in_schema_without_feature_in_reader_succeeds",
+      "feature": "typeWidening",
+      "description": "Reading a (3,7)+[typeWidening in writerFeatures only] table with delta.typeChanges in the schema succeeds; readers only validate delta.typeChanges when typeWidening is in readerFeatures.",
+      "note": "$errata.protocol_structural_validity_should_vs_must",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.type_widening_writer_only_3_7"},
+          {"metaData": {"schemaString": "$schemas.type_widened_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 11,
+      "name": "type_widening_empty_commit_3_7_feature_listed_succeeds",
+      "feature": "typeWidening",
+      "description": "Appending to a (3,7)+[typeWidening] table with delta.enableTypeWidening=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.type_widening_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableTypeWidening": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "type_widening_empty_commit_supported_not_active_succeeds",
+      "feature": "typeWidening",
+      "flavor": "supported_not_active",
+      "description": "Appending to a (3,7)+[typeWidening] table without delta.enableTypeWidening=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.type_widening_3_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 13,
+      "name": "type_widening_empty_commit_3_7_no_feature_listed_with_property_succeeds",
+      "feature": "typeWidening",
+      "flavor": "orphan",
+      "description": "Appending to a (3,7) table with delta.enableTypeWidening=true but typeWidening absent from both feature lists succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableTypeWidening": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 14,
+      "name": "type_widening_preview_create_table_3_7_feature_listed_succeeds",
+      "feature": "typeWidening-preview",
+      "description": "Creating a (3,7)+[typeWidening-preview] table with delta.enableTypeWidening=true succeeds; typeWidening-preview is the pre-ratification name for typeWidening and shares its spec semantics.",
+      "note": "$notes.preview_is_preratification_name",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.type_widening_preview_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableTypeWidening": "true"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 15,
+      "name": "type_widening_preview_read_snapshot_3_7_no_feature_listed_with_property_succeeds",
+      "feature": "typeWidening-preview",
+      "flavor": "orphan",
+      "description": "Reading a (3,7) table with delta.enableTypeWidening=true but typeWidening-preview absent from both feature lists succeeds.",
+      "note": "$notes.preview_is_preratification_name",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableTypeWidening": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    }
+  ]
+}

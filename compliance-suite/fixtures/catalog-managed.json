@@ -1,0 +1,200 @@
+{
+  "$schemas": {
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "catalog_managed_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["catalogManaged"],
+      "writerFeatures": ["catalogManaged", "inCommitTimestamp"]
+    },
+    "catalog_managed_3_7_no_ict": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["catalogManaged"],
+      "writerFeatures": ["catalogManaged"]
+    },
+    "catalog_managed_3_7_writer_only": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["catalogManaged"]
+    },
+    "catalog_managed_3_7_reader_only": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["catalogManaged"],
+      "writerFeatures": []
+    },
+    "catalog_owned_preview_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["catalogOwned-preview"],
+      "writerFeatures": ["catalogOwned-preview", "inCommitTimestamp"]
+    }
+  },
+  "$notes": {
+    "catalog_managed_ict_write_enforcement": "When catalogManaged is supported and active, the spec requires inCommitTimestamp to also be supported and active (feature in writerFeatures plus delta.enableInCommitTimestamps=true), and every commit must include a txnId field in its commitInfo action. setup.log_actions can model prior commitInfo state, but full write-path enforcement (action ordering/content on the new commit) requires richer write_actions coverage.",
+    "catalog_owned_preview_ratification": "catalogOwned-preview is the pre-ratification name for catalogManaged. The ratified Delta protocol spec defines only catalogManaged; catalogOwned-preview does not appear. Kernel retains support for catalogOwned-preview for backwards compatibility with tables written before ratification. The two feature names are semantically equivalent: both are reader+writer features with identical enablement, writer, and reader requirements."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "catalog_managed_create_table_3_7_feature_listed_succeeds",
+      "feature": "catalogManaged",
+      "description": "Creating a (3,7)+[catalogManaged,inCommitTimestamp] table succeeds.",
+      "note": "$notes.catalog_managed_ict_write_enforcement",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.catalog_managed_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableInCommitTimestamps": "true"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "catalog_managed_read_snapshot_3_7_feature_listed_succeeds",
+      "feature": "catalogManaged",
+      "description": "Reading a (3,7)+[catalogManaged,inCommitTimestamp] table succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.catalog_managed_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableInCommitTimestamps": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "catalog_managed_read_snapshot_3_7_without_ict_fails",
+      "feature": "catalogManaged",
+      "flavor": "missing_dependency",
+      "description": "Reading a (3,7)+[catalogManaged] table without inCommitTimestamp support fails.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.catalog_managed_3_7_no_ict"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 4,
+      "name": "catalog_managed_empty_commit_3_7_no_ict_in_prior_commit_fails",
+      "feature": "catalogManaged",
+      "description": "Committing to a (3,7)+[catalogManaged,inCommitTimestamp] table fails when there is no prior commitInfo with inCommitTimestamp.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.catalog_managed_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableInCommitTimestamps": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 5,
+      "name": "catalog_managed_create_table_3_7_writer_only_fails",
+      "feature": "catalogManaged",
+      "flavor": "insufficient_protocol",
+      "description": "Creating a (3,7) table with catalogManaged only in writerFeatures fails.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.catalog_managed_3_7_writer_only",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 6,
+      "name": "catalog_owned_preview_create_table_3_7_feature_listed_succeeds",
+      "feature": "catalogOwned-preview",
+      "description": "Creating a (3,7)+[catalogOwned-preview,inCommitTimestamp] table succeeds.",
+      "note": "$notes.catalog_owned_preview_ratification",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.catalog_owned_preview_3_7",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.enableInCommitTimestamps": "true"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "catalog_owned_preview_read_snapshot_3_7_feature_listed_succeeds",
+      "feature": "catalogOwned-preview",
+      "description": "Reading a (3,7)+[catalogOwned-preview,inCommitTimestamp] table succeeds.",
+      "note": "$notes.catalog_owned_preview_ratification",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.catalog_owned_preview_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableInCommitTimestamps": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 8,
+      "name": "catalog_managed_empty_commit_3_7_with_ict_succeeds",
+      "feature": "catalogManaged",
+      "description": "Committing to a (3,7)+[catalogManaged,inCommitTimestamp] table succeeds with valid prior inCommitTimestamp state.",
+      "note": "$notes.catalog_managed_ict_write_enforcement",
+      "setup": {
+        "log_actions": [
+          {"commitInfo": {"timestamp": 0, "inCommitTimestamp": 0}},
+          {"protocol": "$protocols.catalog_managed_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableInCommitTimestamps": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 9,
+      "name": "catalog_managed_read_snapshot_3_7_reader_only_fails",
+      "feature": "catalogManaged",
+      "flavor": "insufficient_protocol",
+      "description": "Reading a (3,7) table with catalogManaged only in readerFeatures fails.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.catalog_managed_3_7_reader_only"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "failure"
+    }
+  ]
+}

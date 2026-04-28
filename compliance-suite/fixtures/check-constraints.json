@@ -1,0 +1,337 @@
+{
+  "$schemas": {
+    "cm_simple_int": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "col-1"}
+        }
+      ]
+    },
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "modern_3_7_check_constraints": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["checkConstraints"]
+    },
+    "legacy_1_2": {"minReaderVersion": 1, "minWriterVersion": 2},
+    "modern_3_7_cm_check_constraints": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["columnMapping"],
+      "writerFeatures": ["columnMapping", "checkConstraints"]
+    },
+    "legacy_1_3": {"minReaderVersion": 1, "minWriterVersion": 3},
+    "modern_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    }
+  },
+  "$notes": {
+    "orphan_writer_feature": "At (3,7), the spec requires activation properties to be paired with the corresponding feature in writerFeatures. Writing an activation property for a feature absent from writerFeatures is invalid committed state."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "check_constraints_create_table_1_2_fails",
+      "flavor": "insufficient_protocol",
+      "feature": "checkConstraints",
+      "description": "Creating a (1,2) table with a delta.constraints.* property fails: checkConstraints requires minWriterVersion>=3.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_2",
+        "metadata": {
+          "configuration": {"delta.constraints.id_positive": "id > 0"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 2,
+      "name": "check_constraints_create_table_3_7_no_feature_listed_with_property_fails",
+      "flavor": "orphan",
+      "feature": "checkConstraints",
+      "description": "Creating a (3,7) table with a delta.constraints.* property but checkConstraints absent from writerFeatures fails.",
+      "note": "$notes.orphan_writer_feature",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7",
+        "metadata": {
+          "configuration": {"delta.constraints.id_positive": "id > 0"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 3,
+      "name": "check_constraints_empty_commit_3_7_no_feature_listed_with_constraint_fails",
+      "flavor": "orphan",
+      "feature": "checkConstraints",
+      "description": "Committing to a (3,7) table with a delta.constraints.* property but checkConstraints absent from writerFeatures fails.",
+      "note": "$notes.orphan_writer_feature",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.constraints.id_positive": "id > 0"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 4,
+      "name": "check_constraints_create_table_1_3_with_constraint",
+      "flavor": "legacy",
+      "feature": "checkConstraints",
+      "description": "Creating a (1,3) table with a delta.constraints.* property succeeds: checkConstraints are always supported at writer version 3.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_3",
+        "metadata": {
+          "configuration": {"delta.constraints.id_positive": "id > 0"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "check_constraints_read_snapshot_3_7_no_feature_listed_with_constraint",
+      "flavor": "orphan",
+      "feature": "checkConstraints",
+      "description": "Reading a (3,7) table with a delta.constraints.* property but checkConstraints absent from writerFeatures succeeds; checkConstraints is writer-only.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.constraints.id_positive": "id > 0"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "check_constraints_supported_not_active_empty_commit_succeeds",
+      "flavor": "supported_not_active",
+      "feature": "checkConstraints",
+      "description": "Committing to a (3,7)+[checkConstraints] table without any delta.constraints.* property succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_check_constraints"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "check_constraints_supported_active_empty_commit_succeeds",
+      "feature": "checkConstraints",
+      "description": "Committing to a (3,7)+[checkConstraints] table with a delta.constraints.* property succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_check_constraints"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.constraints.id_positive": "id > 0"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 8,
+      "name": "check_constraints_empty_commit_1_3_with_constraint_succeeds",
+      "flavor": "legacy",
+      "feature": "checkConstraints",
+      "description": "Committing to a (1,3) table with a delta.constraints.* property succeeds: checkConstraints are always supported at writer version 3.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_3"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.constraints.id_positive": "id > 0"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 9,
+      "name": "check_constraints_create_table_3_7_nonexistent_column_fails",
+      "feature": "checkConstraints",
+      "description": "Creating a (3,7)+[checkConstraints] table with a constraint expression referencing a column not in the schema fails.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_check_constraints",
+        "metadata": {
+          "configuration": {"delta.constraints.bad": "nonexistent_col > 0"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 10,
+      "name": "check_constraints_create_table_3_7_multiple_constraints_succeeds",
+      "feature": "checkConstraints",
+      "description": "Creating a (3,7)+[checkConstraints] table with multiple delta.constraints.* properties succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_check_constraints",
+        "metadata": {
+          "configuration": {
+            "delta.constraints.id_positive": "id > 0",
+            "delta.constraints.id_lt_100": "id < 100"
+          },
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 11,
+      "name": "check_constraints_cm_create_table_3_7_both_features_listed_succeeds",
+      "feature": "checkConstraints",
+      "description": "Creating a (3,7)+[columnMapping,checkConstraints] table with a CM-annotated column and a constraint referencing the logical column name succeeds.",
+      "note": "$errata.sql_expression_cm_name_resolution",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_cm_check_constraints",
+        "metadata": {
+          "schemaString": "$schemas.cm_simple_int",
+          "configuration": {
+            "delta.columnMapping.mode": "id",
+            "delta.columnMapping.maxColumnId": "1",
+            "delta.constraints.id_positive": "id > 0"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "check_constraints_cm_empty_commit_3_7_both_features_listed_succeeds",
+      "feature": "checkConstraints",
+      "description": "Committing to a (3,7)+[columnMapping,checkConstraints] table with a CM-annotated column and a constraint referencing the logical column name succeeds.",
+      "note": "$errata.sql_expression_cm_name_resolution",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_cm_check_constraints"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.cm_simple_int",
+              "configuration": {
+                "delta.columnMapping.mode": "id",
+                "delta.columnMapping.maxColumnId": "1",
+                "delta.constraints.id_positive": "id > 0"
+              }
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 13,
+      "name": "check_constraints_create_table_3_7_feature_listed_succeeds",
+      "feature": "checkConstraints",
+      "description": "Creating a (3,7)+[checkConstraints] table with a delta.constraints.* property succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_check_constraints",
+        "metadata": {
+          "configuration": {"delta.constraints.id_positive": "id > 0"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 14,
+      "name": "check_constraints_read_snapshot_1_3_with_constraint_succeeds",
+      "flavor": "legacy",
+      "feature": "checkConstraints",
+      "description": "Reading a (1,3) table with a delta.constraints.* property succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_3"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.constraints.id_positive": "id > 0"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 15,
+      "name": "check_constraints_read_snapshot_3_7_feature_listed_succeeds",
+      "feature": "checkConstraints",
+      "description": "Reading a (3,7)+[checkConstraints] table with a delta.constraints.* property succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_check_constraints"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.constraints.id_positive": "id > 0"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 16,
+      "name": "check_constraints_supported_not_active_read_snapshot_succeeds",
+      "flavor": "supported_not_active",
+      "feature": "checkConstraints",
+      "description": "Reading a (3,7)+[checkConstraints] table without any delta.constraints.* property succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_check_constraints"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    }
+  ]
+}

@@ -1,0 +1,331 @@
+{
+  "$schemas": {
+    "identity_col": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "long",
+          "nullable": true,
+          "metadata": {
+            "delta.identity.start": 1,
+            "delta.identity.step": 1,
+            "delta.identity.highWaterMark": 0,
+            "delta.identity.allowExplicitInsert": false
+          }
+        }
+      ]
+    },
+    "identity_col_step_zero": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "long",
+          "nullable": true,
+          "metadata": {
+            "delta.identity.start": 1,
+            "delta.identity.step": 0,
+            "delta.identity.highWaterMark": 0,
+            "delta.identity.allowExplicitInsert": false
+          }
+        }
+      ]
+    },
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    },
+    "identity_col_explicit_insert": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "long",
+          "nullable": true,
+          "metadata": {
+            "delta.identity.start": 1,
+            "delta.identity.step": 1,
+            "delta.identity.highWaterMark": 0,
+            "delta.identity.allowExplicitInsert": true
+          }
+        }
+      ]
+    },
+    "identity_col_negative_step": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "long",
+          "nullable": true,
+          "metadata": {
+            "delta.identity.start": -1,
+            "delta.identity.step": -1,
+            "delta.identity.highWaterMark": 0,
+            "delta.identity.allowExplicitInsert": false
+          }
+        }
+      ]
+    },
+    "cm_identity_col": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "long",
+          "nullable": true,
+          "metadata": {
+            "delta.columnMapping.id": 1,
+            "delta.columnMapping.physicalName": "col-1",
+            "delta.identity.start": 1,
+            "delta.identity.step": 1,
+            "delta.identity.highWaterMark": 0,
+            "delta.identity.allowExplicitInsert": false
+          }
+        }
+      ]
+    }
+  },
+  "$protocols": {
+    "modern_1_7": {"minReaderVersion": 1, "minWriterVersion": 7, "writerFeatures": []},
+    "identity_1_7": {
+      "minReaderVersion": 1,
+      "minWriterVersion": 7,
+      "writerFeatures": ["identityColumns"]
+    },
+    "modern_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    },
+    "modern_3_7_cm_identity": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["columnMapping"],
+      "writerFeatures": ["columnMapping", "identityColumns"]
+    },
+    "legacy_1_6": {"minReaderVersion": 1, "minWriterVersion": 6}
+  },
+  "$notes": {
+    "identity_columns_activation": "identityColumns is activated by the presence of delta.identity.* metadata keys on a column in the schema. At writerVersion 7, the identityColumns feature must also be listed in writerFeatures. At writerVersion 6, the feature is supported implicitly with no feature flag required.",
+    "identity_columns_high_water_mark": "highWaterMark tracks the highest (or lowest, for negative step) value generated so far. The fixtures use start - step as the uninitialized sentinel (e.g. start=1, step=1 gives highWaterMark=0). This is a common convention; the spec does not define an initialization value."
+  },
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "identity_columns_create_table_1_7_feature_listed_with_identity_schema_succeeds",
+      "feature": "identityColumns",
+      "description": "Creating a (1,7)+[identityColumns] table with a column carrying delta.identity.* metadata succeeds.",
+      "note": "$notes.identity_columns_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.identity_1_7",
+        "metadata": {"schemaString": "$schemas.identity_col"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "identity_columns_create_table_1_7_no_feature_listed_with_identity_schema_succeeds",
+      "feature": "identityColumns",
+      "flavor": "orphan",
+      "description": "Creating a (1,7) table with identity column metadata in the schema but without identityColumns in writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_1_7",
+        "metadata": {"schemaString": "$schemas.identity_col"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 3,
+      "name": "identity_columns_read_snapshot_1_7_feature_listed_with_identity_schema_succeeds",
+      "feature": "identityColumns",
+      "description": "Reading a (1,7)+[identityColumns] table with an identity column schema succeeds; identityColumns is writer-only and readers are not required to validate or generate identity values.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.identity_1_7"},
+          {"metaData": {"schemaString": "$schemas.identity_col"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 4,
+      "name": "identity_columns_empty_commit_1_7_feature_listed_with_identity_schema_succeeds",
+      "feature": "identityColumns",
+      "description": "Appending (empty commit) to a (1,7)+[identityColumns] table with an identity column schema succeeds; the empty commit does not generate any identity values.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.identity_1_7"},
+          {"metaData": {"schemaString": "$schemas.identity_col"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "identity_columns_create_table_1_6_with_identity_schema_succeeds",
+      "feature": "identityColumns",
+      "flavor": "legacy",
+      "description": "Creating a (1,6) table with a column carrying delta.identity.* metadata succeeds; writer version 6 provides implicit identity column support without a writerFeatures flag.",
+      "note": "$notes.identity_columns_activation",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_6",
+        "metadata": {"schemaString": "$schemas.identity_col"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "identity_columns_read_snapshot_1_6_with_identity_schema_succeeds",
+      "feature": "identityColumns",
+      "flavor": "legacy",
+      "description": "Reading a (1,6) table with an identity column schema succeeds; identityColumns is writer-only.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_6"},
+          {"metaData": {"schemaString": "$schemas.identity_col"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "identity_columns_empty_commit_1_6_with_identity_schema_succeeds",
+      "feature": "identityColumns",
+      "flavor": "legacy",
+      "description": "Appending (empty commit) to a (1,6) table with an identity column schema succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_6"},
+          {"metaData": {"schemaString": "$schemas.identity_col"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 8,
+      "name": "identity_columns_create_table_1_7_step_zero_fails",
+      "feature": "identityColumns",
+      "description": "Creating a (1,7)+[identityColumns] table with a column where delta.identity.step=0 fails; the spec explicitly prohibits a zero step value.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.identity_1_7",
+        "metadata": {"schemaString": "$schemas.identity_col_step_zero"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 9,
+      "name": "identity_columns_create_table_1_7_negative_step_succeeds",
+      "feature": "identityColumns",
+      "description": "Creating a (1,7)+[identityColumns] table with a column where delta.identity.step=-1 succeeds; negative step is valid and generates a descending sequence.",
+      "note": "$notes.identity_columns_high_water_mark",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.identity_1_7",
+        "metadata": {"schemaString": "$schemas.identity_col_negative_step"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 10,
+      "name": "identity_columns_create_table_1_7_allow_explicit_insert_succeeds",
+      "feature": "identityColumns",
+      "description": "Creating a (1,7)+[identityColumns] table with a column where delta.identity.allowExplicitInsert=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.identity_1_7",
+        "metadata": {"schemaString": "$schemas.identity_col_explicit_insert"}
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 11,
+      "name": "identity_columns_cm_create_table_3_7_succeeds",
+      "feature": "identityColumns",
+      "description": "Creating a (3,7)+[columnMapping,identityColumns] table with a CM-annotated identity column succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_cm_identity",
+        "metadata": {
+          "schemaString": "$schemas.cm_identity_col",
+          "configuration": {
+            "delta.columnMapping.mode": "id",
+            "delta.columnMapping.maxColumnId": "1"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "identity_columns_read_snapshot_3_7_no_feature_listed_with_schema_succeeds",
+      "feature": "identityColumns",
+      "flavor": "orphan",
+      "description": "Reading a (3,7) table with delta.identity.* metadata in the schema but identityColumns absent from writerFeatures succeeds; identityColumns is writer-only.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {"metaData": {"schemaString": "$schemas.identity_col"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 13,
+      "name": "identity_columns_supported_not_active_empty_commit_succeeds",
+      "feature": "identityColumns",
+      "flavor": "supported_not_active",
+      "description": "Appending to a (1,7)+[identityColumns] table with no identity column in the schema succeeds; with no delta.identity.* metadata on any field, no identity enforcement is required.",
+      "note": "$notes.identity_columns_activation",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.identity_1_7"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 14,
+      "name": "identity_columns_create_table_3_7_no_feature_listed_with_identity_schema_fails",
+      "feature": "identityColumns",
+      "flavor": "orphan",
+      "description": "Creating a (3,7) table with delta.identity.* metadata in the schema but identityColumns absent from writerFeatures fails.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7",
+        "metadata": {"schemaString": "$schemas.identity_col"}
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 15,
+      "name": "identity_columns_empty_commit_3_7_no_feature_listed_with_identity_schema_fails",
+      "feature": "identityColumns",
+      "flavor": "orphan",
+      "description": "Appending to a (3,7) table with delta.identity.* metadata in the schema but identityColumns absent from writerFeatures fails.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {"metaData": {"schemaString": "$schemas.identity_col"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "failure"
+    }
+  ]
+}

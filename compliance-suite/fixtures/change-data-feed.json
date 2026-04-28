@@ -1,0 +1,335 @@
+{
+  "$schemas": {
+    "cm_simple_int": {
+      "type": "struct",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": true,
+          "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "col-1"}
+        }
+      ]
+    },
+    "simple_int": {
+      "type": "struct",
+      "fields": [{"name": "id", "type": "integer", "nullable": true, "metadata": {}}]
+    }
+  },
+  "$protocols": {
+    "legacy_1_4": {"minReaderVersion": 1, "minWriterVersion": 4},
+    "legacy_1_3": {"minReaderVersion": 1, "minWriterVersion": 3},
+    "modern_3_7_cdf_cm": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["columnMapping"],
+      "writerFeatures": ["columnMapping", "changeDataFeed"]
+    },
+    "modern_3_7_cdf_dv": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": ["deletionVectors"],
+      "writerFeatures": ["deletionVectors", "changeDataFeed"]
+    },
+    "modern_3_7_change_data_feed": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["changeDataFeed"]
+    },
+    "modern_3_7": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": []
+    },
+    "modern_3_7_cdf_append_only": {
+      "minReaderVersion": 3,
+      "minWriterVersion": 7,
+      "readerFeatures": [],
+      "writerFeatures": ["appendOnly", "changeDataFeed"]
+    }
+  },
+  "$notes": {},
+  "cases": [
+    {
+      "ordinal": 1,
+      "name": "change_data_feed_create_table_1_4_with_property",
+      "flavor": "legacy",
+      "feature": "changeDataFeed",
+      "description": "Creating a (1,4) table with delta.enableChangeDataFeed=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_4",
+        "metadata": {
+          "configuration": {"delta.enableChangeDataFeed": "true"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 2,
+      "name": "change_data_feed_create_table_1_3_fails",
+      "flavor": "insufficient_protocol",
+      "feature": "changeDataFeed",
+      "description": "Creating a (1,3) table with delta.enableChangeDataFeed=true fails; changeDataFeed requires minWriterVersion>=4.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.legacy_1_3",
+        "metadata": {
+          "configuration": {"delta.enableChangeDataFeed": "true"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "failure"
+    },
+    {
+      "ordinal": 3,
+      "name": "change_data_feed_read_snapshot_1_4_with_property_succeeds",
+      "flavor": "legacy",
+      "feature": "changeDataFeed",
+      "description": "Reading a (1,4) table with delta.enableChangeDataFeed=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_4"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableChangeDataFeed": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 4,
+      "name": "change_data_feed_empty_commit_1_4_with_property",
+      "flavor": "legacy",
+      "feature": "changeDataFeed",
+      "description": "Committing to a (1,4) table with delta.enableChangeDataFeed=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.legacy_1_4"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableChangeDataFeed": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 5,
+      "name": "change_data_feed_create_table_3_7_no_feature_listed_with_property_succeeds",
+      "flavor": "orphan",
+      "feature": "changeDataFeed",
+      "description": "Creating a (3,7) table with delta.enableChangeDataFeed=true but changeDataFeed absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7",
+        "metadata": {
+          "configuration": {"delta.enableChangeDataFeed": "true"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 6,
+      "name": "change_data_feed_empty_commit_3_7_no_feature_listed_with_property_succeeds",
+      "flavor": "orphan",
+      "feature": "changeDataFeed",
+      "description": "Committing to a (3,7) table with delta.enableChangeDataFeed=true but changeDataFeed absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableChangeDataFeed": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 7,
+      "name": "change_data_feed_read_snapshot_3_7_no_feature_listed_with_property",
+      "flavor": "orphan",
+      "feature": "changeDataFeed",
+      "description": "Reading a (3,7) table with delta.enableChangeDataFeed=true but changeDataFeed absent from writerFeatures succeeds.",
+      "note": "$errata.orphan_feature_metadata",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableChangeDataFeed": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 8,
+      "name": "change_data_feed_create_table_3_7_feature_listed_succeeds",
+      "feature": "changeDataFeed",
+      "description": "Creating a (3,7)+[changeDataFeed] table with delta.enableChangeDataFeed=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_change_data_feed",
+        "metadata": {
+          "configuration": {"delta.enableChangeDataFeed": "true"},
+          "schemaString": "$schemas.simple_int"
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 9,
+      "name": "change_data_feed_supported_not_active_empty_commit_succeeds",
+      "flavor": "supported_not_active",
+      "feature": "changeDataFeed",
+      "description": "Committing to a (3,7)+[changeDataFeed] table without delta.enableChangeDataFeed=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_change_data_feed"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 10,
+      "name": "change_data_feed_supported_not_active_read_snapshot_succeeds",
+      "flavor": "supported_not_active",
+      "feature": "changeDataFeed",
+      "description": "Reading a (3,7)+[changeDataFeed] table without delta.enableChangeDataFeed=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_change_data_feed"},
+          {"metaData": {"schemaString": "$schemas.simple_int"}}
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 11,
+      "name": "change_data_feed_supported_active_empty_commit_succeeds",
+      "feature": "changeDataFeed",
+      "description": "Committing to a (3,7)+[changeDataFeed] table with delta.enableChangeDataFeed=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_change_data_feed"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableChangeDataFeed": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "empty_commit"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 12,
+      "name": "change_data_feed_supported_active_read_snapshot_succeeds",
+      "feature": "changeDataFeed",
+      "description": "Reading a (3,7)+[changeDataFeed] table with delta.enableChangeDataFeed=true succeeds.",
+      "setup": {
+        "log_actions": [
+          {"protocol": "$protocols.modern_3_7_change_data_feed"},
+          {
+            "metaData": {
+              "schemaString": "$schemas.simple_int",
+              "configuration": {"delta.enableChangeDataFeed": "true"}
+            }
+          }
+        ]
+      },
+      "operation": {"type": "read_snapshot"},
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 13,
+      "name": "change_data_feed_cm_create_table_3_7_succeeds",
+      "feature": "changeDataFeed",
+      "description": "Creating a (3,7)+[columnMapping,changeDataFeed] table with delta.enableChangeDataFeed=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_cdf_cm",
+        "metadata": {
+          "schemaString": "$schemas.cm_simple_int",
+          "configuration": {
+            "delta.columnMapping.mode": "id",
+            "delta.columnMapping.maxColumnId": "1",
+            "delta.enableChangeDataFeed": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 14,
+      "name": "change_data_feed_dv_create_table_3_7_succeeds",
+      "feature": "changeDataFeed",
+      "description": "Creating a (3,7)+[deletionVectors,changeDataFeed] table with both features active succeeds; the spec imposes no mutual exclusion between CDF and deletion vectors.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_cdf_dv",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {
+            "delta.enableDeletionVectors": "true",
+            "delta.enableChangeDataFeed": "true"
+          }
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 15,
+      "name": "change_data_feed_append_only_create_table_3_7_succeeds",
+      "feature": "changeDataFeed",
+      "description": "Creating a (3,7)+[appendOnly,changeDataFeed] table with both delta.appendOnly=true and delta.enableChangeDataFeed=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_cdf_append_only",
+        "metadata": {
+          "schemaString": "$schemas.simple_int",
+          "configuration": {"delta.appendOnly": "true", "delta.enableChangeDataFeed": "true"}
+        }
+      },
+      "expected_outcome": "success"
+    },
+    {
+      "ordinal": 16,
+      "name": "change_data_feed_supported_not_active_create_table_succeeds",
+      "feature": "changeDataFeed",
+      "flavor": "supported_not_active",
+      "description": "Creating a (3,7)+[changeDataFeed] table without delta.enableChangeDataFeed=true succeeds.",
+      "operation": {
+        "type": "create_table",
+        "protocol": "$protocols.modern_3_7_change_data_feed",
+        "metadata": {"schemaString": "$schemas.simple_int"}
+      },
+      "expected_outcome": "success"
+    }
+  ]
+}
