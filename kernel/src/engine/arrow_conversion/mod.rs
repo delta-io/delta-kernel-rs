@@ -379,6 +379,9 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     // GeoArrow extension metadata (the `crs` / `edges` keys), not on the
                     // ArrowDataType itself. Attaching that metadata is deferred to the
                     // StructField -> ArrowField conversion path.
+                    // Geometry/Geography are WKB-encoded bytes.
+                    // The SRID (and edge algorithm for Geometry) belongs on the ArrowField
+                    // as GeoArrow extension metadata
                     PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
                         Ok(ArrowDataType::Binary)
                     }

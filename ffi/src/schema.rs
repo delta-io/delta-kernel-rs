@@ -355,6 +355,8 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             // produce meaningless results. Tables with geo columns should not be consumed
             // through this FFI until dedicated visit_geometry / visit_geography callbacks
             // carrying the SRID are added.
+            // Geometry/Geography are WKB-encoded bytes at the FFI layer
+            // TODO: Add visit_geometry / visit_geography callbacks carrying the SRID once real FFI geo support lands
             DataType::Primitive(PrimitiveType::Geometry(_))
             | DataType::Primitive(PrimitiveType::Geography(_)) => call!(visit_binary),
         }
