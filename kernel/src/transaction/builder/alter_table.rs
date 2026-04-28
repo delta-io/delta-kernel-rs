@@ -118,6 +118,26 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
         self.transition()
     }
 
+    /// Drop a column from the table schema. Supports nested columns via [`ColumnName`] paths
+    /// (e.g. `column_name!("address.city")`).
+    ///
+    /// Requires column mapping to be enabled (mode = name or id). The column is removed from the
+    /// logical schema but physical data in existing Parquet files is untouched.
+    ///
+    /// # Errors (at build time)
+    ///
+    /// - Column does not exist in the current schema
+    /// - Column mapping is not enabled on the table
+    /// - Column is a partition column or clustering column
+    /// - Column is the last remaining field at its struct level (would produce an empty struct)
+    /// - Column is an ancestor struct of a clustering column
+    /// - An intermediate component of the path is not a struct (e.g. `name.inner` where `name` is a
+    ///   primitive)
+    pub fn drop_column(mut self, column: ColumnName) -> AlterTableTransactionBuilder<Modifying> {
+        self.operations.push(SchemaOperation::DropColumn { column });
+        self.transition()
+    }
+
     /// Change a column's nullability from NOT NULL to nullable. If the column is already
     /// nullable, the op is a no-op but still generates a commit.
     ///
@@ -147,7 +167,7 @@ impl AlterTableTransactionBuilder<Modifying> {
     ///   `timestampNtz` column without the `timestampNtz` feature)
     pub fn build(
         self,
-        _engine: &dyn Engine,
+        engine: &dyn Engine,
         committer: Box<dyn Committer>,
     ) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
@@ -160,6 +180,8 @@ impl AlterTableTransactionBuilder<Modifying> {
         let schema = Arc::unwrap_or_clone(table_config.logical_schema());
         let column_mapping_mode = table_config.column_mapping_mode();
         let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
+        let partition_columns = table_config.partition_columns();
+        let clustering_columns = self.snapshot.get_logical_clustering_columns(engine)?;
         let SchemaEvolutionResult {
             schema: evolved_schema,
             new_max_column_id,
@@ -168,6 +190,8 @@ impl AlterTableTransactionBuilder<Modifying> {
             self.operations,
             column_mapping_mode,
             current_max_column_id,
+            partition_columns,
+            clustering_columns.as_deref().unwrap_or(&[]),
         )?;
 
         let mut evolved_metadata = table_config

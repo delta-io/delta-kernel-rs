@@ -117,6 +117,38 @@ impl ColumnName {
             None
         }
     }
+
+    /// Returns `true` if this column name is a case-insensitive prefix of `other`. Equal paths
+    /// return `true` (a name is a prefix of itself), and an empty path is a prefix of every path.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use delta_kernel::expressions::ColumnName;
+    /// let ancestor = ColumnName::new(["user", "address"]);
+    /// let nested = ColumnName::new(["user", "address", "city"]);
+    /// assert!(ancestor.is_prefix_of(&nested));
+    /// assert!(nested.is_prefix_of(&nested));
+    /// assert!(!nested.is_prefix_of(&ancestor));
+    ///
+    /// // Case-insensitive.
+    /// let upper = ColumnName::new(["USER", "ADDRESS"]);
+    /// assert!(upper.is_prefix_of(&nested));
+    ///
+    /// // Empty path is a prefix of everything (including itself).
+    /// let empty = ColumnName::new(Vec::<String>::new());
+    /// assert!(empty.is_prefix_of(&nested));
+    /// assert!(empty.is_prefix_of(&empty));
+    /// assert!(!nested.is_prefix_of(&empty));
+    /// ```
+    pub fn is_prefix_of(&self, other: &ColumnName) -> bool {
+        self.path.len() <= other.path.len()
+            && self
+                .path
+                .iter()
+                .zip(other.path.iter())
+                .all(|(a, b)| a.to_lowercase() == b.to_lowercase())
+    }
 }
 
 /// Creates a new column name from a path of field names. Each field name is taken as-is, and may
@@ -571,6 +603,27 @@ mod test {
 
         let single = ColumnName::new(["field"]);
         assert_eq!(single.parent(), None);
+    }
+
+    #[test]
+    fn test_is_prefix_of_edge_cases() {
+        let empty = ColumnName::empty();
+        let single = column_name!("a");
+        let nested = column_name!("a.b.c");
+
+        // Empty path is a prefix of every path, including itself.
+        assert!(empty.is_prefix_of(&single));
+        assert!(empty.is_prefix_of(&nested));
+        assert!(empty.is_prefix_of(&empty));
+
+        // A non-empty path is not a prefix of an empty path.
+        assert!(!single.is_prefix_of(&empty));
+        assert!(!nested.is_prefix_of(&empty));
+
+        // Case-insensitive equal-length match returns true.
+        let upper = column_name!("A.B.C");
+        assert!(upper.is_prefix_of(&nested));
+        assert!(nested.is_prefix_of(&upper));
     }
 
     #[test]
