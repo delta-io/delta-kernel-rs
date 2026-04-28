@@ -91,7 +91,6 @@ pub mod checkpoint;
 pub mod committer;
 // Public under test-utils so integration tests can inspect CRC state via
 // Snapshot::get_current_crc_if_loaded_for_testing.
-pub mod commit_range;
 #[cfg(feature = "test-utils")]
 pub mod crc;
 #[cfg(not(feature = "test-utils"))]

@@ -46,11 +46,12 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::{ADD_NAME, REMOVE_NAME};
-use crate::commit_range::{CommitDataBatch, CommitRange};
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{column_name, ColumnName};
 use crate::log_replay::deduplicator::Deduplicator;
 use crate::log_replay::{FileActionDeduplicator, FileActionKey};
+use crate::log_segment::LogSegment;
+use crate::path::ParsedLogPath;
 use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
@@ -130,32 +131,53 @@ impl IncrementalScanBuilder {
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
-        // List contiguous commits in (base_version, target_version] via CommitRange.
-        // Listing failures (typically log retention removing JSONs that a checkpoint covers)
-        // surface as CommitsUnavailable so the consumer can fall back to a full scan.
+        // List contiguous commits in (base_version, target_version]. Listing failures
+        // (typically log retention removing JSONs that a checkpoint covers) surface as
+        // CommitsUnavailable so the consumer can fall back to a full scan.
         let log_root = self.snapshot.log_segment().log_root.clone();
-        let commit_range =
-            match CommitRange::try_new(engine, log_root, self.base_version + 1, target_version) {
-                Ok(r) => r,
-                Err(_) => return Ok(IncrementalScanResult::CommitsUnavailable),
-            };
+        let log_segment = match LogSegment::for_table_changes(
+            engine.storage_handler().as_ref(),
+            log_root,
+            self.base_version + 1,
+            target_version,
+        ) {
+            Ok(s) => s,
+            Err(_) => return Ok(IncrementalScanResult::CommitsUnavailable),
+        };
 
         // Walk commits newest-first so `FileActionDeduplicator` (first-seen (path, dv) wins)
-        // yields newest-wins semantics across the range.
+        // yields newest-wins semantics across the range. Per-commit reading lets us tag every
+        // emitted batch with its source commit version (currently unused in the output, but
+        // available for future per-commit consumers).
+        let commit_files: Vec<ParsedLogPath> = log_segment
+            .listed
+            .ascending_commit_files
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
+
         let mut seen_file_keys: HashSet<FileActionKey> = HashSet::new();
         let mut surviving_add_paths: HashSet<String> = HashSet::new();
         let mut remove_files: HashSet<String> = HashSet::new();
         let mut add_files: Vec<FilteredEngineData> = Vec::new();
 
-        for batch in commit_range.iter_rev(engine, INCREMENTAL_READ_SCHEMA.clone()) {
-            let CommitDataBatch { data, .. } = batch?;
-            if let Some(filtered) = process_batch(
-                data,
-                &mut seen_file_keys,
-                &mut surviving_add_paths,
-                &mut remove_files,
-            )? {
-                add_files.push(filtered);
+        for commit_file in commit_files {
+            let batches = engine.json_handler().read_json_files(
+                std::slice::from_ref(&commit_file.location),
+                INCREMENTAL_READ_SCHEMA.clone(),
+                None,
+            )?;
+            for batch_res in batches {
+                let batch = batch_res?;
+                if let Some(filtered) = process_batch(
+                    batch,
+                    &mut seen_file_keys,
+                    &mut surviving_add_paths,
+                    &mut remove_files,
+                )? {
+                    add_files.push(filtered);
+                }
             }
         }
 
