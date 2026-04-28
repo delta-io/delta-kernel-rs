@@ -43,23 +43,24 @@ pub(crate) struct LastCheckpointHint {
     #[allow(unreachable_pub)] // used by acceptance tests (TODO make an fn accessor?)
     pub version: Version,
     /// The number of actions that are stored in the checkpoint.
-    pub(crate) size: i64,
+    pub size: i64,
     /// The number of fragments if the last checkpoint was written in multiple parts.
-    pub(crate) parts: Option<usize>,
+    pub parts: Option<usize>,
     /// The number of bytes of the checkpoint.
-    pub(crate) size_in_bytes: Option<i64>,
+    pub size_in_bytes: Option<i64>,
     /// The number of AddFile actions in the checkpoint.
-    pub(crate) num_of_add_files: Option<i64>,
+    pub num_of_add_files: Option<i64>,
     /// The schema of the checkpoint file.
-    pub(crate) checkpoint_schema: Option<SchemaRef>,
+    pub checkpoint_schema: Option<SchemaRef>,
     /// The checksum of the last checkpoint JSON.
-    pub(crate) checksum: Option<String>,
+    pub checksum: Option<String>,
     /// Additional metadata about the last checkpoint.
-    pub(crate) tags: Option<HashMap<String, String>>,
+    pub tags: Option<HashMap<String, String>>,
 }
 
 impl LastCheckpointHint {
-    // Returns the path the last checkpoint file given the log root of a table.
+    /// Returns the path of the `_last_checkpoint` file given the log root of a table.
+    #[internal_api]
     pub(crate) fn path(log_root: &Url) -> DeltaResult<Url> {
         Ok(log_root.join(LAST_CHECKPOINT_FILE_NAME)?)
     }
@@ -72,6 +73,7 @@ impl LastCheckpointHint {
     /// are assumed to cause failure.
     // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
     // level result coming from storage.read_files
+    #[internal_api]
     #[instrument(name = "last_checkpoint.read", skip_all, err)]
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
