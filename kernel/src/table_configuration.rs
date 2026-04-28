@@ -2390,11 +2390,79 @@ mod test {
         }
     }
 
+    // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.
+    #[rstest]
+    #[case::v1_rejects_v2(
+        TableFeature::IcebergCompatV1,
+        TableFeature::IcebergCompatV2,
+        "requires 'icebergCompatV2' to not be enabled"
+    )]
+    #[case::v1_rejects_v3(
+        TableFeature::IcebergCompatV1,
+        TableFeature::IcebergCompatV3,
+        "requires 'icebergCompatV3' to not be enabled"
+    )]
+    #[case::v2_rejects_v1(
+        TableFeature::IcebergCompatV2,
+        TableFeature::IcebergCompatV1,
+        "requires 'icebergCompatV1' to not be enabled"
+    )]
+    #[case::v2_rejects_v3(
+        TableFeature::IcebergCompatV2,
+        TableFeature::IcebergCompatV3,
+        "requires 'icebergCompatV3' to not be enabled"
+    )]
+    #[case::v3_rejects_v1(
+        TableFeature::IcebergCompatV3,
+        TableFeature::IcebergCompatV1,
+        "requires 'icebergCompatV1' to not be enabled"
+    )]
+    #[case::v3_rejects_v2(
+        TableFeature::IcebergCompatV3,
+        TableFeature::IcebergCompatV2,
+        "requires 'icebergCompatV2' to not be enabled"
+    )]
+    fn test_iceberg_compat_mutual_exclusion(
+        #[case] feature_to_enable: TableFeature,
+        #[case] conflicting_feature: TableFeature,
+        #[case] expected_error_substring: &str,
+    ) {
+        // Map each IcebergCompat feature to the table property that enables it.
+        let conflicting_enable_property = match conflicting_feature {
+            TableFeature::IcebergCompatV1 => ENABLE_ICEBERG_COMPAT_V1,
+            TableFeature::IcebergCompatV2 => ENABLE_ICEBERG_COMPAT_V2,
+            TableFeature::IcebergCompatV3 => ENABLE_ICEBERG_COMPAT_V3,
+            ref other => panic!("unexpected feature in iceberg-compat exclusion test: {other:?}"),
+        };
+        // V3 also requires Column mapping and RowTracking enabled; enable them unconditionally so
+        // V3 cases reach the mutual-exclusion check.
+        let config = create_mock_table_config_with_cm(
+            &[
+                (conflicting_enable_property, "true"),
+                (ENABLE_ROW_TRACKING, "true"),
+            ],
+            Some(ColumnMappingMode::Name),
+            &[TableFeature::ColumnMapping],
+            &[
+                feature_to_enable.clone(),
+                conflicting_feature,
+                TableFeature::ColumnMapping,
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+            ],
+        );
+        assert_result_error_with_message(
+            config.validate_feature_requirements(&feature_to_enable),
+            expected_error_substring,
+        );
+    }
+
     /// Test helper: variant of `create_mock_table_config` that also takes an optional
     /// column-mapping mode and requires the caller to provide reader and writer feature lists
     /// explicitly. `name`/`id` modes need a column-mapping-annotated schema (otherwise
     /// `TableConfiguration::try_new` rejects the metadata for missing per-field annotations);
     /// this helper swaps the schema accordingly.
+    // TODO(#2491): Consolidate the `create_*_table_config*` helpers.
     fn create_mock_table_config_with_cm(
         extra_props: &[(&str, &str)],
         cm_mode: Option<ColumnMappingMode>,

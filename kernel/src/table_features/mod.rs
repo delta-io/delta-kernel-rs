@@ -237,7 +237,10 @@ pub(crate) enum FeatureRequirement {
     NotSupported(TableFeature),
     /// Feature must NOT be enabled (may be supported but property must not activate it)
     NotEnabled(TableFeature),
-    /// Custom validation logic
+    /// Custom validation logic. Currently unused, but already integrated into the
+    /// validation pipeline(`TableConfiguration::validate_feature_requirements`), so kept for
+    /// future use.
+    #[allow(dead_code)]
     Custom(fn(&Protocol, &TableProperties) -> DeltaResult<()>),
 }
 
@@ -373,19 +376,9 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
-        FeatureRequirement::Custom(|_protocol, properties| {
-            let mode = properties.column_mapping_mode;
-            if !matches!(
-                mode,
-                Some(ColumnMappingMode::Name) | Some(ColumnMappingMode::Id)
-            ) {
-                return Err(Error::generic(
-                    "IcebergCompatV1 requires Column Mapping in 'name' or 'id' mode",
-                ));
-            }
-            Ok(())
-        }),
         FeatureRequirement::NotSupported(TableFeature::DeletionVectors),
+        FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV2),
+        FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV3),
     ],
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
@@ -406,20 +399,9 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
-        FeatureRequirement::Custom(|_protocol, properties| {
-            let mode = properties.column_mapping_mode;
-            if !matches!(
-                mode,
-                Some(ColumnMappingMode::Name) | Some(ColumnMappingMode::Id)
-            ) {
-                return Err(Error::generic(
-                    "IcebergCompatV2 requires Column Mapping in 'name' or 'id' mode",
-                ));
-            }
-            Ok(())
-        }),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
         FeatureRequirement::NotEnabled(TableFeature::DeletionVectors),
+        FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV3),
     ],
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
