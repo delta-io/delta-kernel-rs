@@ -28,6 +28,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::committer::Committer;
+use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
@@ -110,6 +111,16 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
         self.operations.push(SchemaOperation::AddColumn { field });
+        self.transition()
+    }
+
+    /// Change a column's nullability from NOT NULL to nullable. If the column is already
+    /// nullable, the op is a no-op but still generates a commit.
+    ///
+    /// Note: this matches Spark's behavior.
+    pub fn set_nullable(mut self, column: ColumnName) -> AlterTableTransactionBuilder<Modifying> {
+        self.operations
+            .push(SchemaOperation::SetNullable { column });
         self.transition()
     }
 }

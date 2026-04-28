@@ -7,8 +7,11 @@ use delta_kernel::arrow::array::{Array, Int32Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+use delta_kernel::expressions::{column_name, ColumnName, Scalar};
 use delta_kernel::schema::{ArrayType, DataType, MapType, SchemaRef, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
@@ -295,5 +298,219 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
         .expect("b is int");
     assert_eq!(b_col.value(0), 100);
 
+    Ok(())
+}
+
+// ============================================================================
+// SET NULLABLE tests
+// ============================================================================
+
+/// Cross-product: 3 schema/column cases x 3 CM modes (off, name, id).
+#[rstest]
+#[case::already_nullable(simple_schema(), column_name!("name"))]
+#[case::required_top_level(
+    Arc::new(StructType::try_new(vec![
+        StructField::not_null("id", DataType::INTEGER),
+        StructField::nullable("name", DataType::STRING),
+    ]).unwrap()),
+    column_name!("id")
+)]
+#[case::required_nested(
+    Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "address",
+            StructType::try_new(vec![
+                StructField::not_null("city", DataType::STRING),
+                StructField::nullable("zip", DataType::STRING),
+            ]).unwrap(),
+        ),
+    ]).unwrap()),
+    column_name!("address.city")
+)]
+#[tokio::test]
+async fn set_nullable_succeeds(
+    #[case] schema: SchemaRef,
+    #[case] column: ColumnName,
+    #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let properties: Vec<(&str, &str)> = cm_mode
+        .map(|m| vec![("delta.columnMapping.mode", m)])
+        .unwrap_or_default();
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &properties)?;
+    // Snapshot the field before the alter so we can prove set_nullable changes only the
+    // nullable bit -- preserving name, data type, and ALL metadata (including column-mapping
+    // id and physical name when CM is enabled).
+    let before = snapshot.schema().field_at_path(column.path()).clone();
+
+    snapshot
+        .alter_table()
+        .set_nullable(column.clone())
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    let reloaded_schema = reloaded.schema();
+    let after = reloaded_schema.field_at_path(column.path());
+    assert!(after.is_nullable());
+    assert_eq!(after.name(), before.name());
+    assert_eq!(after.data_type(), before.data_type());
+    assert_eq!(
+        after.metadata(),
+        before.metadata(),
+        "field metadata (incl. column mapping id/physical name) must be preserved"
+    );
+    Ok(())
+}
+
+/// End-to-end: create a table with a non-null layout column (partition or clustering),
+/// write a row, flip the layout column to nullable, checkpoint, reload from scratch, scan.
+/// Cross-product: layout kind (partitioned, clustered) x column-mapping mode (off, name, id).
+#[rstest]
+#[case::partition("date", DataLayout::partitioned(["date"]), "2026-01-01")]
+#[case::clustered("region", DataLayout::clustered(["region"]), "us")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_nullable_on_layout_column_with_checkpoint(
+    #[case] col_name: &str,
+    #[case] layout: DataLayout,
+    #[case] col_value: &str,
+    #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    // Partition values live in the directory path; clustering values live in the row batch.
+    let is_partitioned = matches!(layout, DataLayout::Partitioned { .. });
+
+    // v0: create the table with the layout column as non-null.
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::not_null(col_name, DataType::STRING),
+    ])?);
+    let properties: Vec<(&str, &str)> = cm_mode
+        .map(|m| vec![("delta.columnMapping.mode", m)])
+        .unwrap_or_default();
+    create_table(&table_path, schema.clone(), "Test/1.0")
+        .with_data_layout(layout)
+        .with_table_properties(properties)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let v0 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(!v0.schema().field(col_name).unwrap().is_nullable());
+
+    // v1: write a single row.
+    let v0_arc = Arc::new(v0);
+    let v1 = if is_partitioned {
+        // Partition cols are excluded from the row batch and passed via partition_values.
+        let nonpartition_arrow_schema: delta_kernel::arrow::datatypes::SchemaRef =
+            Arc::new(delta_kernel::arrow::datatypes::Schema::new(vec![
+                delta_kernel::arrow::datatypes::Field::new(
+                    "id",
+                    delta_kernel::arrow::datatypes::DataType::Int32,
+                    true,
+                ),
+            ]));
+        let batch = RecordBatch::try_new(
+            nonpartition_arrow_schema,
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )?;
+        let mut partition_values = HashMap::new();
+        partition_values.insert(col_name.to_string(), Scalar::String(col_value.to_string()));
+        write_batch_to_table(&v0_arc, engine.as_ref(), batch, partition_values).await?
+    } else {
+        // Clustering cols are regular columns; partition_values is empty.
+        let arrow_schema: delta_kernel::arrow::datatypes::SchemaRef =
+            Arc::new(schema.as_ref().try_into_arrow().unwrap());
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![col_value])),
+            ],
+        )?;
+        write_batch_to_table(&v0_arc, engine.as_ref(), batch, HashMap::new()).await?
+    };
+
+    // v2: ALTER TABLE -- set the layout column nullable.
+    let v2 = v1
+        .alter_table()
+        .set_nullable(ColumnName::new([col_name]))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let v2_snap = v2
+        .post_commit_snapshot()
+        .expect("post-commit snapshot at v2");
+    assert!(v2_snap.schema().field(col_name).unwrap().is_nullable());
+
+    // Checkpoint at v2 so reload exercises the checkpoint path.
+    v2_snap.clone().checkpoint(engine.as_ref())?;
+
+    // Reload from scratch and verify the schema and row survive.
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(reloaded.version(), 2);
+    assert!(reloaded.schema().field(col_name).unwrap().is_nullable());
+
+    let scan = reloaded.scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1);
+    let col = batches[0]
+        .column_by_name(col_name)
+        .expect("layout column")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("layout column is string");
+    assert_eq!(col.value(0), col_value);
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_nullable_nonexistent_column_fails() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    let err = snapshot
+        .alter_table()
+        .set_nullable(column_name!("nonexistent"))
+        .build(engine.as_ref(), committer());
+    assert!(err.is_err());
+    assert!(err.unwrap_err().to_string().contains("does not exist"));
+
+    Ok(())
+}
+
+/// Alternating chain: ADD COLUMN, SET NULLABLE, ADD COLUMN, SET NULLABLE. Verifies that
+/// chaining mixed ops applies them in order and produces the expected final schema. Each
+/// SET NULLABLE flips a still-NOT-NULL column from the original schema.
+#[tokio::test]
+async fn chain_add_column_and_set_nullable() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::not_null("id", DataType::INTEGER),
+        StructField::not_null("name", DataType::STRING),
+    ])?);
+    let snapshot = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
+
+    snapshot
+        .alter_table()
+        .add_column(StructField::nullable("email", DataType::STRING))
+        .set_nullable(column_name!("id"))
+        .add_column(StructField::nullable("age", DataType::INTEGER))
+        .set_nullable(column_name!("name"))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    assert_eq!(schema.fields().count(), 4);
+    for name in ["id", "name", "email", "age"] {
+        let field = schema.field(name).expect("field should be present");
+        assert!(field.is_nullable(), "field '{name}' should be nullable");
+    }
     Ok(())
 }
