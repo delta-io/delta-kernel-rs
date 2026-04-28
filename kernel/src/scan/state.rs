@@ -48,6 +48,21 @@ impl DvInfo {
         self.deletion_vector.is_some()
     }
 
+    /// Number of rows logically removed by this Deletion Vector. Lets engines plan or report
+    /// deleted-row counts without reading the DV bytes.
+    ///
+    /// Returns `None` exactly when [`Self::has_vector`] returns `false`; per the protocol,
+    /// cardinality is always present alongside a DV descriptor.
+    ///
+    /// The value is taken verbatim from the descriptor's `cardinality` field as written by the
+    /// producing writer; kernel does not reconcile it against the physical DV bytes. Combining
+    /// this with [`Stats::num_records`] to compute the logical row count
+    /// (`num_records - cardinality`) is only sound when the file's stats are tight against the
+    /// data file.
+    pub fn cardinality(&self) -> Option<i64> {
+        self.deletion_vector.as_ref().map(|dv| dv.cardinality)
+    }
+
     pub(crate) fn get_treemap(
         &self,
         engine: &dyn Engine,
@@ -230,6 +245,7 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::actions::get_commit_schema;
     use crate::scan::state::ScanFile;
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
@@ -253,7 +269,8 @@ mod tests {
             Some(&"2017-12-10".to_string())
         );
         assert_eq!(scan_file.partition_values.get("non-existent"), None);
-        assert!(scan_file.dv_info.deletion_vector.is_some());
+        assert!(scan_file.dv_info.has_vector());
+        assert_eq!(scan_file.dv_info.cardinality(), Some(2));
         let dv = scan_file.dv_info.deletion_vector.unwrap();
         assert_eq!(dv.unique_id(), "uvBn[lx{q8@P<9BNH/isA@1");
         assert!(scan_file.transform.is_none());
@@ -271,5 +288,36 @@ mod tests {
             context,
             validate_visit,
         );
+    }
+
+    #[test]
+    fn dv_info_cardinality_none_when_no_descriptor() {
+        let dv_info = super::DvInfo::default();
+        assert!(!dv_info.has_vector());
+        assert_eq!(dv_info.cardinality(), None);
+    }
+
+    #[test]
+    fn dv_info_cardinality_returns_descriptor_field() {
+        // Cardinality of zero is legal per spec and must round-trip as Some(0), not None.
+        let zero: super::DvInfo = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::Inline,
+            path_or_inline_dv: String::new(),
+            offset: None,
+            size_in_bytes: 0,
+            cardinality: 0,
+        }
+        .into();
+        assert_eq!(zero.cardinality(), Some(0));
+
+        let typical: super::DvInfo = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::Inline,
+            path_or_inline_dv: String::new(),
+            offset: None,
+            size_in_bytes: 0,
+            cardinality: i64::MAX,
+        }
+        .into();
+        assert_eq!(typical.cardinality(), Some(i64::MAX));
     }
 }

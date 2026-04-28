@@ -78,6 +78,7 @@ void scan_row_callback(
   KernelBoolSlice selection_vector;
 
   if (cdv_info->has_vector) {
+    print_diag("  Deletion vector cardinality: %" PRId64 "\n", cdv_info->cardinality);
     ExternResultKernelBoolSlice selection_vector_res =
       selection_vector_from_dv(cdv_info->info, context->engine, table_root_slice);
     if (selection_vector_res.tag != OkKernelBoolSlice) {
