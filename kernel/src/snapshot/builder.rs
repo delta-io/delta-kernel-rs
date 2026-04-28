@@ -445,6 +445,9 @@ mod tests {
     }
 
     fn measuring_reporter() -> (Arc<CapturingReporter>, tracing::subscriber::DefaultGuard) {
+        // Install a real global default before the per-test thread-local subscriber. See
+        // `test_utils::ensure_metrics_compatible_global_subscriber` for the rationale.
+        test_utils::ensure_metrics_compatible_global_subscriber();
         let reporter = Arc::new(CapturingReporter::default());
         let guard = tracing_subscriber::registry()
             .with_metrics_reporter_layer(reporter.clone())

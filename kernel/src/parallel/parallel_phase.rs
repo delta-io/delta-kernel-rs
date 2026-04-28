@@ -951,6 +951,9 @@ mod tests {
     /// `ScanMetadataCompleted` event with `ScanType::SequentialPhase` when `finish()` is called.
     #[test]
     fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> DeltaResult<()> {
+        // Install a real global default before the per-test thread-local subscriber. See
+        // `test_utils::ensure_metrics_compatible_global_subscriber` for the rationale.
+        test_utils::ensure_metrics_compatible_global_subscriber();
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = tracing_subscriber::registry()
             .with_metrics_reporter_layer(reporter.clone())
@@ -990,6 +993,9 @@ mod tests {
     /// events so callers can correlate them.
     #[test]
     fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> DeltaResult<()> {
+        // Install a real global default before the per-test thread-local subscriber. See
+        // `test_utils::ensure_metrics_compatible_global_subscriber` for the rationale.
+        test_utils::ensure_metrics_compatible_global_subscriber();
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = tracing_subscriber::registry()
             .with_metrics_reporter_layer(reporter.clone())

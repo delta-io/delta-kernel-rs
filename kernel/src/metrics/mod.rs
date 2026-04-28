@@ -103,6 +103,24 @@ pub trait WithMetricsReporterLayer: Subscriber + for<'lookup> LookupSpan<'lookup
     ///         Arc::new(LoggingMetricsReporter::new(tracing::Level::INFO))
     ///     );
     /// ```
+    ///
+    /// # Important: thread-local `set_default` and the callsite interest cache
+    ///
+    /// If you install the resulting subscriber via thread-local
+    /// [`tracing::dispatcher::set_default`] (or
+    /// [`tracing_subscriber::util::SubscriberInitExt::set_default`]), call
+    /// [`tracing::callsite::rebuild_interest_cache`] immediately afterwards. Several
+    /// kernel metrics are emitted from `Drop` impls (notably storage list/read completion
+    /// in the default engine), and those `Drop` sites can run on threads that have no
+    /// subscriber installed -- for example tokio worker threads owned by the
+    /// `DefaultEngine`'s background runtime. If a no-subscriber thread is the first to
+    /// hit such a callsite, tracing caches its `Interest` as `never` process-globally,
+    /// silently disabling that metric for the rest of the process. The rebuild call
+    /// re-evaluates every callsite against all currently installed dispatchers and
+    /// unsticks the cache. [`tracing::dispatcher::set_global_default`] does this rebuild
+    /// automatically and so does not need the manual call.
+    ///
+    /// [`tracing_subscriber::util::SubscriberInitExt::set_default`]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/util/trait.SubscriberInitExt.html#method.set_default
     fn with_metrics_reporter_layer(
         self,
         reporter: Arc<dyn MetricsReporter>,
