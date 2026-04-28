@@ -113,9 +113,10 @@ impl Snapshot {
     ///   [`SnapshotBuilder::with_max_catalog_version`] for catalog-managed tables, otherwise unset
     ///   (defaults to latest).
     /// - `S1` = existing snapshot version.
-    /// - `S2` = end version of the new listing.
+    /// - `S2` = new snapshot version (= end version of the new listing).
     /// - `C1` = existing checkpoint version (if any).
-    /// - `C2` = new checkpoint version (if found in the listing).
+    /// - `C2` = new checkpoint version (if found in the listing). Always `<= S2`, since `C2` is by
+    ///   definition a checkpoint observed within the listing.
     ///
     /// The log listing is catalog-log-tail aware: any `log_tail` provided to the builder is
     /// merged with filesystem listings.
@@ -131,8 +132,10 @@ impl Snapshot {
     ///     - **D.1.** `C2 > S1`: the new checkpoint at `C2` already captures the table state
     ///       through version `C2`, including changes in `(S1, C2]`, so we can use it as the new
     ///       base instead of replaying those commits. Build a fresh snapshot from `C2`.
-    ///     - **D.2.** `C2 <= S1`: the existing snapshot already covers the checkpoint's P+M; fall
-    ///       through to case F to replay only the new commits and advance the checkpoint base.
+    ///     - **D.2.** `C2 <= S1`: the existing snapshot's P+M (at `S1`) already reflects everything
+    ///       `C2` would tell us, so we skip reading `C2` for P+M. Fall through to case F to replay
+    ///       only commits `> S1` for P+M and use `C2` as the new checkpoint base for future
+    ///       incremental updates.
     ///   - **E.** Listing contains commits but no new checkpoint, and `S2 == S1`: return the
     ///     existing snapshot.
     ///   - **F.** Listing contains new commits (and either no new checkpoint or a checkpoint with
