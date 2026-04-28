@@ -35,7 +35,7 @@
 //! match result {
 //!     IncrementalScanResult::Listing(listing) => {
 //!         for batch in listing.add_files { /* append to delta cache */ }
-//!         // mask = listing.remove_files ∪ listing.duplicate_add_paths
+//!         // mask = listing.remove_files | listing.duplicate_add_paths (set union)
 //!     }
 //!     IncrementalScanResult::CommitsUnavailable => { /* full scan fallback */ }
 //! }
@@ -50,8 +50,6 @@ use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{column_name, ColumnName};
 use crate::log_replay::deduplicator::Deduplicator;
 use crate::log_replay::{FileActionDeduplicator, FileActionKey};
-use crate::log_segment::LogSegment;
-use crate::path::ParsedLogPath;
 use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
@@ -77,6 +75,7 @@ static INCREMENTAL_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 /// Builder for an incremental scan over `(base_version, target_version]`. The target version
 /// is taken from the supplied snapshot; the base version is supplied at construction.
+#[derive(Debug)]
 pub struct IncrementalScanBuilder {
     snapshot: SnapshotRef,
     base_version: Version,
@@ -95,7 +94,7 @@ impl IncrementalScanBuilder {
     /// Drive the incremental scan.
     ///
     /// # Parameters
-    /// - `engine`: kernel engine handle for storage and JSON reading.
+    /// - `engine`: kernel engine handle for JSON reading.
     /// - `base_file_paths`: every file path live in the consumer's cached listing at
     ///   `base_version`. Iterated exactly once after within-range dedup, intersected against the
     ///   surviving-Add path set to compute `duplicate_add_paths`. Kernel does not materialize a
@@ -104,16 +103,18 @@ impl IncrementalScanBuilder {
     /// # Errors
     /// - `Err` if `base_version >= snapshot.version()` (caller error).
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
-    /// - `Err` for I/O failures other than missing commits.
+    /// - `Err` for I/O or JSON-parse failures while reading commit files.
     ///
     /// # Returns
     /// [`IncrementalScanResult::Listing`] on success, or
     /// [`IncrementalScanResult::CommitsUnavailable`] when the commit range cannot be served
-    /// (e.g. log retention removed commit JSONs in the range).
-    pub fn build<'a>(
+    /// (e.g. `base_version` predates the snapshot's earliest available commit because log
+    /// retention or a checkpoint subsumed older JSONs, or the snapshot has no JSON commits
+    /// at all because it was loaded purely from a checkpoint).
+    pub fn build<P: AsRef<str>>(
         self,
         engine: &dyn Engine,
-        base_file_paths: impl IntoIterator<Item = &'a str>,
+        base_file_paths: impl IntoIterator<Item = P>,
     ) -> DeltaResult<IncrementalScanResult> {
         let target_version = self.snapshot.version();
         require!(
@@ -124,38 +125,36 @@ impl IncrementalScanBuilder {
             ))
         );
 
-        // Match `Scan::new`: confirm kernel supports every reader feature on the target.
-        // Protocol features are monotonic (cannot be removed), so the target's feature set is
-        // a superset of every intermediate commit's; checking only the target is sufficient.
+        // Confirm kernel supports the target's reader features. Mirrors `Scan::new`. The
+        // intermediate commits in `(base_version, target_version]` are read for their `add`
+        // and `remove` actions only -- their schemas/stats are passed through opaquely to
+        // the caller, who is expected to interpret them against the target snapshot.
         self.snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
-        // List contiguous commits in (base_version, target_version]. Listing failures
-        // (typically log retention removing JSONs that a checkpoint covers) surface as
-        // CommitsUnavailable so the consumer can fall back to a full scan.
-        let log_root = self.snapshot.log_segment().log_root.clone();
-        let log_segment = match LogSegment::for_table_changes(
-            engine.storage_handler().as_ref(),
-            log_root,
-            self.base_version + 1,
-            target_version,
-        ) {
-            Ok(s) => s,
-            Err(_) => return Ok(IncrementalScanResult::CommitsUnavailable),
-        };
+        // Use the snapshot's already-validated commit list rather than re-listing storage.
+        // This is correct for catalog-managed tables: the snapshot's log_segment includes
+        // any staged/ratified-but-unpublished commits passed in via `with_log_tail`, which
+        // a fresh storage listing would silently miss.
+        let snapshot_commits = &self.snapshot.log_segment().listed.ascending_commit_files;
+        let snapshot_first_version = snapshot_commits.first().map(|c| c.version);
+
+        // The snapshot can serve `(base_version, target_version]` only if its earliest
+        // commit version is <= base_version + 1. Otherwise older JSONs were either
+        // retention-cleaned or hidden behind a checkpoint, and the consumer must rebuild
+        // their listing from a full scan.
+        let start_version = self.base_version + 1;
+        if snapshot_first_version.is_none_or(|v| v > start_version) {
+            return Ok(IncrementalScanResult::CommitsUnavailable);
+        }
 
         // Walk commits newest-first so `FileActionDeduplicator` (first-seen (path, dv) wins)
-        // yields newest-wins semantics across the range. Per-commit reading lets us tag every
-        // emitted batch with its source commit version (currently unused in the output, but
-        // available for future per-commit consumers).
-        let commit_files: Vec<ParsedLogPath> = log_segment
-            .listed
-            .ascending_commit_files
+        // yields newest-wins semantics across the range.
+        let commit_files = snapshot_commits
             .iter()
-            .rev()
-            .cloned()
-            .collect();
+            .filter(|c| c.version >= start_version && c.version <= target_version)
+            .rev();
 
         let mut seen_file_keys: HashSet<FileActionKey> = HashSet::new();
         let mut surviving_add_paths: HashSet<String> = HashSet::new();
@@ -183,12 +182,11 @@ impl IncrementalScanBuilder {
 
         // Intersect base paths with surviving-Add paths in a single linear scan over the
         // consumer's iterator. Lookup goes against the smaller, kernel-owned set.
-        let mut duplicate_add_paths: HashSet<String> = HashSet::new();
-        for path in base_file_paths {
-            if surviving_add_paths.contains(path) {
-                duplicate_add_paths.insert(path.to_string());
-            }
-        }
+        let duplicate_add_paths: HashSet<String> = base_file_paths
+            .into_iter()
+            .filter(|p| surviving_add_paths.contains(p.as_ref()))
+            .map(|p| p.as_ref().to_string())
+            .collect();
 
         Ok(IncrementalScanResult::Listing(IncrementalListing {
             base_version: self.base_version,
@@ -201,17 +199,21 @@ impl IncrementalScanBuilder {
 }
 
 /// Outcome of [`IncrementalScanBuilder::build`].
+#[derive(Debug)]
+#[non_exhaustive]
 pub enum IncrementalScanResult {
     /// The full diff over `(base_version, target_version]`.
     Listing(IncrementalListing),
-    /// Commits in the range cannot be served. Most often caused by log retention removing
-    /// commit JSONs that a checkpoint already covers. Consumers should fall back to a full
-    /// scan via [`crate::Snapshot::scan_builder`].
+    /// Commits in the range cannot be served, e.g. `base_version` predates the snapshot's
+    /// earliest available commit because log retention or a checkpoint subsumed older
+    /// JSONs. Consumers should fall back to a full scan via
+    /// [`crate::Snapshot::scan_builder`].
     CommitsUnavailable,
 }
 
 /// Diff between a base version and a target version, suitable for advancing a delta-on-base
 /// file listing cache.
+#[non_exhaustive]
 pub struct IncrementalListing {
     pub base_version: Version,
     pub target_version: Version,
@@ -228,6 +230,18 @@ pub struct IncrementalListing {
     /// Paths of surviving Remove actions in the range. Does not include
     /// `duplicate_add_paths`; consumers union as needed when applying the diff.
     pub remove_files: HashSet<String>,
+}
+
+impl std::fmt::Debug for IncrementalListing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IncrementalListing")
+            .field("base_version", &self.base_version)
+            .field("target_version", &self.target_version)
+            .field("add_files_batch_count", &self.add_files.len())
+            .field("duplicate_add_paths", &self.duplicate_add_paths)
+            .field("remove_files", &self.remove_files)
+            .finish()
+    }
 }
 
 // === Implementation ===

@@ -8,7 +8,7 @@ use crate::Snapshot;
 fn unwrap_listing(result: IncrementalScanResult) -> IncrementalListing {
     match result {
         IncrementalScanResult::Listing(l) => l,
-        IncrementalScanResult::CommitsUnavailable => panic!("expected listing, got unavailable"),
+        other => panic!("expected listing, got {other:?}"),
     }
 }
 

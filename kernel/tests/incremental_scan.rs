@@ -15,7 +15,10 @@ use delta_kernel::incremental_scan::{
 };
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::Snapshot;
-use test_utils::{actions_to_string, add_commit, TestAction};
+use test_utils::{
+    actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
+    create_log_path, TestAction,
+};
 use url::Url;
 
 fn setup_test() -> (
@@ -40,7 +43,7 @@ fn surviving_add_count(listing: &IncrementalListing) -> usize {
 fn unwrap_listing(result: IncrementalScanResult) -> IncrementalListing {
     match result {
         IncrementalScanResult::Listing(l) => l,
-        IncrementalScanResult::CommitsUnavailable => panic!("expected listing, got unavailable"),
+        other => panic!("expected listing, got {other:?}"),
     }
 }
 
@@ -253,6 +256,64 @@ async fn mixed_new_and_duplicate_adds() -> Result<(), Box<dyn std::error::Error>
     assert_eq!(surviving_add_count(&listing), 2);
     assert_eq!(listing.duplicate_add_paths.len(), 1);
     assert!(listing.duplicate_add_paths.contains("re-added.parquet"));
+
+    Ok(())
+}
+
+// Catalog-managed: commits in the range live as staged JSONs under `_staged_commits/`
+// (not in the published log) and are surfaced to the snapshot via `with_log_tail`.
+// `IncrementalScanBuilder` must walk the snapshot's commit list -- not re-list storage --
+// or those commits are silently invisible and the diff is wrong.
+#[tokio::test]
+async fn picks_up_staged_commits_from_log_tail() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    // v0: published, catalog-managed metadata. v1, v2: staged-only.
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_catalog_managed(vec![TestAction::Metadata]),
+    )
+    .await?;
+    let staged1 = add_staged_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![TestAction::Add("staged-1.parquet".to_string())]),
+    )
+    .await?;
+    let staged2 = add_staged_commit(
+        table_root,
+        storage.as_ref(),
+        2,
+        actions_to_string(vec![TestAction::Add("staged-2.parquet".to_string())]),
+    )
+    .await?;
+
+    let log_tail = vec![
+        create_log_path(&table_url, staged1),
+        create_log_path(&table_url, staged2),
+    ];
+    let target = Snapshot::builder_for(table_url)
+        .with_log_tail(log_tail)
+        .with_max_catalog_version(2)
+        .build(engine.as_ref())?;
+    assert_eq!(target.version(), 2);
+
+    let listing = unwrap_listing(
+        IncrementalScanBuilder::new(target, 0)
+            .build(engine.as_ref(), std::iter::empty::<&str>())?,
+    );
+
+    // Both staged Adds must survive -- they're only reachable via log_tail.
+    assert_eq!(
+        surviving_add_count(&listing),
+        2,
+        "expected 2 surviving Adds from staged commits in log_tail"
+    );
+    assert_eq!(listing.target_version, 2);
 
     Ok(())
 }
