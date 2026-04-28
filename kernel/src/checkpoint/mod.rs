@@ -5,10 +5,10 @@
 //! ## Checkpoint Types and Selection Logic
 //! This API supports two checkpoint types, selected based on table features:
 //!
-//! | Table Feature    | Resulting Checkpoint Type    | Description                                                                 |
-//! |------------------|-------------------------------|-----------------------------------------------------------------------------|
-//! | No v2Checkpoints | Single-file Classic-named V1 | Follows V1 specification without [`CheckpointMetadata`] action             |
-//! | v2Checkpoints    | Classic-named V2             | Follows V2 specification with [`CheckpointMetadata`] action while maintaining backward compatibility via classic naming |
+//! | Table Feature    | Resulting Checkpoint Type                   | Description                                                                                                             |
+//! |------------------|---------------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
+//! | No v2Checkpoints | Single-file Classic-named V1                | Follows V1 specification without [`CheckpointMetadata`] action                                                          |
+//! | v2Checkpoints    | Classic-named V2 (with or without sidecars) | Follows V2 specification with [`CheckpointMetadata`] action while maintaining backward compatibility via classic naming |
 //!
 //! For more information on the V1/V2 specifications, see the following protocol section:
 //! <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-specs>

@@ -20,7 +20,9 @@ use delta_kernel::{DeltaResult, Engine, Snapshot, SnapshotRef};
 
 mod common;
 
-use common::write_utils::{get_simple_schema, load_existing_checkpoint_path, simple_id_batch};
+use common::write_utils::{
+    get_simple_schema, load_existing_single_file_checkpoint_path, simple_id_batch,
+};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -376,7 +378,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
 
     // === Step 4: Validate `_last_checkpoint` (version, size, sizeInBytes, numOfAddFiles) ===
     let last_ckpt = read_last_checkpoint(&table_path);
-    let ckpt_file = load_existing_checkpoint_path(&table_path, version as _);
+    let ckpt_file = load_existing_single_file_checkpoint_path(&table_path, version as _);
     let ckpt_file_size = std::fs::metadata(&ckpt_file).unwrap().len() as i64;
     let sidecars_dir_for_size = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
     let sidecars_total_size: i64 = list_sidecar_parquet_files(&sidecars_dir_for_size)
@@ -799,7 +801,7 @@ async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
     );
 
     // Main checkpoint contains no `sidecar` action rows.
-    let ckpt_file = load_existing_checkpoint_path(&table_path, version);
+    let ckpt_file = load_existing_single_file_checkpoint_path(&table_path, version);
     let ckpt_batch = read_parquet_file(&ckpt_file);
     let sidecar_col = get_struct_column_from_record_batch(&ckpt_batch, "sidecar");
     let sidecar_rows = valid_row_indices(sidecar_col, ckpt_batch.num_rows());
@@ -1219,7 +1221,7 @@ async fn test_snapshot_checkpoint_default_on_v2_table(
     );
 
     // V2 checkpoint must contain a `checkpointMetadata` column.
-    let ckpt_path = load_existing_checkpoint_path(&table_path, version);
+    let ckpt_path = load_existing_single_file_checkpoint_path(&table_path, version);
     let file = std::fs::File::open(&ckpt_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
     let schema = reader.schema();
