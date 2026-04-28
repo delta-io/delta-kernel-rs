@@ -166,8 +166,10 @@ to `at_version`.
 | `timestamp_range_to_versions(snapshot, engine, start, end)` | A `(start_version, end_version)` pair covering the timestamp range. |
 
 Each helper takes a `Snapshot` reference, which defines the searchable
-version range. Pass the latest snapshot if you want to search the entire
-history.
+version range. You typically pass the latest snapshot so the search covers
+the table's full history. `timestamp_range_to_versions` is the most
+common of the three because it translates a `[start_ts, end_ts]` window
+into the version range that change data feed (CDF) queries need to read.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -199,8 +201,9 @@ println!("Resolved timestamp {timestamp_ms} to version {version}");
 version whose timestamp is at or after the requested timestamp, which is
 useful for picking up changes that happened after a known point in time.
 
-To resolve a timestamp range (for example, when reading a change feed
-between two points in time), call `timestamp_range_to_versions`. The end
+To resolve a timestamp range, call `timestamp_range_to_versions`. This is
+the primary entry point for CDF queries, which need to translate a user's
+timestamp window into the start and end versions to read. The end
 timestamp is optional. Pass `None` to indicate no upper bound.
 
 ```rust,no_run
