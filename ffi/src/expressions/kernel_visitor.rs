@@ -526,7 +526,7 @@ impl NullTypeTag {
                 // support lands, new NullTypeTag::Geometry / ::Geography variants will
                 // replace this arm.
                 // TODO: Once real FFI geo support lands, new NullTypeTag::Geometry / ::Geography variants
-                // willreplace this arm.
+                // will replace this arm.
                 PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => (Self::Binary, 0, 0),
             },
             _ => (Self::NonPrimitive, 0, 0),
