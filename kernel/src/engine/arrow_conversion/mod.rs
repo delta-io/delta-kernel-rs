@@ -384,7 +384,6 @@ mod tests {
         Ok(())
     }
 
-    // Regression test for https://github.com/delta-io/delta-kernel-rs/issues/739
     // Delta tables can have void columns. The kernel should parse them and convert
     // to Arrow's Null type (and back).
     #[test]
