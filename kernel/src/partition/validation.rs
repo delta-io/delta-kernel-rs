@@ -19,7 +19,8 @@
 //! - [`validate_keys`]: checks key completeness (case-insensitive matching, normalizes to schema
 //!   case, detects post-normalization duplicates).
 //! - [`validate_types`]: checks that each `Scalar`'s type matches the partition column's schema
-//!   type. Null scalars skip the type check.
+//!   type, and that null scalars are only used for nullable partition columns. Null scalars skip
+//!   the value type check; the column's nullability is still enforced.
 
 use std::collections::HashMap;
 
@@ -105,8 +106,10 @@ fn validate_keys(
 }
 
 /// Validates that each [`Scalar`] value's type is compatible with the corresponding
-/// partition column's type in the table schema. Null scalars skip the type check
-/// (null is valid for any partition column type).
+/// partition column's type in the table schema. Null scalars skip the value type check, but a
+/// null is only legal when the schema field is nullable. This matches Delta-Spark's
+/// `DELTA_NOT_NULL_CONSTRAINT_VIOLATED` rejection of NULL writes into a NOT NULL partition
+/// column.
 ///
 /// # Parameters
 /// - `logical_schema`: the table's logical schema.
@@ -117,6 +120,7 @@ fn validate_keys(
 /// # Errors
 /// - A partition column is not found in the table schema
 /// - A partition column's schema type is not a primitive (struct, array, map are rejected)
+/// - A null value is provided for a non-nullable partition column
 /// - A non-null value's type does not match the partition column's schema type
 fn validate_types(
     logical_schema: &StructType,
@@ -139,6 +143,13 @@ fn validate_types(
             )));
         }
         if value.is_null() {
+            // Null partition values are only valid for nullable partition columns. This
+            // mirrors Spark `DELTA_NOT_NULL_CONSTRAINT_VIOLATED` (SQLSTATE 23502).
+            if !field.nullable {
+                return Err(Error::invalid_partition_values(format!(
+                    "partition column '{col_name}' is not nullable but received a null value"
+                )));
+            }
             continue;
         }
         let actual_type = value.data_type();
@@ -170,6 +181,14 @@ mod tests {
         let schema = StructType::new_unchecked(vec![StructField::not_null("p", data_type)]);
         let values = HashMap::from([("p".to_string(), value)]);
         validate_types(&schema, &values).unwrap_err().to_string()
+    }
+
+    /// Like [`assert_type_ok`] but uses a `nullable` schema field. Used by null-value cases,
+    /// since null scalars are only valid for nullable partition columns.
+    fn assert_type_ok_nullable(data_type: DataType, value: Scalar) {
+        let schema = StructType::new_unchecked(vec![StructField::nullable("p", data_type)]);
+        let values = HashMap::from([("p".to_string(), value)]);
+        validate_types(&schema, &values).unwrap();
     }
 
     // ============================================================================
@@ -340,8 +359,8 @@ mod tests {
         assert_type_ok(data_type, value);
     }
 
-    /// NULL rows from the encoding table. Null is valid for every partition column type,
-    /// regardless of the Scalar::Null inner type.
+    /// NULL rows from the encoding table. Null is valid for every partition column type when
+    /// the schema field is nullable, regardless of the `Scalar::Null` inner type.
     #[rstest]
     #[case(DataType::INTEGER, Scalar::Null(DataType::INTEGER))] // row 5
     #[case(DataType::LONG, Scalar::Null(DataType::LONG))] // row 8
@@ -356,16 +375,45 @@ mod tests {
     #[case(DataType::TIMESTAMP_NTZ, Scalar::Null(DataType::TIMESTAMP_NTZ))] // row 46
     #[case(DataType::STRING, Scalar::Null(DataType::STRING))] // row 66
     #[case(DataType::BINARY, Scalar::Null(DataType::BINARY))] // (binary NULL)
-    fn test_validate_types_null_returns_ok(#[case] data_type: DataType, #[case] value: Scalar) {
-        assert_type_ok(data_type, value);
+    fn test_validate_types_null_into_nullable_returns_ok(
+        #[case] data_type: DataType,
+        #[case] value: Scalar,
+    ) {
+        assert_type_ok_nullable(data_type, value);
     }
 
-    /// Null skips the type check even when the Scalar::Null inner type does not match
-    /// the schema column type. This is intentional: null is valid for any partition
-    /// column regardless of what type the Null carries.
+    /// Null skips the value type check even when the `Scalar::Null` inner type does not match
+    /// the schema column type. This is intentional: null carries no concrete type to compare
+    /// against.
     #[test]
     fn test_validate_types_null_with_mismatched_inner_type_returns_ok() {
-        assert_type_ok(DataType::INTEGER, Scalar::Null(DataType::STRING));
+        assert_type_ok_nullable(DataType::INTEGER, Scalar::Null(DataType::STRING));
+    }
+
+    /// A null partition value for a non-nullable partition column is rejected, matching
+    /// Delta-Spark's `DELTA_NOT_NULL_CONSTRAINT_VIOLATED` (SQLSTATE 23502) behavior. The
+    /// `Scalar::Null` inner type is irrelevant -- the rejection is driven entirely by the
+    /// schema field's nullability.
+    #[rstest]
+    #[case(DataType::INTEGER, Scalar::Null(DataType::INTEGER))]
+    #[case(DataType::LONG, Scalar::Null(DataType::LONG))]
+    #[case(DataType::STRING, Scalar::Null(DataType::STRING))]
+    #[case(DataType::BINARY, Scalar::Null(DataType::BINARY))]
+    #[case(DataType::BOOLEAN, Scalar::Null(DataType::BOOLEAN))]
+    #[case(DataType::DATE, Scalar::Null(DataType::DATE))]
+    #[case(DataType::TIMESTAMP, Scalar::Null(DataType::TIMESTAMP))]
+    #[case(DataType::TIMESTAMP_NTZ, Scalar::Null(DataType::TIMESTAMP_NTZ))]
+    #[case(DataType::decimal(10, 2).unwrap(), Scalar::Null(DataType::decimal(10, 2).unwrap()))]
+    // Null with mismatched inner type is also rejected -- the schema's nullability is the
+    // only thing checked for null scalars.
+    #[case(DataType::INTEGER, Scalar::Null(DataType::STRING))]
+    fn test_validate_types_null_into_non_nullable_returns_error(
+        #[case] data_type: DataType,
+        #[case] value: Scalar,
+    ) {
+        let err = assert_type_err(data_type, value);
+        assert!(err.contains("not nullable"), "{err}");
+        assert!(err.contains("'p'"), "{err}");
     }
 
     /// Type mismatch: every non-null Scalar variant against the wrong schema type.

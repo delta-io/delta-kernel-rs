@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    ArrayRef, BinaryArray, Int32Array, StructArray, TimestampMicrosecondArray,
+    ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Int32Array, Int64Array, StringArray,
+    StructArray, TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
@@ -16,11 +17,13 @@ use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::{Engine, Error as KernelError, Snapshot};
 use itertools::Itertools;
+use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-use test_utils::{create_table, engine_store_setup, test_read};
+use test_utils::{create_table, engine_store_setup, test_read, test_table_setup};
 use url::Url;
 
 #[tokio::test]
@@ -461,6 +464,136 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     let res = test_read(&ArrowEngineData::new(data), &table_url, engine);
     assert!(matches!(res,
         Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
+
+    Ok(())
+}
+
+// =============================================================================
+// NOT NULL data column tests (default engine)
+// =============================================================================
+//
+// These tests pin the contract documented on `maybe_enable_invariants` (see
+// `kernel/src/transaction/builder/create_table.rs`): kernel does not enforce
+// nullability at write time -- it relies on the engine's `ParquetHandler` to
+// do so. The default engine inherits the guarantee from `arrow-rs`, which
+// rejects null values for fields with `nullable: false` at
+// `RecordBatch::try_new`.
+//
+// Each case creates the table via the kernel `create_table` builder so the
+// non-null schema drives the auto-enablement of the `invariants` writer
+// feature end-to-end (the protocol is not hand-crafted). The test then opens
+// the standard write path (snapshot + transaction + `unpartitioned_write_context`)
+// and asserts that the input `RecordBatch` for `engine.write_parquet` cannot
+// be constructed with a null in the NOT NULL column. The failure surfaces
+// before the engine is ever invoked.
+
+fn null_array_int32() -> ArrayRef {
+    Arc::new(Int32Array::from(vec![None as Option<i32>]))
+}
+
+fn null_array_int64() -> ArrayRef {
+    Arc::new(Int64Array::from(vec![None as Option<i64>]))
+}
+
+fn null_array_string() -> ArrayRef {
+    Arc::new(StringArray::from(vec![None as Option<&str>]))
+}
+
+fn null_array_binary() -> ArrayRef {
+    Arc::new(BinaryArray::from(vec![None as Option<&[u8]>]))
+}
+
+fn null_array_boolean() -> ArrayRef {
+    Arc::new(BooleanArray::from(vec![None as Option<bool>]))
+}
+
+fn null_array_timestamp_utc() -> ArrayRef {
+    Arc::new(TimestampMicrosecondArray::from(vec![None as Option<i64>]).with_timezone("UTC"))
+}
+
+fn null_array_decimal_10_2() -> ArrayRef {
+    Arc::new(
+        Decimal128Array::from(vec![None as Option<i128>])
+            .with_precision_and_scale(10, 2)
+            .unwrap(),
+    )
+}
+
+/// Verifies the default-engine NOT NULL contract for non-partition columns
+/// across a representative set of primitive types. The contract:
+///
+/// 1. `nullable: false` propagates from kernel's `StructField` into the Arrow logical schema
+///    produced by `try_into_arrow`.
+/// 2. Constructing the Arrow `RecordBatch` an engine would hand to `engine.write_parquet` with a
+///    null in the NOT NULL column fails at `RecordBatch::try_new`, before the engine is invoked.
+///
+/// See [#2465](https://github.com/delta-io/delta-kernel-rs/issues/2465).
+#[rstest]
+#[case::integer(DataType::INTEGER, null_array_int32 as fn() -> ArrayRef)]
+#[case::long(DataType::LONG, null_array_int64 as fn() -> ArrayRef)]
+#[case::string(DataType::STRING, null_array_string as fn() -> ArrayRef)]
+#[case::binary(DataType::BINARY, null_array_binary as fn() -> ArrayRef)]
+#[case::boolean(DataType::BOOLEAN, null_array_boolean as fn() -> ArrayRef)]
+#[case::timestamp(DataType::TIMESTAMP, null_array_timestamp_utc as fn() -> ArrayRef)]
+#[case::decimal(DataType::decimal(10, 2).unwrap(), null_array_decimal_10_2 as fn() -> ArrayRef)]
+#[tokio::test]
+async fn test_not_null_data_column_rejects_null_in_batch(
+    #[case] data_type: DataType,
+    #[case] null_array_fn: fn() -> ArrayRef,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Step 1: Create the table via the kernel builder. The non-null schema is
+    // the only signal needed -- `maybe_enable_invariants` auto-adds the
+    // `invariants` writer feature. The test exercises the full chain
+    // (schema -> auto-enable -> engine enforcement) rather than hand-crafting
+    // the protocol.
+    let schema = Arc::new(StructType::try_new(vec![StructField::not_null(
+        "c",
+        data_type.clone(),
+    )])?);
+    let (_tmp_dir, table_path, engine) = test_table_setup()?;
+    let _ = kernel_create_table(&table_path, schema.clone(), "test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Step 2: Confirm the protocol auto-enabled `invariants` -- the upstream
+    // half of the contract this test pins.
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(
+        snapshot
+            .table_configuration()
+            .protocol()
+            .writer_features()
+            .is_some_and(|f| f.contains(&delta_kernel::table_features::TableFeature::Invariants)),
+        "non-null schema must auto-enable the `invariants` writer feature",
+    );
+
+    // Step 3: Open the standard default-engine write path. Going through
+    // `Snapshot::transaction` and `unpartitioned_write_context` exercises the
+    // exact setup an engine performs prior to calling `engine.write_parquet`.
+    let txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("default engine");
+    let _write_context = txn.unpartitioned_write_context()?;
+
+    // Step 4: Confirm `nullable: false` propagates from kernel into the
+    // logical Arrow schema engines build batches against.
+    let arrow_schema: delta_kernel::arrow::datatypes::Schema = schema.as_ref().try_into_arrow()?;
+    assert!(
+        !arrow_schema.field(0).is_nullable(),
+        "kernel `not_null` field must produce Arrow `nullable: false`",
+    );
+
+    // Step 5: Building the input `RecordBatch` for `engine.write_parquet` with
+    // a null in the NOT NULL column must fail at `RecordBatch::try_new`,
+    // before the engine is called. This is the default-engine NOT NULL
+    // enforcement seam documented on `maybe_enable_invariants`.
+    let result = RecordBatch::try_new(Arc::new(arrow_schema), vec![null_array_fn()]);
+    assert!(
+        result.is_err(),
+        "RecordBatch::try_new should reject null in NOT NULL column ({data_type:?}); got: {result:?}",
+    );
 
     Ok(())
 }
