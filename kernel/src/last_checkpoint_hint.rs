@@ -40,7 +40,6 @@ pub(crate) struct LastCheckpointHintSummary {
 #[internal_api]
 pub(crate) struct LastCheckpointHint {
     /// The version of the table when the last checkpoint was made.
-    #[allow(unreachable_pub)] // used by acceptance tests (TODO make an fn accessor?)
     pub version: Version,
     /// The number of actions that are stored in the checkpoint.
     pub size: i64,
