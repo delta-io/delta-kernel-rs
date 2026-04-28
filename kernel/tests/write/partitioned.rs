@@ -12,6 +12,7 @@ use delta_kernel::arrow::array::{
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
@@ -730,4 +731,82 @@ fn read_single_add(
         "should produce relative paths, got: {rel_path}"
     );
     Ok((add, rel_path))
+}
+
+// ==============================================================================
+// materializePartitionColumns tests
+// ==============================================================================
+
+/// Materialized partition columns are physically present in the parquet file, but their
+/// stats must be omitted from the Add action because the value is already in
+/// `partitionValues`. Pins the stat-collection contract for materialized partition tables
+/// end-to-end through the kernel `create_table` builder.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_materialized_partition_columns_excluded_from_stats(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let partition_col = "partition";
+    let table_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("number", DataType::INTEGER),
+        StructField::nullable(partition_col, DataType::STRING),
+    ])?);
+
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let _ = create_table(&table_path, table_schema.clone(), "test/1.0")
+        .with_data_layout(DataLayout::partitioned([partition_col]))
+        .with_table_properties([("delta.feature.materializePartitionColumns", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("default engine");
+
+    // With materializePartitionColumns, the data batch retains the partition column.
+    let arrow_schema = Arc::new(table_schema.as_ref().try_into_arrow()?);
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "a", "a"])),
+        ],
+    )?;
+    let data = Box::new(ArrowEngineData::new(batch));
+
+    let write_context = txn.partitioned_write_context(HashMap::from([(
+        partition_col.to_string(),
+        Scalar::String("a".into()),
+    )]))?;
+    let result = engine.write_parquet(&data, &write_context).await?;
+    txn.add_files(result);
+    assert!(txn.commit(engine.as_ref())?.is_committed());
+
+    let (add, _) = read_single_add(&table_path, 1)?;
+    let stats: serde_json::Value = serde_json::from_str(add["stats"].as_str().unwrap()).unwrap();
+
+    // Stats should contain the data column but NOT the partition column.
+    assert!(
+        stats["minValues"].get("number").is_some(),
+        "data column 'number' should have minValues"
+    );
+    assert!(
+        stats["maxValues"].get("number").is_some(),
+        "data column 'number' should have maxValues"
+    );
+    assert!(
+        stats["minValues"].get(partition_col).is_none(),
+        "partition column should not have minValues even when materialized"
+    );
+    assert!(
+        stats["maxValues"].get(partition_col).is_none(),
+        "partition column should not have maxValues even when materialized"
+    );
+    assert!(
+        stats["nullCount"].get(partition_col).is_none(),
+        "partition column should not have nullCount even when materialized"
+    );
+
+    Ok(())
 }
