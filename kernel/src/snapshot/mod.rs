@@ -540,7 +540,7 @@ impl Snapshot {
                 ));
             }
             Some(CheckpointSpec::V1) if v2_supported => {
-                // TODO: remove this once we support writing V1 checkpoints when the table supports
+                // TODO: remove this once we support writing V1 checkpoints even if table supports
                 // v2Checkpoint See <https://github.com/delta-io/delta-kernel-rs/issues/2454>.
                 return Err(Error::unsupported(
                     "Kernel does not support writing V1 checkpoints when the table supports v2Checkpoint",

@@ -9,25 +9,34 @@ use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
+use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Engine, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Snapshot, SnapshotRef};
 
 mod common;
 
+use common::write_utils::{get_simple_schema, load_existing_checkpoint_path, simple_id_batch};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
-use common::write_utils::{get_simple_schema, load_checkpoint_path, simple_id_batch};
 use itertools::Itertools;
 use test_utils::{
     create_table_and_load_snapshot, insert_data, load_test_data, read_scan, test_table_setup_mt,
     write_batch_to_table,
 };
+
+fn unwrap_post_commit_snapshot<S: std::fmt::Debug>(result: CommitResult<S>) -> SnapshotRef {
+    result
+        .unwrap_committed()
+        .post_commit_snapshot()
+        .expect("expected post-commit snapshot")
+        .clone()
+}
 
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
@@ -324,16 +333,10 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
     Ok(())
 }
 
-/// E2e test for V2 sidecar checkpoint writing and reading:
-///
-/// 1. Create a V2 table with adds, removes, domain metadata, and set-transactions
-/// 2. Write a V2 checkpoint with sidecars (hint=2)
-/// 3. Add post-checkpoint commits (insert + domain metadata update)
-/// 4. Validate `_last_checkpoint` (version, size, sizeInBytes, numOfAddFiles)
-/// 5. Read the raw checkpoint parquet and validate the actions and sidecar references
-/// 6. Load a fresh snapshot from the checkpoint + post-checkpoint commits
-/// 7. Verify domain metadata (including post-checkpoint update)
-/// 8. Scan and verify data correctness (9 rows: ids 9-17)
+/// E2E test for V2 sidecar checkpoint write and read. Builds a V2 table with mixed types of
+/// delta actions, writes a sidecar checkpoint, then adds more commits on top. Verifies
+/// `_last_checkpoint`, the checkpoint parquet contents, and performs a scan to verify the data
+/// is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -355,29 +358,25 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
         info_field,
         Arc::new(StringArray::from(vec![Some("quinn")])) as ArrayRef,
     )]));
-    let post_ckpt_snapshot = insert_data(
-        Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?,
-        &engine,
-        vec![Arc::new(Int32Array::from(vec![17])) as ArrayRef, info_array],
-    )
-    .await?
-    .unwrap_committed()
-    .post_commit_snapshot()
-    .expect("expected post-commit snapshot")
-    .clone();
+    let post_ckpt_snapshot = unwrap_post_commit_snapshot(
+        insert_data(
+            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?,
+            &engine,
+            vec![Arc::new(Int32Array::from(vec![17])) as ArrayRef, info_array],
+        )
+        .await?,
+    );
 
-    let post_ckpt_snapshot = post_ckpt_snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_domain_metadata("app.settings".to_string(), r#"{"version":3}"#.to_string())
-        .commit(engine.as_ref())?
-        .unwrap_committed()
-        .post_commit_snapshot()
-        .expect("expected post-commit snapshot")
-        .clone();
+    let post_ckpt_snapshot = unwrap_post_commit_snapshot(
+        post_ckpt_snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_domain_metadata("app.settings".to_string(), r#"{"version":3}"#.to_string())
+            .commit(engine.as_ref())?,
+    );
 
     // === Step 4: Validate `_last_checkpoint` (version, size, sizeInBytes, numOfAddFiles) ===
     let last_ckpt = read_last_checkpoint(&table_path);
-    let ckpt_file = load_checkpoint_path(&table_path, version as _);
+    let ckpt_file = load_existing_checkpoint_path(&table_path, version as _);
     let ckpt_file_size = std::fs::metadata(&ckpt_file).unwrap().len() as i64;
     let sidecars_dir_for_size = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
     let sidecars_total_size: i64 = list_sidecar_parquet_files(&sidecars_dir_for_size)
@@ -575,7 +574,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     Ok(())
 }
 
-/// E2e test: create a partitioned table with stats, write several commits, checkpoint,
+/// E2E test: create a partitioned table with stats, write several commits, checkpoint,
 /// then read the raw checkpoint parquet to verify `stats_parsed` and `partitionValues_parsed`
 /// fields are correctly populated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -800,7 +799,7 @@ async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
     );
 
     // Main checkpoint contains no `sidecar` action rows.
-    let ckpt_file = load_checkpoint_path(&table_path, version);
+    let ckpt_file = load_existing_checkpoint_path(&table_path, version);
     let ckpt_batch = read_parquet_file(&ckpt_file);
     let sidecar_col = get_struct_column_from_record_batch(&ckpt_batch, "sidecar");
     let sidecar_rows = valid_row_indices(sidecar_col, ckpt_batch.num_rows());
@@ -852,9 +851,7 @@ fn read_last_checkpoint(table_path: &str) -> serde_json::Value {
 ///
 /// Exercises every action in the V2 checkpoint schema except `sidecar`/`checkpointMetadata`,
 /// which are produced by the checkpoint writer itself.
-async fn v2_table_with_domain_metadata_and_txn<
-    E: delta_kernel::engine::default::executor::TaskExecutor,
->(
+async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
     engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
@@ -896,55 +893,46 @@ async fn v2_table_with_domain_metadata_and_txn<
         "alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi",
     ];
     for (i, name) in names.iter().enumerate() {
-        snapshot = insert_data(snapshot, engine, make_columns(i as i32 + 1, name))
-            .await?
-            .unwrap_committed()
-            .post_commit_snapshot()
-            .expect("expected post-commit snapshot")
-            .clone();
+        snapshot = unwrap_post_commit_snapshot(
+            insert_data(snapshot, engine, make_columns(i as i32 + 1, name)).await?,
+        );
     }
 
     // Domain metadata commit (no data) -- exercises the empty-file-batch skip path in the
     // sidecar splitter. Sets two domains initially.
-    snapshot = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_domain_metadata("app.settings".to_string(), r#"{"version":1}"#.to_string())
-        .with_domain_metadata(
-            "app.feature_flags".to_string(),
-            r#"{"dark_mode":true}"#.to_string(),
-        )
-        .commit(engine.as_ref())?
-        .unwrap_committed()
-        .post_commit_snapshot()
-        .expect("expected post-commit snapshot")
-        .clone();
+    snapshot = unwrap_post_commit_snapshot(
+        snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_domain_metadata("app.settings".to_string(), r#"{"version":1}"#.to_string())
+            .with_domain_metadata(
+                "app.feature_flags".to_string(),
+                r#"{"dark_mode":true}"#.to_string(),
+            )
+            .commit(engine.as_ref())?,
+    );
 
     // Another domain metadata commit -- updates "app.settings" to verify reconciliation
     // picks the latest value, and adds a new domain.
-    snapshot = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_domain_metadata(
-            "app.analytics".to_string(),
-            r#"{"tracking":false}"#.to_string(),
-        )
-        .with_domain_metadata("app.settings".to_string(), r#"{"version":2}"#.to_string())
-        .commit(engine.as_ref())?
-        .unwrap_committed()
-        .post_commit_snapshot()
-        .expect("expected post-commit snapshot")
-        .clone();
+    snapshot = unwrap_post_commit_snapshot(
+        snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_domain_metadata(
+                "app.analytics".to_string(),
+                r#"{"tracking":false}"#.to_string(),
+            )
+            .with_domain_metadata("app.settings".to_string(), r#"{"version":2}"#.to_string())
+            .commit(engine.as_ref())?,
+    );
 
     // SetTransaction commits -- exercise `txn` actions in checkpoint. Two distinct app_ids
     // plus a second update to `app1` to verify reconciliation picks the latest version.
     for (app_id, version) in [("app1", 1i64), ("app2", 5), ("app1", 3)] {
-        snapshot = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_transaction_id(app_id.to_string(), version)
-            .commit(engine.as_ref())?
-            .unwrap_committed()
-            .post_commit_snapshot()
-            .expect("expected post-commit snapshot")
-            .clone();
+        snapshot = unwrap_post_commit_snapshot(
+            snapshot
+                .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+                .with_transaction_id(app_id.to_string(), version)
+                .commit(engine.as_ref())?,
+        );
     }
 
     // Remove all 8 files -> 8 remove tombstones
@@ -956,24 +944,16 @@ async fn v2_table_with_domain_metadata_and_txn<
     for sm in scan.scan_metadata(engine.as_ref())? {
         txn.remove_files(sm?.scan_files);
     }
-    snapshot = txn
-        .commit(engine.as_ref())?
-        .unwrap_committed()
-        .post_commit_snapshot()
-        .expect("expected post-commit snapshot")
-        .clone();
+    snapshot = unwrap_post_commit_snapshot(txn.commit(engine.as_ref())?);
 
     // Insert 8 fresh files (one per commit) -> ids 9..=16
     let names = [
         "ivan", "judy", "karl", "lena", "mike", "nina", "omar", "pat",
     ];
     for (i, name) in names.iter().enumerate() {
-        snapshot = insert_data(snapshot, engine, make_columns(i as i32 + 9, name))
-            .await?
-            .unwrap_committed()
-            .post_commit_snapshot()
-            .expect("expected post-commit snapshot")
-            .clone();
+        snapshot = unwrap_post_commit_snapshot(
+            insert_data(snapshot, engine, make_columns(i as i32 + 9, name)).await?,
+        );
     }
 
     Ok(snapshot)
@@ -1135,9 +1115,7 @@ fn assert_sidecars_contain_only_file_actions(
 /// Creates a partitioned table with stats (`id: long`, `name: string`, partition `part_key`),
 /// writes two commits (partition "a" with 2 rows, partition "b" with 3 rows), and returns
 /// the snapshot after both commits.
-async fn create_partitioned_stats_table<
-    E: delta_kernel::engine::default::executor::TaskExecutor,
->(
+async fn create_partitioned_stats_table<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
     engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
@@ -1241,7 +1219,7 @@ async fn test_snapshot_checkpoint_default_on_v2_table(
     );
 
     // V2 checkpoint must contain a `checkpointMetadata` column.
-    let ckpt_path = load_checkpoint_path(&table_path, version);
+    let ckpt_path = load_existing_checkpoint_path(&table_path, version);
     let file = std::fs::File::open(&ckpt_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
     let schema = reader.schema();
@@ -1251,4 +1229,275 @@ async fn test_snapshot_checkpoint_default_on_v2_table(
     );
 
     Ok(())
+}
+
+// ============================================================================
+// Cross-feature V2 sidecar checkpoint tests
+// ============================================================================
+
+/// V2 sidecar checkpoint works end-to-end on a table that combines `v2Checkpoint` with
+/// one other feature/layout. After the checkpoint, a fresh snapshot loads from the
+/// checkpoint with no trailing commits and the scan returns the full 6-row dataset.
+#[rstest::rstest]
+#[case::column_mapping(CrossFeature::ColumnMapping)]
+#[case::partitioned(CrossFeature::Partitioned)]
+#[case::clustered(CrossFeature::Clustered)]
+#[case::deletion_vectors(CrossFeature::DeletionVectors)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_sidecar_checkpoint_cross_feature(
+    #[case] feature: CrossFeature,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+
+    let snapshot = build_v2_table_with_feature(&table_path, &table_url, &engine, feature).await?;
+    let version = snapshot.version();
+
+    // 3 add files with hint=2 -> 2 sidecars: one with 2 adds, one with 1 add.
+    let spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: Some(2),
+    });
+    snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+
+    let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
+    let per_sidecar = assert_sidecars_contain_only_file_actions(&sidecars_dir);
+    assert_eq!(
+        per_sidecar,
+        vec![(1, 0), (2, 0)],
+        "per-sidecar (adds, removes) distribution does not match expected"
+    );
+
+    // Fresh snapshot loads from the checkpoint with no trailing commits.
+    let fresh = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(fresh.version(), version);
+    let log_segment = fresh.log_segment();
+    assert!(
+        !log_segment.listed.checkpoint_parts.is_empty(),
+        "fresh snapshot should load from the checkpoint"
+    );
+    assert_eq!(log_segment.checkpoint_version, Some(version));
+    assert!(
+        log_segment.listed.ascending_commit_files.is_empty(),
+        "no commit files should remain after the checkpoint"
+    );
+
+    let scan = fresh.scan_builder().build()?;
+    let batches = read_scan(&scan, engine.clone() as Arc<dyn delta_kernel::Engine>)?;
+    assert_batches_sorted_eq!(
+        vec![
+            "+----+-------+--------+",
+            "| id | value | region |",
+            "+----+-------+--------+",
+            "| 1  | a     | east   |",
+            "| 2  | b     | east   |",
+            "| 3  | c     | west   |",
+            "| 4  | d     | west   |",
+            "| 5  | e     | north  |",
+            "| 6  | f     | north  |",
+            "+----+-------+--------+",
+        ],
+        &batches
+    );
+
+    Ok(())
+}
+
+/// Two consecutive V2 sidecar checkpoints with writes in between. After the second
+/// checkpoint, `_last_checkpoint` advances to the latest version, the fresh snapshot
+/// loads from that checkpoint with no trailing commits, and the scan returns the union
+/// of both write phases.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_sidecar_consecutive_checkpoints() -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+
+    let schema = get_simple_schema();
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema.clone(),
+        engine.as_ref(),
+        &[("delta.feature.v2Checkpoint", "supported")],
+    )?;
+
+    let spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: Some(1),
+    });
+
+    // === Phase 1: write [1, 2] and [3, 4], then checkpoint. ===
+    let snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        simple_id_batch(&schema, vec![1, 2]),
+        HashMap::new(),
+    )
+    .await?;
+    let snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        simple_id_batch(&schema, vec![3, 4]),
+        HashMap::new(),
+    )
+    .await?;
+    let v_first = snapshot.version();
+    snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+    assert_eq!(
+        read_last_checkpoint(&table_path)["version"].as_u64(),
+        Some(v_first),
+        "_last_checkpoint should point to the first checkpoint"
+    );
+
+    // === Phase 2: write [5, 6] and [7, 8] from a fresh snapshot, then checkpoint again. ===
+    let after_first_ckpt = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = write_batch_to_table(
+        &after_first_ckpt,
+        engine.as_ref(),
+        simple_id_batch(&schema, vec![5, 6]),
+        HashMap::new(),
+    )
+    .await?;
+    let snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        simple_id_batch(&schema, vec![7, 8]),
+        HashMap::new(),
+    )
+    .await?;
+    let v_second = snapshot.version();
+    snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+
+    // === Validate _last_checkpoint advanced and reflects all 4 add files. ===
+    let last = read_last_checkpoint(&table_path);
+    assert_eq!(last["version"].as_u64(), Some(v_second));
+    assert_eq!(last["numOfAddFiles"].as_i64(), Some(4));
+
+    // === Fresh snapshot loads from the second checkpoint with no trailing commits. ===
+    let fresh = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(fresh.version(), v_second);
+    let log_segment = fresh.log_segment();
+    assert_eq!(log_segment.checkpoint_version, Some(v_second));
+    assert!(
+        log_segment.listed.ascending_commit_files.is_empty(),
+        "no commit files should remain after the second checkpoint"
+    );
+
+    // === Scan returns all 8 ids written across both phases. ===
+    let scan = fresh.scan_builder().build()?;
+    let batches = read_scan(&scan, engine.clone() as Arc<dyn delta_kernel::Engine>)?;
+    #[rustfmt::skip]
+    let expected = vec![
+        "+----+",
+        "| id |",
+        "+----+",
+        "| 1  |",
+        "| 2  |",
+        "| 3  |",
+        "| 4  |",
+        "| 5  |",
+        "| 6  |",
+        "| 7  |",
+        "| 8  |",
+        "+----+",
+    ];
+    assert_batches_sorted_eq!(expected, &batches);
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CrossFeature {
+    ColumnMapping,
+    Partitioned,
+    Clustered,
+    DeletionVectors,
+}
+
+/// Schema shared across all `CrossFeature` variants: `id: int, value: string,
+/// region: string`. The `region` column is used as the partition column in the
+/// `Partitioned` variant; `id` is the clustering column in the `Clustered` variant.
+fn cross_feature_schema() -> Arc<StructType> {
+    Arc::new(
+        StructType::try_new(vec![
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("value", DataType::STRING),
+            StructField::nullable("region", DataType::STRING),
+        ])
+        .unwrap(),
+    )
+}
+
+/// Creates a V2 table for the given `feature` and writes 3 commits totaling 6 rows
+/// across 3 distinct `region` values, returning the post-write snapshot. All variants
+/// share [`cross_feature_schema`] so the post-checkpoint scan can be asserted with the
+/// same expected output.
+async fn build_v2_table_with_feature<E: TaskExecutor>(
+    table_path: &str,
+    table_url: &url::Url,
+    engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
+    feature: CrossFeature,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let schema = cross_feature_schema();
+
+    let mut props: Vec<(&str, &str)> = vec![("delta.feature.v2Checkpoint", "supported")];
+    let layout = match feature {
+        CrossFeature::ColumnMapping => {
+            // As we are verifying sidecar works with column mapping, either name or id mode
+            // is acceptable here.
+            props.push(("delta.columnMapping.mode", "name"));
+            None
+        }
+        CrossFeature::Partitioned => Some(DataLayout::partitioned(["region"])),
+        CrossFeature::Clustered => Some(DataLayout::clustered(["id"])),
+        CrossFeature::DeletionVectors => {
+            props.push(("delta.feature.deletionVectors", "supported"));
+            None
+        }
+    };
+
+    let mut builder =
+        create_table(table_path, schema.clone(), "Test/1.0").with_table_properties(props);
+    if let Some(layout) = layout {
+        builder = builder.with_data_layout(layout);
+    }
+    let _ = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // For partitioned tables, the data batches must NOT include the partition column --
+    // the partition value is supplied separately in `partition_values`.
+    let partitioned = matches!(feature, CrossFeature::Partitioned);
+    let data_arrow_schema = if partitioned {
+        Arc::new(ArrowSchema::try_from_kernel(&StructType::try_new(vec![
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("value", DataType::STRING),
+        ])?)?)
+    } else {
+        Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?)
+    };
+
+    let writes: [(&str, Vec<i32>, Vec<&str>); 3] = [
+        ("east", vec![1, 2], vec!["a", "b"]),
+        ("west", vec![3, 4], vec!["c", "d"]),
+        ("north", vec![5, 6], vec!["e", "f"]),
+    ];
+
+    let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    for (region, ids, values) in writes {
+        let id_arr: ArrayRef = Arc::new(Int32Array::from(ids.clone()));
+        let val_arr: ArrayRef = Arc::new(StringArray::from(values));
+        let columns: Vec<ArrayRef> = if partitioned {
+            vec![id_arr, val_arr]
+        } else {
+            let region_arr: ArrayRef = Arc::new(StringArray::from(vec![region; ids.len()]));
+            vec![id_arr, val_arr, region_arr]
+        };
+        let batch = RecordBatch::try_new(data_arrow_schema.clone(), columns)?;
+        let pv = if partitioned {
+            HashMap::from([("region".to_string(), Scalar::from(region))])
+        } else {
+            HashMap::new()
+        };
+        snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, pv).await?;
+    }
+
+    Ok(snapshot)
 }

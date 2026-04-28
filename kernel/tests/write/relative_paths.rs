@@ -3,14 +3,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::Snapshot;
 use test_utils::{
@@ -18,17 +15,7 @@ use test_utils::{
 };
 use url::Url;
 
-fn get_simple_schema() -> SchemaRef {
-    Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap())
-}
-
-fn simple_id_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
-    RecordBatch::try_new(
-        Arc::new(schema.as_ref().try_into_arrow().unwrap()),
-        vec![Arc::new(Int32Array::from(values))],
-    )
-    .unwrap()
-}
+use super::common::write_utils::{get_simple_schema, simple_id_batch};
 
 /// Helper to write a batch and return the post-commit snapshot.
 async fn write_batch_to_table_simple(

@@ -48,9 +48,7 @@ pub fn simple_id_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
 }
 
 /// Finds the checkpoint parquet file in the `_delta_log` directory for a given version.
-/// Recognizes all checkpoint filename variants (V1 single-part, V1 multi-part, V2 classic-named,
-/// V2 UUID-named) via [`ParsedLogPath`].
-pub fn load_checkpoint_path(table_path: &str, version: u64) -> std::path::PathBuf {
+pub fn load_existing_checkpoint_path(table_path: &str, version: u64) -> std::path::PathBuf {
     let log_dir = std::path::Path::new(table_path).join("_delta_log");
     for entry in std::fs::read_dir(&log_dir).expect("failed to read _delta_log") {
         let entry = entry.unwrap();

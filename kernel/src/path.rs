@@ -26,6 +26,8 @@ const DELTA_LOG_DIR: &str = "_delta_log";
 const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
 /// The subdirectory name within the delta log where staged commits reside
 const STAGED_COMMITS_DIR: &str = "_staged_commits/";
+/// The subdirectory name within the delta log where checkpoint sidecars reside
+const SIDECAR_DIR_WITH_SLASH: &str = "_sidecars/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
@@ -404,15 +406,11 @@ impl ParsedLogPath<Url> {
     }
 }
 
-const SIDECAR_DIR_WITH_SLASH: &str = "_sidecars/";
-
-/// Per the protocol, a checkpoint sidecar is a uniquely-named parquet file:
-/// `{unique}.parquet` where `unique` is some unique string such as a UUID.
-/// We use `<version>.checkpoint.<uuid>.parquet` here.
+/// A checkpoint sidecar is a uniquely-named parquet file: `{unique}.parquet` where `unique` is
+/// some unique string such as a UUID. We use `<version>.checkpoint.<uuid>.parquet` here.
 ///
-/// Per the protocol, sidecar path should be URI-encoded.
-/// All characters in the filename here are Unreserved Characters, so we can just
-/// retain them. Ref: <https://www.ietf.org/rfc/rfc2396.txt>
+/// Sidecar paths should be URI-encoded. All characters in the filename here are Unreserved
+/// Characters, so we can just retain them. Ref: <https://www.ietf.org/rfc/rfc2396.txt>
 pub(crate) fn new_sidecar(table_root: &Url, version: Version) -> DeltaResult<(String, Url)> {
     let filename = format!("{version:020}.checkpoint.{}.parquet", Uuid::new_v4());
     let url = table_root
