@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
@@ -11,58 +11,55 @@ use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
-use crate::metrics::{MetricEvent, MetricsReporter};
+use crate::metrics::reporter::{
+    COPY_COMPLETED_NAME, LIST_COMPLETED_NAME, READ_COMPLETED_NAME, STORAGE_SPAN,
+};
 use crate::object_store::path::Path;
 use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
-/// Iterator wrapper that emits metrics when exhausted
+/// Stream wrapper that emits a storage metric span when dropped.
 ///
-/// Generic over the inner iterator type and item type.
+/// The span is always emitted on the thread that drops this iterator, which is the caller's
+/// thread.
+///
+/// Generic over the inner stream type and item type.
 /// The `event_fn` receives (duration, num_files, bytes_read) to construct the appropriate
 /// MetricEvent. Metrics are emitted either when the iterator is exhausted or when dropped.
 struct MetricsIterator<I, T> {
     inner: I,
-    reporter: Option<Arc<dyn MetricsReporter>>,
+    name: &'static str,
     start: Instant,
     num_files: u64,
     bytes_read: u64,
-    event_fn: fn(Duration, u64, u64) -> MetricEvent,
     _phantom: std::marker::PhantomData<T>,
 }
 
 impl<I, T> MetricsIterator<I, T> {
-    fn new(
-        inner: I,
-        reporter: Option<Arc<dyn MetricsReporter>>,
-        start: Instant,
-        event_fn: fn(Duration, u64, u64) -> MetricEvent,
-    ) -> Self {
+    fn new(inner: I, name: &'static str, start: Instant) -> Self {
         Self {
             inner,
-            reporter,
+            name,
             start,
             num_files: 0,
             bytes_read: 0,
-            event_fn,
             _phantom: std::marker::PhantomData,
-        }
-    }
-
-    fn emit_metrics_once(&mut self) {
-        if let Some(r) = self.reporter.take() {
-            r.report((self.event_fn)(
-                self.start.elapsed(),
-                self.num_files,
-                self.bytes_read,
-            ));
         }
     }
 }
 
 impl<I, T> Drop for MetricsIterator<I, T> {
     fn drop(&mut self) {
-        self.emit_metrics_once();
+        let duration = self.start.elapsed();
+        let _span = tracing::span!(
+            tracing::Level::INFO,
+            STORAGE_SPAN,
+            report = tracing::field::Empty,
+            name = self.name,
+            num_files = self.num_files,
+            bytes_read = self.bytes_read,
+            duration = duration.as_nanos() as u64,
+        );
     }
 }
 
@@ -80,10 +77,7 @@ where
                 }
                 Poll::Ready(Some(item))
             }
-            None => {
-                self.emit_metrics_once();
-                Poll::Ready(None)
-            }
+            None => Poll::Ready(None),
         }
     }
 }
@@ -103,10 +97,7 @@ where
                 }
                 Poll::Ready(Some(item))
             }
-            None => {
-                self.emit_metrics_once();
-                Poll::Ready(None)
-            }
+            None => Poll::Ready(None),
         }
     }
 }
@@ -115,21 +106,15 @@ where
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
     inner: Arc<DynObjectStore>,
     task_executor: Arc<E>,
-    reporter: Option<Arc<dyn MetricsReporter>>,
     readahead: usize,
 }
 
 impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
     #[internal_api]
-    pub(crate) fn new(
-        store: Arc<DynObjectStore>,
-        task_executor: Arc<E>,
-        reporter: Option<Arc<dyn MetricsReporter>>,
-    ) -> Self {
+    pub(crate) fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             inner: store,
             task_executor,
-            reporter,
             readahead: 10,
         }
     }
@@ -145,7 +130,6 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
-    reporter: Option<Arc<dyn MetricsReporter>>,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
     let start = Instant::now();
 
@@ -185,24 +169,16 @@ async fn list_from_impl(
         // Local filesystem doesn't return sorted list - need to collect and sort
         let mut items: Vec<_> = stream.try_collect().await?;
         items.sort_unstable();
-
-        if let Some(r) = reporter {
-            r.report(MetricEvent::StorageListCompleted {
-                duration: start.elapsed(),
-                num_files: items.len() as u64,
-            });
-        }
-        Ok(Box::pin(stream::iter(items.into_iter().map(Ok))))
-    } else {
+        // Wrap in MetricsIterator so the metric fires in Drop on the caller's thread
+        // (not here on the background thread where no tracing subscriber is installed).
         let stream = MetricsIterator::new(
-            stream,
-            reporter,
+            stream::iter(items.into_iter().map(Ok::<FileMeta, crate::Error>)),
+            LIST_COMPLETED_NAME,
             start,
-            |duration, num_files, _bytes_read| MetricEvent::StorageListCompleted {
-                duration,
-                num_files,
-            },
         );
+        Ok(Box::pin(stream))
+    } else {
+        let stream = MetricsIterator::new(stream, LIST_COMPLETED_NAME, start);
         Ok(Box::pin(stream))
     }
 }
@@ -212,7 +188,6 @@ async fn read_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileSlice>,
     readahead: usize,
-    reporter: Option<Arc<dyn MetricsReporter>>,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Bytes>>> {
     let start = Instant::now();
     let files = stream::iter(files).map(move |(url, range)| {
@@ -247,13 +222,8 @@ async fn read_files_impl(
     // buffer the results. This allows us to achieve async concurrency.
     Ok(Box::pin(MetricsIterator::new(
         files.buffered(readahead),
-        reporter,
+        READ_COMPLETED_NAME,
         start,
-        |duration, num_files, bytes_read| MetricEvent::StorageReadCompleted {
-            duration,
-            num_files,
-            bytes_read,
-        },
     )))
 }
 
@@ -262,7 +232,6 @@ async fn copy_atomic_impl(
     store: Arc<DynObjectStore>,
     src_path: Path,
     dest_path: Path,
-    reporter: Option<Arc<dyn MetricsReporter>>,
 ) -> DeltaResult<()> {
     let start = Instant::now();
 
@@ -273,12 +242,14 @@ async fn copy_atomic_impl(
     let result = store
         .put_opts(&dest_path, data.into(), PutMode::Create.into())
         .await;
-
-    if let Some(r) = reporter {
-        r.report(MetricEvent::StorageCopyCompleted {
-            duration: start.elapsed(),
-        });
-    }
+    let duration = start.elapsed();
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        "storage",
+        report = tracing::field::Empty,
+        name = COPY_COMPLETED_NAME,
+        duration = duration.as_nanos() as u64,
+    );
 
     result.map_err(|e| match e {
         object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(dest_path.into()),
@@ -322,7 +293,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        let future = list_from_impl(self.inner.clone(), path.clone(), self.reporter.clone());
+        let future = list_from_impl(self.inner.clone(), path.clone());
         let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
@@ -337,12 +308,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
-        let future = read_files_impl(
-            self.inner.clone(),
-            files,
-            self.readahead,
-            self.reporter.clone(),
-        );
+        let future = read_files_impl(self.inner.clone(), files, self.readahead);
         let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
@@ -356,12 +322,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
         let src_path = Path::from_url_path(src.path())?;
         let dest_path = Path::from_url_path(dest.path())?;
-        let future = copy_atomic_impl(
-            self.inner.clone(),
-            src_path,
-            dest_path,
-            self.reporter.clone(),
-        );
+        let future = copy_atomic_impl(self.inner.clone(), src_path, dest_path);
         self.task_executor.block_on(future)
     }
 
@@ -424,7 +385,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = ObjectStoreStorageHandler::new(store.clone(), executor, None);
+        let handler = ObjectStoreStorageHandler::new(store.clone(), executor);
         (tmp, store, handler)
     }
 
@@ -471,7 +432,7 @@ mod tests {
 
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor, None);
+        let storage = ObjectStoreStorageHandler::new(store, executor);
 
         let mut slices: Vec<FileSlice> = Vec::new();
 

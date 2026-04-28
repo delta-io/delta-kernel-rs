@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, RecordBatchReader, StringArray,
+    StructArray,
 };
 use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
@@ -21,9 +22,11 @@ mod common;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
+use common::write_utils::{get_simple_schema, load_checkpoint_path, simple_id_batch};
 use itertools::Itertools;
 use test_utils::{
-    insert_data, load_test_data, read_scan, test_table_setup_mt, write_batch_to_table,
+    create_table_and_load_snapshot, insert_data, load_test_data, read_scan, test_table_setup_mt,
+    write_batch_to_table,
 };
 
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
@@ -833,20 +836,6 @@ fn read_parquet_file(path: &std::path::Path) -> RecordBatch {
     concat_batches(&schema, &batches).expect("failed to concat batches")
 }
 
-/// Finds the checkpoint parquet file in the `_delta_log` directory for a given version.
-fn load_checkpoint_path(table_path: &str, version: u64) -> std::path::PathBuf {
-    let log_dir = std::path::Path::new(table_path).join("_delta_log");
-    let prefix = format!("{version:020}.checkpoint");
-    for entry in std::fs::read_dir(&log_dir).expect("failed to read _delta_log") {
-        let entry = entry.unwrap();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(&prefix) && name.ends_with(".parquet") {
-            return entry.path();
-        }
-    }
-    panic!("checkpoint parquet file not found for version {version} in {log_dir:?}");
-}
-
 /// Reads the `_last_checkpoint` JSON file from the table's `_delta_log` directory.
 fn read_last_checkpoint(table_path: &str) -> serde_json::Value {
     let path = std::path::Path::new(table_path).join("_delta_log/_last_checkpoint");
@@ -1212,4 +1201,54 @@ async fn create_partitioned_stats_table<
     .await?;
 
     Ok(snapshot2)
+}
+
+/// On a V2 table (table with `v2Checkpoint` feature), passing either `None` or
+/// `Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))` to `snapshot.checkpoint()` produces
+/// a V2 classic checkpoint with no sidecars.
+#[rstest::rstest]
+#[case::none(None)]
+#[case::v2_no_sidecar(Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_snapshot_checkpoint_default_on_v2_table(
+    #[case] spec: Option<CheckpointSpec>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_schema();
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let mut snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema.clone(),
+        engine.as_ref(),
+        &[("delta.feature.v2Checkpoint", "supported")],
+    )?;
+
+    snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        simple_id_batch(&schema, vec![1, 2]),
+        HashMap::new(),
+    )
+    .await?;
+
+    let version = snapshot.version();
+    snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
+
+    let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
+    assert!(
+        !sidecars_dir.exists(),
+        "_sidecars directory should not exist for a no-sidecar V2 checkpoint, found: {}",
+        sidecars_dir.display()
+    );
+
+    // V2 checkpoint must contain a `checkpointMetadata` column.
+    let ckpt_path = load_checkpoint_path(&table_path, version);
+    let file = std::fs::File::open(&ckpt_path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let schema = reader.schema();
+    assert!(
+        schema.field_with_name("checkpointMetadata").is_ok(),
+        "V2 checkpoint must contain `checkpointMetadata` column, found schema: {schema:?}"
+    );
+
+    Ok(())
 }

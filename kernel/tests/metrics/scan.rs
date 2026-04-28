@@ -29,7 +29,7 @@ fn scan_execute_contributes_parquet_data_file_reads() -> DeltaResult<()> {
         .with_data(1, 1)
         .build()?;
 
-    let (engine, reporter) = measuring_engine(table.store().clone());
+    let (engine, reporter, _guard) = measuring_engine(table.store().clone());
     let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
 
     // Reset after snapshot build to isolate scan I/O

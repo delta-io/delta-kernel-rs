@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::process::ExitCode;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use clap::{Parser, Subcommand};
 use common::{LocationArgs, ParseWithExamples};
@@ -14,10 +14,13 @@ use delta_kernel::actions::{
 };
 use delta_kernel::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use delta_kernel::expressions::ColumnName;
+use delta_kernel::metrics::{LoggingMetricsReporter, WithMetricsReporterLayer};
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
 use delta_kernel::{DeltaResult, Error, Snapshot};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -49,7 +52,14 @@ enum Commands {
 }
 
 fn main() -> ExitCode {
-    env_logger::init();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NONE),
+        )
+        .with_metrics_reporter_layer(Arc::new(LoggingMetricsReporter::new(tracing::Level::INFO)))
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     match try_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

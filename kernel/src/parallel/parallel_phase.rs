@@ -125,6 +125,8 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
     use url::Url;
 
     use super::*;
@@ -133,6 +135,7 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
+    use crate::metrics::{MetricEvent, ScanType, WithMetricsReporterLayer};
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -144,7 +147,7 @@ mod tests {
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::{load_test_table, parse_json_batch};
+    use crate::utils::test_utils::{load_test_table, parse_json_batch, CapturingReporter};
     use crate::{PredicateRef, SnapshotRef};
 
     // ============================================================
@@ -941,6 +944,105 @@ mod tests {
             "Parallel workflow with skip_stats=true should return same files as single-node scan_metadata"
         );
 
+        Ok(())
+    }
+
+    /// Sequential-only tables (single-part checkpoint, no sidecars) emit exactly one
+    /// `ScanMetadataCompleted` event with `ScanType::SequentialPhase` when `finish()` is called.
+    #[test]
+    fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> DeltaResult<()> {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = tracing_subscriber::registry()
+            .with_metrics_reporter_layer(reporter.clone())
+            .set_default();
+
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let scan = snapshot.scan_builder().build()?;
+        let mut sequential = scan.parallel_scan_metadata(engine)?;
+        for result in sequential.by_ref() {
+            result?;
+        }
+        assert!(matches!(
+            sequential.finish()?,
+            AfterSequentialScanMetadata::Done
+        ));
+
+        let events = reporter.events();
+        let scan_events: Vec<&ScanType> = events
+            .iter()
+            .filter_map(|e| match e {
+                MetricEvent::ScanMetadataCompleted { scan_type, .. } => Some(scan_type),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            scan_events.len(),
+            1,
+            "expected exactly one ScanMetadataCompleted event"
+        );
+        assert_eq!(*scan_events[0], ScanType::SequentialPhase);
+        Ok(())
+    }
+
+    /// Tables with v2 checkpoint sidecars go through both phases and emit two
+    /// `ScanMetadataCompleted` events. The `operation_id` must be the same on both
+    /// events so callers can correlate them.
+    #[test]
+    fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> DeltaResult<()> {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = tracing_subscriber::registry()
+            .with_metrics_reporter_layer(reporter.clone())
+            .set_default();
+
+        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+        let scan = snapshot.scan_builder().build()?;
+        let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
+        for result in sequential.by_ref() {
+            result?;
+        }
+
+        let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? else {
+            panic!("expected parallel phase for v2-checkpoints-json-with-sidecars");
+        };
+
+        let seq_op_id = reporter
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                MetricEvent::ScanMetadataCompleted {
+                    operation_id,
+                    scan_type: ScanType::SequentialPhase,
+                    ..
+                } => Some(operation_id),
+                _ => None,
+            })
+            .expect("expected SequentialPhase ScanMetadataCompleted event after finish()");
+
+        let final_state = Arc::new(*state);
+        let mut parallel = ParallelScanMetadata::try_new(engine, final_state.clone(), files)?;
+        for result in parallel.by_ref() {
+            result?;
+        }
+        final_state.log_metrics();
+
+        let par_op_id = reporter
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                MetricEvent::ScanMetadataCompleted {
+                    operation_id,
+                    scan_type: ScanType::ParallelPhase,
+                    ..
+                } => Some(operation_id),
+                _ => None,
+            })
+            .expect("expected ParallelPhase ScanMetadataCompleted event after log_metrics()");
+
+        assert_eq!(
+            seq_op_id, par_op_id,
+            "sequential and parallel ScanMetadataCompleted events must share the same operation_id"
+        );
         Ok(())
     }
 }

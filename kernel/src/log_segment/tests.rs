@@ -114,8 +114,7 @@ async fn build_log_with_paths_and_checkpoint(
             .expect("Write _last_checkpoint");
     }
 
-    let storage =
-        ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), None);
+    let storage = ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
@@ -2007,8 +2006,7 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
         .await
         .expect("put empty compaction");
 
-    let storage =
-        ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), None);
+    let storage = ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
 
@@ -2533,9 +2531,14 @@ async fn test_latest_commit_file_field_is_captured() {
     )
     .await;
 
-    let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
-            .unwrap();
+    let log_segment = LogSegment::for_snapshot(
+        storage.as_ref(),
+        log_root.clone(),
+        vec![],
+        None,
+        MetricId::default(),
+    )
+    .unwrap();
 
     // The latest commit should be version 5
     assert_eq!(log_segment.listed.latest_commit_file.unwrap().version, 5);
@@ -2561,9 +2564,14 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
     )
     .await;
 
-    let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
-            .unwrap();
+    let log_segment = LogSegment::for_snapshot(
+        storage.as_ref(),
+        log_root.clone(),
+        vec![],
+        None,
+        MetricId::default(),
+    )
+    .unwrap();
 
     // The latest commit should be version 4
     assert_eq!(log_segment.listed.latest_commit_file.unwrap().version, 4);
@@ -2583,9 +2591,14 @@ async fn test_latest_commit_file_with_no_commits() {
     )
     .await;
 
-    let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
-            .unwrap();
+    let log_segment = LogSegment::for_snapshot(
+        storage.as_ref(),
+        log_root.clone(),
+        vec![],
+        None,
+        MetricId::default(),
+    )
+    .unwrap();
 
     // latest_commit_file should be None when there are no commits
     assert!(log_segment.listed.latest_commit_file.is_none());
@@ -2608,9 +2621,14 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
     )
     .await;
 
-    let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
-            .unwrap();
+    let log_segment = LogSegment::for_snapshot(
+        storage.as_ref(),
+        log_root.clone(),
+        vec![],
+        None,
+        MetricId::default(),
+    )
+    .unwrap();
 
     // The latest commit should be version 1 (saved before filtering)
     assert_eq!(log_segment.listed.latest_commit_file.unwrap().version, 1);
@@ -2635,9 +2653,14 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
     )
     .await;
 
-    let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
-            .unwrap();
+    let log_segment = LogSegment::for_snapshot(
+        storage.as_ref(),
+        log_root.clone(),
+        vec![],
+        None,
+        MetricId::default(),
+    )
+    .unwrap();
 
     // latest_commit_file should be None since there's no commit at the checkpoint version
     assert!(log_segment.listed.latest_commit_file.is_none());
@@ -4008,31 +4031,54 @@ async fn test_try_new_with_checkpoint_rejects_invalid_path(
 }
 
 #[rstest]
-#[case::classic_parquet("file:///_delta_log/00000000000000000002.checkpoint.parquet")]
-#[case::v2_uuid(
-    "file:///_delta_log/00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet"
-)]
+#[case::no_crc(None, None)]
+#[case::stale_crc_cleared(Some(1), None)]
+#[case::crc_at_checkpoint_retained(Some(2), Some(2))]
 #[tokio::test]
-async fn test_try_new_with_checkpoint_sets_checkpoint_and_clears_commits(#[case] path: &str) {
-    let log_segment = create_segment_for(LogSegmentConfig {
+async fn test_try_new_with_checkpoint(
+    #[values(
+        "checkpoint.parquet",
+        "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet"
+    )]
+    ckpt_suffix: &str,
+    #[case] crc_version: Option<u64>,
+    #[case] expected_crc_version: Option<u64>,
+) {
+    const CHECKPOINT_VERSION: u64 = 2;
+    let ckpt_url = format!("file:///_delta_log/{CHECKPOINT_VERSION:020}.{ckpt_suffix}");
+
+    let mut log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &[0, 1, 2],
         compaction_versions: &[(0, 2)],
         ..Default::default()
     })
     .await;
+    if let Some(v) = crc_version {
+        // Bypass try_new_with_crc_file's end_version check so we can plant a stale CRC.
+        log_segment.listed.latest_crc_file =
+            Some(create_log_path(&format!("file:///_delta_log/{v:020}.crc")));
+    }
     assert!(!log_segment.listed.ascending_commit_files.is_empty());
     // TODO(#2337): restore to assert !is_empty() when log compaction is re-enabled
     assert!(log_segment.listed.ascending_compaction_files.is_empty());
 
-    let ckpt_path = create_log_path(path);
-    let result = log_segment.try_new_with_checkpoint(ckpt_path).unwrap();
+    let result = log_segment
+        .try_new_with_checkpoint(create_log_path(&ckpt_url))
+        .unwrap();
 
-    assert_eq!(result.checkpoint_version, Some(2));
+    assert_eq!(result.checkpoint_version, Some(CHECKPOINT_VERSION));
     assert_eq!(result.listed.checkpoint_parts.len(), 1);
-    assert_eq!(result.listed.checkpoint_parts[0].version, 2);
+    assert_eq!(
+        result.listed.checkpoint_parts[0].version,
+        CHECKPOINT_VERSION
+    );
     assert!(result.listed.ascending_commit_files.is_empty());
     assert!(result.listed.ascending_compaction_files.is_empty());
     assert!(result.last_checkpoint_hint_summary().is_none());
+    assert_eq!(
+        result.listed.latest_crc_file.as_ref().map(|c| c.version),
+        expected_crc_version
+    );
 
     // latest_commit_file is preserved for ICT access even though commits are cleared
     assert_eq!(

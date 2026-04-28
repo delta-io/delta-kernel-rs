@@ -52,8 +52,8 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 strum = { version = "0.27", features = ["derive"] }
 thiserror = "2"
-# only for structured logging
 tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = "0.3"
 url = "2"
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
@@ -161,3 +161,12 @@ harness = false
 [[bench]]
 name = "expression_bench"
 harness = false
+
+# Consolidated write-path integration tests. Linking each integration test as a
+# separate binary is expensive (every binary re-links Arrow, Parquet, and the
+# default engine), so all write tests share a single binary whose entry point
+# is `tests/write/main.rs` and whose topics live as modules under that
+# directory.
+[[test]]
+name = "write"
+path = "tests/write/main.rs"
