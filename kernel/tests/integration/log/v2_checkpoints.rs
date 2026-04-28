@@ -18,9 +18,7 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 
-mod common;
-
-use common::write_utils::{
+use crate::common::write_utils::{
     get_simple_schema, load_existing_single_file_checkpoint_path, simple_id_batch,
 };
 use delta_kernel::arrow::datatypes::{

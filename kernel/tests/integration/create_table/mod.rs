@@ -470,6 +470,13 @@ async fn test_create_table_txn_debug() -> DeltaResult<()> {
 #[case("appendOnly", TableFeature::AppendOnly, false, false)]
 #[case("changeDataFeed", TableFeature::ChangeDataFeed, false, false)]
 #[case("rowTracking", TableFeature::RowTracking, false, false)]
+// WriterOnly features (AlwaysIfSupported)
+#[case(
+    "materializePartitionColumns",
+    TableFeature::MaterializePartitionColumns,
+    false,
+    true
+)]
 fn test_create_table_with_feature_signal(
     #[case] feature_name: &str,
     #[case] feature: TableFeature,

@@ -7,9 +7,7 @@ use delta_kernel::checkpoint::CheckpointSpec;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use test_utils::{create_table_and_load_snapshot, test_table_setup_mt, write_batch_to_table};
 
-mod common;
-
-use common::write_utils::{
+use crate::common::write_utils::{
     get_simple_schema, load_existing_single_file_checkpoint_path, simple_id_batch,
 };
 

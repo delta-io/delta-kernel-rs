@@ -15,7 +15,7 @@ use test_utils::{
 };
 use url::Url;
 
-use super::common::write_utils::{get_simple_schema, simple_id_batch};
+use crate::common::write_utils::{get_simple_schema, simple_id_batch};
 
 /// Helper to write a batch and return the post-commit snapshot.
 async fn write_batch_to_table_simple(
