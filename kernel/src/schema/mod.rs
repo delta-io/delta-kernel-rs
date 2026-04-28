@@ -1722,9 +1722,9 @@ pub enum PrimitiveType {
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
     #[serde(serialize_with = "serialize_geometry", untagged)]
-    Geometry(GeometryType),
+    Geometry(Box<GeometryType>),
     #[serde(serialize_with = "serialize_geography", untagged)]
-    Geography(GeographyType),
+    Geography(Box<GeographyType>),
 }
 
 impl PrimitiveType {
@@ -1870,14 +1870,15 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                     .map(PrimitiveType::Decimal)
                     .map_err(serde::de::Error::custom)
             }
-            "geometry" => Ok(PrimitiveType::Geometry(GeometryType::default())),
+            "geometry" => Ok(PrimitiveType::Geometry(Box::default())),
             geo_str if geo_str.starts_with("geometry(") && geo_str.ends_with(')') => {
                 let srid = &geo_str[9..geo_str.len() - 1];
                 GeometryType::try_new(srid.trim())
+                    .map(Box::new)
                     .map(PrimitiveType::Geometry)
                     .map_err(serde::de::Error::custom)
             }
-            "geography" => Ok(PrimitiveType::Geography(GeographyType::default())),
+            "geography" => Ok(PrimitiveType::Geography(Box::default())),
             geo_str if geo_str.starts_with("geography(") && geo_str.ends_with(')') => {
                 let inner = &geo_str[10..geo_str.len() - 1];
                 // Three accepted shapes:
@@ -1891,6 +1892,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                         let algorithm: EdgeInterpolationAlgorithm =
                             algo_str.parse().map_err(serde::de::Error::custom)?;
                         GeographyType::try_new(srid, algorithm)
+                            .map(Box::new)
                             .map(PrimitiveType::Geography)
                             .map_err(serde::de::Error::custom)
                     }
@@ -1898,12 +1900,14 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                         let trimmed = inner.trim();
                         if trimmed.contains(':') {
                             GeographyType::try_new_with_srid(trimmed)
+                                .map(Box::new)
                                 .map(PrimitiveType::Geography)
                                 .map_err(serde::de::Error::custom)
                         } else {
                             let algorithm: EdgeInterpolationAlgorithm =
                                 trimmed.parse().map_err(serde::de::Error::custom)?;
                             GeographyType::try_new_with_algorithm(algorithm)
+                                .map(Box::new)
                                 .map(PrimitiveType::Geography)
                                 .map_err(serde::de::Error::custom)
                         }
@@ -1972,7 +1976,7 @@ impl From<DecimalType> for DataType {
 }
 impl From<GeometryType> for PrimitiveType {
     fn from(gtype: GeometryType) -> Self {
-        PrimitiveType::Geometry(gtype)
+        PrimitiveType::Geometry(Box::new(gtype))
     }
 }
 impl From<GeometryType> for DataType {
@@ -1982,7 +1986,7 @@ impl From<GeometryType> for DataType {
 }
 impl From<GeographyType> for PrimitiveType {
     fn from(gtype: GeographyType) -> Self {
-        PrimitiveType::Geography(gtype)
+        PrimitiveType::Geography(Box::new(gtype))
     }
 }
 impl From<GeographyType> for DataType {
@@ -2486,9 +2490,9 @@ mod tests {
         let field: StructField = serde_json::from_str(data).unwrap();
         assert_eq!(
             field.data_type,
-            DataType::Primitive(PrimitiveType::Geometry(
+            DataType::Primitive(PrimitiveType::Geometry(Box::new(
                 GeometryType::try_new("EPSG:4326").unwrap()
-            ))
+            )))
         );
 
         let json_str = serde_json::to_string(&field).unwrap();
@@ -2511,9 +2515,9 @@ mod tests {
         let field: StructField = serde_json::from_str(data).unwrap();
         assert_eq!(
             field.data_type,
-            DataType::Primitive(PrimitiveType::Geography(
+            DataType::Primitive(PrimitiveType::Geography(Box::new(
                 GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Vincenty).unwrap()
-            ))
+            )))
         );
 
         let json_str = serde_json::to_string(&field).unwrap();
@@ -2640,27 +2644,27 @@ mod tests {
     }
 
     #[rstest]
-    #[case("geometry", PrimitiveType::Geometry(GeometryType::default()))]
-    #[case("geography", PrimitiveType::Geography(GeographyType::default()))]
+    #[case("geometry", PrimitiveType::Geometry(Box::default()))]
+    #[case("geography", PrimitiveType::Geography(Box::default()))]
     #[case(
         "geometry(EPSG:4326)",
-        PrimitiveType::Geometry(GeometryType::try_new("EPSG:4326").unwrap())
+        PrimitiveType::Geometry(Box::new(GeometryType::try_new("EPSG:4326").unwrap()))
     )]
     #[case(
         "geography(EPSG:4326)",
-        PrimitiveType::Geography(GeographyType::try_new_with_srid("EPSG:4326").unwrap())
+        PrimitiveType::Geography(Box::new(GeographyType::try_new_with_srid("EPSG:4326").unwrap()))
     )]
     #[case(
         "geography(EPSG:4326, vincenty)",
-        PrimitiveType::Geography(
+        PrimitiveType::Geography(Box::new(
             GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Vincenty).unwrap()
-        )
+        ))
     )]
     #[case(
         "geography(vincenty)",
-        PrimitiveType::Geography(
+        PrimitiveType::Geography(Box::new(
             GeographyType::try_new_with_algorithm(EdgeInterpolationAlgorithm::Vincenty).unwrap()
-        )
+        ))
     )]
     fn test_geo_deserialize_defaults(#[case] type_str: &str, #[case] expected: PrimitiveType) {
         let json = format!(r#"{{"name":"g","type":"{type_str}","nullable":true,"metadata":{{}}}}"#);
