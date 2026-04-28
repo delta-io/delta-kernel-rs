@@ -551,9 +551,10 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
         "app.analytics domain metadata should be preserved across checkpoint"
     );
 
-    // === Step 8: Scan and verify data correctness (9 rows: ids 9-17) ===
+    // === Step 8: Scan and verify data correctness ===
     let scan = fresh_snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine.clone() as Arc<dyn delta_kernel::Engine>)?;
+    // Note: The data is sorted in lexicographical order. So id 9 appears at last.
     assert_batches_sorted_eq!(
         vec![
             "+----+---------------+",
