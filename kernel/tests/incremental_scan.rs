@@ -404,6 +404,158 @@ async fn metadata_only_commit_in_range() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+// === DV-aware dedup ===
+// The kernel's dedup key is `(path, dv_unique_id)`, where `dv_unique_id` is built from
+// `(storageType, pathOrInlineDv, offset)`. These tests construct raw commit JSON
+// (TestAction doesn't emit DV-bearing Adds) to exercise the DV cases.
+
+const ACTION_METADATA: &str = "{\"metaData\":{\"id\":\"test-id\",\"format\":{\"provider\":\"parquet\",\"options\":{}},\"schemaString\":\"{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[]}\",\"partitionColumns\":[],\"configuration\":{},\"createdTime\":1700000000000}}\n{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\"]}}";
+
+fn add_with_dv(path: &str, storage_type: &str, path_or_inline: &str, offset: i32) -> String {
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":null,\"tags\":null,\"deletionVector\":{{\"storageType\":\"{storage_type}\",\"pathOrInlineDv\":\"{path_or_inline}\",\"offset\":{offset},\"sizeInBytes\":10,\"cardinality\":1}},\"baseRowId\":null,\"defaultRowCommitVersion\":null,\"clusteringProvider\":null}}}}"
+    )
+}
+
+fn add_no_dv(path: &str) -> String {
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":null,\"tags\":null,\"deletionVector\":null,\"baseRowId\":null,\"defaultRowCommitVersion\":null,\"clusteringProvider\":null}}}}"
+    )
+}
+
+// Same path with two different DVs across commits: both rows must survive. The dedup
+// key includes dv_unique_id, so `(X, dv1)` and `(X, dv2)` are distinct and neither
+// cancels the other. This is the protocol-correct outcome for DV-update flows where
+// the file's tombstone state changes between commits.
+#[tokio::test]
+async fn same_path_different_dvs_both_survive() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(table_root, storage.as_ref(), 0, ACTION_METADATA.to_string()).await?;
+    // v1: Add(X, dv=u/abc/1)
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        add_with_dv("X.parquet", "u", "abc", 1),
+    )
+    .await?;
+    // v2: Add(X, dv=u/xyz/2) -- different DV id, distinct key.
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        2,
+        add_with_dv("X.parquet", "u", "xyz", 2),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(2)
+        .build(engine.as_ref())?;
+
+    let listing = unwrap_listing(
+        IncrementalScanBuilder::new(target, 0)
+            .build(engine.as_ref(), std::iter::empty::<&str>())?,
+    );
+
+    assert_eq!(
+        surviving_add_count(&listing),
+        2,
+        "two Adds for the same path with different DVs must both survive (distinct keys)"
+    );
+    assert!(listing.remove_files.is_empty());
+
+    Ok(())
+}
+
+// Same path with the same DV across commits: only the newest Add survives. With dedup
+// walking newest-first, the first occurrence of `(X, dv)` wins and the older copy is
+// dropped. This is the standard "duplicate Add" case.
+#[tokio::test]
+async fn same_path_same_dv_only_newest_survives() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(table_root, storage.as_ref(), 0, ACTION_METADATA.to_string()).await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        add_with_dv("X.parquet", "u", "abc", 1),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        2,
+        add_with_dv("X.parquet", "u", "abc", 1),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(2)
+        .build(engine.as_ref())?;
+
+    let listing = unwrap_listing(
+        IncrementalScanBuilder::new(target, 0)
+            .build(engine.as_ref(), std::iter::empty::<&str>())?,
+    );
+
+    assert_eq!(
+        surviving_add_count(&listing),
+        1,
+        "duplicate `(path, dv)` keys collapse to one surviving Add"
+    );
+
+    Ok(())
+}
+
+// DV-update pattern: v1 introduces the file with no DV; v2 emits Remove(X, no_dv) +
+// Add(X, dv1). The Remove has key `(X, NULL)` and cancels the v1 Add. The new Add has
+// key `(X, dv1)` -- distinct -- and survives. The consumer sees one surviving Add
+// with the new DV and one surviving Remove for the old (no-DV) version.
+#[tokio::test]
+async fn dv_update_remove_no_dv_add_with_dv() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(table_root, storage.as_ref(), 0, ACTION_METADATA.to_string()).await?;
+    // v1: Add(X) without a DV.
+    add_commit(table_root, storage.as_ref(), 1, add_no_dv("X.parquet")).await?;
+    // v2: Remove(X, no_dv) + Add(X, dv=u/abc/1).
+    let remove_no_dv = "{\"remove\":{\"path\":\"X.parquet\",\"deletionTimestamp\":1700000000000,\"dataChange\":true,\"deletionVector\":null}}".to_string();
+    let v2_actions = format!(
+        "{}\n{}",
+        remove_no_dv,
+        add_with_dv("X.parquet", "u", "abc", 1),
+    );
+    add_commit(table_root, storage.as_ref(), 2, v2_actions).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(2)
+        .build(engine.as_ref())?;
+
+    let listing = unwrap_listing(
+        IncrementalScanBuilder::new(target, 0)
+            .build(engine.as_ref(), std::iter::empty::<&str>())?,
+    );
+
+    // The new DV-bearing Add (key `(X, dv1)`) survives. The v1 no-DV Add (key `(X, NULL)`)
+    // is cancelled by the v2 no-DV Remove (same key).
+    assert_eq!(
+        surviving_add_count(&listing),
+        1,
+        "the new DV-bearing Add survives; the old no-DV Add is cancelled"
+    );
+    assert!(
+        listing.remove_files.contains("X.parquet"),
+        "the no-DV Remove survives in remove_files"
+    );
+
+    Ok(())
+}
+
 // A commit file that the snapshot listed has been removed before `build()` runs (e.g.
 // a vacuum races between snapshot construction and our incremental scan). Must surface
 // as `CommitsUnavailable` so the consumer falls back to a full scan, not as a generic
