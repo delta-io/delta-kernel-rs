@@ -1012,9 +1012,7 @@ impl LogSegment {
             Box::new(std::iter::empty())
         };
 
-        // Chain checkpoint batches with sidecar batches.
-        // The boolean flag indicates whether the batch originated from a commit file
-        // (true) or a checkpoint file (false).
+        // Chain checkpoint batches with sidecar batches. Both sources are checkpoint data, not commits.
         let actions_iter = actions
             .map_ok(|batch| ActionsBatch::new(batch, false))
             .chain(sidecar_batches.map_ok(|batch| ActionsBatch::new(batch, false)));

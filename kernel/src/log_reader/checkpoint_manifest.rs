@@ -65,6 +65,17 @@ impl CheckpointManifestReader {
         )
     }
 
+    /// Create a manifest phase with a checkpoint read schema selected by the caller.
+    ///
+    /// The reader adds `remove` and `sidecar` columns when they are absent so it can
+    /// detect removes and sidecar references. Callers can pass projected schemas with
+    /// fields such as `add.stats_parsed` or `add.partitionValues_parsed`.
+    ///
+    /// # Parameters
+    /// `engine`: Engine for reading files
+    /// `manifest`: The checkpoint manifest file to process
+    /// `log_root`: Root URL for resolving sidecar paths
+    /// `checkpoint_read_schema`: Physical checkpoint schema selected by the caller
     pub(crate) fn try_new_with_schema(
         engine: Arc<dyn Engine>,
         manifest: &ParsedLogPath,

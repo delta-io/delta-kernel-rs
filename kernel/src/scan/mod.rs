@@ -973,8 +973,6 @@ impl Scan {
                     sequential,
                     engine,
                     checkpoint_read_schema,
-                    self.state_info.physical_stats_schema.clone(),
-                    self.state_info.physical_partition_schema.clone(),
                 )
             }
             _ => SequentialScanMetadata::new(sequential),

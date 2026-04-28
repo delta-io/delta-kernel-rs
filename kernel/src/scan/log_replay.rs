@@ -19,7 +19,7 @@ use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
     ParallelLogReplayProcessor,
 };
-use crate::log_segment::CheckpointReadInfo;
+use crate::log_segment::{CheckpointReadInfo, LogSegment};
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::scan::Scalar;
 use crate::schema::{
@@ -305,6 +305,34 @@ impl ScanLogReplayProcessor {
         self.checkpoint_info = checkpoint_info;
 
         Ok(())
+    }
+
+    pub(crate) fn projected_checkpoint_read_info_from_files(
+        &self,
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        files: &[crate::FileMeta],
+    ) -> DeltaResult<Option<CheckpointReadInfo>> {
+        if files.is_empty() {
+            return Ok(None);
+        }
+
+        let (stats_schema, partition_schema) = if self.skip_stats {
+            (None, None)
+        } else {
+            (
+                self.state_info.physical_stats_schema.as_deref(),
+                self.state_info.physical_partition_schema.as_deref(),
+            )
+        };
+
+        Ok(Some(LogSegment::projected_checkpoint_read_info_from_files(
+            engine,
+            action_schema,
+            stats_schema,
+            partition_schema,
+            files,
+        )?))
     }
 
     /// Serialize the processor state for distributed processing.

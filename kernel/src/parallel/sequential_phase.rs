@@ -39,7 +39,8 @@ use crate::{DeltaResult, Engine, Error, FileMeta};
 /// # Example
 ///
 /// ```ignore
-/// let mut sequential = SequentialPhase::try_new(processor, log_segment, engine)?;
+/// let mut sequential =
+///     SequentialPhase::try_new(processor, log_segment, engine, checkpoint_read_schema)?;
 ///
 /// // Iterate over sequential batches
 /// for batch in sequential.by_ref() {
@@ -94,9 +95,11 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     /// Create a new sequential phase log replay.
     ///
     /// # Parameters
-    /// - `processor`: The log replay processor
-    /// - `log_segment`: The log segment to process
-    /// - `engine`: Engine for reading files
+    /// `processor`: The log replay processor
+    /// `log_segment`: The log segment to process
+    /// `engine`: Engine for reading files
+    /// `checkpoint_read_schema`: Physical schema to use when reading a single part checkpoint
+    /// manifest during the sequential phase
     #[internal_api]
     pub(crate) fn try_new(
         processor: P,
@@ -181,6 +184,11 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
             })
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn processor(&self) -> &P {
+        &self.processor
+    }
 }
 
 impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
@@ -208,12 +216,7 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{Array, Int64Array, StructArray};
-    use crate::arrow::record_batch::RecordBatch;
-    use crate::engine::arrow_data::ArrowEngineData;
-    use crate::expressions::{column_expr, Expression as Expr};
-    use crate::scan::{AfterSequentialScanMetadata, ScanMetadata};
-    use crate::schema::DataType;
+    use crate::scan::AfterSequentialScanMetadata;
     use crate::utils::test_utils::{assert_result_error_with_message, load_test_table};
 
     /// Core helper function to verify sequential processing with expected adds and sidecars.
@@ -281,38 +284,6 @@ mod tests {
         Ok(())
     }
 
-    fn collect_selected_num_records(
-        rows: &mut Vec<i64>,
-        scan_metadata: ScanMetadata,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let (data, selection_vector) = scan_metadata.scan_files.into_parts();
-        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data)?.into();
-        let stats_parsed = batch
-            .column_by_name("stats_parsed")
-            .expect("stats_parsed column should be present")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("stats_parsed column should be StructArray");
-        let num_records = stats_parsed
-            .column_by_name("numRecords")
-            .expect("stats_parsed.numRecords should be present")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("stats_parsed.numRecords should be Int64Array");
-
-        for (row_index, &selected) in selection_vector.iter().enumerate().take(batch.num_rows()) {
-            if selected {
-                assert!(
-                    !stats_parsed.is_null(row_index),
-                    "stats_parsed should be non-null for selected row {row_index}"
-                );
-                rows.push(num_records.value(row_index));
-            }
-        }
-
-        Ok(())
-    }
-
     #[test]
     fn test_sequential_v2_with_commits_only() -> DeltaResult<()> {
         verify_sequential_processing(
@@ -344,72 +315,6 @@ mod tests {
         // Try to call finish() before exhausting the iterator
         let result = sequential.finish();
         assert_result_error_with_message(result, "Must exhaust iterator before calling finish()");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_parallel_scan_metadata_preserves_stats_parsed_for_single_part_struct_stats_checkpoint(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let (engine, snapshot, _tempdir) = load_test_table("v1-single-part-struct-stats-only")?;
-
-        let scan = snapshot
-            .scan_builder()
-            .include_all_stats_columns()
-            .build()?;
-
-        let mut expected_num_records = Vec::new();
-        for scan_metadata in scan.scan_metadata(engine.as_ref())? {
-            collect_selected_num_records(&mut expected_num_records, scan_metadata?)?;
-        }
-        expected_num_records.sort_unstable();
-        assert!(!expected_num_records.is_empty());
-
-        let mut sequential = scan.parallel_scan_metadata(engine)?;
-        let mut actual_num_records = Vec::new();
-        for scan_metadata in sequential.by_ref() {
-            collect_selected_num_records(&mut actual_num_records, scan_metadata?)?;
-        }
-
-        assert!(matches!(
-            sequential.finish()?,
-            AfterSequentialScanMetadata::Done
-        ));
-
-        actual_num_records.sort_unstable();
-        assert_eq!(actual_num_records, expected_num_records);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_parallel_scan_metadata_plans_partition_values_parsed_for_single_part_checkpoint(
-    ) -> DeltaResult<()> {
-        let (engine, snapshot, _tempdir) = load_test_table("app-txn-checkpoint")?;
-
-        let scan = snapshot
-            .scan_builder()
-            .with_predicate(Arc::new(Expr::eq(
-                column_expr!("modified"),
-                Expr::literal("2021-02-02".to_string()),
-            )))
-            .build()?;
-
-        let sequential = scan.parallel_scan_metadata(engine)?;
-        let checkpoint_info = sequential.sequential.processor.checkpoint_info();
-
-        assert!(checkpoint_info.has_partition_values_parsed);
-        let add_field = checkpoint_info
-            .checkpoint_read_schema
-            .field("add")
-            .expect("checkpoint read schema should include add");
-        let DataType::Struct(add_struct) = add_field.data_type() else {
-            panic!("add field should be a struct");
-        };
-        assert!(
-            add_struct.field("partitionValues_parsed").is_some(),
-            "checkpoint read schema should include add.partitionValues_parsed"
-        );
 
         Ok(())
     }
