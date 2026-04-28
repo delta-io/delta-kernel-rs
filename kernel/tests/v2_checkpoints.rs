@@ -16,7 +16,7 @@ use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Engine, Snapshot, SnapshotRef};
+use delta_kernel::{DeltaResult, Engine, Snapshot};
 
 mod common;
 
@@ -31,14 +31,6 @@ use test_utils::{
     create_table_and_load_snapshot, insert_data, load_test_data, read_scan, test_table_setup_mt,
     write_batch_to_table,
 };
-
-fn unwrap_post_commit_snapshot<S: std::fmt::Debug>(result: CommitResult<S>) -> SnapshotRef {
-    result
-        .unwrap_committed()
-        .post_commit_snapshot()
-        .expect("expected post-commit snapshot")
-        .clone()
-}
 
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
@@ -360,21 +352,19 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
         info_field,
         Arc::new(StringArray::from(vec![Some("quinn")])) as ArrayRef,
     )]));
-    let post_ckpt_snapshot = unwrap_post_commit_snapshot(
-        insert_data(
-            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?,
-            &engine,
-            vec![Arc::new(Int32Array::from(vec![17])) as ArrayRef, info_array],
-        )
-        .await?,
-    );
+    let post_ckpt_snapshot = insert_data(
+        Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![17])) as ArrayRef, info_array],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
 
-    let post_ckpt_snapshot = unwrap_post_commit_snapshot(
-        post_ckpt_snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_domain_metadata("app.settings".to_string(), r#"{"version":3}"#.to_string())
-            .commit(engine.as_ref())?,
-    );
+    let post_ckpt_snapshot = post_ckpt_snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_domain_metadata("app.settings".to_string(), r#"{"version":3}"#.to_string())
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
 
     // === Step 4: Validate `_last_checkpoint` (version, size, sizeInBytes, numOfAddFiles) ===
     let last_ckpt = read_last_checkpoint(&table_path);
@@ -896,46 +886,43 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
         "alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi",
     ];
     for (i, name) in names.iter().enumerate() {
-        snapshot = unwrap_post_commit_snapshot(
-            insert_data(snapshot, engine, make_columns(i as i32 + 1, name)).await?,
-        );
+        snapshot = insert_data(snapshot, engine, make_columns(i as i32 + 1, name))
+            .await?
+            .unwrap_post_commit_snapshot();
     }
 
     // Domain metadata commit (no data) -- exercises the empty-file-batch skip path in the
     // sidecar splitter. Sets two domains initially.
-    snapshot = unwrap_post_commit_snapshot(
-        snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_domain_metadata("app.settings".to_string(), r#"{"version":1}"#.to_string())
-            .with_domain_metadata(
-                "app.feature_flags".to_string(),
-                r#"{"dark_mode":true}"#.to_string(),
-            )
-            .commit(engine.as_ref())?,
-    );
+    snapshot = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_domain_metadata("app.settings".to_string(), r#"{"version":1}"#.to_string())
+        .with_domain_metadata(
+            "app.feature_flags".to_string(),
+            r#"{"dark_mode":true}"#.to_string(),
+        )
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
 
     // Another domain metadata commit -- updates "app.settings" to verify reconciliation
     // picks the latest value, and adds a new domain.
-    snapshot = unwrap_post_commit_snapshot(
-        snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_domain_metadata(
-                "app.analytics".to_string(),
-                r#"{"tracking":false}"#.to_string(),
-            )
-            .with_domain_metadata("app.settings".to_string(), r#"{"version":2}"#.to_string())
-            .commit(engine.as_ref())?,
-    );
+    snapshot = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_domain_metadata(
+            "app.analytics".to_string(),
+            r#"{"tracking":false}"#.to_string(),
+        )
+        .with_domain_metadata("app.settings".to_string(), r#"{"version":2}"#.to_string())
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
 
     // SetTransaction commits -- exercise `txn` actions in checkpoint. Two distinct app_ids
     // plus a second update to `app1` to verify reconciliation picks the latest version.
     for (app_id, version) in [("app1", 1i64), ("app2", 5), ("app1", 3)] {
-        snapshot = unwrap_post_commit_snapshot(
-            snapshot
-                .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-                .with_transaction_id(app_id.to_string(), version)
-                .commit(engine.as_ref())?,
-        );
+        snapshot = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_transaction_id(app_id.to_string(), version)
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
     }
 
     // Remove all 8 files -> 8 remove tombstones
@@ -947,16 +934,16 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     for sm in scan.scan_metadata(engine.as_ref())? {
         txn.remove_files(sm?.scan_files);
     }
-    snapshot = unwrap_post_commit_snapshot(txn.commit(engine.as_ref())?);
+    snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
 
     // Insert 8 fresh files (one per commit) -> ids 9..=16
     let names = [
         "ivan", "judy", "karl", "lena", "mike", "nina", "omar", "pat",
     ];
     for (i, name) in names.iter().enumerate() {
-        snapshot = unwrap_post_commit_snapshot(
-            insert_data(snapshot, engine, make_columns(i as i32 + 9, name)).await?,
-        );
+        snapshot = insert_data(snapshot, engine, make_columns(i as i32 + 9, name))
+            .await?
+            .unwrap_post_commit_snapshot();
     }
 
     Ok(snapshot)
