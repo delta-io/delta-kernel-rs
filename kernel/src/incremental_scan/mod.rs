@@ -38,6 +38,7 @@
 //!         // mask = listing.remove_files | listing.duplicate_add_paths (set union)
 //!     }
 //!     IncrementalScanResult::CommitsUnavailable => { /* full scan fallback */ }
+//!     _ => unreachable!(),
 //! }
 //! # Ok::<(), Error>(())
 //! ```
