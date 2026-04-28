@@ -2683,6 +2683,9 @@ fn test_log_segment_contiguous_commit_files() {
                 create_log_path("file:///_delta_log/00000000000000000002.json"),
                 create_log_path("file:///_delta_log/00000000000000000003.json"),
             ],
+            latest_commit_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000003.json",
+            )),
             ..Default::default()
         },
         log_root.clone(),

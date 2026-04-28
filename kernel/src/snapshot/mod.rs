@@ -342,12 +342,12 @@ impl Snapshot {
             .clone();
         ascending_compaction_files.extend(new_log_segment.listed.ascending_compaction_files);
 
-        // We can pass in just the existing checkpoint parts since by the time we reach this
-        // line, we know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
             LogSegmentFiles {
                 ascending_commit_files,
                 ascending_compaction_files,
+                // We pass in just the existing checkpoint parts since by the time we reach
+                // this line, we know there are no checkpoints in the new log segment.
                 checkpoint_parts: existing_log_segment.listed.checkpoint_parts.clone(),
                 latest_crc_file: crc_file,
                 // In Case F there are new commits (new_end_version > existing_snapshot_version
