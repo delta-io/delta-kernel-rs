@@ -757,10 +757,10 @@ impl PrimitiveType {
                 }
             }
             // Geometry/Geography are not valid partition column types, so there is no
-            // partition-value string format to parse here.
-            Geometry(_) | Geography(_) => Err(Error::generic(
-                "Geometry and Geography types are not supported as partition column values",
-            )),
+            // partition-value string format to parse here
+            Geometry(_) | Geography(_) => Err(Error::Unsupported(format!(
+                "parse_scalar is not supported for {self:?}"
+            ))),
         }
     }
 

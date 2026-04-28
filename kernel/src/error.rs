@@ -174,6 +174,14 @@ pub enum Error {
     #[error("Invalid decimal: {0}")]
     InvalidDecimal(String),
 
+    /// Invalid srid for a GeometryType
+    #[error("Invalid geometry: {0}")]
+    InvalidGeometry(String),
+
+    /// Invalid srid for a GeographyType
+    #[error("Invalid geography: {0}")]
+    InvalidGeography(String),
+
     /// Inconsistent data passed to struct scalar
     #[error("Invalid struct data: {0}")]
     InvalidStructData(String),
@@ -277,6 +285,12 @@ impl Error {
     }
     pub fn invalid_decimal(msg: impl ToString) -> Self {
         Self::InvalidDecimal(msg.to_string())
+    }
+    pub fn invalid_geometry(msg: impl ToString) -> Self {
+        Self::InvalidGeometry(msg.to_string())
+    }
+    pub fn invalid_geography(msg: impl ToString) -> Self {
+        Self::InvalidGeography(msg.to_string())
     }
     pub fn invalid_struct_data(msg: impl ToString) -> Self {
         Self::InvalidStructData(msg.to_string())

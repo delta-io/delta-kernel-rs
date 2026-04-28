@@ -1563,12 +1563,17 @@ pub struct GeometryType {
 }
 
 impl GeometryType {
-    /// Creates a new [`GeometryType`] with the given SRID.
+    /// Creates a new GeometryType with the given SRID.
     ///
     /// # Parameters
     /// - `srid`: The spatial reference identifier (e.g. `"OGC:CRS84"`, `"EPSG:4326"`).
+    ///   Must be non-empty.
     pub fn try_new(srid: impl Into<String>) -> DeltaResult<Self> {
-        Ok(Self { srid: srid.into() })
+        let srid = srid.into();
+        if srid.is_empty() {
+            return Err(Error::invalid_geometry("SRID cannot be empty"));
+        }
+        Ok(Self { srid })
     }
 
     /// Returns the SRID associated with this geometry type.
@@ -1602,19 +1607,32 @@ pub struct GeographyType {
 }
 
 impl GeographyType {
-    /// Creates a new [`GeographyType`] with the given SRID and edge interpolation algorithm.
+    /// Creates a new GeographyType with the given SRID and edge interpolation algorithm.
     ///
     /// # Parameters
-    /// - `srid`: The spatial reference identifier (e.g. `"OGC:CRS84"`).
+    /// - `srid`: The spatial reference identifier (e.g. `"OGC:CRS84"`). Must be non-empty.
     /// - `algorithm`: The edge interpolation algorithm to use.
     pub fn try_new(
         srid: impl Into<String>,
         algorithm: EdgeInterpolationAlgorithm,
     ) -> DeltaResult<Self> {
-        Ok(Self {
-            srid: srid.into(),
-            algorithm,
-        })
+        let srid = srid.into();
+        if srid.is_empty() {
+            return Err(Error::invalid_geography("SRID cannot be empty"));
+        }
+        Ok(Self { srid, algorithm })
+    }
+
+    /// Creates a new GeographyType with the given SRID and the default edge interpolation
+    /// algorithm ([`EdgeInterpolationAlgorithm::Spherical`]).
+    pub fn try_new_with_srid(srid: impl Into<String>) -> DeltaResult<Self> {
+        Self::try_new(srid, EdgeInterpolationAlgorithm::Spherical)
+    }
+
+    /// Creates a new GeographyType with the given edge interpolation algorithm and the
+    /// default SRID (DEFAULT_GEO_SRID).
+    pub fn try_new_with_algorithm(algorithm: EdgeInterpolationAlgorithm) -> DeltaResult<Self> {
+        Self::try_new(DEFAULT_GEO_SRID, algorithm)
     }
 
     /// Returns the SRID associated with this geography type.
@@ -1703,12 +1721,8 @@ pub enum PrimitiveType {
     TimestampNtz,
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
-    /// A geometry type with an associated spatial reference identifier.
-    /// Values are stored as WKB (Well-Known Binary) bytes.
     #[serde(serialize_with = "serialize_geometry", untagged)]
     Geometry(GeometryType),
-    /// A geography type with an associated SRID and edge interpolation algorithm.
-    /// Values are stored as WKB bytes.
     #[serde(serialize_with = "serialize_geography", untagged)]
     Geography(GeographyType),
 }
@@ -1866,7 +1880,10 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "geography" => Ok(PrimitiveType::Geography(GeographyType::default())),
             geo_str if geo_str.starts_with("geography(") && geo_str.ends_with(')') => {
                 let inner = &geo_str[10..geo_str.len() - 1];
-                // Split on the last comma to separate SRID from algorithm
+                // Three accepted shapes:
+                //   geography(<srid>, <algorithm>) -- both
+                //   geography(<srid>)              -- SRID only (contains ':')
+                //   geography(<algorithm>)         -- algorithm only (no ':')
                 match inner.rfind(',') {
                     Some(pos) => {
                         let srid = inner[..pos].trim();
@@ -1878,10 +1895,18 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                             .map_err(serde::de::Error::custom)
                     }
                     None => {
-                        // No comma -- treat entire inner as SRID with default algorithm
-                        GeographyType::try_new(inner.trim(), EdgeInterpolationAlgorithm::Spherical)
-                            .map(PrimitiveType::Geography)
-                            .map_err(serde::de::Error::custom)
+                        let trimmed = inner.trim();
+                        if trimmed.contains(':') {
+                            GeographyType::try_new_with_srid(trimmed)
+                                .map(PrimitiveType::Geography)
+                                .map_err(serde::de::Error::custom)
+                        } else {
+                            let algorithm: EdgeInterpolationAlgorithm =
+                                trimmed.parse().map_err(serde::de::Error::custom)?;
+                            GeographyType::try_new_with_algorithm(algorithm)
+                                .map(PrimitiveType::Geography)
+                                .map_err(serde::de::Error::custom)
+                        }
                     }
                 }
             }
@@ -2449,6 +2474,56 @@ mod tests {
     }
 
     #[test]
+    fn test_roundtrip_geometry() {
+        let data = r#"
+        {
+            "name": "g",
+            "type": "geometry(EPSG:4326)",
+            "nullable": true,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(
+            field.data_type,
+            DataType::Primitive(PrimitiveType::Geometry(
+                GeometryType::try_new("EPSG:4326").unwrap()
+            ))
+        );
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"g","type":"geometry(EPSG:4326)","nullable":true,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_geography() {
+        let data = r#"
+        {
+            "name": "g",
+            "type": "geography(EPSG:4326, vincenty)",
+            "nullable": true,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(
+            field.data_type,
+            DataType::Primitive(PrimitiveType::Geography(
+                GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Vincenty).unwrap()
+            ))
+        );
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"g","type":"geography(EPSG:4326, vincenty)","nullable":true,"metadata":{}}"#
+        );
+    }
+
+    #[test]
     fn test_unshredded_variant() {
         let unshredded_variant_type = DataType::unshredded_variant();
 
@@ -2547,6 +2622,63 @@ mod tests {
     #[case("decimal()", "Invalid precision in decimal")]
     #[case("decimal(10,2,99)", "Invalid decimal format (expected 2 parts)")]
     fn test_invalid_decimal_format(#[case] invalid_type: &str, #[case] expected_error: &str) {
+        let data = format!(
+            r#"{{
+                "name": "invalid",
+                "type": "{invalid_type}",
+                "nullable": false,
+                "metadata": {{}}
+            }}"#
+        );
+        let result: Result<StructField, _> = serde_json::from_str(&data);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains(expected_error),
+            "Expected error containing '{expected_error}', got: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case("geometry", PrimitiveType::Geometry(GeometryType::default()))]
+    #[case("geography", PrimitiveType::Geography(GeographyType::default()))]
+    #[case(
+        "geometry(EPSG:4326)",
+        PrimitiveType::Geometry(GeometryType::try_new("EPSG:4326").unwrap())
+    )]
+    #[case(
+        "geography(EPSG:4326)",
+        PrimitiveType::Geography(GeographyType::try_new_with_srid("EPSG:4326").unwrap())
+    )]
+    #[case(
+        "geography(EPSG:4326, vincenty)",
+        PrimitiveType::Geography(
+            GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Vincenty).unwrap()
+        )
+    )]
+    #[case(
+        "geography(vincenty)",
+        PrimitiveType::Geography(
+            GeographyType::try_new_with_algorithm(EdgeInterpolationAlgorithm::Vincenty).unwrap()
+        )
+    )]
+    fn test_geo_deserialize_defaults(#[case] type_str: &str, #[case] expected: PrimitiveType) {
+        let json = format!(r#"{{"name":"g","type":"{type_str}","nullable":true,"metadata":{{}}}}"#);
+        let field: StructField = serde_json::from_str(&json).unwrap();
+        assert_eq!(field.data_type, DataType::Primitive(expected));
+    }
+
+    #[rstest]
+    #[case(
+        "geography(EPSG:4326, unknown_algo)",
+        "Unknown edge interpolation algorithm"
+    )]
+    #[case("geography(EPSG:4326,)", "Unknown edge interpolation algorithm")]
+    #[case("geometry(EPSG:4326", "Unsupported Delta table type")]
+    #[case("geographyz", "Unsupported Delta table type")]
+    #[case("geometry()", "SRID cannot be empty")]
+    #[case("geography(, vincenty)", "SRID cannot be empty")]
+    fn test_invalid_geo_format(#[case] invalid_type: &str, #[case] expected_error: &str) {
         let data = format!(
             r#"{{
                 "name": "invalid",

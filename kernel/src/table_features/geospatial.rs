@@ -9,6 +9,28 @@ use crate::transforms::SchemaTransform;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
+struct UsesGeo(bool);
+
+impl<'a> SchemaTransform<'a> for UsesGeo {
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
+        if matches!(
+            ptype,
+            PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)
+        ) {
+            self.0 = true;
+        }
+        None
+    }
+}
+
+/// Returns `true` if the schema contains at least one geometry or geography column,
+/// including nested structs, arrays, and maps.
+pub(crate) fn schema_contains_geospatial(schema: &Schema) -> bool {
+    let mut visitor = UsesGeo(false);
+    let _ = visitor.transform_struct(schema);
+    visitor.0
+}
+
 /// Validates that if a table schema contains geometry or geography columns, the table must have
 /// the `geospatial` feature in both reader and writer features.
 pub(crate) fn validate_geospatial_feature_support(tc: &TableConfiguration) -> DeltaResult<()> {
@@ -24,28 +46,6 @@ pub(crate) fn validate_geospatial_feature_support(tc: &TableConfiguration) -> De
     Ok(())
 }
 
-/// Returns `true` if the schema contains at least one geometry or geography column,
-/// including nested structs, arrays, and maps.
-pub(crate) fn schema_contains_geospatial(schema: &Schema) -> bool {
-    let mut detector = GeoDetector(false);
-    let _ = detector.transform_struct(schema);
-    detector.0
-}
-
-struct GeoDetector(bool);
-
-impl<'a> SchemaTransform<'a> for GeoDetector {
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        if matches!(
-            ptype,
-            PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)
-        ) {
-            self.0 = true;
-        }
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::actions::Protocol;
@@ -53,7 +53,9 @@ mod tests {
         DataType, GeographyType, GeometryType, PrimitiveType, StructField, StructType,
     };
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::assert_schema_feature_validation;
+    use crate::utils::test_utils::{
+        assert_result_error_with_message, assert_schema_feature_validation,
+    };
 
     #[test]
     fn test_geospatial_feature_validation() {
@@ -88,6 +90,16 @@ mod tests {
         .unwrap();
         let protocol_without =
             Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
+
+        // ReaderWriter features must be listed on both sides
+        assert_result_error_with_message(
+            Protocol::try_new_modern([&TableFeature::GeospatialType], TableFeature::EMPTY_LIST),
+            "Reader features must contain only ReaderWriter features that are also listed in writer features",
+        );
+        assert_result_error_with_message(
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, [&TableFeature::GeospatialType]),
+            "Writer features must be Writer-only or also listed in reader features",
+        );
 
         assert_schema_feature_validation(
             &schema_with,
