@@ -13,7 +13,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, EngineData, Snapshot};
+use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
 use itertools::Itertools;
 use tempfile::tempdir;
 use test_utils::{
@@ -381,6 +381,159 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
 
     // Verify the correct rows remain using helper
     verify_sorted_scan_results(batches, expected_ids, &expected_values)?;
+
+    Ok(())
+}
+
+/// Verifies the `Transaction::write_deletion_vector` helper end-to-end:
+/// 1. Builds a roaring bitmap of deleted row indexes and serializes it (just the roaring bytes, no
+///    Delta framing).
+/// 2. Calls the helper to author a DV file via the engine's storage handler and get a
+///    `DeletionVectorDescriptor` back.
+/// 3. Applies the descriptor to a table via `update_deletion_vectors` and asserts the scan returns
+///    only the non-deleted rows.
+#[tokio::test]
+async fn test_transaction_write_deletion_vector_helper() -> Result<(), Box<dyn std::error::Error>> {
+    use roaring::RoaringTreemap;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ])?);
+
+    let temp_dir = tempdir()?;
+    let base_url = url::Url::from_directory_path(temp_dir.path()).unwrap();
+    let (store, engine, table_url) = engine_store_setup("dv_helper_table", Some(&base_url));
+    let engine = Arc::new(engine);
+
+    create_table(
+        store.clone(),
+        table_url.clone(),
+        schema.clone(),
+        &[],
+        true,
+        vec!["deletionVectors"],
+        vec!["deletionVectors"],
+    )
+    .await?;
+
+    // Write a single 10-row file and add it to the table.
+    let data_batch = generate_batch(vec![
+        ("id", vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9].into_array()),
+        (
+            "value",
+            vec!["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"].into_array(),
+        ),
+    ])?;
+    let (data_file_path, parquet_data_len) =
+        write_parquet_file(&store, &table_url, "1", &data_batch).await?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("test engine")
+        .with_operation("WRITE".to_string());
+    let add_files_schema = txn.add_files_schema();
+    let add_metadata = create_add_files_metadata(
+        add_files_schema,
+        vec![(&data_file_path, parquet_data_len as i64, 1000000, 10)],
+    )?;
+    txn.add_files(add_metadata);
+    let commit_result = txn.commit(engine.as_ref())?;
+    assert!(matches!(
+        commit_result,
+        CommitResult::CommittedTransaction(_)
+    ));
+
+    // Build a raw RoaringTreemap and serialize it -- the engine in real life would do
+    // this with whatever roaring library it has on hand.
+    let deleted: Vec<u64> = vec![1, 4, 8];
+    let cardinality = deleted.len() as i64;
+    let treemap: RoaringTreemap = deleted.iter().copied().collect();
+    let mut roaring_bytes = Vec::new();
+    treemap.serialize_into(&mut roaring_bytes)?;
+
+    // Hand the bytes to the kernel helper. It frames the file (version + size + magic +
+    // crc), writes via the engine's storage handler, and returns a descriptor.
+    let dv_update_txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
+    let descriptor =
+        dv_update_txn.write_deletion_vector(engine.as_ref(), &roaring_bytes, cardinality, "p1")?;
+    assert_eq!(descriptor.cardinality, 3);
+    assert!(descriptor.size_in_bytes > 0);
+
+    // The helper produces a PersistedRelative descriptor; reading it back should yield
+    // the original bitmap so we know the framing is correct.
+    let read_back = descriptor
+        .read(engine.storage_handler(), &table_url)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert_eq!(read_back, deleted);
+
+    // Apply the descriptor and verify the scan now skips the deleted rows.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
+    let scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
+    let mut dv_map = HashMap::new();
+    dv_map.insert(data_file_path.clone(), descriptor);
+    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+    let commit_result = txn.commit(engine.as_ref())?;
+    assert!(matches!(
+        commit_result,
+        CommitResult::CommittedTransaction(_)
+    ));
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+    let batches: Vec<_> = scan
+        .execute(engine.clone())?
+        .map(|result| result.map(into_record_batch))
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_ids = vec![0, 2, 3, 5, 6, 7, 9];
+    let expected_values = ["a", "c", "d", "f", "g", "h", "j"];
+    verify_sorted_scan_results(batches, expected_ids, &expected_values)?;
+
+    Ok(())
+}
+
+/// Calling `write_deletion_vector` on a table that does not have the `deletionVectors`
+/// feature enabled returns an `unsupported` error before touching storage.
+#[tokio::test]
+async fn test_write_deletion_vector_requires_feature() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+
+    let temp_dir = tempdir()?;
+    let base_url = url::Url::from_directory_path(temp_dir.path()).unwrap();
+    let (store, engine, table_url) = engine_store_setup("dv_no_feature_table", Some(&base_url));
+    let engine = Arc::new(engine);
+
+    // Create a plain table -- no deletion vectors feature.
+    create_table(
+        store.clone(),
+        table_url.clone(),
+        schema.clone(),
+        &[],
+        false,
+        vec![],
+        vec![],
+    )
+    .await?;
+
+    let txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
+    let err = txn
+        .write_deletion_vector(engine.as_ref(), &[1, 2, 3], 0, "")
+        .expect_err("expected unsupported error");
+    assert!(
+        matches!(err, delta_kernel::Error::Unsupported(_)),
+        "expected Unsupported, got: {err}"
+    );
 
     Ok(())
 }
