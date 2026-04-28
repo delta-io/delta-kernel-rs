@@ -406,13 +406,11 @@ impl ParsedLogPath<Url> {
     }
 }
 
-/// Per the protocol, a checkpoint sidecar is a uniquely-named parquet file:
-/// `{unique}.parquet` where `unique` is some unique string such as a UUID.
-/// We use `<version>.checkpoint.<uuid>.parquet` here.
+/// A checkpoint sidecar is a uniquely-named parquet file: `{unique}.parquet` where `unique` is
+/// some unique string such as a UUID. We use `<version>.checkpoint.<uuid>.parquet` here.
 ///
-/// Per the protocol, sidecar path should be URI-encoded.
-/// All characters in the filename here are Unreserved Characters, so we can just
-/// retain them. Ref: <https://www.ietf.org/rfc/rfc2396.txt>
+/// Sidecar paths should be URI-encoded. All characters in the filename here are Unreserved
+/// Characters, so we can just retain them. Ref: <https://www.ietf.org/rfc/rfc2396.txt>
 pub(crate) fn new_sidecar(table_root: &Url, version: Version) -> DeltaResult<(String, Url)> {
     let filename = format!("{version:020}.checkpoint.{}.parquet", Uuid::new_v4());
     let url = table_root
