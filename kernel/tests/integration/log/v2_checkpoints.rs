@@ -6,9 +6,6 @@ use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Snapshot};
-
-mod common;
-
 use itertools::Itertools;
 use test_utils::{insert_data, load_test_data, read_scan, test_table_setup_mt};
 
