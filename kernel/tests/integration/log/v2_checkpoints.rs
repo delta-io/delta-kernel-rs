@@ -6,6 +6,9 @@ use delta_kernel::arrow::array::{
     StructArray,
 };
 use delta_kernel::arrow::compute::concat_batches;
+use delta_kernel::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
@@ -17,17 +20,14 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
-
-use crate::common::write_utils::{
-    get_simple_schema, load_existing_single_file_checkpoint_path, simple_id_batch,
-};
-use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
-};
 use itertools::Itertools;
 use test_utils::{
     create_table_and_load_snapshot, insert_data, load_test_data, read_scan, test_table_setup_mt,
     write_batch_to_table,
+};
+
+use crate::common::write_utils::{
+    get_simple_schema, load_existing_single_file_checkpoint_path, simple_id_batch,
 };
 
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
