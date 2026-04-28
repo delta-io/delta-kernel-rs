@@ -15,10 +15,11 @@ use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{DeltaResult, Engine, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Snapshot, SnapshotRef};
 
 mod common;
 
+use common::write_utils::{get_simple_schema, load_existing_checkpoint_path, simple_id_batch};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -28,7 +29,13 @@ use test_utils::{
     write_batch_to_table,
 };
 
-use common::write_utils::{get_simple_schema, simple_id_batch};
+fn unwrap_post_commit_snapshot<S: std::fmt::Debug>(result: CommitResult<S>) -> SnapshotRef {
+    result
+        .unwrap_committed()
+        .post_commit_snapshot()
+        .expect("expected post-commit snapshot")
+        .clone()
+}
 
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
@@ -325,16 +332,10 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
     Ok(())
 }
 
-/// E2e test for V2 sidecar checkpoint writing and reading:
-///
-/// 1. Create a V2 table with adds, removes, domain metadata, and set-transactions
-/// 2. Write a V2 checkpoint with sidecars (hint=2)
-/// 3. Add post-checkpoint commits (insert + domain metadata update)
-/// 4. Validate `_last_checkpoint` (version, size, sizeInBytes, numOfAddFiles)
-/// 5. Read the raw checkpoint parquet and validate the actions and sidecar references
-/// 6. Load a fresh snapshot from the checkpoint + post-checkpoint commits
-/// 7. Verify domain metadata (including post-checkpoint update)
-/// 8. Scan and verify data correctness (9 rows: ids 9-17)
+/// E2E test for V2 sidecar checkpoint write and read. Builds a V2 table with mixed types of
+/// delta actions, writes a sidecar checkpoint, then adds more commits on top. Verifies
+/// `_last_checkpoint`, the checkpoint parquet contents, and performs a scan to verify the data
+/// is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -356,29 +357,25 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
         info_field,
         Arc::new(StringArray::from(vec![Some("quinn")])) as ArrayRef,
     )]));
-    let post_ckpt_snapshot = insert_data(
-        Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?,
-        &engine,
-        vec![Arc::new(Int32Array::from(vec![17])) as ArrayRef, info_array],
-    )
-    .await?
-    .unwrap_committed()
-    .post_commit_snapshot()
-    .expect("expected post-commit snapshot")
-    .clone();
+    let post_ckpt_snapshot = unwrap_post_commit_snapshot(
+        insert_data(
+            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?,
+            &engine,
+            vec![Arc::new(Int32Array::from(vec![17])) as ArrayRef, info_array],
+        )
+        .await?,
+    );
 
-    let post_ckpt_snapshot = post_ckpt_snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_domain_metadata("app.settings".to_string(), r#"{"version":3}"#.to_string())
-        .commit(engine.as_ref())?
-        .unwrap_committed()
-        .post_commit_snapshot()
-        .expect("expected post-commit snapshot")
-        .clone();
+    let post_ckpt_snapshot = unwrap_post_commit_snapshot(
+        post_ckpt_snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_domain_metadata("app.settings".to_string(), r#"{"version":3}"#.to_string())
+            .commit(engine.as_ref())?,
+    );
 
     // === Step 4: Validate `_last_checkpoint` (version, size, sizeInBytes, numOfAddFiles) ===
     let last_ckpt = read_last_checkpoint(&table_path);
-    let ckpt_file = load_checkpoint_path(&table_path, version as _);
+    let ckpt_file = load_existing_checkpoint_path(&table_path, version as _);
     let ckpt_file_size = std::fs::metadata(&ckpt_file).unwrap().len() as i64;
     let sidecars_dir_for_size = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
     let sidecars_total_size: i64 = list_sidecar_parquet_files(&sidecars_dir_for_size)
@@ -576,7 +573,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     Ok(())
 }
 
-/// E2e test: create a partitioned table with stats, write several commits, checkpoint,
+/// E2E test: create a partitioned table with stats, write several commits, checkpoint,
 /// then read the raw checkpoint parquet to verify `stats_parsed` and `partitionValues_parsed`
 /// fields are correctly populated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -801,7 +798,7 @@ async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
     );
 
     // Main checkpoint contains no `sidecar` action rows.
-    let ckpt_file = load_checkpoint_path(&table_path, version);
+    let ckpt_file = load_existing_checkpoint_path(&table_path, version);
     let ckpt_batch = read_parquet_file(&ckpt_file);
     let sidecar_col = get_struct_column_from_record_batch(&ckpt_batch, "sidecar");
     let sidecar_rows = valid_row_indices(sidecar_col, ckpt_batch.num_rows());
@@ -835,20 +832,6 @@ fn read_parquet_file(path: &std::path::Path) -> RecordBatch {
     let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
     let schema = batches[0].schema();
     concat_batches(&schema, &batches).expect("failed to concat batches")
-}
-
-/// Finds the checkpoint parquet file in the `_delta_log` directory for a given version.
-fn load_checkpoint_path(table_path: &str, version: u64) -> std::path::PathBuf {
-    let log_dir = std::path::Path::new(table_path).join("_delta_log");
-    let prefix = format!("{version:020}.checkpoint");
-    for entry in std::fs::read_dir(&log_dir).expect("failed to read _delta_log") {
-        let entry = entry.unwrap();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(&prefix) && name.ends_with(".parquet") {
-            return entry.path();
-        }
-    }
-    panic!("checkpoint parquet file not found for version {version} in {log_dir:?}");
 }
 
 /// Reads the `_last_checkpoint` JSON file from the table's `_delta_log` directory.
@@ -911,55 +894,46 @@ async fn v2_table_with_domain_metadata_and_txn<
         "alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi",
     ];
     for (i, name) in names.iter().enumerate() {
-        snapshot = insert_data(snapshot, engine, make_columns(i as i32 + 1, name))
-            .await?
-            .unwrap_committed()
-            .post_commit_snapshot()
-            .expect("expected post-commit snapshot")
-            .clone();
+        snapshot = unwrap_post_commit_snapshot(
+            insert_data(snapshot, engine, make_columns(i as i32 + 1, name)).await?,
+        );
     }
 
     // Domain metadata commit (no data) -- exercises the empty-file-batch skip path in the
     // sidecar splitter. Sets two domains initially.
-    snapshot = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_domain_metadata("app.settings".to_string(), r#"{"version":1}"#.to_string())
-        .with_domain_metadata(
-            "app.feature_flags".to_string(),
-            r#"{"dark_mode":true}"#.to_string(),
-        )
-        .commit(engine.as_ref())?
-        .unwrap_committed()
-        .post_commit_snapshot()
-        .expect("expected post-commit snapshot")
-        .clone();
+    snapshot = unwrap_post_commit_snapshot(
+        snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_domain_metadata("app.settings".to_string(), r#"{"version":1}"#.to_string())
+            .with_domain_metadata(
+                "app.feature_flags".to_string(),
+                r#"{"dark_mode":true}"#.to_string(),
+            )
+            .commit(engine.as_ref())?,
+    );
 
     // Another domain metadata commit -- updates "app.settings" to verify reconciliation
     // picks the latest value, and adds a new domain.
-    snapshot = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_domain_metadata(
-            "app.analytics".to_string(),
-            r#"{"tracking":false}"#.to_string(),
-        )
-        .with_domain_metadata("app.settings".to_string(), r#"{"version":2}"#.to_string())
-        .commit(engine.as_ref())?
-        .unwrap_committed()
-        .post_commit_snapshot()
-        .expect("expected post-commit snapshot")
-        .clone();
+    snapshot = unwrap_post_commit_snapshot(
+        snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_domain_metadata(
+                "app.analytics".to_string(),
+                r#"{"tracking":false}"#.to_string(),
+            )
+            .with_domain_metadata("app.settings".to_string(), r#"{"version":2}"#.to_string())
+            .commit(engine.as_ref())?,
+    );
 
     // SetTransaction commits -- exercise `txn` actions in checkpoint. Two distinct app_ids
     // plus a second update to `app1` to verify reconciliation picks the latest version.
     for (app_id, version) in [("app1", 1i64), ("app2", 5), ("app1", 3)] {
-        snapshot = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_transaction_id(app_id.to_string(), version)
-            .commit(engine.as_ref())?
-            .unwrap_committed()
-            .post_commit_snapshot()
-            .expect("expected post-commit snapshot")
-            .clone();
+        snapshot = unwrap_post_commit_snapshot(
+            snapshot
+                .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+                .with_transaction_id(app_id.to_string(), version)
+                .commit(engine.as_ref())?,
+        );
     }
 
     // Remove all 8 files -> 8 remove tombstones
@@ -971,24 +945,16 @@ async fn v2_table_with_domain_metadata_and_txn<
     for sm in scan.scan_metadata(engine.as_ref())? {
         txn.remove_files(sm?.scan_files);
     }
-    snapshot = txn
-        .commit(engine.as_ref())?
-        .unwrap_committed()
-        .post_commit_snapshot()
-        .expect("expected post-commit snapshot")
-        .clone();
+    snapshot = unwrap_post_commit_snapshot(txn.commit(engine.as_ref())?);
 
     // Insert 8 fresh files (one per commit) -> ids 9..=16
     let names = [
         "ivan", "judy", "karl", "lena", "mike", "nina", "omar", "pat",
     ];
     for (i, name) in names.iter().enumerate() {
-        snapshot = insert_data(snapshot, engine, make_columns(i as i32 + 9, name))
-            .await?
-            .unwrap_committed()
-            .post_commit_snapshot()
-            .expect("expected post-commit snapshot")
-            .clone();
+        snapshot = unwrap_post_commit_snapshot(
+            insert_data(snapshot, engine, make_columns(i as i32 + 9, name)).await?,
+        );
     }
 
     Ok(snapshot)
@@ -1245,6 +1211,7 @@ async fn test_snapshot_checkpoint_default_on_v2_table(
     )
     .await?;
 
+    let version = snapshot.version();
     snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
 
     let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
@@ -1255,16 +1222,7 @@ async fn test_snapshot_checkpoint_default_on_v2_table(
     );
 
     // V2 checkpoint must contain a `checkpointMetadata` column.
-    let delta_log = std::path::Path::new(&table_path).join("_delta_log");
-    let ckpt_path = std::fs::read_dir(&delta_log)?
-        .filter_map(|e| e.ok())
-        .find(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.contains(".checkpoint.parquet"))
-        })
-        .expect("checkpoint parquet should exist")
-        .path();
+    let ckpt_path = load_existing_checkpoint_path(&table_path, version);
     let file = std::fs::File::open(&ckpt_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
     let schema = reader.schema();

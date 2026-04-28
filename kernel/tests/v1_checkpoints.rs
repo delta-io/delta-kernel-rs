@@ -9,7 +9,7 @@ use test_utils::{create_table_and_load_snapshot, test_table_setup_mt, write_batc
 
 mod common;
 
-use common::write_utils::{get_simple_schema, simple_id_batch};
+use common::write_utils::{get_simple_schema, load_existing_checkpoint_path, simple_id_batch};
 
 /// On a V1 table (no `v2Checkpoint` feature), passing either `None` or
 /// `Some(CheckpointSpec::V1)` to `snapshot.checkpoint()` produces a V1 checkpoint: the main
@@ -34,18 +34,10 @@ async fn test_snapshot_checkpoint_on_v1_table(
     )
     .await?;
 
+    let version = snapshot.version();
     snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
 
-    let delta_log = std::path::Path::new(&table_path).join("_delta_log");
-    let ckpt_path = std::fs::read_dir(&delta_log)?
-        .filter_map(|e| e.ok())
-        .find(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.contains(".checkpoint.parquet"))
-        })
-        .expect("checkpoint parquet should exist")
-        .path();
+    let ckpt_path = load_existing_checkpoint_path(&table_path, version);
     let file = std::fs::File::open(&ckpt_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
     let schema = reader.schema();

@@ -26,6 +26,8 @@ const DELTA_LOG_DIR: &str = "_delta_log";
 const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
 /// The subdirectory name within the delta log where staged commits reside
 const STAGED_COMMITS_DIR: &str = "_staged_commits/";
+/// The subdirectory name within the delta log where checkpoint sidecars reside
+const SIDECAR_DIR_WITH_SLASH: &str = "_sidecars/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
@@ -403,8 +405,6 @@ impl ParsedLogPath<Url> {
         Ok(path)
     }
 }
-
-const SIDECAR_DIR_WITH_SLASH: &str = "_sidecars/";
 
 /// Per the protocol, a checkpoint sidecar is a uniquely-named parquet file:
 /// `{unique}.parquet` where `unique` is some unique string such as a UUID.

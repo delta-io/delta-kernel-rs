@@ -20,6 +20,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
+use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::CommitResult;
@@ -44,6 +45,22 @@ pub fn simple_id_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
         vec![Arc::new(Int32Array::from(values))],
     )
     .unwrap()
+}
+
+/// Finds the checkpoint parquet file in the `_delta_log` directory for a given version.
+pub fn load_existing_checkpoint_path(table_path: &str, version: u64) -> std::path::PathBuf {
+    let log_dir = std::path::Path::new(table_path).join("_delta_log");
+    for entry in std::fs::read_dir(&log_dir).expect("failed to read _delta_log") {
+        let entry = entry.unwrap();
+        let url = Url::from_file_path(entry.path()).expect("entry path to url");
+        let Some(parsed) = ParsedLogPath::try_from(url).expect("parse log path") else {
+            continue;
+        };
+        if parsed.is_checkpoint() && parsed.version == version {
+            return entry.path();
+        }
+    }
+    panic!("checkpoint parquet file not found for version {version} in {log_dir:?}");
 }
 
 /// Returns the native parquet `field_id` for a field at the given physical path in a parquet file,

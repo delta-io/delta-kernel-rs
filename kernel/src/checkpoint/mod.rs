@@ -671,12 +671,7 @@ impl CheckpointWriter {
             .iter()
             .try_fold(0u64, |acc, (_, m)| acc.checked_add(m.size))
             .ok_or_else(|| Error::internal_error("sidecar sizes sum overflowed u64"))?;
-        let sidecar_count = u64::try_from(sidecar_metas.len()).map_err(|e| {
-            Error::internal_error(format!(
-                "Failed to convert sidecar count from usize {} to u64: {e}",
-                sidecar_metas.len()
-            ))
-        })?;
+        let sidecar_count = sidecar_metas.len() as u64;
         build_written_checkpoint_info(
             engine,
             &checkpoint_path,
