@@ -1,9 +1,11 @@
 //! This module holds functionality for managing transactions.
+mod deletion_vector;
 mod transaction_id;
 mod write_context;
 
 use std::sync::Arc;
 
+pub use deletion_vector::*;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::{
@@ -2141,6 +2143,173 @@ mod tests {
         let filtered = FilteredEngineData::try_new(data, vec![]).unwrap();
         assert_eq!(filtered.selection_vector().len(), 0);
         assert_eq!(filtered.data().len(), 3);
+    }
+
+    /// End-to-end smoke test for the DV update FFI surface. Uses an on-disk DV-enabled
+    /// table; pushes a serialized roaring bitmap through `transaction_write_deletion_vector`,
+    /// inserts the resulting descriptor into a map via `dv_descriptor_map_insert`, and
+    /// applies it via `transaction_update_deletion_vectors`. After commit, asserts the
+    /// scan returns the non-deleted rows.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_dv_update_round_trip_via_ffi() -> Result<(), Box<dyn std::error::Error>> {
+        use delta_kernel::actions::deletion_vector_writer::{DeletionVector, KernelDeletionVector};
+        use delta_kernel::object_store::path::Path as ObjectStorePath;
+        use delta_kernel_ffi::scan::{
+            free_scan, free_scan_metadata_iter, scan, scan_metadata_iter_init,
+        };
+        use delta_kernel_ffi::transaction::{
+            dv_descriptor_map_insert, dv_descriptor_map_new, transaction_update_deletion_vectors,
+            transaction_write_deletion_vector,
+        };
+        use test_utils::{create_default_engine, record_batch_to_bytes};
+
+        let tmp_test_dir = tempdir()?;
+        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+
+        // Build a DV-enabled table; test_utils::create_table now auto-sets
+        // delta.enableDeletionVectors when the writer feature is present.
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )])?);
+        let (store, _test_engine, table_location) =
+            test_utils::engine_store_setup("test_dv_ffi", Some(&tmp_dir_url));
+        let table_url = test_utils::create_table(
+            store.clone(),
+            table_location.clone(),
+            schema.clone(),
+            &[],
+            true,
+            vec!["deletionVectors"],
+            vec!["deletionVectors"],
+        )
+        .await?;
+
+        // Write a 4-row parquet file directly into the table.
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef,
+        )])?;
+        let parquet_bytes = record_batch_to_bytes(&batch);
+        let parquet_len = parquet_bytes.len();
+        let data_file_path = "data_file.parquet".to_string();
+        let data_url = table_url.join(&data_file_path)?;
+        store
+            .put(
+                &ObjectStorePath::from_url_path(data_url.path())?,
+                parquet_bytes.into(),
+            )
+            .await?;
+
+        // Add the file via a kernel transaction so the table has something to scan.
+        let kernel_engine: Arc<dyn delta_kernel::Engine> = create_default_engine(&table_url)?;
+        let snapshot = delta_kernel::snapshot::Snapshot::builder_for(table_url.clone())
+            .build(kernel_engine.as_ref())?;
+        let mut add_txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), kernel_engine.as_ref())?
+            .with_engine_info("test-engine/1.0")
+            .with_operation("WRITE".to_string());
+        let add_files_schema = add_txn.add_files_schema();
+        let add_metadata = test_utils::create_add_files_metadata(
+            add_files_schema,
+            vec![(&data_file_path, parquet_len as i64, 1_000_000, 4)],
+        )?;
+        add_txn.add_files(add_metadata);
+        let _ = add_txn.commit(kernel_engine.as_ref())?.unwrap_committed();
+
+        // Build a serialized roaring bitmap deleting rows 1 and 2 (ids 20, 30) via the
+        // kernel-provided helper to avoid pulling in the roaring crate directly.
+        let mut dv = KernelDeletionVector::new();
+        dv.add_deleted_row_indexes([1u64, 2]);
+        let roaring_bytes: Vec<u8> = dv.serialize()?.to_vec();
+
+        // === FFI surface under test ===
+        let table_path = table_url.to_file_path().unwrap();
+        let table_path_str = table_path.to_str().unwrap();
+        let engine = get_default_engine(table_path_str);
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+        });
+        let engine_info = "test-engine/1.0";
+        let txn = ok_or_panic(unsafe {
+            with_engine_info(
+                txn,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+
+        // Frame the bitmap into a DV file via the kernel.
+        let prefix = "p1";
+        let descriptor = ok_or_panic(unsafe {
+            transaction_write_deletion_vector(
+                txn.shallow_copy(),
+                engine.shallow_copy(),
+                roaring_bytes.as_ptr(),
+                roaring_bytes.len(),
+                2,
+                kernel_string_slice!(prefix),
+            )
+        });
+
+        // Build the DV map and insert.
+        let map = dv_descriptor_map_new();
+        ok_or_panic(unsafe {
+            dv_descriptor_map_insert(
+                map.shallow_copy(),
+                kernel_string_slice!(data_file_path),
+                descriptor,
+                engine.shallow_copy(),
+            )
+        });
+
+        // Build a scan + iterator handle to feed the update call.
+        let snap_handle =
+            unsafe { build_snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy()) };
+        let scan_handle = ok_or_panic(unsafe {
+            scan(
+                snap_handle.shallow_copy(),
+                engine.shallow_copy(),
+                None,
+                None,
+            )
+        });
+        let scan_iter = ok_or_panic(unsafe {
+            scan_metadata_iter_init(engine.shallow_copy(), scan_handle.shallow_copy())
+        });
+
+        ok_or_panic(unsafe {
+            transaction_update_deletion_vectors(
+                txn.shallow_copy(),
+                map,
+                scan_iter.shallow_copy(),
+                engine.shallow_copy(),
+            )
+        });
+
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        assert_eq!(committed, 2);
+
+        // Verify: scan now returns 2 rows (10 and 40).
+        let snapshot = delta_kernel::snapshot::Snapshot::builder_for(table_url.clone())
+            .build(kernel_engine.as_ref())?;
+        let scan_after = snapshot.scan_builder().build()?;
+        let total: usize = scan_after
+            .execute(kernel_engine.clone())?
+            .map(|r| Ok::<_, delta_kernel::Error>(r?.len()))
+            .sum::<Result<_, _>>()?;
+        assert_eq!(total, 2, "expected 2 surviving rows");
+
+        unsafe {
+            free_scan_metadata_iter(scan_iter);
+            free_scan(scan_handle);
+            free_snapshot(snap_handle);
+            free_engine(engine);
+        }
+
+        Ok(())
     }
 
     #[tokio::test]

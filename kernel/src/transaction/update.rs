@@ -18,6 +18,7 @@ use tracing::instrument;
 
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::actions::deletion_vector_writer::StreamingDeletionVectorWriter;
 use crate::actions::get_log_add_schema;
 use crate::committer::Committer;
 use crate::engine_data::{
@@ -260,15 +261,7 @@ impl Transaction {
                 "Deletion vector operations require an existing table",
             ));
         }
-        if !self
-            .effective_table_config
-            .is_feature_supported(&TableFeature::DeletionVectors)
-        {
-            return Err(Error::unsupported(
-                "Deletion vector operations require reader version 3, writer version 7, \
-                 and the 'deletionVectors' feature in both reader and writer features",
-            ));
-        }
+        self.ensure_deletion_vectors_enabled()?;
 
         let mut matched_dv_files = 0;
         let mut visitor = DvMatchVisitor::new(&new_dv_descriptors);
@@ -321,6 +314,92 @@ impl Transaction {
         }
 
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Deletion vector file authoring
+    // -------------------------------------------------------------------------
+
+    /// Frame already-serialized 64-bit RoaringTreemap bytes into a Delta deletion-vector
+    /// file and write it via the engine's storage handler.
+    ///
+    /// Intended for engines that already produce serialized RoaringTreemap bytes (the
+    /// format produced by `RoaringTreemap::serialize_into` or any portable-roaring writer
+    /// in another language). The kernel handles the on-disk DV file framing -- version
+    /// byte, big-endian size prefix, magic number, and big-endian CRC32 -- as well as
+    /// path generation, so engines (in particular FFI connectors) do not need to replicate
+    /// the format.
+    ///
+    /// Each call writes a fresh single-DV file at
+    /// `<table_root>/<random_prefix>/deletion_vector_<uuid>.bin` (or
+    /// `<table_root>/deletion_vector_<uuid>.bin` if `random_prefix` is empty). To pack
+    /// multiple DVs into one file, drive the lower-level [`StreamingDeletionVectorWriter`]
+    /// directly.
+    ///
+    /// # Arguments
+    ///
+    /// * `engine` - the engine, used for the storage handler that performs the write
+    /// * `roaring_bytes` - portable 64-bit RoaringTreemap bytes (no Delta framing). Native
+    ///   (non-portable) roaring serialization is reserved by the spec and will not round-trip.
+    /// * `cardinality` - number of deleted rows in the bitmap. The kernel does not verify this
+    ///   against `roaring_bytes`; passing a wrong value produces a descriptor with incorrect
+    ///   cardinality and will skew downstream row-count accounting.
+    /// * `random_prefix` - optional path-component prefix for the DV file name. Pass an empty
+    ///   string to write at the table root. Treated as a single path segment -- do not include
+    ///   leading or trailing slashes. A short non-empty prefix can help spread load across
+    ///   object-store partitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The table does not have the `deletionVectors` writer feature enabled
+    ///   (`delta.enableDeletionVectors=true` is required in addition to feature support).
+    /// - `cardinality` is negative.
+    /// - The framing or storage write fails.
+    pub fn write_deletion_vector(
+        &self,
+        engine: &dyn Engine,
+        roaring_bytes: &[u8],
+        cardinality: i64,
+        random_prefix: impl Into<String>,
+    ) -> DeltaResult<DeletionVectorDescriptor> {
+        self.ensure_deletion_vectors_enabled()?;
+
+        let shared = self.shared_write_state();
+        let dv_path = crate::actions::deletion_vector::DeletionVectorPath::new(
+            shared.table_root.clone(),
+            random_prefix.into(),
+        );
+        let absolute = dv_path.absolute_path()?;
+
+        // Single-DV framing overhead: version(1) + size(4) + magic(4) + crc(4).
+        let mut buffer = Vec::with_capacity(roaring_bytes.len() + 13);
+        let mut writer = StreamingDeletionVectorWriter::new(&mut buffer);
+        let result = writer.write_serialized_deletion_vector(roaring_bytes, cardinality)?;
+        writer.finalize()?;
+
+        engine
+            .storage_handler()
+            .put(&absolute, buffer.into(), false)?;
+        Ok(result.to_descriptor(&dv_path))
+    }
+
+    /// Verify the table has deletion vectors *enabled* (writer feature supported AND the
+    /// `delta.enableDeletionVectors` table property set to `true`). Per the Delta protocol
+    /// "Deletion Vectors" section, writers MUST only write new DVs when the property is
+    /// enabled, not merely when the feature is in the writer features list.
+    fn ensure_deletion_vectors_enabled(&self) -> DeltaResult<()> {
+        if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::DeletionVectors)
+        {
+            return Ok(());
+        }
+        Err(Error::unsupported(
+            "Deletion vector writes require reader version 3, writer version 7, the \
+             'deletionVectors' feature in both reader and writer features, and the \
+             `delta.enableDeletionVectors` table property set to `true`",
+        ))
     }
 }
 

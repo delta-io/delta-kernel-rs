@@ -350,6 +350,21 @@ pub struct ScanMetadataIterator {
     engine: Arc<dyn ExternEngine>,
 }
 
+impl ScanMetadataIterator {
+    /// Acquire the iterator's mutex, returning a guard the caller can drain. While the
+    /// guard is alive, concurrent `scan_metadata_next` calls on the same handle block.
+    /// Used by [`crate::transaction::transaction_update_deletion_vectors`].
+    pub(crate) fn lock_iter(
+        &self,
+    ) -> DeltaResult<
+        std::sync::MutexGuard<'_, Box<dyn Iterator<Item = DeltaResult<ScanMetadata>> + Send>>,
+    > {
+        self.data
+            .lock()
+            .map_err(|_| Error::generic("poisoned scan-metadata iterator mutex"))
+    }
+}
+
 #[handle_descriptor(target=ScanMetadataIterator, mutable=false, sized=true)]
 pub struct SharedScanMetadataIterator;
 

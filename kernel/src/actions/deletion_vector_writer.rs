@@ -184,7 +184,7 @@ impl DeletionVector for KernelDeletionVector {
 /// The writer produces deletion vector files in the Delta Lake format:
 /// - The first byte of the file is a version byte (currently 1)
 /// - Each DV is prefixed with a 4-byte size (big-endian) of the serialized data
-/// - Followed by a 4-byte magic number (0x64485871, little-endian)
+/// - Followed by a 4-byte magic number (0x6439d3d1, little-endian)
 /// - Followed by the serialized 64-bit Roaring Bitmap
 /// - Followed by a 4-byte CRC32 checksum (big-endian) of the serialized data
 ///
@@ -264,6 +264,42 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         &mut self,
         deletion_vector: impl DeletionVector,
     ) -> DeltaResult<DeletionVectorWriteResult> {
+        let cardinality = deletion_vector.cardinality();
+        let serialized = deletion_vector.serialize()?;
+        self.write_serialized_deletion_vector(&serialized, cardinality as i64)
+    }
+
+    /// Frame an already-serialized 64-bit RoaringTreemap and write it to the underlying writer.
+    ///
+    /// Use this when the caller already holds the bitmap as bytes (e.g. produced in another
+    /// language or in a different process) and does not want to round-trip through
+    /// [`RoaringTreemap`]. Drives the same framing as [`Self::write_deletion_vector`].
+    ///
+    /// # Arguments
+    ///
+    /// * `serialized` - portable 64-bit RoaringTreemap bytes (the format produced by
+    ///   `RoaringTreemap::serialize_into`). The caller is responsible for using the *portable*
+    ///   serialization; native serialization is reserved by the Delta spec and will round-trip-fail
+    ///   when read back.
+    /// * `cardinality` - number of deleted rows in the bitmap. The kernel does not verify this
+    ///   against `serialized`; if the value is wrong the resulting descriptor will carry an
+    ///   incorrect `cardinality`. Must be non-negative.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `cardinality` is negative, the framed size would overflow `i32`,
+    /// or any I/O write fails.
+    pub fn write_serialized_deletion_vector(
+        &mut self,
+        serialized: &[u8],
+        cardinality: i64,
+    ) -> DeltaResult<DeletionVectorWriteResult> {
+        if cardinality < 0 {
+            return Err(Error::generic(
+                "Deletion vector cardinality must be non-negative",
+            ));
+        }
+
         // Write version byte on first write
         if self.current_offset == 0 {
             // Write header.
@@ -272,10 +308,6 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
                 .map_err(|e| Error::generic(format!("Failed to write version byte: {e}")))?;
             self.current_offset = 1;
         }
-
-        let cardinality = deletion_vector.cardinality();
-        // Serialize the deletion vector to bytes
-        let serialized = deletion_vector.serialize()?;
 
         // Calculate sizes
 
@@ -312,7 +344,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
 
         // Write the serialized treemap
         self.writer
-            .write_all(&serialized)
+            .write_all(serialized)
             .map_err(|e| Error::generic(format!("Failed to write deletion vector data: {e}")))?;
 
         // Calculate and write CRC32 checksum (big-endian)
@@ -320,7 +352,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         let crc_instance = create_dv_crc32();
         let mut digest = crc_instance.digest();
         digest.update(&magic.to_le_bytes());
-        digest.update(&serialized);
+        digest.update(serialized);
         let checksum = digest.finalize();
         self.writer
             .write_all(&checksum.to_be_bytes())
@@ -333,7 +365,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         Ok(DeletionVectorWriteResult {
             offset: dv_offset,
             size_in_bytes: dv_size as i32,
-            cardinality: cardinality as i64,
+            cardinality,
         })
     }
 
