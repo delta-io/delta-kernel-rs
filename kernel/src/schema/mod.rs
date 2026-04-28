@@ -1566,8 +1566,8 @@ impl GeometryType {
     /// Creates a new GeometryType with the given SRID.
     ///
     /// # Parameters
-    /// - `srid`: The spatial reference identifier (e.g. `"OGC:CRS84"`, `"EPSG:4326"`).
-    ///   Must be non-empty.
+    /// - `srid`: The spatial reference identifier (e.g. `"OGC:CRS84"`, `"EPSG:4326"`). Must be
+    ///   non-empty.
     pub fn try_new(srid: impl Into<String>) -> DeltaResult<Self> {
         let srid = srid.into();
         if srid.is_empty() {
