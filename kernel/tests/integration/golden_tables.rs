@@ -24,11 +24,8 @@ use futures::stream::TryStreamExt;
 use futures::StreamExt;
 use itertools::Itertools;
 use paste::paste;
-use url::Url;
-
-mod common;
-
 use test_utils::load_test_data;
+use url::Url;
 
 // NB adapted from DAT: read all parquet files in the directory and concatenate them
 async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
