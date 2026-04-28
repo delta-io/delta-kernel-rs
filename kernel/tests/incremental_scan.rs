@@ -14,10 +14,12 @@ use delta_kernel::incremental_scan::{
     IncrementalListing, IncrementalScanBuilder, IncrementalScanResult,
 };
 use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::path::Path as ObjectStorePath;
+use delta_kernel::object_store::ObjectStoreExt;
 use delta_kernel::Snapshot;
 use test_utils::{
     actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
-    create_log_path, TestAction,
+    create_log_path, delta_path_for_version, TestAction,
 };
 use url::Url;
 
@@ -314,6 +316,135 @@ async fn picks_up_staged_commits_from_log_tail() -> Result<(), Box<dyn std::erro
         "expected 2 surviving Adds from staged commits in log_tail"
     );
     assert_eq!(listing.target_version, 2);
+
+    Ok(())
+}
+
+// A commit in the range that contains only Remove actions (no Adds) should not crash,
+// should produce no entries in `add_files`, and the Remove paths should land in
+// `remove_files`.
+#[tokio::test]
+async fn removes_only_commit_in_range() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![
+            TestAction::Remove("gone-a.parquet".to_string()),
+            TestAction::Remove("gone-b.parquet".to_string()),
+        ]),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let listing = unwrap_listing(
+        IncrementalScanBuilder::new(target, 0)
+            .build(engine.as_ref(), std::iter::empty::<&str>())?,
+    );
+
+    assert_eq!(surviving_add_count(&listing), 0);
+    assert!(listing.add_files.is_empty(), "no Adds means no add batches");
+    assert_eq!(listing.remove_files.len(), 2);
+    assert!(listing.remove_files.contains("gone-a.parquet"));
+    assert!(listing.remove_files.contains("gone-b.parquet"));
+
+    Ok(())
+}
+
+// A commit in the range with only metadata actions (no Add or Remove) should be
+// silently skipped: no add batches, no removes.
+#[tokio::test]
+async fn metadata_only_commit_in_range() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // v1 contains only the standard Metadata; no Add or Remove.
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let listing = unwrap_listing(
+        IncrementalScanBuilder::new(target, 0)
+            .build(engine.as_ref(), std::iter::empty::<&str>())?,
+    );
+
+    assert_eq!(surviving_add_count(&listing), 0);
+    assert!(listing.add_files.is_empty());
+    assert!(listing.remove_files.is_empty());
+    assert!(listing.duplicate_add_paths.is_empty());
+
+    Ok(())
+}
+
+// A commit file that the snapshot listed has been removed before `build()` runs (e.g.
+// a vacuum races between snapshot construction and our incremental scan). Must surface
+// as `CommitsUnavailable` so the consumer falls back to a full scan, not as a generic
+// I/O error.
+#[tokio::test]
+async fn missing_commit_file_returns_commits_unavailable() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![TestAction::Add("a.parquet".to_string())]),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url.clone())
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    // Simulate a vacuum: delete the v1 commit JSON from underlying storage AFTER the
+    // snapshot is built (so the snapshot still lists it, but reading it will fail).
+    let v1_path: ObjectStorePath = delta_path_for_version(1, "json");
+    storage.delete(&v1_path).await?;
+
+    let result = IncrementalScanBuilder::new(target, 0)
+        .build(engine.as_ref(), std::iter::empty::<&str>())?;
+
+    match result {
+        IncrementalScanResult::CommitsUnavailable => {}
+        other => panic!("expected CommitsUnavailable for missing commit, got {other:?}"),
+    }
 
     Ok(())
 }

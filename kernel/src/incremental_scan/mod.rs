@@ -119,6 +119,10 @@ impl IncrementalScanBuilder {
         engine: &dyn Engine,
         base_file_paths: impl IntoIterator<Item = P>,
     ) -> DeltaResult<IncrementalScanResult> {
+        // TODO(#2493): the version validation, the snapshot-commit-list extraction and
+        // clipping below, and the "snapshot covers the range" check should all be replaced
+        // by a single `CommitRangeBuilder::from_snapshot(...).build(engine)` call once
+        // that primitive lands. https://github.com/delta-io/delta-kernel-rs/issues/2493
         let target_version = self.snapshot.version();
         require!(
             self.base_version < target_version,
@@ -136,17 +140,18 @@ impl IncrementalScanBuilder {
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
-        // Use the snapshot's already-validated commit list rather than re-listing storage.
-        // This is correct for catalog-managed tables: the snapshot's log_segment includes
-        // any staged/ratified-but-unpublished commits passed in via `with_log_tail`, which
-        // a fresh storage listing would silently miss.
+        // TODO(#2493): replace this block with `CommitRange` once it exists.
+        // Today we use the snapshot's already-validated commit list rather than re-listing
+        // storage. This is correct for catalog-managed tables: the snapshot's log_segment
+        // includes any staged/ratified-but-unpublished commits passed in via `with_log_tail`,
+        // which a fresh storage listing would silently miss. `CommitRange` will own this
+        // listing-and-validation responsibility centrally.
         let snapshot_commits = &self.snapshot.log_segment().listed.ascending_commit_files;
         let snapshot_first_version = snapshot_commits.first().map(|c| c.version);
 
-        // The snapshot can serve `(base_version, target_version]` only if its earliest
-        // commit version is <= base_version + 1. Otherwise older JSONs were either
-        // retention-cleaned or hidden behind a checkpoint, and the consumer must rebuild
-        // their listing from a full scan.
+        // TODO(#2493): this "snapshot covers range" check becomes a typed error from
+        // `CommitRange::build` (e.g. `Error::CommitsUnavailable { missing: Range<Version> }`),
+        // pattern-matched here to produce `IncrementalScanResult::CommitsUnavailable`.
         let start_version = self.base_version + 1;
         if snapshot_first_version.is_none_or(|v| v > start_version) {
             return Ok(IncrementalScanResult::CommitsUnavailable);
@@ -165,6 +170,11 @@ impl IncrementalScanBuilder {
         let mut add_files: Vec<FilteredEngineData> = Vec::new();
 
         for commit_file in commit_files {
+            // TODO(#2493): the FileNotFound -> CommitsUnavailable conversion below
+            // is a property of "reading the commits in a range" and should live behind
+            // `CommitRange` once that primitive lands; consumers shouldn't redo this
+            // pattern matching every time.
+            //
             // A commit file the snapshot listed may have been removed by a racing vacuum
             // (or, for staged commits, by a catalog publication race). Treat that as
             // CommitsUnavailable so the consumer falls back to a full scan; propagate any
