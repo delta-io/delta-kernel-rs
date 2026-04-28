@@ -119,7 +119,8 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   whether a new test duplicates the flow of an existing nearby test and should be
   merged into it as a new `#[case]`. A common pattern is toggling a feature (e.g.
   column mapping on/off) and asserting success vs. error.
-- Reuse helpers from `test_utils` instead of writing custom ones when possible.
+- Reuse helpers from `test_utils` and the integration-test fixtures instead of writing
+  custom ones when possible. See **Common test helpers** below for a curated starter list.
 - **Committing in tests:** Use `txn.commit(engine)?.unwrap_committed()` to assert a
   successful commit and get the `CommittedTransaction`. Do NOT use `match` + `panic!`
   for this -- `unwrap_committed()` provides a clear error message on failure. Available
@@ -139,6 +140,64 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
   `InMemory::new()` with `"memory:///"`. Always use the same `table_root` URL string for
   both `add_commit` (writing log files) and `snapshot`/`Snapshot::try_new` (reading the
   table). Always include a trailing slash in directory URLs to ensure correct path joining.
+
+### Common test helpers
+
+Before writing a custom helper, check this curated list and the locations below.
+This list is non-exhaustive -- when in doubt, browse the source files directly
+(`test-utils/src/lib.rs`, `kernel/tests/integration/common/`,
+`kernel/tests/integration/<topic>/mod.rs`).
+
+**Arrow construction (from `delta_kernel::arrow`)**
+
+- `arrow::array::new_null_array(&arrow_type, n)` -- Arrow array of `n` nulls of any Arrow
+  type. Prefer this over per-type `Int32Array::from(vec![None as Option<i32>])` builders.
+- `engine::arrow_conversion::TryIntoArrow`:
+  `(&kernel_data_type).try_into_arrow()` for `DataType`,
+  `(&kernel_struct_type).try_into_arrow()` for `StructType` -> Arrow `Schema`.
+
+**Engine + table setup (from `test_utils`)**
+
+- `test_table_setup()` / `test_table_setup_mt()` -- engine + temp table path. Use the `_mt`
+  variant under `#[tokio::test(flavor = "multi_thread")]`.
+- `engine_store_setup(name, opts)` -- returns `(store, engine, table_location)` when a test
+  needs direct object-store access.
+- `setup_test_tables(...)` -- multiple pre-built tables for read/scan tests.
+
+**Table creation in tests**
+
+- Prefer the kernel `create_table` builder
+  (`delta_kernel::transaction::create_table::create_table`). It exercises the same path
+  connectors use and auto-derives the protocol from the schema and feature flags.
+- `test_utils::create_table` (a JSON helper that hand-rolls protocol + metadata) is older
+  but still needed when the kernel builder cannot enable a particular feature combination.
+
+**Schema fixtures**
+
+- `test_utils`: `nested_schema`, `schema_with_type`, `nested_schema_with_type`,
+  `multi_schema_with_type`, `top_level_ntz_schema` / `nested_ntz_schema` /
+  `multiple_ntz_schema`, `top_level_variant_schema` / `nested_variant_schema` /
+  `multiple_variant_schema`.
+- `kernel/tests/integration/create_table/mod.rs`: `simple_schema`, `partition_test_schema`.
+
+**Commit + read helpers (from `test_utils`)**
+
+- `add_commit`, `add_staged_commit` -- write a JSON commit at a given version.
+- `read_actions_from_commit` -- read raw JSON actions from a specific commit. Use this
+  instead of hand-rolled `serde_json` parsing.
+- `test_read` -- full-scan read of a table; use for round-trip assertions.
+- `into_record_batch` -- convert `Box<dyn EngineData>` to Arrow `RecordBatch`.
+
+**Assertion helpers (from `test_utils`)**
+
+- `assert_schema_has_field(schema, &["a", "b"])` -- assert a (possibly nested) field path.
+- `assert_result_error_with_message(result, "needle")` -- assert an error contains a
+  substring.
+
+**If a name here doesn't match what's in code:** the list may have drifted from a rename.
+Run `rg '^pub (fn|async fn)' test-utils/src/lib.rs` to discover the current public surface,
+and update this section in your PR. The same pattern works for
+`kernel/tests/integration/common/write_utils.rs`.
 
 ## Protocol TLDR
 

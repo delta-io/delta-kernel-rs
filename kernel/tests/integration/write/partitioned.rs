@@ -813,3 +813,211 @@ async fn test_materialized_partition_columns_excluded_from_stats(
 
     Ok(())
 }
+
+// ==============================================================================
+// NOT NULL partition column tests
+// ==============================================================================
+//
+// See [#2465](https://github.com/delta-io/delta-kernel-rs/issues/2465). These tests pin the
+// kernel contract that mirrors Delta-Spark's `DELTA_NOT_NULL_CONSTRAINT_VIOLATED` (SQLSTATE
+// 23502): a NULL written into a `NOT NULL` partition column must be rejected on the default
+// engine. The two arms exercise the two enforcement seams:
+//
+// 1. Non-materialized (default): partition columns are stripped from the batch before the Parquet
+//    write, so the partition-value map is the authority. Kernel validation rejects null-equivalent
+//    values for `nullable: false` partition columns up front.
+// 2. Materialized (`materializePartitionColumns` writer feature): partition columns stay in the
+//    batch on the way to the engine, so a null in the NOT NULL column is rejected by the engine
+//    (arrow-rs) at batch construction, matching the data-column NOT NULL contract.
+
+/// Validates the e2e NOT NULL contract on partition values for the non-materialized path: a
+/// null-equivalent value into a `nullable: false` partition column is rejected before
+/// serialization, and ordinary non-null values pass through unchanged. The column-mapping
+/// axis is orthogonal. Validation runs against logical names and field nullability before
+/// any column-mapping renaming, so the same outcome is expected under all three CM modes.
+///
+/// Three value cases cross-multiplied against three column-mapping modes:
+///
+/// - `Scalar::Null(STRING)` -- explicit null, must be rejected.
+/// - `Scalar::String("a")`  -- ordinary non-null value, must be accepted.
+/// - `Scalar::String("")`   -- empty string, which the Delta protocol treats as JSON null in
+///   `partitionValues`. It must be rejected for the same reason as `Scalar::Null` -- otherwise it
+///   would slip past the nullability check and land a null value in a NOT NULL column.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_partition_null_validation_non_materialized(
+    #[values(
+        ColumnMappingMode::None,
+        ColumnMappingMode::Name,
+        ColumnMappingMode::Id
+    )]
+    cm_mode: ColumnMappingMode,
+    #[values(
+        (Scalar::Null(DataType::STRING), Some("not nullable")),
+        (Scalar::String("a".into()), None),
+        (Scalar::String(String::new()), Some("not nullable")),
+    )]
+    case: (Scalar, Option<&'static str>),
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (value, expected_err) = case;
+
+    // Schema: a nullable data column + a NOT NULL string partition column.
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("value", DataType::INTEGER),
+        StructField::not_null("p", DataType::STRING),
+    ])?);
+
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot = create_partitioned_table(&table_path, engine.as_ref(), schema, &["p"], cm_mode)?;
+
+    let result = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("default engine")
+        .partitioned_write_context(HashMap::from([("p".to_string(), value)]));
+
+    match expected_err {
+        Some(needle) => {
+            let err = result
+                .err()
+                .ok_or(
+                    "expected partitioned_write_context to error for a null-equivalent value into NOT NULL partition",
+                )?
+                .to_string();
+            assert!(err.contains(needle), "{err}");
+            assert!(err.contains("'p'"), "{err}");
+        }
+        None => {
+            result?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Verifies mixed-nullability partition schemas enforce each partition column's own contract:
+/// null-equivalent values are accepted for nullable partition columns and rejected for NOT NULL
+/// partition columns.
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_partition_null_validation_mixed_nullability(
+    #[values(
+        ColumnMappingMode::None,
+        ColumnMappingMode::Name,
+        ColumnMappingMode::Id
+    )]
+    cm_mode: ColumnMappingMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("value", DataType::INTEGER),
+        StructField::not_null("p_required", DataType::STRING),
+        StructField::nullable("p_optional", DataType::STRING),
+    ])?);
+
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot = create_partitioned_table(
+        &table_path,
+        engine.as_ref(),
+        schema,
+        &["p_required", "p_optional"],
+        cm_mode,
+    )?;
+
+    snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("default engine")
+        .partitioned_write_context(HashMap::from([
+            ("p_required".to_string(), Scalar::String("a".into())),
+            ("p_optional".to_string(), Scalar::Null(DataType::STRING)),
+        ]))?;
+
+    snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("default engine")
+        .partitioned_write_context(HashMap::from([
+            ("p_required".to_string(), Scalar::String("a".into())),
+            ("p_optional".to_string(), Scalar::String(String::new())),
+        ]))?;
+
+    let err = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("default engine")
+        .partitioned_write_context(HashMap::from([
+            ("p_required".to_string(), Scalar::Null(DataType::STRING)),
+            ("p_optional".to_string(), Scalar::String("b".into())),
+        ]))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not nullable"), "{err}");
+    assert!(err.contains("'p_required'"), "{err}");
+
+    Ok(())
+}
+
+/// Materialized arm: with the `materializePartitionColumns` writer feature enabled, partition
+/// columns stay in the engine-bound Arrow batch, so the NOT NULL enforcement seam is the same
+/// as for data columns where the engine rejects a null in a `nullable: false` field at batch
+/// construction.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_partition_null_validation_in_batch_materialized(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("value", DataType::INTEGER),
+        StructField::not_null("p", DataType::STRING),
+    ])?);
+
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let _ = create_table(&table_path, schema.clone(), "test/1.0")
+        .with_data_layout(DataLayout::partitioned(["p"]))
+        .with_table_properties([("delta.feature.materializePartitionColumns", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(
+        snapshot.table_configuration().is_feature_enabled(
+            &delta_kernel::table_features::TableFeature::MaterializePartitionColumns
+        ),
+        "test setup must enable materializePartitionColumns"
+    );
+
+    // The partition-value map below is a benign mock: it satisfies the kernel write API
+    // but is decoupled from this test's assertion. With the materialize feature enabled,
+    // the partition column stays in the Arrow batch on the way to the engine (rather than
+    // being filtered out), so the NOT NULL enforcement seam moves into the engine: a null
+    // in a `nullable: false` field is rejected at batch construction below, independent of
+    // whatever value the mock map carries here.
+    let txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_engine_info("default engine");
+    let _write_context = txn.partitioned_write_context(HashMap::from([(
+        "p".to_string(),
+        Scalar::String("a".into()),
+    )]))?;
+
+    let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
+    assert!(
+        !arrow_schema.field_with_name("p")?.is_nullable(),
+        "kernel `not_null` partition field must produce Arrow `nullable: false`",
+    );
+
+    let result = RecordBatch::try_new(
+        Arc::new(arrow_schema),
+        vec![
+            Arc::new(Int32Array::from(vec![Some(1)])),
+            Arc::new(StringArray::from(vec![None as Option<&str>])),
+        ],
+    );
+    assert!(
+        result.is_err(),
+        "RecordBatch::try_new should reject null in NOT NULL materialized partition column; got: {result:?}",
+    );
+
+    Ok(())
+}

@@ -884,7 +884,10 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// - **Type checking**: rejects non-primitive partition column types (struct, array, map) and
     ///   validates that each non-null `Scalar`'s type matches the partition column's schema type.
     ///   For example, passing `Scalar::String("2024")` for an `INTEGER` column returns an error.
-    ///   Null scalars skip the value type check (null is valid for any primitive partition column).
+    ///   Null-equivalent scalars (null scalars, empty strings, and empty binary) all of which
+    ///   collapse to JSON null in `partitionValues`) skip the value type check, but they are only
+    ///   legal when the partition column is nullable; passing any of these for a `nullable: false`
+    ///   partition column returns an error.
     ///
     /// - **Value serialization**: serializes each `Scalar` to a protocol-compliant string per the
     ///   Delta protocol's "Partition Value Serialization" rules. `Scalar::Null(...)` becomes `None`

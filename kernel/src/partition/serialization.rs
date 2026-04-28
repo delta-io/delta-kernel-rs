@@ -44,13 +44,35 @@ const UNIX_EPOCH_CE_DAYS: i32 = 719_163;
 // Binary            Raw UTF-8: String::from_utf8            strict, error on invalid
 // Struct/Array/Map  Error                                   not valid partition types
 
+/// Whether a partition-value [`Scalar`] is equivalent to null under the Delta protocol's
+/// partition value serialization rules.
+///
+/// The protocol collapses three Scalar shapes onto JSON null in `AddFile.partitionValues`:
+/// `Scalar::Null(_)`, empty `Scalar::String`, and empty `Scalar::Binary`. Partition
+/// values are serialized according to protocol rules on write and interpreted against
+/// the table schema on read, so all three forms must be treated as null before enforcing
+/// NOT NULL constraints.
+///
+/// Read paths do not need this predicate: the on-wire collapse to JSON null is undone at
+/// JSON deserialization (null map entries are dropped before kernel sees a Scalar), so a
+/// "null" partition value never appears in Scalar form on reads.
+pub(crate) fn would_serialize_to_null(value: &Scalar) -> bool {
+    match value {
+        Scalar::Null(_) => true,
+        Scalar::String(s) if s.is_empty() => true,
+        Scalar::Binary(b) if b.is_empty() => true,
+        _ => false,
+    }
+}
+
 /// Serializes a [`Scalar`] partition value to a protocol-compliant string for the
 /// `partitionValues` map in Add actions.
 ///
-/// Returns `Ok(None)` for null values (regardless of the null's data type), empty strings,
-/// and empty binary (the Delta protocol treats all three as null partition values). Returns
-/// `Err` for non-null values of types that cannot be partition columns (Struct, Array, Map)
-/// or for binary values that are not valid UTF-8.
+/// Returns `Ok(None)` for any value the Delta protocol treats as null in `partitionValues`:
+/// `Scalar::Null`, empty `Scalar::String`, and empty `Scalar::Binary`. Non-null partition
+/// values are serialized according to protocol rules; readers interpret the stored value
+/// against the table schema. Returns `Err` for non-null values of types that cannot be
+/// partition columns (Struct, Array, Map) or for binary values that are not valid UTF-8.
 ///
 /// The inverse of [`PrimitiveType::parse_scalar`].
 ///
@@ -58,7 +80,8 @@ const UNIX_EPOCH_CE_DAYS: i32 = 719_163;
 pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> {
     match value {
         Scalar::Null(_) => Ok(None),
-        Scalar::String(s) => Ok(if s.is_empty() { None } else { Some(s.clone()) }),
+        Scalar::String(s) if s.is_empty() => Ok(None),
+        Scalar::String(s) => Ok(Some(s.clone())),
         Scalar::Boolean(v) => Ok(Some(v.to_string())),
         Scalar::Byte(v) => Ok(Some(v.to_string())),
         Scalar::Short(v) => Ok(Some(v.to_string())),
@@ -70,13 +93,8 @@ pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> 
         Scalar::Timestamp(us) => Ok(Some(format_timestamp(*us)?)),
         Scalar::TimestampNtz(us) => Ok(Some(format_timestamp_ntz(*us)?)),
         Scalar::Decimal(d) => Ok(Some(format_decimal(d))),
-        Scalar::Binary(b) => {
-            if b.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(format_binary(b)?))
-            }
-        }
+        Scalar::Binary(b) if b.is_empty() => Ok(None),
+        Scalar::Binary(b) => Ok(Some(format_binary(b)?)),
         Scalar::Struct(_) | Scalar::Array(_) | Scalar::Map(_) => Err(Error::generic(format!(
             "cannot serialize partition value: type {:?} is not a valid partition column type",
             value.data_type()
@@ -252,6 +270,39 @@ mod tests {
     #[case::row49_empty_binary(Scalar::Binary(vec![]))]
     fn test_spark_ref_empty_value_returns_none(#[case] input: Scalar) {
         assert_eq!(serialize_partition_value(&input).unwrap(), None);
+    }
+
+    /// Tests the canonical null-equivalence rule: `would_serialize_to_null` returns true for
+    /// exactly the three Scalar shapes that collapse to JSON null (`Scalar::Null`, empty
+    /// `Scalar::String`, empty `Scalar::Binary`) and false for everything else, including
+    /// non-empty strings/binary and primitive scalars.
+    #[rstest]
+    // Null-equivalent: all three shapes return true.
+    #[case::null_int(Scalar::Null(DataType::INTEGER), true)]
+    #[case::null_string(Scalar::Null(DataType::STRING), true)]
+    #[case::null_binary(Scalar::Null(DataType::BINARY), true)]
+    #[case::empty_string(Scalar::String(String::new()), true)]
+    #[case::empty_binary(Scalar::Binary(Vec::new()), true)]
+    // Non-empty strings/binary and primitive scalars return false.
+    #[case::nonempty_string(Scalar::String("a".into()), false)]
+    #[case::single_space(Scalar::String(" ".into()), false)]
+    #[case::nonempty_binary(Scalar::Binary(vec![0x00]), false)]
+    #[case::integer(Scalar::Integer(0), false)]
+    #[case::boolean_false(Scalar::Boolean(false), false)]
+    fn test_would_serialize_to_null(#[case] value: Scalar, #[case] expected: bool) {
+        assert_eq!(would_serialize_to_null(&value), expected);
+    }
+
+    /// Cross-check: any value where `would_serialize_to_null` is true must also serialize
+    /// to `Ok(None)`, and vice versa for the cases above. Locks the predicate to the actual
+    /// serialization outcome so the helper cannot drift from `serialize_partition_value`.
+    #[rstest]
+    #[case(Scalar::Null(DataType::INTEGER))]
+    #[case(Scalar::String(String::new()))]
+    #[case(Scalar::Binary(Vec::new()))]
+    fn test_would_serialize_to_null_matches_serialize_result(#[case] value: Scalar) {
+        assert!(would_serialize_to_null(&value));
+        assert_eq!(serialize_partition_value(&value).unwrap(), None);
     }
 
     // ============================================================================
