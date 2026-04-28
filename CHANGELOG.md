@@ -1,5 +1,18 @@
 # Changelog
 
+## [v0.18.3](https://github.com/delta-io/delta-kernel-rs/tree/v0.18.3/) (2026-04-28)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.18.2...v0.18.3)
+
+
+### 🐛 Bug Fixes
+
+1. Support databricks style presigned URLs ([#2485])
+
+
+[#2485]: https://github.com/delta-io/delta-kernel-rs/pull/2485
+
+
 ## [v0.18.2](https://github.com/delta-io/delta-kernel-rs/tree/v0.18.2/) (2025-12-03)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.18.1...v0.18.2)
