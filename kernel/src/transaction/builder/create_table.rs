@@ -991,7 +991,6 @@ mod tests {
             "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
         );
 
-        // delta.enableIcebergCompatV3 is also not on the allow list.
         let mut properties = HashMap::new();
         properties.insert(ENABLE_ICEBERG_COMPAT_V3.to_string(), "true".to_string());
         assert_result_error_with_message(
