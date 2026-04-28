@@ -9,7 +9,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::{
     CreateTableTransaction, CreateTableTransactionBuilder,
 };
-use delta_kernel::transaction::{CommitResult, Transaction};
+use delta_kernel::transaction::{CommitResult, CommittedTransaction, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::error::{ExternResult, IntoExternResult};
@@ -35,6 +35,15 @@ pub struct ExclusiveTransaction;
 /// file removal, blind append, and deletion vector updates are not available.
 #[handle_descriptor(target=CreateTableTransaction, mutable=true, sized=true)]
 pub struct ExclusiveCreateTransaction;
+
+/// A handle for a successfully [`CommittedTransaction`].
+///
+/// Returned by [`commit`] and [`create_table_commit`]. Carries the committed version and,
+/// when available, the post-commit snapshot. Use [`committed_transaction_version`] and
+/// [`committed_transaction_post_commit_snapshot`] to read the contents, then release with
+/// [`free_committed_transaction`].
+#[handle_descriptor(target=CommittedTransaction, mutable=true, sized=true)]
+pub struct ExclusiveCommittedTransaction;
 
 /// Handle for a mutable boxed committer that can be passed across FFI
 #[handle_descriptor(target = dyn Committer, mutable = true, sized = false)]
@@ -94,13 +103,18 @@ fn transaction_with_committer_impl(
     Ok(Box::new(transaction?).into())
 }
 
-/// Convert a [`CommitResult`] into a committed version number, or an error if the commit was not
-/// successful.
+/// Convert a [`CommitResult`] into a [`CommittedTransaction`] handle, or an error if the commit
+/// was not successful.
+///
+/// The returned handle owns the [`CommittedTransaction`] and must be freed with
+/// [`free_committed_transaction`].
 ///
 /// TODO: expose the full `CommitResult` enum through FFI for conflict resolution.
-fn commit_result_to_version<S>(result: DeltaResult<CommitResult<S>>) -> DeltaResult<u64> {
+fn commit_result_to_committed_handle<S>(
+    result: DeltaResult<CommitResult<S>>,
+) -> DeltaResult<Handle<ExclusiveCommittedTransaction>> {
     match result? {
-        CommitResult::CommittedTransaction(committed) => Ok(committed.commit_version()),
+        CommitResult::CommittedTransaction(committed) => Ok(Box::new(committed).into()),
         CommitResult::RetryableTransaction(_) => Err(delta_kernel::Error::unsupported(
             "commit failed: retryable transaction not supported in FFI (yet)",
         )),
@@ -270,8 +284,11 @@ pub unsafe extern "C" fn set_data_change(mut txn: Handle<ExclusiveTransaction>, 
     underlying_txn.set_data_change(data_change);
 }
 
-/// Attempt to commit a transaction to the table. Returns version number if successful.
-/// Returns error if the commit fails.
+/// Attempt to commit a transaction to the table. On success, returns a handle to the
+/// [`CommittedTransaction`] from which the caller can read the version and the optional
+/// post-commit snapshot. The returned handle must be freed with [`free_committed_transaction`].
+///
+/// Returns an error if the commit fails (including conflicts and retryable IO errors).
 ///
 /// # Safety
 ///
@@ -281,11 +298,12 @@ pub unsafe extern "C" fn set_data_change(mut txn: Handle<ExclusiveTransaction>, 
 pub unsafe extern "C" fn commit(
     txn: Handle<ExclusiveTransaction>,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<u64> {
+) -> ExternResult<Handle<ExclusiveCommittedTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
     let engine = extern_engine.engine();
-    commit_result_to_version(txn.commit(engine.as_ref())).into_extern_result(&extern_engine)
+    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
+        .into_extern_result(&extern_engine)
 }
 
 // ============================================================================
@@ -358,8 +376,11 @@ pub unsafe extern "C" fn create_table_set_data_change(
     underlying_txn.set_data_change(data_change);
 }
 
-/// Attempt to commit a create-table transaction. Returns version number if successful.
-/// Returns error if the commit fails.
+/// Attempt to commit a create-table transaction. On success, returns a handle to the
+/// [`CommittedTransaction`] from which the caller can read the version and the optional
+/// post-commit snapshot. The returned handle must be freed with [`free_committed_transaction`].
+///
+/// Returns an error if the commit fails.
 ///
 /// # Safety
 ///
@@ -369,11 +390,78 @@ pub unsafe extern "C" fn create_table_set_data_change(
 pub unsafe extern "C" fn create_table_commit(
     txn: Handle<ExclusiveCreateTransaction>,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<u64> {
+) -> ExternResult<Handle<ExclusiveCommittedTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
     let engine = extern_engine.engine();
-    commit_result_to_version(txn.commit(engine.as_ref())).into_extern_result(&extern_engine)
+    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
+        .into_extern_result(&extern_engine)
+}
+
+// ============================================================================
+// Committed transaction accessors
+// ============================================================================
+
+/// Free a [`CommittedTransaction`] handle.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle and must not use it after this call.
+#[no_mangle]
+pub unsafe extern "C" fn free_committed_transaction(txn: Handle<ExclusiveCommittedTransaction>) {
+    txn.drop_handle();
+}
+
+/// Read the committed version from a [`CommittedTransaction`] handle.
+///
+/// Does not consume the handle; the caller still owns it and must eventually pass it to
+/// [`free_committed_transaction`].
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn committed_transaction_version(
+    txn: Handle<ExclusiveCommittedTransaction>,
+) -> u64 {
+    let committed = unsafe { txn.as_ref() };
+    committed.commit_version()
+}
+
+/// Read the post-commit snapshot from a [`CommittedTransaction`] handle.
+///
+/// Returns `true` if a post-commit snapshot is available (in which case `*out_snapshot` is
+/// written with a fresh [`SharedSnapshot`] handle that the caller must eventually free with
+/// [`free_snapshot`](crate::free_snapshot)). Returns `false` otherwise (in which case
+/// `*out_snapshot` is not modified). The kernel does not currently produce post-commit
+/// snapshots for transactions that experienced conflicts; in the FFI today, conflicts are
+/// reported as errors at commit time rather than as committed transactions, so a `false`
+/// return primarily indicates that this committed transaction was constructed without a
+/// post-commit snapshot.
+///
+/// Does not consume the handle; the caller still owns it and must eventually pass it to
+/// [`free_committed_transaction`]. Calling this function multiple times yields independent
+/// snapshot handles, each of which must be freed.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle and a valid, writable `out_snapshot`
+/// pointer.
+#[no_mangle]
+pub unsafe extern "C" fn committed_transaction_post_commit_snapshot(
+    txn: Handle<ExclusiveCommittedTransaction>,
+    out_snapshot: *mut Handle<SharedSnapshot>,
+) -> bool {
+    let committed = unsafe { txn.as_ref() };
+    match committed.post_commit_snapshot() {
+        Some(snap) => {
+            // Arc::clone bumps the refcount; the resulting Handle owns its own strong reference,
+            // so freeing the CommittedTransaction handle later does not invalidate the snapshot.
+            unsafe { out_snapshot.write(Arc::clone(snap).into()) };
+            true
+        }
+        None => false,
+    }
 }
 
 // ============================================================================
@@ -627,6 +715,22 @@ mod tests {
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
+    /// Read the version from a [`Handle<ExclusiveCommittedTransaction>`] and free the handle.
+    ///
+    /// Most existing tests only assert against the committed version, so this preserves the
+    /// pre-handle-API ergonomics (`let v = ok_or_panic(commit(...))`) while still exercising
+    /// the new accessor and explicit free.
+    ///
+    /// # Safety
+    ///
+    /// Caller asserts the handle is valid (i.e. produced by [`commit`] / [`create_table_commit`]
+    /// and not previously freed).
+    unsafe fn version_and_free(committed: Handle<ExclusiveCommittedTransaction>) -> u64 {
+        let version = unsafe { committed_transaction_version(committed.shallow_copy()) };
+        unsafe { free_committed_transaction(committed) };
+        version
+    }
+
     fn check_txn_id_exists(commit_info: &serde_json::Value) {
         commit_info["txnId"]
             .as_str()
@@ -803,7 +907,8 @@ mod tests {
 
             unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
 
-            ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+            let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+            unsafe { free_committed_transaction(committed) };
 
             // Confirm that our commit is what we expect
             let commit1_url = table_url
@@ -941,7 +1046,8 @@ mod tests {
             )
         });
 
-        let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let version = unsafe { version_and_free(committed) };
         assert_eq!(version, 1);
 
         let dm = read_domain_metadata_action(&*store, &table_url, 1).await;
@@ -959,7 +1065,8 @@ mod tests {
             with_domain_metadata_removed(txn, kernel_string_slice!(domain), engine.shallow_copy())
         });
 
-        let version = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let version = unsafe { version_and_free(committed) };
         assert_eq!(version, 2);
 
         let dm = read_domain_metadata_action(&*store, &table_url, 2).await;
@@ -1256,6 +1363,9 @@ mod tests {
 
             // UC committer returns success from our mock callback
             assert!(commit_result.is_ok(), "Commit should succeed");
+            if let ExternResult::Ok(committed) = commit_result {
+                unsafe { free_committed_transaction(committed) };
+            }
 
             let context = recover_test_context(context).unwrap();
 
@@ -1423,7 +1533,8 @@ mod tests {
     ) -> u64 {
         let txn =
             ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
-        let version = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let version = unsafe { version_and_free(committed) };
         assert_eq!(version, 0);
         version
     }
@@ -1458,6 +1569,97 @@ mod tests {
 
         unsafe { free_schema(snap_schema) };
         unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    /// CREATE TABLE: the committed transaction must expose a post-commit snapshot at version 0
+    /// without re-listing the log.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_post_commit_snapshot_create_table() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let (_table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+
+        assert_eq!(
+            unsafe { committed_transaction_version(committed.shallow_copy()) },
+            0
+        );
+
+        let mut slot = std::mem::MaybeUninit::<Handle<SharedSnapshot>>::uninit();
+        let has_snapshot = unsafe {
+            committed_transaction_post_commit_snapshot(committed.shallow_copy(), slot.as_mut_ptr())
+        };
+        assert!(
+            has_snapshot,
+            "create_table commit should produce a post-commit snapshot"
+        );
+        let snap = unsafe { slot.assume_init() };
+        assert_eq!(unsafe { version(snap.shallow_copy()) }, 0);
+
+        unsafe { free_snapshot(snap) };
+        unsafe { free_committed_transaction(committed) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    /// Existing-table commit: the committed transaction's post-commit snapshot must be at the
+    /// just-committed version. Also verifies that calling the accessor a second time yields an
+    /// independent handle (Arc clone).
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_post_commit_snapshot_existing_table() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        // create_table_with_one_file commits v0 (create) and v1 (file add).
+        let (table_path, engine) = create_table_with_one_file(&tmp_dir)?;
+
+        // Blind no-op commit on top of v1 -> v2.
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        unsafe { set_data_change(txn.shallow_copy(), false) };
+        let engine_info = "test-engine/1.0";
+        let txn = ok_or_panic(unsafe {
+            with_engine_info(
+                txn,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let v = unsafe { committed_transaction_version(committed.shallow_copy()) };
+        assert_eq!(v, 2);
+
+        let mut slot = std::mem::MaybeUninit::<Handle<SharedSnapshot>>::uninit();
+        let has_snapshot = unsafe {
+            committed_transaction_post_commit_snapshot(committed.shallow_copy(), slot.as_mut_ptr())
+        };
+        assert!(
+            has_snapshot,
+            "existing-table commit should produce a post-commit snapshot"
+        );
+        let snap = unsafe { slot.assume_init() };
+        assert_eq!(unsafe { version(snap.shallow_copy()) }, v);
+
+        // Calling the accessor a second time must yield an independent handle (Arc clone).
+        let mut slot2 = std::mem::MaybeUninit::<Handle<SharedSnapshot>>::uninit();
+        assert!(unsafe {
+            committed_transaction_post_commit_snapshot(committed.shallow_copy(), slot2.as_mut_ptr())
+        });
+        let snap2 = unsafe { slot2.assume_init() };
+        assert_eq!(unsafe { version(snap2.shallow_copy()) }, v);
+
+        unsafe { free_snapshot(snap2) };
+        unsafe { free_snapshot(snap) };
+        unsafe { free_committed_transaction(committed) };
         unsafe { free_engine(engine) };
         Ok(())
     }
@@ -1623,8 +1825,8 @@ mod tests {
                 engine.shallow_copy(),
             )
         });
-        let committed_version =
-            ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+        let committed_version = unsafe { version_and_free(committed) };
         assert_eq!(committed_version, 0);
 
         // Verify the table was created
@@ -1705,7 +1907,8 @@ mod tests {
             )
         });
         unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
-        ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        unsafe { free_committed_transaction(committed) };
 
         Ok((table_path.to_string(), engine))
     }
@@ -1812,7 +2015,8 @@ mod tests {
             )
         });
 
-        ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        unsafe { free_committed_transaction(committed) };
         assert_no_active_files(&kernel_engine, table_path.as_str())?;
 
         unsafe { free_engine(engine) };
