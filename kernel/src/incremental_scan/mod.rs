@@ -103,14 +103,16 @@ impl IncrementalScanBuilder {
     /// # Errors
     /// - `Err` if `base_version >= snapshot.version()` (caller error).
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
-    /// - `Err` for I/O or JSON-parse failures while reading commit files.
+    /// - `Err` for I/O or JSON-parse failures other than a missing commit file.
     ///
     /// # Returns
     /// [`IncrementalScanResult::Listing`] on success, or
-    /// [`IncrementalScanResult::CommitsUnavailable`] when the commit range cannot be served
-    /// (e.g. `base_version` predates the snapshot's earliest available commit because log
-    /// retention or a checkpoint subsumed older JSONs, or the snapshot has no JSON commits
-    /// at all because it was loaded purely from a checkpoint).
+    /// [`IncrementalScanResult::CommitsUnavailable`] when any commit in the range cannot be
+    /// served. This covers `base_version` predating the snapshot's earliest available
+    /// commit (log retention or a checkpoint subsumed older JSONs, or the snapshot was
+    /// loaded purely from a checkpoint with no JSONs), and the race where a commit file
+    /// listed by the snapshot is removed before this builder reads it (e.g. a vacuum runs
+    /// between snapshot construction and the call to `build`).
     pub fn build<P: AsRef<str>>(
         self,
         engine: &dyn Engine,
@@ -162,13 +164,29 @@ impl IncrementalScanBuilder {
         let mut add_files: Vec<FilteredEngineData> = Vec::new();
 
         for commit_file in commit_files {
-            let batches = engine.json_handler().read_json_files(
+            // A commit file the snapshot listed may have been removed by a racing vacuum
+            // (or, for staged commits, by a catalog publication race). Treat that as
+            // CommitsUnavailable so the consumer falls back to a full scan; propagate any
+            // other I/O or parse error.
+            let batches = match engine.json_handler().read_json_files(
                 std::slice::from_ref(&commit_file.location),
                 INCREMENTAL_READ_SCHEMA.clone(),
                 None,
-            )?;
+            ) {
+                Ok(b) => b,
+                Err(Error::FileNotFound(_)) => {
+                    return Ok(IncrementalScanResult::CommitsUnavailable)
+                }
+                Err(e) => return Err(e),
+            };
             for batch_res in batches {
-                let batch = batch_res?;
+                let batch = match batch_res {
+                    Ok(b) => b,
+                    Err(Error::FileNotFound(_)) => {
+                        return Ok(IncrementalScanResult::CommitsUnavailable)
+                    }
+                    Err(e) => return Err(e),
+                };
                 if let Some(filtered) = process_batch(
                     batch,
                     &mut seen_file_keys,
