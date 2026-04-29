@@ -150,6 +150,9 @@ pub mod tokio {
             T: Future + Send + 'static,
             T::Output: Send + 'static,
         {
+            if let Some(_id) = tokio::task::try_id() {
+                tracing::info!("It looks like TokioBackgroundExecutor::block_on was called in a nested fashion that could deadlock");
+            }
             // We cannot call `tokio::runtime::Runtime::block_on` here because
             // it panics if called within an async context. So instead we spawn
             // the future on the runtime and send the result back using a channel.

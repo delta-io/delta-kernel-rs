@@ -342,38 +342,54 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         location: url::Url,
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
     ) -> DeltaResult<()> {
+        use tokio::sync::Mutex;
+
         let store = self.store.clone();
+        let path = Path::from_url_path(location.path())?;
 
+        // Get first batch to initialize writer with schema
+        let first_batch = data.next().ok_or_else(|| {
+            Error::generic("Cannot write parquet file with empty data iterator")
+        })??;
+        let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
+        let first_record_batch: RecordBatch = (*first_arrow).into();
+
+        let object_writer = ParquetObjectWriter::new(store, path);
+        let schema = first_record_batch.schema();
+        let writer = Arc::new(Mutex::new(AsyncArrowWriter::try_new_with_options(
+            object_writer,
+            schema,
+            writer_options(),
+        )?));
+
+        let w = writer.clone();
         self.task_executor.block_on(async move {
-            let path = Path::from_url_path(location.path())?;
-
-            // Get first batch to initialize writer with schema
-            let first_batch = data.next().ok_or_else(|| {
-                Error::generic("Cannot write parquet file with empty data iterator")
-            })??;
-            let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
-            let first_record_batch: RecordBatch = (*first_arrow).into();
-
-            let object_writer = ParquetObjectWriter::new(store, path);
-            let schema = first_record_batch.schema();
-            let mut writer =
-                AsyncArrowWriter::try_new_with_options(object_writer, schema, writer_options())?;
-
             // Write the first batch
-            writer.write(&first_record_batch).await?;
+            let mut writer = w.lock().await;
+            writer.write(&first_record_batch).await
+        })?;
 
-            // Write remaining batches
-            for result in data {
-                let engine_data = result?;
-                let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
-                let batch: RecordBatch = (*arrow_data).into();
-                writer.write(&batch).await?;
-            }
+        // In order to avoid a deadlock when running inside a single-threaded runtime, this code
+        // iterator over the blocking stream of `data` separately from the `write` awaits` .
+        // See: https://github.com/delta-io/delta-kernel-rs/issues/2399>
+        for result in data {
+            let engine_data = result?;
+            let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
+            let batch: RecordBatch = (*arrow_data).into();
+            let w = writer.clone();
+            self.task_executor.block_on(async move {
+                let mut writer = w.lock().await;
+                writer.write(&batch).await
+            })?;
+        }
 
-            writer.finish().await?;
+        let w = writer.clone();
+        self.task_executor.block_on(async move {
+            let mut writer = w.lock().await;
+            writer.finish().await
+        })?;
 
-            Ok(())
-        })
+        Ok(())
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {

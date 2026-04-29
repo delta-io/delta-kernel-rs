@@ -20,7 +20,7 @@ use crate::checkpoint::{
 };
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
-use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
+use crate::engine::default::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
 use crate::engine::default::DefaultEngineBuilder;
 use crate::log_replay::HasSelectionVector;
 use crate::object_store::local::LocalFileSystem;
@@ -847,6 +847,81 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
     let domain_value = snapshot.get_domain_metadata("foo", &engine)?;
     assert_eq!(domain_value, Some("bar2".to_string()));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_snapshot_checkpoint_singlethread() -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let executor = Arc::new(TokioBackgroundExecutor::new());
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_task_executor(executor)
+        .build();
+
+    // Version 0: metadata & protocol
+    write_commit_to_store(
+        &store,
+        vec![create_metadata_action(), create_basic_protocol_action()],
+        0,
+    )
+    .await?;
+
+    // Version 1: add 3 files
+    write_commit_to_store(
+        &store,
+        vec![
+            create_add_action("file1.parquet"),
+            create_add_action("file2.parquet"),
+            create_add_action("file3.parquet"),
+        ],
+        1,
+    )
+    .await?;
+
+    // Version 2: add 2 more files, remove 1
+    write_commit_to_store(
+        &store,
+        vec![
+            create_add_action("file4.parquet"),
+            create_add_action("file5.parquet"),
+            create_remove_action("file1.parquet"),
+        ],
+        2,
+    )
+    .await?;
+
+    // Version 3: add 1 file, remove 2
+    write_commit_to_store(
+        &store,
+        vec![
+            create_add_action("file6.parquet"),
+            create_remove_action("file2.parquet"),
+            create_remove_action("file3.parquet"),
+        ],
+        3,
+    )
+    .await?;
+
+    // Version 4: add 2 files
+    write_commit_to_store(
+        &store,
+        vec![
+            create_add_action("file7.parquet"),
+            create_add_action("file8.parquet"),
+        ],
+        4,
+    )
+    .await?;
+
+    let table_root = Url::parse("memory:///")?;
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+
+    snapshot.checkpoint(&engine)?;
+
+    // First checkpoint: 1 metadata + 1 protocol + 5 add + 3 remove = 10, numOfAddFiles = 5
+    let checkpoint_path = Path::from("_delta_log/00000000000000000004.checkpoint.parquet");
+    let checkpoint_size = store.head(&checkpoint_path).await?.size;
+    assert_last_checkpoint_contents(&store, 4, 10, 5, checkpoint_size).await?;
     Ok(())
 }
 
