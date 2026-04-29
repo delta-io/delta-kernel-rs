@@ -17,6 +17,18 @@ use crate::{DeltaResult, Error};
 #[derive(Debug, Default)]
 struct CheckVoidInComplexTypes {
     error_message: Option<&'static str>,
+    container_depth: usize,
+}
+
+impl CheckVoidInComplexTypes {
+    /// Recurses into a container element/value type, tracking that we are inside an Array or Map
+    /// so that nested struct fields with void type can be rejected.
+    fn descend_into_container<'a>(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
+        self.container_depth += 1;
+        let result = self.transform(etype);
+        self.container_depth -= 1;
+        result
+    }
 }
 
 impl<'a> SchemaTransform<'a> for CheckVoidInComplexTypes {
@@ -24,6 +36,11 @@ impl<'a> SchemaTransform<'a> for CheckVoidInComplexTypes {
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         if self.error_message.is_some() {
+            return Some(Cow::Borrowed(field));
+        }
+        if self.container_depth > 0 && *field.data_type() == DataType::VOID {
+            self.error_message =
+                Some("Void type is not allowed inside a struct nested in Array or Map");
             return Some(Cow::Borrowed(field));
         }
         self.recurse_into_struct_field(field)
@@ -34,7 +51,7 @@ impl<'a> SchemaTransform<'a> for CheckVoidInComplexTypes {
             self.error_message = Some("Void type is not allowed as an array element type");
             return Some(Cow::Borrowed(etype));
         }
-        self.transform(etype)
+        self.descend_into_container(etype)
     }
 
     fn transform_map_key(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
@@ -42,7 +59,7 @@ impl<'a> SchemaTransform<'a> for CheckVoidInComplexTypes {
             self.error_message = Some("Void type is not allowed as a map key type");
             return Some(Cow::Borrowed(etype));
         }
-        self.transform(etype)
+        self.descend_into_container(etype)
     }
 
     fn transform_map_value(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
@@ -50,7 +67,7 @@ impl<'a> SchemaTransform<'a> for CheckVoidInComplexTypes {
             self.error_message = Some("Void type is not allowed as a map value type");
             return Some(Cow::Borrowed(etype));
         }
-        self.transform(etype)
+        self.descend_into_container(etype)
     }
 }
 
@@ -225,6 +242,106 @@ mod tests {
         ),
         "map value type"
     )]
+    #[case(
+        "void inside struct nested in array",
+        StructField::nullable(
+            "arr",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Struct(Box::new(StructType::new_unchecked([
+                    StructField::nullable("a", DataType::INTEGER),
+                    StructField::nullable("b", DataType::VOID),
+                ]))),
+                true,
+            ))),
+        ),
+        "struct nested in Array or Map"
+    )]
+    #[case(
+        "void inside struct nested in map value",
+        StructField::nullable(
+            "m",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::Struct(Box::new(StructType::new_unchecked([
+                    StructField::nullable("a", DataType::INTEGER),
+                    StructField::nullable("b", DataType::VOID),
+                ]))),
+                true,
+            ))),
+        ),
+        "struct nested in Array or Map"
+    )]
+    #[case(
+        "void inside struct nested in map key",
+        StructField::nullable(
+            "m",
+            DataType::Map(Box::new(MapType::new(
+                DataType::Struct(Box::new(StructType::new_unchecked([
+                    StructField::nullable("a", DataType::INTEGER),
+                    StructField::nullable("b", DataType::VOID),
+                ]))),
+                DataType::STRING,
+                true,
+            ))),
+        ),
+        "struct nested in Array or Map"
+    )]
+    #[case(
+        "void inside struct nested in array inside array",
+        StructField::nullable(
+            "outer",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::Struct(Box::new(StructType::new_unchecked([
+                        StructField::nullable("a", DataType::INTEGER),
+                        StructField::nullable("b", DataType::VOID),
+                    ]))),
+                    true,
+                ))),
+                true,
+            ))),
+        ),
+        "struct nested in Array or Map"
+    )]
+    #[case(
+        "void in deeply nested struct inside array",
+        StructField::nullable(
+            "arr",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Struct(Box::new(StructType::new_unchecked([
+                    StructField::nullable("a", DataType::INTEGER),
+                    StructField::nullable(
+                        "b",
+                        DataType::Struct(Box::new(StructType::new_unchecked([
+                            StructField::nullable("x", DataType::INTEGER),
+                            StructField::nullable("y", DataType::VOID),
+                        ]))),
+                    ),
+                ]))),
+                true,
+            ))),
+        ),
+        "struct nested in Array or Map"
+    )]
+    #[case(
+        "void in struct inside array inside struct inside array",
+        StructField::nullable(
+            "outer",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Struct(Box::new(StructType::new_unchecked([StructField::nullable(
+                    "inner",
+                    DataType::Array(Box::new(ArrayType::new(
+                        DataType::Struct(Box::new(StructType::new_unchecked([
+                            StructField::nullable("v", DataType::VOID),
+                        ]))),
+                        true,
+                    ))),
+                )]))),
+                true,
+            ))),
+        ),
+        "struct nested in Array or Map"
+    )]
     fn test_void_in_complex_type_rejected(
         #[case] desc: &str,
         #[case] field: StructField,
@@ -261,6 +378,33 @@ mod tests {
                 StructField::nullable("a", DataType::INTEGER),
                 StructField::nullable("b", DataType::VOID),
             ]))),
+        )])
+    )]
+    #[case(
+        "array of struct without void",
+        StructType::new_unchecked([StructField::nullable(
+            "arr",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Struct(Box::new(StructType::new_unchecked([
+                    StructField::nullable("a", DataType::INTEGER),
+                    StructField::nullable("b", DataType::STRING),
+                ]))),
+                true,
+            ))),
+        )])
+    )]
+    #[case(
+        "map of struct without void",
+        StructType::new_unchecked([StructField::nullable(
+            "m",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::Struct(Box::new(StructType::new_unchecked([
+                    StructField::nullable("a", DataType::INTEGER),
+                    StructField::nullable("b", DataType::STRING),
+                ]))),
+                true,
+            ))),
         )])
     )]
     fn test_valid_schema_for_complex_types(#[case] desc: &str, #[case] schema: StructType) {
