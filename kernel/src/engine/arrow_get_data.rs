@@ -3,7 +3,7 @@ use std::ops::Range;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{
     Date32Type, Decimal128Type, Float32Type, Float64Type, GenericBinaryType, GenericStringType,
-    Int16Type, Int32Type, Int64Type, Int8Type, TimestampMicrosecondType,
+    Int16Type, Int32Type, Int64Type, Int8Type, TimestampMicrosecondType, TimestampNanosecondType,
 };
 use crate::arrow::array::{
     Array, BinaryViewArray, BooleanArray, GenericByteArray, GenericListArray, GenericListViewArray,
@@ -64,6 +64,12 @@ impl GetData<'_> for PrimitiveArray<Date32Type> {
 }
 
 impl GetData<'_> for PrimitiveArray<TimestampMicrosecondType> {
+    fn get_timestamp(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<i64>> {
+        Ok(self.is_valid(row_index).then(|| self.value(row_index)))
+    }
+}
+
+impl GetData<'_> for PrimitiveArray<TimestampNanosecondType> {
     fn get_timestamp(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<i64>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
@@ -397,6 +403,21 @@ mod tests {
             Some(-1_000_000),
             None,
         ]);
+        assert_eq!(array.get_timestamp(0, "f").unwrap(), Some(1_000_000));
+        assert_eq!(array.get_timestamp(1, "f").unwrap(), Some(-1_000_000));
+        assert_eq!(array.get_timestamp(2, "f").unwrap(), None);
+    }
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[test]
+    fn test_get_timestamp_nanos() {
+        // TimestampNanosecond stores nanoseconds since epoch
+        let array = PrimitiveArray::<TimestampNanosecondType>::from(vec![
+            Some(1_000_000),
+            Some(-1_000_000),
+            None,
+        ])
+        .with_timezone("UTC");
         assert_eq!(array.get_timestamp(0, "f").unwrap(), Some(1_000_000));
         assert_eq!(array.get_timestamp(1, "f").unwrap(), Some(-1_000_000));
         assert_eq!(array.get_timestamp(2, "f").unwrap(), None);

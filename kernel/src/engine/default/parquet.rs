@@ -585,6 +585,9 @@ mod tests {
     use url::Url;
 
     use super::*;
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    use crate::arrow::array::TimestampNanosecondArray;
     use crate::arrow::array::{
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
         Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
@@ -1033,6 +1036,21 @@ mod tests {
                     Arc::new(Date32Array::from(vec![18262, 18263, 18264, 18265, 18266]))
                         as Arc<dyn Array>, // Days since epoch (2020-01-01 onwards)
                 ),
+                #[cfg(feature = "nanosecond-timestamps")]
+                // Timestamps in nanoseconds (with UTC timezone)
+                (
+                    "timestamp_nanos_col",
+                    Arc::new(
+                        TimestampNanosecondArray::from(vec![
+                            1609459200000000000i64, // 2021-01-01 00:00:00 UTC
+                            1609545600000000000i64,
+                            1609632000000000000i64,
+                            1609718400000000000i64,
+                            1609804800000000123i64,
+                        ])
+                        .with_timezone("UTC"),
+                    ) as Arc<dyn Array>,
+                ),
                 // Timestamp (with UTC timezone)
                 (
                     "timestamp_col",
@@ -1111,7 +1129,10 @@ mod tests {
         // Verify the data
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 5);
-        assert_eq!(data[0].num_columns(), 13);
+        assert_eq!(
+            data[0].num_columns(),
+            13 + cfg!(feature = "nanosecond-timestamps") as usize
+        );
 
         let mut col_idx = 0;
 
@@ -1207,6 +1228,22 @@ mod tests {
             .unwrap();
         assert_eq!(date_col.values(), &[18262, 18263, 18264, 18265, 18266]);
         col_idx += 1;
+
+        #[cfg(feature = "nanosecond-timestamps")]
+        {
+            // Verify timestamp column (with UTC timezone)
+            let timestamp_col = data[0]
+                .column(col_idx)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            assert_eq!(timestamp_col.value(0), 1609459200000000000i64);
+            assert_eq!(timestamp_col.value(4), 1609804800000000123i64);
+            assert!(timestamp_col
+                .timezone()
+                .is_some_and(|tz| tz.eq_ignore_ascii_case("utc")));
+            col_idx += 1;
+        }
 
         // Verify timestamp column (with UTC timezone)
         let timestamp_col = data[0]

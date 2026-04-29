@@ -308,6 +308,25 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
         .into_extern_result(&allocate_error)
 }
 
+#[cfg(feature = "nanosecond-timestamps")]
+/// Visit a timestamp_nanos field. Similar to timestamp but nanosecond resolution.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_timestamp_nanos(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::TimestampNanos, nullable)
+        .into_extern_result(&allocate_error)
+}
+
 /// Visit a decimal field. Decimal fields store fixed-precision decimal numbers with specified
 /// precision and scale.
 ///
@@ -755,6 +774,7 @@ mod tests {
         //   col_date: date,
         //   col_timestamp: timestamp,
         //   col_timestamp_ntz: timestamp_ntz,
+        //   col_timestamp_nanos: timestamp_nanos,
         //   col_decimal: decimal(10,2),
         //   col_array: array<string>,
         //   col_map: map<string, long>,
@@ -777,6 +797,9 @@ mod tests {
         let col_date = visit_field!(date, state, "col_date", false);
         let col_timestamp = visit_field!(timestamp, state, "col_timestamp", false);
         let col_timestamp_ntz = visit_field!(timestamp_ntz, state, "col_timestamp_ntz", false);
+        #[cfg(feature = "nanosecond-timestamps")]
+        let col_timestamp_nanos =
+            visit_field!(timestamp_nanos, state, "col_timestamp_nanos", false);
         let col_decimal = visit_field!(decimal, state, "col_decimal", 10, 2, false);
 
         // Create array<string>
@@ -821,6 +844,8 @@ mod tests {
             col_date,
             col_timestamp,
             col_timestamp_ntz,
+            #[cfg(feature = "nanosecond-timestamps")]
+            col_timestamp_nanos,
             col_decimal,
             col_array,
             col_map,
@@ -841,7 +866,6 @@ mod tests {
         // Verify the schema
         let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
         let fields: Vec<_> = schema.fields().collect();
-        assert_eq!(fields.len(), 17);
 
         // Validate the primitive fields
         let primitive_field_expectations = [
@@ -857,7 +881,10 @@ mod tests {
             ("col_date", PrimitiveType::Date),
             ("col_timestamp", PrimitiveType::Timestamp),
             ("col_timestamp_ntz", PrimitiveType::TimestampNtz),
+            #[cfg(feature = "nanosecond-timestamps")]
+            ("col_timestamp_nanos", PrimitiveType::TimestampNanos),
         ];
+        assert_eq!(fields.len(), primitive_field_expectations.len() + 5);
 
         for (index, (expected_name, expected_type)) in
             primitive_field_expectations.iter().enumerate()
@@ -870,25 +897,32 @@ mod tests {
             assert!(!fields[index].is_nullable());
         }
 
-        assert_eq!(fields[12].name(), "col_decimal");
-        let DataType::Primitive(PrimitiveType::Decimal(decimal_type)) = fields[12].data_type()
+        let num_primitive = primitive_field_expectations.len();
+        assert_eq!(fields[num_primitive].name(), "col_decimal");
+        let DataType::Primitive(PrimitiveType::Decimal(decimal_type)) =
+            fields[num_primitive].data_type()
         else {
             panic!("Field col_decimal is not a decimal type");
         };
         assert_eq!(decimal_type.precision(), 10);
         assert_eq!(decimal_type.scale(), 2);
 
-        assert_eq!(fields[13].name(), "col_array");
-        assert_array(fields[13], DataType::STRING, false);
+        assert_eq!(fields[num_primitive + 1].name(), "col_array");
+        assert_array(fields[num_primitive + 1], DataType::STRING, false);
 
-        assert_eq!(fields[14].name(), "col_map");
-        assert_map(fields[14], DataType::STRING, DataType::LONG, false);
+        assert_eq!(fields[num_primitive + 2].name(), "col_map");
+        assert_map(
+            fields[num_primitive + 2],
+            DataType::STRING,
+            DataType::LONG,
+            false,
+        );
 
-        assert_eq!(fields[15].name(), "col_struct");
-        assert_struct(fields[15], DataType::STRING, false);
+        assert_eq!(fields[num_primitive + 3].name(), "col_struct");
+        assert_struct(fields[num_primitive + 3], DataType::STRING, false);
 
-        assert_eq!(fields[16].name(), "col_variant");
-        let DataType::Variant(variant_type) = fields[16].data_type() else {
+        assert_eq!(fields[num_primitive + 4].name(), "col_variant");
+        let DataType::Variant(variant_type) = fields[num_primitive + 4].data_type() else {
             panic!("Expected variant type for col_variant");
         };
         let variant_fields: Vec<_> = variant_type.fields().collect();

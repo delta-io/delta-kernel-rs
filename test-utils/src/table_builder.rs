@@ -48,6 +48,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+#[cfg(feature = "nanosecond-timestamps")]
+use delta_kernel::arrow::array::TimestampNanosecondArray;
 use delta_kernel::arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
@@ -993,6 +995,17 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
                 None => Arc::new(array),
             }
         }
+        #[cfg(feature = "nanosecond-timestamps")]
+        ArrowDataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            let values: Vec<i64> = (0..rows)
+                .map(|i| (18000 + base + i as i32) as i64 * 86_400_000_000_000)
+                .collect();
+            let array = TimestampNanosecondArray::from(values);
+            match tz {
+                Some(tz) => Arc::new(array.with_timezone(tz.as_ref())),
+                None => Arc::new(array),
+            }
+        }
         ArrowDataType::Decimal128(precision, scale) => {
             let scale_factor = 10i128.pow(*scale as u32);
             let values: Vec<i128> = (0..rows)
@@ -1172,6 +1185,11 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                 // Microseconds since epoch (no timezone)
                 Scalar::TimestampNtz((18000 + seed as i64) * 86_400_000_000)
             }
+            #[cfg(feature = "nanosecond-timestamps")]
+            PrimitiveType::TimestampNanos => {
+                // Nanoseconds since epoch
+                Scalar::TimestampNanos((18000 + seed as i64) * 86_400_000_000_000)
+            }
             PrimitiveType::Decimal(dt) => {
                 let scale_factor = 10i128.pow(dt.scale() as u32);
                 let bits = seed as i128 * scale_factor;
@@ -1201,6 +1219,8 @@ pub(crate) fn default_schema() -> SchemaRef {
         StructField::new("string_col", DataType::STRING, true),
         StructField::new("binary_col", DataType::BINARY, true),
         StructField::new("date_col", DataType::DATE, true),
+        #[cfg(feature = "nanosecond-timestamps")]
+        StructField::new("ts_nanos_col", DataType::TIMESTAMP_NANOS, true),
         StructField::new("ts_col", DataType::TIMESTAMP, true),
         StructField::new("ts_ntz_col", DataType::TIMESTAMP_NTZ, true),
         StructField::new("decimal_col", DataType::decimal(10, 2).unwrap(), true),
