@@ -104,22 +104,33 @@ pub trait WithMetricsReporterLayer: Subscriber + for<'lookup> LookupSpan<'lookup
     ///     );
     /// ```
     ///
-    /// # Important: thread-local `set_default` and the callsite interest cache
+    /// # Important: keep a real global default subscriber installed
     ///
-    /// If you install the resulting subscriber via thread-local
-    /// [`tracing::dispatcher::set_default`] (or
-    /// [`tracing_subscriber::util::SubscriberInitExt::set_default`]), call
-    /// [`tracing::callsite::rebuild_interest_cache`] immediately afterwards. Several
-    /// kernel metrics are emitted from `Drop` impls (notably storage list/read completion
-    /// in the default engine), and those `Drop` sites can run on threads that have no
+    /// Prefer installing this subscriber as the *global* default via
+    /// [`tracing::dispatcher::set_global_default`] (or
+    /// [`tracing_subscriber::util::SubscriberInitExt::init`]). The global path rebuilds
+    /// the callsite interest cache internally and guarantees that every thread has a
+    /// real subscriber to consult the first time it hits a callsite.
+    ///
+    /// If you need thread-local isolation -- e.g. per-test
+    /// [`tracing_subscriber::util::SubscriberInitExt::set_default`] guards in a
+    /// multi-threaded test binary -- also install a bare global default subscriber
+    /// (e.g. `tracing_subscriber::registry().init()`) up front. Several kernel metrics
+    /// are emitted from `Drop` impls (notably storage list/read completion in the
+    /// default engine), and those `Drop` sites can run on threads that have no
     /// subscriber installed -- for example tokio worker threads owned by the
     /// `DefaultEngine`'s background runtime. If a no-subscriber thread is the first to
     /// hit such a callsite, tracing caches its `Interest` as `never` process-globally,
-    /// silently disabling that metric for the rest of the process. The rebuild call
-    /// re-evaluates every callsite against all currently installed dispatchers and
-    /// unsticks the cache. [`tracing::dispatcher::set_global_default`] does this rebuild
-    /// automatically and so does not need the manual call.
+    /// silently disabling that metric for the rest of the process. Keeping a real
+    /// global default active means every thread's "current dispatcher" is a real
+    /// subscriber, so the cached interest stays in the `always`/`sometimes` regime.
     ///
+    /// [`tracing::callsite::rebuild_interest_cache`] is *not* a reliable substitute on
+    /// its own: it only re-evaluates callsites that are already registered, but
+    /// callsites can be registered for the first time at any point on no-subscriber
+    /// threads, re-poisoning the cache after the rebuild.
+    ///
+    /// [`tracing_subscriber::util::SubscriberInitExt::init`]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/util/trait.SubscriberInitExt.html#method.init
     /// [`tracing_subscriber::util::SubscriberInitExt::set_default`]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/util/trait.SubscriberInitExt.html#method.set_default
     fn with_metrics_reporter_layer(
         self,

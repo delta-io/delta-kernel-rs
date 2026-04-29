@@ -44,12 +44,13 @@ pub fn ensure_metrics_compatible_global_subscriber() {
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
         // Install a bare Registry. `try_init` calls `set_global_default`, which can only
-        // succeed once per process; if a global default is already installed (e.g. by a
-        // test runner via `RUST_LOG`), respect it and fall through to the rebuild.
-        let _ = tracing_subscriber::registry().try_init();
-        // `set_global_default` triggers a rebuild internally; we call it again here to
-        // cover the path where `try_init` failed because some other code beat us to it.
-        tracing::callsite::rebuild_interest_cache();
+        // succeed once per process and triggers an interest-cache rebuild internally on
+        // success. If a global default is already installed (e.g. by a test runner via
+        // `RUST_LOG`), respect it and rebuild the cache ourselves so any callsites that
+        // were registered before this call are re-evaluated against the current dispatcher.
+        if tracing_subscriber::registry().try_init().is_err() {
+            tracing::callsite::rebuild_interest_cache();
+        }
     });
 }
 
