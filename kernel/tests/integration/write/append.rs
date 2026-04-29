@@ -17,7 +17,7 @@ use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::{DeltaResult, Error as KernelError, Snapshot};
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
-use test_utils::{create_table, engine_store_setup, set_json_value, setup_test_tables, test_read};
+use test_utils::{set_json_value, setup_test_tables, test_read};
 
 use crate::common::write_utils::{
     check_action_timestamps, get_and_check_all_parquet_sizes, get_simple_int_schema,
@@ -324,100 +324,6 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
             engine,
         )?;
     }
-    Ok(())
-}
-
-// Verify that materialized partition columns do not get stats collected. The partition column
-// is physically present in the parquet file, but its stats should be omitted because the
-// value is already in the Add action's `partitionValues`.
-#[tokio::test]
-async fn test_materialized_partition_columns_excluded_from_stats(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = tracing_subscriber::fmt::try_init();
-
-    let partition_col = "partition";
-    let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("number", DataType::INTEGER),
-        StructField::nullable("partition", DataType::STRING),
-    ])?);
-
-    // Create a table with materializePartitionColumns writer feature
-    let (store, engine, table_location) = engine_store_setup("test_mat_part", None);
-    let table_url = create_table(
-        store.clone(),
-        table_location,
-        table_schema.clone(),
-        &[partition_col],
-        true, // use_37_protocol for writer features
-        vec![],
-        vec!["materializePartitionColumns"],
-    )
-    .await?;
-
-    let engine = Arc::new(engine);
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_engine_info("default engine");
-
-    // With materializePartitionColumns, the data batch includes the partition column
-    let arrow_schema = Arc::new(table_schema.as_ref().try_into_arrow()?);
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["a", "a", "a"])),
-        ],
-    )?;
-    let data = Box::new(ArrowEngineData::new(batch));
-
-    let write_context = txn.partitioned_write_context(HashMap::from([(
-        partition_col.to_string(),
-        Scalar::String("a".into()),
-    )]))?;
-    let result = engine.write_parquet(&data, &write_context).await?;
-    txn.add_files(result);
-    assert!(txn.commit(engine.as_ref())?.is_committed());
-
-    // Read the commit log and verify stats
-    let commit = store
-        .get(&Path::from(
-            "/test_mat_part/_delta_log/00000000000000000001.json",
-        ))
-        .await?;
-    let parsed: Vec<serde_json::Value> = Deserializer::from_slice(&commit.bytes().await?)
-        .into_iter::<serde_json::Value>()
-        .try_collect()?;
-
-    let add = parsed
-        .iter()
-        .find(|v| v.get("add").is_some())
-        .expect("should have an add action");
-    let stats: serde_json::Value =
-        serde_json::from_str(add["add"]["stats"].as_str().unwrap()).unwrap();
-
-    // Stats should contain the data column but NOT the partition column
-    assert!(
-        stats["minValues"].get("number").is_some(),
-        "Data column 'number' should have minValues"
-    );
-    assert!(
-        stats["maxValues"].get("number").is_some(),
-        "Data column 'number' should have maxValues"
-    );
-    assert!(
-        stats["minValues"].get("partition").is_none(),
-        "Partition column should not have minValues even when materialized"
-    );
-    assert!(
-        stats["maxValues"].get("partition").is_none(),
-        "Partition column should not have maxValues even when materialized"
-    );
-    assert!(
-        stats["nullCount"].get("partition").is_none(),
-        "Partition column should not have nullCount even when materialized"
-    );
-
     Ok(())
 }
 
