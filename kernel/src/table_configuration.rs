@@ -150,6 +150,32 @@ impl TableConfiguration {
         version: Version,
     ) -> DeltaResult<Self> {
         let logical_schema = Arc::new(metadata.parse_schema()?);
+        Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
+    }
+
+    /// Like [`try_new`](Self::try_new), but reuses `base`'s protocol, table root, and version
+    /// and takes a pre-parsed `logical_schema`.
+    pub(crate) fn try_new_with_schema(
+        base: &Self,
+        metadata: Metadata,
+        logical_schema: SchemaRef,
+    ) -> DeltaResult<Self> {
+        Self::try_new_inner(
+            metadata,
+            base.protocol.clone(),
+            base.table_root.clone(),
+            base.version,
+            logical_schema,
+        )
+    }
+
+    fn try_new_inner(
+        metadata: Metadata,
+        protocol: Protocol,
+        table_root: Url,
+        version: Version,
+        logical_schema: SchemaRef,
+    ) -> DeltaResult<Self> {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 

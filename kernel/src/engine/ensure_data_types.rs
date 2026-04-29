@@ -18,8 +18,8 @@ use crate::{DeltaResult, Error};
 #[internal_api]
 pub(crate) enum ValidationMode {
     /// Check types only. Struct fields are matched by ordinal position, not by name.
-    /// Nullability and metadata are not checked. Used by the expression evaluator where
-    /// column mapping can cause physical/logical name mismatches.
+    /// Nullability and metadata are not checked.
+    #[allow(dead_code)]
     TypesOnly,
     /// Check types and match struct fields by name, but skip nullability and metadata.
     /// Used by the parquet reader where fields are already resolved by name upstream.

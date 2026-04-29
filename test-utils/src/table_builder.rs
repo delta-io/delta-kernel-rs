@@ -518,7 +518,7 @@ impl fmt::Display for DataLayoutConfig {
 /// All columns are nullable. Follow-up: add non-nullable variants to test NOT NULL handling.
 pub fn partitioned_schema() -> SchemaRef {
     Arc::new(StructType::new_unchecked(vec![
-        // Partition-candidate columns (all valid partition types, matches write_partitioned.rs)
+        // Partition-candidate columns (all valid partition types, matches write::partitioned)
         StructField::new("part_bool", DataType::BOOLEAN, true),
         StructField::new("part_byte", DataType::BYTE, true),
         StructField::new("part_short", DataType::SHORT, true),

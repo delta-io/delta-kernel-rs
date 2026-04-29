@@ -1,4 +1,4 @@
-//! Schema validation utilities for Delta table creation.
+//! Schema validation utilities shared by table creation and schema evolution.
 //!
 //! Validates schemas per the Delta protocol specification.
 
@@ -14,7 +14,7 @@ use crate::{DeltaResult, Error};
 /// These characters have special meaning in Parquet schema syntax.
 const INVALID_PARQUET_CHARS: &[char] = &[' ', ',', ';', '{', '}', '(', ')', '\n', '\t', '='];
 
-/// Validates a schema for table creation.
+/// Validates a schema for CREATE TABLE or ALTER TABLE.
 ///
 /// Performs the following checks:
 /// 1. Schema is non-empty
@@ -22,7 +22,7 @@ const INVALID_PARQUET_CHARS: &[char] = &[' ', ',', ';', '{', '}', '(', ')', '\n'
 /// 3. Column names contain only valid characters
 /// 4. Rejects fields with `delta.invariants` metadata (SQL expression invariants are not supported
 ///    by kernel; see `TableConfiguration::ensure_write_supported`)
-pub(crate) fn validate_schema_for_create(
+pub(crate) fn validate_schema(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<()> {
@@ -371,7 +371,7 @@ mod tests {
     #[case::dot_in_name_with_cm(schema_with_dot(), ColumnMappingMode::Name)]
     #[case::different_struct_children(schema_different_struct_children(), ColumnMappingMode::None)]
     fn valid_schema_accepted(#[case] schema: StructType, #[case] cm: ColumnMappingMode) {
-        assert!(validate_schema_for_create(&schema, cm).is_ok());
+        assert!(validate_schema(&schema, cm).is_ok());
     }
 
     // === Invalid schemas ===
@@ -393,7 +393,7 @@ mod tests {
         #[case] cm: ColumnMappingMode,
         #[case] expected_errs: &[&str],
     ) {
-        let result = validate_schema_for_create(&schema, cm);
+        let result = validate_schema(&schema, cm);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         for expected in expected_errs {
@@ -412,7 +412,7 @@ mod tests {
     #[case::array_nested(schema_array_nested_invariant(), "arr.child")]
     #[case::map_nested(schema_map_nested_invariant(), "map.child")]
     fn invariants_metadata_rejected(#[case] schema: StructType, #[case] expected_path: &str) {
-        let result = validate_schema_for_create(&schema, ColumnMappingMode::None);
+        let result = validate_schema(&schema, ColumnMappingMode::None);
         let err = result.expect_err("expected delta.invariants metadata rejection");
         let msg = err.to_string();
         assert!(

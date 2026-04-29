@@ -1,3 +1,5 @@
+pub mod write_utils;
+
 #[macro_export]
 macro_rules! sort_lines {
     ($lines: expr) => {{

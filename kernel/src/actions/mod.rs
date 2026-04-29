@@ -214,6 +214,11 @@ impl TryFrom<Format> for Scalar {
 }
 
 // Serde derives are needed for CRC file deserialization (see `crc::reader`).
+//
+// TODO(#2446): `Metadata` stores the schema only as a JSON string. Callers that already hold
+// a parsed `SchemaRef` (e.g. CREATE TABLE) serialize into `schema_string` and then re-parse
+// downstream in `TableConfiguration::try_new` via `parse_schema()`. Caching the parsed schema
+// on `Metadata` would eliminate the round-trip.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
@@ -341,6 +346,18 @@ impl Metadata {
     #[internal_api]
     pub(crate) fn parse_table_properties(&self) -> TableProperties {
         TableProperties::from(self.configuration.iter())
+    }
+
+    /// Returns a new Metadata with the schema replaced, preserving all other fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if schema serialization fails.
+    pub(crate) fn with_schema(self, schema: SchemaRef) -> DeltaResult<Self> {
+        Ok(Self {
+            schema_string: serde_json::to_string(&schema)?,
+            ..self
+        })
     }
 
     #[cfg(test)]

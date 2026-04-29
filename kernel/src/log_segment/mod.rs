@@ -223,6 +223,7 @@ impl LogSegment {
             &listed_files.checkpoint_parts,
             end_version,
         )?;
+        validate_latest_commit_file(&listed_files, effective_version)?;
 
         let log_segment = LogSegment {
             end_version: effective_version,
@@ -1625,4 +1626,30 @@ fn validate_end_version(
         );
     }
     Ok(effective_version)
+}
+
+/// Validates the `latest_commit_file` field of a [`LogSegmentFiles`]. Enforces:
+///
+/// 1. If `ascending_commit_files` is non-empty, `latest_commit_file` must be `Some`.
+/// 2. If `latest_commit_file` is `Some`, its version must equal `effective_version`.
+fn validate_latest_commit_file(
+    listed: &LogSegmentFiles,
+    effective_version: Version,
+) -> DeltaResult<()> {
+    require!(
+        listed.ascending_commit_files.is_empty() || listed.latest_commit_file.is_some(),
+        Error::internal_error(
+            "latest_commit_file must be Some when ascending_commit_files is non-empty"
+        )
+    );
+    if let Some(commit) = &listed.latest_commit_file {
+        require!(
+            commit.version == effective_version,
+            Error::internal_error(format!(
+                "latest_commit_file version {} does not match end_version {effective_version}",
+                commit.version,
+            ))
+        );
+    }
+    Ok(())
 }
