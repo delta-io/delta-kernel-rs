@@ -123,6 +123,24 @@ impl Snapshot {
     /// The log listing is catalog-log-tail aware: any `log_tail` provided to the builder is
     /// merged with filesystem listings.
     ///
+    /// Position layout per case (`....` is the version axis; `====` marks the range read for
+    /// P+M replay; `listed` is the listing range; `read` is what's read for P+M):
+    ///
+    /// ```text
+    ///             positions                       listed       read       outcome
+    /// Case A:     C1 ........ S1 (= T)            -            -          return existing
+    /// Case B:     C1 .. T .. S1                   -            -          error (T < S1)
+    /// Case C.1:   C1 .. S1 .. T                   empty        -          error (T unreachable)
+    /// Case C.2:   C1 .. S1                        empty        -          return existing
+    /// Case D.1:   C1 .. S1 .. C2 ===== S2         [C1+1, S2]   [C2, S2]   rebuild from C2
+    /// Case D.2:   C1 . C2 .. S1 ====== S2         [C1+1, S2]   (S1, S2]   advance base, -> F
+    /// Case E:     C1 .. S1 (= S2)                 [C1+1, S1]   -          return existing
+    /// Case F:     C1 .. S1 ====== S2              [C1+1, S2]   (S1, S2]   incremental update
+    /// ```
+    ///
+    /// In the incremental cases (D.2, F), the existing snapshot's P+M at `S1` is the baseline
+    /// and only commits in `(S1, S2]` are replayed.
+    ///
     /// - **A.** `T == S1`: return the existing snapshot unchanged.
     /// - **B.** `T < S1`: error. The incremental path only moves forward.
     /// - Otherwise (`T` unset or `T > S1`), list the log from `C1+1` (or from version 1 if there is
@@ -136,13 +154,13 @@ impl Snapshot {
     ///       base instead of replaying those commits. Build a fresh snapshot from `C2`.
     ///     - **D.2.** `C2 <= S1`: the existing snapshot's P+M (at `S1`) already reflects everything
     ///       `C2` would tell us, so we skip reading `C2` for P+M. Fall through to case F to replay
-    ///       only commits `> S1` for P+M and use `C2` as the new checkpoint base for future
-    ///       incremental updates.
+    ///       only commits `> S1` for P+M; the combined segment uses `C2` as its checkpoint base,
+    ///       producing a better log segment with fewer deltas above the checkpoint (e.g. faster
+    ///       distributed log replay).
     ///   - **E.** Listing contains commits but no new checkpoint, and `S2 == S1`: return the
     ///     existing snapshot.
-    ///   - **F.** Listing contains new commits (and either no new checkpoint or a checkpoint with
-    ///     `C2 <= S1`): run lightweight P+M replay on commits `> S1` and merge them into the
-    ///     existing log segment.
+    ///   - **F.** Listing contains new commits (no new checkpoint, or fall through from D.2): run
+    ///     lightweight P+M replay on commits `> S1` and merge them into the existing log segment.
     ///
     /// Each case is marked with `// Case X` in `Snapshot::try_new_from`. The engine is passed
     /// to [`SnapshotBuilder::build`].
