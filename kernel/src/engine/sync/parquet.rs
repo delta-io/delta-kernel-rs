@@ -11,8 +11,9 @@ use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
     RowIndexBuilder,
 };
-use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::engine::parquet_row_group_skipping::{CheckpointReadCtx, ParquetRowGroupSkipping};
 use crate::engine::{reader_options, writer_options};
+use crate::log_segment::checkpoint_action_identifier_predicate;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
@@ -27,7 +28,7 @@ fn try_create_from_parquet_inner(
     file: File,
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
-    checkpoint_ctx: Option<(Option<PredicateRef>, Arc<HashSet<String>>)>,
+    checkpoint_ctx: Option<CheckpointReadCtx>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
@@ -46,13 +47,11 @@ fn try_create_from_parquet_inner(
 
     // Filter row groups and row indexes if a predicate is provided
     match (predicate.as_deref(), &checkpoint_ctx) {
-        (pred, Some((action_predicate, partition_columns)))
-            if pred.is_some() || action_predicate.is_some() =>
-        {
+        (pred, Some(ctx)) if pred.is_some() || ctx.action_predicate.is_some() => {
             builder = builder.with_checkpoint_row_group_filter(
                 pred,
-                action_predicate.as_deref(),
-                partition_columns,
+                ctx.action_predicate.as_deref(),
+                &ctx.partition_columns,
                 row_indexes.as_mut(),
             );
         }
@@ -92,13 +91,14 @@ impl ParquetHandler for SyncParquetHandler {
         files: &[FileMeta],
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
-        action_predicate: Option<PredicateRef>,
         partition_columns: &HashSet<String>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let partition_columns = Arc::new(partition_columns.clone());
+        let ctx = CheckpointReadCtx {
+            action_predicate: checkpoint_action_identifier_predicate(&schema),
+            partition_columns: Arc::new(partition_columns.clone()),
+        };
         read_files(files, schema, predicate, move |file, schema, pred, loc| {
-            let ctx = Some((action_predicate.clone(), partition_columns.clone()));
-            try_create_from_parquet_inner(file, schema, pred, ctx, loc)
+            try_create_from_parquet_inner(file, schema, pred, Some(ctx.clone()), loc)
         })
     }
 
