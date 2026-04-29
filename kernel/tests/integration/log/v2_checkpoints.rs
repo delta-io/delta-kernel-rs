@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, RecordBatchReader, StringArray,
     StructArray,
@@ -22,12 +23,13 @@ use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use itertools::Itertools;
 use test_utils::{
-    create_table_and_load_snapshot, insert_data, load_test_data, read_scan, test_table_setup_mt,
-    write_batch_to_table,
+    create_table_and_load_snapshot, insert_data, load_test_data, read_add_infos, read_scan,
+    test_table_setup_mt, write_batch_to_table,
 };
 
 use crate::common::write_utils::{
-    get_simple_schema, load_existing_single_file_checkpoint_path, simple_id_batch,
+    get_simple_schema, load_existing_single_file_checkpoint_path, resolve_struct_field,
+    simple_id_batch,
 };
 
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
@@ -1230,7 +1232,6 @@ async fn test_snapshot_checkpoint_default_on_v2_table(
 #[case::column_mapping(CrossFeature::ColumnMapping)]
 #[case::partitioned(CrossFeature::Partitioned)]
 #[case::clustered(CrossFeature::Clustered)]
-#[case::deletion_vectors(CrossFeature::DeletionVectors)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v2_sidecar_checkpoint_cross_feature(
     #[case] feature: CrossFeature,
@@ -1391,12 +1392,107 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// On a table with `deletionVectors` + `rowTracking` enabled, insert data, apply DV and write a
+/// V2 sidecar checkpoint. Scan back and make sure the DV and row-tracking columns are present.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let schema = get_simple_schema();
+
+    // === Step 1: Create v2 + DV + row-tracking table. ===
+    let _ = create_table(&table_path, schema.clone(), "Test/1.0")
+        .with_table_properties([
+            ("delta.feature.v2Checkpoint", "supported"),
+            ("delta.feature.deletionVectors", "supported"),
+            ("delta.enableRowTracking", "true"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // === Step 2: Append one batch. ===
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        simple_id_batch(&schema, vec![1, 2, 3]),
+        HashMap::new(),
+    )
+    .await?;
+
+    // === Step 3: Apply a DV to the just-written file. ===
+    let path = read_add_infos(snapshot.as_ref(), engine.as_ref())?[0]
+        .path
+        .clone();
+    let dv = DeletionVectorDescriptor {
+        storage_type: DeletionVectorStorageType::PersistedRelative,
+        path_or_inline_dv: "abcdefghijklmnopqrst".to_string(),
+        offset: Some(7),
+        size_in_bytes: 42,
+        cardinality: 1,
+    };
+    let scan_files: Vec<_> = snapshot
+        .clone()
+        .scan_builder()
+        .build()?
+        .scan_metadata(engine.as_ref())?
+        .map_ok(|sm| sm.scan_files)
+        .try_collect()?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_data_change(true);
+    txn.update_deletion_vectors(
+        HashMap::from([(path, dv.clone())]),
+        scan_files.into_iter().map(Ok),
+    )?;
+    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+
+    // === Step 4: Write a V2 sidecar checkpoint. ===
+    snapshot.checkpoint(
+        engine.as_ref(),
+        Some(&CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: None,
+        })),
+    )?;
+
+    // === Step 5: Read the sidecar parquet directly and assert protocol fields on the
+    //     live add: `add.deletionVector.*`, `add.baseRowId`, `add.defaultRowCommitVersion`. ===
+    let sidecars =
+        list_sidecar_parquet_files(&std::path::Path::new(&table_path).join("_delta_log/_sidecars"));
+    assert_eq!(sidecars.len(), 1, "default hint should produce one sidecar");
+    let batch = read_parquet_file(&sidecars[0].path());
+    let add = get_struct_column_from_record_batch(&batch, "add");
+    let live = valid_row_indices(add, batch.num_rows());
+    assert_eq!(live.len(), 1, "expected one live add in sidecar");
+    let row = live[0];
+
+    // Closures that read a leaf value at the given field path under `add`.
+    let path_to_vec = |path: &[&str]| path.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let read_str = |path| resolve_struct_field::<StringArray>(add, &path_to_vec(path)).value(row);
+    let read_i32 = |path| resolve_struct_field::<Int32Array>(add, &path_to_vec(path)).value(row);
+    let read_i64 = |path| resolve_struct_field::<Int64Array>(add, &path_to_vec(path)).value(row);
+    assert_eq!(read_str(&["deletionVector", "storageType"]), "u");
+    assert_eq!(
+        read_str(&["deletionVector", "pathOrInlineDv"]),
+        dv.path_or_inline_dv
+    );
+    assert_eq!(read_i32(&["deletionVector", "offset"]), 7);
+    assert_eq!(read_i32(&["deletionVector", "sizeInBytes"]), 42);
+    assert_eq!(read_i64(&["deletionVector", "cardinality"]), 1);
+    // `update_deletion_vectors` preserves the original `baseRowId` (0 -- first file) and
+    // `defaultRowCommitVersion` (1 -- version that first wrote the file).
+    assert_eq!(read_i64(&["baseRowId"]), 0);
+    assert_eq!(read_i64(&["defaultRowCommitVersion"]), 1);
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CrossFeature {
     ColumnMapping,
     Partitioned,
     Clustered,
-    DeletionVectors,
 }
 
 /// Schema shared across all `CrossFeature` variants: `id: int, value: string,
@@ -1435,10 +1531,6 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
         }
         CrossFeature::Partitioned => Some(DataLayout::partitioned(["region"])),
         CrossFeature::Clustered => Some(DataLayout::clustered(["id"])),
-        CrossFeature::DeletionVectors => {
-            props.push(("delta.feature.deletionVectors", "supported"));
-            None
-        }
     };
 
     let mut builder =
@@ -1489,3 +1581,4 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
 
     Ok(snapshot)
 }
+
