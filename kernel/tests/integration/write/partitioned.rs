@@ -47,7 +47,10 @@ async fn test_write_partitioned_normal_values_roundtrip(
         normal_partition_values()?,
     )
     .await?;
+    #[cfg(not(feature="nanosecond-timestamps"))]
     assert_eq!(snapshot.table_configuration().partition_columns().len(), 13);
+    #[cfg(feature="nanosecond-timestamps")]
+    assert_eq!(snapshot.table_configuration().partition_columns().len(), 14);
 
     // ===== Step 2: Validate add.path structure in the commit log JSON. =====
     let (add, rel_path) = read_single_add(&table_path, 1)?;
