@@ -99,7 +99,10 @@ pub(crate) fn strip_void_from_field(field: &StructField) -> StructField {
 }
 
 /// Validates that a schema is suitable for writing data. Writes are rejected when:
-/// - Void is nested inside Array or Map (not written to Parquet by Delta)
+/// - Void is nested inside Array or Map. Parquet's UNKNOWN logical type can in principle annotate
+///   any physical type with all-null values, but Delta itself does not materialize void columns in
+///   data files, and our logical-to-physical transform does not descend into Array elements or Map
+///   values to drop them.
 /// - A struct has only void fields (would produce an empty Parquet struct)
 /// - All top-level columns are void (would produce an empty Parquet schema)
 pub(crate) fn validate_schema_for_write(schema: &Schema) -> DeltaResult<()> {
@@ -138,7 +141,9 @@ pub(crate) fn validate_schema_for_write(schema: &Schema) -> DeltaResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use crate::schema::{
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    };
 
     // ---- validate_no_void_in_complex_types tests ----
 
@@ -249,16 +254,18 @@ mod tests {
         ])
     )]
     #[case(
-      "void in nested struct",
-      StructType::new_unchecked([
-            StructField::nullable("s", DataType::Struct(Box::new(StructType::new_unchecked([
+        "void in nested struct",
+        StructType::new_unchecked([StructField::nullable(
+            "s",
+            DataType::Struct(Box::new(StructType::new_unchecked([
                 StructField::nullable("a", DataType::INTEGER),
                 StructField::nullable("b", DataType::VOID),
-            ]))))
-        ])
+            ]))),
+        )])
     )]
-    fn test_valid_schema_for_complex_types(#[case] _desc: &str, #[case] schema: StructType) {
-        validate_no_void_in_complex_types(&schema).unwrap();
+    fn test_valid_schema_for_complex_types(#[case] desc: &str, #[case] schema: StructType) {
+        validate_no_void_in_complex_types(&schema)
+            .unwrap_or_else(|e| panic!("{desc}: unexpected validation error: {e}"));
     }
 
     // ---- validate_schema_for_write tests ----
@@ -288,8 +295,9 @@ mod tests {
             ]))),
         )])
     )]
-    fn test_write_valid_schemas(#[case] _desc: &str, #[case] schema: StructType) {
-        validate_schema_for_write(&schema).unwrap();
+    fn test_write_valid_schemas(#[case] desc: &str, #[case] schema: StructType) {
+        validate_schema_for_write(&schema)
+            .unwrap_or_else(|e| panic!("{desc}: unexpected validation error: {e}"));
     }
 
     #[rstest::rstest]
@@ -354,14 +362,14 @@ mod tests {
         "all fields are void"
     )]
     fn test_write_rejected_schemas(
-        #[case] _desc: &str,
+        #[case] desc: &str,
         #[case] schema: StructType,
         #[case] expected_msg: &str,
     ) {
         let result = validate_schema_for_write(&schema);
         assert!(
             result.unwrap_err().to_string().contains(expected_msg),
-            "expected error containing '{expected_msg}'"
+            "{desc}: expected error containing '{expected_msg}'"
         );
     }
 
@@ -435,17 +443,16 @@ mod tests {
         )
     )]
     fn test_strip_void_from_field(
-        #[case] _desc: &str,
+        #[case] desc: &str,
         #[case] input: StructField,
         #[case] expected: StructField,
     ) {
         let stripped = strip_void_from_field(&input);
-        assert_eq!(stripped, expected);
+        assert_eq!(stripped, expected, "{desc}");
     }
 
     #[test]
     fn test_strip_preserves_metadata() {
-        use crate::schema::{ColumnMetadataKey, MetadataValue};
         let mut field = StructField::nullable(
             "s",
             DataType::Struct(Box::new(StructType::new_unchecked([
