@@ -1507,21 +1507,16 @@ fn default_true() -> bool {
     true
 }
 
-/// The default spatial reference identifier for geometry and geography types.
+/// Default spatial reference identifier for geometry and geography types.
 pub const DEFAULT_GEO_SRID: &str = "OGC:CRS84";
 
-/// The algorithm used to interpolate edges between two vertices of a geography path.
+/// Algorithm used to interpolate edges between two vertices of a geography path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EdgeInterpolationAlgorithm {
-    /// Great circle paths on a sphere.
     Spherical,
-    /// Vincenty's inverse formula on an ellipsoid.
     Vincenty,
-    /// Thomas's formula on an ellipsoid.
     Thomas,
-    /// Andoyer's method on an ellipsoid.
     Andoyer,
-    /// Karney's method on an ellipsoid.
     Karney,
 }
 
@@ -1553,21 +1548,13 @@ impl std::str::FromStr for EdgeInterpolationAlgorithm {
     }
 }
 
-/// A geometry column type with an associated spatial reference identifier (SRID).
-///
-/// Geometry values are encoded as WKB (Well-Known Binary) bytes in the Arrow layer,
-/// represented as a `Binary` physical array with GeoArrow field metadata.
+/// A geometry column type with an associated spatial reference identifier (SRID)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GeometryType {
     srid: String,
 }
 
 impl GeometryType {
-    /// Creates a new GeometryType with the given SRID.
-    ///
-    /// # Parameters
-    /// - `srid`: The spatial reference identifier (e.g. `"OGC:CRS84"`, `"EPSG:4326"`). Must be
-    ///   non-empty.
     pub fn try_new(srid: impl Into<String>) -> DeltaResult<Self> {
         let srid = srid.into();
         if srid.is_empty() {
@@ -1576,7 +1563,6 @@ impl GeometryType {
         Ok(Self { srid })
     }
 
-    /// Returns the SRID associated with this geometry type.
     pub fn srid(&self) -> &str {
         &self.srid
     }
@@ -1596,10 +1582,7 @@ impl Display for GeometryType {
     }
 }
 
-/// A geography column type with an associated SRID and edge interpolation algorithm.
-///
-/// Geography values are encoded as WKB bytes in the Arrow layer,
-/// represented as a `Binary` physical array with GeoArrow field metadata.
+/// Geography column type with an associated SRID and edge interpolation algorithm.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GeographyType {
     srid: String,
@@ -1607,11 +1590,6 @@ pub struct GeographyType {
 }
 
 impl GeographyType {
-    /// Creates a new GeographyType with the given SRID and edge interpolation algorithm.
-    ///
-    /// # Parameters
-    /// - `srid`: The spatial reference identifier (e.g. `"OGC:CRS84"`). Must be non-empty.
-    /// - `algorithm`: The edge interpolation algorithm to use.
     pub fn try_new(
         srid: impl Into<String>,
         algorithm: EdgeInterpolationAlgorithm,
@@ -1623,24 +1601,18 @@ impl GeographyType {
         Ok(Self { srid, algorithm })
     }
 
-    /// Creates a new GeographyType with the given SRID and the default edge interpolation
-    /// algorithm ([`EdgeInterpolationAlgorithm::Spherical`]).
     pub fn try_new_with_srid(srid: impl Into<String>) -> DeltaResult<Self> {
         Self::try_new(srid, EdgeInterpolationAlgorithm::Spherical)
     }
 
-    /// Creates a new GeographyType with the given edge interpolation algorithm and the
-    /// default SRID (DEFAULT_GEO_SRID).
     pub fn try_new_with_algorithm(algorithm: EdgeInterpolationAlgorithm) -> DeltaResult<Self> {
         Self::try_new(DEFAULT_GEO_SRID, algorithm)
     }
 
-    /// Returns the SRID associated with this geography type.
     pub fn srid(&self) -> &str {
         &self.srid
     }
 
-    /// Returns the edge interpolation algorithm for this geography type.
     pub fn algorithm(&self) -> &EdgeInterpolationAlgorithm {
         &self.algorithm
     }
@@ -1882,9 +1854,9 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             geo_str if geo_str.starts_with("geography(") && geo_str.ends_with(')') => {
                 let inner = &geo_str[10..geo_str.len() - 1];
                 // Three accepted shapes:
-                //   geography(<srid>, <algorithm>) -- both
-                //   geography(<srid>)              -- SRID only (contains ':')
-                //   geography(<algorithm>)         -- algorithm only (no ':')
+                //   geography(<srid>, <algorithm>) - both
+                //   geography(<srid>)              - SRID only (contains ':')
+                //   geography(<algorithm>)         - algorithm only (no ':')
                 match inner.rfind(',') {
                     Some(pos) => {
                         let srid = inner[..pos].trim();
