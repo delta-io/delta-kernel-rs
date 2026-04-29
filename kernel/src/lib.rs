@@ -861,12 +861,6 @@ pub trait ParquetHandler: AsAny {
     /// - `predicate`: user data predicate with physical column names (e.g. `x > 10`, or
     ///   `col-abc-123 > 10` under column mapping). Evaluated against checkpoint-internal stat
     ///   columns (`add.stats_parsed.*`, `add.partitionValues_parsed.*`).
-    /// - `action_predicate`: optional predicate referencing only top-level action-identifier
-    ///   columns (e.g. `txn.appId IS NOT NULL`). Evaluated directly against the checkpoint parquet
-    ///   schema to skip row groups that contain no rows of the caller's action types of interest.
-    ///   MUST NOT reference user data columns, since user column paths can alias to Delta action
-    ///   leaves (e.g. user column `protocol.minReaderVersion` would collide with the protocol
-    ///   action's field).
     /// - `partition_columns`: physical names of the table's partition columns, used to distinguish
     ///   partition-value stats from data column stats.
     ///
@@ -875,17 +869,23 @@ pub trait ParquetHandler: AsAny {
     /// alias Delta action leaves in the checkpoint parquet schema (e.g. a user column path
     /// `protocol.minReaderVersion` collides with the protocol action's field), so forwarding
     /// it to an engine that performs row group filtering would risk false pruning. The
-    /// `action_predicate` and `partition_columns` are also dropped. Engines that want row
-    /// group skipping on checkpoints should override this method.
+    /// `partition_columns` is also dropped. Engines that want row group skipping on checkpoints
+    /// should override this method.
+    ///
+    /// Engines that want additional pruning of row groups containing no rows of the caller's
+    /// action types of interest (e.g. `protocol`/`metaData` replay, `txn` lookup) can derive an
+    /// IS NOT NULL predicate from the read schema via
+    /// `log_segment::checkpoint_action_identifier_predicate` and apply it as a secondary
+    /// row-group filter. This MUST be applied independently from `predicate` to avoid aliasing
+    /// user column paths to Delta action leaves.
     fn read_checkpoint_parquet_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-        action_predicate: Option<PredicateRef>,
         partition_columns: &HashSet<String>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let _ = (predicate, action_predicate, partition_columns);
+        let _ = (predicate, partition_columns);
         self.read_parquet_files(files, physical_schema, None)
     }
 

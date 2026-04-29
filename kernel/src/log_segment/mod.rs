@@ -136,10 +136,22 @@ fn action_identifying_column(action_name: &str) -> Option<ColumnName> {
     }
 }
 
-/// Builds an IS NOT NULL predicate for row group skipping based on the action types in `schema`.
-/// Returns `None` if any top-level field in the schema is not a recognized action type, since
-/// an unknown type could have non-null rows in the same row group, making skipping unsafe.
-fn schema_to_is_not_null_predicate(schema: &StructType) -> Option<PredicateRef> {
+/// Builds an OR-combined `IS NOT NULL` predicate over action-identifier columns derived from
+/// `schema`. Suitable for row group pruning in checkpoint parquet files: a row group can be
+/// skipped if every action-identifier column is all-null in that group (i.e. the row group
+/// contains no rows of any action type the caller asked about).
+///
+/// Returns `None` if any top-level field in the schema is not a recognized "needle" action type
+/// (`txn`, `metaData`, `protocol`, `domainMetadata`). Bulk action types like `add` and `remove`
+/// are excluded because pruning yields negligible benefit -- they dominate checkpoint contents,
+/// so requiring "every row is non-add" almost never holds. The conservative short-circuit also
+/// keeps the predicate safe: an unrecognized type might have non-null rows in the same row
+/// group, making skipping unsafe.
+///
+/// Engines implementing [`crate::ParquetHandler::read_checkpoint_parquet_files`] can call this
+/// helper to derive an action-identifier pruning predicate from the read schema.
+#[internal_api]
+pub(crate) fn checkpoint_action_identifier_predicate(schema: &StructType) -> Option<PredicateRef> {
     // Collect identifying columns for every field; short-circuit to None on any unknown field.
     let columns: Vec<ColumnName> = schema
         .fields()
@@ -660,8 +672,7 @@ impl LogSegment {
     /// - `checkpoint_read_schema`: physical schema to read checkpoint files with. Two schemas allow
     ///   additional filtering of checkpoint files (e.g. skipping remove actions).
     /// - `meta_predicate`: optional expression for row group skipping in checkpoint parquet files.
-    ///   Not the query's data predicate, but a hint for skipping irrelevant data. IS NOT NULL
-    ///   predicates derived from `checkpoint_read_schema` are AND-combined with this.
+    ///   Not the query's data predicate, but a hint for skipping irrelevant data.
     /// - `partition_columns`: physical names of the table's partition columns. Forwarded to
     ///   `ParquetHandler::read_checkpoint_parquet_files` to enable partition-aware row group
     ///   skipping on checkpoint files.
@@ -682,13 +693,6 @@ impl LogSegment {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        // The schema-derived IS NOT NULL predicate references only top-level action-identifier
-        // columns. It is routed to the direct RowGroupFilter so row groups without any relevant
-        // action type can be skipped. The caller-supplied `meta_predicate` (user data predicate)
-        // is routed separately to CheckpointRowGroupFilter -- it must never go through the direct
-        // filter because user column paths can collide with Delta action leaves.
-        let action_predicate = schema_to_is_not_null_predicate(&checkpoint_read_schema);
-
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
         let commit_stream = CommitReader::try_new(engine, self, commit_read_schema)?;
@@ -697,7 +701,6 @@ impl LogSegment {
             engine,
             checkpoint_read_schema,
             meta_predicate,
-            action_predicate,
             partition_columns,
             stats_schema,
             partition_schema,
@@ -868,13 +871,11 @@ impl LogSegment {
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
     ///
     /// Returns a tuple of the actions iterator and [`CheckpointReadInfo`].
-    #[allow(clippy::too_many_arguments)]
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
-        action_predicate: Option<PredicateRef>,
         partition_columns: Vec<String>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
@@ -975,18 +976,10 @@ impl LogSegment {
         let partition_columns: HashSet<String> = partition_columns.into_iter().collect();
         let actions = match self.listed.checkpoint_parts.first() {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
-                // JSON checkpoints don't have parquet row group skipping; combine the predicates
-                // so the JSON reader still sees the intent (even though it will likely ignore it).
-                let combined = match (meta_predicate.clone(), action_predicate.clone()) {
-                    (None, x) | (x, None) => x,
-                    (Some(a), Some(b)) => {
-                        Some(Arc::new(Predicate::and((*a).clone(), (*b).clone())))
-                    }
-                };
                 engine.json_handler().read_json_files(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
-                    combined,
+                    meta_predicate.clone(),
                 )?
             }
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
@@ -994,7 +987,6 @@ impl LogSegment {
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
-                    action_predicate.clone(),
                     &partition_columns,
                 )?,
             Some(parsed_log_path) => {
@@ -1017,7 +1009,6 @@ impl LogSegment {
                 &sidecar_files,
                 augmented_checkpoint_read_schema.clone(),
                 meta_predicate,
-                action_predicate,
                 &partition_columns,
             )?
         } else {

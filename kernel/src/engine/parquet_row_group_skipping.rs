@@ -1,6 +1,7 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer
 //! stats.
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, Days};
 use delta_kernel_derive::internal_api;
@@ -14,9 +15,27 @@ use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::file::statistics::Statistics;
 use crate::parquet::schema::types::ColumnDescPtr;
 use crate::schema::{DataType, DecimalType, PrimitiveType};
+use crate::PredicateRef;
 
 #[cfg(test)]
 mod tests;
+
+/// Engine-internal context for checkpoint parquet reads. Carries the inputs needed by
+/// [`CheckpointRowGroupFilter`] when an engine implementation routes a checkpoint or sidecar
+/// read through its row-group-skipping pass.
+///
+/// `partition_columns` is `Arc`-wrapped so the set isn't cloned for each per-file future the
+/// engine spawns.
+#[derive(Clone)]
+pub(crate) struct CheckpointReadCtx {
+    /// Schema-derived `IS NOT NULL` predicate over action-identifier columns (e.g.
+    /// `txn.appId IS NOT NULL`). Evaluated via the plain [`RowGroupFilter`] to skip row groups
+    /// containing no rows of the caller's action types of interest.
+    pub action_predicate: Option<PredicateRef>,
+    /// Physical names of the table's partition columns. Used by [`CheckpointRowGroupFilter`] to
+    /// distinguish partition-value stats (`add.partitionValues_parsed.<col>`) from data stats.
+    pub partition_columns: Arc<HashSet<String>>,
+}
 
 /// An extension trait for [`ArrowReaderBuilder`] that injects row group skipping capability.
 #[internal_api]
