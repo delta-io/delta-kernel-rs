@@ -2954,7 +2954,7 @@ mod tests {
         Snapshot::builder_for(ctx.url.as_str())
             .at_version(new_ckpt_v)
             .build(ctx.engine.as_ref())?
-            .checkpoint(ctx.engine.as_ref())?;
+            .checkpoint(ctx.engine.as_ref(), None)?;
         if let Some(v) = newly_listed_crc_v {
             ctx.store
                 .put(
@@ -3055,7 +3055,7 @@ mod tests {
         Snapshot::builder_for(table_root)
             .at_version(2)
             .build(ctx.engine.as_ref())?
-            .checkpoint(ctx.engine.as_ref())?;
+            .checkpoint(ctx.engine.as_ref(), None)?;
 
         // Incremental update. With the filter: CRC@v1 dropped, log replay via checkpoint@v2
         // returns the correct new metadata. Without the filter: Case 2(b) fallback returns
@@ -3118,7 +3118,7 @@ mod tests {
         Snapshot::builder_for(ctx.url.as_str())
             .at_version(7)
             .build(ctx.engine.as_ref())?
-            .checkpoint(ctx.engine.as_ref())?;
+            .checkpoint(ctx.engine.as_ref(), None)?;
 
         // Hop 3: incremental v5 -> v10 (discovers a new checkpoint@v7, triggering rebuild).
         // CRC@v5 is below the new checkpoint (5 < 7) so the filter drops it, and the rebuilt
