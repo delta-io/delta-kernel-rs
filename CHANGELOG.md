@@ -8,7 +8,7 @@
 ### 🏗️ Breaking changes
 
 1. Add delta.parquet.format.version table property ([#2369])
-   - Adds `parquet_format_version: Option<String>` field to `TableProperties`. Callers using exhaustive struct construction must add `parquet_format_version: None`; callers using `..Default::default()` are unaffected.
+   - Adds `parquet_format_version: Option<String>` field to `TableProperties`. Callers using exhaustive struct construction must add `parquet_format_version: None`.
 2. Robust partitioned-write APIs ([#2356])
    - Replaces the old `WriteContext` API with partition-aware variants: use `txn.partitioned_write_context(partition_values)` or `txn.unpartitioned_write_context()`. Partition values are now passed as `Map<String, Scalar>` (kernel handles serialization per the Delta spec) instead of `Map<String, String>`.
 3. Add typed null literal support to FFI expression visitors ([#2375])
@@ -20,13 +20,13 @@
 6. Transform stats parsed for remove actions ([#2061])
    - Adds `fn has_field(&self, name: &ColumnName) -> bool` to the `EngineData` trait. Custom `EngineData` implementors must add this method.
 7. Add PathMode to control relative vs absolute paths in Delta log ([#2360])
-   - Default write behavior changed: kernel now writes **relative** paths in `add.path` (e.g. `abc.parquet`) instead of absolute URLs (e.g. `s3://bucket/table/abc.parquet`), matching Delta Spark. `DefaultParquetHandler::write_parquet_file` signature changed from `(path, data, partition_values, stats_columns)` to `(data, &WriteContext)`. Note: the `PathMode` enum added here was removed by #2410 within the same release -- only the relative-path default and the `write_parquet_file` signature change remain user-visible.
+   - Default write behavior changed: kernel now writes **relative** paths in `add.path` (e.g. `abc.parquet`) instead of absolute URLs (e.g. `s3://bucket/table/abc.parquet`), matching Delta Spark. `DefaultParquetHandler::write_parquet_file` signature changed from `(path, data, partition_values, stats_columns)` to `(data, &WriteContext)`.
 8. Add tests for histograms and expose stats and histogram ([#2373])
-   - Exposes `stats` and `histogram` accessors on file metadata for connector use. Most callers gain new getters; the `breaking-change` label was applied because public surface area on existing types grew.
+   - Exposes `stats` and `histogram` accessors on file metadata for connector use. Most callers gain new getters.
 9. Remove PathMode, always write relative paths ([#2410])
-   - Removes the `PathMode` enum, `Transaction::with_path_mode()`, and FFI `set_path_mode` / `create_table_set_path_mode` (all added by #2360 in this same release). Kernel always writes relative paths. No action needed unless you adopted the transient `PathMode` API on a pre-release of v0.22.0.
+   - Removes the `PathMode` enum, `Transaction::with_path_mode()`, and FFI `set_path_mode` / `create_table_set_path_mode`.
 10. Separate read state from effective state in Transaction ([#2385])
-    - Internal `Transaction` refactor: splits the held snapshot into `read_snapshot_opt: Option<SnapshotRef>` (pre-commit state) and `effective_table_config: TableConfiguration` (state this commit will produce). Pure refactor with no behavior change; flagged because public types touched include exposed fields/methods on `Transaction`.
+    - Internal `Transaction` refactor: splits the held snapshot into `read_snapshot_opt: Option<SnapshotRef>` (pre-commit state) and `effective_table_config: TableConfiguration` (state this commit will produce).
 11. Make scan_table_changes_next return *mut ArrowFFIData ([#2430])
     - FFI `scan_table_changes_next` now returns `*mut ArrowFFIData` instead of `ExternResult<ArrowFFIData>`. FFI consumers must switch from value-style access (`res.ok`) to pointer-style access and call the new `free_arrow_ffi_data` on non-null results.
 12. Update `CheckpointWriter::finalize` to accept `LastCheckpointHintStats` ([#2400])
