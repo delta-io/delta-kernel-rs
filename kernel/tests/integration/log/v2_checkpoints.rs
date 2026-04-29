@@ -23,8 +23,8 @@ use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use itertools::Itertools;
 use test_utils::{
-    create_table_and_load_snapshot, insert_data, load_test_data, read_add_infos, read_scan,
-    test_table_setup_mt, write_batch_to_table,
+    create_add_files_metadata, create_table_and_load_snapshot, insert_data, load_test_data,
+    read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
 };
 
 use crate::common::write_utils::{
@@ -1488,6 +1488,65 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
     Ok(())
 }
 
+/// Verify the default `file_actions_per_sidecar_hint` (50_000): staging 60_000 add actions
+/// across 60 batches of 1000 (so the splitter cuts cleanly at the 50k boundary) must
+/// produce exactly 2 sidecar files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std::error::Error>> {
+    const PER_COMMIT: usize = 1_000;
+    const COMMITS: usize = 60;
+
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+
+    // === Step 1: Create v2Checkpoint table. ===
+    let _ = create_table(&table_path, get_simple_schema(), "Test/1.0")
+        .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // === Step 2: Run 60 commits of 1_000 synthetic adds each (60_000 total). ===
+    let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    for c in 0..COMMITS {
+        let mut txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_data_change(true);
+        let add_files_schema = txn.add_files_schema().clone();
+        let paths: Vec<String> = (0..PER_COMMIT)
+            .map(|i| format!("part-{c:03}-{i:04}.parquet"))
+            .collect();
+        // Each tuple is (path, size_bytes, modification_time, num_records).
+        let files: Vec<(&str, i64, i64, i64)> =
+            paths.iter().map(|p| (p.as_str(), 100, 0, 1)).collect();
+        txn.add_files(create_add_files_metadata(&add_files_schema, files)?);
+        snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    }
+
+    // === Step 3: Sidecar checkpoint with default hint (None -> 50_000). ===
+    snapshot.checkpoint(
+        engine.as_ref(),
+        Some(&CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: None,
+        })),
+    )?;
+
+    // === Step 4: 50 commits' worth (50k adds) fills the first sidecar at the 50k hint;
+    //     the remaining 10 commits (10k adds) go into the second sidecar. ===
+    let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
+    let per_sidecar = assert_sidecars_contain_only_file_actions(&sidecars_dir);
+    assert_eq!(
+        per_sidecar,
+        vec![(10_000, 0), (50_000, 0)],
+        "per-sidecar (adds, removes) distribution"
+    );
+    assert_eq!(
+        read_last_checkpoint(&table_path)["numOfAddFiles"].as_i64(),
+        Some((PER_COMMIT * COMMITS) as i64),
+    );
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CrossFeature {
     ColumnMapping,
@@ -1581,4 +1640,3 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
 
     Ok(snapshot)
 }
-
