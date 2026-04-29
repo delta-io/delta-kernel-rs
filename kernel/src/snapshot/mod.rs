@@ -113,10 +113,12 @@ impl Snapshot {
     ///   [`SnapshotBuilder::with_max_catalog_version`] for catalog-managed tables, otherwise unset
     ///   (defaults to latest).
     /// - `S1` = existing snapshot version.
-    /// - `S2` = new snapshot version (= end version of the new listing).
+    /// - `S2` = new snapshot version (= end version of the new listing). When `T` is set, the
+    ///   listing is upper-bounded by `T`, so `S2 == T`.
     /// - `C1` = existing checkpoint version (if any).
     /// - `C2` = new checkpoint version (if found in the listing). Always `<= S2`, since `C2` is by
-    ///   definition a checkpoint observed within the listing.
+    ///   definition a checkpoint observed within the listing. By transitivity, `C2 <= T` when `T`
+    ///   is set.
     ///
     /// The log listing is catalog-log-tail aware: any `log_tail` provided to the builder is
     /// merged with filesystem listings.
