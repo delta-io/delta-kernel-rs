@@ -2232,6 +2232,7 @@ mod test {
     #[rstest]
     #[case::v3_enabled(
         &[(ENABLE_ICEBERG_COMPAT_V3, "true"), (ENABLE_ROW_TRACKING, "true")],
+        // pcol is included, meaning we expect the partition col to be materialized to disk.
         vec!["value", "pcol"],
     )]
     #[case::v3_supported_but_property_unset(&[], vec!["value"])]
@@ -2269,6 +2270,8 @@ mod test {
                 .unwrap();
 
         let write_schema = config.physical_write_schema();
+        // This is the final check: whether the partition column `pcol` is present in the
+        // physical schema as expected.
         let field_names: Vec<&str> = write_schema.fields().map(|f| f.name.as_str()).collect();
         assert_eq!(field_names, expected_field_names);
     }
