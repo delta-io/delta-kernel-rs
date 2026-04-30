@@ -747,10 +747,9 @@ async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn st
     let engine =
         Arc::new(DefaultEngineBuilder::<TokioBackgroundExecutor>::new(storage.clone()).build());
 
-    // V0 commit: protocol with V3 + dependent writer features, metadata enabling V3 + column
-    // mapping (V3 requires CM `name`/`id` mode) + row tracking. Single column carries the
-    // column-mapping annotations the metadata loader expects when CM mode is set.
-    // Note: Create table doesn't support IcebergCompatV3 yet, so we hand-craft the commit here.
+    // Create table doesn't support IcebergCompatV3 yet, so this test hand-crafts a V0 commit.
+    // The commit enables V3, column mapping, and row tracking. The schema contains one `id`
+    // column with the column-mapping metadata required when CM mode is set.
     let schema = StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)
         .with_metadata([
             (
