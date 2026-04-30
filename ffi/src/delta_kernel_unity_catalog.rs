@@ -122,11 +122,12 @@ pub struct SharedFfiUCCommitClient;
 /// Get a commit client that will call the passed callbacks when it wants to make a commit. The
 /// context will be passed back to the callback when called.
 ///
-/// IMPORTANT: The pointer passed for the context MUST be safe for **concurrent access from
-/// multiple threads** (i.e. `Sync`, not merely `Send`) and MUST remain valid for as long as the
-/// client is used. Because the returned commit client is wrapped in a shared committer handle
-/// (`SharedCommitter`), its callback can be invoked concurrently on the same context from
-/// multiple threads driving independent transactions. It is valid to pass NULL as the context.
+/// IMPORTANT: The context pointer (and any data it transitively references) MUST be safe to
+/// dereference and mutate concurrently from multiple OS threads. If the context is shared across
+/// threads, the caller MUST synchronize accesses internally (e.g. via a mutex). The pointer must
+/// also remain valid for as long as the client is used. NULL is permitted. The kernel may invoke
+/// `commit_callback` from different threads at the same time when this client is shared across
+/// transactions via a `SharedCommitter` handle.
 ///
 /// # Safety
 ///

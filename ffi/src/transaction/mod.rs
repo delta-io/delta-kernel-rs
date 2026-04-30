@@ -1588,49 +1588,10 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    #[cfg_attr(miri, ignore)]
-    async fn test_create_table_with_custom_committer() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
-        let (table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
-            vec![StructField::nullable("id", DataType::INTEGER)],
-        );
-        let table_path_str = table_path.as_str();
-
-        // Create a FileSystemCommitter handle and pass it to build_with_committer
-        let committer: Arc<dyn delta_kernel::committer::Committer> =
-            Arc::new(FileSystemCommitter::new());
-        let committer_handle: Handle<SharedCommitter> = committer.into();
-
-        let txn = ok_or_panic(unsafe {
-            create_table_builder_build_with_committer(
-                builder,
-                committer_handle.shallow_copy(),
-                engine.shallow_copy(),
-            )
-        });
-        let committed_version =
-            ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
-        assert_eq!(committed_version, 0);
-
-        // Verify the table was created
-        let snap =
-            unsafe { build_snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy()) };
-        assert_eq!(unsafe { version(snap.shallow_copy()) }, 0);
-
-        unsafe { free_snapshot(snap) };
-        // The committer handle is NOT consumed by create_table_builder_build_with_committer --
-        // the caller owns it and must drop it explicitly.
-        unsafe { committer_handle.drop_handle() };
-        unsafe { free_engine(engine) };
-        Ok(())
-    }
-
     // Exercises the motivating property of `SharedCommitter`: a single committer handle can
     // drive multiple independent transactions via `shallow_copy`. If either of the FFI entry
     // points accidentally reverted to consume-on-use semantics, this test would fault at the
-    // second use.
+    // second use. Also verifies the resulting table is loadable at version 0.
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
     async fn test_shared_committer_handle_drives_multiple_tables(
@@ -1641,10 +1602,11 @@ mod tests {
 
         for _ in 0..2 {
             let tmp_dir = tempdir()?;
-            let (_table_path, engine, builder) = create_table_builder(
+            let (table_path, engine, builder) = create_table_builder(
                 &tmp_dir,
                 vec![StructField::nullable("id", DataType::INTEGER)],
             );
+            let table_path_str = table_path.as_str();
             let txn = ok_or_panic(unsafe {
                 create_table_builder_build_with_committer(
                     builder,
@@ -1655,10 +1617,16 @@ mod tests {
             let committed_version =
                 ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
             assert_eq!(committed_version, 0);
+
+            let snap = unsafe {
+                build_snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy())
+            };
+            assert_eq!(unsafe { version(snap.shallow_copy()) }, 0);
+            unsafe { free_snapshot(snap) };
             unsafe { free_engine(engine) };
         }
 
-        // Committer handle was not consumed by either build_with_committer call -- still valid.
+        // Committer handle was not consumed by either build_with_committer call, still valid.
         unsafe { committer_handle.drop_handle() };
         Ok(())
     }

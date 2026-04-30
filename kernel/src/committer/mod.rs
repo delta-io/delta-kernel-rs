@@ -50,8 +50,11 @@ use crate::{DeltaResult, Engine, FilteredEngineData};
 ///
 /// Committers are passed as `Arc<dyn Committer>` so a single instance (e.g. a `UCCommitter`
 /// wrapping a shared catalog client) can be constructed once and reused across many transactions.
-/// The `Send + Sync` bound means implementations must be safe to call [`commit`] and [`publish`]
-/// concurrently from multiple threads on the same instance.
+/// The kernel itself invokes [`commit`] and [`publish`] at most once per transaction, but a
+/// connector may drive multiple transactions concurrently from the same shared instance. The
+/// `Send + Sync` bound therefore requires implementations to be safe to call [`commit`] and
+/// [`publish`] from multiple threads at once. Because both methods take `&self`, any mutable
+/// state must be protected by interior synchronization (mutex, atomic, etc.).
 ///
 /// [`commit`]: Committer::commit
 /// [`publish`]: Committer::publish
