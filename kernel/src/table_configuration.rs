@@ -455,15 +455,27 @@ impl TableConfiguration {
         self.physical_schemas.full.clone()
     }
 
+    /// Whether partition column values must be materialized into data files.
+    /// Returns true when either:
+    ///   * The [`MaterializePartitionColumns`] writer feature is enabled, or
+    ///   * [`IcebergCompatV3`] is enabled
+    ///
+    /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
+    /// [`IcebergCompatV3`]: crate::table_features::TableFeature::IcebergCompatV3
+    pub(crate) fn should_materialize_partition_columns(&self) -> bool {
+        self.is_feature_enabled(&TableFeature::MaterializePartitionColumns)
+            || self.is_feature_enabled(&TableFeature::IcebergCompatV3)
+    }
+
     /// The physical schema for writing data files.
     ///
-    /// When [`MaterializePartitionColumns`] is enabled, returns the full physical schema
+    /// When [`should_materialize_partition_columns`] is true, returns the full physical schema
     /// (partition columns are materialized in data files). Otherwise, returns the physical
     /// schema with partition columns excluded.
     ///
-    /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
+    /// [`should_materialize_partition_columns`]: Self::should_materialize_partition_columns
     pub(crate) fn physical_write_schema(&self) -> SchemaRef {
-        if self.is_feature_enabled(&TableFeature::MaterializePartitionColumns) {
+        if self.should_materialize_partition_columns() {
             self.physical_schema()
         } else {
             self.physical_data_schema_without_partition_columns()
@@ -2213,6 +2225,50 @@ mod test {
             config.ensure_operation_supported(Operation::Write).is_ok(),
             "ClusteredTable with DomainMetadata should be supported for writes"
         );
+    }
+
+    // V3 supported + property set -> partition column materialized into the write schema;
+    // V3 supported but property unset -> partition column stripped from the write schema.
+    #[rstest]
+    #[case::v3_enabled(
+        &[(ENABLE_ICEBERG_COMPAT_V3, "true"), (ENABLE_ROW_TRACKING, "true")],
+        vec!["value", "pcol"],
+    )]
+    #[case::v3_supported_but_property_unset(&[], vec!["value"])]
+    fn test_physical_write_schema_iceberg_compat_v3_materializes_iff_enabled(
+        #[case] extra_props: &[(&str, &str)],
+        #[case] expected_field_names: Vec<&str>,
+    ) {
+        // Partitioned schema: one data col + one partition col. No column mapping, so physical
+        // names equal logical names.
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("value", DataType::INTEGER),
+            StructField::nullable("pcol", DataType::STRING),
+        ]));
+        let props: HashMap<String, String> = extra_props
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let metadata =
+            Metadata::try_new(None, None, schema, vec!["pcol".to_string()], 0, props).unwrap();
+        let protocol = Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(Vec::<TableFeature>::new()),
+            Some(vec![
+                TableFeature::IcebergCompatV3,
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+            ]),
+        )
+        .unwrap();
+        let config =
+            TableConfiguration::try_new(metadata, protocol, Url::try_from("file:///").unwrap(), 0)
+                .unwrap();
+
+        let write_schema = config.physical_write_schema();
+        let field_names: Vec<&str> = write_schema.fields().map(|f| f.name.as_str()).collect();
+        assert_eq!(field_names, expected_field_names);
     }
 
     #[test]
