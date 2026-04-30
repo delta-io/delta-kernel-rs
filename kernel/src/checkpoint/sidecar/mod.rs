@@ -23,24 +23,27 @@ const SIDECAR_SCHEMA_TAGS: &str = "tags";
 /// Each row has the `sidecar` field populated and all other fields set to null.
 /// All rows are created in one batch via [`EvaluationHandler::create_many`].
 ///
-/// Returns an empty `Vec` when there are no sidecars.
+/// Returns `None` when there are no sidecars.
 ///
 /// # Parameters
 /// - `engine`: Implementation of [`Engine`] apis.
 /// - `checkpoint_data_schema`: The checkpoint data schema.
 /// - `sidecar_metas`: Pairs of (sidecar filename, FileMeta) for each sidecar file.
-pub(super) fn create_sidecar_action_batches(
+pub(super) fn create_sidecar_action_batch(
     engine: &dyn Engine,
     checkpoint_data_schema: &SchemaRef,
     sidecar_metas: &[(String, FileMeta)],
-) -> DeltaResult<Vec<Box<dyn EngineData>>> {
+) -> DeltaResult<Option<Box<dyn EngineData>>> {
     if sidecar_metas.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
-    // Derive the sidecar struct schema from the checkpoint data schema.
-    let sidecar_field = checkpoint_data_schema
-        .field(SIDECAR_NAME)
+    // Derive the sidecar struct schema and sidecar column index from the checkpoint data schema.
+    let checkpoint_data_fields: Vec<&StructField> = checkpoint_data_schema.fields().collect();
+    let (sidecar_col_idx, sidecar_field) = checkpoint_data_fields
+        .iter()
+        .enumerate()
+        .find(|(_, f)| f.name() == SIDECAR_NAME)
         .ok_or_else(|| Error::internal_error("checkpoint schema missing sidecar field"))?;
     let DataType::Struct(sidecar_struct) = sidecar_field.data_type() else {
         return Err(Error::internal_error(format!(
@@ -49,12 +52,6 @@ pub(super) fn create_sidecar_action_batches(
         )));
     };
     let sidecar_fields: Vec<StructField> = sidecar_struct.fields().cloned().collect();
-
-    let checkpoint_data_fields: Vec<&StructField> = checkpoint_data_schema.fields().collect();
-    let sidecar_col_idx = checkpoint_data_fields
-        .iter()
-        .position(|f| f.name() == SIDECAR_NAME)
-        .ok_or_else(|| Error::internal_error("checkpoint schema missing sidecar field"))?;
     // Per-row data template (follows checkpoint data schema, all fields null). Each sidecar row is
     // built by cloning this and populating only the `sidecar` field.
     let null_template: Vec<Scalar> = checkpoint_data_fields
@@ -99,7 +96,7 @@ pub(super) fn create_sidecar_action_batches(
     let batch = engine
         .evaluation_handler()
         .create_many(checkpoint_data_schema.clone(), &row_refs)?;
-    Ok(vec![batch])
+    Ok(Some(batch))
 }
 
 /// Transforms [`EngineData`] and filters out all-null rows.

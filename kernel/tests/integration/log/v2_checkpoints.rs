@@ -568,10 +568,10 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
 }
 
 /// E2E test: create a partitioned table with stats, write several commits, checkpoint,
-/// then read the raw checkpoint parquet to verify `stats_parsed` and `partitionValues_parsed`
-/// fields are correctly populated.
+/// then read the raw checkpoint parquet to verify `stats_parsed`, `stats`, and
+/// `partitionValues_parsed` fields are correctly populated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
+async fn test_v2_checkpoint_partition_values_parsed_and_stats(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -594,13 +594,14 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
         "per-sidecar (adds, removes) distribution"
     );
 
-    // === Read sidecar files and validate stats_parsed / partitionValues_parsed ===
+    // === Read sidecar files and validate stats_parsed, stats JSON, and partitionValues_parsed ===
     let sidecar_files = list_sidecar_parquet_files(&sidecars_dir);
 
     let mut all_record_counts = Vec::new();
     let mut all_part_values = Vec::new();
     let mut all_min_ids = Vec::new();
     let mut all_max_ids = Vec::new();
+    let mut all_stats_json = Vec::new();
 
     for sidecar_entry in &sidecar_files {
         let sidecar_batch = read_parquet_file(&sidecar_entry.path());
@@ -608,6 +609,15 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
         let add_rows = valid_row_indices(add_col, sidecar_batch.num_rows());
         if add_rows.is_empty() {
             continue;
+        }
+
+        // `add.stats` is a raw JSON string.
+        let stats_col = add_col
+            .column_by_name("stats")
+            .expect("add should have stats");
+        for &row in &add_rows {
+            assert!(stats_col.is_valid(row), "add.stats should be non-null");
+            all_stats_json.push(stats_col.as_string::<i32>().value(row).to_string());
         }
 
         let stats_parsed = get_struct_column_from_struct_array(add_col, "stats_parsed");
@@ -682,6 +692,33 @@ async fn test_v2_checkpoint_stats_parsed_and_partition_values_parsed(
         all_part_values,
         vec!["a", "b"],
         "partitionValues_parsed.part_key should be ['a', 'b']"
+    );
+
+    // Validate stats JSON.
+    let mut parsed_stats: Vec<serde_json::Value> = all_stats_json
+        .iter()
+        .map(|s| serde_json::from_str(s).expect("add.stats should be valid JSON"))
+        .collect();
+    parsed_stats.sort_by_key(|v| v["numRecords"].as_i64().unwrap());
+    assert_eq!(
+        parsed_stats,
+        vec![
+            serde_json::json!({
+                "numRecords": 2,
+                "minValues": { "id": 1, "name": "alice" },
+                "maxValues": { "id": 2, "name": "bob" },
+                "nullCount": { "id": 0, "name": 0 },
+                "tightBounds": true,
+            }),
+            serde_json::json!({
+                "numRecords": 3,
+                "minValues": { "id": 3, "name": "charlie" },
+                "maxValues": { "id": 5, "name": "eve" },
+                "nullCount": { "id": 0, "name": 0 },
+                "tightBounds": true,
+            }),
+        ],
+        "add.stats JSON should match the expected stats"
     );
 
     // === Verify scan reads all data correctly after sidecar checkpoint ===
@@ -1229,17 +1266,16 @@ async fn test_snapshot_checkpoint_default_on_v2_table(
 /// one other feature/layout. After the checkpoint, a fresh snapshot loads from the
 /// checkpoint with no trailing commits and the scan returns the full 6-row dataset.
 #[rstest::rstest]
-#[case::column_mapping(CrossFeature::ColumnMapping)]
-#[case::partitioned(CrossFeature::Partitioned)]
-#[case::clustered(CrossFeature::Clustered)]
+#[case::clustered(vec![CrossFeature::Clustered])]
+#[case::column_mapping_and_partitioned(vec![CrossFeature::ColumnMapping, CrossFeature::Partitioned])]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v2_sidecar_checkpoint_cross_feature(
-    #[case] feature: CrossFeature,
+    #[case] features: Vec<CrossFeature>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
-    let snapshot = build_v2_table_with_feature(&table_path, &table_url, &engine, feature).await?;
+    let snapshot = build_v2_table_with_feature(&table_path, &table_url, &engine, &features).await?;
     let version = snapshot.version();
 
     // 3 add files with hint=2 -> 2 sidecars: one with 2 adds, one with 1 add.
@@ -1547,7 +1583,7 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CrossFeature {
     ColumnMapping,
     Partitioned,
@@ -1568,7 +1604,7 @@ fn cross_feature_schema() -> Arc<StructType> {
     )
 }
 
-/// Creates a V2 table for the given `feature` and writes 3 commits totaling 6 rows
+/// Creates a V2 table for the given `features` and writes 3 commits totaling 6 rows
 /// across 3 distinct `region` values, returning the post-write snapshot. All variants
 /// share [`cross_feature_schema`] so the post-checkpoint scan can be asserted with the
 /// same expected output.
@@ -1576,21 +1612,35 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
     engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
-    feature: CrossFeature,
+    features: &[CrossFeature],
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let schema = cross_feature_schema();
 
     let mut props: Vec<(&str, &str)> = vec![("delta.feature.v2Checkpoint", "supported")];
-    let layout = match feature {
-        CrossFeature::ColumnMapping => {
-            // As we are verifying sidecar works with column mapping, either name or id mode
-            // is acceptable here.
-            props.push(("delta.columnMapping.mode", "name"));
-            None
+    let mut layout: Option<DataLayout> = None;
+    for feature in features {
+        match feature {
+            CrossFeature::ColumnMapping => {
+                // As we are verifying sidecar works with column mapping, either name or id mode
+                // is acceptable here.
+                props.push(("delta.columnMapping.mode", "name"));
+            }
+            CrossFeature::Partitioned => {
+                assert!(
+                    layout.is_none(),
+                    "Partitioned and Clustered are mutually exclusive"
+                );
+                layout = Some(DataLayout::partitioned(["region"]));
+            }
+            CrossFeature::Clustered => {
+                assert!(
+                    layout.is_none(),
+                    "Partitioned and Clustered are mutually exclusive"
+                );
+                layout = Some(DataLayout::clustered(["id"]));
+            }
         }
-        CrossFeature::Partitioned => Some(DataLayout::partitioned(["region"])),
-        CrossFeature::Clustered => Some(DataLayout::clustered(["id"])),
-    };
+    }
 
     let mut builder =
         create_table(table_path, schema.clone(), "Test/1.0").with_table_properties(props);
@@ -1603,7 +1653,7 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
 
     // For partitioned tables, the data batches must NOT include the partition column --
     // the partition value is supplied separately in `partition_values`.
-    let partitioned = matches!(feature, CrossFeature::Partitioned);
+    let partitioned = features.contains(&CrossFeature::Partitioned);
     let data_arrow_schema = if partitioned {
         Arc::new(ArrowSchema::try_from_kernel(&StructType::try_new(vec![
             StructField::nullable("id", DataType::INTEGER),

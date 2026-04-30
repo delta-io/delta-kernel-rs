@@ -549,7 +549,10 @@ impl Snapshot {
     ///   Delta protocol permits writing V1 checkpoints to such tables; this is a kernel limitation.
     /// - If `file_actions_per_sidecar_hint` is `Some(0)`.
     /// - If the checkpoint write fails (e.g. I/O, parquet write). A `FileAlreadyExists` error is
-    ///   not propagated; it returns [`CheckpointWriteResult::AlreadyExists`] instead.
+    ///   not propagated; it returns [`CheckpointWriteResult::AlreadyExists`] instead. Note: this
+    ///   also fires on the (unlikely) case of a sidecar UUID filename collision, where
+    ///   it should ideally surface as an error. Tracked in
+    ///   <https://github.com/delta-io/delta-kernel-rs/issues/2503>.
     ///
     /// Note:
     ///     - It is still possible that an existing checkpoint gets overwritten if that checkpoint
@@ -586,10 +589,20 @@ impl Snapshot {
             .table_configuration()
             .is_feature_supported(&TableFeature::V2Checkpoint);
         match spec {
-            Some(CheckpointSpec::V2(_)) if !v2_supported => {
-                return Err(Error::checkpoint_write(
-                    "CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
-                ));
+            Some(CheckpointSpec::V2(cfg)) => {
+                if !v2_supported {
+                    return Err(Error::checkpoint_write(
+                        "CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
+                    ));
+                }
+                if let V2CheckpointConfig::WithSidecar {
+                    file_actions_per_sidecar_hint: Some(0),
+                } = cfg
+                {
+                    return Err(Error::checkpoint_write(
+                        "file_actions_per_sidecar_hint must be greater than 0",
+                    ));
+                }
             }
             Some(CheckpointSpec::V1) if v2_supported => {
                 // TODO: remove this once we support writing V1 checkpoints even if table supports

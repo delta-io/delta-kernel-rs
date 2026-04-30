@@ -1,6 +1,8 @@
-//! This module implements the API for writing Delta checkpoints.
+//! This module implements the API for **customized** Delta checkpoint writes, where the
+//! caller drives the write themselves. The entry point is [`Snapshot::create_checkpoint_writer`].
 //!
-//! The entry point for this API is [`Snapshot::create_checkpoint_writer`].
+//! If you want an all-in-one API that handles writing the checkpoint, use
+//! [`Snapshot::checkpoint`] instead.
 //!
 //! ## Checkpoint Types and Selection Logic
 //! This API supports two checkpoint types, selected based on table features:
@@ -95,6 +97,7 @@
 //! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
 //! [`FileMeta`]: crate::FileMeta
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
+//! [`Snapshot::checkpoint`]: crate::Snapshot::checkpoint
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
@@ -132,7 +135,7 @@ use checkpoint_transform::{
     build_checkpoint_output_schema, build_checkpoint_read_schema, build_checkpoint_transform,
     StatsTransformConfig,
 };
-use sidecar::{create_sidecar_action_batches, SidecarSplitter, SingleSidecarDataIterator};
+use sidecar::{create_sidecar_action_batch, SidecarSplitter, SingleSidecarDataIterator};
 #[cfg(test)]
 mod tests;
 
@@ -264,7 +267,7 @@ pub enum CheckpointSpec {
 pub enum V2CheckpointConfig {
     /// Write a V2 checkpoint without sidecar files.
     NoSidecar,
-    /// Write a V2 checkpoint with file actions split into sidecar files. A main
+    /// Write a V2 checkpoint with file actions split into [Sidecar Files]. A main
     /// checkpoint file is written, with one `sidecar` action pointing to each sidecar file.
     ///
     /// # Benefits of Sidecars
@@ -642,7 +645,7 @@ impl CheckpointWriter {
             }
         }
 
-        // Collect non-file action batches(e.g. `protocol`, `metaData`, `txn`, etc.)
+        // Collect non-file action batches(e.g., `protocol`, `metaData`, `txn`, etc.)
         let non_file_batches = Arc::into_inner(splitter)
             .ok_or_else(|| {
                 Error::internal_error("sidecar splitter Arc should have no other references")
@@ -655,18 +658,17 @@ impl CheckpointWriter {
         // the `sidecar` column, e.g. `sidecar: { path: "<sidecar_filename>.parquet", sizeInBytes:
         // <size>, modificationTime: <time>, tags: null }`, with all other action columns
         // left null.
-        let sidecar_batches =
-            create_sidecar_action_batches(engine, &output_schema, &sidecar_metas)?;
+        let sidecar_batch = create_sidecar_action_batch(engine, &output_schema, &sidecar_metas)?;
 
         // Write main checkpoint file: non-file actions + sidecar references
         let checkpoint_path = self.checkpoint_path()?;
         let main_data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
-            Box::new(non_file_batches.into_iter().chain(sidecar_batches).map(Ok));
+            Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
         engine
             .parquet_handler()
             .write_parquet_file(checkpoint_path.clone(), main_data)?;
 
-        // Size_in_bytes covers the main checkpoint file plus all sidecar files.
+        // size_in_bytes covers the main checkpoint file plus all sidecar files.
         let sidecar_sizes_sum = sidecar_metas
             .iter()
             .try_fold(0u64, |acc, (_, m)| acc.checked_add(m.size))
