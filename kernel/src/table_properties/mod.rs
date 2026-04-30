@@ -322,17 +322,17 @@ pub enum IsolationLevel {
 #[derive(Debug, EnumString, Clone, Copy, PartialEq, Eq, Default)]
 #[strum(ascii_case_insensitive)]
 pub enum ParquetCompression {
-    /// Snappy compression (default).
-    #[default]
+    /// Snappy compression.
     Snappy,
-    /// Zstandard compression.
+    /// Zstandard compression (default).
+    #[default]
     Zstd,
 }
 
 /// Configuration for writing Parquet files.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParquetWriterConfig {
-    /// Compression codec to use. Defaults to [`ParquetCompression::Snappy`].
+    /// Compression codec to use. Defaults to [`ParquetCompression::Zstd`].
     pub compression: ParquetCompression,
 }
 

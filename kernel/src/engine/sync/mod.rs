@@ -30,13 +30,17 @@ pub(crate) struct SyncEngine {
 
 impl SyncEngine {
     pub(crate) fn new() -> Self {
+        Self::with_parquet_writer_config(ParquetWriterConfig {
+            compression: ParquetCompression::Zstd,
+        })
+    }
+
+    pub(crate) fn with_parquet_writer_config(parquet_writer_config: ParquetWriterConfig) -> Self {
         SyncEngine {
             storage_handler: Arc::new(storage::SyncStorageHandler {}),
             json_handler: Arc::new(json::SyncJsonHandler {}),
             parquet_handler: Arc::new(parquet::SyncParquetHandler {
-                parquet_writer_config: ParquetWriterConfig {
-                    compression: ParquetCompression::Zstd,
-                },
+                parquet_writer_config,
             }),
             evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
         }

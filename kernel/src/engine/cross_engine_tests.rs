@@ -24,6 +24,9 @@ use crate::object_store::local::LocalFileSystem;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::ARROW_SCHEMA_META_KEY;
+use crate::parquet::basic::Compression;
+use crate::parquet::file::reader::{FileReader, SerializedFileReader};
+use crate::table_properties::{ParquetCompression, ParquetWriterConfig};
 use crate::{EngineData, JsonHandler, ParquetHandler};
 
 fn default_parquet_handler() -> Box<dyn ParquetHandler> {
@@ -168,4 +171,54 @@ fn test_reads_file_with_arrow_schema_metadata(#[case] handler: Box<dyn ParquetHa
 #[case::sync_engine(sync_json_handler())]
 fn test_json_file_path_contract(#[case] handler: Box<dyn JsonHandler>) {
     super::tests::test_json_handler_file_path_contract(handler.as_ref());
+}
+
+type HandlerFactory = fn(ParquetWriterConfig) -> Box<dyn ParquetHandler>;
+
+fn default_parquet_handler_with_config(config: ParquetWriterConfig) -> Box<dyn ParquetHandler> {
+    Box::new(DefaultParquetHandler::new(
+        Arc::new(LocalFileSystem::new()),
+        Arc::new(TokioBackgroundExecutor::new()),
+        config,
+    ))
+}
+
+fn sync_parquet_handler_with_config(config: ParquetWriterConfig) -> Box<dyn ParquetHandler> {
+    Box::new(SyncParquetHandler {
+        parquet_writer_config: config,
+    })
+}
+
+/// Verifies that a configured [`ParquetWriterConfig`] controls the compression codec used for
+/// parquet writes. Covers both the default (async) and sync handlers.
+#[rstest]
+#[case(ParquetCompression::Snappy, Compression::SNAPPY)]
+#[case(ParquetCompression::Zstd, Compression::ZSTD(Default::default()))]
+fn test_parquet_writer_config_controls_compression(
+    #[case] kernel_compression: ParquetCompression,
+    #[case] expected_compression: Compression,
+    #[values(default_parquet_handler_with_config, sync_parquet_handler_with_config)]
+    make_handler: HandlerFactory,
+) {
+    let temp_dir = tempdir().unwrap();
+    let file_path = temp_dir.path().join("test.parquet");
+    let url = Url::from_file_path(&file_path).unwrap();
+
+    let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+        RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int64Array::from(vec![1])) as Arc<dyn Array>,
+        )])
+        .unwrap(),
+    ));
+    let handler = make_handler(ParquetWriterConfig {
+        compression: kernel_compression,
+    });
+    handler
+        .write_parquet_file(url, Box::new(std::iter::once(Ok(data))))
+        .unwrap();
+
+    let reader = SerializedFileReader::new(File::open(&file_path).unwrap()).unwrap();
+    let actual_compression = reader.metadata().row_group(0).column(0).compression();
+    assert_eq!(actual_compression, expected_compression);
 }

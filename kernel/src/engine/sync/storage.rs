@@ -89,8 +89,26 @@ impl StorageHandler for SyncStorageHandler {
         unimplemented!("SyncStorageHandler does not implement copy");
     }
 
-    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
-        unimplemented!("head is not implemented for SyncStorageHandler")
+    fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
+        let file_path = path
+            .to_file_path()
+            .map_err(|_| Error::generic(format!("Invalid path for head: {path}")))?;
+        let metadata = std::fs::metadata(&file_path)?;
+        let last_modified = metadata
+            .modified()?
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map_err(|_| Error::generic("Failed to convert file timestamp to milliseconds"))?;
+        let last_modified = last_modified.as_millis().try_into().map_err(|_| {
+            Error::generic(format!(
+                "Failed to convert file modification time {:?} into i64",
+                last_modified.as_millis()
+            ))
+        })?;
+        Ok(FileMeta {
+            location: path.clone(),
+            last_modified,
+            size: metadata.len(),
+        })
     }
 }
 
