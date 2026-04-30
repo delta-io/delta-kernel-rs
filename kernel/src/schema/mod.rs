@@ -1555,12 +1555,17 @@ pub struct GeometryType {
 }
 
 impl GeometryType {
-    pub fn try_new(srid: impl Into<String>) -> DeltaResult<Self> {
-        let srid = srid.into();
+    /// Constructs a [`GeometryType`] from the given SRID. Use [`GeometryType::default`] to
+    /// build with [`DEFAULT_GEO_SRID`] (`OGC:CRS84`).
+    ///
+    /// Returns `Err` if `srid` is empty.
+    pub fn try_new(srid: &str) -> DeltaResult<Self> {
         if srid.is_empty() {
             return Err(Error::invalid_geometry("SRID cannot be empty"));
         }
-        Ok(Self { srid })
+        Ok(Self {
+            srid: srid.to_string(),
+        })
     }
 
     pub fn srid(&self) -> &str {
@@ -1590,23 +1595,26 @@ pub struct GeographyType {
 }
 
 impl GeographyType {
+    /// Constructs a GeographyType. Pass `None` for either argument to use the default:
+    /// SRID defaults to DEFAULT_GEO_SRID (`OGC:CRS84`); algorithm defaults to
+    /// EdgeInterpolationAlgorithm::Spherical.
+    ///
+    /// Returns `Err` if `srid` is `Some("")` (empty string is not a valid SRID).
     pub fn try_new(
-        srid: impl Into<String>,
-        algorithm: EdgeInterpolationAlgorithm,
+        srid: Option<&str>,
+        algorithm: Option<EdgeInterpolationAlgorithm>,
     ) -> DeltaResult<Self> {
-        let srid = srid.into();
-        if srid.is_empty() {
-            return Err(Error::invalid_geography("SRID cannot be empty"));
-        }
+        let srid = match srid {
+            None => DEFAULT_GEO_SRID.to_string(),
+            Some(s) => {
+                if s.is_empty() {
+                    return Err(Error::invalid_geography("SRID cannot be empty"));
+                }
+                s.to_string()
+            }
+        };
+        let algorithm = algorithm.unwrap_or(EdgeInterpolationAlgorithm::Spherical);
         Ok(Self { srid, algorithm })
-    }
-
-    pub fn try_new_with_srid(srid: impl Into<String>) -> DeltaResult<Self> {
-        Self::try_new(srid, EdgeInterpolationAlgorithm::Spherical)
-    }
-
-    pub fn try_new_with_algorithm(algorithm: EdgeInterpolationAlgorithm) -> DeltaResult<Self> {
-        Self::try_new(DEFAULT_GEO_SRID, algorithm)
     }
 
     pub fn srid(&self) -> &str {
@@ -1863,7 +1871,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                         let algo_str = inner[pos + 1..].trim();
                         let algorithm: EdgeInterpolationAlgorithm =
                             algo_str.parse().map_err(serde::de::Error::custom)?;
-                        GeographyType::try_new(srid, algorithm)
+                        GeographyType::try_new(Some(srid), Some(algorithm))
                             .map(Box::new)
                             .map(PrimitiveType::Geography)
                             .map_err(serde::de::Error::custom)
@@ -1871,14 +1879,14 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                     None => {
                         let trimmed = inner.trim();
                         if trimmed.contains(':') {
-                            GeographyType::try_new_with_srid(trimmed)
+                            GeographyType::try_new(Some(trimmed), None)
                                 .map(Box::new)
                                 .map(PrimitiveType::Geography)
                                 .map_err(serde::de::Error::custom)
                         } else {
                             let algorithm: EdgeInterpolationAlgorithm =
                                 trimmed.parse().map_err(serde::de::Error::custom)?;
-                            GeographyType::try_new_with_algorithm(algorithm)
+                            GeographyType::try_new(None, Some(algorithm))
                                 .map(Box::new)
                                 .map(PrimitiveType::Geography)
                                 .map_err(serde::de::Error::custom)
@@ -2488,7 +2496,11 @@ mod tests {
         assert_eq!(
             field.data_type,
             DataType::Primitive(PrimitiveType::Geography(Box::new(
-                GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Vincenty).unwrap()
+                GeographyType::try_new(
+                    Some("EPSG:4326"),
+                    Some(EdgeInterpolationAlgorithm::Vincenty)
+                )
+                .unwrap()
             )))
         );
 
@@ -2624,18 +2636,21 @@ mod tests {
     )]
     #[case(
         "geography(EPSG:4326)",
-        PrimitiveType::Geography(Box::new(GeographyType::try_new_with_srid("EPSG:4326").unwrap()))
+        PrimitiveType::Geography(Box::new(
+            GeographyType::try_new(Some("EPSG:4326"), None).unwrap()
+        ))
     )]
     #[case(
         "geography(EPSG:4326, vincenty)",
         PrimitiveType::Geography(Box::new(
-            GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Vincenty).unwrap()
+            GeographyType::try_new(Some("EPSG:4326"), Some(EdgeInterpolationAlgorithm::Vincenty))
+                .unwrap()
         ))
     )]
     #[case(
         "geography(vincenty)",
         PrimitiveType::Geography(Box::new(
-            GeographyType::try_new_with_algorithm(EdgeInterpolationAlgorithm::Vincenty).unwrap()
+            GeographyType::try_new(None, Some(EdgeInterpolationAlgorithm::Vincenty)).unwrap()
         ))
     )]
     fn test_geo_deserialize_defaults(#[case] type_str: &str, #[case] expected: PrimitiveType) {
@@ -2650,6 +2665,7 @@ mod tests {
         "Unknown edge interpolation algorithm"
     )]
     #[case("geography(EPSG:4326,)", "Unknown edge interpolation algorithm")]
+    #[case("geography(unknown_algo)", "Unknown edge interpolation algorithm")]
     #[case("geometry(EPSG:4326", "Unsupported Delta table type")]
     #[case("geographyz", "Unsupported Delta table type")]
     #[case("geometry()", "SRID cannot be empty")]
