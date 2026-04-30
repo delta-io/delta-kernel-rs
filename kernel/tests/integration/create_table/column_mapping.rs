@@ -112,9 +112,7 @@ pub(super) fn assert_column_mapping_config(snapshot: &Snapshot, expected_mode: C
             // No column mapping metadata on any field
             for field in snapshot.schema().fields() {
                 assert!(
-                    field
-                        .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-                        .is_none(),
+                    field.column_mapping_id().is_none(),
                     "Field '{}' should not have a column mapping ID when mode is None",
                     field.name()
                 );
