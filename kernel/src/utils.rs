@@ -4,10 +4,10 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::{DeltaResult, Error};
-use delta_kernel_derive::internal_api;
 
 /// convenient way to return an error if a condition isn't true
 macro_rules! require {
@@ -167,9 +167,8 @@ where
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use std::path::PathBuf;
-    use std::sync::Mutex;
-    use std::{path::Path, sync::Arc};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
 
     use itertools::Itertools;
     use serde::Serialize;
@@ -193,8 +192,7 @@ pub(crate) mod test_utils {
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::transaction::{CreateTable, Transaction};
-    use crate::{DeltaResult, EngineData, Error, SnapshotRef};
-    use crate::{Engine, Snapshot};
+    use crate::{DeltaResult, Engine, EngineData, Error, Snapshot, SnapshotRef};
 
     /// A metrics reporter that captures all events for test assertions.
     #[derive(Debug, Default)]
@@ -212,11 +210,6 @@ pub(crate) mod test_utils {
         /// Returns a copy of all captured events.
         pub(crate) fn events(&self) -> Vec<MetricEvent> {
             self.events.lock().unwrap().clone()
-        }
-
-        /// Clears all captured events.
-        pub(crate) fn clear(&self) {
-            self.events.lock().unwrap().clear();
         }
     }
 
@@ -282,15 +275,16 @@ pub(crate) mod test_utils {
         }
     }
 
-    /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
-    /// the default module
+    /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData`
+    /// from the default module
     fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         ArrowEngineData::try_from_engine_data(engine_data)
             .unwrap()
             .into()
     }
 
-    /// Checks that two `EngineData` objects are equal by converting them to `RecordBatch` and comparing
+    /// Checks that two `EngineData` objects are equal by converting them to `RecordBatch` and
+    /// comparing
     pub(crate) fn assert_batch_matches(actual: Box<dyn EngineData>, expected: Box<dyn EngineData>) {
         assert_eq!(into_record_batch(actual), into_record_batch(expected));
     }
@@ -493,7 +487,7 @@ pub(crate) mod test_utils {
     /// Flat schema: `[id: long, name: string]`
     pub(crate) fn test_schema_flat() -> SchemaRef {
         Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, false),
+            StructField::new("id", KernelDataType::LONG, true),
             StructField::nullable("name", KernelDataType::STRING),
         ]))
     }
@@ -502,7 +496,7 @@ pub(crate) mod test_utils {
     pub(crate) fn test_schema_flat_with_column_mapping() -> SchemaRef {
         Arc::new(StructType::new_unchecked([
             with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, false),
+                StructField::new("id", KernelDataType::LONG, true),
                 1,
                 "phys_id",
             ),
@@ -517,7 +511,7 @@ pub(crate) mod test_utils {
     /// Nested struct schema with array and map inside the struct
     pub(crate) fn test_schema_nested() -> SchemaRef {
         Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, false),
+            StructField::new("id", KernelDataType::LONG, true),
             StructField::nullable(
                 "info",
                 StructType::new_unchecked([
@@ -537,7 +531,7 @@ pub(crate) mod test_utils {
     pub(crate) fn test_schema_nested_with_column_mapping() -> SchemaRef {
         Arc::new(StructType::new_unchecked([
             with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, false),
+                StructField::new("id", KernelDataType::LONG, true),
                 1,
                 "phys_id",
             ),
@@ -586,7 +580,7 @@ pub(crate) mod test_utils {
             StructField::nullable("value", KernelDataType::INTEGER),
         ]);
         Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, false),
+            StructField::new("id", KernelDataType::LONG, true),
             StructField::nullable(
                 "entries",
                 MapType::new(
@@ -615,7 +609,7 @@ pub(crate) mod test_utils {
         ]);
         Arc::new(StructType::new_unchecked([
             with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, false),
+                StructField::new("id", KernelDataType::LONG, true),
                 1,
                 "phys_id",
             ),
@@ -646,7 +640,7 @@ pub(crate) mod test_utils {
             StructField::nullable("count", KernelDataType::INTEGER),
         ]);
         Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, false),
+            StructField::new("id", KernelDataType::LONG, true),
             StructField::nullable(
                 "items",
                 ArrayType::new(KernelDataType::Struct(Box::new(item_struct)), true),
@@ -671,7 +665,7 @@ pub(crate) mod test_utils {
         ]);
         Arc::new(StructType::new_unchecked([
             with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, false),
+                StructField::new("id", KernelDataType::LONG, true),
                 1,
                 "phys_id",
             ),
@@ -901,9 +895,10 @@ mod tests {
     }
 
     mod on_complete_tests {
-        use super::*;
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         use std::sync::Arc;
+
+        use super::*;
 
         #[test]
         fn test_calls_on_exhaustion() {

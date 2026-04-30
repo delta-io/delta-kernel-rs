@@ -1,0 +1,23 @@
+name: Validate PR Body
+
+on:
+  pull_request:
+    types: [opened, edited]
+  merge_group:
+
+jobs:
+  validate-body:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR Body
+        shell: bash
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if LC_ALL=C grep -q '[^[:print:][:space:]]' <<< "$PR_BODY"; then
+            echo "PR body contains non-ascii characters. Please remove them."
+            exit 1
+          else
+            echo "PR body contains ascii characters only"
+          fi
+

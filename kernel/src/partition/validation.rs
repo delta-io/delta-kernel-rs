@@ -16,10 +16,10 @@
 //! The primary entry point is [`validate_partition_values`], which combines key validation
 //! and type checking. The two phases are also exposed individually for testing:
 //!
-//! - [`validate_keys`]: checks key completeness (case-insensitive matching,
-//!   normalizes to schema case, detects post-normalization duplicates).
-//! - [`validate_types`]: checks that each `Scalar`'s type matches the
-//!   partition column's schema type. Null scalars skip the type check.
+//! - [`validate_keys`]: checks key completeness (case-insensitive matching, normalizes to schema
+//!   case, detects post-normalization duplicates).
+//! - [`validate_types`]: checks that each `Scalar`'s type matches the partition column's schema
+//!   type. Null scalars skip the type check.
 
 use std::collections::HashMap;
 
@@ -36,8 +36,8 @@ use crate::{DeltaResult, Error};
 /// # Parameters
 /// - `logical_partition_columns`: logical partition column names from kernel's table metadata.
 /// - `logical_schema`: the table's logical schema.
-/// - `logical_partition_values`: connector-provided map from logical column names (any
-///   case) to typed values.
+/// - `logical_partition_values`: connector-provided map from logical column names (any case) to
+///   typed values.
 pub(crate) fn validate_partition_values(
     logical_partition_columns: &[String],
     logical_schema: &StructType,
@@ -58,8 +58,8 @@ pub(crate) fn validate_partition_values(
 ///
 /// # Parameters
 /// - `logical_partition_columns`: logical partition column names from kernel's table metadata.
-/// - `logical_partition_values`: connector-provided map from logical column names (any
-///   case) to typed values.
+/// - `logical_partition_values`: connector-provided map from logical column names (any case) to
+///   typed values.
 ///
 /// # Errors
 /// - A partition column is missing from the map
@@ -110,9 +110,9 @@ fn validate_keys(
 ///
 /// # Parameters
 /// - `logical_schema`: the table's logical schema.
-/// - `logical_partition_values`: map from logical column names (schema case) to typed
-///   values. Keys must use the exact logical names from the schema, as returned by
-///   [`validate_keys`]. This function uses case-sensitive schema lookup.
+/// - `logical_partition_values`: map from logical column names (schema case) to typed values. Keys
+///   must use the exact logical names from the schema, as returned by [`validate_keys`]. This
+///   function uses case-sensitive schema lookup.
 ///
 /// # Errors
 /// - A partition column is not found in the table schema
@@ -154,9 +154,9 @@ fn validate_types(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rstest::rstest;
 
+    use super::*;
     use crate::expressions::Scalar;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
 

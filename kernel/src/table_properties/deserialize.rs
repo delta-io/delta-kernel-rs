@@ -5,12 +5,12 @@
 use std::num::NonZero;
 use std::time::Duration;
 
+use tracing::warn;
+
 use super::*;
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
-
-use tracing::warn;
 
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
@@ -54,6 +54,9 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
             props.checkpoint_write_stats_as_struct = Some(parse_bool(v)?)
         }
         COLUMN_MAPPING_MODE => props.column_mapping_mode = ColumnMappingMode::try_from(v).ok(),
+        COLUMN_MAPPING_MAX_COLUMN_ID => {
+            props.column_mapping_max_column_id = Some(parse_non_negative(v)?)
+        }
         DATA_SKIPPING_NUM_INDEXED_COLS => {
             props.data_skipping_num_indexed_cols = DataSkippingNumIndexedCols::try_from(v).ok()
         }
@@ -107,8 +110,8 @@ pub(crate) fn parse_positive_int(s: &str) -> Option<NonZero<u64>> {
     NonZero::new(parse_non_negative(s)?)
 }
 
-/// Deserialize a string representing a non-negative integer into an `Option<u64>`. Returns `Some` if
-/// successfully parses, and `None` otherwise.
+/// Deserialize a string representing a non-negative integer into an `Option<u64>`. Returns `Some`
+/// if successfully parses, and `None` otherwise.
 pub(crate) fn parse_non_negative<T>(s: &str) -> Option<T>
 where
     i64: TryInto<T>,

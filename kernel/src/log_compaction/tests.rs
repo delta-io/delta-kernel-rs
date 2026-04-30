@@ -244,11 +244,14 @@ fn test_version_filtering() {
 #[tokio::test]
 #[ignore = "log compaction disabled (#2337)"]
 async fn test_no_compaction_staged_commits() {
+    use std::sync::Arc;
+
     use crate::actions::Add;
     use crate::engine::default::DefaultEngineBuilder;
-    use crate::object_store::{memory::InMemory, path::Path, ObjectStoreExt as _};
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::table_features::TableFeature;
-    use std::sync::Arc;
 
     // Set up in-memory store
     let store = Arc::new(InMemory::new());

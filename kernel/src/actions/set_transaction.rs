@@ -1,11 +1,9 @@
-use crate::actions::get_log_txn_schema;
+pub(crate) use crate::actions::visitors::SetTransactionMap;
 use crate::actions::visitors::SetTransactionVisitor;
-use crate::actions::SetTransaction;
+use crate::actions::{get_log_txn_schema, SetTransaction};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::{DeltaResult, Engine, RowVisitor as _};
-
-pub(crate) use crate::actions::visitors::SetTransactionMap;
 
 /// Returns `true` if a set transaction is expired according to the given expiration and
 /// last-updated timestamps. A transaction is expired when both values are present and
@@ -96,13 +94,13 @@ fn replay_for_app_ids(
 mod tests {
     use std::path::PathBuf;
 
+    use itertools::Itertools;
+
     use super::*;
+    use crate::arrow::array::StringArray;
     use crate::engine::sync::SyncEngine;
     use crate::utils::test_utils::parse_json_batch;
     use crate::Snapshot;
-
-    use crate::arrow::array::StringArray;
-    use itertools::Itertools;
 
     fn get_latest_transactions(
         path: &str,

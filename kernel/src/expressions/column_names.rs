@@ -1,10 +1,10 @@
-use crate::{DeltaResult, Error};
-
 use std::borrow::Borrow;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::iter::Peekable;
 use std::ops::Deref;
+
+use crate::{DeltaResult, Error};
 
 /// A (possibly nested) column name.
 #[derive(Debug, Clone, Default, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
@@ -473,8 +473,9 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use delta_kernel_derive::parse_column_name;
+
+    use super::*;
 
     impl ColumnName {
         fn empty() -> Self {

@@ -3,12 +3,13 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use delta_kernel::object_store::{local::LocalFileSystem, path::Path as ObjectPath, ObjectStore};
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::path::Path as ObjectPath;
+use delta_kernel::object_store::ObjectStore;
+use delta_kernel::{Engine, Error, Snapshot, Version};
 use futures::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use url::Url;
-
-use delta_kernel::{Engine, Error, Snapshot, Version};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssertionError {

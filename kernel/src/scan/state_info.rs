@@ -134,17 +134,17 @@ impl StateInfo {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     use url::Url;
 
+    use super::*;
     use crate::actions::{Metadata, Protocol};
     use crate::expressions::{column_expr, column_name, Expression as Expr};
     use crate::schema::{ColumnMetadataKey, MetadataValue};
     use crate::table_features::{FeatureType, TableFeature};
     use crate::utils::test_utils::assert_result_error_with_message;
-
-    use super::*;
 
     // get a state info with no predicate or extra metadata
     pub(crate) fn get_simple_state_info(
@@ -486,7 +486,8 @@ pub(crate) mod tests {
     #[test]
     fn request_row_ids_conflicting_row_index_col_name() {
         let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "row_indexes_for_row_id_0", // this will conflict with the first generated name for row indexes
+            "row_indexes_for_row_id_0", /* this will conflict with the first generated name for
+                                         * row indexes */
             DataType::STRING,
         )]));
 

@@ -1,20 +1,17 @@
 use std::ops::Range;
 
 use crate::arrow::array::cast::AsArray;
+use crate::arrow::array::types::{
+    Date32Type, Decimal128Type, Float32Type, Float64Type, GenericBinaryType, GenericStringType,
+    Int16Type, Int32Type, Int64Type, Int8Type, TimestampMicrosecondType,
+};
 use crate::arrow::array::{
-    types::{
-        Date32Type, Decimal128Type, Float32Type, Float64Type, GenericBinaryType, GenericStringType,
-        Int16Type, Int32Type, Int64Type, Int8Type, TimestampMicrosecondType,
-    },
     Array, BinaryViewArray, BooleanArray, GenericByteArray, GenericListArray, GenericListViewArray,
     MapArray, OffsetSizeTrait, PrimitiveArray, RunArray, StringViewArray,
 };
-
 use crate::engine::arrow_data::as_string_accessor;
-use crate::{
-    engine_data::{GetData, ListItem, MapItem},
-    DeltaResult, Error,
-};
+use crate::engine_data::{GetData, ListItem, MapItem};
+use crate::{DeltaResult, Error};
 
 // actual impls (todo: could macro these)
 

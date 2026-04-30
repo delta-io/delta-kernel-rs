@@ -4,23 +4,23 @@ use std::io::BufReader;
 use std::sync::Arc;
 use std::task::Poll;
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use crate::arrow::json::ReaderBuilder;
-use crate::arrow::record_batch::RecordBatch;
-use crate::object_store::path::Path;
-use crate::object_store::{self, DynObjectStore, GetResultPayload, ObjectStoreExt as _, PutMode};
 use bytes::{Buf, Bytes};
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
 use url::Url;
 
 use super::executor::TaskExecutor;
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::arrow::json::ReaderBuilder;
+use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_utils::{
     build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
     to_json_bytes,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::metrics::{MetricEvent, MetricsReporter};
+use crate::metrics::emit_json_read_completed;
+use crate::object_store::path::Path;
+use crate::object_store::{self, DynObjectStore, GetResultPayload, ObjectStoreExt as _, PutMode};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
@@ -39,8 +39,6 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// Limit the number of rows per batch. That is, for batch_size = N, then each RecordBatch
     /// yielded by the stream will have at most N rows.
     batch_size: usize,
-    /// Optional reporter for emitting [`MetricEvent::JsonReadCompleted`] events.
-    reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl<E: TaskExecutor> DefaultJsonHandler<E> {
@@ -50,14 +48,7 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
             task_executor,
             buffer_size: super::DEFAULT_BUFFER_SIZE,
             batch_size: super::DEFAULT_BATCH_SIZE,
-            reporter: None,
         }
-    }
-
-    /// Set a metrics reporter to receive [`MetricEvent::JsonReadCompleted`] events.
-    pub fn with_reporter(mut self, reporter: Option<Arc<dyn MetricsReporter>>) -> Self {
-        self.reporter = reporter;
-        self
     }
 
     /// Set the maximum number read requests to buffer in memory at once in
@@ -171,6 +162,8 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        let num_files = files.len() as u64;
+        let bytes_read = files.iter().map(|f| f.size).sum();
         let future = read_json_files_impl(
             self.store.clone(),
             files.to_vec(),
@@ -180,22 +173,12 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             self.buffer_size,
         );
         let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
-        if let Some(reporter) = &self.reporter {
-            let num_files = files.len() as u64;
-            let bytes_read = files.iter().map(|f| f.size).sum();
-            Ok(Box::new(super::ReadMetricsIterator::new(
-                inner,
-                reporter.clone(),
-                num_files,
-                bytes_read,
-                |num_files, bytes_read| MetricEvent::JsonReadCompleted {
-                    num_files,
-                    bytes_read,
-                },
-            )))
-        } else {
-            Ok(inner)
-        }
+        Ok(Box::new(super::ReadMetricsIterator::new(
+            inner,
+            num_files,
+            bytes_read,
+            emit_json_read_completed,
+        )))
     }
 
     // note: for now we just buffer all the data and write it out all at once
@@ -291,6 +274,11 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::task::Waker;
 
+    use futures::future;
+    use itertools::Itertools;
+    use serde_json::json;
+    use tracing::info;
+
     use crate::actions::get_commit_schema;
     use crate::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -300,19 +288,14 @@ mod tests {
     };
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
-    use crate::object_store::PutMultipartOptions;
     #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
     use crate::object_store::{CopyOptions, ObjectStore};
     use crate::object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutOptions, PutPayload,
-        PutResult, Result,
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, Result,
     };
     use crate::schema::{DataType as DeltaDataType, Schema, StructField};
     use crate::utils::test_utils::string_array_to_engine_data;
-    use futures::future;
-    use itertools::Itertools;
-    use serde_json::json;
-    use tracing::info;
 
     // TODO: should just use the one from test_utils, but running into dependency issues
     fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
@@ -336,7 +319,6 @@ mod tests {
     /// block until the earlier keys are requested.
     ///
     /// WARN: Does not handle duplicate keys, and will fail on duplicate requests of the same key.
-    ///
     // TODO(zach): we can handle duplicate requests if we retain the ordering of the keys track
     // that all of the keys prior to the one requested have been resolved.
     #[derive(Debug)]
@@ -416,7 +398,8 @@ mod tests {
                 return self.inner.get_opts(location, options).await;
             }
 
-            // Do the actual GET request first, then introduce any artificial ordering delays as needed
+            // Do the actual GET request first, then introduce any artificial ordering delays as
+            // needed
             let result = self.inner.get_opts(location, options).await;
 
             // we implement a future which only resolves once the requested path is next in order
@@ -542,9 +525,10 @@ mod tests {
     }
 
     // Test that operationParameters with boolean/numeric primitives are coerced to strings.
-    // Some delta logs contain values like `"statsOnLoad": false` instead of `"statsOnLoad": "false"`.
-    // Without `with_coerce_primitive(true)`, this would fail with:
-    // "whilst decoding field 'commitInfo': whilst decoding field 'operationParameters': expected string got false"
+    // Some delta logs contain values like `"statsOnLoad": false` instead of `"statsOnLoad":
+    // "false"`. Without `with_coerce_primitive(true)`, this would fail with:
+    // "whilst decoding field 'commitInfo': whilst decoding field 'operationParameters': expected
+    // string got false"
     #[test]
     fn test_parse_json_coerce_operation_parameters() {
         let store = Arc::new(LocalFileSystem::new());
@@ -715,11 +699,13 @@ mod tests {
         );
     }
 
+    use std::io::Write;
+
+    use tempfile::NamedTempFile;
+
     use crate::engine::default::DefaultEngineBuilder;
     use crate::schema::StructType;
     use crate::Engine;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
 
     fn make_invalid_named_temp() -> (NamedTempFile, Url) {
         let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");

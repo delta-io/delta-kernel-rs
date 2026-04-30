@@ -1,12 +1,12 @@
 use serde::Deserialize;
 use tracing::instrument;
+use unity_catalog_delta_client_api::{
+    CommitClient, CommitRequest, CommitsRequest, CommitsResponse, GetCommitsClient,
+};
 use url::Url;
 
 use crate::config::ClientConfig;
 use crate::http::{build_http_client, execute_with_retry, handle_response};
-use unity_catalog_delta_client_api::{
-    CommitClient, CommitRequest, CommitsRequest, CommitsResponse, GetCommitsClient,
-};
 
 /// Placeholder for deserializing empty JSON responses from void-returning endpoints.
 #[derive(Deserialize)]

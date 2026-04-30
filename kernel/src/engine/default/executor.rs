@@ -10,7 +10,8 @@
 //! A generic trait [TaskExecutor] can be implemented with your preferred async
 //! runtime. Behind the `tokio` feature flag, we provide a both a single-threaded
 //! and multi-threaded executor based on Tokio.
-use futures::{future::BoxFuture, Future};
+use futures::future::BoxFuture;
+use futures::Future;
 
 use crate::DeltaResult;
 
@@ -51,13 +52,14 @@ pub trait TaskExecutor: Send + Sync + 'static {
 
 #[cfg(any(feature = "tokio", test))]
 pub mod tokio {
-    use super::TaskExecutor;
-    use futures::TryFutureExt;
-    use futures::{future::BoxFuture, Future};
     use std::mem::ManuallyDrop;
     use std::sync::mpsc::channel;
+
+    use futures::future::BoxFuture;
+    use futures::{Future, TryFutureExt};
     use tokio::runtime::{EnterGuard, Handle, RuntimeFlavor};
 
+    use super::TaskExecutor;
     use crate::{DeltaResult, Error};
 
     /// A [`TaskExecutor`] that uses the tokio single-threaded runtime in a
@@ -219,10 +221,10 @@ pub mod tokio {
         /// Create a new executor that owns its own multi-threaded Tokio runtime.
         ///
         /// # Parameters
-        /// - `worker_threads`: Number of worker threads. If `None`, uses Tokio's default.
-        ///   See [`tokio::runtime::Builder::worker_threads`].
-        /// - `max_blocking_threads`: Maximum number of threads for blocking operations.
-        ///   If `None`, uses Tokio's default. See [`tokio::runtime::Builder::max_blocking_threads`].
+        /// - `worker_threads`: Number of worker threads. If `None`, uses Tokio's default. See
+        ///   [`tokio::runtime::Builder::worker_threads`].
+        /// - `max_blocking_threads`: Maximum number of threads for blocking operations. If `None`,
+        ///   uses Tokio's default. See [`tokio::runtime::Builder::max_blocking_threads`].
         ///
         /// # Errors
         /// Returns an error if the runtime cannot be created.
@@ -255,8 +257,8 @@ pub mod tokio {
     impl TaskExecutor for TokioMultiThreadExecutor {
         type Guard<'a> = EnterGuard<'a>;
 
-        // `block_on` uses `block_in_place`; If concurrent `block_on` calls exceed Tokio's `max_blocking_threads`, this can deadlock
-        // See:
+        // `block_on` uses `block_in_place`; If concurrent `block_on` calls exceed Tokio's
+        // `max_blocking_threads`, this can deadlock See:
         // https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.max_blocking_threads
         fn block_on<T>(&self, task: T) -> T::Output
         where
@@ -441,7 +443,8 @@ pub mod tokio {
                 tx.send(result).ok();
             });
 
-            // With 1 worker thread, 1 blocking thread and 4 nested block_on calls, this should deadlock
+            // With 1 worker thread, 1 blocking thread and 4 nested block_on calls, this should
+            // deadlock
             let timeout = Duration::from_millis(500);
             let result = rx.recv_timeout(timeout);
 

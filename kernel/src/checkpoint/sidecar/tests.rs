@@ -1,5 +1,9 @@
 use std::sync::Arc;
 
+use rstest::rstest;
+use serde_json::json;
+use url::Url;
+
 use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState,
 };
@@ -24,9 +28,6 @@ use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::schema::{DataType, StructField, StructType};
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, Engine, EngineData, Snapshot};
-use rstest::rstest;
-use serde_json::json;
-use url::Url;
 
 struct CheckpointParts {
     sidecar_files: Vec<Url>,

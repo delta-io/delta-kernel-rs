@@ -4,12 +4,12 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
-use crate::arrow::array::RecordBatch;
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use futures::FutureExt;
 
+use crate::arrow::array::RecordBatch;
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::{DeltaResult, FileMeta};
 
 /// A fallible future that resolves to a stream of [`RecordBatch`]
@@ -179,7 +179,8 @@ impl FileStream {
                         }
                         Some(Err(err)) => {
                             match self.on_error {
-                                // If `OnError::Skip` we skip the file as soon as we hit the first error
+                                // If `OnError::Skip` we skip the file as soon as we hit the first
+                                // error
                                 OnError::Skip => match mem::take(next) {
                                     Some(future) => match future {
                                         NextOpen::Pending(future) => {

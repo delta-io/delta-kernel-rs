@@ -1,11 +1,7 @@
 //! Defines [`EngineExpressionVisitor`]. This is a visitor that can be used to convert the kernel's
 //! [`Expression`] or [`Predicate`] to an engine's native expression format.
-use crate::expressions::{
-    SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp, SharedPredicate,
-};
-use crate::{handle::Handle, kernel_string_slice, KernelStringSlice, SharedSchema};
+use std::ffi::c_void;
 
-use super::kernel_visitor::NullTypeTag;
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     ColumnName, Expression, ExpressionRef, JunctionPredicate, JunctionPredicateOp, MapData,
@@ -15,7 +11,12 @@ use delta_kernel::expressions::{
     VariadicExpressionOp,
 };
 
-use std::ffi::c_void;
+use super::kernel_visitor::NullTypeTag;
+use crate::expressions::{
+    SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp, SharedPredicate,
+};
+use crate::handle::Handle;
+use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
 
 type VisitLiteralFn<T> = extern "C" fn(data: *mut c_void, sibling_list_id: usize, value: T);
 type VisitUnaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
@@ -40,10 +41,10 @@ type VisitParseJsonFn = extern "C" fn(
 /// future.
 ///
 /// Every expression the kernel visits belongs to some list of "sibling" elements. The schema
-/// itself is a list of schema elements, and every complex type (struct expression, array, junction, etc)
-/// contains a list of "child" elements.
-///  1. Before visiting any complex expression type, the kernel asks the engine to allocate a list to
-///     hold its children
+/// itself is a list of schema elements, and every complex type (struct expression, array, junction,
+/// etc) contains a list of "child" elements.
+///  1. Before visiting any complex expression type, the kernel asks the engine to allocate a list
+///     to hold its children
 ///  2. When visiting any expression element, the kernel passes its parent's "child list" as the
 ///     "sibling list" the element should be appended to:
 ///      - For a struct literal, first visit each struct field and visit each value
@@ -52,8 +53,8 @@ type VisitParseJsonFn = extern "C" fn(
 ///      - For a junction `and` or `or` expression, visit each sub-expression.
 ///      - For a binary operator expression, visit the left and right operands.
 ///      - For a unary `is null` or `not` expression, visit the sub-expression.
-///  3. When visiting a complex expression, the kernel also passes the "child list" containing
-///     that element's (already-visited) children.
+///  3. When visiting a complex expression, the kernel also passes the "child list" containing that
+///     element's (already-visited) children.
 ///  4. The [`visit_expression`] method returns the id of the list of top-level columns
 ///
 /// WARNING: The visitor MUST NOT retain internal references to string slices or binary data passed
@@ -89,8 +90,8 @@ pub struct EngineExpressionVisitor {
     /// Visit a 64bit timestamp belonging to the list identified by `sibling_list_id`.
     /// The timestamp is microsecond precision with no timezone.
     pub visit_literal_timestamp_ntz: VisitLiteralFn<i64>,
-    /// Visit a 32bit integer `date` representing days since UNIX epoch 1970-01-01.  The `date` belongs
-    /// to the list identified by `sibling_list_id`.
+    /// Visit a 32bit integer `date` representing days since UNIX epoch 1970-01-01.  The `date`
+    /// belongs to the list identified by `sibling_list_id`.
     pub visit_literal_date: VisitLiteralFn<i32>,
     /// Visit binary data at the `buffer` with length `len` belonging to the list identified by
     /// `sibling_list_id`.
@@ -158,24 +159,28 @@ pub struct EngineExpressionVisitor {
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`
     pub visit_to_json: VisitUnaryFn,
     /// Visits the `ParseJson` expression belonging to the list identified by `sibling_list_id`.
-    /// The sub-expression (JSON string) will be in a _one_ item list identified by `child_list_id`.
-    /// The `output_schema` handle specifies the schema to parse the JSON into.
+    /// The sub-expression (JSON string) will be in a _one_ item list identified by
+    /// `child_list_id`. The `output_schema` handle specifies the schema to parse the JSON
+    /// into.
     pub visit_parse_json: VisitParseJsonFn,
     /// Visits the `MapToStruct` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression (map column) will be in a _one_ item list identified by `child_list_id`.
     /// The output struct schema is determined by the evaluator's result type.
     pub visit_map_to_struct: VisitUnaryFn,
-    /// Visits the `LessThan` binary operator belonging to the list identified by `sibling_list_id`.
-    /// The operands will be in a _two_ item list identified by `child_list_id`
+    /// Visits the `LessThan` binary operator belonging to the list identified by
+    /// `sibling_list_id`. The operands will be in a _two_ item list identified by
+    /// `child_list_id`
     pub visit_lt: VisitBinaryFn,
-    /// Visits the `GreaterThan` binary operator belonging to the list identified by `sibling_list_id`.
-    /// The operands will be in a _two_ item list identified by `child_list_id`
+    /// Visits the `GreaterThan` binary operator belonging to the list identified by
+    /// `sibling_list_id`. The operands will be in a _two_ item list identified by
+    /// `child_list_id`
     pub visit_gt: VisitBinaryFn,
     /// Visits the `Equal` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_eq: VisitBinaryFn,
-    /// Visits the `Distinct` binary operator belonging to the list identified by `sibling_list_id`.
-    /// The operands will be in a _two_ item list identified by `child_list_id`
+    /// Visits the `Distinct` binary operator belonging to the list identified by
+    /// `sibling_list_id`. The operands will be in a _two_ item list identified by
+    /// `child_list_id`
     pub visit_distinct: VisitBinaryFn,
     /// Visits the `In` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
@@ -186,14 +191,15 @@ pub struct EngineExpressionVisitor {
     /// Visits the `Minus` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_minus: VisitBinaryFn,
-    /// Visits the `Multiply` binary operator belonging to the list identified by `sibling_list_id`.
-    /// The operands will be in a _two_ item list identified by `child_list_id`
+    /// Visits the `Multiply` binary operator belonging to the list identified by
+    /// `sibling_list_id`. The operands will be in a _two_ item list identified by
+    /// `child_list_id`
     pub visit_multiply: VisitBinaryFn,
     /// Visits the `Divide` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_divide: VisitBinaryFn,
-    /// Visits the `Coalesce` variadic operator belonging to the list identified by `sibling_list_id`.
-    /// The operands will be in a list identified by `child_list_id`
+    /// Visits the `Coalesce` variadic operator belonging to the list identified by
+    /// `sibling_list_id`. The operands will be in a list identified by `child_list_id`
     pub visit_coalesce: VisitVariadicFn,
     /// Visits the `column` belonging to the list identified by `sibling_list_id`.
     pub visit_column:
@@ -237,7 +243,8 @@ pub struct EngineExpressionVisitor {
     /// | YES | NO  | Insert a (possibly empty)  list of expressions after the named input field
     /// | YES | YES | Replace the named input field with a (possibly empty) list of expressions
     ///
-    /// NOTE: The expressions of each field transform must be emitted in order at the insertion point.
+    /// NOTE: The expressions of each field transform must be emitted in order at the insertion
+    /// point.
     pub visit_field_transform: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,

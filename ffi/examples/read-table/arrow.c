@@ -160,7 +160,11 @@ static void visit_read_data(void* vcontext, ExclusiveEngineData* data)
   }
   ArrowFFIData* arrow_data = arrow_res.ok;
   add_batch_to_context(context->arrow_context, arrow_data);
-  free(arrow_data); // just frees the struct, the data and schema are freed/owned by add_batch_to_context
+  // The inner FFI_ArrowArray/FFI_ArrowSchema have already been imported by arrow-glib
+  // inside add_batch_to_context (which moves their release callbacks), so this call only
+  // drops the outer Box. It's still necessary to use the kernel-provided free because the
+  // struct was allocated by Rust's global allocator.
+  free_arrow_ffi_data(arrow_data);
 }
 
 // We call this for each file we get called back to read in read_table.c::visit_callback

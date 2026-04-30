@@ -16,13 +16,12 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use delta_kernel::arrow::array::{
     ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, StringBuilder, StructArray,
 };
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields};
 use delta_kernel::engine::arrow_expression::evaluate_expression::to_json;
-
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 /// Creates a test struct array with realistic data for benchmarking.
 fn create_test_struct_array(num_rows: usize) -> StructArray {

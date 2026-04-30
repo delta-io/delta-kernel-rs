@@ -1,16 +1,16 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use rstest::rstest;
 use url::Url;
 
-use rstest::rstest;
-
+use super::*;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-use crate::object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStoreExt as _};
+use crate::object_store::memory::InMemory;
+use crate::object_store::path::Path as ObjectPath;
+use crate::object_store::ObjectStoreExt as _;
 use crate::FileMeta;
-
-use super::*;
 
 // size markers used to identify commit sources in tests
 const FILESYSTEM_SIZE_MARKER: u64 = 10;
@@ -71,7 +71,7 @@ async fn create_storage(
     }
 
     let executor = Arc::new(TokioBackgroundExecutor::new());
-    let storage = Box::new(ObjectStoreStorageHandler::new(store, executor, None));
+    let storage = Box::new(ObjectStoreStorageHandler::new(store, executor));
     (storage, log_root)
 }
 
@@ -288,7 +288,8 @@ async fn test_request_subset_with_log_tail() {
 #[tokio::test]
 async fn test_log_tail_defines_latest_version() {
     // log_tail defines the latest version of the table: if there is file system files after log
-    // tail, they are ignored. But we still list all filesystem files to track max_published_version.
+    // tail, they are ignored. But we still list all filesystem files to track
+    // max_published_version.
     let log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
@@ -537,8 +538,8 @@ async fn test_non_commit_files_at_log_tail_versions_are_preserved() {
 // Checkpoint at end_version: found in window 1, no commits after it
 #[case::checkpoint_at_end(Some(1005), 0..0, Some(1005), 1)]
 // Checkpoint at v5: falls in window 2 -> 2 listings; commits 6..=1005 returned.
-// Tests the inclusive window boundary: window 1 covers [6, 1006) or [6, 1005] (lower = 1006 - 1000 = 6),
-// so v5 falls just outside it and requires a second listing, while v6 (next case) does not.
+// Tests the inclusive window boundary: window 1 covers [6, 1006) or [6, 1005] (lower = 1006 - 1000
+// = 6), so v5 falls just outside it and requires a second listing, while v6 (next case) does not.
 #[case::checkpoint_in_second_window(Some(5), 6..=1005, Some(5), 2)]
 // Checkpoint at v6: falls in window 1 -> 1 listing; commits 7..=1005 returned
 #[case::checkpoint_in_first_window(Some(6), 7..=1005, Some(6), 1)]
@@ -878,7 +879,7 @@ async fn create_storage_with_empty_files(
     }
 
     let executor = Arc::new(TokioBackgroundExecutor::new());
-    let storage = Box::new(ObjectStoreStorageHandler::new(store, executor, None));
+    let storage = Box::new(ObjectStoreStorageHandler::new(store, executor));
     (storage, log_root)
 }
 
@@ -1045,7 +1046,10 @@ async fn test_list_commits_zero_byte_commit_kept() {
     assert_eq!(result.ascending_commit_files[2].location.size, 0);
 }
 
-// ===== find_complete_checkpoint_version direct unit tests (other cases already covered by tests above) =====
+// ---------------------------------------------------------------------------
+// find_complete_checkpoint_version direct unit tests
+// (other cases already covered by tests above)
+// ---------------------------------------------------------------------------
 
 fn incomplete_then_complete_files() -> Vec<ParsedLogPath> {
     // Commits v0..=10, an incomplete checkpoint at v5 (1 of 3 parts), and a complete

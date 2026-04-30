@@ -22,9 +22,8 @@
 //! [`Schema`]: crate::schema::Schema
 use std::collections::{HashMap, HashSet};
 
-use crate::utils::require;
-
 use super::{DataType, StructField, StructType};
+use crate::utils::require;
 
 /// The nullability flag of a schema's field. This can be compared with a read schema field's
 /// nullability flag using [`Nullable::can_read_as`].
@@ -140,7 +139,8 @@ impl SchemaComparison for DataType {
     /// Returns `Ok` if this [`DataType`] can be read as `read_type`. This is the case when:
     ///     1. The data types are the same, OR the source type can be widened to the target type
     ///        (see [`PrimitiveType::can_widen_to`])
-    ///     2. For complex data types, the nested types must be compatible as defined by [`SchemaComparison`]
+    ///     2. For complex data types, the nested types must be compatible as defined by
+    ///        [`SchemaComparison`]
     ///     3. For array data types, the nullability may not be tightened in the `read_type`. See
     ///        [`Nullable::can_read_as`]
     ///

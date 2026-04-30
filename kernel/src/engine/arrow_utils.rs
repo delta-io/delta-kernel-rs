@@ -1,22 +1,17 @@
 //! Some utilities for working with arrow data types
 
-use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
-use crate::engine::ensure_data_types::DataTypeCompat;
-use crate::engine_data::FilteredEngineData;
-use crate::schema::{ColumnMetadataKey, MetadataValue};
-use crate::{
-    engine::arrow_data::ArrowEngineData,
-    schema::{DataType, MetadataColumnSpec, Schema, SchemaRef, StructField, StructType},
-    utils::require,
-    DeltaResult, EngineData, Error,
-};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
+use delta_kernel_derive::internal_api;
+use itertools::Itertools;
+use tracing::debug;
+
+use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
-    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
-    OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray, OffsetSizeTrait,
+    PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::datatypes::{
@@ -25,12 +20,19 @@ use crate::arrow::datatypes::{
 };
 use crate::arrow::json::writer::{make_encoder, LineDelimited, NullableEncoder};
 use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder, WriterBuilder};
-use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
+use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::ensure_data_types::DataTypeCompat;
+use crate::engine_data::FilteredEngineData;
+use crate::parquet::arrow::{ProjectionMask, PARQUET_FIELD_ID_META_KEY};
 use crate::parquet::file::metadata::RowGroupMetaData;
-use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
-use delta_kernel_derive::internal_api;
-use itertools::Itertools;
-use tracing::debug;
+use crate::parquet::schema::types::SchemaDescriptor;
+use crate::schema::{
+    ColumnMetadataKey, DataType, MetadataColumnSpec, MetadataValue, Schema, SchemaRef, StructField,
+    StructType,
+};
+use crate::utils::require;
+use crate::{DeltaResult, EngineData, Error};
 
 macro_rules! prim_array_cmp {
     ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
@@ -148,7 +150,8 @@ impl RowIndexBuilder {
                         if !seen_ordinals.insert(i) {
                             return Err(Error::generic("Found duplicate row group ordinal"));
                         }
-                        // We have to clone here to avoid modifying the original vector in each iteration
+                        // We have to clone here to avoid modifying the original vector in each
+                        // iteration
                         self.row_group_row_index_ranges
                             .get(i)
                             .cloned()
@@ -216,7 +219,8 @@ pub(crate) fn fixup_parquet_read(
 ///
 /// this function returns a new `RecordBatch` whose schema matches the target exactly — every
 /// field's nullability flag (including deeply nested ones like `a.c.d`) is updated to match,
-/// recursing into structs and maps. The underlying array data is unchanged; only the nullability flag is adjusted.
+/// recursing into structs and maps. The underlying array data is unchanged; only the nullability
+/// flag is adjusted.
 ///
 /// **Complexity:** O(F) time and space where F is the total number of fields (including nested)
 /// in the schema. The actual row data (Arrow buffers) is shared via `Arc` and never copied.
@@ -599,7 +603,8 @@ impl ReorderIndex {
     /// [`ordering_needs_transform`] to understand why this is needed.
     fn needs_transform(&self) -> bool {
         match self.transform {
-            // if we're casting, inserting null, or generating row index/file path, we need to transform
+            // if we're casting, inserting null, or generating row index/file path, we need to
+            // transform
             ReorderIndexTransform::Cast(_)
             | ReorderIndexTransform::Missing(_)
             | ReorderIndexTransform::RowIndex(_)
@@ -696,8 +701,9 @@ fn get_indices(
             ..
         }) = kernel_field_info
         {
-            // If the field is a variant, make sure the parquet schema matches the unshredded variant
-            // representation. This is to ensure that shredded reads are not performed.
+            // If the field is a variant, make sure the parquet schema matches the unshredded
+            // variant representation. This is to ensure that shredded reads are not
+            // performed.
             if requested_field.data_type == DataType::unshredded_variant() {
                 validate_parquet_variant(field)?;
             }
@@ -743,8 +749,8 @@ fn get_indices(
                 ArrowDataType::List(list_field)
                 | ArrowDataType::LargeList(list_field)
                 | ArrowDataType::ListView(list_field) => {
-                    // we just want to transparently recurse into lists, need to transform the kernel
-                    // list data type into a schema
+                    // we just want to transparently recurse into lists, need to transform the
+                    // kernel list data type into a schema
                     if let DataType::Array(array_type) = requested_field.data_type() {
                         let requested_schema = StructType::new_unchecked([StructField::new(
                             list_field.name().clone(), // so we find it in the inner call
@@ -883,7 +889,8 @@ fn get_indices(
     reorder_indices.extend(deferred_missing);
 
     if found_fields.len() != requested_schema.num_fields() {
-        // some fields are missing, but they might be nullable or metadata columns, need to insert them into the reorder_indices
+        // some fields are missing, but they might be nullable or metadata columns, need to insert
+        // them into the reorder_indices
         for (requested_position, field) in requested_schema.fields().enumerate() {
             if !found_fields.contains(field.name()) {
                 match field.get_metadata_column_spec() {
@@ -965,10 +972,12 @@ fn match_parquet_fields<'k, 'p>(
                 .get(PARQUET_FIELD_ID_META_KEY)
                 .and_then(|x| x.parse::<FieldId>().ok());
 
-            // Get kernel field name by parquet field id if present. Otherwise fallback to using parquet name.
+            // Get kernel field name by parquet field id if present. Otherwise fallback to using
+            // parquet name.
             let field_name = parquet_field_id
                 .and_then(|field_id| {
-                    // If the fid to name map hasn't been initialized, construct it and get the field name
+                    // If the fid to name map hasn't been initialized, construct it and get the
+                    // field name
                     field_id_to_name
                         .get_or_init(init_field_map)
                         .get(&field_id)
@@ -1133,8 +1142,10 @@ pub(crate) fn reorder_struct_array(
                             let result_array = Arc::new(reorder_struct_array(
                                 struct_array,
                                 children,
-                                None, // Nested structures don't need row indexes since metadata columns can't be nested
-                                None, // No file_location passed since metadata columns can't be nested
+                                None, /* Nested structures don't need row indexes since metadata
+                                       * columns can't be nested */
+                                None, /* No file_location passed since metadata columns can't be
+                                       * nested */
                             )?);
                             // create the new field specifying the correct order for the struct
                             let new_field = Arc::new(ArrowField::new_struct(
@@ -1232,7 +1243,8 @@ fn reorder_list<O: OffsetSizeTrait>(
         let result_array = Arc::new(reorder_struct_array(
             struct_array,
             children,
-            None, // Nested structures don't need row indexes since metadata columns can't be nested
+            None, /* Nested structures don't need row indexes since metadata columns can't be
+                   * nested */
             None, // No file_location passed since metadata columns can't be nested
         )?);
         let new_list_field = Arc::new(ArrowField::new_struct(
@@ -1564,17 +1576,16 @@ pub(crate) fn json_arrow_schema(schema: &StructType) -> DeltaResult<ArrowSchema>
 mod tests {
     use std::sync::Arc;
 
+    use super::*;
     use crate::arrow::array::{
-        Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, Int32Builder,
-        Int64Array, MapArray, MapBuilder, StringArray, StringBuilder, StructArray, StructBuilder,
+        Array, ArrayRef as ArrowArrayRef, AsArray, BooleanArray, GenericListArray, Int32Array,
+        Int32Builder, Int64Array, MapArray, MapBuilder, StringArray, StringBuilder, StructArray,
+        StructBuilder,
     };
+    use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
         Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
-    };
-    use crate::arrow::{
-        array::AsArray,
-        buffer::{OffsetBuffer, ScalarBuffer},
     };
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::schema::{
@@ -1583,8 +1594,6 @@ mod tests {
     };
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
-
-    use super::*;
 
     fn column_mapping_cases() -> [ColumnMappingMode; 3] {
         [

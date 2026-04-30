@@ -22,4 +22,5 @@ delta_kernel = { path = "../../../kernel", features = [
   "default-engine-rustls",
   "internal-api",
 ] }
+tracing = { version = "0.1", features = ["log"] }
 url = "2"

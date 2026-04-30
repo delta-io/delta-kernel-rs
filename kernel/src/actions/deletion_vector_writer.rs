@@ -52,8 +52,9 @@ pub trait DeletionVector: Sized {
     /// Serialize the deletion vector into bytes.
     ///
     /// This serializes the deletion vector in the format expected by the Delta Lake protocol.
-    /// it may be overridden for more efficient serialization if the implementation already has the data in a suitable format.
-    /// But generally, only do this if you fully understand the the format requirements.
+    /// it may be overridden for more efficient serialization if the implementation already has the
+    /// data in a suitable format. But generally, only do this if you fully understand the the
+    /// format requirements.
     fn serialize(self) -> DeltaResult<Bytes> {
         let treemap: RoaringTreemap = self.into_iter().collect();
         let mut serialized = Vec::new();
@@ -85,7 +86,8 @@ pub struct DeletionVectorWriteResult {
 impl DeletionVectorWriteResult {
     /// Convert the write result to a deletion vector descriptor.
     ///
-    /// As an implementation detail, this method will always use the persisted relative storage type.
+    /// As an implementation detail, this method will always use the persisted relative storage
+    /// type.
     ///
     /// # Arguments
     ///
@@ -367,8 +369,9 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Cursor;
+
+    use super::*;
 
     #[test]
     fn test_kernel_deletion_vector_new() {
@@ -433,10 +436,12 @@ mod tests {
 
     #[test]
     fn test_streaming_writer_empty_dv() {
-        use crate::Engine;
         use std::fs::File;
+
         use tempfile::tempdir;
         use url::Url;
+
+        use crate::Engine;
 
         // Create a temporary directory and file
         let temp_dir = tempdir().unwrap();
@@ -567,10 +572,12 @@ mod tests {
 
     #[test]
     fn test_array_based_deletion_vector() {
-        use crate::Engine;
         use std::fs::File;
+
         use tempfile::tempdir;
         use url::Url;
+
+        use crate::Engine;
 
         // Custom DeletionVector implementation that wraps an array of u64
         struct ArrayDeletionVector {
@@ -722,10 +729,12 @@ mod tests {
 
     #[test]
     fn test_multiple_deletion_vectors_roundtrip_with_descriptor() {
-        use crate::Engine;
         use std::fs::File;
+
         use tempfile::tempdir;
         use url::Url;
+
+        use crate::Engine;
 
         // Create a temporary directory and file
         let temp_dir = tempdir().unwrap();
@@ -770,8 +779,8 @@ mod tests {
 
         // Now read back each deletion vector using the descriptors
         for (write_result, expected_indexes) in descriptors.iter().zip(&test_data) {
-            // Create a new DeletionVectorPath for each DV (they would have different UUIDs normally,
-            // but for this test we're writing multiple to the same file)
+            // Create a new DeletionVectorPath for each DV (they would have different UUIDs
+            // normally, but for this test we're writing multiple to the same file)
             let descriptor = write_result.clone().to_descriptor(&dv_path);
 
             // Read the deletion vector back using the descriptor

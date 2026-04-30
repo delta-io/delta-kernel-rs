@@ -15,7 +15,6 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::Snapshot;
-
 use serde_json::json;
 use tempfile::tempdir;
 use url::Url;

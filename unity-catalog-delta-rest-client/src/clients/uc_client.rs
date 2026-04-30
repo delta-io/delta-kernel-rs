@@ -3,9 +3,8 @@
 // to unity-catalog-delta-client-api.
 use reqwest::StatusCode;
 use tracing::instrument;
-use url::Url;
-
 use unity_catalog_delta_client_api::{Operation, TemporaryTableCredentials};
+use url::Url;
 
 use crate::config::ClientConfig;
 use crate::error::Result;

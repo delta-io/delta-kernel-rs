@@ -1,9 +1,10 @@
 use std::os::raw::c_void;
 
+use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
+
 use crate::handle::Handle;
 use crate::scan::CStringMap;
 use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
-use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 
 /// The `EngineSchemaVisitor` defines a visitor system to allow engines to build their own
 /// representation of a schema from a particular schema within kernel.
@@ -30,7 +31,8 @@ use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructTy
 ///  3. When visiting a complex schema element, the kernel also passes the "child list" containing
 ///     that element's (already-visited) children.
 ///  4. The [`visit_schema`] method returns the id of the list of top-level columns
-// WARNING: the visitor MUST NOT retain internal references to the string slices passed to visitor methods
+// WARNING: the visitor MUST NOT retain internal references to the string slices passed to visitor
+// methods
 #[repr(C)]
 pub struct EngineSchemaVisitor {
     /// opaque state pointer

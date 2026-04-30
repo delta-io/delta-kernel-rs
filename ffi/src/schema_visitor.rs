@@ -20,17 +20,17 @@
 //! IDs are consumed when used. Each element takes ownership of its referenced child
 //! elements. Trying to pass an ID more than once to a complex field visitor will result in an
 //! error.
-//!
 
-use crate::{
-    AllocateErrorFn, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet,
-    TryFromStringSlice,
-};
 use delta_kernel::schema::{
     ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField, StructType,
 };
 use delta_kernel::{DeltaResult, Error};
 use tracing::warn;
+
+use crate::{
+    AllocateErrorFn, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet,
+    TryFromStringSlice,
+};
 
 #[derive(Default)]
 pub struct KernelSchemaVisitorState {
@@ -90,7 +90,8 @@ fn visit_field_primitive_impl(
     Ok(wrap_field(state, field))
 }
 
-// TODO: turn all the primitive visitors below into a macro once cbindgen can run on macro expanded code
+// TODO: turn all the primitive visitors below into a macro once cbindgen can run on macro expanded
+// code
 /// Visit a string field. Strings can hold arbitrary UTF-8 text data.
 ///
 /// # Safety
@@ -307,7 +308,8 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
         .into_extern_result(&allocate_error)
 }
 
-/// Visit a decimal field. Decimal fields store fixed-precision decimal numbers with specified precision and scale.
+/// Visit a decimal field. Decimal fields store fixed-precision decimal numbers with specified
+/// precision and scale.
 ///
 /// # Safety
 ///
@@ -455,8 +457,8 @@ fn visit_field_array_impl(
 ///
 /// # Safety
 ///
-/// Caller is responsible for providing valid `state`, `name` slice, `key_type_id` and `value_type_id`
-/// from previous `visit_data_type_*` calls, and `allocate_error` function pointer.
+/// Caller is responsible for providing valid `state`, `name` slice, `key_type_id` and
+/// `value_type_id` from previous `visit_data_type_*` calls, and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_map(
     state: &mut KernelSchemaVisitorState,
@@ -551,13 +553,15 @@ fn create_variant_data_type(
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel::schema::{DataType, PrimitiveType};
+
     use super::*;
     use crate::error::{EngineError, KernelError};
     use crate::ffi_test_utils::ok_or_panic;
     use crate::KernelStringSlice;
-    use delta_kernel::schema::{DataType, PrimitiveType};
 
-    // Error allocator for tests that panics when invoked. It is used in tests where we don't expect errors.
+    // Error allocator for tests that panics when invoked. It is used in tests where we don't expect
+    // errors.
     #[no_mangle]
     extern "C" fn test_allocate_error(
         etype: KernelError,
@@ -915,7 +919,8 @@ mod tests {
         // struct<
         //   col_nested: 1.array<2.map<2a.struct<key_id: long>, 2b.struct<
         //     inner_arrays: 3.array<4.struct<
-        //       deep_maps: 4a.map<4a1.variant<metadata: binary, value: binary>, 4a2.array<decimal(10,2)>>,
+        //       deep_maps: 4a.map<4a1.variant<metadata: binary, value: binary>,
+        //                  4a2.array<decimal(10,2)>>,
         //       variant_data: 4b.variant<metadata: binary, value: binary>,
         //       nested_struct: 4c.struct<
         //         final_array: 5.array<6.map<6a.struct<coord: double>, 6b.double>>
@@ -1297,7 +1302,8 @@ mod tests {
 
     #[test]
     fn cannot_use_nullable_as_map_keys() {
-        // Error allocator for tests that panics when invoked. It is used in tests where we don't expect errors.
+        // Error allocator for tests that panics when invoked. It is used in tests where we don't
+        // expect errors.
         #[no_mangle]
         extern "C" fn ensure_map_err(
             _etype: KernelError,

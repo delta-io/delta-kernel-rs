@@ -68,7 +68,55 @@
 //! correlating to specific Snapshot/Transaction operations.
 
 mod events;
-mod reporter;
+pub(crate) mod reporter;
+
+use std::sync::Arc;
 
 pub use events::{MetricEvent, MetricId, ScanType};
-pub use reporter::MetricsReporter;
+pub use reporter::{
+    emit_json_read_completed, emit_parquet_read_completed, LoggingMetricsReporter, MetricsReporter,
+    ReportGeneratorLayer,
+};
+use tracing::Subscriber;
+use tracing_subscriber::layer::{Layered, SubscriberExt as _};
+use tracing_subscriber::registry::LookupSpan;
+
+/// Extension trait that adds [`with_metrics_reporter_layer`] to any compatible tracing subscriber.
+///
+/// Only implemented for subscribers that also implement [`LookupSpan`], which is required by
+/// [`ReportGeneratorLayer`] to store and retrieve per-span state.
+///
+/// [`with_metrics_reporter_layer`]: WithMetricsReporterLayer::with_metrics_reporter_layer
+pub trait WithMetricsReporterLayer: Subscriber + for<'lookup> LookupSpan<'lookup> {
+    /// Wrap this subscriber with a [`ReportGeneratorLayer`] that converts tracing spans into
+    /// [`MetricEvent`]s and forwards them to `reporter`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use delta_kernel::metrics::{WithMetricsReporterLayer, LoggingMetricsReporter};
+    /// use tracing_subscriber::prelude::*;
+    ///
+    /// tracing_subscriber::registry()
+    ///     .with_metrics_reporter_layer(
+    ///         Arc::new(LoggingMetricsReporter::new(tracing::Level::INFO))
+    ///     );
+    /// ```
+    fn with_metrics_reporter_layer(
+        self,
+        reporter: Arc<dyn MetricsReporter>,
+    ) -> Layered<ReportGeneratorLayer, Self>
+    where
+        Self: Sized,
+    {
+        self.with(ReportGeneratorLayer::new(reporter))
+    }
+}
+
+impl<S> WithMetricsReporterLayer for S
+where
+    S: Subscriber,
+    for<'lookup> S: LookupSpan<'lookup>,
+{
+}

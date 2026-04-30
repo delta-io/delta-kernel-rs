@@ -1,6 +1,6 @@
 //! Provides an engine implementation that implements the required traits. The engine can optionally
-//! be built into the kernel by setting the `default-engine` feature flag. See the related module
-//! for more information.
+//! be built into the kernel by setting the `default-engine-rustls` or `default-engine-native-tls`
+//! feature flag. See the related module for more information.
 
 #[cfg(feature = "arrow-expression")]
 use crate::parquet::arrow::arrow_reader::ArrowReaderOptions;

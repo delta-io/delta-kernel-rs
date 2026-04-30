@@ -1,0 +1,6 @@
+Writing empty commit to <TABLE>
+Write context:
+  schema_handle: <obtained>
+  write_path:    file://<TABLE>/
+Committed version: 1
+Snapshot version after commit: 1

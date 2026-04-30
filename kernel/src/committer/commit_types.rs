@@ -332,12 +332,12 @@ pub enum CommitResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::sync::Arc;
 
-    use crate::path::LogRoot;
     use url::Url;
+
+    use super::*;
+    use crate::path::LogRoot;
 
     #[test]
     fn test_commit_metadata() {

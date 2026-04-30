@@ -5,7 +5,8 @@
 
 use std::path::Path;
 
-use acceptance::acceptance_workloads::{workload::execute_and_validate_workload, TestCase};
+use acceptance::acceptance_workloads::workload::execute_and_validate_workload;
+use acceptance::acceptance_workloads::TestCase;
 
 /// Tests that cannot be executed due to test harness limitations.
 /// These fail at parse time or cause infrastructure issues (OOM, hang).

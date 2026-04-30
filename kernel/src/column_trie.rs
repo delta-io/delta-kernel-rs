@@ -75,13 +75,44 @@ impl<'col> ColumnTrie<'col> {
         node.is_terminal = true;
     }
 
+    /// Returns true if `path` exactly matches a terminal (leaf) column in the trie.
+    ///
+    /// This is used by stats collection to detect columns that are structs at the Arrow level
+    /// but should be treated as leaf columns for statistics (e.g. Variant, which is
+    /// `Struct { metadata, value }` in Arrow but a single leaf in the stats schema). For such
+    /// columns, stats collection computes nullCount at the struct level instead of recursing
+    /// into sub-fields.
+    ///
+    /// Unlike [`contains_prefix_of`], this does NOT match descendants. It returns true only
+    /// when the path ends at a terminal node. `contains_prefix_of` would return true for both
+    /// a terminal column and its descendants, which can't distinguish a stats-leaf struct from
+    /// a regular struct whose children are stats columns.
+    ///
+    /// For example, if the trie contains `["a", "b"]`:
+    /// - `["a", "b"]` -> true (exact terminal match)
+    /// - `["a", "b", "c"]` -> false (descendant, not exact)
+    /// - `["a"]` -> false (not terminal)
+    ///
+    /// [`contains_prefix_of`]: Self::contains_prefix_of
+    #[internal_api]
+    pub(crate) fn is_terminal(&self, path: &[String]) -> bool {
+        let mut node = self;
+        for part in path {
+            match node.children.get(part.as_str()) {
+                Some(child) => node = child,
+                None => return false,
+            }
+        }
+        node.is_terminal
+    }
+
     /// Returns true if `path` equals or is a descendant of any inserted column.
     ///
     /// For example, if the trie contains `["a", "b"]`:
-    /// - `["a", "b"]` → true (exact match)
-    /// - `["a", "b", "c"]` → true (descendant)
-    /// - `["a"]` → false (ancestor, not descendant)
-    /// - `["a", "x"]` → false (divergent path)
+    /// - `["a", "b"]` -> true (exact match)
+    /// - `["a", "b", "c"]` -> true (descendant)
+    /// - `["a"]` -> false (ancestor, not descendant)
+    /// - `["a", "x"]` -> false (divergent path)
     #[internal_api]
     pub(crate) fn contains_prefix_of(&self, path: &[String]) -> bool {
         let mut node = self;
@@ -111,21 +142,21 @@ mod tests {
         let columns = [ColumnName::new(["a", "b"])];
         let trie = ColumnTrie::from_columns(&columns);
 
-        // Exact match: path = ["a", "b"] → include
+        // Exact match: path = ["a", "b"] -> include
         assert!(trie.contains_prefix_of(&["a".to_string(), "b".to_string()]));
 
-        // Descendant of specified: path = ["a", "b", "c"] → include
+        // Descendant of specified: path = ["a", "b", "c"] -> include
         assert!(trie.contains_prefix_of(&["a".to_string(), "b".to_string(), "c".to_string()]));
 
-        // Ancestor of specified: path = ["a"] → NOT include
+        // Ancestor of specified: path = ["a"] -> NOT include
         assert!(!trie.contains_prefix_of(&["a".to_string()]));
 
-        // Unrelated paths → NOT include
+        // Unrelated paths -> NOT include
         assert!(!trie.contains_prefix_of(&["a".to_string(), "c".to_string()]));
         assert!(!trie.contains_prefix_of(&["x".to_string(), "y".to_string()]));
 
         // Non-existent nested path: trie has ["a", "b", "c", "d"], path = ["a", "b"]
-        // User asked for a.b.c.d but a.b is a leaf → NOT include
+        // User asked for a.b.c.d but a.b is a leaf -> NOT include
         let deep_columns = [ColumnName::new(["a", "b", "c", "d"])];
         let deep_trie = ColumnTrie::from_columns(&deep_columns);
         assert!(!deep_trie.contains_prefix_of(&["a".to_string(), "b".to_string()]));
@@ -150,5 +181,27 @@ mod tests {
         assert!(!multi_trie.contains_prefix_of(&["x".to_string(), "y".to_string()])); // ancestor
         assert!(!multi_trie.contains_prefix_of(&["a".to_string(), "c".to_string()]));
         // divergent
+    }
+
+    #[test]
+    fn test_is_terminal() {
+        let columns = [ColumnName::new(["a", "b"]), ColumnName::new(["x"])];
+        let trie = ColumnTrie::from_columns(&columns);
+
+        // Exact terminal match
+        assert!(trie.is_terminal(&["a".to_string(), "b".to_string()]));
+        assert!(trie.is_terminal(&["x".to_string()]));
+
+        // Non-terminal ancestor
+        assert!(!trie.is_terminal(&["a".to_string()]));
+
+        // Descendant past terminal
+        assert!(!trie.is_terminal(&["a".to_string(), "b".to_string(), "c".to_string()]));
+
+        // Path not in trie
+        assert!(!trie.is_terminal(&["z".to_string()]));
+
+        // Empty path (root is never terminal)
+        assert!(!trie.is_terminal(&[]));
     }
 }

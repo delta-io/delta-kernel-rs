@@ -39,9 +39,9 @@ use crate::transforms::{map_owned_children_or_else, map_owned_or_else, map_owned
 /// * Binary (two children) - If either child was filtered out, filter out the parent. If at least
 ///   one child changed, build a new parent around them. Otherwise, return the parent unchanged.
 ///
-/// * Variadic (0+ children) - If no children remain (all filtered out), filter out the
-///   parent. Otherwise, if at least one child changed or was filtered out, build a new parent around
-///   the children. Otherwise, return the parent unchanged.
+/// * Variadic (0+ children) - If no children remain (all filtered out), filter out the parent.
+///   Otherwise, if at least one child changed or was filtered out, build a new parent around the
+///   children. Otherwise, return the parent unchanged.
 ///
 /// Implementations can call these as needed but will generally not need to override them.
 pub trait ExpressionTransform<'a> {
@@ -537,6 +537,8 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
@@ -550,7 +552,6 @@ mod tests {
     };
     use crate::schema::{DataType, StructField, StructType};
     use crate::DeltaResult;
-    use std::sync::Arc;
 
     #[derive(Debug, PartialEq)]
     struct OpaqueTestOp(String);
@@ -766,7 +767,7 @@ mod tests {
                 match value {
                     Scalar::Integer(1) => None,                 // Remove literal 1
                     Scalar::String(s) if s == "remove" => None, // Remove "remove" string
-                    Scalar::Integer(n) => Some(Cow::Owned(Scalar::Integer(n * 2))), // Double other integers
+                    Scalar::Integer(n) => Some(Cow::Owned(Scalar::Integer(n * 2))), /* Double other integers */
                     _ => Some(Cow::Borrowed(value)), // Keep others unchanged
                 }
             }

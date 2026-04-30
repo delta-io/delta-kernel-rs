@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
+use itertools::Itertools;
 use tempfile::{tempdir, NamedTempFile};
+use test_utils::delta_path_for_version;
 use url::Url;
 
 use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
@@ -25,9 +27,6 @@ use crate::schema::{
     StructField, StructType,
 };
 use crate::{DeltaResult, Engine, EngineData, FileMeta, JsonHandler, ParquetHandler};
-use itertools::Itertools;
-
-use test_utils::delta_path_for_version;
 
 // ---------------------------------------------------------------------------
 // Shared file-setup helpers

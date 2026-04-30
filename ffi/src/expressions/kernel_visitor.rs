@@ -347,7 +347,8 @@ pub extern "C" fn visit_expression_literal_timestamp(
     wrap_expression(state, Expression::literal(Scalar::Timestamp(value)))
 }
 
-/// visit a timestamp_ntz literal expression 'value' (i64 representing microseconds since unix epoch)
+/// visit a timestamp_ntz literal expression 'value' (i64 representing microseconds since unix
+/// epoch)
 #[no_mangle]
 pub extern "C" fn visit_expression_literal_timestamp_ntz(
     state: &mut KernelExpressionVisitorState,
@@ -691,10 +692,11 @@ fn visit_engine_predicate_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::*;
     use delta_kernel::expressions::{Expression, Scalar};
     use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use rstest::rstest;
+
+    use super::*;
 
     // ============================================================================
     // NullTypeTag::from_data_type

@@ -99,7 +99,8 @@ pub(crate) struct RowTrackingVisitor {
 
 impl RowTrackingVisitor {
     pub(crate) fn new(row_id_high_water_mark: Option<i64>, num_batches: Option<usize>) -> Self {
-        // A table might not have a row ID high water mark yet, so we model the input as an Option<i64>
+        // A table might not have a row ID high water mark yet, so we model the input as an
+        // Option<i64>
         Self {
             row_id_high_water_mark: row_id_high_water_mark
                 .unwrap_or(RowTrackingDomainMetadata::MISSING_ROW_ID_HIGH_WATERMARK),

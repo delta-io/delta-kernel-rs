@@ -3,6 +3,10 @@
 //! and parquet row group filtering. The evaluation is normally performed over [`Scalar`] values,
 //! but data skipping "evaluation" actually produces a transformed predicate that replaces column
 //! references with stats column references, which log replay will instruct the engine to evaluate.
+use std::cmp::Ordering;
+
+use tracing::{debug, warn};
+
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, ColumnName,
     Expression as Expr, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
@@ -10,9 +14,6 @@ use crate::expressions::{
     UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
-
-use std::cmp::Ordering;
-use tracing::{debug, warn};
 
 pub(crate) mod parquet_stats_skipping;
 
@@ -26,7 +27,8 @@ mod tests;
 // below with generic lifetimes allows `&'r DynFoo<'a>` (again with `'a: 'r`). Unfortunately,
 // generic lifetimes cannot be hidden, so we end up with `&DynFoo<'_>` at every use site.
 
-/// A predicate evaluator that directly evaluates predicates, resolving column references to scalar values.
+/// A predicate evaluator that directly evaluates predicates, resolving column references to scalar
+/// values.
 pub type DirectPredicateEvaluator<'a> = dyn KernelPredicateEvaluator<Output = bool> + 'a;
 
 /// A data skipping predicate evaluator that directly applies data skipping, resolving column
@@ -188,7 +190,8 @@ pub trait KernelPredicateEvaluator {
         }
     }
 
-    /// Dispatches a (possibly inverted) unary expression to each operator's specific implementation.
+    /// Dispatches a (possibly inverted) unary expression to each operator's specific
+    /// implementation.
     fn eval_pred_unary(
         &self,
         op: UnaryPredicateOp,
@@ -256,7 +259,8 @@ pub trait KernelPredicateEvaluator {
         None // TODO?
     }
 
-    /// Dispatches a (possibly inverted) binary expression to each operator's specific implementation.
+    /// Dispatches a (possibly inverted) binary expression to each operator's specific
+    /// implementation.
     ///
     /// NOTE: Only binary operators that produce boolean outputs are supported.
     fn eval_pred_binary(
@@ -434,7 +438,8 @@ pub trait KernelPredicateEvaluator {
         use Pred::*;
         match pred {
             Junction(JunctionPredicate { op, preds }) => {
-                // Recursively invoke `eval_pred_sql_where` instead of the usual `eval_pred` for AND/OR.
+                // Recursively invoke `eval_pred_sql_where` instead of the usual `eval_pred` for
+                // AND/OR.
                 let mut preds = preds
                     .iter()
                     .map(|pred| self.eval_pred_sql_where(pred, inverted));
@@ -480,7 +485,6 @@ pub trait KernelPredicateEvaluator {
             // = AND(TRUE, FALSE, TRUE)
             // = FALSE
             // ```
-            //
             _ => self.eval_pred(pred, inverted),
         }
     }
@@ -497,8 +501,8 @@ pub trait KernelPredicateEvaluator {
     }
 }
 
-/// A collection of provided methods from the [`KernelPredicateEvaluator`] trait, factored out to allow
-/// reuse by multiple bool-output predicate evaluator implementations.
+/// A collection of provided methods from the [`KernelPredicateEvaluator`] trait, factored out to
+/// allow reuse by multiple bool-output predicate evaluator implementations.
 pub struct KernelPredicateEvaluatorDefaults;
 impl KernelPredicateEvaluatorDefaults {
     /// Directly evaluates a boolean scalar. See [`KernelPredicateEvaluator::eval_pred_scalar`].
@@ -533,7 +537,8 @@ impl KernelPredicateEvaluatorDefaults {
         Some(matched != inverted)
     }
 
-    /// Directly evaluates a boolean comparison. See [`KernelPredicateEvaluator::eval_pred_binary_scalars`].
+    /// Directly evaluates a boolean comparison. See
+    /// [`KernelPredicateEvaluator::eval_pred_binary_scalars`].
     pub fn eval_pred_binary_scalars(
         op: BinaryPredicateOp,
         left: &Scalar,
@@ -832,7 +837,8 @@ pub trait DataSkippingPredicateEvaluator {
     ) -> Option<Self::Output>;
 
     /// Performs a partial comparison against a column min-stat. See
-    /// [`KernelPredicateEvaluatorDefaults::partial_cmp_scalars`] for details of the comparison semantics.
+    /// [`KernelPredicateEvaluatorDefaults::partial_cmp_scalars`] for details of the comparison
+    /// semantics.
     fn partial_cmp_min_stat(
         &self,
         col: &ColumnName,
@@ -845,7 +851,8 @@ pub trait DataSkippingPredicateEvaluator {
     }
 
     /// Performs a partial comparison against a column max-stat. See
-    /// [`KernelPredicateEvaluatorDefaults::partial_cmp_scalars`] for details of the comparison semantics.
+    /// [`KernelPredicateEvaluatorDefaults::partial_cmp_scalars`] for details of the comparison
+    /// semantics.
     fn partial_cmp_max_stat(
         &self,
         col: &ColumnName,

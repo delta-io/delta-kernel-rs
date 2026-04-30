@@ -1,7 +1,8 @@
 //! Utility functions for loading workload specifications
 
-use crate::models::{Spec, TableInfo, Workload};
 use std::path::{Path, PathBuf};
+
+use crate::models::{Spec, TableInfo, Workload};
 
 // Environment variable used to filter benchmarks by tag (e.g. `BENCH_TAGS=base,feature_x`).
 pub const BENCH_TAGS_ENV_VAR: &str = "BENCH_TAGS";
@@ -51,8 +52,9 @@ fn get_required_tags() -> Option<Vec<String>> {
         .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
 }
 
-/// Returns all subdirectories of `base_dir`. In practice this is called with `base_dir` = `OUTPUT_FOLDER`/`BENCHMARKS_DIR_NAME`,
-/// Each subdirectory returned represents a table to be benchmarked and contains the table itself, specs, and table info
+/// Returns all subdirectories of `base_dir`. In practice this is called with `base_dir` =
+/// `OUTPUT_FOLDER`/`BENCHMARKS_DIR_NAME`, Each subdirectory returned represents a table to be
+/// benchmarked and contains the table itself, specs, and table info
 fn find_table_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let entries = std::fs::read_dir(base_dir)
         .map_err(|e| format!("Cannot read directory {}: {}", base_dir.display(), e))?;
@@ -76,8 +78,9 @@ fn find_table_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::
 /// Reads table info from `TABLE_INFO_FILE_NAME` at the root of `table_dir`,
 /// then loads each JSON spec from `table_dir`/`SPECS_DIR_NAME`.
 ///
-/// If `required_tags` is `None`, all tables are included (no tables will be skipped in this function)
-/// Otherwise, a specific table is included (not skipped by this function) if any of its tags appear in `required_tags` (uses union semantics)
+/// If `required_tags` is `None`, all tables are included (no tables will be skipped in this
+/// function) Otherwise, a specific table is included (not skipped by this function) if any of its
+/// tags appear in `required_tags` (uses union semantics)
 fn load_specs_from_table(
     table_dir: &Path,
     required_tags: Option<&[String]>,
@@ -175,7 +178,8 @@ mod tests {
 
     #[test]
     fn test_get_required_tags() {
-        // These cases must run sequentially b/c env vars conflict when these tests are separate (as they run in parallel)
+        // These cases must run sequentially b/c env vars conflict when these tests are separate (as
+        // they run in parallel)
         std::env::remove_var(BENCH_TAGS_ENV_VAR);
         assert!(get_required_tags().is_none());
 

@@ -1,17 +1,16 @@
 //! FFI functions to allow engines to receive log and tracing events from kernel
 
-use std::sync::LazyLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::{fmt, io};
 
 use delta_kernel::{DeltaResult, Error};
-use tracing::{error, warn};
-use tracing::{
-    field::{Field as TracingField, Visit},
-    Event as TracingEvent, Subscriber,
-};
+use tracing::field::{Field as TracingField, Visit};
+use tracing::{error, warn, Event as TracingEvent, Subscriber};
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::{filter::LevelFilter, layer::Context, registry::LookupSpan, Layer};
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::Layer;
 
 use crate::{kernel_string_slice, KernelStringSlice};
 
@@ -70,15 +69,16 @@ pub struct Event {
     target: KernelStringSlice,
     /// source file line number where the event occurred, or 0 (zero) if unknown
     line: u32,
-    /// file where the event occurred. If unknown the slice `ptr` will be null and the len will be 0
+    /// file where the event occurred. If unknown the slice `ptr` will be null and the len will be
+    /// 0
     file: KernelStringSlice,
 }
 
 pub type TracingEventFn = extern "C" fn(event: Event);
 
 /// Enable getting called back for tracing (logging) events in the kernel. `max_level` specifies
-/// that only events `<=` to the specified level should be reported.  More verbose Levels are "greater
-/// than" less verbose ones. So Level::ERROR is the lowest, and Level::TRACE the highest.
+/// that only events `<=` to the specified level should be reported.  More verbose Levels are
+/// "greater than" less verbose ones. So Level::ERROR is the lowest, and Level::TRACE the highest.
 ///
 /// Note that setting up such a call back can only be done ONCE. Calling any of
 /// `enable_event_tracing`, `enable_log_line_tracing`, or `enable_formatted_log_line_tracing` more
@@ -128,7 +128,8 @@ pub enum LogLineFormat {
     /// structured logs are consumed as JSON by analysis and viewing tools. The JSON output is not
     /// optimized for human readability.
     /// Example:
-    /// `{"timestamp":"2022-02-15T18:47:10.821315Z","level":"INFO","fields":{"message":"preparing to shave yaks","number_of_yaks":3},"target":"fmt_json"}`
+    /// `{"timestamp":"2022-02-15T18:47:10.821315Z","level":"INFO","fields":{"message":"preparing
+    /// to shave yaks","number_of_yaks":3},"target":"fmt_json"}`
     JSON,
 }
 
@@ -380,7 +381,8 @@ fn create_event_dispatch(
     tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>,
     Arc<Mutex<TracingEventFn>>,
 ) {
-    use tracing_subscriber::{layer::SubscriberExt, registry::Registry};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::registry::Registry;
 
     let callback_arc = Arc::new(Mutex::new(callback));
     let (filter_layer, reload_handle) =
@@ -485,7 +487,8 @@ fn create_log_line_dispatch(
     tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>,
     Arc<Mutex<TracingLogLineFn>>,
 ) {
-    use tracing_subscriber::{layer::SubscriberExt, registry::Registry};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::registry::Registry;
 
     let buffer = Arc::new(Mutex::new(vec![]));
     let writer = BufferedMessageWriter {
@@ -561,14 +564,11 @@ fn setup_log_line_subscriber(
 mod tests {
     use std::sync::LazyLock;
 
-    use tracing::debug;
-    use tracing::info;
-    use tracing::trace;
+    use tracing::{debug, info, trace};
     use tracing_subscriber::fmt::time::FormatTime;
 
-    use crate::TryFromStringSlice;
-
     use super::*;
+    use crate::TryFromStringSlice;
 
     // Because we have to access a global messages buffer, we have to force tests to run one at a
     // time
@@ -590,7 +590,8 @@ mod tests {
         }
     }
 
-    // Note: record callbacks must be extern "C". Thus we cannot construct test callback closures in runtime.
+    // Note: record callbacks must be extern "C". Thus we cannot construct test callback closures in
+    // runtime.
     extern "C" fn record_callback_with_filter_1(line: KernelStringSlice) {
         record_callback_with_filter(line, vec!["Testing 1\n", "Another line\n"])
     }
@@ -852,7 +853,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // We cannot run this test if test_enable_log_line_tracing was run before - see comment there, however this test works if run individually.
+    #[ignore] // We cannot run this test if test_enable_log_line_tracing was run before - see comment there,
+              // however this test works if run individually.
     fn test_enable_event_tracing() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_events();
