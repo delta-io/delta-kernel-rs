@@ -25,10 +25,10 @@ use crate::schema::{
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    assign_column_mapping_metadata, get_any_level_column_physical_name,
-    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
-    EnablementCheck, FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
-    SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    assign_column_mapping_metadata, find_max_column_id_in_schema,
+    get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
+    schema_contains_timestamp_ntz, ColumnMappingMode, EnablementCheck, FeatureType, TableFeature,
+    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
@@ -535,8 +535,11 @@ fn maybe_apply_column_mapping_for_table_create(
                 &mut validated.writer_features,
             );
 
-            // Transform schema: assign IDs and physical names to all fields
-            let mut max_id = 0i64;
+            // Transform schema: preserve any pre-populated CM annotations, fill in any
+            // missing pieces, and assign fresh metadata to bare fields. Seed `max_id` from
+            // the schema's existing max so newly assigned IDs cannot collide with preserved
+            // ones (matches delta-spark's `assignColumnIdAndPhysicalName`).
+            let mut max_id = find_max_column_id_in_schema(schema).unwrap_or(0);
             let transformed_schema = assign_column_mapping_metadata(schema, &mut max_id)?;
 
             // Add maxColumnId to properties
