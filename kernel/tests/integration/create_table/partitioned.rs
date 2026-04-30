@@ -2,6 +2,8 @@
 //!
 //! TODO(#2201): Add end-to-end tests for insert + scan + checkpoint on partitioned tables.
 
+use std::sync::Arc;
+
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
@@ -22,7 +24,7 @@ fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> DeltaResu
 
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_data_layout(DataLayout::partitioned([partition_col]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -64,7 +66,7 @@ fn test_create_table_with_materialize_partition_columns_partitioned_and_not(
         builder = builder.with_data_layout(DataLayout::partitioned(["date"]));
     }
     let _ = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;

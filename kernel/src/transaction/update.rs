@@ -225,7 +225,7 @@ impl Transaction {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let mut txn = snapshot.clone().transaction(Arc::new(FileSystemCommitter::new()))?
+    /// let mut txn = snapshot.clone().transaction(Arc::new(FileSystemCommitter::new()), engine)?
     ///     .with_operation("UPDATE".to_string());
     ///
     /// let scan = snapshot.scan_builder().build()?;
