@@ -679,7 +679,7 @@ fn verify_and_checkpoint(
     let sorted = read_sorted(snapshot, engine.clone())?;
     assert_fn(&sorted);
 
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
     let reloaded = Snapshot::builder_for(snapshot.table_root()).build(engine.as_ref())?;
     let sorted = read_sorted(&reloaded, engine)?;
     assert_fn(&sorted);

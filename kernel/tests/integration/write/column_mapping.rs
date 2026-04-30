@@ -107,7 +107,7 @@ async fn test_column_mapping_write(
 
     // Step 3: Checkpoint and verify add.stats uses correct column names
     let snapshot_for_checkpoint = latest_snapshot.clone();
-    snapshot_for_checkpoint.checkpoint(engine.as_ref())?;
+    snapshot_for_checkpoint.checkpoint(engine.as_ref(), None)?;
     let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let add_actions = read_add_infos(&ckpt_snapshot, engine.as_ref())?;
     let mut all_stats: Vec<_> = add_actions

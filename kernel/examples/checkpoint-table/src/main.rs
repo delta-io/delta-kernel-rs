@@ -75,7 +75,7 @@ async fn try_main() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
     if cli.unsafe_i_know_what_im_doing {
-        snapshot.checkpoint(&engine)?;
+        snapshot.checkpoint(&engine, None)?;
         println!("Table checkpointed");
     } else {
         // first we create a checkpoint writer
