@@ -8,33 +8,53 @@
 ### 🏗️ Breaking changes
 
 1. Add delta.parquet.format.version table property ([#2369])
-   - Adds `parquet_format_version: Option<String>` field to `TableProperties`. Callers using exhaustive struct construction must add `parquet_format_version: None`.
+   - Adds `parquet_format_version: Option<String>` field to `TableProperties`. Callers using
+     exhaustive struct construction must add `parquet_format_version: None`.
 2. Robust partitioned-write APIs ([#2356])
-   - Replaces the old `WriteContext` API with partition-aware variants: use `txn.partitioned_write_context(partition_values)` or `txn.unpartitioned_write_context()`. Partition values are now passed as `Map<String, Scalar>` (kernel handles serialization per the Delta spec) instead of `Map<String, String>`.
+   - Replaces the old `WriteContext` API with partition-aware variants: use
+     `txn.partitioned_write_context(partition_values)` or `txn.unpartitioned_write_context()`.
+     Partition values are now passed as `Map<String, Scalar>` (kernel handles serialization per
+     the Delta spec) instead of `Map<String, String>`.
 3. Add typed null literal support to FFI expression visitors ([#2375])
-   - FFI `visit_expression_literal_null` and `visit_literal_null` now accept `type_tag` (plus `precision`/`scale` for decimal). FFI engines must provide type information when emitting null literals; see the new `NullTypeTag` enum for the contract.
+   - FFI `visit_expression_literal_null` and `visit_literal_null` now accept `type_tag` (plus
+     `precision`/`scale` for decimal). FFI engines must provide type information when emitting
+     null literals; see the new `NullTypeTag` enum for the contract.
 4. Change get_create_table_builder to accept EngineSchema visitor ([#2378])
-   - FFI `get_create_table_builder` now takes `&EngineSchema` instead of `Handle<SharedSchema>`. FFI callers must encode the schema via `visit_field_*` downcalls (matching the `scan_builder_with_schema` pattern) instead of going through `schema_from_json`.
-5. Revert add WriteContext::partition_group_key ([#2403])
-   - Reverts `WriteContext::partition_group_key` introduced earlier in this release line. Connectors should partition data themselves (e.g. via Arrow's `partition` kernel + serialized partition values as the group key) before constructing one `WriteContext` per partition group.
-6. Transform stats parsed for remove actions ([#2061])
-   - Adds `fn has_field(&self, name: &ColumnName) -> bool` to the `EngineData` trait. Custom `EngineData` implementors must add this method.
-7. Add PathMode to control relative vs absolute paths in Delta log ([#2360])
-   - Default write behavior changed: kernel now writes **relative** paths in `add.path` (e.g. `abc.parquet`) instead of absolute URLs (e.g. `s3://bucket/table/abc.parquet`), matching Delta Spark. `DefaultParquetHandler::write_parquet_file` signature changed from `(path, data, partition_values, stats_columns)` to `(data, &WriteContext)`.
-8. Add tests for histograms and expose stats and histogram ([#2373])
-   - Exposes `stats` and `histogram` accessors on file metadata for connector use. Most callers gain new getters.
-9. Remove PathMode, always write relative paths ([#2410])
-   - Removes the `PathMode` enum, `Transaction::with_path_mode()`, and FFI `set_path_mode` / `create_table_set_path_mode`.
-10. Separate read state from effective state in Transaction ([#2385])
-    - Internal `Transaction` refactor: splits the held snapshot into `read_snapshot_opt: Option<SnapshotRef>` (pre-commit state) and `effective_table_config: TableConfiguration` (state this commit will produce).
-11. Make scan_table_changes_next return *mut ArrowFFIData ([#2430])
-    - FFI `scan_table_changes_next` now returns `*mut ArrowFFIData` instead of `ExternResult<ArrowFFIData>`. FFI consumers must switch from value-style access (`res.ok`) to pointer-style access and call the new `free_arrow_ffi_data` on non-null results.
-12. Update `CheckpointWriter::finalize` to accept `LastCheckpointHintStats` ([#2400])
-    - `CheckpointWriter::finalize` now takes a `LastCheckpointHintStats` struct instead of `(FileMeta, ActionReconciliationIteratorState)`. Construct the new struct to correctly populate `_last_checkpoint` (including `sizeInBytes` and `size`) for V2 checkpoints with sidecars.
-13. Replace existing metrics reporting with tracing ([#1822])
-    - Removes the `MetricsReporter` trait and the metrics-reporter slot from `Engine`. Connectors register a `tracing-subscriber` layer instead. Migrate any custom `MetricsReporter` implementations to a `tracing::Layer`.
-14. Add CheckpointRowGroupFilter for checkpoint data skipping ([#1893])
-    - `ParquetStatsProvider::get_parquet_rowcount_stat` return type changed from `i64` to `Option<i64>`. Engines implementing `ParquetStatsProvider` must wrap their existing return in `Some(num_rows)`.
+   - FFI `get_create_table_builder` now takes `&EngineSchema` instead of `Handle<SharedSchema>`.
+     FFI callers must encode the schema via `visit_field_*` downcalls (matching the
+     `scan_builder_with_schema` pattern) instead of going through `schema_from_json`.
+5. Transform stats parsed for remove actions ([#2061])
+   - Adds `fn has_field(&self, name: &ColumnName) -> bool` to the `EngineData` trait. Custom
+     `EngineData` implementors must add this method.
+6. Default to writing relative paths in `add.path` ([#2410])
+   - Kernel now writes **relative** paths in `add.path` (e.g. `abc.parquet`) instead of absolute
+     URLs (e.g. `s3://bucket/table/abc.parquet`), matching Delta Spark.
+     `DefaultParquetHandler::write_parquet_file` signature changed from
+     `(path, data, partition_values, stats_columns)` to `(data, &WriteContext)`.
+7. Add tests for histograms and expose stats and histogram ([#2373])
+   - Exposes `stats` and `histogram` accessors on file metadata for connector use. Most callers
+     gain new getters.
+8. Separate read state from effective state in Transaction ([#2385])
+   - Internal `Transaction` refactor: splits the held snapshot into
+     `read_snapshot_opt: Option<SnapshotRef>` (pre-commit state) and
+     `effective_table_config: TableConfiguration` (state this commit will produce).
+9. Make scan_table_changes_next return *mut ArrowFFIData ([#2430])
+   - FFI `scan_table_changes_next` now returns `*mut ArrowFFIData` instead of
+     `ExternResult<ArrowFFIData>`. FFI consumers must switch from value-style access (`res.ok`)
+     to pointer-style access and call the new `free_arrow_ffi_data` on non-null results.
+10. Update `CheckpointWriter::finalize` to accept `LastCheckpointHintStats` ([#2400])
+    - `CheckpointWriter::finalize` now takes a `LastCheckpointHintStats` struct instead of
+      `(FileMeta, ActionReconciliationIteratorState)`. Construct the new struct to correctly
+      populate `_last_checkpoint` (including `sizeInBytes` and `size`) for V2 checkpoints with
+      sidecars.
+11. Replace existing metrics reporting with tracing ([#1822])
+    - Removes the `MetricsReporter` trait and the metrics-reporter slot from `Engine`. Connectors
+      register a `tracing-subscriber` layer instead. Migrate any custom `MetricsReporter`
+      implementations to a `tracing::Layer`.
+12. Add CheckpointRowGroupFilter for checkpoint data skipping ([#1893])
+    - `ParquetStatsProvider::get_parquet_rowcount_stat` return type changed from `i64` to
+      `Option<i64>`. Engines implementing `ParquetStatsProvider` must wrap their existing return
+      in `Some(num_rows)`.
 
 ### 🚀 Features / new APIs
 
@@ -42,18 +62,17 @@
 2. Add`extract_primitive_scalar` utility for Arrow-to-Scalar conversion ([#2368])
 3. `ParquetHandler` supports auto-creates when directory not exist ([#2287])
 4. Add schema validation for CREATE TABLE ([#2309])
-5. Add WriteContext::partition_group_key ([#2392])
-6. Add row tracking support for create table ([#2317])
-7. *(tests)* Add read-path integration tests for row tracking ([#2316])
-8. Add Arrow batch-mode scan metadata FFI ([#2395])
-9. Reject non-null columns in CREATE TABLE unconditionally ([#2404])
-10. Auto-enable invariants writer feature for non-null columns in CREATE TABLE ([#2418])
-11. Add ffi examples for cdf, create-table, write-table ([#2431])
-12. Add high level api for timestamp conversion ([#900])
-13. Collect nullCount statistics for array, map, and variant columns ([#2442])
-14. Add AlterTable framework with add_column support ([#2387])
-15. Add set_nullable support for ALTER TABLE ([#2388])
-16. Allow materializePartitionColumns feature signal in CREATE TABLE ([#2481])
+5. Add row tracking support for create table ([#2317])
+6. *(tests)* Add read-path integration tests for row tracking ([#2316])
+7. Add Arrow batch-mode scan metadata FFI ([#2395])
+8. Reject non-null columns in CREATE TABLE unconditionally ([#2404])
+9. Auto-enable invariants writer feature for non-null columns in CREATE TABLE ([#2418])
+10. Add ffi examples for cdf, create-table, write-table ([#2431])
+11. Add high level api for timestamp conversion ([#900])
+12. Collect nullCount statistics for array, map, and variant columns ([#2442])
+13. Add AlterTable framework with add_column support ([#2387])
+14. Add set_nullable support for ALTER TABLE ([#2388])
+15. Allow materializePartitionColumns feature signal in CREATE TABLE ([#2481])
 
 ### 🐛 Bug Fixes
 
@@ -101,6 +120,8 @@
 1. Don't generate unused Arrow schema. ([#2107])
 2. Validate ascii only in PR body via CI job ([#2405])
 3. Skip invalid handle code tests for coverage ([#2414])
+4. PathMode ([#2360], [#2410]) and `WriteContext::partition_group_key` ([#2392], [#2403]) were
+   added and reverted within this release. No net user-visible change.
 
 
 [#2369]: https://github.com/delta-io/delta-kernel-rs/pull/2369
