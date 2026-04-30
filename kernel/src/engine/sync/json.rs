@@ -5,7 +5,7 @@ use bytes::Bytes;
 use tempfile::NamedTempFile;
 use url::Url;
 
-use super::{read_files, read_files_from_store};
+use super::read_files;
 use crate::arrow::json::ReaderBuilder;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
@@ -34,21 +34,6 @@ impl SyncJsonHandler {
 }
 
 fn try_create_from_json(
-    file: std::fs::File,
-    schema: SchemaRef,
-    _predicate: Option<PredicateRef>,
-    file_location: String,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    let json_schema = Arc::new(json_arrow_schema(&schema)?);
-    let reorder_indices = build_json_reorder_indices(&schema)?;
-    let json = ReaderBuilder::new(json_schema)
-        .with_coerce_primitive(true)
-        .build(BufReader::new(file))?
-        .map(move |data| fixup_json_read(data?, &reorder_indices, &file_location));
-    Ok(json)
-}
-
-fn try_create_from_json_bytes(
     data: Bytes,
     schema: SchemaRef,
     _predicate: Option<PredicateRef>,
@@ -70,16 +55,13 @@ impl JsonHandler for SyncJsonHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        if let Some(store) = &self.store {
-            return read_files_from_store(
-                files,
-                schema,
-                predicate,
-                store.clone(),
-                try_create_from_json_bytes,
-            );
-        }
-        read_files(files, schema, predicate, try_create_from_json)
+        read_files(
+            self.store.as_ref(),
+            files,
+            schema,
+            predicate,
+            try_create_from_json,
+        )
     }
 
     fn parse_json(
@@ -108,14 +90,14 @@ impl JsonHandler for SyncJsonHandler {
                     ..Default::default()
                 }
             };
-            super::block_on_async(store.put_opts(&object_path, buf.into(), opts)).map_err(|e| {
-                match e {
+            futures::executor::block_on(store.put_opts(&object_path, buf.into(), opts)).map_err(
+                |e| match e {
                     crate::object_store::Error::AlreadyExists { .. } => {
                         Error::FileAlreadyExists(path.to_string())
                     }
                     other => Error::generic(other.to_string()),
-                }
-            })?;
+                },
+            )?;
             return Ok(());
         }
 

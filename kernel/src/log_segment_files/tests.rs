@@ -9,8 +9,7 @@ use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
-use crate::Engine as _;
-use crate::FileMeta;
+use crate::{Engine as _, FileMeta};
 
 // size markers used to identify commit sources in tests
 const FILESYSTEM_SIZE_MARKER: u64 = 10;

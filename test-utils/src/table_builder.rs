@@ -1106,19 +1106,29 @@ macro_rules! build_snapshot {
 
 /// Build a table, engine, and snapshot from rstest parameters in one call.
 ///
-/// Expands at the call site so `Snapshot` and `DefaultEngineBuilder` resolve to the
-/// caller's crate types. Returns `(engine, snapshot, table)`.
+/// Expands at the call site so `Snapshot` and the engine type resolve to the caller's crate
+/// types. Returns `(engine, snapshot, table)`.
 ///
-/// Requires `Snapshot` and `DefaultEngineBuilder` to be in scope at the call site.
+/// The 3-argument form defaults to `DefaultEngine` and requires `DefaultEngineBuilder` to be in
+/// scope at the call site. The 4-argument form takes an explicit engine factory closure
+/// `Fn(Arc<DynObjectStore>) -> Engine`, useful when the caller cannot construct a
+/// `DefaultEngine` (e.g. kernel-internal unit tests that depend only on `SyncEngine`).
 ///
 /// ```ignore
 /// let (engine, snap, table) = test_context!(log_state, feature_set, version_target);
+/// let (engine, snap, table) = test_context!(log_state, feature_set, version_target,
+///     |store| SyncEngine::new_with_store(store));
 /// ```
 #[macro_export]
 macro_rules! test_context {
-    ($log_state:expr, $feature_set:expr, $version_target:expr) => {{
+    ($log_state:expr, $feature_set:expr, $version_target:expr) => {
+        $crate::test_context!($log_state, $feature_set, $version_target, |store| {
+            DefaultEngineBuilder::new(store).build()
+        })
+    };
+    ($log_state:expr, $feature_set:expr, $version_target:expr, $engine_factory:expr) => {{
         let table = $crate::table_builder::test_table($log_state, $feature_set);
-        let engine = DefaultEngineBuilder::new(table.store().clone()).build();
+        let engine = ($engine_factory)(table.store().clone());
         let snap = $crate::build_snapshot!($version_target, table.table_root(), &engine);
         (engine, snap, table)
     }};

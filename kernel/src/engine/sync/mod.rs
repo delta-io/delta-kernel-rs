@@ -3,8 +3,15 @@
 //! Supports both local filesystem and [`ObjectStore`]-backed reads. Use [`SyncEngine::new`] for
 //! local-only access, or [`SyncEngine::new_with_store`] to read from any [`ObjectStore`]
 //! implementation (e.g. `InMemory`).
+//!
+//! Async work in `ObjectStore` calls is driven via [`futures::executor::block_on`], which is
+//! sufficient for stores that do not require a tokio reactor (e.g. `LocalFileSystem`,
+//! `InMemory`). Cloud-backed stores are NOT supported here -- they would deadlock because
+//! `block_on` parks the calling thread with no reactor to wake it. That's acceptable for this
+//! test-only engine; production code should use [`DefaultEngine`] instead.
+//!
+//! [`DefaultEngine`]: crate::engine::default::DefaultEngine
 
-use std::fs::File;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -45,7 +52,8 @@ impl SyncEngine {
     }
 
     /// Create a SyncEngine backed by an [`ObjectStore`]. All I/O is performed synchronously
-    /// via [`block_on_async`].
+    /// via [`futures::executor::block_on`]. See module docs for the deadlock caveat on
+    /// reactor-dependent stores.
     pub(crate) fn new_with_store(store: Arc<DynObjectStore>) -> Self {
         SyncEngine {
             storage_handler: Arc::new(storage::SyncStorageHandler::with_store(store.clone())),
@@ -74,87 +82,50 @@ impl Engine for SyncEngine {
     }
 }
 
-/// Run an async future to completion on the current thread.
-pub(super) fn block_on_async<F: std::future::Future>(f: F) -> F::Output {
-    futures::executor::block_on(f)
-}
-
-/// Fetch the contents of a file from an [`ObjectStore`] synchronously.
-pub(super) fn get_bytes_from_store(
-    store: &DynObjectStore,
+/// Fetch the contents of a file synchronously, either from an [`ObjectStore`] when present or
+/// from the local filesystem otherwise.
+pub(super) fn get_bytes(
+    store: Option<&Arc<DynObjectStore>>,
     location: &url::Url,
 ) -> DeltaResult<Bytes> {
-    let path = crate::object_store::path::Path::from(location.path());
-    let get_result = block_on_async(store.get(&path))?;
-    let bytes = block_on_async(get_result.bytes())?;
-    Ok(bytes)
-}
-
-fn read_files<F, I>(
-    files: &[FileMeta],
-    schema: SchemaRef,
-    predicate: Option<PredicateRef>,
-    mut try_create_from_file: F,
-) -> DeltaResult<FileDataReadResultIterator>
-where
-    I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
-    F: FnMut(File, SchemaRef, Option<PredicateRef>, String) -> DeltaResult<I> + Send + 'static,
-{
-    debug!("Reading files: {files:#?} with schema {schema:#?} and predicate {predicate:#?}");
-    if files.is_empty() {
-        return Ok(Box::new(std::iter::empty()));
+    if let Some(store) = store {
+        let path = crate::object_store::path::Path::from(location.path());
+        let get_result = futures::executor::block_on(store.get(&path))?;
+        let bytes = futures::executor::block_on(get_result.bytes())?;
+        return Ok(bytes);
     }
-    let files = files.to_vec();
-    let result = files
-        .into_iter()
-        .map(move |file| {
-            let location_string = file.location.to_string();
-            let location = file.location;
-            debug!("Reading {location:#?} with schema {schema:#?} and predicate {predicate:#?}");
-            let path = location
-                .to_file_path()
-                .map_err(|_| Error::generic("can only read local files"))?;
-            try_create_from_file(
-                File::open(path)?,
-                schema.clone(),
-                predicate.clone(),
-                location_string,
-            )
-        })
-        .flatten_ok()
-        .map(|data| Ok(Box::new(ArrowEngineData::new(data??.into())) as _));
-    Ok(Box::new(result))
+    let path = location
+        .to_file_path()
+        .map_err(|_| Error::generic("can only read local files"))?;
+    Ok(std::fs::read(path)?.into())
 }
 
-/// Like [`read_files`] but fetches file contents from an [`ObjectStore`] as [`Bytes`].
-fn read_files_from_store<F, I>(
+/// Read each file as bytes (from store or local FS) and feed it to `try_create_from_bytes` to
+/// produce data batches. Consolidates the dispatch so callers don't have to branch on the
+/// presence of an [`ObjectStore`].
+fn read_files<F, I>(
+    store: Option<&Arc<DynObjectStore>>,
     files: &[FileMeta],
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
-    store: Arc<DynObjectStore>,
     mut try_create_from_bytes: F,
 ) -> DeltaResult<FileDataReadResultIterator>
 where
     I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
     F: FnMut(Bytes, SchemaRef, Option<PredicateRef>, String) -> DeltaResult<I> + Send + 'static,
 {
-    debug!(
-        "Reading files from store: {files:#?} with schema {schema:#?} and predicate {predicate:#?}"
-    );
+    debug!("Reading files: {files:#?} with schema {schema:#?} and predicate {predicate:#?}");
     if files.is_empty() {
         return Ok(Box::new(std::iter::empty()));
     }
     let files = files.to_vec();
+    let store = store.cloned();
     let result = files
         .into_iter()
         .map(move |file| {
             let location_string = file.location.to_string();
-            debug!(
-                "Reading {:#?} from store with schema {schema:#?} and predicate {predicate:#?}",
-                file.location
-            );
-            let data = get_bytes_from_store(&store, &file.location)?;
-            try_create_from_bytes(data, schema.clone(), predicate.clone(), location_string)
+            let bytes = get_bytes(store.as_ref(), &file.location)?;
+            try_create_from_bytes(bytes, schema.clone(), predicate.clone(), location_string)
         })
         .flatten_ok()
         .map(|data| Ok(Box::new(ArrowEngineData::new(data??.into())) as _));
