@@ -413,15 +413,16 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 // Spec: <https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-compat-v3.md>
 //
 // TODO: Implement the write-side requirements for IcebergCompatV3.
-// Note: unlike V1/V2, V3 intentionally permits DeletionVectors per the RFC -- no
-// `NotEnabled(DeletionVectors)` requirement is needed.
 static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
         FeatureRequirement::Enabled(TableFeature::RowTracking),
-        // V1/V2 may remain in `writerFeatures` (supported) as long as they are not active --
+        // Unlike V1/V2, V3 intentionally permits DeletionVectors per the RFC. No
+        // `NotEnabled(DeletionVectors)` requirement is needed.
+        //
+        // V1/V2 may remain in `writerFeatures` (supported) as long as they are not active,
         // hence `NotEnabled` rather than `NotSupported`.
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV2),
