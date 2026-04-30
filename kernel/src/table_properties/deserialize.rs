@@ -71,6 +71,7 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         ENABLE_TYPE_WIDENING => props.enable_type_widening = Some(parse_bool(v)?),
         ENABLE_ICEBERG_COMPAT_V1 => props.enable_iceberg_compat_v1 = Some(parse_bool(v)?),
         ENABLE_ICEBERG_COMPAT_V2 => props.enable_iceberg_compat_v2 = Some(parse_bool(v)?),
+        ENABLE_ICEBERG_COMPAT_V3 => props.enable_iceberg_compat_v3 = Some(parse_bool(v)?),
         ISOLATION_LEVEL => props.isolation_level = IsolationLevel::try_from(v).ok(),
         LOG_RETENTION_DURATION => props.log_retention_duration = Some(parse_interval(v)?),
         ENABLE_EXPIRED_LOG_CLEANUP => props.enable_expired_log_cleanup = Some(parse_bool(v)?),

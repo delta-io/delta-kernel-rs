@@ -164,8 +164,8 @@ is the source of truth. Key concepts:
 
 - Writer: `appendOnly`, `invariants`, `checkConstraints`, `generatedColumns`,
   `allowColumnDefaults`, `changeDataFeed`, `identityColumns`, `rowTracking`,
-  `domainMetadata`, `icebergCompatV1`, `icebergCompatV2`, `clustering`,
-  `inCommitTimestamp`
+  `domainMetadata`, `icebergCompatV1`, `icebergCompatV2`, `icebergCompatV3`,
+  `clustering`, `inCommitTimestamp`
 - Reader + writer: `catalogManaged`, `catalogOwned-preview`, `columnMapping`,
   `deletionVectors`, `timestampNtz`, `v2Checkpoint`, `vacuumProtocolCheck`,
   `variantType`, `variantType-preview`, `typeWidening`
