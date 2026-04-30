@@ -164,10 +164,7 @@ pub(crate) mod last_checkpoint_hint;
 
 pub(crate) mod log_segment_files;
 
-#[cfg(feature = "internal-api")]
 pub mod history_manager;
-#[cfg(not(feature = "internal-api"))]
-pub(crate) mod history_manager;
 
 #[cfg(feature = "internal-api")]
 pub mod parallel;
@@ -184,7 +181,6 @@ pub use error::{DeltaResult, Error};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
-pub use metrics::MetricsReporter;
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 
@@ -923,14 +919,6 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
-
-    /// Get the connector provided [`MetricsReporter`] for metrics collection.
-    ///
-    /// Returns an optional reporter that will receive metric events from Delta operations.
-    /// The default implementation returns None (no metrics reporting).
-    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
-        None
-    }
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared

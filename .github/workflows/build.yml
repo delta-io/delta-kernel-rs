@@ -272,6 +272,33 @@ jobs:
           cmake ..
           make
           make test
+      - name: build and run create-table test
+        run: |
+          pushd ffi/examples/create-table
+          mkdir build
+          pushd build
+          cmake ..
+          make
+          make test
+      # NOTE: write-table's ctest seeds its target table by invoking the create-table
+      # binary, so create-table must be built first (its build/ dir is preserved by the
+      # preceding step and write-table's CMakeLists references it via a relative path).
+      - name: build and run write-table test
+        run: |
+          pushd ffi/examples/write-table
+          mkdir build
+          pushd build
+          cmake ..
+          make
+          make test
+      - name: build and run read-table-changes test
+        run: |
+          pushd ffi/examples/read-table-changes
+          mkdir build
+          pushd build
+          cmake ..
+          make
+          make test
   miri:
     name: "Miri (shard ${{ matrix.partition }}/3)"
     runs-on: ubuntu-latest

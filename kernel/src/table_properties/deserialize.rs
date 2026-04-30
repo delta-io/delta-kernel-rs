@@ -54,6 +54,9 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
             props.checkpoint_write_stats_as_struct = Some(parse_bool(v)?)
         }
         COLUMN_MAPPING_MODE => props.column_mapping_mode = ColumnMappingMode::try_from(v).ok(),
+        COLUMN_MAPPING_MAX_COLUMN_ID => {
+            props.column_mapping_max_column_id = Some(parse_non_negative(v)?)
+        }
         DATA_SKIPPING_NUM_INDEXED_COLS => {
             props.data_skipping_num_indexed_cols = DataSkippingNumIndexedCols::try_from(v).ok()
         }

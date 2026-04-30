@@ -258,7 +258,13 @@
 [#2116]: https://github.com/delta-io/delta-kernel-rs/pull/2116
 [#2349]: https://github.com/delta-io/delta-kernel-rs/pull/2349
 [#2336]: https://github.com/delta-io/delta-kernel-rs/pull/2336
-
+[#2077]: https://github.com/delta-io/delta-kernel-rs/pull/2077                                                                                               
+[#2111]: https://github.com/delta-io/delta-kernel-rs/pull/2111                                                                                                 
+[#2065]: https://github.com/delta-io/delta-kernel-rs/pull/2065                                                                                               
+[#2025]: https://github.com/delta-io/delta-kernel-rs/pull/2025                                                                                               
+[#1996]: https://github.com/delta-io/delta-kernel-rs/pull/1996
+[#1717]: https://github.com/delta-io/delta-kernel-rs/pull/1717
+[#1922]: https://github.com/delta-io/delta-kernel-rs/pull/1922
 
 ## [v0.20.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.20.0/) (2026-02-26)
 

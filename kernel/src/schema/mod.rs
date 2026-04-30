@@ -334,6 +334,37 @@ impl StructField {
         self.metadata.get(key.as_ref())
     }
 
+    /// Returns this field's `delta.columnMapping.id` annotation if present and well-formed.
+    /// Returns `None` if the annotation is missing or carries a non-numeric value.
+    pub fn column_mapping_id(&self) -> Option<i64> {
+        match self.get_config_value(&ColumnMetadataKey::ColumnMappingId)? {
+            MetadataValue::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Recursively collects every `delta.columnMapping.id` reachable from this field --
+    /// the field's own ID plus any nested struct fields under Struct/Array/Map/Variant.
+    /// Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn collect_column_mapping_ids(&self) -> Vec<i64> {
+        struct CollectIds(Vec<i64>);
+        impl<'a> SchemaTransform<'a> for CollectIds {
+            fn transform_struct_field(
+                &mut self,
+                field: &'a StructField,
+            ) -> Option<Cow<'a, StructField>> {
+                if let Some(id) = field.column_mapping_id() {
+                    self.0.push(id);
+                }
+                self.recurse_into_struct_field(field)
+            }
+        }
+        let mut visitor = CollectIds(Vec::new());
+        visitor.transform_struct_field(self);
+        visitor.0
+    }
+
     /// Get the physical name for this field as it should be read from parquet.
     ///
     /// When `column_mapping_mode` is `None`, always returns the logical name (even if physical
@@ -446,7 +477,7 @@ impl StructField {
         MakePhysical::new(column_mapping_mode).run_field(self)
     }
 
-    fn has_invariants(&self) -> bool {
+    pub(crate) fn has_invariants(&self) -> bool {
         self.metadata
             .contains_key(ColumnMetadataKey::Invariants.as_ref())
     }
@@ -815,6 +846,56 @@ impl StructType {
         self,
     ) -> impl ExactSizeIterator<Item = StructField> + DoubleEndedIterator + FusedIterator {
         self.fields.into_values()
+    }
+
+    /// Gets a mutable reference to the underlying field map.
+    pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, StructField> {
+        &mut self.fields
+    }
+
+    /// Walk a pre-segmented column path through this schema and return the leaf field.
+    ///
+    /// `path` is the path's individual name segments (one per nesting level), already split by
+    /// the caller. Lookup at each level is case-insensitive. The Delta protocol uses `.` as the
+    /// dotted-path separator at the API surface, but `field_at_path` itself does not split --
+    /// callers typically pass [`ColumnName::path()`](crate::expressions::ColumnName::path),
+    /// which yields the segments directly.
+    ///
+    /// Panics if any segment is missing or an intermediate field is not a struct. Intended for
+    /// use in test assertions.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Schema:
+    /// //   id:      INTEGER  not null
+    /// //   address: STRUCT { city: STRING not null, zip: STRING }
+    /// let path = vec!["address".to_string(), "city".to_string()];
+    /// let city = schema.field_at_path(&path);
+    /// assert_eq!(city.name(), "city");
+    /// assert!(!city.is_nullable());
+    /// ```
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::panic, clippy::expect_used)]
+    pub fn field_at_path<'a>(&'a self, path: &[String]) -> &'a StructField {
+        fn find_ci<'a>(
+            mut fields: impl Iterator<Item = &'a StructField>,
+            name: &str,
+        ) -> &'a StructField {
+            let lowered = name.to_lowercase();
+            fields
+                .find(|f| f.name().to_lowercase() == lowered)
+                .unwrap_or_else(|| panic!("field '{name}' not found"))
+        }
+        let (first, rest) = path.split_first().expect("non-empty path");
+        let mut field = find_ci(self.fields(), first);
+        for seg in rest {
+            let DataType::Struct(s) = field.data_type() else {
+                panic!("expected struct at intermediate segment '{seg}'");
+            };
+            field = find_ci(s.fields(), seg);
+        }
+        field
     }
 
     /// Gets all the field names in this struct type in the order they are defined.
@@ -1289,6 +1370,40 @@ pub(crate) fn schema_has_invariants(schema: &Schema) -> bool {
     let mut checker = InvariantChecker(false);
     let _ = checker.transform_struct(schema);
     checker.0
+}
+
+/// Visitor that reports whether any non-null (`nullable: false`) field exists in a schema.
+/// Walks the full schema tree including nested struct, array element, and map value structs.
+struct NonNullFieldChecker {
+    found: bool,
+}
+
+impl<'a> SchemaTransform<'a> for NonNullFieldChecker {
+    /// Skip recursion into variant internals. The `metadata` and `value` fields inside a
+    /// `Variant` are protocol-defined, always non-null, and not user-controlled, so they
+    /// must not be treated as user-declared non-null columns.
+    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+        Some(Cow::Borrowed(stype))
+    }
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        if !field.is_nullable() {
+            self.found = true;
+        } else if !self.found {
+            let _ = self.recurse_into_struct_field(field);
+        }
+        Some(Cow::Borrowed(field))
+    }
+}
+
+/// Checks if any user-controlled column in the schema (including nested columns) is declared
+/// non-null (`nullable: false`).
+///
+/// Skips `Variant` internal struct fields, which are protocol-defined and always non-null.
+pub(crate) fn schema_contains_non_null_fields(schema: &Schema) -> bool {
+    let mut checker = NonNullFieldChecker { found: false };
+    let _ = checker.transform_struct(schema);
+    checker.found
 }
 
 /// Normalizes column name field names to match the casing in the schema.
@@ -2731,6 +2846,70 @@ mod tests {
             map_field,
         ]);
         assert!(schema_has_invariants(&schema));
+    }
+
+    fn all_nullable_schema() -> StructType {
+        StructType::new_unchecked([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+        ])
+    }
+
+    fn top_level_non_null_schema() -> StructType {
+        StructType::new_unchecked([
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable("name", DataType::STRING),
+        ])
+    }
+
+    fn nested_non_null_schema() -> StructType {
+        let nested_field = StructField::nullable(
+            "parent",
+            DataType::try_struct_type([StructField::not_null("child", DataType::INTEGER)]).unwrap(),
+        );
+        StructType::new_unchecked([StructField::nullable("a", DataType::STRING), nested_field])
+    }
+
+    fn array_non_null_schema() -> StructType {
+        let array_field = StructField::nullable(
+            "arr",
+            ArrayType::new(
+                DataType::try_struct_type([StructField::not_null("child", DataType::INTEGER)])
+                    .unwrap(),
+                true,
+            ),
+        );
+        StructType::new_unchecked([array_field])
+    }
+
+    fn map_non_null_schema() -> StructType {
+        let map_field = StructField::nullable(
+            "map",
+            MapType::new(
+                DataType::STRING,
+                DataType::try_struct_type([StructField::not_null("child", DataType::INTEGER)])
+                    .unwrap(),
+                true,
+            ),
+        );
+        StructType::new_unchecked([map_field])
+    }
+
+    fn variant_only_schema() -> StructType {
+        // Variant internal fields (metadata, value) are protocol-defined non-null but
+        // must NOT be counted as user-controlled non-null fields.
+        StructType::new_unchecked([StructField::nullable("v", DataType::unshredded_variant())])
+    }
+
+    #[rstest]
+    #[case::all_nullable(all_nullable_schema(), false)]
+    #[case::top_level(top_level_non_null_schema(), true)]
+    #[case::nested_struct(nested_non_null_schema(), true)]
+    #[case::array_element(array_non_null_schema(), true)]
+    #[case::map_value(map_non_null_schema(), true)]
+    #[case::variant_skipped(variant_only_schema(), false)]
+    fn test_schema_contains_non_null_fields(#[case] schema: StructType, #[case] expected: bool) {
+        assert_eq!(schema_contains_non_null_fields(&schema), expected);
     }
 
     #[test]
