@@ -5,8 +5,9 @@ pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
 pub(crate) use column_mapping::{
     assign_column_mapping_metadata, column_mapping_mode, find_max_column_id_in_schema,
-    get_column_mapping_mode_from_properties, get_field_column_mapping_info,
-    physical_to_logical_column_name, try_assign_flat_column_mapping_info,
+    get_column_mapping_mode_from_properties, physical_to_logical_column_name,
+    try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
+    validate_column_mapping_id, SeenColumnMappingAnnotations,
 };
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
