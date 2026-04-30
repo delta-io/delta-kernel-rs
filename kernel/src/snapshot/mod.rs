@@ -3251,7 +3251,7 @@ mod tests {
         Snapshot::builder_for(table_root)
             .at_version(1)
             .build(ctx.engine.as_ref())?
-            .checkpoint(ctx.engine.as_ref())?;
+            .checkpoint(ctx.engine.as_ref(), None)?;
 
         // Incremental update. The pruned replay on commits > 3 is empty. With the stale-
         // CRC skip, the replay returns (None, None) and `TableConfiguration::try_new_from`
@@ -3466,7 +3466,7 @@ mod tests {
         Snapshot::builder_for(table_root)
             .at_version(0)
             .build(ctx.engine.as_ref())?
-            .checkpoint(ctx.engine.as_ref())?;
+            .checkpoint(ctx.engine.as_ref(), None)?;
 
         // Build snapshot at v3: has checkpoint@v0, protocol (2, 5) from commit 2.
         let snapshot_v3 = Snapshot::builder_for(table_root)
@@ -3493,7 +3493,7 @@ mod tests {
         Snapshot::builder_for(table_root)
             .at_version(1)
             .build(ctx.engine.as_ref())?
-            .checkpoint(ctx.engine.as_ref())?;
+            .checkpoint(ctx.engine.as_ref(), None)?;
 
         // Commit 4: add file (new state beyond existing_snapshot_version=3).
         commit(table_root, &ctx.store, 4, vec![add_action("file4.parquet")]).await;
