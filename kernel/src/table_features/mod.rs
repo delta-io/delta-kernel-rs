@@ -572,7 +572,12 @@ static GEOSPATIAL_TYPE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    kernel_support: KernelSupport::Supported,
+    kernel_support: KernelSupport::Custom(|_, _, op| match op {
+        Operation::Scan | Operation::Cdf => Ok(()),
+        Operation::Write => Err(Error::unsupported(
+            "Feature 'geospatial' is not supported for writes",
+        )),
+    }),
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
