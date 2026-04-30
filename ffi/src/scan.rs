@@ -466,6 +466,15 @@ pub struct Stats {
 pub struct CDvInfo<'a> {
     info: &'a DvInfo,
     has_vector: bool,
+    /// Number of rows logically removed from the data file by this Deletion Vector. The value is
+    /// the `cardinality` field of the DV descriptor as written by the producing writer (kernel
+    /// does not reconcile it against the physical DV bytes). Meaningful only when `has_vector`
+    /// is `true`; `0` otherwise. Per the protocol, when a DV is present `cardinality` is always
+    /// available, so this field never observes the "DV present but cardinality missing" case.
+    /// Note that combining this with [`Stats::num_records`] to compute the logical row count
+    /// (`num_records - cardinality`) is only sound when the file's stats are tight against the
+    /// data file.
+    cardinality: i64,
 }
 
 /// This callback will be invoked for each valid file that needs to be read for a scan.
@@ -655,6 +664,7 @@ fn rust_callback(context: &mut ContextWrapper, scan_file: ScanFile) {
     let cdv_info = CDvInfo {
         info: &scan_file.dv_info,
         has_vector: scan_file.dv_info.has_vector(),
+        cardinality: scan_file.dv_info.cardinality().unwrap_or(0),
     };
     let path = scan_file.path.as_str();
     (context.callback)(
