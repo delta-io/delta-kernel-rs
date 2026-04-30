@@ -1,12 +1,13 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
+use futures::StreamExt as _;
 use itertools::Itertools;
 use url::Url;
 
-use super::block_on_async;
-use crate::object_store::{path::Path, DynObjectStore, ObjectStoreExt as _};
+use crate::object_store::path::Path;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
-
-use std::sync::Arc;
 
 pub(crate) struct SyncStorageHandler {
     store: Option<Arc<DynObjectStore>>,
@@ -62,7 +63,7 @@ impl StorageHandler for SyncStorageHandler {
     }
 }
 
-// -- ObjectStore-backed implementations --
+// === ObjectStore-backed implementations ===
 
 fn list_from_store(
     store: &DynObjectStore,
@@ -71,8 +72,9 @@ fn list_from_store(
     let path = Path::from(url_path.path());
     let url_is_directory = url_path.path().ends_with('/');
 
-    // If the URL represents a directory, list it directly. Otherwise extract the parent
-    // directory and use the filename as a lower bound filter (matching local behavior).
+    // If the URL is a directory, list everything underneath. Otherwise treat the final segment as
+    // a lower-bound filename and list its parent. We use recursive `list` (not
+    // `list_with_delimiter`) to match the local implementation, which walks into subdirectories.
     let (list_prefix, filter_path) = if url_is_directory {
         (path, None)
     } else {
@@ -83,17 +85,17 @@ fn list_from_store(
         (parent, Some(path.to_string()))
     };
 
-    let list_result = block_on_async(store.list_with_delimiter(Some(&list_prefix)))?;
-
-    let mut metas: Vec<_> = list_result
-        .objects
-        .into_iter()
-        .filter(|meta| {
-            filter_path
-                .as_ref()
-                .is_none_or(|fp| meta.location.to_string() > *fp)
-        })
-        .collect();
+    let mut metas: Vec<_> =
+        futures::executor::block_on(store.list(Some(&list_prefix)).collect::<Vec<_>>())
+            .into_iter()
+            .filter_map(|res| match res {
+                Ok(meta) => filter_path
+                    .as_ref()
+                    .is_none_or(|fp| meta.location.to_string() > *fp)
+                    .then_some(Ok(meta)),
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<_, _>>()?;
     metas.sort_by(|a, b| a.location.cmp(&b.location));
 
     let base_url = {
@@ -124,8 +126,8 @@ fn read_files_store(
         .into_iter()
         .map(|(url, _range_opt)| {
             let path = Path::from(url.path());
-            let get_result = block_on_async(store.get(&path))?;
-            let bytes = block_on_async(get_result.bytes())?;
+            let get_result = futures::executor::block_on(store.get(&path))?;
+            let bytes = futures::executor::block_on(get_result.bytes())?;
             Ok(bytes)
         })
         .collect();
@@ -144,18 +146,20 @@ fn put_store(store: &DynObjectStore, path: &Url, data: Bytes, overwrite: bool) -
             ..Default::default()
         }
     };
-    block_on_async(store.put_opts(&object_path, data.into(), opts)).map_err(|e| match e {
-        crate::object_store::Error::AlreadyExists { .. } => {
-            Error::FileAlreadyExists(path.to_string())
+    futures::executor::block_on(store.put_opts(&object_path, data.into(), opts)).map_err(|e| {
+        match e {
+            crate::object_store::Error::AlreadyExists { .. } => {
+                Error::FileAlreadyExists(path.to_string())
+            }
+            other => Error::generic(other.to_string()),
         }
-        other => Error::generic(other.to_string()),
     })?;
     Ok(())
 }
 
 fn head_store(store: &DynObjectStore, url: &Url) -> DeltaResult<FileMeta> {
     let path = Path::from(url.path());
-    let meta = block_on_async(store.head(&path))?;
+    let meta = futures::executor::block_on(store.head(&path))?;
     Ok(FileMeta {
         location: url.clone(),
         last_modified: meta.last_modified.timestamp_millis(),
@@ -163,7 +167,7 @@ fn head_store(store: &DynObjectStore, url: &Url) -> DeltaResult<FileMeta> {
     })
 }
 
-// -- Local filesystem implementations (original behavior) --
+// === Local filesystem implementations (original behavior) ===
 
 fn list_from_local(url_path: &Url) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
     if url_path.scheme() == "file" {
@@ -265,8 +269,10 @@ mod tests {
     use url::Url;
 
     use super::SyncStorageHandler;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::utils::current_time_duration;
-    use crate::StorageHandler;
+    use crate::{Error, StorageHandler};
 
     /// generate json filenames that follow the spec (numbered padded to 20 chars)
     fn get_json_filename(index: usize) -> String {
@@ -357,5 +363,111 @@ mod tests {
         }
         assert_eq!(file_count, 1);
         Ok(())
+    }
+
+    /// `list_from` against an [`ObjectStore`] must walk subdirectories, matching the local FS
+    /// implementation that uses `read_dir` recursively.
+    #[tokio::test]
+    async fn list_from_store_is_recursive() {
+        let store = std::sync::Arc::new(InMemory::new());
+        store
+            .put(
+                &crate::object_store::path::Path::from("a/file1.json"),
+                bytes::Bytes::from("x").into(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &crate::object_store::path::Path::from("a/sub/file2.json"),
+                bytes::Bytes::from("y").into(),
+            )
+            .await
+            .unwrap();
+
+        let storage = SyncStorageHandler::with_store(store);
+        let url = Url::parse("memory:///a/").unwrap();
+        let listed: Vec<_> = storage
+            .list_from(&url)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        let names: Vec<_> = listed
+            .iter()
+            .map(|f| f.location.path().to_string())
+            .collect();
+        assert_eq!(names, vec!["/a/file1.json", "/a/sub/file2.json"]);
+    }
+
+    #[test]
+    fn head_local_returns_metadata() {
+        let storage = SyncStorageHandler::new();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("file.json");
+        std::fs::write(&path, b"hello").unwrap();
+        let url = Url::from_file_path(&path).unwrap();
+
+        let meta = storage.head(&url).unwrap();
+        assert_eq!(meta.location, url);
+        assert_eq!(meta.size, 5);
+    }
+
+    #[test]
+    fn head_local_missing_file_errors() {
+        let storage = SyncStorageHandler::new();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let url = Url::from_file_path(tmp_dir.path().join("missing.json")).unwrap();
+        assert!(matches!(
+            storage.head(&url).unwrap_err(),
+            Error::FileNotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn head_store_returns_metadata() {
+        let store = std::sync::Arc::new(InMemory::new());
+        let path = crate::object_store::path::Path::from("file.json");
+        store
+            .put(&path, bytes::Bytes::from("hello").into())
+            .await
+            .unwrap();
+
+        let storage = SyncStorageHandler::with_store(store);
+        let url = Url::parse("memory:///file.json").unwrap();
+        let meta = storage.head(&url).unwrap();
+        assert_eq!(meta.location, url);
+        assert_eq!(meta.size, 5);
+    }
+
+    #[tokio::test]
+    async fn put_store_creates_and_blocks_overwrite() {
+        let store = std::sync::Arc::new(InMemory::new());
+        let storage = SyncStorageHandler::with_store(store.clone());
+        let url = Url::parse("memory:///file.json").unwrap();
+
+        storage
+            .put(&url, bytes::Bytes::from("first"), false)
+            .unwrap();
+        let path = crate::object_store::path::Path::from("file.json");
+        let bytes = futures::executor::block_on(async {
+            store.get(&path).await.unwrap().bytes().await.unwrap()
+        });
+        assert_eq!(bytes.as_ref(), b"first");
+
+        // Without overwrite, a second put must fail with FileAlreadyExists.
+        let err = storage
+            .put(&url, bytes::Bytes::from("second"), false)
+            .unwrap_err();
+        assert!(matches!(err, Error::FileAlreadyExists(_)));
+
+        // With overwrite, it should succeed.
+        storage
+            .put(&url, bytes::Bytes::from("third"), true)
+            .unwrap();
+        let bytes = futures::executor::block_on(async {
+            store.get(&path).await.unwrap().bytes().await.unwrap()
+        });
+        assert_eq!(bytes.as_ref(), b"third");
     }
 }

@@ -3,6 +3,13 @@
 //!
 //! Contract tests (things any handler implementation must satisfy) call into [`super::tests`].
 //! Internal implementation tests (Arrow-specific behavior) are defined as local helpers here.
+//!
+//! Currently only [`SyncEngine`] handlers are exercised here. [`DefaultEngine`] handlers used to
+//! be tested too; that coverage moves out with the default engine when it is split into its own
+//! crate so the kernel crate does not depend on it for tests.
+//!
+//! [`SyncEngine`]: crate::engine::sync::SyncEngine
+//! [`DefaultEngine`]: crate::engine::default::DefaultEngine
 
 use std::fs::File;
 use std::sync::Arc;

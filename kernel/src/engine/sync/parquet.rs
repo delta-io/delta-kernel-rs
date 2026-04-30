@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use url::Url;
 
-use super::{get_bytes_from_store, read_files, read_files_from_store};
+use super::{get_bytes, read_files};
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
@@ -37,42 +37,6 @@ impl SyncParquetHandler {
 }
 
 fn try_create_from_parquet(
-    file: File,
-    schema: SchemaRef,
-    predicate: Option<PredicateRef>,
-    file_location: String,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
-    let reader_options = reader_options();
-    let metadata = ArrowReaderMetadata::load(&file, reader_options.clone())?;
-    let parquet_schema = metadata.schema();
-    let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, reader_options)?;
-    let (indices, requested_ordering) = get_requested_indices(&schema, parquet_schema)?;
-    if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indices) {
-        builder = builder.with_projection(mask);
-    }
-
-    let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
-        .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
-
-    if let Some(predicate) = predicate {
-        builder = builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut());
-    }
-
-    let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
-    let stream = builder.build()?;
-    Ok(stream.map(move |rbr| {
-        fixup_parquet_read(
-            rbr?,
-            &requested_ordering,
-            row_indexes.as_mut(),
-            Some(&file_location),
-            Some(&arrow_schema),
-        )
-    }))
-}
-
-fn try_create_from_parquet_bytes(
     data: Bytes,
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
@@ -115,16 +79,13 @@ impl ParquetHandler for SyncParquetHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        if let Some(store) = &self.store {
-            return read_files_from_store(
-                files,
-                schema,
-                predicate,
-                store.clone(),
-                try_create_from_parquet_bytes,
-            );
-        }
-        read_files(files, schema, predicate, try_create_from_parquet)
+        read_files(
+            self.store.as_ref(),
+            files,
+            schema,
+            predicate,
+            try_create_from_parquet,
+        )
     }
 
     /// Writes engine data to a Parquet file at the specified location.
@@ -134,8 +95,7 @@ impl ParquetHandler for SyncParquetHandler {
     ///
     /// # Parameters
     ///
-    /// - `location` - The full URL path where the Parquet file should be written
-    ///   (e.g., `file:///path/to/file.parquet`).
+    /// - `location` - The full URL path where the Parquet file should be written (e.g., `file:///path/to/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
     ///
     /// # Returns
@@ -171,7 +131,7 @@ impl ParquetHandler for SyncParquetHandler {
             writer.close()?;
 
             let object_path = crate::object_store::path::Path::from(location.path());
-            super::block_on_async(store.put(&object_path, buf.into()))?;
+            futures::executor::block_on(store.put(&object_path, buf.into()))?;
             return Ok(());
         }
 
@@ -206,21 +166,8 @@ impl ParquetHandler for SyncParquetHandler {
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
-        if let Some(store) = &self.store {
-            let data = get_bytes_from_store(store, &file.location)?;
-            let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
-            let schema = StructType::try_from_arrow(metadata.schema().as_ref())
-                .map(Arc::new)
-                .map_err(Error::Arrow)?;
-            return Ok(ParquetFooter { schema });
-        }
-
-        let path = file
-            .location
-            .to_file_path()
-            .map_err(|_| Error::generic("SyncEngine can only read local files"))?;
-        let file = File::open(path)?;
-        let metadata = ArrowReaderMetadata::load(&file, reader_options())?;
+        let data = get_bytes(self.store.as_ref(), &file.location)?;
+        let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
         let schema = StructType::try_from_arrow(metadata.schema().as_ref())
             .map(Arc::new)
             .map_err(Error::Arrow)?;
@@ -397,5 +344,32 @@ mod tests {
 
         handler.write_parquet_file(url, test_data_iter()).unwrap();
         assert!(file_path.exists());
+    }
+
+    /// Ensures `write_parquet_file` and `read_parquet_footer` work end-to-end with an
+    /// `ObjectStore` backend. The local path is exercised by the other tests in this module.
+    #[test]
+    fn parquet_store_write_and_footer_roundtrip() {
+        let store = Arc::new(crate::object_store::memory::InMemory::new());
+        let handler = SyncParquetHandler::with_store(store);
+        let url = Url::parse("memory:///t/data.parquet").unwrap();
+
+        handler
+            .write_parquet_file(url.clone(), test_data_iter())
+            .unwrap();
+
+        let footer = handler
+            .read_parquet_footer(&FileMeta {
+                location: url,
+                last_modified: 0,
+                size: 0,
+            })
+            .unwrap();
+        let field_names: Vec<_> = footer
+            .schema
+            .fields()
+            .map(|f| f.name().to_string())
+            .collect();
+        assert_eq!(field_names, vec!["id".to_string(), "name".to_string()]);
     }
 }

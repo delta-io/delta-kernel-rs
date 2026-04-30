@@ -1290,7 +1290,7 @@ mod tests {
 
     use rstest::rstest;
     use serde_json::json;
-    use test_utils::table_builder::TestTableBuilder;
+    use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
     use test_utils::{add_commit, delta_path_for_version};
 
     use super::*;
@@ -2510,6 +2510,20 @@ mod tests {
         assert_result_error_with_message(result, "In-Commit Timestamp not found in commit file");
 
         Ok(())
+    }
+
+    // Verifies the test_context! macro works from kernel/src/ unit tests
+    // (crosses the crate type boundary via macro expansion). The kernel can't construct a
+    // DefaultEngine here, so we pass a SyncEngine factory.
+    #[test]
+    fn test_context_macro_works_in_unit_test() {
+        let (_engine, snap, _table) = test_utils::test_context!(
+            LogState::with_commits(3),
+            FeatureSet::empty(),
+            VersionTarget::Latest,
+            SyncEngine::new_with_store
+        );
+        assert_eq!(snap.version(), 2);
     }
 
     #[test]
