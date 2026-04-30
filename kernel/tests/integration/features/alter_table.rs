@@ -7,7 +7,10 @@ use delta_kernel::arrow::array::{Array, Int32Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{column_name, ColumnName, Scalar};
+use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef, StructField,
     StructType,
@@ -18,7 +21,8 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
-    create_table_and_load_snapshot, test_table_setup, test_table_setup_mt, write_batch_to_table,
+    add_commit, create_table_and_load_snapshot, test_table_setup, test_table_setup_mt,
+    write_batch_to_table,
 };
 
 fn simple_schema() -> SchemaRef {
@@ -733,5 +737,40 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_fails(
         msg.contains("column mapping") || msg.contains("columnMapping"),
         "error should mention column mapping, got: {msg}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn std::error::Error>> {
+    let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
+    let engine =
+        Arc::new(DefaultEngineBuilder::<TokioBackgroundExecutor>::new(storage.clone()).build());
+
+    // V0 commit: protocol with V3 + dependent writer features, metadata enabling V3 + column
+    // mapping (V3 requires CM `name`/`id` mode) + row tracking. Single column carries the
+    // column-mapping annotations the metadata loader expects when CM mode is set.
+    // Note: Create table doesn't support IcebergCompatV3 yet, so we hand-craft the commit here.
+    let commit = [
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"CREATE TABLE","operationParameters":{},"isBlindAppend":true}}"#,
+        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["icebergCompatV3","columnMapping","rowTracking","domainMetadata"]}}"#,
+        r#"{"metaData":{"id":"deadbeef-1234-5678-abcd-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-1\"}}]}","partitionColumns":[],"configuration":{"delta.enableIcebergCompatV3":"true","delta.columnMapping.mode":"name","delta.enableRowTracking":"true","delta.rowTracking.materializedRowIdColumnName":"_row_id","delta.rowTracking.materializedRowCommitVersionColumnName":"_row_commit_version","delta.columnMapping.maxColumnId":"1"},"createdTime":1234567890000}}"#,
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 0, commit.to_string()).await?;
+
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+
+    let msg = snapshot
+        .alter_table()
+        .add_column(StructField::nullable("new_col", DataType::STRING))
+        .build(engine.as_ref(), committer())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("ALTER TABLE is not supported on tables with icebergCompatV3 enabled"),
+        "unexpected error: {msg}",
+    );
+
     Ok(())
 }
