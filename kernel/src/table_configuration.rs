@@ -2235,12 +2235,14 @@ mod test {
         vec!["value", "pcol"],
     )]
     #[case::v3_supported_but_property_unset(&[], vec!["value"])]
-    fn test_physical_write_schema_iceberg_compat_v3_materializes_iff_enabled(
+    fn test_physical_write_schema_materializes_pv_when_iceberg_compact_v3_enabled(
         #[case] extra_props: &[(&str, &str)],
         #[case] expected_field_names: Vec<&str>,
     ) {
         // Partitioned schema: one data col + one partition col. No column mapping, so physical
         // names equal logical names.
+        // IcebergCompatV3 requires column mapping. This test bypasses that requirement for
+        // convenience.
         let schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("value", DataType::INTEGER),
             StructField::nullable("pcol", DataType::STRING),
