@@ -91,7 +91,7 @@ async fn add_columns_lifecycle(
         let post = committed
             .post_commit_snapshot()
             .expect("post-commit snapshot");
-        let (_, ckpt) = post.clone().checkpoint(engine.as_ref())?;
+        let (_, ckpt) = post.clone().checkpoint(engine.as_ref(), None)?;
         current = ckpt;
     }
 
@@ -654,7 +654,7 @@ async fn chain_add_column_and_set_nullable(
     let v1_snap = v1
         .post_commit_snapshot()
         .expect("post-commit snapshot at v1");
-    let (_, v1_ckpt) = v1_snap.clone().checkpoint(engine.as_ref())?;
+    let (_, v1_ckpt) = v1_snap.clone().checkpoint(engine.as_ref(), None)?;
     let v2 = v1_ckpt
         .alter_table()
         .add_column(StructField::nullable("age", DataType::INTEGER))
@@ -665,7 +665,7 @@ async fn chain_add_column_and_set_nullable(
     let v2_snap = v2
         .post_commit_snapshot()
         .expect("post-commit snapshot at v2");
-    v2_snap.clone().checkpoint(engine.as_ref())?;
+    v2_snap.clone().checkpoint(engine.as_ref(), None)?;
 
     let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
     let schema = reloaded.schema();
