@@ -33,6 +33,7 @@ use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::Operation;
+use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
     apply_schema_operations, SchemaEvolutionResult, SchemaOperation,
@@ -108,6 +109,9 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// The field must not already exist in the schema (case-insensitive). The field must be
     /// nullable because existing data files do not contain this column and will read NULL for it.
+    /// `field` and any of its nested fields must not carry `delta.columnMapping.id` or
+    /// `delta.columnMapping.physicalName` annotations.
+    ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
         self.operations.push(SchemaOperation::AddColumn { field });
@@ -154,14 +158,26 @@ impl AlterTableTransactionBuilder<Modifying> {
         table_config.ensure_operation_supported(Operation::Write)?;
 
         let schema = Arc::unwrap_or_clone(table_config.logical_schema());
+        let column_mapping_mode = table_config.column_mapping_mode();
+        let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
         let SchemaEvolutionResult {
             schema: evolved_schema,
-        } = apply_schema_operations(schema, self.operations, table_config.column_mapping_mode())?;
+            new_max_column_id,
+        } = apply_schema_operations(
+            schema,
+            self.operations,
+            column_mapping_mode,
+            current_max_column_id,
+        )?;
 
-        let evolved_metadata = table_config
+        let mut evolved_metadata = table_config
             .metadata()
             .clone()
             .with_schema(evolved_schema.clone())?;
+        if let Some(id) = new_max_column_id {
+            evolved_metadata = evolved_metadata
+                .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string());
+        }
 
         // Validates the evolved metadata against the protocol.
         let evolved_table_config = TableConfiguration::try_new_with_schema(

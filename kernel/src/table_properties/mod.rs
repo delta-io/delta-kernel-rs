@@ -100,6 +100,11 @@ pub struct TableProperties {
     /// Parquet columns that use different names.
     pub column_mapping_mode: Option<ColumnMappingMode>,
 
+    /// The largest column-mapping ID assigned in the table schema. ALTER TABLE operations
+    /// that add new column-mapped columns must allocate IDs strictly greater than this value
+    /// and bump the property accordingly.
+    pub column_mapping_max_column_id: Option<i64>,
+
     /// The number of columns for Delta Lake to collect statistics about for data skipping.
     /// A value of -1 means to collect statistics for all columns. Updating this property does
     /// not automatically collect statistics again; instead, it redefines the statistics schema
@@ -443,6 +448,34 @@ mod tests {
     }
 
     #[test]
+    fn column_mapping_max_column_id_invalid_falls_through_to_unknown() {
+        // Non-integer and negative values are invalid; following the established pattern,
+        // they fall through to `unknown_properties` rather than failing the whole parse.
+        for invalid in ["not_a_number", "-5", "1.5"] {
+            let properties = HashMap::from([(
+                COLUMN_MAPPING_MAX_COLUMN_ID.to_string(),
+                invalid.to_string(),
+            )]);
+            let parsed = TableProperties::from(properties.iter());
+            assert_eq!(
+                parsed.column_mapping_max_column_id, None,
+                "input: {invalid}"
+            );
+            assert!(parsed
+                .unknown_properties
+                .contains_key(COLUMN_MAPPING_MAX_COLUMN_ID));
+        }
+    }
+
+    #[test]
+    fn column_mapping_max_column_id_zero_is_valid() {
+        let properties =
+            HashMap::from([(COLUMN_MAPPING_MAX_COLUMN_ID.to_string(), "0".to_string())]);
+        let parsed = TableProperties::from(properties.iter());
+        assert_eq!(parsed.column_mapping_max_column_id, Some(0));
+    }
+
+    #[test]
     fn allow_unknown_keys() {
         let properties = [("unknown_properties".to_string(), "two words".to_string())];
         let actual = TableProperties::from(properties.clone().into_iter());
@@ -471,6 +504,7 @@ mod tests {
             (CHECKPOINT_WRITE_STATS_AS_JSON, "true"),
             (CHECKPOINT_WRITE_STATS_AS_STRUCT, "true"),
             (COLUMN_MAPPING_MODE, "id"),
+            (COLUMN_MAPPING_MAX_COLUMN_ID, "42"),
             (DATA_SKIPPING_NUM_INDEXED_COLS, "-1"),
             (DATA_SKIPPING_STATS_COLUMNS, "col1,col2"),
             (DELETED_FILE_RETENTION_DURATION, "interval 1 second"),
@@ -509,6 +543,7 @@ mod tests {
             checkpoint_write_stats_as_json: Some(true),
             checkpoint_write_stats_as_struct: Some(true),
             column_mapping_mode: Some(ColumnMappingMode::Id),
+            column_mapping_max_column_id: Some(42),
             data_skipping_num_indexed_cols: Some(DataSkippingNumIndexedCols::AllColumns),
             data_skipping_stats_columns: Some(vec![column_name!("col1"), column_name!("col2")]),
             deleted_file_retention_duration: Some(Duration::new(1, 0)),

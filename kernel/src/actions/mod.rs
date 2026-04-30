@@ -360,6 +360,17 @@ impl Metadata {
         })
     }
 
+    /// Returns a new Metadata with a single configuration entry inserted (or replaced),
+    /// preserving all other configuration entries and metadata fields.
+    pub(crate) fn with_configuration_entry(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.configuration.insert(key.into(), value.into());
+        self
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_unchecked(

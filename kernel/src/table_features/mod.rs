@@ -4,8 +4,9 @@ pub(crate) use column_mapping::get_any_level_column_physical_name;
 pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
 pub(crate) use column_mapping::{
-    assign_column_mapping_metadata, column_mapping_mode, get_column_mapping_mode_from_properties,
-    get_field_column_mapping_info, physical_to_logical_column_name,
+    assign_column_mapping_metadata, column_mapping_mode, find_max_column_id_in_schema,
+    get_column_mapping_mode_from_properties, get_field_column_mapping_info,
+    physical_to_logical_column_name, try_assign_field_column_mapping,
 };
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -21,6 +22,7 @@ use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
+
 mod column_mapping;
 mod timestamp_ntz;
 
