@@ -321,7 +321,7 @@ impl Snapshot {
         {
             // We must check checkpoint_version here: if a checkpoint at or below the existing
             // snapshot version was discovered, we still need to fall through to advance the
-            // checkpoint base even though the version did not change (see example 5 below).
+            // checkpoint base even though the version did not change.
             return Ok(existing_snapshot.clone());
         }
 
@@ -329,34 +329,12 @@ impl Snapshot {
         // (Also reached from Case D.2 when a checkpoint at or below the existing snapshot
         // version was discovered.)
         //
-        // All examples start from: existing segment = checkpoint@v0 + commit@v1, v2, v3
-        //                          existing_snapshot_version = v3, listing_start = v1
-        //
-        // The `#[rustfmt::skip]` below attaches to the `retain` statement at the end of the
-        // comment block; it protects the preceding column-aligned examples from being
-        // reflowed by rustfmt's `wrap_comments = true`. Do not remove without also
-        // restructuring the examples to survive a reflow.
+        // The example below illustrates Case D.2 -> F.
         #[rustfmt::skip]
-        // 1. target=v3, no new commits:
-        //    listing:          commit@v1, v2, v3
-        //    new_end_version(v3) == existing_snapshot_version(v3), no new checkpoint
-        //    -> return same snapshot (caught above)
+        // Example: existing segment = checkpoint@v0 + commit@v1, v2, v3
+        //          existing_snapshot_version = v3, listing_start = v1
+        //          target=v4, new checkpoint@v2 written since last build (Case D.2 -> F):
         //
-        // 2. target=v4, one new commit:
-        //    listing:          commit@v1, v2, v3, v4
-        //    after dedup:      drop v1-v3 (already in existing snapshot)
-        //                      -> ascending_commit_files = [commit@v4]
-        //    commit@v4 is replayed for P&M below and merged into the combined log segment.
-        //
-        // 3. target=v6, new checkpoint@v5 written since last build:
-        //    listing:          commit@v1-v4, then checkpoint@v5 + commit@v6
-        //                      (checkpoint flush drops v1-v4; checkpoint@v5 is a complete
-        //                       snapshot through v5, so all earlier commits are not needed)
-        //    new segment:      checkpoint@v5 + commit@v6
-        //    new_checkpoint_version(v5) > existing_snapshot_version(v3) -> full rebuild
-        //    (caught above)
-        //
-        // 4. target=v4, new checkpoint@v2 written since last build:
         //    listing:          commit@v1, then checkpoint@v2 + commit@v3, v4
         //                      (checkpoint flush drops v1)
         //    new segment:      checkpoint@v2 + commit@v3, v4
@@ -365,17 +343,6 @@ impl Snapshot {
         //    commit@v3 is not lost: the existing segment contributes it below
         //    (existing commits above checkpoint@v2 = [commit@v3])
         //    combined segment: checkpoint@v2 + commit@v3 (from existing) + commit@v4 (from new)
-        //    checkpoint@v2 is kept in checkpoint_parts to advance the listing base.
-        //
-        // 5. target=v3, new checkpoint@v2 written since last build, no new commits:
-        //    listing:          commit@v1, then checkpoint@v2 + commit@v3
-        //                      (checkpoint flush drops v1)
-        //    new segment:      checkpoint@v2 + commit@v3
-        //    after dedup:      drop commit@v3 (already in existing snapshot)
-        //                      -> ascending_commit_files = []
-        //    commit@v3 is not lost: the existing segment contributes it below
-        //    (existing commits above checkpoint@v2 = [commit@v3])
-        //    combined segment: checkpoint@v2 + commit@v3 (from existing)
         //    checkpoint@v2 is kept in checkpoint_parts to advance the listing base.
         new_log_segment
             .listed
@@ -428,12 +395,12 @@ impl Snapshot {
         // already covered by it; otherwise keep all existing files.
         let new_checkpoint_version = new_log_segment.checkpoint_version;
         let new_checkpoint_hint = new_log_segment.last_checkpoint_hint_summary();
-        let mut ascending_commit_files = Self::old_files_above_checkpoint(
+        let mut ascending_commit_files = Self::files_after_checkpoint(
             &existing_log_segment.listed.ascending_commit_files,
             new_checkpoint_version,
         );
         ascending_commit_files.extend(new_log_segment.listed.ascending_commit_files);
-        let mut ascending_compaction_files = Self::old_files_above_checkpoint(
+        let mut ascending_compaction_files = Self::files_after_checkpoint(
             &existing_log_segment.listed.ascending_compaction_files,
             new_checkpoint_version,
         );
@@ -1394,7 +1361,7 @@ impl Snapshot {
 
     /// Filters `files` to only those with version above `checkpoint_version`, or clones all if
     /// `checkpoint_version` is `None`.
-    fn old_files_above_checkpoint(
+    fn files_after_checkpoint(
         files: &[ParsedLogPath],
         checkpoint_version: Option<Version>,
     ) -> Vec<ParsedLogPath> {
