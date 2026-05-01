@@ -30,6 +30,12 @@ pub(crate) enum SchemaOperation {
     /// Requires column mapping.
     DropColumn { column: ColumnName },
 
+    /// Rename a column by path. Supports nested columns. Requires column mapping.
+    RenameColumn {
+        column: ColumnName,
+        new_name: String,
+    },
+
     /// Change a column's nullability from NOT NULL to nullable.
     SetNullable { column: ColumnName },
 }
@@ -49,11 +55,14 @@ pub(crate) enum LeafAction {
 // (case-insensitive), then descends into the next nested struct. At the leaf, calls `modifier`
 // and applies its returned [`LeafAction`] in place.
 //
-// `Keep` mutations leave the leaf in place after the modifier ran. `Remove` deletes the leaf
-// entry, preserving the order of remaining siblings.
+// `Keep` mutations include rename: if `modifier` changes `field.name`, the IndexMap key is
+// updated to match (preserving insertion order) and a case-insensitive sibling-conflict check
+// is applied.
+// `Remove` deletes the leaf entry, preserving the order of remaining siblings.
 //
 // Returns an error if a field in the path does not exist, an intermediate field is not a struct,
-// or a `Remove` action would leave the parent struct empty.
+// a `Keep` rename would collide with a sibling, or a `Remove` action would leave the parent
+// struct empty.
 //
 // Example (mutate):
 //   fields  = [ id: int not null, address: struct { city: string not null, zip: string } ]
@@ -104,8 +113,33 @@ fn modify_field_at_path(
     let (_, field) = fields
         .get_index_mut(idx)
         .ok_or_else(|| Error::internal_error("idx from position() invalid"))?;
+    let old_name = field.name().clone();
     match modifier(field)? {
-        LeafAction::Keep => Ok(()),
+        LeafAction::Keep => {
+            let new_name = field.name().clone();
+            if old_name == new_name {
+                return Ok(());
+            }
+            // Rename: validate against siblings (case-insensitive), then re-key the entry while
+            // preserving insertion order via swap_remove + insert + swap_indices (all O(1)).
+            let lowered_new = new_name.to_lowercase();
+            if fields
+                .iter()
+                .enumerate()
+                .any(|(i, (_, f))| i != idx && f.name().to_lowercase() == lowered_new)
+            {
+                return Err(Error::generic(format!(
+                    "Cannot rename '{old_name}' to '{new_name}': \
+                     a column with that name already exists"
+                )));
+            }
+            let (_, old_value) = fields
+                .swap_remove_index(idx)
+                .ok_or_else(|| Error::internal_error("entry vanished between lookup and remove"))?;
+            fields.insert(new_name, old_value);
+            fields.swap_indices(idx, fields.len() - 1);
+            Ok(())
+        }
         LeafAction::Remove => {
             // Reject drops that would leave the parent struct empty
             // Note: Matches Spark behaviour.
@@ -120,6 +154,18 @@ fn modify_field_at_path(
             Ok(())
         }
     }
+}
+
+/// Rejects an operation when column mapping is not enabled. `op_name_uppercase` is used in the
+/// error message so it reads naturally (e.g. "DROP COLUMN requires...").
+fn require_column_mapping(cm_enabled: bool, op_name_uppercase: &str) -> DeltaResult<()> {
+    if !cm_enabled {
+        return Err(Error::generic(format!(
+            "{op_name_uppercase} requires column mapping to be enabled \
+             (delta.columnMapping.mode = 'name' or 'id')"
+        )));
+    }
+    Ok(())
 }
 
 /// Rejects empty paths and columns the table layout locks (partition columns, clustering
@@ -149,7 +195,7 @@ fn reject_layout_locked_column(
             )));
         }
     }
-    // Clustering columns may be nested; dropping an ancestor struct of one is also rejected.
+    // Clustering columns may be nested; modifying an ancestor struct of one is also rejected.
     // Matches Spark.
     if clustering_columns.iter().any(|cc| column.is_prefix_of(cc)) {
         return Err(Error::generic(format!(
@@ -262,12 +308,7 @@ pub(crate) fn apply_schema_operations(
                 })?;
             }
             SchemaOperation::DropColumn { column } => {
-                if !cm_enabled {
-                    return Err(Error::generic(
-                        "DROP COLUMN requires column mapping to be enabled \
-                         (delta.columnMapping.mode = 'name' or 'id')",
-                    ));
-                }
+                require_column_mapping(cm_enabled, "DROP COLUMN")?;
                 reject_layout_locked_column(
                     &column,
                     partition_columns,
@@ -278,6 +319,25 @@ pub(crate) fn apply_schema_operations(
                     Ok(LeafAction::Remove)
                 })
                 .map_err(|e| Error::generic(format!("Cannot drop column '{column}': {e}")))?;
+            }
+            SchemaOperation::RenameColumn { column, new_name } => {
+                require_column_mapping(cm_enabled, "RENAME COLUMN")?;
+                // `new_name` validity (non-empty, valid chars) is enforced by `validate_schema`
+                // at the end of this function via `SchemaValidator::transform_struct_field`.
+                // TODO(#2446): delta-spark supports renaming partition and clustering columns
+                // and rewrites `Metadata.partitionColumns` / clustering domain metadata
+                // accordingly. Until then, we reject via the layout-lock helper.
+                reject_layout_locked_column(
+                    &column,
+                    partition_columns,
+                    clustering_columns,
+                    "rename",
+                )?;
+                modify_field_at_path(schema.field_map_mut(), column.path(), &|f| {
+                    f.name = new_name.clone();
+                    Ok(LeafAction::Keep)
+                })
+                .map_err(|e| Error::generic(format!("Cannot rename column '{column}': {e}")))?;
             }
         }
     }
@@ -1190,5 +1250,355 @@ mod tests {
             }
             other => panic!("Expected Struct, got: {other:?}"),
         }
+    }
+
+    // === apply_schema_operations: RenameColumn tests ===
+
+    #[rstest]
+    #[case::without_cm(
+        simple_schema(), column_name!("name"), "full_name",
+        ColumnMappingMode::None, vec![], vec![], "column mapping"
+    )]
+    #[case::nonexistent(
+        simple_schema(), column_name!("nonexistent"), "new_name",
+        ColumnMappingMode::Name, vec![], vec![], "does not exist"
+    )]
+    #[case::to_existing_top_level(
+        simple_schema(), column_name!("name"), "id",
+        ColumnMappingMode::Name, vec![], vec![], "already exists"
+    )]
+    #[case::empty_name(
+        simple_schema(), column_name!("name"), "",
+        ColumnMappingMode::Name, vec![], vec![], "cannot be empty"
+    )]
+    #[case::newline_in_name(
+        simple_schema(), column_name!("name"), "full\nname",
+        ColumnMappingMode::Name, vec![], vec![], "newline"
+    )]
+    #[case::partition_column(
+        simple_schema(), column_name!("name"), "full_name",
+        ColumnMappingMode::Name, vec!["name".to_string()], vec![], "partition column"
+    )]
+    #[case::partition_column_target_uppercase(
+        simple_schema(), column_name!("NAME"), "full_name",
+        ColumnMappingMode::Name, vec!["name".to_string()], vec![], "partition column"
+    )]
+    #[case::partition_column_stored_uppercase(
+        simple_schema(), column_name!("name"), "full_name",
+        ColumnMappingMode::Name, vec!["NAME".to_string()], vec![], "partition column"
+    )]
+    #[case::clustering_column(
+        simple_schema(), column_name!("name"), "full_name",
+        ColumnMappingMode::Name, vec![], vec![column_name!("name")], "clustering column"
+    )]
+    #[case::clustering_ancestor_target_uppercase(
+        nested_schema(), column_name!("ADDRESS"), "location",
+        ColumnMappingMode::Name, vec![], vec![column_name!("address.city")],
+        "clustering column"
+    )]
+    #[case::clustering_ancestor(
+        nested_schema(), column_name!("address"), "location",
+        ColumnMappingMode::Name, vec![], vec![column_name!("address.city")],
+        "clustering column"
+    )]
+    #[case::nested_sibling_conflict(
+        nested_schema(), column_name!("address.city"), "street",
+        ColumnMappingMode::Name, vec![], vec![], "already exists"
+    )]
+    #[case::case_insensitive_sibling_conflict(
+        simple_schema(), column_name!("name"), "ID",
+        ColumnMappingMode::Name, vec![], vec![], "already exists"
+    )]
+    #[case::empty_path(
+        simple_schema(), ColumnName::new(Vec::<String>::new()), "new",
+        ColumnMappingMode::Name, vec![], vec![], "empty column path"
+    )]
+    #[case::through_non_struct(
+        simple_schema(), column_name!("name.inner"), "new",
+        ColumnMappingMode::Name, vec![], vec![], "not a struct"
+    )]
+    fn rename_fails(
+        #[case] schema: StructType,
+        #[case] column: ColumnName,
+        #[case] new_name: &str,
+        #[case] mode: ColumnMappingMode,
+        #[case] partition: Vec<String>,
+        #[case] clustering: Vec<ColumnName>,
+        #[case] expected_err: &str,
+    ) {
+        let ops = vec![SchemaOperation::RenameColumn {
+            column,
+            new_name: new_name.to_string(),
+        }];
+        let err = apply_schema_operations(schema, ops, mode, Some(10), &partition, &clustering)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(expected_err),
+            "expected error containing '{expected_err}', got: {err}"
+        );
+    }
+
+    #[test]
+    fn rename_column_succeeds() {
+        let schema = simple_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            column: column_name!("name"),
+            new_name: "full_name".to_string(),
+        }];
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(2)).unwrap();
+        assert!(result.schema.field("full_name").is_some());
+        assert!(result.schema.field("name").is_none());
+        assert_eq!(result.schema.fields().count(), 2);
+    }
+
+    #[test]
+    fn rename_nested_column_succeeds() {
+        let schema = nested_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            column: column_name!("address.city"),
+            new_name: "town".to_string(),
+        }];
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(4)).unwrap();
+        let addr = result.schema.field("address").unwrap();
+        match addr.data_type() {
+            DataType::Struct(s) => {
+                assert!(s.field("town").is_some());
+                assert!(s.field("city").is_none());
+                assert_eq!(s.fields().count(), 3); // street, town, zip
+            }
+            other => panic!("Expected Struct, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_case_change_succeeds() {
+        let schema = simple_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            column: column_name!("name"),
+            new_name: "Name".to_string(),
+        }];
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(2)).unwrap();
+        // Asserting on the literal stored name proves the case actually changed -- the
+        // IndexMap key and the StructField.name both round-trip the requested case.
+        let renamed = result.schema.field("Name").expect("renamed column present");
+        assert_eq!(renamed.name(), "Name");
+        assert!(result.schema.field("name").is_none());
+    }
+
+    #[test]
+    fn rename_to_same_name_is_noop() {
+        let schema = simple_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            column: column_name!("name"),
+            new_name: "name".to_string(),
+        }];
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(2)).unwrap();
+        assert!(result.schema.field("name").is_some());
+        assert_eq!(result.schema.fields().count(), 2);
+    }
+
+    /// Rename must preserve the column's `delta.columnMapping.id` and
+    /// `delta.columnMapping.physicalName`. This is the whole point of rename under CM --
+    /// without this invariant, existing Parquet data would be orphaned.
+    #[test]
+    fn rename_preserves_column_mapping_metadata() {
+        let mut name_field = StructField::nullable("name", DataType::STRING);
+        name_field.metadata.insert(
+            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            MetadataValue::Number(2),
+        );
+        name_field.metadata.insert(
+            ColumnMetadataKey::ColumnMappingPhysicalName
+                .as_ref()
+                .to_string(),
+            MetadataValue::String("col-abc".to_string()),
+        );
+        let schema = StructType::try_new(vec![
+            StructField::not_null("id", DataType::INTEGER),
+            name_field,
+        ])
+        .unwrap();
+        let ops = vec![SchemaOperation::RenameColumn {
+            column: column_name!("name"),
+            new_name: "full_name".to_string(),
+        }];
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(2)).unwrap();
+        let renamed = result.schema.field("full_name").unwrap();
+        assert_eq!(
+            renamed.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+            Some(&MetadataValue::Number(2)),
+            "CM id must be preserved"
+        );
+        assert_eq!(
+            renamed.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+            Some(&MetadataValue::String("col-abc".to_string())),
+            "CM physical name must be preserved"
+        );
+    }
+
+    /// Nested rename must preserve CM metadata too (same invariant as top-level).
+    #[test]
+    fn rename_nested_preserves_column_mapping_metadata() {
+        let mut city_field = StructField::nullable("city", DataType::STRING);
+        city_field.metadata.insert(
+            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            MetadataValue::Number(3),
+        );
+        city_field.metadata.insert(
+            ColumnMetadataKey::ColumnMappingPhysicalName
+                .as_ref()
+                .to_string(),
+            MetadataValue::String("col-xyz".to_string()),
+        );
+        let schema = StructType::try_new(vec![
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable("address", StructType::try_new(vec![city_field]).unwrap()),
+        ])
+        .unwrap();
+        let ops = vec![SchemaOperation::RenameColumn {
+            column: column_name!("address.city"),
+            new_name: "town".to_string(),
+        }];
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(3)).unwrap();
+        let addr = result.schema.field("address").unwrap();
+        let DataType::Struct(inner) = addr.data_type() else {
+            panic!("expected struct");
+        };
+        let town = inner.field("town").expect("renamed column present");
+        assert_eq!(
+            town.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+            Some(&MetadataValue::Number(3)),
+        );
+        assert_eq!(
+            town.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+            Some(&MetadataValue::String("col-xyz".to_string())),
+        );
+    }
+
+    /// Rename must NOT bump `maxColumnId` -- it doesn't introduce a column.
+    #[test]
+    fn rename_does_not_bump_max_column_id() {
+        let schema = simple_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            column: column_name!("name"),
+            new_name: "full_name".to_string(),
+        }];
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(5)).unwrap();
+        assert_eq!(
+            result.new_max_column_id, None,
+            "rename must not bump maxColumnId"
+        );
+    }
+
+    /// Renaming a nested leaf must not clobber siblings (parallels
+    /// `modify_nested_leaf_preserves_other_fields`).
+    #[test]
+    fn rename_nested_leaf_preserves_other_fields() {
+        let schema = nested_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            column: column_name!("address.city"),
+            new_name: "town".to_string(),
+        }];
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(4)).unwrap();
+        // Top-level "id" untouched.
+        assert!(result.schema.field("id").is_some());
+        // Siblings of "city" in address struct must still be present.
+        let addr = result.schema.field("address").unwrap();
+        let DataType::Struct(inner) = addr.data_type() else {
+            panic!("expected struct");
+        };
+        assert!(inner.field("street").is_some());
+        assert!(inner.field("zip").is_some());
+    }
+
+    /// Renaming an ancestor struct must preserve every nested field's CM id and physical name.
+    /// This is the recursive case of the "rename preserves CM metadata" invariant.
+    #[test]
+    fn rename_ancestor_struct_preserves_nested_cm_metadata() {
+        let mut city = StructField::nullable("city", DataType::STRING);
+        city.metadata.insert(
+            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            MetadataValue::Number(3),
+        );
+        city.metadata.insert(
+            ColumnMetadataKey::ColumnMappingPhysicalName
+                .as_ref()
+                .to_string(),
+            MetadataValue::String("col-city".to_string()),
+        );
+        let mut zip = StructField::nullable("zip", DataType::STRING);
+        zip.metadata.insert(
+            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            MetadataValue::Number(4),
+        );
+        zip.metadata.insert(
+            ColumnMetadataKey::ColumnMappingPhysicalName
+                .as_ref()
+                .to_string(),
+            MetadataValue::String("col-zip".to_string()),
+        );
+        let schema = StructType::try_new(vec![
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable("address", StructType::try_new(vec![city, zip]).unwrap()),
+        ])
+        .unwrap();
+        let ops = vec![SchemaOperation::RenameColumn {
+            column: column_name!("address"),
+            new_name: "location".to_string(),
+        }];
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(4)).unwrap();
+        let location = result.schema.field("location").expect("renamed struct");
+        let DataType::Struct(inner) = location.data_type() else {
+            panic!("expected struct");
+        };
+        let inner_city = inner.field("city").expect("nested city preserved");
+        assert_eq!(
+            inner_city.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+            Some(&MetadataValue::Number(3)),
+        );
+        assert_eq!(
+            inner_city.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+            Some(&MetadataValue::String("col-city".to_string())),
+        );
+        let inner_zip = inner.field("zip").expect("nested zip preserved");
+        assert_eq!(
+            inner_zip.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+            Some(&MetadataValue::Number(4)),
+        );
+        assert_eq!(
+            inner_zip.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
+            Some(&MetadataValue::String("col-zip".to_string())),
+        );
+    }
+
+    /// Chain `add_column` then `rename_column` in one ALTER. The newly-added column gets a
+    /// fresh CM id and is then renamed to a different logical name in the same pass. This is
+    /// the only chain the type-state allows that involves rename (rename is terminal).
+    #[test]
+    fn chain_add_then_rename_added_column() {
+        let schema = simple_schema();
+        let ops = vec![
+            SchemaOperation::AddColumn {
+                field: StructField::nullable("email", DataType::STRING),
+            },
+            SchemaOperation::RenameColumn {
+                column: column_name!("email"),
+                new_name: "contact_email".to_string(),
+            },
+        ];
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(2)).unwrap();
+        assert!(result.schema.field("contact_email").is_some());
+        assert!(result.schema.field("email").is_none());
+        let added_renamed = result.schema.field("contact_email").unwrap();
+        // The fresh CM id must come from the AddColumn step, not have been wiped by rename.
+        let cm_id = get_cm_id(added_renamed);
+        assert_eq!(cm_id, 3, "added column should get fresh id (max+1)");
+        // Physical name must follow the standard "col-..." pattern from the AddColumn step.
+        assert!(get_physical_name(added_renamed).starts_with("col-"));
+        assert_eq!(
+            result.new_max_column_id,
+            Some(3),
+            "max id advances to cover the added column even though it was renamed"
+        );
     }
 }

@@ -301,9 +301,10 @@ static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
 };
 
 // TODO: Before flipping `kernel_support` to `Supported`, implement the dependent-expression
-// check in `AlterTableTransactionBuilder::build` for drop_column (mirror Spark's
-// SchemaUtils.checkDependentExpressions): reject drops of columns referenced by any CHECK
-// constraint, and remove the corresponding guard in transaction/builder/alter_table.rs.
+// check in `AlterTableTransactionBuilder::build` for drop_column AND rename_column (mirror
+// Spark's SchemaUtils.checkDependentExpressions): reject drops/renames of columns referenced
+// by any CHECK constraint, and remove the corresponding guard in
+// transaction/builder/alter_table.rs.
 static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 3)),
@@ -323,9 +324,9 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
 };
 
 // TODO: Before flipping `kernel_support` to `Supported`, implement the dependent-expression
-// check in `AlterTableTransactionBuilder::build` for drop_column (mirror Spark's
-// SchemaUtils.checkDependentExpressions): reject drops of columns referenced by any
-// generated-column expression, and remove the corresponding guard in
+// check in `AlterTableTransactionBuilder::build` for drop_column AND rename_column (mirror
+// Spark's SchemaUtils.checkDependentExpressions): reject drops/renames of columns referenced
+// by any generated-column expression, and remove the corresponding guard in
 // transaction/builder/alter_table.rs.
 static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
@@ -335,11 +336,10 @@ static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// TODO: Before flipping `kernel_support` to `Supported`, implement the dependent-expression
-// check in `AlterTableTransactionBuilder::build` for drop_column (mirror Spark's
-// SchemaUtils.checkDependentExpressions): reject drops of identity-tagged columns where the
-// dropped column is the identity column itself, and remove the corresponding guard in
-// transaction/builder/alter_table.rs.
+// TODO: Before flipping `kernel_support` to `Supported`, decide on drop/rename behavior for
+// identity-tagged columns and remove the corresponding guard in
+// transaction/builder/alter_table.rs. (Delta-spark does not block drops/renames here -- the
+// per-field identity metadata vanishes with the field.)
 static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 6)),

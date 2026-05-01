@@ -9,12 +9,14 @@
 //!   operation is required).
 //! - [`Modifying`]: After any chainable schema operation. More ops can be chained, and `build()` is
 //!   available. See [`AlterTableTransactionBuilder<Modifying>`] for ops.
+//! - [`Renaming`]: After `rename_column`. Terminal state -- only `build()` is available.
 //!
 //! # Transitions
 //!
 //! Each `impl` block below is gated by a state bound and documents which operations that
 //! state enables. Chainable schema operations live on `impl<S: Chainable>` and transition
-//! the builder to a chainable state; `build()` lives on states that are buildable.
+//! the builder to a chainable state; `build()` lives on states that are buildable
+//! (see [`Buildable`]).
 //!
 //! ```ignore
 //! // Allowed: at least one op queued before build().
@@ -45,9 +47,15 @@ use crate::{DeltaResult, Engine};
 /// See [`Chainable`] for the operations available on this state.
 pub struct Ready;
 
-/// State after at least one operation has been added. `build()` is available.
-/// See [`Chainable`] for the operations available on this state.
+/// State after at least one chainable operation. `build()` is available, more chainable ops
+/// can be queued. See [`Chainable`] for the operations available on this state.
 pub struct Modifying;
+
+/// Terminal state after `rename_column`. Only `build()` is available; no further operations
+/// can be chained. This mirrors delta-spark's per-statement semantics: a single ALTER TABLE
+/// statement that renames a column is not also allowed to add, drop, or set-nullable other
+/// columns.
+pub struct Renaming;
 
 /// Marker trait for builder states that accept chainable schema operations. Grouping states
 /// under one bound lets each op (like `add_column`) live on a single `impl<S: Chainable>`
@@ -58,22 +66,32 @@ pub trait Chainable: sealed::Sealed {}
 impl Chainable for Ready {}
 impl Chainable for Modifying {}
 
+/// Marker trait for builder states that support `build()`. Grouping the post-op states
+/// (`Modifying` and `Renaming`) under one bound lets `build()` live on a single
+/// `impl<S: Buildable>` block -- shared body rather than duplicating per state.
+///
+/// Sealed: external types cannot implement this, keeping the set of buildable states closed.
+pub trait Buildable: sealed::Sealed {}
+impl Buildable for Modifying {}
+impl Buildable for Renaming {}
+
 mod sealed {
     pub trait Sealed {}
     impl Sealed for super::Ready {}
     impl Sealed for super::Modifying {}
+    impl Sealed for super::Renaming {}
 }
 
 /// Builder for constructing an [`AlterTableTransaction`] with schema evolution operations.
 ///
 /// Uses a type-state pattern (`S`) to enforce at compile time:
 /// - At least one schema operation must be queued before `build()` is callable.
-/// - Only operations valid for the current state can be chained. This will disallow incompatibel
+/// - Only operations valid for the current state can be chained. This will disallow incompatible
 ///   chaining.
 pub struct AlterTableTransactionBuilder<S = Ready> {
     snapshot: SnapshotRef,
     operations: Vec<SchemaOperation>,
-    // PhantomData marker for builder state (Ready or Modifying).
+    // PhantomData marker for builder state (Ready, Modifying, or Renaming).
     // Zero-sized; only affects which methods are available at compile time.
     _state: PhantomData<S>,
 }
@@ -150,9 +168,44 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
             .push(SchemaOperation::SetNullable { column });
         self.transition()
     }
+
+    /// Rename a column in the table schema. Supports nested columns via [`ColumnName`] paths.
+    ///
+    /// Requires column mapping to be enabled (mode = name or id). Only the logical name
+    /// changes; the physical name and column ID are preserved, so existing Parquet files
+    /// continue to be readable without rewrites.
+    ///
+    /// Rename is a terminal operation: no further operations can be chained on the same
+    /// builder. This matches delta-spark's per-statement semantics.
+    ///
+    /// Renaming a column to its current name (exact match) is a no-op; a case-only rename
+    /// (e.g. `name` -> `Name`) updates the stored logical name. Both still produce a commit.
+    ///
+    /// # Errors (at build time)
+    ///
+    /// - Column path is empty or the column does not exist in the current schema
+    /// - Column mapping is not enabled on the table
+    /// - `new_name` is empty or contains invalid characters (e.g. newlines)
+    /// - New name conflicts with an existing sibling column (case-insensitive)
+    /// - Column is a partition column, clustering column, or ancestor struct of one
+    /// - An intermediate component of the path is not a struct (e.g. `name.inner` where `name` is a
+    ///   primitive)
+    /// - Table has `delta.dataSkippingStatsColumns` set (kernel doesn't yet rewrite it; #2446)
+    // TODO(#2446): rewrite `delta.dataSkippingStatsColumns` on rename to match delta-spark.
+    pub fn rename_column(
+        mut self,
+        column: ColumnName,
+        new_name: impl Into<String>,
+    ) -> AlterTableTransactionBuilder<Renaming> {
+        self.operations.push(SchemaOperation::RenameColumn {
+            column,
+            new_name: new_name.into(),
+        });
+        self.transition()
+    }
 }
 
-impl AlterTableTransactionBuilder<Modifying> {
+impl<S: Buildable> AlterTableTransactionBuilder<S> {
     /// Validate and apply schema operations, then build the [`AlterTableTransaction`].
     ///
     /// This method:
@@ -180,16 +233,18 @@ impl AlterTableTransactionBuilder<Modifying> {
         // protocol must also re-check this on the evolved `TableConfiguration`.
         table_config.ensure_operation_supported(Operation::Write)?;
 
-        // drop_column does not yet check dependent expressions (Spark's
-        // checkDependentExpressions). Block drops on tables with these features so flipping
-        // any of them to Supported won't silently orphan a generated/CHECK/identity reference.
-        // Also block drops on tables with `delta.dataSkippingStatsColumns` set: drop_column
-        // does not yet rewrite that property to remove the dropped column.
-        if self
-            .operations
-            .iter()
-            .any(|op| matches!(op, SchemaOperation::DropColumn { .. }))
-        {
+        // drop_column and rename_column do not yet check dependent expressions (Spark's
+        // checkDependentExpressions) or rewrite stats-columns metadata. Block these ops on
+        // tables with the corresponding features so flipping any feature to Supported won't
+        // silently orphan a generated/CHECK/identity reference, and so a rewrite gap on
+        // `delta.dataSkippingStatsColumns` doesn't leave the property pointing at a missing
+        // or renamed column.
+        let op_label = self.operations.iter().find_map(|op| match op {
+            SchemaOperation::DropColumn { .. } => Some("drop_column"),
+            SchemaOperation::RenameColumn { .. } => Some("rename_column"),
+            _ => None,
+        });
+        if let Some(op_label) = op_label {
             for feature in [
                 TableFeature::GeneratedColumns,
                 TableFeature::CheckConstraints,
@@ -197,8 +252,8 @@ impl AlterTableTransactionBuilder<Modifying> {
             ] {
                 if table_config.is_feature_supported(&feature) {
                     return Err(Error::unsupported(format!(
-                        "drop_column is not supported on tables with the '{feature}' feature: \
-                         the dropped column may be referenced by a generated-column expression, \
+                        "{op_label} is not supported on tables with the '{feature}' feature: \
+                         the column may be referenced by a generated-column expression, \
                          CHECK constraint, or identity column"
                     )));
                 }
@@ -208,11 +263,11 @@ impl AlterTableTransactionBuilder<Modifying> {
                 .data_skipping_stats_columns
                 .is_some()
             {
-                return Err(Error::unsupported(
-                    "drop_column is not supported on tables with \
+                return Err(Error::unsupported(format!(
+                    "{op_label} is not supported on tables with \
                      'delta.dataSkippingStatsColumns' set: the property may reference the \
-                     dropped column and kernel does not yet rewrite it on drop",
-                ));
+                     column and kernel does not yet rewrite it on drop or rename"
+                )));
             }
         }
 
