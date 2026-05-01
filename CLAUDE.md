@@ -255,6 +255,7 @@ run: |
 Read these when relevant to the task at hand:
 - `CLAUDE/architecture.md` -- kernel architecture: snapshot loading, read/write paths,
   engine trait system, EngineData, key modules, catalog-managed tables
+- `docs/user-guide/CLAUDE.md` -- writing standards for the mdBook user guide
 - Always cross-check protocol behavior against the
   [Delta protocol spec](https://raw.githubusercontent.com/delta-io/delta/master/PROTOCOL.md)
 
