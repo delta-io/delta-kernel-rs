@@ -22,27 +22,50 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::engine::{reader_options, writer_options};
+use crate::engine::reader_options;
 use crate::expressions::ColumnName;
 use crate::metrics::emit_parquet_read_completed;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use crate::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
+use crate::parquet::basic::Compression;
 use crate::schema::{SchemaRef, StructType};
+use crate::table_properties::{ParquetCompression, ParquetWriterConfig};
 use crate::transaction::WriteContext;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
     ParquetHandler, PredicateRef,
 };
 
+/// Returns [`ArrowWriterOptions`] for kernel parquet writes.
+///
+/// Sets the compression codec from the provided config and disables embedding of the
+/// Arrow IPC schema in Parquet key-value metadata. Omitting the embedded schema keeps
+/// the files compatible with pure-Parquet readers and is consistent with how kernel
+/// reads parquet files (which also skip Arrow schema metadata).
+pub(crate) fn writer_options(config: &ParquetWriterConfig) -> ArrowWriterOptions {
+    let compression = match config.compression {
+        ParquetCompression::Snappy => Compression::SNAPPY,
+        ParquetCompression::Zstd => Compression::ZSTD(Default::default()),
+        ParquetCompression::Uncompressed => Compression::UNCOMPRESSED,
+    };
+    let props = crate::parquet::file::properties::WriterProperties::builder()
+        .set_compression(compression)
+        .build();
+    ArrowWriterOptions::new()
+        .with_properties(props)
+        .with_skip_arrow_metadata(true)
+}
+
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
     readahead: usize,
+    parquet_writer_config: ParquetWriterConfig,
 }
 
 /// Metadata of a data file (typically a parquet file).
@@ -142,11 +165,16 @@ impl DataFileMetadata {
 }
 
 impl<E: TaskExecutor> DefaultParquetHandler<E> {
-    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub fn new(
+        store: Arc<DynObjectStore>,
+        task_executor: Arc<E>,
+        parquet_writer_config: ParquetWriterConfig,
+    ) -> Self {
         Self {
             store,
             task_executor,
             readahead: 10,
+            parquet_writer_config,
         }
     }
 
@@ -176,11 +204,9 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let stats = collect_stats(record_batch, stats_columns)?;
 
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new_with_options(
-            &mut buffer,
-            record_batch.schema(),
-            writer_options(),
-        )?;
+        let options = writer_options(&self.parquet_writer_config);
+        let mut writer =
+            ArrowWriter::try_new_with_options(&mut buffer, record_batch.schema(), options)?;
         writer.write(record_batch)?;
         writer.close()?; // writer must be closed to write footer
 
@@ -343,6 +369,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
     ) -> DeltaResult<()> {
         let store = self.store.clone();
+        let options = writer_options(&self.parquet_writer_config);
 
         self.task_executor.block_on(async move {
             let path = Path::from_url_path(location.path())?;
@@ -357,7 +384,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             let object_writer = ParquetObjectWriter::new(store, path);
             let schema = first_record_batch.schema();
             let mut writer =
-                AsyncArrowWriter::try_new_with_options(object_writer, schema, writer_options())?;
+                AsyncArrowWriter::try_new_with_options(object_writer, schema, options)?;
 
             // Write the first batch
             writer.write(&first_record_batch).await?;
@@ -694,7 +721,11 @@ mod tests {
             size: meta.size,
         }];
 
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultParquetHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
+        );
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(
                 files,
@@ -799,11 +830,58 @@ mod tests {
         assert_eq!(actual.record_batch(), &expected);
     }
 
+    #[rstest::rstest]
+    #[case(ParquetCompression::Snappy, Compression::SNAPPY)]
+    #[case(ParquetCompression::Zstd, Compression::ZSTD(Default::default()))]
+    #[tokio::test]
+    async fn test_write_parquet_compression(
+        #[case] kernel_compression: ParquetCompression,
+        #[case] expected: Compression,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+            ParquetWriterConfig {
+                compression: kernel_compression,
+            },
+        ));
+
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "a",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(data)));
+
+        let file_url = Url::parse("memory:///test/compression.parquet").unwrap();
+        parquet_handler
+            .write_parquet_file(file_url.clone(), data_iter)
+            .unwrap();
+
+        // Read back the parquet metadata and verify the compression codec was applied
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store, path);
+        let metadata = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .metadata()
+            .clone();
+        let actual = metadata.row_group(0).column(0).compression();
+        assert_eq!(actual, expected);
+    }
+
     #[tokio::test]
     async fn test_write_parquet() {
         let store = Arc::new(InMemory::new());
-        let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let parquet_handler = DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
+        );
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
@@ -881,8 +959,11 @@ mod tests {
     #[tokio::test]
     async fn test_disallow_non_trailing_slash() {
         let store = Arc::new(InMemory::new());
-        let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let parquet_handler = DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
+        );
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
@@ -906,6 +987,7 @@ mod tests {
         let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
             store.clone(),
             Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
         ));
 
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
@@ -970,6 +1052,7 @@ mod tests {
         let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
             store.clone(),
             Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
         ));
 
         // Create test data with all Delta-supported primitive types
@@ -1271,7 +1354,11 @@ mod tests {
 
         // Read footer and verify field ID accessibility
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultParquetHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
+        );
         let file_size = std::fs::metadata(&file_path).unwrap().len();
         let file_meta = FileMeta {
             location: Url::from_file_path(&file_path).unwrap(),
@@ -1365,7 +1452,11 @@ mod tests {
 
         // Read using kernel schema with different column names
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultParquetHandler::new(
+            store,
+            Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
+        );
         let file_meta = FileMeta {
             location: Url::from_file_path(&file_path).unwrap(),
             last_modified: 0,
@@ -1406,8 +1497,11 @@ mod tests {
     #[tokio::test]
     async fn write_parquet_omits_arrow_schema_metadata() {
         let store = Arc::new(InMemory::new());
-        let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let parquet_handler = DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
+        );
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
@@ -1445,6 +1539,7 @@ mod tests {
         let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
             store.clone(),
             Arc::new(TokioBackgroundExecutor::new()),
+            Default::default(),
         ));
 
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(

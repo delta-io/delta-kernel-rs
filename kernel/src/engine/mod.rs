@@ -4,8 +4,6 @@
 
 #[cfg(feature = "arrow-expression")]
 use crate::parquet::arrow::arrow_reader::ArrowReaderOptions;
-#[cfg(feature = "arrow-expression")]
-use crate::parquet::arrow::arrow_writer::ArrowWriterOptions;
 
 /// Returns the standard [`ArrowReaderOptions`] for all default engine parquet reads.
 ///
@@ -14,15 +12,6 @@ use crate::parquet::arrow::arrow_writer::ArrowWriterOptions;
 #[cfg(feature = "arrow-expression")]
 pub(crate) fn reader_options() -> ArrowReaderOptions {
     ArrowReaderOptions::new().with_skip_arrow_metadata(true)
-}
-
-/// Returns the standard [`ArrowWriterOptions`] for all kernel parquet writes.
-///
-/// Omitting the Arrow IPC schema from the file metadata keeps Delta files interoperable with
-/// non-Arrow readers and avoids encoding Arrow-specific type information.
-#[cfg(feature = "arrow-expression")]
-pub(crate) fn writer_options() -> ArrowWriterOptions {
-    ArrowWriterOptions::new().with_skip_arrow_metadata(true)
 }
 
 #[cfg(feature = "arrow-conversion")]

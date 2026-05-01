@@ -21,6 +21,7 @@ use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
+use crate::table_properties::ParquetWriterConfig;
 use crate::transaction::WriteContext;
 use crate::{
     DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
@@ -172,6 +173,7 @@ pub struct DefaultEngine<E: TaskExecutor> {
 pub struct DefaultEngineBuilder<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
+    writer_config: ParquetWriterConfig,
 }
 
 impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
@@ -180,11 +182,20 @@ impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
         Self {
             object_store,
             task_executor: Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
+            writer_config: Default::default(),
         }
     }
 }
 
 impl<E: TaskExecutor> DefaultEngineBuilder<E> {
+    /// Set a custom Parquet writer configuration for all writes performed by this engine.
+    ///
+    /// Controls compression and other write-time settings. Defaults to Zstd compression.
+    pub fn with_parquet_writer_config(mut self, config: ParquetWriterConfig) -> Self {
+        self.writer_config = config;
+        self
+    }
+
     /// Set a custom task executor for the engine.
     ///
     /// See [`executor::TaskExecutor`] for more details.
@@ -195,12 +206,13 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
         DefaultEngineBuilder {
             object_store: self.object_store,
             task_executor,
+            writer_config: self.writer_config,
         }
     }
 
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor)
+        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.writer_config)
     }
 }
 
@@ -218,7 +230,11 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
-    fn new_with_opts(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    fn new_with_opts(
+        object_store: Arc<DynObjectStore>,
+        task_executor: Arc<E>,
+        parquet_writer_config: ParquetWriterConfig,
+    ) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
@@ -231,6 +247,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             parquet: Arc::new(DefaultParquetHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
+                parquet_writer_config,
             )),
             object_store,
             task_executor,
