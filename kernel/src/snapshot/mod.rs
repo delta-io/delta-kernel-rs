@@ -1290,7 +1290,7 @@ mod tests {
 
     use rstest::rstest;
     use serde_json::json;
-    use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
+    use test_utils::table_builder::*;
     use test_utils::{add_commit, delta_path_for_version};
 
     use super::*;
@@ -1488,19 +1488,78 @@ mod tests {
             .unwrap();
     }
 
-    // interesting cases for testing Snapshot::new_from:
-    // 1. new version < existing version
-    // 2. new version == existing version
-    // 3. new version > existing version AND
-    //   a. log segment hasn't changed
-    //   b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
-    //   b. log segment for old..=new version has no checkpoint
-    //     i. commits have (new protocol, new metadata)
-    //     ii. commits have (new protocol, no metadata)
-    //     iii. commits have (no protocol, new metadata)
-    //     iv. commits have (no protocol, no metadata)
+    // Incremental snapshot update (builder_from) produces the same result as a fresh
+    // load (builder_for). Parameterized over log states, feature sets, and whether the
+    // `_last_checkpoint` hint file is present (kernel reads the hint on fresh load, so
+    // its presence affects `Snapshot::last_checkpoint_metadata`). Incompatible
+    // log-state + feature-set pairings return early rather than fail.
+    #[rstest::rstest]
+    fn test_incremental_snapshot_matches_fresh_load(
+        #[values(
+            LogState::with_commits(3),
+            LogState::checkpoint_v1(2, 3),
+            LogState::checkpoint_v2(2, 3),
+            LogState::checkpoint_and_commits(1, 1),
+            LogState::with_crc(0, 3)
+        )]
+        log_state: LogState,
+        #[values(
+            FeatureSet::empty(),
+            FeatureSet::new().column_mapping("name"),
+            FeatureSet::new().v2_checkpoint(),
+        )]
+        features: FeatureSet,
+        #[values(true, false)] with_last_checkpoint_hint: bool,
+    ) -> DeltaResult<()> {
+        let needs_v2 = matches!(log_state, LogState::CheckpointV2 { .. });
+        let needs_v1 = matches!(
+            log_state,
+            LogState::CheckpointV1 { .. } | LogState::CheckpointAndCommits { .. }
+        );
+        let has_v2 = features.has_v2_checkpoint();
+        if (needs_v2 && !has_v2) || (needs_v1 && has_v2) {
+            return Ok(());
+        }
+
+        let table = TestTableBuilder::new()
+            .with_log_state(log_state)
+            .with_features(features)
+            .build()
+            .map_err(|e| Error::generic(e.to_string()))?;
+        if !with_last_checkpoint_hint {
+            table
+                .delete_last_checkpoint()
+                .map_err(|e| Error::generic(e.to_string()))?;
+        }
+
+        let engine = DefaultEngineBuilder::new(table.store().clone()).build();
+        let base = Snapshot::builder_for(table.table_root())
+            .at_version(0)
+            .build(&engine)?;
+        let incremental = Snapshot::builder_from(base).at_version(2).build(&engine)?;
+        let fresh = Snapshot::builder_for(table.table_root())
+            .at_version(2)
+            .build(&engine)?;
+        let ctx = table.description();
+        assert_eq!(incremental.version(), fresh.version(), "{ctx}");
+        assert_eq!(incremental.schema(), fresh.schema(), "{ctx}");
+        assert_eq!(
+            incremental.table_configuration().protocol(),
+            fresh.table_configuration().protocol(),
+            "{ctx}",
+        );
+        assert_eq!(
+            incremental.table_configuration().metadata(),
+            fresh.table_configuration().metadata(),
+            "{ctx}",
+        );
+        Ok(())
+    }
+
+    // Error cases and edge cases for incremental snapshot updates that require
+    // hand-crafted commits (protocol-only, metadata-only, etc.).
     #[tokio::test]
-    async fn test_snapshot_new_from() -> DeltaResult<()> {
+    async fn test_snapshot_new_from_edge_cases() -> DeltaResult<()> {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -1699,127 +1758,53 @@ mod tests {
         Ok(())
     }
 
-    // test new CRC in new log segment (old log segment has old CRC)
-    #[tokio::test]
-    async fn test_snapshot_new_from_crc() -> Result<(), Box<dyn std::error::Error>> {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
-        let protocol = |reader_version, writer_version| {
-            json!({
-                "protocol": {
-                    "minReaderVersion": reader_version,
-                    "minWriterVersion": writer_version
-                }
-            })
-        };
-        let metadata = json!({
-            "metaData": {
-                "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
-                "format": {
-                    "provider": "parquet",
-                    "options": {}
-                },
-                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
-                "partitionColumns": [],
-                "configuration": {},
-                "createdTime": 1587968585495i64
-            }
-        });
-        let commit0 = vec![
-            json!({
-                "commitInfo": {
-                    "timestamp": 1587968586154i64,
-                    "operation": "WRITE",
-                    "operationParameters": {"mode":"ErrorIfExists","partitionBy":"[]"},
-                    "isBlindAppend":true
-                }
-            }),
-            protocol(1, 1),
-            metadata.clone(),
-        ];
-        let commit1 = vec![
-            json!({
-                "commitInfo": {
-                    "timestamp": 1587968586154i64,
-                    "operation": "WRITE",
-                    "operationParameters": {"mode":"ErrorIfExists","partitionBy":"[]"},
-                    "isBlindAppend":true
-                }
-            }),
-            protocol(1, 2),
-        ];
+    // Incremental snapshot update picks up CRC files from the new log segment.
+    #[rstest::rstest]
+    fn test_snapshot_new_from_crc(
+        #[values(false, true)] add_crc_at_v1: bool,
+        #[values(
+            FeatureSet::empty(),
+            FeatureSet::new().column_mapping("name"),
+            FeatureSet::new().ict(),
+            FeatureSet::new().v2_checkpoint(),
+            FeatureSet::new().column_mapping("name").ict(),
+        )]
+        features: FeatureSet,
+    ) -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_crc(0, 2))
+            .with_features(features)
+            .build()
+            .map_err(|e| Error::generic(e.to_string()))?;
+        let engine = DefaultEngineBuilder::new(table.store().clone()).build();
 
-        // commit 0 and 1 jsons
-        commit(table_root, &store, 0, commit0.clone()).await;
-        commit(table_root, &store, 1, commit1).await;
+        if add_crc_at_v1 {
+            test_utils::table_builder::write_crc_sync(1, table.store(), table.table_root())
+                .map_err(|e| Error::generic(e.to_string()))?;
+        }
 
-        // Test CRC handling during incremental snapshot update (v0 -> v1).
-        // The new log listing starts at v1, so the new log segment doesn't find 0.crc.
-        // a) Only 0.crc exists: resolve_crc falls back to old segment's 0.crc.
-        // b) Both 0.crc and 1.crc exist: resolve_crc picks up 1.crc.
-        let crc = json!({
-            "table_size_bytes": 100,
-            "num_files": 1,
-            "num_metadata": 1,
-            "num_protocol": 1,
-            "metadata": metadata,
-            "protocol": protocol(1, 1),
-        });
-
-        // put the old crc
-        let path = delta_path_for_version(0, "crc");
-        store.put(&path, crc.to_string().into()).await?;
-
-        // base snapshot is at version 0
-        let base_snapshot = Snapshot::builder_for(table_root)
+        let base = Snapshot::builder_for(table.table_root())
             .at_version(0)
             .build(&engine)?;
-
-        // a) only 0.crc exists -- falls back to old segment's 0.crc
-        let snapshot = Snapshot::builder_from(base_snapshot.clone())
+        let updated = Snapshot::builder_from(base).at_version(1).build(&engine)?;
+        let fresh = Snapshot::builder_for(table.table_root())
             .at_version(1)
             .build(&engine)?;
+
+        // Incremental update must produce the same result as a fresh load.
+        assert_eq!(updated, fresh);
+
+        let expected_crc_version = if add_crc_at_v1 { 1 } else { 0 };
         assert_eq!(
-            snapshot
+            updated
                 .log_segment
                 .listed
                 .latest_crc_file
                 .as_ref()
                 .unwrap()
                 .version,
-            0
+            expected_crc_version
         );
-
-        // b) both 0.crc and 1.crc exist -- resolve_crc picks up 1.crc
-        let path = delta_path_for_version(1, "crc");
-        let crc = json!({
-            "table_size_bytes": 100,
-            "num_files": 1,
-            "num_metadata": 1,
-            "num_protocol": 1,
-            "metadata": metadata,
-            "protocol": protocol(1, 2),
-        });
-        store.put(&path, crc.to_string().into()).await?;
-        let snapshot = Snapshot::builder_from(base_snapshot.clone())
-            .at_version(1)
-            .build(&engine)?;
-        let expected = Snapshot::builder_for(table_root)
-            .at_version(1)
-            .build(&engine)?;
-        assert_eq!(snapshot, expected);
-        assert_eq!(
-            snapshot
-                .log_segment
-                .listed
-                .latest_crc_file
-                .as_ref()
-                .unwrap()
-                .version,
-            1
-        );
-
         Ok(())
     }
 
@@ -2137,24 +2122,54 @@ mod tests {
         assert_result_error_with_message(result, "not currently supported");
     }
 
-    #[tokio::test]
-    async fn test_timestamp_with_ict_disabled() -> Result<(), Box<dyn std::error::Error>> {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory://test/";
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+    #[rstest::rstest]
+    fn test_ict_enabled_across_all_configs(
+        #[values(
+            LogState::with_commits(3),
+            LogState::checkpoint_v1(2, 3),
+            LogState::checkpoint_v2(2, 3),
+            LogState::checkpoint_and_commits(2, 1),
+            LogState::with_crc(0, 3)
+        )]
+        log_state: LogState,
+        #[values(
+            FeatureSet::new().ict(),
+            FeatureSet::new().column_mapping("name").ict()
+        )]
+        base_features: FeatureSet,
+        #[values(
+            VersionTarget::Latest,
+            VersionTarget::IncrementalToLatest { from: 0 }
+        )]
+        version_target: VersionTarget,
+    ) {
+        // V2 checkpoint log state requires the v2Checkpoint feature; add it on the fly
+        // so each log-state case exercises the feature combination it needs.
+        let feature_set = if matches!(log_state, LogState::CheckpointV2 { .. }) {
+            base_features.v2_checkpoint()
+        } else {
+            base_features
+        };
+        let (engine, snap, _table) =
+            test_utils::test_context!(log_state, feature_set, version_target);
+        assert!(snap.get_in_commit_timestamp(&engine).unwrap().is_some());
+    }
 
-        // Create a basic commit without ICT enabled
-        let commit0 = create_basic_commit(false, None);
-        add_commit(table_root, store.as_ref(), 0, commit0).await?;
-
-        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-
-        // When ICT is disabled, get_timestamp should return None
-        let result = snapshot.get_in_commit_timestamp(&engine)?;
-        assert_eq!(result, None);
-
+    #[test]
+    fn test_ict_disabled_returns_none() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_commits(2))
+            .build()
+            .map_err(|e| Error::generic(e.to_string()))?;
+        let engine = DefaultEngineBuilder::new(table.store().clone()).build();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.get_in_commit_timestamp(&engine)?, None);
         Ok(())
     }
+
+    // Tests that ICT works across the enablement timeline: v0 without ICT,
+    // v1 enables ICT, v2 has ICT timestamp. This requires mid-stream feature
+    // enablement which the builder cannot produce.
 
     #[tokio::test]
     async fn test_timestamp_with_ict_enablement_timeline() -> Result<(), Box<dyn std::error::Error>>
