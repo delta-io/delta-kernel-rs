@@ -30,6 +30,7 @@ use crate::scan::log_replay::{
     PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
+use crate::schema::void_utils::validate_schema_for_write;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
@@ -322,6 +323,39 @@ where
     })
 }
 
+/// Returns true if the struct (or any nested struct) contains void fields.
+fn contains_void(st: &StructType) -> bool {
+    st.fields().any(|f| {
+        *f.data_type() == DataType::VOID
+            || matches!(f.data_type(), DataType::Struct(inner) if contains_void(inner))
+    })
+}
+
+/// Recursively builds a nested Transform that drops void fields from a struct type.
+/// Returns `None` if the struct contains no void fields (no transform needed).
+/// The `path` parameter specifies the column path to the struct being transformed.
+fn build_void_stripping_transform(st: &StructType, path: &[&str]) -> Option<Transform> {
+    if !contains_void(st) {
+        return None;
+    }
+
+    let mut transform = Transform::new_nested(path.iter().copied());
+    for field in st.fields() {
+        if *field.data_type() == DataType::VOID {
+            transform = transform.with_dropped_field_if_exists(field.name());
+        } else if let DataType::Struct(inner) = field.data_type() {
+            // Build path for the nested struct: parent_path + field_name
+            let mut child_path: Vec<&str> = path.to_vec();
+            child_path.push(field.name());
+            if let Some(nested) = build_void_stripping_transform(inner, &child_path) {
+                transform = transform
+                    .with_replaced_field(field.name(), Arc::new(Expression::transform(nested)));
+            }
+        }
+    }
+    Some(transform)
+}
+
 // =============================================================================
 // Shared methods available on ALL transaction types
 // =============================================================================
@@ -364,6 +398,13 @@ impl<S> Transaction<S> {
         }
 
         self.validate_blind_append_semantics()?;
+
+        // Validate that the schema supports data writes when files are being added.
+        // Void-in-array/map, all-void structs, and all-void tables cannot produce valid Parquet.
+        // Reads and metadata-only commits are always allowed.
+        if !self.add_files_metadata.is_empty() {
+            validate_schema_for_write(&self.effective_table_config.logical_schema())?;
+        }
 
         // CDF check only applies to existing tables (not create table)
         // If there are add and remove files with data change in the same transaction, we block it.
@@ -837,12 +878,24 @@ impl<S: SupportsDataFiles> Transaction<S> {
         let materialize_partition_columns = self
             .effective_table_config
             .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
-        // Build a Transform expression that drops partition columns from the input
-        // (unless materializePartitionColumns is enabled).
+        // Build a Transform expression that drops partition columns (unless
+        // materializePartitionColumns is enabled) and void columns (never written to Parquet).
+        // Void columns are dropped at all nesting levels: top-level void fields are dropped
+        // directly, and void sub-fields inside structs are dropped via nested transforms.
         let mut transform = Transform::new_top_level();
         if !materialize_partition_columns {
             for col in &partition_cols {
                 transform = transform.with_dropped_field_if_exists(col);
+            }
+        }
+        for field in self.effective_table_config.logical_schema().fields() {
+            if *field.data_type() == DataType::VOID {
+                transform = transform.with_dropped_field_if_exists(field.name());
+            } else if let DataType::Struct(inner) = field.data_type() {
+                if let Some(nested) = build_void_stripping_transform(inner, &[field.name()]) {
+                    transform = transform
+                        .with_replaced_field(field.name(), Arc::new(Expression::transform(nested)));
+                }
             }
         }
         Expression::transform(transform)
@@ -857,10 +910,18 @@ impl<S: SupportsDataFiles> Transaction<S> {
     fn shared_write_state(&self) -> &Arc<SharedWriteState> {
         self.shared_write_state.get_or_init(|| {
             let table_config = &self.effective_table_config;
+            // Strip void fields from the physical write schema: they are never written to Parquet.
+            let physical_write_schema = table_config.physical_write_schema();
+            let physical_schema = Arc::new(StructType::new_unchecked(
+                physical_write_schema
+                    .fields()
+                    .filter(|f| *f.data_type() != DataType::VOID)
+                    .map(crate::schema::void_utils::strip_void_from_field),
+            ));
             Arc::new(SharedWriteState {
                 table_root: table_config.table_root().clone(),
                 logical_schema: table_config.logical_schema(),
-                physical_schema: table_config.physical_write_schema(),
+                physical_schema,
                 logical_to_physical: Arc::new(self.generate_logical_to_physical()),
                 column_mapping_mode: table_config.column_mapping_mode(),
                 stats_columns: self.stats_columns(),
