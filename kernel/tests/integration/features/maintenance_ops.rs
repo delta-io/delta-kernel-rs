@@ -40,7 +40,7 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
     assert!(seg.listed.latest_crc_file.is_none());
 
     // ===== WHEN: we checkpoint =====
-    let (_, snapshot_w_ckpt) = snapshot.checkpoint(engine.as_ref())?;
+    let (_, snapshot_w_ckpt) = snapshot.checkpoint(engine.as_ref(), None)?;
     let seg = snapshot_w_ckpt.log_segment();
 
     // ===== THEN =====
@@ -94,11 +94,11 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaRes
     let snapshot = committed.post_commit_snapshot().unwrap();
 
     // First checkpoint writes successfully
-    let (result, snapshot_w_ckpt) = snapshot.checkpoint(engine.as_ref())?;
+    let (result, snapshot_w_ckpt) = snapshot.checkpoint(engine.as_ref(), None)?;
     assert_eq!(result, CheckpointWriteResult::Written);
 
     // Calling checkpoint again on the returned snapshot detects the existing checkpoint
-    let (result, unchanged) = snapshot_w_ckpt.checkpoint(engine.as_ref())?;
+    let (result, unchanged) = snapshot_w_ckpt.checkpoint(engine.as_ref(), None)?;
     assert_eq!(result, CheckpointWriteResult::AlreadyExists);
     assert_eq!(unchanged.version(), snapshot_w_ckpt.version());
 
@@ -108,7 +108,7 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaRes
         fresh.log_segment().checkpoint_version,
         Some(snapshot.version())
     );
-    let (result, _) = fresh.checkpoint(engine.as_ref())?;
+    let (result, _) = fresh.checkpoint(engine.as_ref(), None)?;
     assert_eq!(result, CheckpointWriteResult::AlreadyExists);
 
     Ok(())

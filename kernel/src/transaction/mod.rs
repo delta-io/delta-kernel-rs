@@ -1255,7 +1255,7 @@ impl<S> Transaction<S> {
         }
 
         let input_schema = scan_row_schema();
-        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema())?;
+        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema());
         let evaluation_handler = engine.evaluation_handler();
 
         let make_eval = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {
@@ -1427,6 +1427,18 @@ impl<S: std::fmt::Debug> CommitResult<S> {
             CommitResult::CommittedTransaction(c) => c,
             other => panic!("Expected CommittedTransaction, got: {other:?}"),
         }
+    }
+
+    /// Unwraps the post-commit snapshot of the [`CommittedTransaction`], panicking if the
+    /// commit was not successful or the post-commit snapshot is missing.
+    /// TODO(#2494): Refactor existing tests to use this.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::panic, clippy::expect_used)]
+    pub fn unwrap_post_commit_snapshot(self) -> SnapshotRef {
+        self.unwrap_committed()
+            .post_commit_snapshot()
+            .expect("expected post-commit snapshot")
+            .clone()
     }
 }
 

@@ -940,7 +940,7 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             // log segment lazily while writing). This requires `TokioMultiThreadExecutor`,
             // which uses `block_in_place` to avoid deadlocking a single-thread runtime.
             let mt_engine = create_default_engine_mt_executor(&table_url)?;
-            snapshot_v2.checkpoint(mt_engine.as_ref())?;
+            snapshot_v2.checkpoint(mt_engine.as_ref(), None)?;
             Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
         } else {
             Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
