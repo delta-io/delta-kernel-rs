@@ -375,6 +375,46 @@ mod apply_schema_validation_tests {
         );
     }
 
+    #[cfg(feature = "arrow-conversion")]
+    #[test]
+    fn test_apply_schema_attaches_geoarrow_metadata_for_geo_field() {
+        use crate::arrow::array::BinaryArray;
+        use crate::schema::{GeometryType, PrimitiveType};
+
+        let target_schema = StructType::new_unchecked([StructField::nullable(
+            "geom",
+            DataType::Primitive(PrimitiveType::Geometry(Box::new(
+                GeometryType::try_new("EPSG:4326").unwrap(),
+            ))),
+        )]);
+
+        let arrow_field = ArrowField::new("geom", ArrowDataType::Binary, true);
+        let input_array = StructArray::try_new(
+            vec![arrow_field].into(),
+            vec![Arc::new(BinaryArray::from(vec![Some(
+                b"\x01\x01\x00\x00\x00".as_ref(),
+            )]))],
+            None,
+        )
+        .unwrap();
+
+        let result = apply_schema_to_struct(&input_array, &target_schema).unwrap();
+
+        let (_, output_field) = result.fields().find("geom").unwrap();
+        assert_eq!(
+            output_field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("geoarrow.wkb"),
+        );
+        let ext_meta = output_field
+            .metadata()
+            .get("ARROW:extension:metadata")
+            .expect("geo target should produce CRS extension metadata");
+        assert!(ext_meta.contains("EPSG:4326"));
+    }
+
     /// Test that apply_schema succeeds when the input Arrow field already carries the same field
     /// ID as the target kernel schema field (no conflict).
     #[test]

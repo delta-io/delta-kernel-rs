@@ -4174,6 +4174,56 @@ mod tests {
         assert!(map_val.is_nullable());
     }
 
+    #[cfg(feature = "arrow-conversion")]
+    #[test]
+    fn test_coerce_batch_nullability_geo_target_attaches_extension() {
+        use std::collections::HashMap;
+
+        use crate::geoarrow_schema::{GeoArrowType, Metadata, WkbType};
+
+        let src_field = ArrowField::new("geom", ArrowDataType::Binary, true)
+            .with_metadata(HashMap::from([(
+                "parquet.field.id".to_string(),
+                "1".to_string(),
+            )]));
+        let src_array: Arc<dyn ArrowArray> = Arc::new(crate::arrow::array::BinaryArray::from(
+            vec![Some(b"\x01\x01\x00\x00\x00".as_ref())],
+        ));
+        let src_schema = Arc::new(ArrowSchema::new(vec![src_field]));
+        let batch = RecordBatch::try_new(src_schema, vec![src_array]).unwrap();
+
+        let crs = crate::geoarrow_schema::crs::Crs::from_srid("EPSG:4326".to_string());
+        let target_field =
+            GeoArrowType::Wkb(WkbType::new(Arc::new(Metadata::new(crs, None)))).to_field("geom", true);
+        let target_schema = Arc::new(ArrowSchema::new(vec![target_field]));
+
+        let result = coerce_batch_nullability(batch, &target_schema, None).unwrap();
+        let out_field = result.schema().field(0).clone();
+
+        assert_eq!(
+            out_field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("geoarrow.wkb"),
+        );
+        let ext_meta = out_field
+            .metadata()
+            .get("ARROW:extension:metadata")
+            .expect("CRS metadata should be present");
+        assert!(ext_meta.contains("EPSG:4326"));
+
+        // `with_extension_type` preserves source metadata; the prior `target_field.clone()`
+        // path would have dropped this.
+        assert_eq!(
+            out_field
+                .metadata()
+                .get("parquet.field.id")
+                .map(String::as_str),
+            Some("1"),
+        );
+    }
+
     // --- Tests for build_json_reorder_indices and json_arrow_schema ---
 
     const FILE_PATH: &str = "s3://bucket/test.json";
@@ -4529,6 +4579,26 @@ mod tests {
             "WKB bytes should be non-empty"
         );
 
+        let geom_field = match batch.schema().field(0).data_type() {
+            ArrowDataType::Struct(f) => f[0].clone(),
+            other => panic!("expected Struct minValues, got {other:?}"),
+        };
+        assert_eq!(
+            geom_field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("geoarrow.wkb"),
+        );
+        let ext_meta = geom_field
+            .metadata()
+            .get("ARROW:extension:metadata")
+            .expect("CRS metadata should be present on output");
+        assert!(
+            ext_meta.contains("OGC:CRS84"),
+            "output CRS should be OGC:CRS84, got {ext_meta}"
+        );
+
         // Missing geom field produces a null entry
         let input: Vec<Option<&str>> = vec![Some(r#"{"minValues":{}}"#)];
         let batch = parse_json_impl(&input.into(), schema.clone()).unwrap();
@@ -4663,5 +4733,73 @@ mod tests {
             .expect("should be BinaryArray");
         assert_eq!(binary.len(), 1);
         assert!(!binary.value(0).is_empty(), "WKB bytes should be non-empty");
+    }
+
+    #[cfg(feature = "arrow-conversion")]
+    #[test]
+    fn test_parse_json_impl_preserves_crs_and_edges_metadata() {
+        use crate::geoarrow_schema::{Edges, GeoArrowType, Metadata, WkbType};
+
+        fn parse_one_geo_row(geo_type: GeoArrowType, field_name: &str) -> ArrowField {
+            let geo_field = geo_type.to_field(field_name, true);
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "minValues",
+                ArrowDataType::Struct(ArrowFields::from(vec![geo_field])),
+                true,
+            )]));
+            let json = format!(r#"{{"minValues":{{"{field_name}":"POINT(1.0 2.0)"}}}}"#);
+            let input: Vec<Option<&str>> = vec![Some(&json)];
+            let batch = parse_json_impl(&input.into(), schema).unwrap();
+            match batch.schema().field(0).data_type() {
+                ArrowDataType::Struct(f) => f[0].as_ref().clone(),
+                other => panic!("expected Struct, got {other:?}"),
+            }
+        }
+
+        let crs = crate::geoarrow_schema::crs::Crs::from_srid("EPSG:4326".to_string());
+        let geometry_field = parse_one_geo_row(
+            GeoArrowType::Wkb(WkbType::new(Arc::new(Metadata::new(crs, None)))),
+            "geom",
+        );
+        let geometry_meta = geometry_field
+            .metadata()
+            .get("ARROW:extension:metadata")
+            .expect("Geometry output should have CRS metadata");
+        assert!(
+            geometry_meta.contains("EPSG:4326"),
+            "Geometry CRS should be EPSG:4326, got {geometry_meta}"
+        );
+
+        let crs = crate::geoarrow_schema::crs::Crs::from_srid("OGC:CRS84".to_string());
+        let geography_field = parse_one_geo_row(
+            GeoArrowType::Wkb(WkbType::new(Arc::new(Metadata::new(
+                crs,
+                Some(Edges::Vincenty),
+            )))),
+            "geog",
+        );
+        let geography_meta = geography_field
+            .metadata()
+            .get("ARROW:extension:metadata")
+            .expect("Geography output should have CRS metadata");
+        assert!(
+            geography_meta.contains("\"edges\":\"vincenty\""),
+            "Geography output should carry edges=vincenty, got {geography_meta}"
+        );
+    }
+
+    #[test]
+    fn test_parse_json_impl_no_op_when_schema_has_no_geo() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int64, true),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ]));
+
+        let input: Vec<Option<&str>> = vec![Some(r#"{"id":42,"name":"hello"}"#)];
+        let batch = parse_json_impl(&input.into(), schema.clone()).unwrap();
+
+        assert_eq!(*batch.schema(), *schema);
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 2);
     }
 }
