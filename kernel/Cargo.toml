@@ -39,7 +39,7 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.21.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.22.0" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
@@ -161,3 +161,11 @@ harness = false
 [[bench]]
 name = "expression_bench"
 harness = false
+
+# Single integration test binary. Linking each integration test as a separate
+# binary is expensive (every binary re-links Arrow, Parquet, and the default
+# engine), so all integration tests share one binary whose entry point is
+# `tests/integration/main.rs` and whose topics live as submodules.
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"

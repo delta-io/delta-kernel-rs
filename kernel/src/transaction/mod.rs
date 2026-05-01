@@ -55,8 +55,11 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
+pub(crate) mod alter_table;
+pub use alter_table::AlterTableTransaction;
 mod commit_info;
 mod domain_metadata;
+pub(crate) mod schema_evolution;
 mod stats_verifier;
 mod update;
 mod write_context;
@@ -177,6 +180,13 @@ pub struct ExistingTable;
 /// invalid for table creation (e.g. file removal, domain metadata removal) are not available.
 #[derive(Debug)]
 pub struct CreateTable;
+
+/// Marker type for alter-table (schema evolution) transactions.
+///
+/// Transactions in this state perform metadata-only commits. Data file operations are not
+/// available at compile time because `AlterTable` does not implement [`SupportsDataFiles`].
+#[derive(Debug)]
+pub struct AlterTable;
 
 /// Marker trait for transaction states that support data file operations.
 ///
@@ -1418,6 +1428,18 @@ impl<S: std::fmt::Debug> CommitResult<S> {
             other => panic!("Expected CommittedTransaction, got: {other:?}"),
         }
     }
+
+    /// Unwraps the post-commit snapshot of the [`CommittedTransaction`], panicking if the
+    /// commit was not successful or the post-commit snapshot is missing.
+    /// TODO(#2494): Refactor existing tests to use this.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::panic, clippy::expect_used)]
+    pub fn unwrap_post_commit_snapshot(self) -> SnapshotRef {
+        self.unwrap_committed()
+            .post_commit_snapshot()
+            .expect("expected post-commit snapshot")
+            .clone()
+    }
 }
 
 /// This is the result of a successfully committed [Transaction]. One can retrieve the
@@ -2111,7 +2133,7 @@ mod tests {
 
     // Note: Additional test coverage for partial file matching (where some files in a scan
     // have DV updates but others don't) is provided by the end-to-end integration test
-    // kernel/tests/dv.rs and kernel/tests/write.rs, which exercises
+    // kernel/tests/features/dv.rs and kernel/tests/write/remove_dv.rs, which exercise
     // the full deletion vector write workflow including the DvMatchVisitor logic.
 
     #[test]

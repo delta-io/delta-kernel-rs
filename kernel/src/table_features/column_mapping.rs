@@ -236,7 +236,7 @@ pub(crate) fn get_column_mapping_mode_from_properties(
 /// arrays, and maps. Each field is assigned a new unique ID and physical name.
 ///
 /// Fields with pre-existing column mapping metadata (id or physicalName) are rejected
-/// to avoid conflicts. ALTER TABLE will need different handling in the future.
+/// to avoid conflicts.
 ///
 /// # Arguments
 ///
@@ -253,35 +253,38 @@ pub(crate) fn assign_column_mapping_metadata(
 ) -> DeltaResult<StructType> {
     let new_fields: Vec<StructField> = schema
         .fields()
-        .map(|field| assign_field_column_mapping(field, max_id))
+        .map(|field| try_assign_field_column_mapping(field, max_id))
         .collect::<DeltaResult<Vec<_>>>()?;
 
     StructType::try_new(new_fields)
 }
 
 /// Assigns column mapping metadata to a single field, recursively processing nested types.
+/// Returns a new field with a fresh unique ID and a UUID-based physical name, and increments
+/// `max_id` to reflect the assignment.
 ///
-/// Rejects fields with pre-existing column mapping metadata. Otherwise, assigns a new
-/// unique ID and physical name (incrementing `max_id`).
-fn assign_field_column_mapping(field: &StructField, max_id: &mut i64) -> DeltaResult<StructField> {
-    let has_id = field
-        .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-        .is_some();
-    let has_physical_name = field
-        .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-        .is_some();
-
-    // For CREATE TABLE, reject any pre-existing column mapping metadata.
-    // This avoids conflicts between user-provided IDs/physical names and the ones we assign.
-    // ALTER TABLE (adding columns) will need different handling in the future.
+/// # Errors
+///
+/// - Field carries a pre-existing `delta.columnMapping.id` or `delta.columnMapping.physicalName`
+///   annotation.
+pub(crate) fn try_assign_field_column_mapping(
+    field: &StructField,
+    max_id: &mut i64,
+) -> DeltaResult<StructField> {
     // TODO: Also check for nested column IDs (`delta.columnMapping.nested.ids`) once
     // Iceberg compatibility (IcebergCompatV2+) is supported. See issue #1125.
-    if has_id || has_physical_name {
-        return Err(Error::generic(format!(
-            "Field '{}' already has column mapping metadata. \
-             Pre-existing column mapping metadata is not supported for CREATE TABLE.",
-            field.name
-        )));
+    for key in [
+        ColumnMetadataKey::ColumnMappingId,
+        ColumnMetadataKey::ColumnMappingPhysicalName,
+    ] {
+        if field.get_config_value(&key).is_some() {
+            return Err(Error::generic(format!(
+                "Field '{}' has pre-populated `{}` metadata; the caller must not provide \
+                 column-mapping annotations on input fields.",
+                field.name,
+                key.as_ref(),
+            )));
+        }
     }
 
     // Start with the existing field and assign new ID
@@ -305,6 +308,30 @@ fn assign_field_column_mapping(field: &StructField, max_id: &mut i64) -> DeltaRe
     new_field.data_type = process_nested_data_type(&field.data_type, max_id)?;
 
     Ok(new_field)
+}
+
+/// Returns the largest `delta.columnMapping.id` found anywhere in `schema`, including nested
+/// data types. Returns `None` if no field carries a column mapping ID.
+pub(crate) fn find_max_column_id_in_schema(schema: &StructType) -> Option<i64> {
+    let mut visitor = MaxColumnId(None);
+    visitor.transform_struct(schema);
+    visitor.0
+}
+
+/// Visitor that walks a schema and records the largest `delta.columnMapping.id` seen on any
+/// field (including nested struct, array, map, and variant fields).
+struct MaxColumnId(Option<i64>);
+
+impl<'a> SchemaTransform<'a> for MaxColumnId {
+    transform_output_type!(|'a, T| ());
+
+    fn transform_struct_field(&mut self, field: &'a StructField) {
+        if let Some(n) = field.column_mapping_id() {
+            self.0 = Some(self.0.map_or(n, |prev| prev.max(n)));
+        }
+        // Recurse into the field's data type so we also visit nested struct/array/map members.
+        self.recurse_into_struct_field(field)
+    }
 }
 
 /// Process nested data types to assign column mapping metadata to any nested struct fields.
@@ -768,8 +795,8 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("already has column mapping metadata"),
-            "Expected error about existing column mapping metadata, got: {err_msg}"
+            err_msg.contains("pre-populated") && err_msg.contains("delta.columnMapping.id"),
+            "Expected error naming the pre-populated CM annotation, got: {err_msg}"
         );
     }
 
@@ -1297,5 +1324,106 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("is not a struct type"));
+    }
+
+    // === find_max_column_id_in_schema tests ===
+
+    fn field_with_id(name: &str, ty: DataType, id: i64) -> StructField {
+        let mut f = StructField::nullable(name, ty);
+        f.metadata.insert(
+            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            MetadataValue::Number(id),
+        );
+        f
+    }
+
+    #[test]
+    fn find_max_column_id_empty_schema_is_none() {
+        let schema =
+            StructType::try_new(vec![StructField::nullable("a", DataType::STRING)]).unwrap();
+        assert_eq!(find_max_column_id_in_schema(&schema), None);
+    }
+
+    #[test]
+    fn find_max_column_id_top_level_only() {
+        let schema = StructType::try_new(vec![
+            field_with_id("a", DataType::STRING, 1),
+            field_with_id("b", DataType::INTEGER, 3),
+            field_with_id("c", DataType::STRING, 2),
+        ])
+        .unwrap();
+        assert_eq!(find_max_column_id_in_schema(&schema), Some(3));
+    }
+
+    #[test]
+    fn find_max_column_id_nested_struct() {
+        let inner = DataType::Struct(Box::new(
+            StructType::try_new(vec![
+                field_with_id("x", DataType::STRING, 7),
+                field_with_id("y", DataType::STRING, 5),
+            ])
+            .unwrap(),
+        ));
+        let schema = StructType::try_new(vec![
+            field_with_id("outer", inner, 2),
+            field_with_id("sibling", DataType::STRING, 3),
+        ])
+        .unwrap();
+        assert_eq!(find_max_column_id_in_schema(&schema), Some(7));
+    }
+
+    #[test]
+    fn find_max_column_id_array_and_map_recurse_into_element_types() {
+        let array_elem_struct = DataType::Array(Box::new(ArrayType::new(
+            DataType::Struct(Box::new(
+                StructType::try_new(vec![field_with_id("deep", DataType::STRING, 42)]).unwrap(),
+            )),
+            true,
+        )));
+        let map_ty = DataType::Map(Box::new(MapType::new(
+            DataType::STRING,
+            DataType::Struct(Box::new(
+                StructType::try_new(vec![field_with_id("inside", DataType::STRING, 9)]).unwrap(),
+            )),
+            false,
+        )));
+        let schema = StructType::try_new(vec![
+            field_with_id("arr", array_elem_struct, 1),
+            field_with_id("m", map_ty, 2),
+        ])
+        .unwrap();
+        assert_eq!(find_max_column_id_in_schema(&schema), Some(42));
+    }
+
+    #[test]
+    fn find_max_column_id_map_with_struct_key_recurses() {
+        let key_struct = DataType::Struct(Box::new(
+            StructType::try_new(vec![field_with_id("key_id", DataType::INTEGER, 17)]).unwrap(),
+        ));
+        let value_struct = DataType::Struct(Box::new(
+            StructType::try_new(vec![field_with_id("val_id", DataType::INTEGER, 11)]).unwrap(),
+        ));
+        let map_ty = DataType::Map(Box::new(MapType::new(key_struct, value_struct, false)));
+        let schema = StructType::try_new(vec![field_with_id("m", map_ty, 1)]).unwrap();
+        // Max should come from the key struct's `key_id = 17`, beating value's 11 and
+        // top-level's 1.
+        assert_eq!(find_max_column_id_in_schema(&schema), Some(17));
+    }
+
+    /// Every inner variant field carries a cm.id so the assertion proves all three are walked,
+    /// not just one. The `shred=23` is the max and beats `metadata=10`, `value=20`, and
+    /// top-level `v=4`.
+    #[test]
+    fn find_max_column_id_variant_recurses_into_inner_fields() {
+        let variant = DataType::Variant(Box::new(
+            StructType::try_new(vec![
+                field_with_id("metadata", DataType::BINARY, 10),
+                field_with_id("value", DataType::BINARY, 20),
+                field_with_id("shred", DataType::STRING, 23),
+            ])
+            .unwrap(),
+        ));
+        let schema = StructType::try_new(vec![field_with_id("v", variant, 4)]).unwrap();
+        assert_eq!(find_max_column_id_in_schema(&schema), Some(23));
     }
 }

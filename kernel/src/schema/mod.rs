@@ -334,6 +334,36 @@ impl StructField {
         self.metadata.get(key.as_ref())
     }
 
+    /// Returns this field's `delta.columnMapping.id` annotation if present and well-formed.
+    /// Returns `None` if the annotation is missing or carries a non-numeric value.
+    pub fn column_mapping_id(&self) -> Option<i64> {
+        match self.get_config_value(&ColumnMetadataKey::ColumnMappingId)? {
+            MetadataValue::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Recursively collects every `delta.columnMapping.id` reachable from this field --
+    /// the field's own ID plus any nested struct fields under Struct/Array/Map/Variant.
+    /// Test-only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn collect_column_mapping_ids(&self) -> Vec<i64> {
+        struct CollectIds(Vec<i64>);
+        impl<'a> SchemaTransform<'a> for CollectIds {
+            transform_output_type!(|'a, T| ());
+
+            fn transform_struct_field(&mut self, field: &'a StructField) {
+                if let Some(id) = field.column_mapping_id() {
+                    self.0.push(id);
+                }
+                self.recurse_into_struct_field(field)
+            }
+        }
+        let mut visitor = CollectIds(Vec::new());
+        visitor.transform_struct_field(self);
+        visitor.0
+    }
+
     /// Get the physical name for this field as it should be read from parquet.
     ///
     /// When `column_mapping_mode` is `None`, always returns the logical name (even if physical
@@ -817,6 +847,56 @@ impl StructType {
         self,
     ) -> impl ExactSizeIterator<Item = StructField> + DoubleEndedIterator + FusedIterator {
         self.fields.into_values()
+    }
+
+    /// Gets a mutable reference to the underlying field map.
+    pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, StructField> {
+        &mut self.fields
+    }
+
+    /// Walk a pre-segmented column path through this schema and return the leaf field.
+    ///
+    /// `path` is the path's individual name segments (one per nesting level), already split by
+    /// the caller. Lookup at each level is case-insensitive. The Delta protocol uses `.` as the
+    /// dotted-path separator at the API surface, but `field_at_path` itself does not split --
+    /// callers typically pass [`ColumnName::path()`](crate::expressions::ColumnName::path),
+    /// which yields the segments directly.
+    ///
+    /// Panics if any segment is missing or an intermediate field is not a struct. Intended for
+    /// use in test assertions.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Schema:
+    /// //   id:      INTEGER  not null
+    /// //   address: STRUCT { city: STRING not null, zip: STRING }
+    /// let path = vec!["address".to_string(), "city".to_string()];
+    /// let city = schema.field_at_path(&path);
+    /// assert_eq!(city.name(), "city");
+    /// assert!(!city.is_nullable());
+    /// ```
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::panic, clippy::expect_used)]
+    pub fn field_at_path<'a>(&'a self, path: &[String]) -> &'a StructField {
+        fn find_ci<'a>(
+            mut fields: impl Iterator<Item = &'a StructField>,
+            name: &str,
+        ) -> &'a StructField {
+            let lowered = name.to_lowercase();
+            fields
+                .find(|f| f.name().to_lowercase() == lowered)
+                .unwrap_or_else(|| panic!("field '{name}' not found"))
+        }
+        let (first, rest) = path.split_first().expect("non-empty path");
+        let mut field = find_ci(self.fields(), first);
+        for seg in rest {
+            let DataType::Struct(s) = field.data_type() else {
+                panic!("expected struct at intermediate segment '{seg}'");
+            };
+            field = find_ci(s.fields(), seg);
+        }
+        field
     }
 
     /// Gets all the field names in this struct type in the order they are defined.

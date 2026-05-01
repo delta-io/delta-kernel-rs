@@ -43,6 +43,7 @@ pub(crate) const ENABLE_DELETION_VECTORS: &str = "delta.enableDeletionVectors";
 pub(crate) const ENABLE_TYPE_WIDENING: &str = "delta.enableTypeWidening";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V1: &str = "delta.enableIcebergCompatV1";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V2: &str = "delta.enableIcebergCompatV2";
+pub(crate) const ENABLE_ICEBERG_COMPAT_V3: &str = "delta.enableIcebergCompatV3";
 pub(crate) const ISOLATION_LEVEL: &str = "delta.isolationLevel";
 pub(crate) const LOG_RETENTION_DURATION: &str = "delta.logRetentionDuration";
 pub(crate) const ENABLE_EXPIRED_LOG_CLEANUP: &str = "delta.enableExpiredLogCleanup";
@@ -100,6 +101,11 @@ pub struct TableProperties {
     /// Parquet columns that use different names.
     pub column_mapping_mode: Option<ColumnMappingMode>,
 
+    /// The largest column-mapping ID assigned in the table schema. ALTER TABLE operations
+    /// that add new column-mapped columns must allocate IDs strictly greater than this value
+    /// and bump the property accordingly.
+    pub column_mapping_max_column_id: Option<i64>,
+
     /// The number of columns for Delta Lake to collect statistics about for data skipping.
     /// A value of -1 means to collect statistics for all columns. Updating this property does
     /// not automatically collect statistics again; instead, it redefines the statistics schema
@@ -143,6 +149,10 @@ pub struct TableProperties {
     /// Whether Iceberg compatibility V2 is enabled for this table. When enabled, Delta Lake
     /// ensures compatibility with Apache Iceberg V2 table format.
     pub enable_iceberg_compat_v2: Option<bool>,
+
+    /// Whether Iceberg compatibility V3 is enabled for this table. When enabled, Delta Lake
+    /// ensures compatibility with Apache Iceberg V3 table format.
+    pub enable_iceberg_compat_v3: Option<bool>,
 
     /// The degree to which a transaction must be isolated from modifications made by concurrent
     /// transactions.
@@ -353,6 +363,7 @@ mod tests {
         assert_eq!(ENABLE_TYPE_WIDENING, "delta.enableTypeWidening");
         assert_eq!(ENABLE_ICEBERG_COMPAT_V1, "delta.enableIcebergCompatV1");
         assert_eq!(ENABLE_ICEBERG_COMPAT_V2, "delta.enableIcebergCompatV2");
+        assert_eq!(ENABLE_ICEBERG_COMPAT_V3, "delta.enableIcebergCompatV3");
         assert_eq!(ISOLATION_LEVEL, "delta.isolationLevel");
         assert_eq!(LOG_RETENTION_DURATION, "delta.logRetentionDuration");
         assert_eq!(ENABLE_EXPIRED_LOG_CLEANUP, "delta.enableExpiredLogCleanup");
@@ -431,6 +442,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_iceberg_compat_v3() {
+        let properties =
+            HashMap::from([(ENABLE_ICEBERG_COMPAT_V3.to_string(), "true".to_string())]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_iceberg_compat_v3, Some(true));
+
+        let properties =
+            HashMap::from([(ENABLE_ICEBERG_COMPAT_V3.to_string(), "false".to_string())]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_iceberg_compat_v3, Some(false));
+    }
+
+    #[test]
     fn known_key_unknown_val() {
         let properties = HashMap::from([(APPEND_ONLY.to_string(), "wack".to_string())]);
         let table_properties = TableProperties::from(properties.iter());
@@ -440,6 +464,34 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(table_properties, expected);
+    }
+
+    #[test]
+    fn column_mapping_max_column_id_invalid_falls_through_to_unknown() {
+        // Non-integer and negative values are invalid; following the established pattern,
+        // they fall through to `unknown_properties` rather than failing the whole parse.
+        for invalid in ["not_a_number", "-5", "1.5"] {
+            let properties = HashMap::from([(
+                COLUMN_MAPPING_MAX_COLUMN_ID.to_string(),
+                invalid.to_string(),
+            )]);
+            let parsed = TableProperties::from(properties.iter());
+            assert_eq!(
+                parsed.column_mapping_max_column_id, None,
+                "input: {invalid}"
+            );
+            assert!(parsed
+                .unknown_properties
+                .contains_key(COLUMN_MAPPING_MAX_COLUMN_ID));
+        }
+    }
+
+    #[test]
+    fn column_mapping_max_column_id_zero_is_valid() {
+        let properties =
+            HashMap::from([(COLUMN_MAPPING_MAX_COLUMN_ID.to_string(), "0".to_string())]);
+        let parsed = TableProperties::from(properties.iter());
+        assert_eq!(parsed.column_mapping_max_column_id, Some(0));
     }
 
     #[test]
@@ -471,6 +523,7 @@ mod tests {
             (CHECKPOINT_WRITE_STATS_AS_JSON, "true"),
             (CHECKPOINT_WRITE_STATS_AS_STRUCT, "true"),
             (COLUMN_MAPPING_MODE, "id"),
+            (COLUMN_MAPPING_MAX_COLUMN_ID, "42"),
             (DATA_SKIPPING_NUM_INDEXED_COLS, "-1"),
             (DATA_SKIPPING_STATS_COLUMNS, "col1,col2"),
             (DELETED_FILE_RETENTION_DURATION, "interval 1 second"),
@@ -479,6 +532,7 @@ mod tests {
             (ENABLE_TYPE_WIDENING, "true"),
             (ENABLE_ICEBERG_COMPAT_V1, "true"),
             (ENABLE_ICEBERG_COMPAT_V2, "true"),
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
             (ISOLATION_LEVEL, "snapshotIsolation"),
             (LOG_RETENTION_DURATION, "interval 2 seconds"),
             (ENABLE_EXPIRED_LOG_CLEANUP, "true"),
@@ -509,6 +563,7 @@ mod tests {
             checkpoint_write_stats_as_json: Some(true),
             checkpoint_write_stats_as_struct: Some(true),
             column_mapping_mode: Some(ColumnMappingMode::Id),
+            column_mapping_max_column_id: Some(42),
             data_skipping_num_indexed_cols: Some(DataSkippingNumIndexedCols::AllColumns),
             data_skipping_stats_columns: Some(vec![column_name!("col1"), column_name!("col2")]),
             deleted_file_retention_duration: Some(Duration::new(1, 0)),
@@ -517,6 +572,7 @@ mod tests {
             enable_type_widening: Some(true),
             enable_iceberg_compat_v1: Some(true),
             enable_iceberg_compat_v2: Some(true),
+            enable_iceberg_compat_v3: Some(true),
             isolation_level: Some(IsolationLevel::SnapshotIsolation),
             log_retention_duration: Some(Duration::new(2, 0)),
             enable_expired_log_cleanup: Some(true),

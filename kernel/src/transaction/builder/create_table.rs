@@ -17,7 +17,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
-use crate::schema::validation::validate_schema_for_create;
+use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
     normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
@@ -75,6 +75,11 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // the feature on an all-nullable table so a later ALTER TABLE ADD COLUMN NOT NULL does
     // not need a protocol upgrade.
     TableFeature::Invariants,
+    // MaterializePartitionColumns keeps partition columns in the data files instead of
+    // dropping them on write. There is no `delta.*` enablement property; the only opt-in at
+    // create time is the explicit feature signal
+    // `delta.feature.materializePartitionColumns=supported`.
+    TableFeature::MaterializePartitionColumns,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
@@ -390,7 +395,7 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
 /// compatible with Spark readers/writers.
 ///
 /// Explicit `delta.invariants` metadata annotations are rejected by
-/// `validate_schema_for_create`, so this only flips on the feature for nullability-driven
+/// `validate_schema`, so this only flips on the feature for nullability-driven
 /// invariants. Kernel does not itself enforce the null mask at write time -- it relies on
 /// the engine's `ParquetHandler` to do so. Kernel's default `ParquetHandler` uses
 /// `arrow-rs`, whose `RecordBatch::try_new` rejects null values in fields marked
@@ -799,7 +804,7 @@ impl CreateTableTransactionBuilder {
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
 
         // Validate schema (non-empty, column names, duplicates, no `delta.invariants` metadata)
-        validate_schema_for_create(&effective_schema, column_mapping_mode)?;
+        validate_schema(&effective_schema, column_mapping_mode)?;
 
         // Validate data layout and resolve column names (physical for clustering, logical
         // for partitioning). Adds required table features for clustering.
@@ -867,7 +872,9 @@ mod tests {
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_features::FeatureType;
-    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V1, PARQUET_FORMAT_VERSION};
+    use crate::table_properties::{
+        ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3, PARQUET_FORMAT_VERSION,
+    };
     use crate::utils::test_utils::assert_result_error_with_message;
 
     fn test_schema() -> SchemaRef {
@@ -982,6 +989,13 @@ mod tests {
         assert_result_error_with_message(
             validate_extract_table_features_and_properties(properties),
             "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
+        );
+
+        let mut properties = HashMap::new();
+        properties.insert(ENABLE_ICEBERG_COMPAT_V3.to_string(), "true".to_string());
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(properties),
+            "Setting delta property 'delta.enableIcebergCompatV3' is not supported",
         );
 
         // Feature signals for features not in ALLOWED_DELTA_FEATURES are rejected
