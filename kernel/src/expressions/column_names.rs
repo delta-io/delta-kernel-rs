@@ -123,8 +123,7 @@ impl ColumnName {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # use delta_kernel::expressions::ColumnName;
+    /// ```ignore
     /// let ancestor = ColumnName::new(["user", "address"]);
     /// let nested = ColumnName::new(["user", "address", "city"]);
     /// assert!(ancestor.is_prefix_of(&nested));
@@ -141,13 +140,13 @@ impl ColumnName {
     /// assert!(empty.is_prefix_of(&empty));
     /// assert!(!nested.is_prefix_of(&empty));
     /// ```
-    pub fn is_prefix_of(&self, other: &ColumnName) -> bool {
+    pub(crate) fn is_prefix_of(&self, other: &ColumnName) -> bool {
         self.path.len() <= other.path.len()
-            && self
-                .path
-                .iter()
-                .zip(other.path.iter())
-                .all(|(a, b)| a.to_lowercase() == b.to_lowercase())
+            && self.path.iter().zip(other.path.iter()).all(|(a, b)| {
+                a.chars()
+                    .flat_map(char::to_lowercase)
+                    .eq(b.chars().flat_map(char::to_lowercase))
+            })
     }
 }
 

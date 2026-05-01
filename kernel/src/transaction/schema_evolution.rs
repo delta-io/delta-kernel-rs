@@ -39,32 +39,32 @@ pub(crate) enum SchemaOperation {
 #[must_use]
 pub(crate) enum LeafAction {
     /// Keep the leaf in its parent IndexMap. Leaf was mutated in place (or unchanged).
-    Kept,
+    Keep,
     /// Remove the leaf field from its parent IndexMap. `modify_field_at_path` rejects this
     /// action if it would leave the parent struct with zero fields.
-    Removed,
+    Remove,
 }
 
 // Helper to modify a nested column. For each component in `path`, locates the matching field
 // (case-insensitive), then descends into the next nested struct. At the leaf, calls `modifier`
 // and applies its returned [`LeafAction`] in place.
 //
-// `Kept` mutations leave the leaf in place after the modifier ran. `Removed` deletes the leaf
+// `Keep` mutations leave the leaf in place after the modifier ran. `Remove` deletes the leaf
 // entry, preserving the order of remaining siblings.
 //
 // Returns an error if a field in the path does not exist, an intermediate field is not a struct,
-// or a `Removed` action would leave the parent struct empty.
+// or a `Remove` action would leave the parent struct empty.
 //
 // Example (mutate):
 //   fields  = [ id: int not null, address: struct { city: string not null, zip: string } ]
 //   path    = ["address", "city"]
-//   modifier = |f| { f.nullable = true; Ok(LeafAction::Kept) }
+//   modifier = |f| { f.nullable = true; Ok(LeafAction::Keep) }
 // yields:
 //   [ id: int not null, address: struct { city: string, zip: string } ]
 //
 // Example (remove):
 //   path    = ["address", "city"]
-//   modifier = |_| Ok(LeafAction::Removed)
+//   modifier = |_| Ok(LeafAction::Remove)
 // yields:
 //   [ id: int not null, address: struct { zip: string } ]
 fn modify_field_at_path(
@@ -97,18 +97,22 @@ fn modify_field_at_path(
 
     // === Leaf handling ===
     let parent_len = fields.len();
+    debug_assert!(
+        parent_len > 0,
+        "idx from position() implies non-empty fields"
+    );
     let (_, field) = fields
         .get_index_mut(idx)
         .ok_or_else(|| Error::internal_error("idx from position() invalid"))?;
     match modifier(field)? {
-        LeafAction::Kept => Ok(()),
-        LeafAction::Removed => {
+        LeafAction::Keep => Ok(()),
+        LeafAction::Remove => {
             // Reject drops that would leave the parent struct empty
             // Note: Matches Spark behaviour.
-            if parent_len <= 1 {
-                let old_name = field.name();
+            if parent_len == 1 {
                 return Err(Error::generic(format!(
-                    "field '{old_name}' is the last field at its level"
+                    "field '{}' is the last field at its level",
+                    field.name()
                 )));
             }
             // Preserve insertion order of remaining siblings.
@@ -132,15 +136,18 @@ fn reject_layout_locked_column(
             "Cannot {op_name} column: empty column path"
         )));
     }
-    // Partition columns are always top-level.
-    if path.len() == 1
-        && partition_columns
+    // Partition columns are always top-level. The slice pattern matches iff path.len() == 1
+    // and binds the sole element to `field_name`.
+    if let [field_name] = path {
+        let field_name_lower = field_name.to_lowercase();
+        if partition_columns
             .iter()
-            .any(|pc| pc.to_lowercase() == path[0].to_lowercase())
-    {
-        return Err(Error::generic(format!(
-            "Cannot {op_name} column '{column}': it is a partition column"
-        )));
+            .any(|pc| pc.to_lowercase() == field_name_lower)
+        {
+            return Err(Error::generic(format!(
+                "Cannot {op_name} column '{column}': it is a partition column"
+            )));
+        }
     }
     // Clustering columns may be nested; dropping an ancestor struct of one is also rejected.
     // Matches Spark.
@@ -248,7 +255,7 @@ pub(crate) fn apply_schema_operations(
             SchemaOperation::SetNullable { column } => {
                 modify_field_at_path(schema.field_map_mut(), column.path(), &|f| {
                     f.nullable = true;
-                    Ok(LeafAction::Kept)
+                    Ok(LeafAction::Keep)
                 })
                 .map_err(|e| {
                     Error::generic(format!("Cannot set nullable on column '{column}': {e}"))
@@ -268,7 +275,7 @@ pub(crate) fn apply_schema_operations(
                     "drop",
                 )?;
                 modify_field_at_path(schema.field_map_mut(), column.path(), &|_| {
-                    Ok(LeafAction::Removed)
+                    Ok(LeafAction::Remove)
                 })
                 .map_err(|e| Error::generic(format!("Cannot drop column '{column}': {e}")))?;
             }
@@ -322,7 +329,7 @@ mod tests {
                 "address",
                 StructType::try_new(vec![
                     StructField::nullable("street", DataType::STRING),
-                    StructField::nullable("city", DataType::STRING),
+                    StructField::not_null("city", DataType::STRING),
                     StructField::nullable("zip", DataType::STRING),
                 ])
                 .unwrap(),
@@ -364,7 +371,7 @@ mod tests {
 
     fn set_nullable_modifier(f: &mut StructField) -> DeltaResult<LeafAction> {
         f.nullable = true;
-        Ok(LeafAction::Kept)
+        Ok(LeafAction::Keep)
     }
 
     fn modify_field_at_path_test_helper(
@@ -381,7 +388,7 @@ mod tests {
         path: &[String],
     ) -> DeltaResult<IndexMap<String, StructField>> {
         let mut fields = into_field_map(schema);
-        modify_field_at_path(&mut fields, path, &|_| Ok(LeafAction::Removed))?;
+        modify_field_at_path(&mut fields, path, &|_| Ok(LeafAction::Remove))?;
         Ok(fields)
     }
 
@@ -458,7 +465,7 @@ mod tests {
         assert!(id.is_nullable());
     }
 
-    // === modify_field_at_path: remove via LeafAction::Removed ===
+    // === modify_field_at_path: remove via LeafAction::Remove ===
 
     #[test]
     fn remove_top_level_field() {
@@ -481,7 +488,7 @@ mod tests {
     }
 
     /// After removing a field, the surviving fields must retain their original order.
-    /// `modify_field_at_path` uses `shift_remove_index` for `LeafAction::Removed`, which
+    /// `modify_field_at_path` uses `shift_remove_index` for `LeafAction::Remove`, which
     /// preserves order. This test verifies that across drop positions (first / middle / last).
     #[rstest]
     #[case::first(0, &["b", "c", "d", "e"])]
@@ -1153,12 +1160,9 @@ mod tests {
         assert_eq!(result.schema.fields().count(), 2);
         let re_added = result.schema.field("name").unwrap();
         assert_eq!(re_added.data_type(), &DataType::INTEGER);
-        let new_id = get_cm_id(re_added);
-        assert!(
-            new_id > dropped_name_id,
-            "re-added column must get a fresh CM id ({new_id}) strictly greater \
-             than the dropped column's id ({dropped_name_id})"
-        );
+        let expected_new_id = dropped_name_id + 1;
+        assert_eq!(get_cm_id(re_added), expected_new_id);
+        assert_eq!(result.new_max_column_id, Some(expected_new_id));
         let new_physical_name = get_physical_name(re_added);
         assert_ne!(
             new_physical_name, "col-existing",

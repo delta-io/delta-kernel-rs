@@ -771,7 +771,7 @@ async fn chain_add_drop_set_nullable_on_cm_table(
     let v1_snap = v1
         .post_commit_snapshot()
         .expect("post-commit snapshot at v1");
-    let (_, v1_ckpt) = v1_snap.clone().checkpoint(engine.as_ref())?;
+    let (_, v1_ckpt) = v1_snap.clone().checkpoint(engine.as_ref(), None)?;
     let v2 = v1_ckpt
         .alter_table()
         .set_nullable(column_name!("id"))
@@ -781,7 +781,7 @@ async fn chain_add_drop_set_nullable_on_cm_table(
     let v2_snap = v2
         .post_commit_snapshot()
         .expect("post-commit snapshot at v2");
-    v2_snap.clone().checkpoint(engine.as_ref())?;
+    v2_snap.clone().checkpoint(engine.as_ref(), None)?;
 
     let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
     let schema = reloaded.schema();
@@ -853,7 +853,9 @@ async fn chain_add_then_drop_same_column_burns_id_but_no_schema_change() -> Delt
 /// Reload from scratch must rebuild from each checkpoint plus the subsequent commits and:
 /// surface only the surviving columns in the schema and scan output (no value bleed-through
 /// from physical Parquet storage), preserve remaining row data, and leave `maxColumnId`
-/// unchanged (drops never bump it).
+/// unchanged (drops never bump it). Also verifies that time travel back to the pre-drop
+/// version still surfaces the dropped columns with their original values (drops do not
+/// retroactively rewrite earlier versions).
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_column_lifecycle_removes_column_and_preserves_remaining_data(
@@ -895,7 +897,7 @@ async fn drop_column_lifecycle_removes_column_and_preserves_remaining_data(
         let post = committed
             .post_commit_snapshot()
             .expect("post-commit snapshot");
-        let (_, ckpt) = post.clone().checkpoint(engine.as_ref())?;
+        let (_, ckpt) = post.clone().checkpoint(engine.as_ref(), None)?;
         current = ckpt;
     }
 
@@ -930,6 +932,33 @@ async fn drop_column_lifecycle_removes_column_and_preserves_remaining_data(
     assert_eq!(id_col.value(0), 1);
     assert_eq!(id_col.value(1), 2);
 
+    // Time travel: at v1 (post-write, pre-drop) all 4 columns are still in the schema with
+    // their original values. Drops must not retroactively rewrite earlier versions.
+    let pre_drop = Snapshot::builder_for(&table_path)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    assert_eq!(pre_drop.schema().fields().count(), 4);
+    let scan = pre_drop.scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+    let email_col = batches[0]
+        .column_by_name("email")
+        .expect("v1 must surface 'email'")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("email is string");
+    assert_eq!(email_col.value(0), "a@x");
+    assert_eq!(email_col.value(1), "b@x");
+    let age_col = batches[0]
+        .column_by_name("age")
+        .expect("v1 must surface 'age'")
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("age is int");
+    assert_eq!(age_col.value(0), 10);
+    assert_eq!(age_col.value(1), 20);
+
     Ok(())
 }
 
@@ -958,6 +987,90 @@ async fn drop_non_clustering_column_on_clustered_table_succeeds() -> DeltaResult
 
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(reloaded.schema().field("id").is_none());
+    Ok(())
+}
+
+/// Dropping a top-level column whose `DataType` is non-primitive (struct, Array, Map, or a
+/// complex type containing a Struct) succeeds and removes only that column. The matching
+/// failure case for structs -- dropping a struct that is an ancestor of a clustering column
+/// -- is covered by `drop_column_failures::clustering_ancestor`.
+#[rstest]
+#[case::top_level_struct(StructField::nullable(
+    "address",
+    StructType::try_new(vec![
+        StructField::nullable("city", DataType::STRING),
+        StructField::nullable("zip", DataType::STRING),
+    ])
+    .unwrap(),
+))]
+#[case::array_of_primitive(StructField::nullable("tags", ArrayType::new(DataType::STRING, true)))]
+#[case::map_of_primitives(StructField::nullable(
+    "labels",
+    MapType::new(DataType::STRING, DataType::INTEGER, true),
+))]
+#[case::array_of_struct(StructField::nullable(
+    "items",
+    ArrayType::new(
+        DataType::Struct(Box::new(
+            StructType::try_new(vec![
+                StructField::nullable("a", DataType::STRING),
+                StructField::nullable("b", DataType::INTEGER),
+            ])
+            .unwrap(),
+        )),
+        true,
+    ),
+))]
+#[case::map_value_is_struct(StructField::nullable(
+    "by_id",
+    MapType::new(
+        DataType::STRING,
+        DataType::Struct(Box::new(
+            StructType::try_new(vec![
+                StructField::nullable("a", DataType::STRING),
+                StructField::nullable("b", DataType::INTEGER),
+            ])
+            .unwrap(),
+        )),
+        true,
+    ),
+))]
+#[tokio::test]
+async fn drop_complex_type_column(#[case] field: StructField) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let field_name = field.name().to_string();
+    // Schema is simple_schema() + the complex column, so dropping it leaves a non-empty schema.
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("name", DataType::STRING),
+        field,
+    ])?);
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+    let original_max_id = max_column_id(&snapshot);
+
+    snapshot
+        .alter_table()
+        .drop_column(ColumnName::new([field_name.as_str()]))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    assert_eq!(schema.fields().count(), 2);
+    assert!(schema.field(&field_name).is_none());
+    assert!(schema.field("id").is_some());
+    assert!(schema.field("name").is_some());
+    assert_eq!(
+        max_column_id(&reloaded),
+        original_max_id,
+        "drop must not bump maxColumnId, including for inner fields lost with a struct"
+    );
     Ok(())
 }
 

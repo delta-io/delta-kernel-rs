@@ -28,11 +28,12 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::committer::Committer;
+use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::Operation;
+use crate::table_features::{Operation, TableFeature};
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
@@ -133,6 +134,8 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     /// - Column is an ancestor struct of a clustering column
     /// - An intermediate component of the path is not a struct (e.g. `name.inner` where `name` is a
     ///   primitive)
+    /// - Table has `delta.dataSkippingStatsColumns` set (kernel doesn't yet rewrite it; #2446)
+    // TODO(#2446): rewrite `delta.dataSkippingStatsColumns` on drop to match delta-spark.
     pub fn drop_column(mut self, column: ColumnName) -> AlterTableTransactionBuilder<Modifying> {
         self.operations.push(SchemaOperation::DropColumn { column });
         self.transition()
@@ -176,6 +179,42 @@ impl AlterTableTransactionBuilder<Modifying> {
         // invariants. Runs on the pre-alter snapshot; future ALTER variants that change the
         // protocol must also re-check this on the evolved `TableConfiguration`.
         table_config.ensure_operation_supported(Operation::Write)?;
+
+        // drop_column does not yet check dependent expressions (Spark's
+        // checkDependentExpressions). Block drops on tables with these features so flipping
+        // any of them to Supported won't silently orphan a generated/CHECK/identity reference.
+        // Also block drops on tables with `delta.dataSkippingStatsColumns` set: drop_column
+        // does not yet rewrite that property to remove the dropped column.
+        if self
+            .operations
+            .iter()
+            .any(|op| matches!(op, SchemaOperation::DropColumn { .. }))
+        {
+            for feature in [
+                TableFeature::GeneratedColumns,
+                TableFeature::CheckConstraints,
+                TableFeature::IdentityColumns,
+            ] {
+                if table_config.is_feature_supported(&feature) {
+                    return Err(Error::unsupported(format!(
+                        "drop_column is not supported on tables with the '{feature}' feature: \
+                         the dropped column may be referenced by a generated-column expression, \
+                         CHECK constraint, or identity column"
+                    )));
+                }
+            }
+            if table_config
+                .table_properties()
+                .data_skipping_stats_columns
+                .is_some()
+            {
+                return Err(Error::unsupported(
+                    "drop_column is not supported on tables with \
+                     'delta.dataSkippingStatsColumns' set: the property may reference the \
+                     dropped column and kernel does not yet rewrite it on drop",
+                ));
+            }
+        }
 
         let schema = Arc::unwrap_or_clone(table_config.logical_schema());
         let column_mapping_mode = table_config.column_mapping_mode();
