@@ -215,7 +215,7 @@ impl TryFromKernel<&StructField> for ArrowField {
 ///
 /// # Example
 ///
-/// Kernel field: [`StructField`] (rendered as Delta-protocol-style JSON):
+/// Kernel field: [`StructField`]:
 ///
 /// ```json
 /// {
