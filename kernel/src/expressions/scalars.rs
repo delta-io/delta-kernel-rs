@@ -790,6 +790,7 @@ impl PrimitiveType {
             )),
             // Geometry/Geography are not valid partition column types, so there is no
             // partition-value string format to parse here
+            // Kernel does not support parsing text into Geometry/Geography types
             Geometry(_) | Geography(_) => Err(Error::Unsupported(format!(
                 "parse_scalar is not supported for {self:?}"
             ))),
