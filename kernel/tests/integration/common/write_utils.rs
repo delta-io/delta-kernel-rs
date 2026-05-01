@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
+use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
@@ -69,6 +71,18 @@ pub fn load_existing_single_file_checkpoint_path(
     panic!("checkpoint parquet file not found for version {version} in {log_dir:?}");
 }
 
+/// Open a parquet file and return its root schema.
+fn read_parquet_root_schema(parquet_file: &std::path::Path) -> ParquetType {
+    let file = std::fs::File::open(parquet_file).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    reader
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .clone()
+}
+
 /// Returns the native parquet `field_id` for a field at the given physical path in a parquet file,
 /// or `None` if the field has no `field_id` set.
 ///
@@ -77,15 +91,7 @@ pub fn get_parquet_field_id(
     parquet_file: &std::path::Path,
     physical_path: &[String],
 ) -> Option<i32> {
-    let file = std::fs::File::open(parquet_file).unwrap();
-    let reader = SerializedFileReader::new(file).unwrap();
-    let root = reader
-        .metadata()
-        .file_metadata()
-        .schema_descr()
-        .root_schema()
-        .clone();
-
+    let root = read_parquet_root_schema(parquet_file);
     let mut current = &root;
     for name in physical_path {
         current = current
@@ -97,6 +103,30 @@ pub fn get_parquet_field_id(
 
     let info = current.get_basic_info();
     info.has_id().then(|| info.id())
+}
+
+/// Recursively walks a parquet schema tree and returns a map from each node's absolute
+/// dot-separated path to its `field_id`. Top-level fields appear under their bare name.
+pub fn collect_all_parquet_field_ids(parquet_file: &std::path::Path) -> HashMap<String, i64> {
+    fn walk(t: &ParquetType, path: &str, out: &mut HashMap<String, i64>) {
+        let info = t.get_basic_info();
+        if info.has_id() {
+            out.insert(path.to_string(), info.id() as i64);
+        }
+        if let ParquetType::GroupType { fields, .. } = t {
+            for f in fields {
+                walk(f, &format!("{path}.{}", f.name()), out);
+            }
+        }
+    }
+
+    let mut ids = HashMap::new();
+    if let ParquetType::GroupType { fields, .. } = &read_parquet_root_schema(parquet_file) {
+        for f in fields {
+            walk(f, f.name(), &mut ids);
+        }
+    }
+    ids
 }
 
 /// Validate that `commitInfo["txnId"]` is a valid UUID.
