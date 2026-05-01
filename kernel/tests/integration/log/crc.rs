@@ -6,8 +6,10 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::crc::{Crc, FileStatsValidity};
+use delta_kernel::engine::default::storage::PrefixedStore;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::{ChecksumWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
@@ -26,7 +28,7 @@ async fn test_get_file_stats_from_crc() -> DeltaResult<()> {
     let table_root = url::Url::from_directory_path(path).unwrap();
 
     let store = Arc::new(LocalFileSystem::new());
-    let engine = DefaultEngineBuilder::new(store).build();
+    let engine = DefaultEngineBuilder::new(PrefixedStore::new(store, Path::from(""))).build();
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 0);
@@ -106,7 +108,7 @@ async fn test_get_current_crc_if_loaded_returns_loaded_crc() -> DeltaResult<()> 
     let table_root = url::Url::from_directory_path(path).unwrap();
 
     let store = Arc::new(LocalFileSystem::new());
-    let engine = DefaultEngineBuilder::new(store).build();
+    let engine = DefaultEngineBuilder::new(PrefixedStore::new(store, Path::from(""))).build();
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 0);

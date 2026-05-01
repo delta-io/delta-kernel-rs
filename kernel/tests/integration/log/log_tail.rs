@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::storage::PrefixedStore;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::Snapshot;
 use test_utils::{
     actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
@@ -17,7 +19,9 @@ fn setup_test() -> (
 ) {
     let storage = Arc::new(InMemory::new());
     let table_root = Url::parse("memory:///").unwrap();
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(PrefixedStore::new(storage.clone(), Path::from(""))).build(),
+    );
     (storage, engine, table_root)
 }
 

@@ -16,24 +16,18 @@ use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema, TimestampMicrosecondType,
 };
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel::engine::default::storage::PrefixedStore;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{column_expr, Scalar};
-use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::{DeltaResult, Expression, Snapshot};
 use serde_json::json;
 use test_utils::{insert_data, read_scan, write_batch_to_table};
-use url::Url;
-
-/// Creates an in-memory store and the table root URL.
-fn new_in_memory_store() -> (Arc<InMemory>, Url) {
-    (Arc::new(InMemory::new()), Url::parse("memory:///").unwrap())
-}
 
 /// Writes a JSON commit file to the store.
-async fn write_commit(store: &Arc<InMemory>, content: &str, version: u64) -> DeltaResult<()> {
+async fn write_commit(store: &Arc<DynObjectStore>, content: &str, version: u64) -> DeltaResult<()> {
     let path = Path::from(format!("_delta_log/{version:020}.json"));
     store.put(&path, content.to_string().into()).await?;
     Ok(())
@@ -98,12 +92,12 @@ async fn test_checkpoint_stats_config_with_real_data(
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (store, table_root) = new_in_memory_store();
+    let (store, table_root) = test_utils::in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from("")))
             .with_task_executor(executor)
             .build(),
     );
@@ -221,12 +215,12 @@ async fn test_checkpoint_partitioned_with_real_data(
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (store, table_root) = new_in_memory_store();
+    let (store, table_root) = test_utils::in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from("")))
             .with_task_executor(executor)
             .build(),
     );
@@ -422,12 +416,12 @@ const COLUMN_MAPPING_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_partition_values_parsed_with_column_mapping(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (store, table_root) = new_in_memory_store();
+    let (store, table_root) = test_utils::in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from("")))
             .with_task_executor(executor)
             .build(),
     );
@@ -542,12 +536,12 @@ const WIDE_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"lon
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (store, table_root) = new_in_memory_store();
+    let (store, table_root) = test_utils::in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from("")))
             .with_task_executor(executor)
             .build(),
     );

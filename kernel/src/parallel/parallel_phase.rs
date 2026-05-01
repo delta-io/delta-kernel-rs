@@ -15,7 +15,6 @@ use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine, EngineData, FileMeta};
-
 /// Processes checkpoint leaf files in parallel using a shared processor.
 ///
 /// This struct is designed for distributed execution where checkpoint leaf files (sidecars or
@@ -132,6 +131,7 @@ mod tests {
     use super::*;
     use crate::actions::get_log_add_schema;
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::default::storage::PrefixedStore;
     use crate::engine::default::DefaultEngine;
     use crate::log_replay::FileActionKey;
     use crate::log_segment::CheckpointReadInfo;
@@ -227,7 +227,8 @@ mod tests {
     ) -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::builder(store.clone()).build();
+        let engine =
+            DefaultEngine::builder(PrefixedStore::new(store.clone(), Path::from(""))).build();
 
         // Create sidecar with add actions
         let json_adds = add_paths
@@ -314,7 +315,8 @@ mod tests {
         // This test uses multiple sidecar files, so we need custom logic
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::builder(store.clone()).build();
+        let engine =
+            DefaultEngine::builder(PrefixedStore::new(store.clone(), Path::from(""))).build();
 
         // Create two sidecars
         let sidecar1_data = parse_json_batch(vec![

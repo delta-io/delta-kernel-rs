@@ -13,17 +13,16 @@ use crate::arrow::datatypes::{ArrowPrimitiveType, Int32Type, Int64Type};
 use crate::checkpoint::sidecar::{SidecarSplitter, SingleSidecarDataIterator};
 use crate::checkpoint::tests::{
     create_add_action, create_metadata_action, create_metadata_with_stats_config_and_partitions,
-    create_remove_action, create_v2_checkpoint_protocol_action, new_in_memory_store,
-    write_commit_to_store,
+    create_remove_action, create_v2_checkpoint_protocol_action, write_commit_to_store,
 };
 use crate::checkpoint::CheckpointWriter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
+use crate::engine::default::storage::PrefixedStore;
 use crate::engine::default::DefaultEngineBuilder;
-use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
-use crate::object_store::ObjectStoreExt as _;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::schema::{DataType, StructField, StructType};
 use crate::utils::test_utils::Action;
@@ -93,11 +92,11 @@ fn generate_checkpoint_parts(
 }
 
 /// Helper to build a DefaultEngine with multi-thread executor.
-fn new_multi_thread_engine(store: Arc<InMemory>) -> impl Engine {
+fn new_multi_thread_engine(prefixed: PrefixedStore) -> impl Engine {
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
-    DefaultEngineBuilder::new(store)
+    DefaultEngineBuilder::new(prefixed)
         .with_task_executor(executor)
         .build()
 }
@@ -110,7 +109,10 @@ struct ExpectedNonFileContent<'a> {
 }
 
 /// Reads sidecar parquet files from storage and returns all record batches.
-async fn read_sidecar_batches(store: &Arc<InMemory>, sidecar_urls: &[Url]) -> Vec<RecordBatch> {
+async fn read_sidecar_batches(
+    store: &Arc<DynObjectStore>,
+    sidecar_urls: &[Url],
+) -> Vec<RecordBatch> {
     let mut batches = Vec::new();
     for url in sidecar_urls {
         let obj_path = Path::from(url.path().strip_prefix('/').unwrap_or(url.path()));
@@ -289,8 +291,8 @@ fn verify_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedN
 /// action counts correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let (store, _) = test_utils::in_memory_store();
+    let engine = new_multi_thread_engine(PrefixedStore::new(store.clone(), Path::from("")));
 
     write_commit_to_store(
         &store,
@@ -352,8 +354,8 @@ async fn test_generate_sidecars_single_sidecar() -> DeltaResult<()> {
 /// file and non-file batches is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let (store, _) = test_utils::in_memory_store();
+    let engine = new_multi_thread_engine(PrefixedStore::new(store.clone(), Path::from("")));
 
     // Commit 0: v2 protocol + metadata + 3 adds (mixed batch of file and non-file actions)
     write_commit_to_store(
@@ -462,8 +464,8 @@ async fn test_generate_sidecars_multiple_chunks() -> DeltaResult<()> {
 /// Verifies: produces multiple sidecar files, splitter is exhausted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let (store, _) = test_utils::in_memory_store();
+    let engine = new_multi_thread_engine(PrefixedStore::new(store.clone(), Path::from("")));
 
     write_commit_to_store(
         &store,
@@ -532,8 +534,8 @@ async fn test_generate_sidecars_hint_one_per_batch() -> DeltaResult<()> {
 /// 5. Validate the actual values in `stats_parsed` and `partitionValues_parsed` match the input.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let (store, _) = test_utils::in_memory_store();
+    let engine = new_multi_thread_engine(PrefixedStore::new(store.clone(), Path::from("")));
 
     write_commit_to_store(
         &store,
@@ -650,8 +652,8 @@ async fn test_generate_sidecars_stats_and_partition_values() -> DeltaResult<()> 
 /// Verifies: SidecarSplitter yields no file-action rows and buffers all non-file actions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_splitter_no_file_actions() -> DeltaResult<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = new_multi_thread_engine(store.clone());
+    let (store, _) = test_utils::in_memory_store();
+    let engine = new_multi_thread_engine(PrefixedStore::new(store.clone(), Path::from("")));
 
     write_commit_to_store(
         &store,

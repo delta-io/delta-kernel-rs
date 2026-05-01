@@ -11,7 +11,6 @@ use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, Version};
-
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;
 
@@ -484,9 +483,11 @@ pub(crate) mod tests {
     use test_utils::add_commit;
 
     use super::*;
+    use crate::engine::default::storage::PrefixedStore;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
     use crate::utils::test_utils::assert_result_error_with_message;
 
     impl ParsedLogPath<FileMeta> {
@@ -1058,7 +1059,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_read_in_commit_timestamp_success() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine =
+            DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
         let table_root = "memory://test/";
         let table_url = url::Url::parse(table_root).unwrap();
 
@@ -1088,7 +1090,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_read_in_commit_timestamp_missing_ict() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine =
+            DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
         let table_root = "memory://test/";
         let table_url = url::Url::parse(table_root).unwrap();
 

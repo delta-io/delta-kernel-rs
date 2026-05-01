@@ -120,8 +120,10 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
+    use delta_kernel::engine::default::storage::PrefixedStore;
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::path::Path;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::snapshot::Snapshot;
     use delta_kernel::transaction::create_table::create_table;
@@ -167,7 +169,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_final_required_properties_for_uc() {
         let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(PrefixedStore::new(storage, Path::from(""))).build();
         let table_path = "memory:///test_table/";
         let schema = Arc::new(
             StructType::try_new(vec![
@@ -224,7 +226,7 @@ mod tests {
     #[tokio::test]
     async fn test_clustering_columns_serialization_multiple_and_nested() {
         let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(PrefixedStore::new(storage, Path::from(""))).build();
         let table_path = "memory:///test_clustering_ser/";
         let address_struct = StructType::new_unchecked(vec![
             StructField::new("city", DataType::STRING, true),
@@ -275,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_final_required_properties_for_uc_rejects_non_zero_version() {
         let storage = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(PrefixedStore::new(storage, Path::from(""))).build();
         let table_path = "memory:///test_version_check/";
         let schema = Arc::new(
             StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap(),

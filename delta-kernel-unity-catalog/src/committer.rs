@@ -275,8 +275,10 @@ mod tests {
     use std::fs;
 
     use delta_kernel::committer::{CatalogCommit, CommitMetadata};
+    use delta_kernel::engine::default::storage::PrefixedStore;
     use delta_kernel::engine::default::DefaultEngine;
     use delta_kernel::object_store::local::LocalFileSystem;
+    use delta_kernel::object_store::path::Path;
     use delta_kernel::Version;
     use unity_catalog_delta_client_api::error::Result;
 
@@ -317,7 +319,11 @@ mod tests {
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root.clone(), 0);
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine = DefaultEngine::builder(PrefixedStore::new(
+            Arc::new(LocalFileSystem::new()),
+            Path::from(""),
+        ))
+        .build();
 
         // Create the _delta_log directory
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
@@ -350,7 +356,11 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine = DefaultEngine::builder(PrefixedStore::new(
+            Arc::new(LocalFileSystem::new()),
+            Path::from(""),
+        ))
+        .build();
 
         // Pre-create the commit file to trigger a conflict
         let delta_log = tmp_dir.path().join("_delta_log");
@@ -373,7 +383,11 @@ mod tests {
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = CommitMetadata::new_unchecked(table_root, 0).unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine = DefaultEngine::builder(PrefixedStore::new(
+            Arc::new(LocalFileSystem::new()),
+            Path::from(""),
+        ))
+        .build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
         let err = committer
@@ -402,7 +416,11 @@ mod tests {
         )
         .unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine = DefaultEngine::builder(PrefixedStore::new(
+            Arc::new(LocalFileSystem::new()),
+            Path::from(""),
+        ))
+        .build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
         let err = committer
@@ -431,7 +449,11 @@ mod tests {
         )
         .unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine = DefaultEngine::builder(PrefixedStore::new(
+            Arc::new(LocalFileSystem::new()),
+            Path::from(""),
+        ))
+        .build();
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
         let err = committer
@@ -450,7 +472,11 @@ mod tests {
         // Version >= 1 but without catalogManaged feature (simulates downgrade attempt)
         let commit_metadata = CommitMetadata::new_unchecked(table_root, 1).unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine = DefaultEngine::builder(PrefixedStore::new(
+            Arc::new(LocalFileSystem::new()),
+            Path::from(""),
+        ))
+        .build();
 
         let err = committer
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
@@ -467,7 +493,11 @@ mod tests {
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root, 1).with_protocol_change();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine = DefaultEngine::builder(PrefixedStore::new(
+            Arc::new(LocalFileSystem::new()),
+            Path::from(""),
+        ))
+        .build();
 
         let err = committer
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
@@ -484,7 +514,11 @@ mod tests {
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         let commit_metadata = catalog_managed_commit_metadata(table_root, 1).with_metadata_change();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine = DefaultEngine::builder(PrefixedStore::new(
+            Arc::new(LocalFileSystem::new()),
+            Path::from(""),
+        ))
+        .build();
 
         let err = committer
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
@@ -502,7 +536,11 @@ mod tests {
         let commit_metadata =
             catalog_managed_commit_metadata(table_root, 1).with_domain_change("delta.clustering");
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "test-table-id");
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine = DefaultEngine::builder(PrefixedStore::new(
+            Arc::new(LocalFileSystem::new()),
+            Path::from(""),
+        ))
+        .build();
 
         let err = committer
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
@@ -520,7 +558,11 @@ mod tests {
         let commit_metadata = catalog_managed_commit_metadata(table_root, 1);
         // Committer initialized with a different table ID than what's in the metadata
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "different-table-id");
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine = DefaultEngine::builder(PrefixedStore::new(
+            Arc::new(LocalFileSystem::new()),
+            Path::from(""),
+        ))
+        .build();
 
         let err = committer
             .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
@@ -582,7 +624,11 @@ mod tests {
         // ===== WHEN =====
         let publish_metadata = PublishMetadata::try_new(12, catalog_commits).unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "testUcTableId");
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine = DefaultEngine::builder(PrefixedStore::new(
+            Arc::new(LocalFileSystem::new()),
+            Path::from(""),
+        ))
+        .build();
         committer.publish(&engine, publish_metadata).unwrap();
 
         // ===== THEN =====

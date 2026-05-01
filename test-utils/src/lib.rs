@@ -22,8 +22,8 @@ use delta_kernel::engine::default::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
 use delta_kernel::engine::default::executor::TaskExecutor;
-use delta_kernel::engine::default::storage::store_from_url;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::engine::default::storage::PrefixedStore;
+use delta_kernel::engine::default::{storage, DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::memory::InMemory;
@@ -91,6 +91,22 @@ pub fn copy_directory(
     }
 
     Ok(())
+}
+
+/// Construct a fresh in-memory object store paired with the table-root URL `memory:///`.
+///
+/// `InMemory` URLs have no scoping authority, so callers should pair this store with an
+/// empty path prefix when constructing a `PrefixedStore` (e.g.
+/// `PrefixedStore::new(store, Path::from(""))`). Returning the raw store rather than a
+/// `PrefixedStore` lets `delta_kernel`'s in-tree unit tests and external integration tests
+/// each wrap with their own copy of the type, avoiding the `delta_kernel`-version mismatch
+/// that arises from cyclic dev-dependencies.
+///
+/// Callers that need the `_delta_log/` URL can `.join("_delta_log/")` on the returned URL.
+pub fn in_memory_store() -> (Arc<DynObjectStore>, Url) {
+    let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+    let url = Url::parse("memory:///").expect("memory:/// is a valid URL");
+    (store, url)
 }
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
@@ -338,8 +354,9 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
 pub fn create_default_engine(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
-    let store = store_from_url(table_root)?;
-    Ok(Arc::new(DefaultEngineBuilder::new(store).build()))
+    Ok(Arc::new(
+        DefaultEngineBuilder::new(storage::store_from_url(table_root)?).build(),
+    ))
 }
 
 /// Helper to create a DefaultEngine with the default executor for tests.
@@ -348,12 +365,11 @@ pub fn create_default_engine(
 pub fn create_default_engine_mt_executor(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioMultiThreadExecutor>>> {
-    let store = store_from_url(table_root)?;
     let task_executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
     Ok(Arc::new(
-        DefaultEngineBuilder::new(store)
+        DefaultEngineBuilder::new(storage::store_from_url(table_root)?)
             .with_task_executor(task_executor)
             .build(),
     ))
@@ -429,7 +445,8 @@ pub fn engine_store_setup(
             Url::parse(format!("{dir}{table_name}/").as_str()).expect("valid url"),
         ),
     };
-    let engine = DefaultEngineBuilder::new(Arc::clone(&storage)).build();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(Arc::clone(&storage), Path::from(""))).build();
 
     (storage, engine, url)
 }

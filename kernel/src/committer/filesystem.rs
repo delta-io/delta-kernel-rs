@@ -6,7 +6,6 @@ use super::commit_types::{CommitMetadata, CommitResponse};
 use super::publish_types::PublishMetadata;
 use super::Committer;
 use crate::{DeltaResult, Engine, Error, FileMeta, FilteredEngineData};
-
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
 /// commits to a file system directly via `Engine::json_handler().write_json_file` for
 /// non-catalog-managed tables.
@@ -93,6 +92,7 @@ mod tests {
     use super::*;
     use crate::actions::{Metadata, Protocol};
     use crate::committer::{CommitProtocolMetadata, CommitType};
+    use crate::engine::default::storage::PrefixedStore;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
@@ -103,7 +103,8 @@ mod tests {
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine =
+            DefaultEngineBuilder::new(PrefixedStore::new(storage.clone(), Path::from(""))).build();
 
         let actions = [
             r#"{"commitInfo":{"timestamp":12345678900,"inCommitTimestamp":12345678900}}"#,
@@ -135,7 +136,7 @@ mod tests {
     async fn test_filesystem_committer_returns_valid_commit_response() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(PrefixedStore::new(storage, Path::from(""))).build();
 
         let committer = FileSystemCommitter::new();
         let log_root = LogRoot::new(table_root).unwrap();
@@ -172,7 +173,7 @@ mod tests {
     async fn test_filesystem_committer_returns_conflict_for_existing_version() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
-        let engine = DefaultEngineBuilder::new(storage).build();
+        let engine = DefaultEngineBuilder::new(PrefixedStore::new(storage, Path::from(""))).build();
 
         let committer = FileSystemCommitter::new();
         let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
