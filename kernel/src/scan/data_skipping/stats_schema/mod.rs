@@ -414,6 +414,8 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
             | &PrimitiveType::TimestampNtz
             | &PrimitiveType::String
             | PrimitiveType::Decimal(_)
+            | PrimitiveType::Geometry(_)
+            | PrimitiveType::Geography(_)
     )
 }
 

@@ -213,6 +213,9 @@ impl Scalar {
                     "Variant is not supported as scalar yet.",
                 ));
             }
+            DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+                append_nulls_as!(array::BinaryBuilder)
+            }
         }
         Ok(())
     }

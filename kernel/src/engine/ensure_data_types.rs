@@ -9,7 +9,7 @@ use itertools::Itertools;
 use super::arrow_conversion::TryIntoArrow as _;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit};
 use crate::engine::arrow_utils::make_arrow_error;
-use crate::schema::{DataType, MetadataValue, StructField};
+use crate::schema::{DataType, MetadataValue, PrimitiveType, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -89,6 +89,12 @@ impl EnsureDataTypes {
             | (&DataType::BINARY, ArrowDataType::LargeBinary)
             | (&DataType::BINARY, ArrowDataType::BinaryView)
             | (&DataType::BINARY, ArrowDataType::Binary) => Ok(DataTypeCompat::Identical),
+            // Geometry and Geography values are stored as WKB bytes in a Binary array; the
+            // kernel schema carries the geo annotation while the physical Arrow type is Binary.
+            (
+                DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)),
+                ArrowDataType::Binary | ArrowDataType::LargeBinary | ArrowDataType::BinaryView,
+            ) => Ok(DataTypeCompat::Identical),
             (DataType::Array(inner_type), ArrowDataType::List(arrow_list_field))
             | (DataType::Array(inner_type), ArrowDataType::LargeList(arrow_list_field))
             | (DataType::Array(inner_type), ArrowDataType::ListView(arrow_list_field))
