@@ -821,7 +821,7 @@ async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn st
         .unwrap_err()
         .to_string();
     assert!(
-        msg.contains("ALTER TABLE is not supported on tables with icebergCompatV3 enabled"),
+        msg.contains("ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled"),
         "unexpected error: {msg}",
     );
 
