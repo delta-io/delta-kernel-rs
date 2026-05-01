@@ -614,7 +614,9 @@ mod tests {
     use tempfile::tempdir;
     use test_utils::{set_json_value, setup_test_tables, test_read};
     use write_context::{
-        free_write_context, get_unpartitioned_write_context, get_write_path, get_write_schema,
+        create_table_get_unpartitioned_write_context, free_write_context, get_logical_to_physical,
+        get_physical_write_schema, get_unpartitioned_write_context, get_write_path,
+        get_write_schema,
     };
 
     use super::*;
@@ -1517,6 +1519,84 @@ mod tests {
         assert!(config.is_feature_enabled(&TableFeature::AppendOnly));
 
         unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+    }
+
+    /// Verifies that the FFI write-context accessors needed to write a column-mapping table --
+    /// `get_write_schema` (logical), `get_physical_write_schema` (physical names + parquet
+    /// field IDs), and `get_logical_to_physical` (transform expression) -- produce a
+    /// physical schema whose field names differ from the logical names and a non-null
+    /// transform expression handle. Together these are what an FFM-side engine must thread
+    /// through its evaluator + parquet writer to write a CM-enabled table.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_cm_write_context_accessors() {
+        use crate::expressions::free_kernel_expression;
+
+        let tmp_dir = tempdir().unwrap();
+        let (_table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("name", DataType::STRING),
+            ],
+        );
+
+        // Enable column mapping in name mode. Kernel will assign physical names like
+        // `col-<uuid>` to every field during build.
+        let cm_key = "delta.columnMapping.mode";
+        let cm_val = "name";
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_table_property(
+                builder,
+                kernel_string_slice!(cm_key),
+                kernel_string_slice!(cm_val),
+                engine.shallow_copy(),
+            )
+        });
+
+        // Build the create-table transaction (do not commit -- we only need the WriteContext).
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+
+        let write_context = ok_or_panic(unsafe {
+            create_table_get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+        });
+
+        // Logical schema retains user-facing names.
+        let logical = unsafe { get_write_schema(write_context.shallow_copy()) };
+        let logical_ref = unsafe { logical.as_ref() };
+        assert_eq!(logical_ref.num_fields(), 2);
+        assert_eq!(logical_ref.field_at_index(0).unwrap().name, "id");
+        assert_eq!(logical_ref.field_at_index(1).unwrap().name, "name");
+
+        // Physical schema has CM-assigned `col-<uuid>` names. Distinct from logical names.
+        let physical = unsafe { get_physical_write_schema(write_context.shallow_copy()) };
+        let physical_ref = unsafe { physical.as_ref() };
+        assert_eq!(physical_ref.num_fields(), 2);
+        let phys_id = &physical_ref.field_at_index(0).unwrap().name;
+        let phys_name = &physical_ref.field_at_index(1).unwrap().name;
+        assert!(
+            phys_id.starts_with("col-"),
+            "expected CM physical name prefix `col-`, got {phys_id}"
+        );
+        assert!(
+            phys_name.starts_with("col-"),
+            "expected CM physical name prefix `col-`, got {phys_name}"
+        );
+        assert_ne!(phys_id, "id");
+        assert_ne!(phys_name, "name");
+
+        // Logical-to-physical transform handle is reachable; the kernel-built expression
+        // currently only drops partition columns. We do not evaluate it here -- the rename
+        // is carried by the physical schema above.
+        let l2p = unsafe { get_logical_to_physical(write_context.shallow_copy()) };
+
+        unsafe { free_kernel_expression(l2p) };
+        unsafe { free_schema(physical) };
+        unsafe { free_schema(logical) };
+        unsafe { free_write_context(write_context) };
+        unsafe { create_table_free_transaction(txn) };
         unsafe { free_engine(engine) };
     }
 
