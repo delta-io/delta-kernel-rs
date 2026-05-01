@@ -1,0 +1,2 @@
+{"commitInfo":{"timestamp":1776720409227,"engineInfo":"Kernel-4.2.0-SNAPSHOT/test-engine","operation":"WRITE","operationParameters":{},"isBlindAppend":false,"txnId":"b6308213-dd5c-4e43-a655-8d3781705d2c","operationMetrics":{}}}
+{"add":{"path":"part-4.parquet","partitionValues":{},"size":1000,"modificationTime":0,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{},\"maxValues\":{},\"nullCount\":{}}"}}
