@@ -1255,7 +1255,7 @@ impl<S> Transaction<S> {
         }
 
         let input_schema = scan_row_schema();
-        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema())?;
+        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema());
         let evaluation_handler = engine.evaluation_handler();
 
         let make_eval = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {

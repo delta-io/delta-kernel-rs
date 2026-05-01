@@ -843,7 +843,7 @@ fn test_prefix_columns_simple() {
     };
     // A simple binary predicate: x > 100
     let pred = Pred::gt(column_expr!("x"), Expr::literal(100i64));
-    let result = prefixer.transform_pred(&pred).unwrap().into_owned();
+    let result = prefixer.transform_pred(&pred).into_owned();
 
     // The column reference should now be add.stats_parsed.x
     let refs: Vec<_> = result.references().into_iter().collect();
@@ -1041,12 +1041,7 @@ fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
     let mut prefixer = PrefixColumns {
         prefix: ColumnName::new(["add", "stats_parsed"]),
     };
-    Some(
-        prefixer
-            .transform_pred(&skipping_pred)
-            .unwrap()
-            .into_owned(),
-    )
+    Some(prefixer.transform_pred(&skipping_pred).into_owned())
 }
 
 /// Applies a meta predicate as a row group filter and returns the total rows read.
