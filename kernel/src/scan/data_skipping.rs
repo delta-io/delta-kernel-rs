@@ -311,26 +311,6 @@ impl DataSkippingFilter {
     }
 }
 
-/// Rewrites a predicate for parquet row group skipping in checkpoint/sidecar files.
-/// Returns `None` if the predicate is not eligible for data skipping.
-///
-/// Adds IS NULL guards on each stat column reference so the parquet RowGroupFilter
-/// conservatively keeps row groups containing files with missing stats (null stat values
-/// are invisible to footer min/max). For example, `col_a > 100` becomes:
-/// ```text
-/// OR(maxValues.col_a IS NULL, maxValues.col_a > 100)
-/// ```
-///
-/// Partition columns are excluded since their values live in `add.partitionValues_parsed`,
-/// not `add.stats_parsed`.
-pub(crate) fn as_checkpoint_skipping_predicate(
-    pred: &Pred,
-    partition_columns: &[String],
-) -> Option<Pred> {
-    let partition_columns: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
-    NullGuardedDataSkippingPredicateCreator { partition_columns }.eval(pred)
-}
-
 /// Maps an ordering and inversion flag to the corresponding comparison predicate.
 fn comparison_predicate(ord: Ordering, col: Expr, val: &Scalar, inverted: bool) -> Pred {
     let pred_fn = match (ord, inverted) {
@@ -375,13 +355,8 @@ fn collect_junction_preds(
 /// 999us from the comparison value to avoid incorrectly pruning files whose actual max may be
 /// higher than the stored (truncated) max.
 ///
-/// For example, if a file's actual max is `4_000_500us` (4.000500s), Spark truncates the
-/// stored max stat to `4_000_000us` (4.000s). A predicate `ts > 4_000_400` would incorrectly
-/// prune this file by comparing against the truncated max. By adjusting the comparison value
-/// to `4_000_400 - 999 = 3_999_401`, we ensure the file is kept.
-///
 /// Non-timestamp values pass through unchanged.
-fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Scalar {
+fn adjust_stats_for_truncation(val: &Scalar) -> Scalar {
     match val {
         Scalar::Timestamp(micros) => Scalar::Timestamp(micros.saturating_sub(999)),
         Scalar::TimestampNtz(micros) => Scalar::TimestampNtz(micros.saturating_sub(999)),
@@ -447,7 +422,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     /// Compares a column's max stat against a literal value, adjusting for timestamp
     /// truncation on non-partition columns. Partition values are exact and not subject to
     /// JSON stats truncation, so no adjustment is needed. For data columns, the comparison
-    /// value is adjusted by [`adjust_scalar_for_max_stat_truncation`].
+    /// value is adjusted by [`adjust_stats_for_truncation`].
     fn partial_cmp_max_stat(
         &self,
         col: &ColumnName,
@@ -459,7 +434,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         if self.is_partition_column(col) {
             return self.eval_partial_cmp(ord, max, val, inverted);
         }
-        let adjusted = adjust_scalar_for_max_stat_truncation(val);
+        let adjusted = adjust_stats_for_truncation(val);
         self.eval_partial_cmp(ord, max, &adjusted, inverted)
     }
 
@@ -546,164 +521,6 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         op.as_data_skipping_predicate(self, exprs, inverted)
     }
 
-    fn finish_eval_pred_junction(
-        &self,
-        op: JunctionPredicateOp,
-        preds: &mut dyn Iterator<Item = Option<Pred>>,
-        inverted: bool,
-    ) -> Option<Pred> {
-        Some(collect_junction_preds(op, preds, inverted))
-    }
-}
-
-/// Like [`DataSkippingPredicateCreator`] but adds IS NULL guards on stat column references
-/// for safe parquet row group filtering. Partition columns are excluded since their values
-/// live in `add.partitionValues_parsed`, not `add.stats_parsed`.
-struct NullGuardedDataSkippingPredicateCreator<'a> {
-    partition_columns: HashSet<&'a str>,
-}
-
-impl NullGuardedDataSkippingPredicateCreator<'_> {
-    /// Returns true if the column is a partition column (no stats in `stats_parsed`).
-    fn is_partition_column(&self, col: &ColumnName) -> bool {
-        let path = col.path();
-        path.len() == 1 && self.partition_columns.contains(path[0].as_str())
-    }
-}
-
-impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<'_> {
-    type Output = Pred;
-    type ColumnStat = Expr;
-
-    // These stat methods produce unprefixed column references (e.g. `minValues.col`) because
-    // the checkpoint skipping path applies its own `add.stats_parsed` prefix afterward.
-    // Partition columns return None since their values live in `add.partitionValues_parsed`.
-
-    fn get_min_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
-        if self.is_partition_column(col) {
-            return None;
-        }
-        Some(joined_column_expr!("minValues", col))
-    }
-
-    fn get_max_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
-        if self.is_partition_column(col) {
-            return None;
-        }
-        Some(joined_column_expr!("maxValues", col))
-    }
-
-    fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Expr> {
-        if self.is_partition_column(col) {
-            return None;
-        }
-        Some(joined_column_expr!("nullCount", col))
-    }
-
-    fn get_rowcount_stat(&self) -> Option<Expr> {
-        Some(column_expr!("numRecords"))
-    }
-
-    /// Compares a column's max stat against a literal value, adjusting for timestamp
-    /// truncation. See [`adjust_scalar_for_max_stat_truncation`].
-    ///
-    /// No partition column guard needed: `get_max_stat` returns `None` for partition columns,
-    /// so their exact values never reach the adjustment.
-    fn partial_cmp_max_stat(
-        &self,
-        col: &ColumnName,
-        val: &Scalar,
-        ord: Ordering,
-        inverted: bool,
-    ) -> Option<Pred> {
-        let max = self.get_max_stat(col, &val.data_type())?;
-        let adjusted = adjust_scalar_for_max_stat_truncation(val);
-        self.eval_partial_cmp(ord, max, &adjusted, inverted)
-    }
-
-    /// Wraps a stat column comparison with an IS NULL guard.
-    ///
-    /// `col > 100` → `OR(maxValues.col IS NULL, maxValues.col > 100)`
-    ///
-    /// `col = 100` (calls this twice, once per stat):
-    /// ```text
-    /// AND(
-    ///   OR(minValues.col IS NULL, minValues.col <= 100),
-    ///   OR(maxValues.col IS NULL, maxValues.col >= 100)
-    /// )
-    /// ```
-    fn eval_partial_cmp(
-        &self,
-        ord: Ordering,
-        col: Expr,
-        val: &Scalar,
-        inverted: bool,
-    ) -> Option<Pred> {
-        let comparison = comparison_predicate(ord, col.clone(), val, inverted);
-        Some(Pred::or(Pred::is_null(col), comparison))
-    }
-
-    /// No guard needed — no stat column reference. `TRUE` → `Some(true)`.
-    fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
-        KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted).map(Pred::literal)
-    }
-
-    /// No guard needed — no stat column reference. `NULL IS NULL` → `Some(true)`.
-    fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
-        KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Pred::literal)
-    }
-
-    /// IS NULL guard on nullCount stat.
-    ///
-    /// `IS NULL` → `OR(nullCount.col IS NULL, nullCount.col != 0)`:
-    /// column vs literal — RowGroupFilter can evaluate via footer stats.
-    ///
-    /// `IS NOT NULL` → returns `None`. The unguarded version produces
-    /// `nullCount.col != numRecords`, which is column vs column. The RowGroupFilter can
-    /// only resolve one column at a time, so it can never prune with this predicate.
-    // TODO(#1873): IS NOT NULL pruning requires cross-column range comparison in RowGroupFilter.
-    // Skippable when the nullCount and numRecords ranges don't overlap (e.g. nullCount in
-    // [0, 0] vs numRecords in [500, 2000] proves all files have non-null values).
-    fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
-        if inverted {
-            return None; // IS NOT NULL: column vs column, can't prune (#1873)
-        }
-        let nullcount = self.get_nullcount_stat(col)?;
-        let comparison = Pred::ne(nullcount.clone(), Expr::literal(0i64));
-        Some(Pred::or(Pred::is_null(nullcount), comparison))
-    }
-
-    /// No guard needed — no stat column reference. `5 < 10` → `Some(true)`.
-    fn eval_pred_binary_scalars(
-        &self,
-        op: BinaryPredicateOp,
-        left: &Scalar,
-        right: &Scalar,
-        inverted: bool,
-    ) -> Option<Pred> {
-        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
-            .map(Pred::literal)
-    }
-
-    /// Unsupported. Opaque predicates can construct stat column references directly,
-    /// bypassing IS NULL guards and risking false pruning. Returns `None` to conservatively
-    /// drop these from the skipping predicate.
-    fn eval_pred_opaque(
-        &self,
-        _op: &OpaquePredicateOpRef,
-        _exprs: &[Expr],
-        _inverted: bool,
-    ) -> Option<Pred> {
-        None
-    }
-
-    /// Combines sub-predicates with AND/OR. `col_a > 100 AND col_b < 50` →
-    /// ```text
-    /// AND(
-    ///   OR(maxValues.col_a IS NULL, maxValues.col_a > 100),
-    ///   OR(minValues.col_b IS NULL, minValues.col_b < 50)
-    /// )
-    /// ```
     fn finish_eval_pred_junction(
         &self,
         op: JunctionPredicateOp,

@@ -75,6 +75,7 @@ extern crate self as delta_kernel;
 
 use std::any::Any;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fs::DirEntry;
 use std::ops::Range;
 use std::sync::Arc;
@@ -848,6 +849,45 @@ pub trait ParquetHandler: AsAny {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
+
+    /// Reads checkpoint or sidecar parquet files with checkpoint-aware row group skipping.
+    ///
+    /// Checkpoint files store per-file statistics as nested parquet columns (e.g.
+    /// `add.stats_parsed.minValues.x`). The parquet footer aggregates these across all files
+    /// in a row group. Unlike data file statistics, these aggregates can be misleading when
+    /// some files are missing statistics (null stat values are invisible to footer min/max).
+    ///
+    /// # Parameters
+    /// - `predicate`: user data predicate with physical column names (e.g. `x > 10`, or
+    ///   `col-abc-123 > 10` under column mapping). Evaluated against checkpoint-internal stat
+    ///   columns (`add.stats_parsed.*`, `add.partitionValues_parsed.*`).
+    /// - `partition_columns`: physical names of the table's partition columns, used to distinguish
+    ///   partition-value stats from data column stats.
+    ///
+    /// The default implementation falls back to [`read_parquet_files`](Self::read_parquet_files)
+    /// without any predicate: the user `predicate` uses bare physical column names that can
+    /// alias Delta action leaves in the checkpoint parquet schema (e.g. a user column path
+    /// `protocol.minReaderVersion` collides with the protocol action's field), so forwarding
+    /// it to an engine that performs row group filtering would risk false pruning. The
+    /// `partition_columns` is also dropped. Engines that want row group skipping on checkpoints
+    /// should override this method.
+    ///
+    /// Engines that want additional pruning of row groups containing no rows of the caller's
+    /// action types of interest (e.g. `protocol`/`metaData` replay, `txn` lookup) can derive an
+    /// IS NOT NULL predicate from the read schema via
+    /// `log_segment::checkpoint_action_identifier_predicate` and apply it as a secondary
+    /// row-group filter. This MUST be applied independently from `predicate` to avoid aliasing
+    /// user column paths to Delta action leaves.
+    fn read_checkpoint_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        partition_columns: &HashSet<String>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        let _ = (predicate, partition_columns);
+        self.read_parquet_files(files, physical_schema, None)
+    }
 
     /// Write data to a Parquet file at the specified URL.
     ///

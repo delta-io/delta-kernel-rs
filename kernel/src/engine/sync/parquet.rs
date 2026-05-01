@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::sync::Arc;
 
@@ -10,8 +11,9 @@ use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
     RowIndexBuilder,
 };
-use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::engine::parquet_row_group_skipping::{CheckpointReadCtx, ParquetRowGroupSkipping};
 use crate::engine::{reader_options, writer_options};
+use crate::log_segment::checkpoint_action_identifier_predicate;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
@@ -22,10 +24,11 @@ use crate::{
 
 pub(crate) struct SyncParquetHandler;
 
-fn try_create_from_parquet(
+fn try_create_from_parquet_inner(
     file: File,
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
+    checkpoint_ctx: Option<CheckpointReadCtx>,
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
@@ -43,8 +46,19 @@ fn try_create_from_parquet(
         .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
     // Filter row groups and row indexes if a predicate is provided
-    if let Some(predicate) = predicate {
-        builder = builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut());
+    match (predicate.as_deref(), &checkpoint_ctx) {
+        (pred, Some(ctx)) if pred.is_some() || ctx.action_predicate.is_some() => {
+            builder = builder.with_checkpoint_row_group_filter(
+                pred,
+                ctx.action_predicate.as_deref(),
+                &ctx.partition_columns,
+                row_indexes.as_mut(),
+            );
+        }
+        (Some(pred), None) => {
+            builder = builder.with_row_group_filter(pred, row_indexes.as_mut());
+        }
+        _ => {}
     }
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
@@ -67,7 +81,25 @@ impl ParquetHandler for SyncParquetHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        read_files(files, schema, predicate, try_create_from_parquet)
+        read_files(files, schema, predicate, |file, schema, pred, loc| {
+            try_create_from_parquet_inner(file, schema, pred, None, loc)
+        })
+    }
+
+    fn read_checkpoint_parquet_files(
+        &self,
+        files: &[FileMeta],
+        schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        partition_columns: &HashSet<String>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        let ctx = CheckpointReadCtx {
+            action_predicate: checkpoint_action_identifier_predicate(&schema),
+            partition_columns: Arc::new(partition_columns.clone()),
+        };
+        read_files(files, schema, predicate, move |file, schema, pred, loc| {
+            try_create_from_parquet_inner(file, schema, pred, Some(ctx.clone()), loc)
+        })
     }
 
     /// Writes engine data to a Parquet file at the specified location.

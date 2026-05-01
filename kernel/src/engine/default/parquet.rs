@@ -1,6 +1,6 @@
 //! Default Parquet handler implementation
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -21,9 +21,10 @@ use crate::engine::arrow_utils::{
     RowIndexBuilder,
 };
 use crate::engine::default::executor::TaskExecutor;
-use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::engine::parquet_row_group_skipping::{CheckpointReadCtx, ParquetRowGroupSkipping as _};
 use crate::engine::{reader_options, writer_options};
 use crate::expressions::ColumnName;
+use crate::log_segment::checkpoint_action_identifier_predicate;
 use crate::metrics::emit_parquet_read_completed;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
@@ -238,12 +239,17 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     }
 }
 
-/// Internal async implementation of read_parquet_files
+/// Internal async implementation of read_parquet_files and read_checkpoint_parquet_files.
+///
+/// When `checkpoint_ctx` is `Some`, files are read as checkpoint/sidecar files using
+/// [`CheckpointRowGroupFilter`] for row group skipping. When `None`, files are read as data files
+/// using the standard [`RowGroupFilter`].
 async fn read_parquet_files_impl(
     store: Arc<DynObjectStore>,
     files: Vec<FileMeta>,
     physical_schema: SchemaRef,
     predicate: Option<PredicateRef>,
+    checkpoint_ctx: Option<CheckpointReadCtx>,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
@@ -264,6 +270,7 @@ async fn read_parquet_files_impl(
             1024,
             physical_schema.clone(),
             predicate,
+            checkpoint_ctx.clone(),
         ));
         let stream = FileStream::new(files, arrow_schema, file_opener)?.map_ok(
             |record_batch| -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch)) },
@@ -276,11 +283,13 @@ async fn read_parquet_files_impl(
         let store = store.clone();
         let schema = physical_schema.clone();
         let predicate = predicate.clone();
+        let checkpoint_ctx = checkpoint_ctx.clone();
         async move {
             open_parquet_file(
                 store,
                 schema,
                 predicate,
+                checkpoint_ctx,
                 None,
                 super::DEFAULT_BATCH_SIZE,
                 file,
@@ -313,6 +322,43 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             files.to_vec(),
             physical_schema,
             predicate,
+            None,
+        );
+        let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        Ok(Box::new(super::ReadMetricsIterator::new(
+            inner,
+            num_files,
+            bytes_read,
+            emit_parquet_read_completed,
+        )))
+    }
+
+    /// Reads checkpoint or sidecar parquet files using `CheckpointRowGroupFilter` for row group
+    /// skipping. See `ParquetHandler::read_checkpoint_parquet_files` for the full contract.
+    ///
+    /// Derives an action-identifier IS NOT NULL predicate from the read schema (via
+    /// `checkpoint_action_identifier_predicate`) and applies it as a secondary row-group
+    /// filter -- this lets row groups with no rows of the caller's action types of interest be
+    /// skipped (e.g. snapshot init reading `protocol`+`metaData`).
+    fn read_checkpoint_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        partition_columns: &HashSet<String>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        let num_files = files.len() as u64;
+        let bytes_read = files.iter().map(|f| f.size).sum();
+        let ctx = CheckpointReadCtx {
+            action_predicate: checkpoint_action_identifier_predicate(&physical_schema),
+            partition_columns: Arc::new(partition_columns.clone()),
+        };
+        let future = read_parquet_files_impl(
+            self.store.clone(),
+            files.to_vec(),
+            physical_schema,
+            predicate,
+            Some(ctx),
         );
         let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(Box::new(super::ReadMetricsIterator::new(
@@ -407,11 +453,16 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     }
 }
 
-/// Opens a Parquet file and returns a stream of record batches
+/// Opens a Parquet file and returns a stream of record batches.
+///
+/// When `checkpoint_ctx` is `Some`, the file is treated as a checkpoint or sidecar file and the
+/// predicate is evaluated using [`CheckpointRowGroupFilter`] which maps bare column names to the
+/// checkpoint's nested `add.stats_parsed.*` layout and null-guards unreliable stats.
 async fn open_parquet_file(
     store: Arc<DynObjectStore>,
     table_schema: SchemaRef,
     predicate: Option<PredicateRef>,
+    checkpoint_ctx: Option<CheckpointReadCtx>,
     limit: Option<usize>,
     batch_size: usize,
     file_meta: FileMeta,
@@ -465,8 +516,19 @@ async fn open_parquet_file(
         .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
     // Filter row groups and row indexes if a predicate is provided
-    if let Some(ref predicate) = predicate {
-        builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
+    match (predicate.as_deref(), &checkpoint_ctx) {
+        (pred, Some(ctx)) if pred.is_some() || ctx.action_predicate.is_some() => {
+            builder = builder.with_checkpoint_row_group_filter(
+                pred,
+                ctx.action_predicate.as_deref(),
+                &ctx.partition_columns,
+                row_indexes.as_mut(),
+            );
+        }
+        (Some(pred), None) => {
+            builder = builder.with_row_group_filter(pred, row_indexes.as_mut());
+        }
+        _ => {}
     }
     if let Some(limit) = limit {
         builder = builder.with_limit(limit)
@@ -493,6 +555,7 @@ async fn open_parquet_file(
 struct PresignedUrlOpener {
     batch_size: usize,
     predicate: Option<PredicateRef>,
+    checkpoint_ctx: Option<CheckpointReadCtx>,
     limit: Option<usize>,
     table_schema: SchemaRef,
     client: reqwest::Client,
@@ -503,11 +566,13 @@ impl PresignedUrlOpener {
         batch_size: usize,
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
+        checkpoint_ctx: Option<CheckpointReadCtx>,
     ) -> Self {
         Self {
             batch_size,
             table_schema: schema,
             predicate,
+            checkpoint_ctx,
             limit: None,
             client: reqwest::Client::new(),
         }
@@ -519,6 +584,7 @@ impl FileOpener for PresignedUrlOpener {
         let batch_size = self.batch_size;
         let table_schema = self.table_schema.clone();
         let predicate = self.predicate.clone();
+        let checkpoint_ctx = self.checkpoint_ctx.clone();
         let limit = self.limit;
         let client = self.client.clone(); // uses Arc internally according to reqwest docs
         let file_location = file_meta.location.to_string();
@@ -547,9 +613,22 @@ impl FileOpener for PresignedUrlOpener {
             let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
                 .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
-            // Filter row groups and row indexes if a predicate is provided
-            if let Some(ref predicate) = predicate {
-                builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
+            // Filter row groups and row indexes if a predicate is provided. Route through the
+            // checkpoint-aware filter when reading checkpoint/sidecar files so we don't alias
+            // user predicate columns to Delta action leaves in the parquet schema.
+            match (predicate.as_deref(), &checkpoint_ctx) {
+                (pred, Some(ctx)) if pred.is_some() || ctx.action_predicate.is_some() => {
+                    builder = builder.with_checkpoint_row_group_filter(
+                        pred,
+                        ctx.action_predicate.as_deref(),
+                        &ctx.partition_columns,
+                        row_indexes.as_mut(),
+                    );
+                }
+                (Some(pred), None) => {
+                    builder = builder.with_row_group_filter(pred, row_indexes.as_mut());
+                }
+                _ => {}
             }
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
@@ -623,6 +702,7 @@ mod tests {
         let stream = open_parquet_file(
             store,
             Arc::new(physical_schema.try_into_kernel().unwrap()),
+            None,
             None,
             None,
             DEFAULT_BATCH_SIZE,
