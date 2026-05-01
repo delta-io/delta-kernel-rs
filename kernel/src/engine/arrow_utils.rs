@@ -23,7 +23,9 @@ use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder,
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::ensure_data_types::DataTypeCompat;
+use crate::engine::parse_json_geo;
 use crate::engine_data::FilteredEngineData;
+use crate::geoarrow_schema::GeoArrowType;
 use crate::parquet::arrow::{ProjectionMask, PARQUET_FIELD_ID_META_KEY};
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::schema::types::SchemaDescriptor;
@@ -393,15 +395,26 @@ pub(crate) fn coerce_batch_nullability(
                             )));
                         }
                     }
-                    let coerced_field = if src_field.is_nullable() == target_field.is_nullable() {
-                        src_field.clone()
-                    } else {
-                        Arc::new(
+
+                    // At this point, the fields should be identical other than nullability, and geo-related metadata (for geo types only)
+                    // We want to return a field with the target field nullability (and geo-related metadata if present)
+                    let coerced_field = match GeoArrowType::try_from(target_field.as_ref()) {
+                        Ok(GeoArrowType::Wkb(wkb_type)) => Arc::new(
+                            src_field
+                                .as_ref()
+                                .clone()
+                                .with_nullable(target_field.is_nullable())
+                                .with_extension_type(wkb_type),
+                        ),
+                        _ if src_field.is_nullable() == target_field.is_nullable() => {
+                            src_field.clone()
+                        }
+                        _ => Arc::new(
                             src_field
                                 .as_ref()
                                 .clone()
                                 .with_nullable(target_field.is_nullable()),
-                        )
+                        ),
                     };
                     return Ok((src_column, coerced_field));
                 }
@@ -1388,7 +1401,16 @@ pub(crate) fn parse_json_impl(
         return Ok(RecordBatch::new_empty(schema));
     }
 
-    let mut decoder = ReaderBuilder::new(schema.clone())
+    // Geo fields are Binary in the schema but on-disk JSON stats encode geometry bounds as
+    // WKT strings, so swap geo leaves to Utf8 for decoding and convert back to WKB after.
+    let (temp_schema, has_geo) = parse_json_geo::replace_geo_fields_with_utf8(&schema);
+    let temp_schema = if has_geo {
+        Arc::new(temp_schema)
+    } else {
+        schema.clone()
+    };
+
+    let mut decoder = ReaderBuilder::new(temp_schema)
         .with_batch_size(json_strings.len())
         .with_coerce_primitive(true)
         .build_decoder()?;
@@ -1418,6 +1440,11 @@ pub(crate) fn parse_json_impl(
                 json_strings.len()
             )));
         }
+        let batch = if has_geo {
+            parse_json_geo::convert_geo_columns(batch, &schema)?
+        } else {
+            batch
+        };
         return Ok(batch);
     }
     Err(Error::generic(
@@ -4460,5 +4487,181 @@ mod tests {
                 ReorderIndex::missing(1, expected_empty_field),
             ]
         );
+    }
+
+    #[cfg(feature = "arrow-conversion")]
+    #[test]
+    fn test_parse_json_impl_converts_wkt_to_wkb_for_geo_fields() {
+        use crate::geoarrow_schema::{GeoArrowType, Metadata, WkbType};
+
+        let geo_metadata = Arc::new(Metadata::new(
+            crate::geoarrow_schema::crs::Crs::from_srid("OGC:CRS84".to_string()),
+            None,
+        ));
+        let wkb_field = GeoArrowType::Wkb(WkbType::new(geo_metadata)).to_field("geom", true);
+
+        // Shape: { minValues: { geom: geoarrow.wkb } }
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "minValues",
+            ArrowDataType::Struct(ArrowFields::from(vec![wkb_field])),
+            true,
+        )]));
+
+        // Valid WKT string produces non-null WKB binary
+        let input: Vec<Option<&str>> = vec![Some(r#"{"minValues":{"geom":"POINT(1.0 2.0)"}}"#)];
+        let batch = parse_json_impl(&input.into(), schema.clone()).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let min_values = batch.column(0).as_struct();
+        let geom_col = min_values.column(0);
+        assert_eq!(
+            *geom_col.data_type(),
+            ArrowDataType::Binary,
+            "geo field should be Binary (WKB), not Utf8"
+        );
+        assert!(!geom_col.is_null(0), "WKB value should not be null");
+        let binary_array = geom_col
+            .as_any()
+            .downcast_ref::<crate::arrow::array::BinaryArray>()
+            .expect("should be BinaryArray");
+        assert!(
+            !binary_array.value(0).is_empty(),
+            "WKB bytes should be non-empty"
+        );
+
+        // Missing geom field produces a null entry
+        let input: Vec<Option<&str>> = vec![Some(r#"{"minValues":{}}"#)];
+        let batch = parse_json_impl(&input.into(), schema.clone()).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let min_values = batch.column(0).as_struct();
+        let geom_col = min_values.column(0);
+        assert_eq!(*geom_col.data_type(), ArrowDataType::Binary);
+        assert!(geom_col.is_null(0), "missing geom should produce null");
+
+        // Null JSON row produces a null entry
+        let input: Vec<Option<&str>> = vec![None];
+        let batch = parse_json_impl(&input.into(), schema).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let min_values = batch.column(0).as_struct();
+        let geom_col = min_values.column(0);
+        assert_eq!(*geom_col.data_type(), ArrowDataType::Binary);
+        assert!(
+            geom_col.is_null(0),
+            "null JSON row should produce null geom"
+        );
+    }
+
+    #[cfg(feature = "arrow-conversion")]
+    #[test]
+    fn test_parse_json_impl_converts_wkt_to_wkb_in_list() {
+        use crate::geoarrow_schema::{GeoArrowType, Metadata, WkbType};
+
+        let geo_metadata = Arc::new(Metadata::new(
+            crate::geoarrow_schema::crs::Crs::from_srid("OGC:CRS84".to_string()),
+            None,
+        ));
+        let geo_element =
+            Arc::new(GeoArrowType::Wkb(WkbType::new(geo_metadata)).to_field("element", true));
+        let list_field = ArrowField::new("geoms", ArrowDataType::List(geo_element), true);
+        let schema = Arc::new(ArrowSchema::new(vec![list_field]));
+
+        let input: Vec<Option<&str>> =
+            vec![Some(r#"{"geoms":["POINT(1.0 2.0)","POINT(3.0 4.0)"]}"#)];
+        let batch = parse_json_impl(&input.into(), schema).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let list = batch.column(0).as_list::<i32>();
+        let values = list.values();
+        assert_eq!(
+            *values.data_type(),
+            ArrowDataType::Binary,
+            "list element should be Binary (WKB), not Utf8"
+        );
+        let binary = values
+            .as_any()
+            .downcast_ref::<crate::arrow::array::BinaryArray>()
+            .expect("should be BinaryArray");
+        assert_eq!(binary.len(), 2);
+        assert!(!binary.value(0).is_empty(), "first WKB should be non-empty");
+        assert!(
+            !binary.value(1).is_empty(),
+            "second WKB should be non-empty"
+        );
+    }
+
+    #[cfg(feature = "arrow-conversion")]
+    #[test]
+    fn test_parse_json_impl_converts_wkt_to_wkb_in_struct_inside_list() {
+        use crate::geoarrow_schema::{GeoArrowType, Metadata, WkbType};
+
+        // Shape: { rows: array<struct<g: geometry>> }
+        let geo_metadata = Arc::new(Metadata::new(
+            crate::geoarrow_schema::crs::Crs::from_srid("OGC:CRS84".to_string()),
+            None,
+        ));
+        let geo_field = GeoArrowType::Wkb(WkbType::new(geo_metadata)).to_field("g", true);
+        let struct_field = Arc::new(ArrowField::new(
+            "element",
+            ArrowDataType::Struct(ArrowFields::from(vec![geo_field])),
+            true,
+        ));
+        let list_field = ArrowField::new("rows", ArrowDataType::List(struct_field), true);
+        let schema = Arc::new(ArrowSchema::new(vec![list_field]));
+
+        let input: Vec<Option<&str>> = vec![Some(
+            r#"{"rows":[{"g":"POINT(1.0 2.0)"},{"g":"POINT(3.0 4.0)"}]}"#,
+        )];
+        let batch = parse_json_impl(&input.into(), schema).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let list = batch.column(0).as_list::<i32>();
+        let struct_values = list.values().as_struct();
+        let geom_col = struct_values.column(0);
+        assert_eq!(
+            *geom_col.data_type(),
+            ArrowDataType::Binary,
+            "geo leaf inside list<struct> should be Binary"
+        );
+        let binary = geom_col
+            .as_any()
+            .downcast_ref::<crate::arrow::array::BinaryArray>()
+            .expect("should be BinaryArray");
+        assert_eq!(binary.len(), 2);
+        assert!(!binary.value(0).is_empty());
+        assert!(!binary.value(1).is_empty());
+    }
+
+    #[cfg(feature = "arrow-conversion")]
+    #[test]
+    fn test_parse_json_impl_converts_wkt_to_wkb_in_map_value() {
+        use crate::geoarrow_schema::{GeoArrowType, Metadata, WkbType};
+
+        let geo_metadata = Arc::new(Metadata::new(
+            crate::geoarrow_schema::crs::Crs::from_srid("OGC:CRS84".to_string()),
+            None,
+        ));
+        let key_field = Arc::new(ArrowField::new("keys", ArrowDataType::Utf8, false));
+        let value_field =
+            Arc::new(GeoArrowType::Wkb(WkbType::new(geo_metadata)).to_field("values", true));
+        let map_field = ArrowField::new_map("m", "entries", key_field, value_field, false, true);
+        let schema = Arc::new(ArrowSchema::new(vec![map_field]));
+
+        let input: Vec<Option<&str>> = vec![Some(r#"{"m":{"k1":"POINT(1.0 2.0)"}}"#)];
+        let batch = parse_json_impl(&input.into(), schema).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let map = batch.column(0).as_map();
+        let values = map.values();
+        assert_eq!(
+            *values.data_type(),
+            ArrowDataType::Binary,
+            "map value should be Binary (WKB), not Utf8"
+        );
+        let binary = values
+            .as_any()
+            .downcast_ref::<crate::arrow::array::BinaryArray>()
+            .expect("should be BinaryArray");
+        assert_eq!(binary.len(), 1);
+        assert!(!binary.value(0).is_empty(), "WKB bytes should be non-empty");
     }
 }

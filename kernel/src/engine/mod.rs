@@ -37,6 +37,9 @@ pub(crate) mod arrow_utils;
 #[cfg(feature = "internal-api")]
 pub use self::arrow_utils::{parse_json, to_json_bytes};
 
+#[cfg(feature = "arrow-expression")]
+mod parse_json_geo;
+
 #[cfg(feature = "default-engine-base")]
 pub mod default;
 
