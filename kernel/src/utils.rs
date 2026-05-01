@@ -732,7 +732,7 @@ pub(crate) mod test_utils {
             ("inner.value", 201),
             ("inner.value.element", 202),
         ]);
-        // Each top-level field carries `parquet.field.id` plus the nested-ids JSON.
+        // Each `StructField` carries `parquet.field.id` plus the nested-ids JSON.
         let inner_field = StructField::nullable("inner", complex_nested_inner_map_type())
             .with_metadata([
                 (
