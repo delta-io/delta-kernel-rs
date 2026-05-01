@@ -655,33 +655,217 @@ mod tests {
         );
     }
 
-    fn field_with_stray_cm_id(name: &str, ty: DataType) -> StructField {
-        let mut f = StructField::nullable(name, ty);
-        f.metadata.insert(
-            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-            MetadataValue::Number(99),
-        );
-        f
+    fn field_with_column_mapping(
+        name: &str,
+        ty: impl Into<DataType>,
+        id: Option<MetadataValue>,
+        physical_name: Option<MetadataValue>,
+    ) -> StructField {
+        let mut field = StructField::nullable(name, ty);
+        if let Some(id) = id {
+            field
+                .metadata
+                .insert(ColumnMetadataKey::ColumnMappingId.as_ref().to_string(), id);
+        }
+        if let Some(physical_name) = physical_name {
+            field.metadata.insert(
+                ColumnMetadataKey::ColumnMappingPhysicalName
+                    .as_ref()
+                    .to_string(),
+                physical_name,
+            );
+        }
+        field
     }
 
-    /// CM-enabled: stray CM annotations on a new column are rejected at any nesting depth.
+    fn cm_add_column_input(
+        field: StructField,
+        path: impl IntoIterator<Item = &'static str>,
+    ) -> (StructField, Vec<String>) {
+        (field, path.into_iter().map(String::from).collect())
+    }
+
+    /// CM-enabled ALTER preserves pre-existing AddColumn metadata, fills the missing piece when
+    /// only one annotation is present, and reports the correct `new_max_column_id`.
+    // TODO: Move these local column-mapping schema fixtures to test utils if more modules
+    // need the same shapes.
     #[rstest]
-    #[case::top_level(field_with_stray_cm_id("tainted", DataType::STRING))]
-    #[case::nested_in_struct(StructField::nullable(
-        "outer",
-        DataType::Struct(Box::new(
-            StructType::try_new(vec![field_with_stray_cm_id("inner", DataType::STRING)]).unwrap(),
-        )),
-    ))]
-    fn add_column_with_preexisting_cm_metadata_is_rejected_under_cm(#[case] field: StructField) {
+    #[case::id_only_top_level(
+        cm_add_column_input(
+            field_with_column_mapping(
+                "id_only",
+                DataType::STRING,
+                Some(MetadataValue::Number(99)),
+                None,
+            ),
+            ["id_only"],
+        ),
+        99,
+        None,
+        Some(99),
+        Some(99)
+    )]
+    #[case::physical_name_only_top_level(
+        cm_add_column_input(
+            field_with_column_mapping(
+                "physical_name_only",
+                DataType::STRING,
+                None,
+                Some(MetadataValue::String("user-supplied-name".to_string())),
+            ),
+            ["physical_name_only"],
+        ),
+        3,
+        Some("user-supplied-name"),
+        Some(3),
+        Some(3),
+    )]
+    #[case::both_top_level(
+        cm_add_column_input(
+            field_with_column_mapping(
+                "both",
+                DataType::STRING,
+                Some(MetadataValue::Number(99)),
+                Some(MetadataValue::String("user-supplied-name".to_string())),
+            ),
+            ["both"],
+        ),
+        99,
+        Some("user-supplied-name"),
+        Some(99),
+        Some(99),
+    )]
+    #[case::id_zero_both_top_level(
+        cm_add_column_input(
+            field_with_column_mapping(
+                "zero",
+                DataType::STRING,
+                Some(MetadataValue::Number(0)),
+                Some(MetadataValue::String("zero-name".to_string())),
+            ),
+            ["zero"],
+        ),
+        0,
+        Some("zero-name"),
+        None,
+        Some(0),
+    )]
+    #[case::id_only_nested_struct(
+        cm_add_column_input(
+            StructField::nullable(
+                "outer",
+                StructType::try_new(vec![field_with_column_mapping(
+                    "inner",
+                    DataType::STRING,
+                    Some(MetadataValue::Number(99)),
+                    None,
+                )])
+                .unwrap(),
+            ),
+            ["outer", "inner"],
+        ),
+        99,
+        None,
+        Some(99),
+        Some(99)
+    )]
+    fn add_column_with_preexisting_cm_metadata_is_preserved_under_cm(
+        #[case] field_and_path: (StructField, Vec<String>),
+        #[case] expected_id: i64,
+        #[case] expected_physical_name: Option<&str>,
+        #[case] expected_new_max_column_id: Option<i64>,
+        #[case] expected_schema_max_column_id: Option<i64>,
+    ) {
+        let (field, path) = field_and_path;
+        let ops = vec![SchemaOperation::AddColumn { field }];
+        let result =
+            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(2))
+                .unwrap();
+
+        let added = result.schema.field_at_path(&path);
+        assert_eq!(get_cm_id(added), expected_id);
+        match expected_physical_name {
+            Some(expected) => assert_eq!(get_physical_name(added), expected),
+            None => assert!(get_physical_name(added).starts_with("col-")),
+        }
+        assert_eq!(
+            result.new_max_column_id, expected_new_max_column_id,
+            "new maxColumnId must reflect only ids allocated or preserved above the current max",
+        );
+        assert_eq!(
+            find_max_column_id_in_schema(&result.schema),
+            expected_schema_max_column_id,
+        );
+    }
+
+    /// ALTER surfaces malformed pre-existing column-mapping annotations from AddColumn input.
+    #[rstest]
+    #[case::wrong_typed_id(
+        cm_add_column_input(
+            field_with_column_mapping(
+                "bad_id",
+                DataType::STRING,
+                Some(MetadataValue::String("not-a-number".to_string())),
+                Some(MetadataValue::String("p".to_string())),
+            ),
+            ["bad_id"],
+        ),
+        "non-numeric",
+        ColumnMetadataKey::ColumnMappingId,
+    )]
+    #[case::wrong_typed_physical_name(
+        cm_add_column_input(
+            field_with_column_mapping(
+                "bad_name",
+                DataType::STRING,
+                Some(MetadataValue::Number(5)),
+                Some(MetadataValue::Number(7)),
+            ),
+            ["bad_name"],
+        ),
+        "non-string",
+        ColumnMetadataKey::ColumnMappingPhysicalName
+    )]
+    #[case::empty_physical_name(
+        cm_add_column_input(
+            field_with_column_mapping(
+                "empty_name",
+                DataType::STRING,
+                Some(MetadataValue::Number(5)),
+                Some(MetadataValue::String(String::new())),
+            ),
+            ["empty_name"],
+        ),
+        "empty",
+        ColumnMetadataKey::ColumnMappingPhysicalName
+    )]
+    #[case::negative_id(
+        cm_add_column_input(
+            field_with_column_mapping(
+                "negative_id",
+                DataType::STRING,
+                Some(MetadataValue::Number(-7)),
+                Some(MetadataValue::String("p".to_string())),
+            ),
+            ["negative_id"],
+        ),
+        "negative",
+        ColumnMetadataKey::ColumnMappingId,
+    )]
+    fn add_column_with_invalid_existing_cm_metadata_is_rejected_under_cm(
+        #[case] field_and_path: (StructField, Vec<String>),
+        #[case] violation_kind: &str,
+        #[case] offending_key: ColumnMetadataKey,
+    ) {
+        let (field, _) = field_and_path;
         let ops = vec![SchemaOperation::AddColumn { field }];
         let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(2))
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("pre-populated"));
+            .unwrap_err()
+            .to_string();
+        let key = offending_key.as_ref();
         assert!(
-            msg.contains("delta.columnMapping.id"),
-            "error should name the offending annotation, got: {msg}"
+            err.contains(violation_kind) && err.contains(key),
+            "Expected '{violation_kind}' and '{key}' in error, got: {err}",
         );
     }
 
