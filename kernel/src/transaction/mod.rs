@@ -856,14 +856,14 @@ impl<S> Transaction<S> {
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
         let partition_cols = self.effective_table_config.partition_columns().to_vec();
-        // Build a Transform expression that drops partition columns from the input unless the
-        // table requires partition values to be physically materialized in data files
-        // (materializePartitionColumns or icebergCompatV3).
-        let mut transform = Transform::new_top_level();
-        if !self
+        // Check if partition columns should be materialized into data files.
+        let should_materialize_partition_columns = self
             .effective_table_config
-            .should_materialize_partition_columns()
-        {
+            .should_materialize_partition_columns();
+        // Build a Transform expression that drops partition columns from the input
+        // (unless they should be materialized).
+        let mut transform = Transform::new_top_level();
+        if !should_materialize_partition_columns {
             for col in &partition_cols {
                 transform = transform.with_dropped_field_if_exists(col);
             }

@@ -6,6 +6,7 @@
 //!       - Array `element` fields carry `field_id`.
 //!       - Map `key`/`value` fields carry `field_id`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, ListArray, MapArray, StructArray};
@@ -14,10 +15,13 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowFi
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+use delta_kernel::expressions::Scalar;
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::Snapshot;
+use rstest::rstest;
 use tempfile::tempdir;
 use test_utils::{create_default_engine, write_batch_to_table};
 use url::Url;
@@ -252,4 +256,134 @@ async fn test_v3_create_write_read_parquet_field_ids() -> Result<(), Box<dyn std
     );
 
     Ok(())
+}
+
+/// Verifies that on an IcebergCompatV3 table, partition column values are materialized into
+/// the parquet data file (instead of only being recorded in the partition path / Add action),
+/// and that on a non-V3 partitioned table they are NOT materialized.
+///
+/// This guards the `should_materialize_partition_columns()` branch added for V3 (see PR
+/// #2504): without that branch, V3 writes would skip the partition column from the physical
+/// write schema and produce parquet files an Iceberg reader could not consume.
+#[rstest]
+#[case::v3_enabled_materializes(true, true)]
+#[case::v3_disabled_does_not_materialize(false, false)]
+#[tokio::test]
+async fn test_partition_column_materialization_in_parquet(
+    #[case] enable_v3: bool,
+    #[case] expect_pcol_in_parquet: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // === Schema: one data column + one partition column ===
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("value", DataType::INTEGER),
+        StructField::nullable("pcol", DataType::INTEGER),
+    ])?);
+
+    // === Setup ===
+    let tmp = tempdir()?;
+    let table_url = Url::from_directory_path(tmp.path()).unwrap();
+    let engine = create_default_engine(&table_url)?;
+
+    // === Create the table, partitioned by `pcol`, with V3 toggled per case ===
+    let mut builder = create_table(tmp.path().to_str().unwrap(), schema.clone(), "Test/1.0")
+        .with_data_layout(DataLayout::partitioned(["pcol"]));
+    if enable_v3 {
+        builder = builder.with_table_properties(vec![("delta.enableIcebergCompatV3", "true")]);
+    }
+    let _ = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    assert_eq!(
+        snapshot.table_configuration().table_properties().enable_iceberg_compat_v3,
+        if enable_v3 { Some(true) } else { None },
+    );
+
+    // === Write a single-row batch with pcol=7 ===
+    let value_array: ArrayRef = Arc::new(Int32Array::from(vec![42i32]));
+    let pcol_array: ArrayRef = Arc::new(Int32Array::from(vec![7i32]));
+    let arrow_schema: delta_kernel::arrow::datatypes::Schema = schema.as_ref().try_into_arrow()?;
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![value_array, pcol_array])?;
+
+    let mut partition_values = HashMap::new();
+    partition_values.insert("pcol".to_string(), Scalar::Integer(7));
+
+    let _ = write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values).await?;
+
+    // === Find the parquet data file ===
+    fn collect_parquet(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if p.file_name().and_then(|n| n.to_str()) == Some("_delta_log") {
+                    continue;
+                }
+                collect_parquet(&p, out);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("parquet") {
+                out.push(p);
+            }
+        }
+    }
+    let mut parquet_files = Vec::new();
+    collect_parquet(tmp.path(), &mut parquet_files);
+    assert_eq!(
+        parquet_files.len(),
+        1,
+        "expected exactly one parquet data file under {:?}; found: {parquet_files:?}",
+        tmp.path()
+    );
+    let parquet_file = parquet_files.pop().unwrap();
+
+    // === Read the raw parquet schema and check whether `pcol`'s physical name is present ===
+    let logical = snapshot.table_configuration().logical_schema();
+    let pcol_phys_name = physical_name_of(logical.as_ref(), "pcol");
+    let value_phys_name = physical_name_of(logical.as_ref(), "value");
+
+    let top_level_names: Vec<String> = top_level_parquet_field_names(&parquet_file);
+
+    assert!(
+        top_level_names.contains(&value_phys_name),
+        "data column '{value_phys_name}' must always be present in parquet; got {top_level_names:?}"
+    );
+    assert_eq!(
+        top_level_names.contains(&pcol_phys_name),
+        expect_pcol_in_parquet,
+        "partition column '{pcol_phys_name}' presence in parquet (V3 enabled = {enable_v3}) \
+         did not match expectation; got {top_level_names:?}"
+    );
+
+    Ok(())
+}
+
+/// Returns the physical column name kernel assigned to `field_name` (logical name).
+/// Falls back to the logical name when column mapping is disabled.
+fn physical_name_of(logical: &StructType, field_name: &str) -> String {
+    use delta_kernel::schema::{ColumnMetadataKey, MetadataValue};
+    let field = logical.field(field_name).unwrap();
+    match field
+        .metadata
+        .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+    {
+        Some(MetadataValue::String(s)) => s.clone(),
+        _ => field_name.to_string(),
+    }
+}
+
+/// Returns the names of the top-level fields of the parquet file's schema, in declaration order.
+fn top_level_parquet_field_names(parquet_file: &std::path::Path) -> Vec<String> {
+    let file = std::fs::File::open(parquet_file).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let root = reader
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .clone();
+    root.get_fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect()
 }
