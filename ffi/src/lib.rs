@@ -1685,7 +1685,11 @@ mod tests {
     // Test checkpoint using FFI engine builder APIs with multithreaded executor.
     // NOTE: We made this a sync test to simulate the expected case: C code calling FFI APIs to
     // build engine without existing tokio runtime.
+    //
+    // Ignored under Miri because checkpoint writes use Zstd compression, which calls into the
+    // zstd-sys C library. Miri cannot execute foreign C code.
     #[cfg(feature = "default-engine-base")]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {
         use delta_kernel::object_store::local::LocalFileSystem;

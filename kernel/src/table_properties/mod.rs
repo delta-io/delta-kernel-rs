@@ -643,9 +643,16 @@ mod tests {
     // None means no property is set; use None as a sentinel for "omit the key"
     #[case(None, ParquetWriterConfig::default())]
     #[case(Some("snappy"), ParquetWriterConfig { compression: ParquetCompression::Snappy })]
+    #[case(Some("SNAPPY"), ParquetWriterConfig { compression: ParquetCompression::Snappy })]
+    #[case(Some("Snappy"), ParquetWriterConfig { compression: ParquetCompression::Snappy })]
+    #[case(Some("zstd"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
     #[case(Some("ZSTD"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
+    #[case(Some("Zstd"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
     // Unrecognized codec falls back to the default
     #[case(Some("not_a_codec"), ParquetWriterConfig::default())]
+    #[case(Some("gzip"), ParquetWriterConfig::default())]
+    #[case(Some("lz4"), ParquetWriterConfig::default())]
+    #[case(Some("uncompressed"), ParquetWriterConfig::default())]
     fn test_parquet_writer_config(
         #[case] codec: Option<&str>,
         #[case] expected: ParquetWriterConfig,
