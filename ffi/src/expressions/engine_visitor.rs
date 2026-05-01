@@ -437,6 +437,13 @@ fn visit_expression_transform(
         input_path,
         field_transforms,
         prepended_fields,
+        // Conditional inserts (column-defaults Mode B) are not yet exposed to the FFI: the
+        // C/C++ surface lacks a way to signal "fill if missing". Engines using the FFI go
+        // through Mode A (raw_default_value + connector-side evaluation) instead, so kernel
+        // does not register conditional inserts in transforms reachable here. Silently
+        // ignoring lets such transforms still be visited for unrelated purposes (e.g. logging).
+        // TODO: extend the FFI ABI with conditional-insert visitor calls when needed.
+        conditional_inserts: _,
     } = transform;
 
     // Treat the input path like a column expression

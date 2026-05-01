@@ -65,6 +65,7 @@ mod stats_verifier;
 mod update;
 mod write_context;
 
+pub use column_defaults::ColumnDefault;
 use stats_verifier::StatsVerifier;
 use write_context::SharedWriteState;
 pub use write_context::WriteContext;
@@ -516,20 +517,24 @@ impl<S> Transaction<S> {
     ///
     /// # Semantics
     ///
-    /// For every listed column, kernel wraps the connector-supplied column with
-    /// `Coalesce(col, Literal(default))` in the `logical_to_physical` expression: wherever
-    /// the connector writes `NULL`, kernel substitutes the result of the default expression;
-    /// wherever the connector writes a concrete value, that value is preserved. This matches
-    /// the protocol rule that a default is applied when a row "lacks any explicit value
-    /// (including `NULL`)".
+    /// For every listed column, kernel attaches a *conditional insert* to the
+    /// `logical_to_physical` transform: when the connector's batch **omits** the column,
+    /// kernel injects the parsed default literal at that column's position; when the
+    /// connector's batch **includes** the column, kernel takes the data verbatim -- including
+    /// any `NULL` rows -- and the default is not applied.
+    ///
+    /// This matches the design-doc rule that data takes priority when present and the default
+    /// fills only when the column is absent. Per-row mixing (some rows defaulted, others not
+    /// within the same batch) is handled by Mode A: read `raw_sql` / `parsed` from
+    /// [`Transaction::columns_with_defaults`] and evaluate yourself.
     ///
     /// # Scope (prototype)
     ///
-    /// - Only **literal** SQL expressions are supported in this prototype. Non-literal
-    ///   defaults (e.g. `current_timestamp()`) cause
+    /// - Only **literal** SQL expressions are supported in this prototype. Non-literal defaults
+    ///   (e.g. `current_timestamp()`) cause
     ///   [`partitioned_write_context`]/[`unpartitioned_write_context`] to return an error.
-    ///   Connectors that need richer expressions can read [`StructField::raw_default_value`]
-    ///   and evaluate the SQL themselves instead of calling this method.
+    ///   Connectors that need richer expressions can read [`StructField::raw_default_value`] and
+    ///   evaluate the SQL themselves instead of calling this method.
     /// - Only top-level columns may be named.
     ///
     /// # Errors (deferred)
@@ -551,20 +556,20 @@ impl<S> Transaction<S> {
     }
 
     /// Returns the top-level columns of the table that carry a `CURRENT_DEFAULT` metadata
-    /// entry, as `(logical_column_name, raw_default_sql)` pairs.
+    /// entry, keyed by the column's logical name.
     ///
-    /// Connectors use this to decide, per column, whether to evaluate the default expression
-    /// themselves (Mode A -- supply the column with concrete values) or to delegate to
-    /// kernel via [`Transaction::with_default_filled_columns`] (Mode B -- supply the column
-    /// with `NULL` wherever the default should apply).
-    pub fn columns_with_defaults(&self) -> Vec<(String, String)> {
+    /// Each value is a [`ColumnDefault`] exposing both the raw SQL string and -- when kernel's
+    /// built-in literal parser succeeds -- the parsed kernel [`Expression`]. Connectors use
+    /// this map to decide per column whether to evaluate the default themselves (Mode A) or
+    /// delegate to kernel via [`Transaction::with_default_filled_columns`] (Mode B).
+    ///
+    /// [`ColumnDefault`]: column_defaults::ColumnDefault
+    /// [`Expression`]: crate::expressions::Expression
+    pub fn columns_with_defaults(&self) -> HashMap<String, column_defaults::ColumnDefault> {
         self.effective_table_config
             .logical_schema()
             .fields()
-            .filter_map(|f| {
-                f.raw_default_value()
-                    .map(|v| (f.name.clone(), v.to_string()))
-            })
+            .filter_map(|f| column_defaults::try_parse(f).map(|cd| (f.name.clone(), cd)))
             .collect()
     }
 
@@ -900,13 +905,20 @@ impl<S: SupportsDataFiles> Transaction<S> {
     //
     // Composes two independent operations on top-level fields:
     //   1. Drop partition columns (unless `materializePartitionColumns` is enabled).
-    //   2. Replace each column listed in `default_filled_columns` with
-    //      `Coalesce(col, Literal(default))` so NULLs in that column are filled from the
-    //      column's parsed `CURRENT_DEFAULT` expression.
+    //   2. Attach a *conditional insert* for each column listed in `default_filled_columns`: when
+    //      the connector's batch omits the column, kernel emits the parsed default literal at that
+    //      column's position; when the connector includes the column, the conditional is skipped
+    //      and the data passes through verbatim (NULLs preserved).
     //
     // Default-fill validation happens here: a missing column, a column without a
     // `CURRENT_DEFAULT`, an overlap with partition columns, or a default expression the
     // built-in literal parser cannot handle all produce an error.
+    //
+    // Each conditional's predecessor is chosen as the first preceding *non-default-fill*
+    // field in the table schema (or `None` -> prepend if no such field exists). This keeps
+    // the predecessor stable: connectors cannot omit non-default-fill columns, so the
+    // predecessor is guaranteed to be present in any valid input batch even when several
+    // adjacent default-fill columns are simultaneously omitted.
     fn generate_logical_to_physical(&self) -> DeltaResult<Expression> {
         let table_config = &self.effective_table_config;
         let partition_cols = table_config.partition_columns();
@@ -922,35 +934,57 @@ impl<S: SupportsDataFiles> Transaction<S> {
             }
         }
 
-        // === Default-filled columns ===
+        // === Default-filled columns: conditional inserts ===
         if !self.default_filled_columns.is_empty() {
             let schema = table_config.logical_schema();
             let parser = column_defaults::LiteralDefaultExpressionParser;
-            for col_name in &self.default_filled_columns {
-                let field = schema.field(col_name).ok_or_else(|| {
-                    Error::generic(format!(
-                        "default-filled column {col_name:?} not found in table schema"
-                    ))
-                })?;
+
+            // Walk the schema in order, tracking the most-recent non-default-fill field as the
+            // stable predecessor for any subsequent default-fill column.
+            let mut stable_predecessor: Option<&str> = None;
+            // Validate every requested column exists; we'll fail fast below if any name is bogus.
+            let mut seen: HashSet<&String> = HashSet::new();
+
+            for field in schema.fields() {
+                if !self.default_filled_columns.contains(&field.name) {
+                    stable_predecessor = Some(field.name.as_str());
+                    continue;
+                }
+                seen.insert(&field.name);
                 require!(
-                    !partition_cols.iter().any(|p| p == col_name),
+                    !partition_cols.iter().any(|p| p == &field.name),
                     Error::generic(format!(
-                        "default-filled column {col_name:?} is a partition column; \
-                         partition columns cannot use column defaults"
+                        "default-filled column {:?} is a partition column; \
+                         partition columns cannot use column defaults",
+                        field.name
                     ))
                 );
                 let raw = field.raw_default_value().ok_or_else(|| {
                     Error::generic(format!(
-                        "default-filled column {col_name:?} has no CURRENT_DEFAULT metadata"
+                        "default-filled column {:?} has no CURRENT_DEFAULT metadata",
+                        field.name
                     ))
                 })?;
                 let default_expr = {
                     use column_defaults::DefaultExpressionParser;
                     parser.parse(raw, field.data_type())?
                 };
-                let coalesce =
-                    Expression::coalesce([Expression::column([col_name.as_str()]), default_expr]);
-                transform = transform.with_replaced_field(col_name.clone(), Arc::new(coalesce));
+                transform = transform.with_inserted_field_if_missing(
+                    stable_predecessor.map(str::to_string),
+                    field.name.clone(),
+                    Arc::new(default_expr),
+                );
+                // A default-fill column does not become a stable predecessor: the connector may
+                // also be omitting it, so nothing later can safely anchor to it.
+            }
+
+            // Any opt-in name not found in the schema is a configuration error.
+            for col_name in &self.default_filled_columns {
+                if !seen.contains(col_name) {
+                    return Err(Error::generic(format!(
+                        "default-filled column {col_name:?} not found in table schema"
+                    )));
+                }
             }
         }
 
@@ -1638,7 +1672,7 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::CommitInfo;
     use crate::arrow::array::{ArrayRef, Int64Array, StringArray};
-    use crate::arrow::datatypes::Schema as ArrowSchema;
+    use crate::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::{FileSystemCommitter, PublishMetadata};
     use crate::engine::arrow_conversion::TryIntoArrow;
@@ -2836,19 +2870,39 @@ mod tests {
             StructField::nullable("plain", DataType::INTEGER),
             field_with_default("greet", DataType::STRING, "'hello'"),
             field_with_default("answer", DataType::INTEGER, "42"),
+            field_with_default("ts", DataType::TIMESTAMP, "current_timestamp()"),
         ]);
         let txn = snap
             .transaction(Box::new(FileSystemCommitter::new()), &SyncEngine::new())
             .unwrap();
 
-        let mut defaults = txn.columns_with_defaults();
-        defaults.sort();
+        let defaults = txn.columns_with_defaults();
+        // Map should contain exactly the three default-bearing columns; "plain" must be absent.
+        assert_eq!(defaults.len(), 3);
+        assert!(!defaults.contains_key("plain"));
+
+        // Literal defaults: raw_sql preserved, parsed populated as a kernel literal.
+        let greet = defaults.get("greet").expect("greet should be present");
+        assert_eq!(greet.raw_sql, "'hello'");
         assert_eq!(
-            defaults,
-            vec![
-                ("answer".to_string(), "42".to_string()),
-                ("greet".to_string(), "'hello'".to_string()),
-            ]
+            greet.parsed,
+            Some(Expression::literal(crate::expressions::Scalar::String(
+                "hello".into()
+            )))
+        );
+
+        let answer = defaults.get("answer").expect("answer should be present");
+        assert_eq!(answer.raw_sql, "42");
+        assert_eq!(answer.parsed, Some(Expression::literal(42i32)));
+
+        // Non-literal default: raw_sql still surfaces, parsed = None so connector knows kernel
+        // cannot auto-fill it (Mode A only).
+        let ts = defaults.get("ts").expect("ts should be present");
+        assert_eq!(ts.raw_sql, "current_timestamp()");
+        assert!(
+            ts.parsed.is_none(),
+            "non-literal default should leave parsed = None, got: {:?}",
+            ts.parsed
         );
     }
 
@@ -2856,7 +2910,7 @@ mod tests {
     fn mode_a_default_column_not_opted_in_uses_identity_transform() {
         // Table has a default but the caller does NOT opt into kernel-side fill.
         // The write context should succeed and produce an identity-shaped
-        // logical_to_physical (no Coalesce injected).
+        // logical_to_physical (no conditional insert injected).
         let snap = column_defaults_snapshot(vec![
             StructField::nullable("plain", DataType::INTEGER),
             field_with_default("greet", DataType::STRING, "current_timestamp()"),
@@ -2871,12 +2925,19 @@ mod tests {
         let expr_str = format!("{}", wc.logical_to_physical());
         assert!(
             !expr_str.contains("COALESCE"),
-            "Mode A should not inject COALESCE; got: {expr_str}"
+            "Mode A should never inject COALESCE; got: {expr_str}"
+        );
+        assert!(
+            !expr_str.contains("fill missing"),
+            "Mode A should not register a conditional insert; got: {expr_str}"
         );
     }
 
     #[test]
-    fn mode_b_injects_coalesce_for_opted_in_column() {
+    fn mode_b_uses_conditional_insert_for_opted_in_column() {
+        // Mode B no longer uses Coalesce: it registers a conditional insert that fires only
+        // when the column is omitted from the connector's batch. The default literal is
+        // emitted at the column's position; otherwise the connector's data passes through.
         let snap = column_defaults_snapshot(vec![
             StructField::nullable("plain", DataType::INTEGER),
             field_with_default("answer", DataType::INTEGER, "42"),
@@ -2888,12 +2949,12 @@ mod tests {
         let wc = txn.unpartitioned_write_context().unwrap();
         let expr_str = format!("{}", wc.logical_to_physical());
         assert!(
-            expr_str.contains("COALESCE"),
-            "Mode B should inject COALESCE; got: {expr_str}"
+            !expr_str.contains("COALESCE"),
+            "Mode B must NOT use COALESCE (would corrupt connector NULLs); got: {expr_str}"
         );
         assert!(
-            expr_str.contains("answer"),
-            "COALESCE should reference the answer column; got: {expr_str}"
+            expr_str.contains("fill missing answer"),
+            "Mode B should register a conditional insert for 'answer'; got: {expr_str}"
         );
     }
 
@@ -2952,8 +3013,10 @@ mod tests {
     }
 
     #[test]
-    fn mode_b_end_to_end_per_row_default_fill() -> Result<(), Box<dyn std::error::Error>> {
-        // Build a table where `greet` has a literal default and `id` does not.
+    fn mode_b_end_to_end_omitted_column_filled_with_default(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Connector OMITS the default-bearing column. Kernel injects the literal default for
+        // every row at that column's position.
         let snap = column_defaults_snapshot(vec![
             StructField::nullable("id", DataType::INTEGER),
             field_with_default("greet", DataType::STRING, "'hello'"),
@@ -2963,7 +3026,43 @@ mod tests {
             .with_default_filled_columns(["greet"]);
         let wc = txn.unpartitioned_write_context()?;
 
-        // Connector supplies a batch with mixed NULL / concrete values for `greet`.
+        // Build a batch with only `id`. `greet` is absent.
+        let id_field = ArrowField::new("id", crate::arrow::datatypes::DataType::Int32, true);
+        let id = Arc::new(crate::arrow::array::Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef;
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![id_field])), vec![id])?;
+
+        let output = eval_logical_to_physical(&wc, batch)?;
+        let greet_out = output
+            .column_by_name("greet")
+            .expect("greet column should be injected")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("greet should be a string array");
+        let values: Vec<Option<&str>> = greet_out.iter().collect();
+        assert_eq!(
+            values,
+            vec![Some("hello"), Some("hello"), Some("hello"), Some("hello")],
+            "omitted column must be filled entirely with the parsed default literal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mode_b_end_to_end_included_column_taken_literally() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Connector INCLUDES the default-bearing column with mixed NULL/concrete values. The
+        // default must NOT be applied -- connector data takes priority verbatim, including
+        // NULLs. This is the no-Coalesce semantic the design doc describes.
+        let snap = column_defaults_snapshot(vec![
+            StructField::nullable("id", DataType::INTEGER),
+            field_with_default("greet", DataType::STRING, "'hello'"),
+        ]);
+        let txn = snap
+            .transaction(Box::new(FileSystemCommitter::new()), &SyncEngine::new())?
+            .with_default_filled_columns(["greet"]);
+        let wc = txn.unpartitioned_write_context()?;
+
+        // Build a batch including both columns; `greet` carries explicit NULLs.
         let logical: ArrowSchema = wc.logical_schema().as_ref().try_into_arrow()?;
         let id = Arc::new(crate::arrow::array::Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef;
         let greet = Arc::new(StringArray::from(vec![None, Some("a"), None, Some("b")])) as ArrayRef;
@@ -2979,8 +3078,8 @@ mod tests {
         let values: Vec<Option<&str>> = greet_out.iter().collect();
         assert_eq!(
             values,
-            vec![Some("hello"), Some("a"), Some("hello"), Some("b")],
-            "NULL inputs should be replaced with the default literal"
+            vec![None, Some("a"), None, Some("b")],
+            "included column data must be preserved verbatim, NULLs and all"
         );
         Ok(())
     }

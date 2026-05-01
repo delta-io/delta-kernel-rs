@@ -17,8 +17,47 @@
 //! Mirrors the validation rules in kernel-java's `ColumnDefaults.java`.
 
 use crate::expressions::{Expression, Scalar};
-use crate::schema::{DataType, PrimitiveType};
+use crate::schema::{DataType, PrimitiveType, StructField};
 use crate::{DeltaResult, Error};
+
+/// A column's `CURRENT_DEFAULT` expression, surfaced to connectors via
+/// [`Transaction::columns_with_defaults`]. Connectors use this struct to decide, per
+/// column, whether to evaluate the default themselves (Mode A: read `raw_sql` and use a
+/// connector-side SQL engine) or to delegate to kernel via
+/// [`Transaction::with_default_filled_columns`] (Mode B: rely on `parsed`).
+///
+/// `parsed` is `None` when kernel's built-in parser cannot interpret `raw_sql` (e.g. for
+/// non-literal expressions like `current_timestamp()`). Connectors that need such
+/// expressions must run them through their own evaluator.
+///
+/// [`Transaction::columns_with_defaults`]: super::Transaction::columns_with_defaults
+/// [`Transaction::with_default_filled_columns`]: super::Transaction::with_default_filled_columns
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnDefault {
+    /// The raw SQL expression as stored in the field's `CURRENT_DEFAULT` metadata.
+    pub raw_sql: String,
+    /// The parsed default as a kernel [`Expression`], or `None` if kernel's literal-only
+    /// parser could not interpret `raw_sql`.
+    pub parsed: Option<Expression>,
+}
+
+/// Attempts to extract a [`ColumnDefault`] from a [`StructField`].
+///
+/// Returns `None` if the field does not carry a `CURRENT_DEFAULT` metadata entry. If the
+/// entry is present but kernel's built-in literal parser cannot interpret it, the parse
+/// error is swallowed and `parsed` is set to `None` -- discovery surfaces the raw SQL so
+/// connectors can decide what to do, and parseability is re-validated only when the
+/// connector explicitly opts into kernel-side fill via
+/// [`Transaction::with_default_filled_columns`].
+///
+/// [`Transaction::with_default_filled_columns`]: super::Transaction::with_default_filled_columns
+pub(super) fn try_parse(field: &StructField) -> Option<ColumnDefault> {
+    let raw_sql = field.raw_default_value()?.to_string();
+    let parsed = LiteralDefaultExpressionParser
+        .parse(&raw_sql, field.data_type())
+        .ok();
+    Some(ColumnDefault { raw_sql, parsed })
+}
 
 /// Parses a `CURRENT_DEFAULT` SQL expression string into a kernel [`Expression`],
 /// validated against the column's target [`DataType`].
@@ -127,10 +166,10 @@ fn unsupported(raw: &str, data_type: &DataType, reason: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::schema::{DataType, DecimalType, PrimitiveType};
-
-    use rstest::rstest;
 
     fn parse(raw: &str, dt: DataType) -> DeltaResult<Scalar> {
         parse_literal(raw, &dt)
@@ -217,5 +256,46 @@ mod tests {
         let parser = LiteralDefaultExpressionParser;
         let expr = parser.parse("'hello'", &DataType::STRING).unwrap();
         assert_eq!(expr, Expression::literal(Scalar::String("hello".into())));
+    }
+
+    // ==================== try_parse / ColumnDefault tests ====================
+
+    use crate::schema::StructField;
+
+    #[test]
+    fn try_parse_returns_none_when_no_default() {
+        let field = StructField::nullable("x", DataType::INTEGER);
+        assert!(try_parse(&field).is_none());
+    }
+
+    #[test]
+    fn try_parse_populates_parsed_for_literal() {
+        use crate::schema::ColumnMetadataKey;
+
+        let field = StructField::nullable("greet", DataType::STRING)
+            .add_metadata([(ColumnMetadataKey::CurrentDefault.as_ref(), "'hello'")]);
+        let result = try_parse(&field).unwrap();
+        assert_eq!(result.raw_sql, "'hello'");
+        assert_eq!(
+            result.parsed,
+            Some(Expression::literal(Scalar::String("hello".into())))
+        );
+    }
+
+    #[test]
+    fn try_parse_leaves_parsed_none_for_non_literal() {
+        use crate::schema::ColumnMetadataKey;
+
+        let field = StructField::nullable("ts", DataType::TIMESTAMP).add_metadata([(
+            ColumnMetadataKey::CurrentDefault.as_ref(),
+            "current_timestamp()",
+        )]);
+        let result = try_parse(&field).unwrap();
+        assert_eq!(result.raw_sql, "current_timestamp()");
+        assert!(
+            result.parsed.is_none(),
+            "non-literal SQL should leave parsed = None, got: {:?}",
+            result.parsed
+        );
     }
 }
