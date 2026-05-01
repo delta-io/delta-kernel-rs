@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
-use super::super::arrow_conversion::kernel_metadata_to_arrow_metadata;
+use super::super::arrow_conversion::{kernel_metadata_to_arrow_metadata, TryIntoArrow as _};
 use super::super::arrow_utils::make_arrow_error;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
@@ -15,7 +15,7 @@ use crate::arrow::datatypes::{
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use crate::schema::{ArrayType, DataType, MapType, Schema, StructField};
+use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, Schema, StructField};
 
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch` where
 // the names of fields, nullable, and metadata in the struct have been transformed to match those
@@ -88,12 +88,21 @@ fn transform_struct(
                     )));
                 }
             }
-            let transformed_field = new_field_with_metadata(
-                &target_field.name,
-                transformed_col.data_type(),
-                target_field.nullable,
-                Some(arrow_metadata),
-            );
+
+            let transformed_field = match target_field.data_type() {
+                // The generic path would drop the geoarrow extension keys, so route geo
+                // targets through the full kernel-to-arrow field conversion
+                DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+                    let field: ArrowField = target_field.try_into_arrow()?;
+                    field.with_data_type(transformed_col.data_type().clone())
+                }
+                _ => new_field_with_metadata(
+                    &target_field.name,
+                    transformed_col.data_type(),
+                    target_field.nullable,
+                    Some(arrow_metadata),
+                ),
+            };
             Ok((transformed_field, transformed_col))
         });
     let (transformed_fields, transformed_cols): (Vec<ArrowField>, Vec<ArrayRef>) =
@@ -364,6 +373,46 @@ mod apply_schema_validation_tests {
             !output_field.metadata().contains_key(field_id_key),
             "original parquet.field.id key should not be present after translation"
         );
+    }
+
+    #[cfg(feature = "arrow-conversion")]
+    #[test]
+    fn test_apply_schema_attaches_geoarrow_metadata_for_geo_field() {
+        use crate::arrow::array::BinaryArray;
+        use crate::schema::{GeometryType, PrimitiveType};
+
+        let target_schema = StructType::new_unchecked([StructField::nullable(
+            "geom",
+            DataType::Primitive(PrimitiveType::Geometry(Box::new(
+                GeometryType::try_new("EPSG:4326").unwrap(),
+            ))),
+        )]);
+
+        let arrow_field = ArrowField::new("geom", ArrowDataType::Binary, true);
+        let input_array = StructArray::try_new(
+            vec![arrow_field].into(),
+            vec![Arc::new(BinaryArray::from(vec![Some(
+                b"\x01\x01\x00\x00\x00".as_ref(),
+            )]))],
+            None,
+        )
+        .unwrap();
+
+        let result = apply_schema_to_struct(&input_array, &target_schema).unwrap();
+
+        let (_, output_field) = result.fields().find("geom").unwrap();
+        assert_eq!(
+            output_field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("geoarrow.wkb"),
+        );
+        let ext_meta = output_field
+            .metadata()
+            .get("ARROW:extension:metadata")
+            .expect("geo target should produce CRS extension metadata");
+        assert!(ext_meta.contains("EPSG:4326"));
     }
 
     /// Test that apply_schema succeeds when the input Arrow field already carries the same field

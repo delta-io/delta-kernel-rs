@@ -81,6 +81,14 @@ package = "parquet"
 version = "57"
 features = ["async", "object_store"]
 optional = true
+[dependencies.geoarrow_array_07]
+package = "geoarrow-array"
+version = "0.7"
+optional = true
+[dependencies.geoarrow_schema_07]
+package = "geoarrow-schema"
+version = "0.7"
+optional = true
 
 # arrow 58
 [dependencies.arrow_58]
@@ -93,7 +101,14 @@ package = "parquet"
 version = "58"
 features = ["async", "object_store"]
 optional = true
-
+[dependencies.geoarrow_array_08]
+package = "geoarrow-array"
+version = "0.8"
+optional = true
+[dependencies.geoarrow_schema_08]
+package = "geoarrow-schema"
+version = "0.8"
+optional = true
 [features]
 # no default features
 default = []
@@ -110,8 +125,20 @@ integration-test = ["hdfs-native-object-store/integration-test"]
 arrow = ["arrow-58"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
-arrow-57 = ["dep:arrow_57", "dep:parquet_57", "dep:object_store_12"]
-arrow-58 = ["dep:arrow_58", "dep:parquet_58", "dep:object_store_13"]
+arrow-57 = [
+  "dep:arrow_57",
+  "dep:parquet_57",
+  "dep:object_store_12",
+  "dep:geoarrow_array_07",
+  "dep:geoarrow_schema_07",
+]
+arrow-58 = [
+  "dep:arrow_58",
+  "dep:parquet_58",
+  "dep:object_store_13",
+  "dep:geoarrow_array_08",
+  "dep:geoarrow_schema_08",
+]
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow"]
 

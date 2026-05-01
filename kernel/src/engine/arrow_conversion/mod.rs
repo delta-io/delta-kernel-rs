@@ -1,5 +1,6 @@
 //! Conversions between kernel schema types and arrow schema types.
 
+mod geo;
 pub mod scalar;
 
 use std::collections::HashMap;
@@ -107,9 +108,26 @@ impl TryFromKernel<&StructType> for ArrowSchema {
 
 impl TryFromKernel<&StructField> for ArrowField {
     fn try_from_kernel(f: &StructField) -> Result<Self, ArrowError> {
-        let metadata = kernel_metadata_to_arrow_metadata(f)?;
-        let field = ArrowField::new(f.name(), f.data_type().try_into_arrow()?, f.is_nullable())
-            .with_metadata(metadata);
+        let kernel_metadata = kernel_metadata_to_arrow_metadata(f)?;
+
+        let field = match f.data_type() {
+            DataType::Primitive(PrimitiveType::Geometry(geo_type)) => geo::wkb_arrow_field(
+                f.name(),
+                geo_type.srid(),
+                None,
+                f.is_nullable(),
+                kernel_metadata,
+            ),
+            DataType::Primitive(PrimitiveType::Geography(geo_type)) => geo::wkb_arrow_field(
+                f.name(),
+                geo_type.srid(),
+                Some(geo_type.algorithm()),
+                f.is_nullable(),
+                kernel_metadata,
+            ),
+            _ => ArrowField::new(f.name(), f.data_type().try_into_arrow()?, f.is_nullable())
+                .with_metadata(kernel_metadata),
+        };
 
         Ok(field)
     }
@@ -175,6 +193,10 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     )),
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
+                    }
+                    // Geo values are WKB binary; GeoArrow extension metadata lives on the field.
+                    PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
+                        Ok(ArrowDataType::Binary)
                     }
                 }
             }
@@ -637,5 +659,108 @@ mod tests {
             StructField::try_from_arrow(&arrow_field),
             "conflicting parquet field IDs",
         );
+    }
+
+    #[cfg(feature = "arrow-conversion")]
+    #[test]
+    fn test_geometry_field_produces_geoarrow_wkb_extension_metadata() -> DeltaResult<()> {
+        use crate::schema::GeometryType;
+
+        let geo_type = GeometryType::try_new("EPSG:4326")?;
+        let kernel_schema = StructType::try_new(vec![StructField::nullable(
+            "geom",
+            DataType::Primitive(PrimitiveType::Geometry(Box::new(geo_type))),
+        )])?;
+        let arrow_schema = ArrowSchema::try_from_kernel(&kernel_schema)?;
+        let field = arrow_schema.field(0);
+
+        assert_eq!(*field.data_type(), ArrowDataType::Binary);
+        assert_eq!(
+            field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(|s| s.as_str()),
+            Some("geoarrow.wkb"),
+        );
+        assert!(
+            field.metadata().contains_key("ARROW:extension:metadata"),
+            "GeoArrow extension metadata should be present"
+        );
+
+        // Verify CRS is encoded in the metadata JSON
+        let ext_meta = field.metadata().get("ARROW:extension:metadata").unwrap();
+        assert!(
+            ext_meta.contains("EPSG:4326"),
+            "Extension metadata should contain the SRID: {ext_meta}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow-conversion")]
+    #[test]
+    fn test_geography_field_produces_geoarrow_wkb_extension_metadata() -> DeltaResult<()> {
+        use crate::schema::{EdgeInterpolationAlgorithm, GeographyType};
+
+        let geo_type = GeographyType::try_new(
+            Some("OGC:CRS84"),
+            Some(EdgeInterpolationAlgorithm::Spherical),
+        )?;
+        let kernel_schema = StructType::try_new(vec![StructField::nullable(
+            "geog",
+            DataType::Primitive(PrimitiveType::Geography(Box::new(geo_type))),
+        )])?;
+        let arrow_schema = ArrowSchema::try_from_kernel(&kernel_schema)?;
+        let field = arrow_schema.field(0);
+
+        assert_eq!(*field.data_type(), ArrowDataType::Binary);
+        assert_eq!(
+            field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(|s| s.as_str()),
+            Some("geoarrow.wkb"),
+        );
+        let ext_meta = field.metadata().get("ARROW:extension:metadata").unwrap();
+        assert!(
+            ext_meta.contains("OGC:CRS84"),
+            "Extension metadata should contain the SRID: {ext_meta}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow-conversion")]
+    #[test]
+    fn test_geo_field_preserves_kernel_metadata_alongside_geoarrow() -> DeltaResult<()> {
+        use crate::schema::GeometryType;
+
+        let geo_type = GeometryType::try_new("EPSG:4326")?;
+        let field = StructField::nullable(
+            "geom",
+            DataType::Primitive(PrimitiveType::Geometry(Box::new(geo_type))),
+        )
+        .with_metadata([(
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            MetadataValue::Number(42),
+        )]);
+
+        let arrow_field = ArrowField::try_from_kernel(&field)?;
+
+        // GeoArrow metadata is present
+        assert_eq!(
+            arrow_field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(|s| s.as_str()),
+            Some("geoarrow.wkb"),
+        );
+        // Kernel metadata (parquet field ID) is also present
+        assert_eq!(
+            arrow_field
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .map(|s| s.as_str()),
+            Some("42"),
+        );
+        Ok(())
     }
 }

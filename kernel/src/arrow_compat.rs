@@ -3,6 +3,8 @@
 #[cfg(feature = "arrow-58")]
 mod arrow_compat_shims {
     pub use arrow_58 as arrow;
+    pub use geoarrow_array_08 as geoarrow_array;
+    pub use geoarrow_schema_08 as geoarrow_schema;
     pub use parquet_58 as parquet;
 
     pub mod object_store {
@@ -13,6 +15,8 @@ mod arrow_compat_shims {
 #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
 mod arrow_compat_shims {
     pub use arrow_57 as arrow;
+    pub use geoarrow_array_07 as geoarrow_array;
+    pub use geoarrow_schema_07 as geoarrow_schema;
     pub use parquet_57 as parquet;
 
     pub mod object_store {

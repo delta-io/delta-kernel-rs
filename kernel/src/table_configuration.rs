@@ -24,7 +24,7 @@ use crate::scan::data_skipping::stats_schema::{
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
-    column_mapping_mode, get_any_level_column_physical_name,
+    column_mapping_mode, get_any_level_column_physical_name, validate_geospatial_feature_support,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
     FeatureType, KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES,
     LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
@@ -195,6 +195,7 @@ impl TableConfiguration {
 
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
+        validate_geospatial_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
 
         Ok(table_config)
@@ -1673,6 +1674,13 @@ mod test {
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
             r#"Feature 'typeWidening' is not supported for writes"#,
+        );
+
+        // Geospatial is not supported for writes
+        let config = create_mock_table_config(&[], &[TableFeature::GeospatialType]);
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            r#"Feature 'geospatial' is not supported for writes"#,
         );
     }
 
