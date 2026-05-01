@@ -5,7 +5,9 @@ pub mod table_builder;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-pub use counting_reporter::{CountingReporter, RelaxedCounter};
+pub use counting_reporter::{
+    ensure_metrics_compatible_global_subscriber, CountingReporter, RelaxedCounter,
+};
 use delta_kernel::actions::get_log_add_schema;
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,

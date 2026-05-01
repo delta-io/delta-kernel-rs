@@ -5,8 +5,54 @@
 //! inspect the counters or call [`CountingReporter::print_summary`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use delta_kernel::metrics::{MetricEvent, MetricsReporter};
+use tracing_subscriber::util::SubscriberInitExt as _;
+
+/// Ensure a process-global tracing subscriber is installed exactly once for the lifetime
+/// of the test binary.
+///
+/// **Tests that use `tracing_subscriber::set_default` (thread-local) to install a
+/// metrics-bearing subscriber MUST call this first**, before installing their thread-local
+/// subscriber. Without it, kernel metrics emitted from `Drop` impls (notably storage
+/// list/read in the default engine, and the JSON/Parquet emit helpers) can be silently
+/// disabled for the entire process.
+///
+/// # Why
+///
+/// `tracing` caches per-callsite `Interest` *process-globally* on first registration. The
+/// kernel emits metrics from `Drop` impls that fire `tracing::span!` on whichever thread
+/// happens to drop the iterator -- often a tokio worker thread owned by the
+/// `DefaultEngine`'s background runtime, which has no thread-local subscriber. When such
+/// a thread is the first to hit a metric callsite, it consults `NoSubscriber` (the
+/// fallback), gets `Interest::never`, and that verdict is cached process-globally. Every
+/// later emission of that callsite -- including emissions from threads that *do* have the
+/// test's subscriber installed -- is then a no-op. Counters that depend on those metrics
+/// sit at zero and assertions fail.
+///
+/// `set_default` (thread-local) does *not* invalidate the callsite cache; only
+/// `set_global_default` does. This helper installs a bare `Registry` as the global
+/// default once per process. It does nothing on its own (no metrics layer attached to
+/// it), but it ensures every thread sees a real subscriber whenever it first hits a
+/// callsite, which keeps the cached interest in the `always`/`sometimes` regime.
+/// Per-test `set_default(...)` then routes events to the test's `CountingReporter` as
+/// usual; metrics emissions on threads without a thread-local override (tokio workers,
+/// libtest scaffolding) silently fall through to the bare `Registry`, which is correct
+/// because those threads have no test counter to update.
+pub fn ensure_metrics_compatible_global_subscriber() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        // Install a bare Registry. `try_init` calls `set_global_default`, which can only
+        // succeed once per process and triggers an interest-cache rebuild internally on
+        // success. If a global default is already installed (e.g. by a test runner via
+        // `RUST_LOG`), respect it and rebuild the cache ourselves so any callsites that
+        // were registered before this call are re-evaluated against the current dispatcher.
+        if tracing_subscriber::registry().try_init().is_err() {
+            tracing::callsite::rebuild_interest_cache();
+        }
+    });
+}
 
 /// An atomic `u64` counter using [`Ordering::Relaxed`] throughout.
 ///

@@ -1541,6 +1541,9 @@ mod scan_metadata_completed_tests {
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
         let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
+        // Install a real global default before the per-test thread-local subscriber. See
+        // `test_utils::ensure_metrics_compatible_global_subscriber` for the rationale.
+        test_utils::ensure_metrics_compatible_global_subscriber();
         let guard = tracing_subscriber::registry()
             .with_metrics_reporter_layer(reporter.clone())
             .set_default();
@@ -1616,6 +1619,9 @@ mod scan_metadata_completed_tests {
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
         let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
+        // Install a real global default before the per-test thread-local subscriber. See
+        // `test_utils::ensure_metrics_compatible_global_subscriber` for the rationale.
+        test_utils::ensure_metrics_compatible_global_subscriber();
         let _guard = tracing_subscriber::registry()
             .with_metrics_reporter_layer(reporter.clone())
             .set_default();

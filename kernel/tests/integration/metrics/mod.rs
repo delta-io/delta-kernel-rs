@@ -25,7 +25,9 @@ use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
 use test_utils::table_builder::{LogState, TestTableBuilder};
-use test_utils::{insert_data, test_table_setup_mt, CountingReporter};
+use test_utils::{
+    ensure_metrics_compatible_global_subscriber, insert_data, test_table_setup_mt, CountingReporter,
+};
 use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
 
@@ -44,6 +46,7 @@ fn measuring_engine(
     Arc<CountingReporter>,
     tracing::subscriber::DefaultGuard,
 ) {
+    ensure_metrics_compatible_global_subscriber();
     let reporter = Arc::new(CountingReporter::default());
     let engine = DefaultEngineBuilder::new(store).build();
     let guard = tracing_subscriber::registry()
