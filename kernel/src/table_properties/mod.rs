@@ -328,9 +328,9 @@ pub enum IsolationLevel {
 
 /// Compression codec to use when writing Parquet files.
 ///
-/// String parsing is case-insensitive. Only `snappy` and `zstd` are currently supported.
-/// Any other value (e.g. `gzip`, `lz4`, `brotli`, `uncompressed`) parsed from a table property
-/// is silently ignored and the default codec applies.
+/// String parsing is case-insensitive. Only `snappy`, `zstd`, and `uncompressed` are currently
+/// supported. Any other value (e.g. `gzip`, `lz4`, `brotli`) parsed from a table property is
+/// silently ignored and the default codec applies.
 #[derive(Debug, EnumString, Clone, Copy, PartialEq, Eq, Default)]
 #[strum(ascii_case_insensitive)]
 pub enum ParquetCompression {
@@ -339,6 +339,8 @@ pub enum ParquetCompression {
     /// Zstandard compression (default).
     #[default]
     Zstd,
+    /// No compression.
+    Uncompressed,
 }
 
 /// Configuration for writing Parquet files.
@@ -648,6 +650,8 @@ mod tests {
     #[case(Some("zstd"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
     #[case(Some("ZSTD"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
     #[case(Some("Zstd"), ParquetWriterConfig { compression: ParquetCompression::Zstd })]
+    #[case(Some("uncompressed"), ParquetWriterConfig { compression: ParquetCompression::Uncompressed })]
+    #[case(Some("UNCOMPRESSED"), ParquetWriterConfig { compression: ParquetCompression::Uncompressed })]
     // Unrecognized codec falls back to the default
     #[case(Some("not_a_codec"), ParquetWriterConfig::default())]
     fn test_parquet_writer_config(

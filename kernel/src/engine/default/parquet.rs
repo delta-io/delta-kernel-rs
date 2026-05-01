@@ -50,6 +50,7 @@ pub(crate) fn writer_options(config: &ParquetWriterConfig) -> ArrowWriterOptions
     let compression = match config.compression {
         ParquetCompression::Snappy => Compression::SNAPPY,
         ParquetCompression::Zstd => Compression::ZSTD(Default::default()),
+        ParquetCompression::Uncompressed => Compression::UNCOMPRESSED,
     };
     let props = crate::parquet::file::properties::WriterProperties::builder()
         .set_compression(compression)
