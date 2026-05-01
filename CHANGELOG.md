@@ -15,42 +15,46 @@
      `txn.partitioned_write_context(partition_values)` or `txn.unpartitioned_write_context()`.
      Partition values are now passed as `Map<String, Scalar>` (kernel handles serialization per
      the Delta spec) instead of `Map<String, String>`.
+     `DefaultParquetHandler::write_parquet_file` signature changed from
+     `(path, data, partition_values, stats_columns)` to `(data, &WriteContext)`. See
+     `kernel/tests/integration/write/partitioned.rs` and the updated
+     `kernel/examples/write-table` for migration examples.
 3. Add typed null literal support to FFI expression visitors ([#2375])
    - FFI `visit_expression_literal_null` and `visit_literal_null` now accept `type_tag` (plus
      `precision`/`scale` for decimal). FFI engines must provide type information when emitting
      null literals; see the new `NullTypeTag` enum for the contract.
 4. Change get_create_table_builder to accept EngineSchema visitor ([#2378])
    - FFI `get_create_table_builder` now takes `&EngineSchema` instead of `Handle<SharedSchema>`.
-     FFI callers must encode the schema via `visit_field_*` downcalls (matching the
-     `scan_builder_with_schema` pattern) instead of going through `schema_from_json`.
+     Engines must implement the visitor pattern (`visit_field_*` callbacks) to populate the
+     schema, matching the existing `scan_builder_with_schema` pattern. See the
+     `ffi/examples/create-table` example for a reference implementation.
 5. Transform stats parsed for remove actions ([#2061])
    - Adds `fn has_field(&self, name: &ColumnName) -> bool` to the `EngineData` trait. Custom
      `EngineData` implementors must add this method.
 6. Default to writing relative paths in `add.path` ([#2410])
    - Kernel now writes **relative** paths in `add.path` (e.g. `abc.parquet`) instead of absolute
      URLs (e.g. `s3://bucket/table/abc.parquet`), matching Delta Spark.
-     `DefaultParquetHandler::write_parquet_file` signature changed from
-     `(path, data, partition_values, stats_columns)` to `(data, &WriteContext)`.
 7. Add tests for histograms and expose stats and histogram ([#2373])
-   - Exposes `stats` and `histogram` accessors on file metadata for connector use. Most callers
-     gain new getters.
+   - New public types `FileStats` and `FileSizeHistogram`, plus `Snapshot::get_or_load_file_stats`
+     and `Snapshot::get_file_stats_if_loaded` accessors. Connectors can read CRC file-stats
+     histogram data through these public APIs.
 8. Separate read state from effective state in Transaction ([#2385])
    - Internal `Transaction` refactor: splits the held snapshot into
      `read_snapshot_opt: Option<SnapshotRef>` (pre-commit state) and
      `effective_table_config: TableConfiguration` (state this commit will produce).
 9. Make scan_table_changes_next return *mut ArrowFFIData ([#2430])
-   - FFI `scan_table_changes_next` now returns `*mut ArrowFFIData` instead of
-     `ExternResult<ArrowFFIData>`. FFI consumers must switch from value-style access (`res.ok`)
-     to pointer-style access and call the new `free_arrow_ffi_data` on non-null results.
+   - The Ok variant of FFI `scan_table_changes_next`'s `ExternResult` is now a heap-allocated
+     `*mut ArrowFFIData` instead of an inline `ArrowFFIData` value. FFI consumers must switch
+     from value-style access (`res.ok`) to pointer-style and call the new `free_arrow_ffi_data`
+     on non-null results.
 10. Update `CheckpointWriter::finalize` to accept `LastCheckpointHintStats` ([#2400])
     - `CheckpointWriter::finalize` now takes a `LastCheckpointHintStats` struct instead of
       `(FileMeta, ActionReconciliationIteratorState)`. Construct the new struct to correctly
       populate `_last_checkpoint` (including `sizeInBytes` and `size`) for V2 checkpoints with
       sidecars.
 11. Replace existing metrics reporting with tracing ([#1822])
-    - Removes the `MetricsReporter` trait and the metrics-reporter slot from `Engine`. Connectors
-      register a `tracing-subscriber` layer instead. Migrate any custom `MetricsReporter`
-      implementations to a `tracing::Layer`.
+    - `MetricsReporter` is no longer part of the `Engine` APIs. Instead you can register a
+      reporter as a tracing layer. See `kernel/examples/inspect-table` for migration.
 12. Add CheckpointRowGroupFilter for checkpoint data skipping ([#1893])
     - `ParquetStatsProvider::get_parquet_rowcount_stat` return type changed from `i64` to
       `Option<i64>`. Engines implementing `ParquetStatsProvider` must wrap their existing return
@@ -59,8 +63,8 @@
 ### 🚀 Features / new APIs
 
 1. Add infrastructures for sidecar splitting support ([#2271])
-2. Add`extract_primitive_scalar` utility for Arrow-to-Scalar conversion ([#2368])
-3. `ParquetHandler` supports auto-creates when directory not exist ([#2287])
+2. Add `extract_primitive_scalar` utility for Arrow-to-Scalar conversion ([#2368])
+3. `ParquetHandler` auto-creates the target directory if it does not exist ([#2287])
 4. Add schema validation for CREATE TABLE ([#2309])
 5. Add row tracking support for create table ([#2317])
 6. *(tests)* Add read-path integration tests for row tracking ([#2316])
@@ -79,7 +83,7 @@
 1. Acceptance test framework should reject negative snapshot version ([#2364])
 2. Exclude partition columns from write-path stats collection ([#2362])
 3. Add BYTE/SHORT support to stats verifier and GetData trait ([#2382])
-4. Support presigned db urls, and refactor a bit ([#2398])
+4. Support presigned DB URLs ([#2398])
 5. Ensure doctests are run in GitHub Actions ([#2412])
 6. Missing PR link in the v0.21.0 CHANGELOG ([#2428])
 7. Drop partitionValues_parsed in build_remove_transform ([#2429])
@@ -88,7 +92,7 @@
 10. Correct inaccuracies in ffi examples ([#2432])
 11. Restore the Snapshot::new internal API ([#2425])
 12. Clear stale CRC file in LogSegment::try_new_with_checkpoint ([#2457])
-13. Keep name-based validation for column expressions with struct  ([#2440])
+13. Keep name-based validation for column expressions with struct ([#2440])
 14. Reuse LazyCrc in checkpoint early-return during incremental update ([#2329])
 15. Add deserialization alias for file histogram ([#2489])
 
@@ -101,7 +105,7 @@
 1. Extract prerequisite schema constructions for `CheckpointWriter` ([#2313])
 2. Change inconsistent kernel modules to use mod convention ([#2408])
 3. Enforce line width and import ordering with nightly rustfmt ([#2383])
-4. Add more test setup utils in `write_partitioned.rs` tests ([#2422])
+4. Add more test setup utils for partitioned write tests ([#2422])
 5. Move data file methods behind SupportsDataFiles trait ([#2386])
 
 ### 🧪 Testing
