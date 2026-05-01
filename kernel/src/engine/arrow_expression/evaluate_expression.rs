@@ -1,5 +1,6 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -9,8 +10,8 @@ use tracing::warn;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
-    AsArray, BooleanArray, Datum, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch,
-    StringArray, StructArray,
+    AsArray, BooleanArray, BooleanBufferBuilder, Datum, MapArray, MutableArrayData,
+    NullBufferBuilder, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
@@ -484,6 +485,127 @@ fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array
     }
 }
 
+// === Float SQL comparison helpers ===
+//
+// Arrow's `cmp` kernels (`eq`, `lt`, `gt`, etc.) use total ordering for floats: `-0.0 < 0.0`
+// and NaN sorts greatest. SQL semantics require `-0.0 == 0.0` while keeping Spark's
+// NaN-as-greatest with `NaN == NaN`. The helpers below implement that hybrid ordering.
+//
+// Any new code path that compares float arrays via the Arrow expression evaluator should
+// route through [`float_sql_cmp`] / [`float_sql_distinct`]. Calling Arrow's `cmp` kernels
+// directly on float arrays will reintroduce the `-0.0 != 0.0` bug. The `IN` predicate path
+// (`eval_in`) currently uses Arrow's `in_list`, which does Rust IEEE `PartialEq` per element:
+// `-0.0 == 0.0` is correct, but `NaN IN [NaN]` is `false` (not `true`). Aligning IN with
+// these helpers is tracked separately. The scalar path (`Scalar::logical_partial_cmp`)
+// uses `partial_cmp`: correct for `-0.0`, but returns `None` for NaN rather than treating
+// NaN as greatest. That divergence is also tracked separately and is safe today because
+// both paths conservatively keep files when NaN is present.
+
+/// Returns the SQL ordering of two floats: `-0.0 == 0.0`, `NaN == NaN`, and NaN sorts
+/// greater than every non-NaN value (matching Spark's `SQLOrderingUtil.compareDoubles`).
+fn sql_float_cmp<F: PartialOrd>(a: F, b: F) -> Ordering {
+    match a.partial_cmp(&b) {
+        Some(ord) => ord,
+        // partial_cmp(&x) is None iff x is NaN; this is the generic equivalent of !x.is_nan().
+        None => match (a.partial_cmp(&a).is_some(), b.partial_cmp(&b).is_some()) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => Ordering::Equal,
+        },
+    }
+}
+
+/// Element-wise float comparison using [`sql_float_cmp`].
+///
+/// # Parameters
+/// - `left`, `right`: input arrays of equal length.
+/// - `ord`: the [`Ordering`] result that produces `true` for each row (e.g. [`Ordering::Less`] for
+///   `<`, [`Ordering::Equal`] for `=`).
+/// - `inverted`: when true, flips each output bit. Used to express `>=` as `NOT <`, `<=` as `NOT
+///   >`, and `!=` as `NOT =`.
+///
+/// Returns a [`BooleanArray`] whose null mask is the union of the input null masks. Values
+/// are compared unconditionally; null branching only happens once at the end (single
+/// `NullBuffer::union`) rather than per element.
+fn float_sql_cmp<T: ArrowPrimitiveType>(
+    left: &PrimitiveArray<T>,
+    right: &PrimitiveArray<T>,
+    ord: Ordering,
+    inverted: bool,
+) -> BooleanArray
+where
+    T::Native: PartialOrd,
+{
+    let mut builder = BooleanBufferBuilder::new(left.len());
+    for (l, r) in left.values().iter().zip(right.values().iter()) {
+        builder.append((sql_float_cmp(*l, *r) == ord) != inverted);
+    }
+    let nulls = NullBuffer::union(left.nulls(), right.nulls());
+    BooleanArray::new(builder.finish(), nulls)
+}
+
+/// Like [`float_sql_cmp`], but for `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` which treat
+/// nulls as comparable values: `NULL IS NOT DISTINCT FROM NULL` is true.
+///
+/// # Parameters
+/// - `left`, `right`: input arrays of equal length.
+/// - `inverted`: when false, computes `IS DISTINCT FROM` (true for unequal values or null
+///   mismatch). When true, computes `IS NOT DISTINCT FROM`.
+///
+/// Unlike [`float_sql_cmp`], this inspects nulls per element since null equality is part of
+/// the result rather than something to propagate. Output never contains nulls.
+fn float_sql_distinct<T: ArrowPrimitiveType>(
+    left: &PrimitiveArray<T>,
+    right: &PrimitiveArray<T>,
+    inverted: bool,
+) -> BooleanArray
+where
+    T::Native: PartialOrd,
+{
+    let len = left.len();
+    let left_vals = left.values();
+    let right_vals = right.values();
+    let mut builder = BooleanBufferBuilder::new(len);
+    for i in 0..len {
+        // SQL: NULL is not distinct from NULL; NULL is distinct from any value.
+        let result = match (left.is_null(i), right.is_null(i)) {
+            (false, false) => {
+                (sql_float_cmp(left_vals[i], right_vals[i]) != Ordering::Equal) != inverted
+            }
+            (true, true) => inverted,
+            _ => !inverted,
+        };
+        builder.append(result);
+    }
+    BooleanArray::new(builder.finish(), None)
+}
+
+/// Dispatches a float-array comparison to [`float_sql_cmp`] or [`float_sql_distinct`].
+/// Caller already established `op` is one of `Equal`, `LessThan`, `GreaterThan`, or
+/// `Distinct`; `In` is handled separately via `eval_in` and would be a programmer error here.
+fn float_dispatch<T: ArrowPrimitiveType>(
+    left: &PrimitiveArray<T>,
+    right: &PrimitiveArray<T>,
+    op: BinaryPredicateOp,
+    inverted: bool,
+) -> DeltaResult<BooleanArray>
+where
+    T::Native: PartialOrd,
+{
+    use BinaryPredicateOp::*;
+    Ok(match op {
+        Distinct => float_sql_distinct(left, right, inverted),
+        LessThan => float_sql_cmp(left, right, Ordering::Less, inverted),
+        GreaterThan => float_sql_cmp(left, right, Ordering::Greater, inverted),
+        Equal => float_sql_cmp(left, right, Ordering::Equal, inverted),
+        In => {
+            return Err(Error::internal_error(
+                "unexpected IN predicate in float comparison dispatch",
+            ))
+        }
+    })
+}
+
 /// Evaluates a (possibly inverted) kernel predicate over a record batch
 pub fn evaluate_predicate(
     predicate: &Predicate,
@@ -612,7 +734,30 @@ pub fn evaluate_predicate(
                     arrow_convert_to_view_type(right)?,
                 )
             };
-            Ok(eval_fn(&left, &right)?)
+
+            // Arrow's `cmp` kernels use total ordering for floats (-0.0 != 0.0), which
+            // would silently drop rows during data skipping. Float arrays are routed to
+            // `float_dispatch` for SQL semantics (-0.0 == 0.0, NaN == NaN, NaN > all). See
+            // the section comment above `sql_float_cmp` for paths still on Arrow's kernels.
+            match (left.data_type(), right.data_type()) {
+                (ArrowDataType::Float32, ArrowDataType::Float32) => {
+                    let l = left.as_primitive_opt::<Float32Type>();
+                    let r = right.as_primitive_opt::<Float32Type>();
+                    if let (Some(l), Some(r)) = (l, r) {
+                        return float_dispatch(l, r, *op, inverted);
+                    }
+                    Ok(eval_fn(&left, &right)?)
+                }
+                (ArrowDataType::Float64, ArrowDataType::Float64) => {
+                    let l = left.as_primitive_opt::<Float64Type>();
+                    let r = right.as_primitive_opt::<Float64Type>();
+                    if let (Some(l), Some(r)) = (l, r) {
+                        return float_dispatch(l, r, *op, inverted);
+                    }
+                    Ok(eval_fn(&left, &right)?)
+                }
+                _ => Ok(eval_fn(&left, &right)?),
+            }
         }
         Junction(JunctionPredicate { op, preds }) => {
             // Leverage de Morgan's laws (invert the children and swap the operator):
