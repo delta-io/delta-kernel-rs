@@ -574,7 +574,7 @@ mod tests {
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
-    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::schema::{DataType, MetadataValue, StructField, StructType};
     use delta_kernel::table_features::TableFeature;
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
     use delta_kernel_ffi::error::KernelError;
@@ -584,14 +584,19 @@ mod tests {
     };
     use delta_kernel_ffi::tests::get_default_engine;
     use itertools::Itertools;
+    use rstest::rstest;
     use serde_json::{json, Deserializer};
     use tempfile::tempdir;
     use test_utils::{set_json_value, setup_test_tables, test_read};
     use write_context::{
-        free_write_context, get_unpartitioned_write_context, get_write_path, get_write_schema,
+        create_table_get_unpartitioned_write_context, free_write_context, get_logical_to_physical,
+        get_physical_write_schema, get_unpartitioned_write_context, get_write_path,
+        get_write_schema,
     };
 
     use super::*;
+    use crate::engine_funcs::{free_expression_evaluator, new_expression_evaluator};
+    use crate::expressions::free_kernel_expression;
     use crate::schema_visitor::{
         visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
     };
@@ -1488,6 +1493,118 @@ mod tests {
         assert!(config.is_feature_enabled(&TableFeature::AppendOnly));
 
         unsafe { free_snapshot(snap) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[rstest]
+    #[case::name_mode("name")]
+    #[case::id_mode("id")]
+    #[cfg_attr(miri, ignore)]
+    fn test_cm_write_context_accessors(#[case] cm_mode: &str) {
+        let tmp_dir = tempdir().unwrap();
+        let (_table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("name", DataType::STRING),
+            ],
+        );
+
+        let cm_key = "delta.columnMapping.mode";
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_table_property(
+                builder,
+                kernel_string_slice!(cm_key),
+                kernel_string_slice!(cm_mode),
+                engine.shallow_copy(),
+            )
+        });
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+        let write_context = ok_or_panic(unsafe {
+            create_table_get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+        });
+
+        let logical = unsafe { get_write_schema(write_context.shallow_copy()) };
+        let logical_ref = unsafe { logical.as_ref() };
+        assert_eq!(logical_ref.num_fields(), 2);
+        assert_eq!(logical_ref.field_at_index(0).unwrap().name, "id");
+        assert_eq!(logical_ref.field_at_index(1).unwrap().name, "name");
+
+        let physical = unsafe { get_physical_write_schema(write_context.shallow_copy()) };
+        let physical_ref = unsafe { physical.as_ref() };
+        assert_eq!(physical_ref.num_fields(), 2);
+        for (i, logical_name) in ["id", "name"].iter().enumerate() {
+            let field = physical_ref.field_at_index(i).unwrap();
+            assert_ne!(
+                &field.name, logical_name,
+                "physical name for field {i} must differ from logical name {logical_name}"
+            );
+            let field_id = field.metadata.get("parquet.field.id");
+            assert!(
+                matches!(field_id, Some(MetadataValue::Number(_))),
+                "field {i} must carry parquet.field.id metadata as a Number, got {field_id:?}"
+            );
+        }
+
+        let l2p = unsafe { get_logical_to_physical(write_context.shallow_copy()) };
+
+        unsafe { free_kernel_expression(l2p) };
+        unsafe { free_schema(physical) };
+        unsafe { free_schema(logical) };
+        unsafe { free_write_context(write_context) };
+        unsafe { create_table_free_transaction(txn) };
+        unsafe { free_engine(engine) };
+    }
+
+    /// Builds an evaluator from (logical, l2p, physical) to verify the three FFI write-context
+    /// accessors compose correctly.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_cm_write_context_evaluator_composition() {
+        let tmp_dir = tempdir().unwrap();
+        let (_table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("name", DataType::STRING),
+            ],
+        );
+        let cm_key = "delta.columnMapping.mode";
+        let cm_val = "name";
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_table_property(
+                builder,
+                kernel_string_slice!(cm_key),
+                kernel_string_slice!(cm_val),
+                engine.shallow_copy(),
+            )
+        });
+        let txn =
+            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
+        let write_context = ok_or_panic(unsafe {
+            create_table_get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
+        });
+
+        let logical = unsafe { get_write_schema(write_context.shallow_copy()) };
+        let physical = unsafe { get_physical_write_schema(write_context.shallow_copy()) };
+        let l2p = unsafe { get_logical_to_physical(write_context.shallow_copy()) };
+
+        let evaluator = ok_or_panic(unsafe {
+            new_expression_evaluator(
+                engine.shallow_copy(),
+                logical.shallow_copy(),
+                l2p.as_ref(),
+                physical.shallow_copy(),
+            )
+        });
+
+        unsafe { free_expression_evaluator(evaluator) };
+        unsafe { free_kernel_expression(l2p) };
+        unsafe { free_schema(physical) };
+        unsafe { free_schema(logical) };
+        unsafe { free_write_context(write_context) };
+        unsafe { create_table_free_transaction(txn) };
         unsafe { free_engine(engine) };
     }
 
