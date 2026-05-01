@@ -64,14 +64,10 @@ pub unsafe extern "C" fn free_write_context(write_context: Handle<SharedWriteCon
     write_context.drop_handle();
 }
 
-/// Get the **logical** schema from a [`WriteContext`] handle. This is the user-facing schema
-/// the engine should produce as the input to its logical-to-physical transform.
-///
-/// To write a column-mapping-enabled table, an engine MUST also use
-/// [`get_physical_write_schema`] (the evaluator's output schema and the parquet writer's
-/// schema) and [`get_logical_to_physical`] (the transform expression that drops partition
-/// columns when not materialized). For non-column-mapping unpartitioned tables, the logical
-/// and physical schemas are identical.
+/// Returns the logical schema from a [`WriteContext`] handle: the user-facing schema, used as
+/// the input to the logical-to-physical transform. See [`get_logical_to_physical`] for the
+/// full evaluator recipe (input/transform/output) needed to write column-mapping-enabled
+/// tables. For non-column-mapping unpartitioned tables, logical and physical are identical.
 ///
 /// The returned schema must be freed when no longer needed via [`crate::free_schema`].
 ///
@@ -85,22 +81,20 @@ pub unsafe extern "C" fn get_write_schema(
     write_context.logical_schema().clone().into()
 }
 
-/// Get the **physical write schema** from a [`WriteContext`] handle. This is the schema of
-/// the data that will be written to parquet files:
+/// Returns the physical write schema from a [`WriteContext`] handle: the schema of the data
+/// that will be written to parquet files.
 ///
 /// - Field names are physical column-mapping names (e.g. `col-<uuid>`) when column mapping is
 ///   enabled, and identical to the logical names otherwise.
-/// - Field metadata carries the parquet field IDs that the Delta protocol writer requirements for
-///   column mapping mandate when column mapping is enabled.
+/// - Field metadata carries `parquet.field.id` entries when column mapping is enabled, per the
+///   Delta protocol writer requirements for column mapping.
 /// - Partition columns are excluded unless a feature requiring partition materialization (e.g.
 ///   `materializePartitionColumns`) is active.
 ///
-/// Engines that perform their own logical-to-physical transformation must pass this schema as
-/// the output schema of the expression evaluator (see
-/// [`crate::engine_funcs::new_expression_evaluator`]). The evaluator realizes the
-/// logical->physical column rename by positionally matching input columns to the fields of
-/// this output schema. Engines that write parquet directly must use this as the writer's
-/// schema so that field IDs and physical names land in the file.
+/// Engines doing their own logical-to-physical transformation pass this as the evaluator's
+/// output schema (see [`crate::engine_funcs::new_expression_evaluator`] and
+/// [`get_logical_to_physical`] for the full recipe). Engines writing parquet directly use
+/// this as the writer schema so field IDs and physical names land in the file.
 ///
 /// The returned schema must be freed when no longer needed via [`crate::free_schema`].
 ///
@@ -114,20 +108,19 @@ pub unsafe extern "C" fn get_physical_write_schema(
     write_context.physical_schema().clone().into()
 }
 
-/// Get the **logical-to-physical transform** from a [`WriteContext`] handle. This is the
-/// kernel-built [`Expression`] an engine must apply (via an [`ExpressionEvaluator`]) to
-/// every batch of logical data before writing it to a parquet file.
+/// Returns the logical-to-physical transform from a [`WriteContext`] handle: the kernel-built
+/// [`Expression`] an engine applies (via an [`ExpressionEvaluator`]) to every batch of logical
+/// data before writing it to a parquet file.
 ///
-/// Today the kernel-built expression only drops partition columns (when
-/// `materializePartitionColumns` is not enabled). It may grow to encode additional
-/// structural transforms over time -- for example, type coercion or generated-column
-/// materialization. Engines must always evaluate this expression against the logical
-/// batch; do not skip evaluation on the assumption it is a no-op.
+/// The expression drops partition columns when `materializePartitionColumns` is not enabled,
+/// and may encode additional structural transforms (e.g. type coercion, generated-column
+/// materialization). Always evaluate it against the logical batch -- do not skip on the
+/// assumption it is a no-op.
 ///
-/// The logical->physical column rename is carried by the schema returned from
-/// [`get_physical_write_schema`], not by this expression: the evaluator realizes the rename
-/// by positionally matching input columns to fields of the output schema. Callers must
-/// therefore construct an evaluator with:
+/// The logical-to-physical column rename is carried by [`get_physical_write_schema`], not by
+/// this expression: the evaluator realizes the rename by positionally matching input columns
+/// to fields of the output schema. Callers construct an evaluator (see
+/// [`crate::engine_funcs::new_expression_evaluator`]) with:
 ///
 /// - input schema  = [`get_write_schema`] (logical)
 /// - transform     = this expression

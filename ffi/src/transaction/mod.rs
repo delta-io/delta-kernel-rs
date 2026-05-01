@@ -1525,10 +1525,6 @@ mod tests {
         unsafe { free_engine(engine) };
     }
 
-    /// Verifies that the FFI write-context accessors expose CM-aware write metadata for both
-    /// `Name` and `Id` modes: physical schema field names differ from logical names and carry
-    /// the `parquet.field.id` metadata that Delta's writer requirements for column mapping
-    /// require.
     #[rstest]
     #[case::name_mode("name")]
     #[case::id_mode("id")]
@@ -1552,24 +1548,18 @@ mod tests {
                 engine.shallow_copy(),
             )
         });
-
-        // Build the create-table transaction (do not commit -- we only need the WriteContext).
         let txn =
             ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
-
         let write_context = ok_or_panic(unsafe {
             create_table_get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
         });
 
-        // Logical schema retains user-facing names.
         let logical = unsafe { get_write_schema(write_context.shallow_copy()) };
         let logical_ref = unsafe { logical.as_ref() };
         assert_eq!(logical_ref.num_fields(), 2);
         assert_eq!(logical_ref.field_at_index(0).unwrap().name, "id");
         assert_eq!(logical_ref.field_at_index(1).unwrap().name, "name");
 
-        // Physical schema has CM-assigned physical names distinct from logical names, and
-        // each field carries the parquet.field.id metadata required by the Delta protocol.
         let physical = unsafe { get_physical_write_schema(write_context.shallow_copy()) };
         let physical_ref = unsafe { physical.as_ref() };
         assert_eq!(physical_ref.num_fields(), 2);
@@ -1586,9 +1576,6 @@ mod tests {
             );
         }
 
-        // Smoke-check that the transform handle is reachable. The kernel-side
-        // `validate_logical_to_physical_transform` test covers expression semantics;
-        // `test_cm_write_context_evaluator_composition` (below) covers FFI composition.
         let l2p = unsafe { get_logical_to_physical(write_context.shallow_copy()) };
 
         unsafe { free_kernel_expression(l2p) };
@@ -1599,10 +1586,8 @@ mod tests {
         unsafe { free_engine(engine) };
     }
 
-    /// Composes all three FFI accessors into a [`new_expression_evaluator`] call to prove the
-    /// documented contract on `get_logical_to_physical`: an engine can construct an evaluator
-    /// from `(logical, l2p, physical)` and have it succeed. Catches handle-wiring mistakes
-    /// the smoke test in `test_cm_write_context_accessors` cannot.
+    /// Builds an evaluator from (logical, l2p, physical) to verify the three FFI write-context
+    /// accessors compose correctly.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_cm_write_context_evaluator_composition() {
