@@ -155,7 +155,7 @@ impl AlterTableTransactionBuilder<Modifying> {
         // [`crate::table_features::ICEBERG_COMPAT_V3_INFO`] for the tracking issue.
         if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
             return Err(Error::unsupported(
-                "ALTER TABLE is not supported on tables with icebergCompatV3 enabled",
+                "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
             ));
         }
         // Rejects writes to tables kernel can't safely commit to: writer version out of
