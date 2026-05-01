@@ -856,6 +856,17 @@ pub trait ParquetHandler: AsAny {
     /// This will overwrite the file if it already exists. For filesystem-backed
     /// implementations, the parent directories must be created if they do not exist.
     ///
+    /// # Parquet field IDs
+    ///
+    /// The engine must write a Parquet `field_id` correctly when the kernel
+    /// [`StructField`] carries a field-id related annotation, including:
+    /// - [`ColumnMetadataKey::ColumnMappingId`] / [`ColumnMetadataKey::ParquetFieldId`]
+    /// - [`ColumnMetadataKey::ColumnMappingNestedIds`] /
+    ///   [`ColumnMetadataKey::ParquetFieldNestedIds`]
+    ///
+    /// For how to use these keys, refer to the Delta protocol's [Column Mapping] and
+    /// [IcebergCompatV2] sections.
+    ///
     /// # Parameters
     ///
     /// - `url` - The full URL path where the Parquet file should be written (e.g.,
@@ -865,6 +876,14 @@ pub trait ParquetHandler: AsAny {
     /// # Returns
     ///
     /// A [`DeltaResult`] indicating success or failure.
+    ///
+    /// [`StructField`]: crate::schema::StructField
+    /// [`ColumnMetadataKey::ColumnMappingId`]: crate::schema::ColumnMetadataKey::ColumnMappingId
+    /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
+    /// [`ColumnMetadataKey::ColumnMappingNestedIds`]: crate::schema::ColumnMetadataKey::ColumnMappingNestedIds
+    /// [`ColumnMetadataKey::ParquetFieldNestedIds`]: crate::schema::ColumnMetadataKey::ParquetFieldNestedIds
+    /// [Column Mapping]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
+    /// [IcebergCompatV2]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#iceberg-compatibility-v2
     fn write_parquet_file(
         &self,
         location: url::Url,
