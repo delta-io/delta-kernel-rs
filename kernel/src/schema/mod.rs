@@ -1510,6 +1510,32 @@ fn default_true() -> bool {
 /// Default spatial reference identifier for geometry and geography types.
 pub const DEFAULT_GEO_SRID: &str = "OGC:CRS84";
 
+/// Validates that an SRID is in AUTHORITY:CODE form: contains a colon, has non-empty text
+/// before and after it, and has no leading or trailing whitespace. Validating the value
+/// against the full set of recognized SRIDs is future work.
+fn validate_srid(srid: &str) -> DeltaResult<()> {
+    require!(
+        srid == srid.trim(),
+        Error::invalid_geo_params(format!(
+            "SRID '{srid}' must not have leading or trailing whitespace"
+        ))
+    );
+    let (authority, code) = srid.split_once(':').ok_or_else(|| {
+        Error::invalid_geo_params(format!("SRID '{srid}' must be in 'AUTHORITY:CODE' format"))
+    })?;
+    require!(
+        !authority.is_empty(),
+        Error::invalid_geo_params(format!(
+            "SRID '{srid}' must have an authority before the colon"
+        ))
+    );
+    require!(
+        !code.is_empty(),
+        Error::invalid_geo_params(format!("SRID '{srid}' must have a code after the colon"))
+    );
+    Ok(())
+}
+
 /// Algorithm used to interpolate edges between two vertices of a geography path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EdgeInterpolationAlgorithm {
@@ -1555,16 +1581,11 @@ pub struct GeometryType {
 }
 
 impl GeometryType {
-    /// Constructs a [`GeometryType`] from the given SRID. Use [`GeometryType::default`] to
-    /// build with [`DEFAULT_GEO_SRID`] (`OGC:CRS84`).
-    ///
-    /// Returns `Err` if `srid` is empty.
+    /// Constructs a GeometryType from the given SRID, or returns an error if the SRID is
+    /// not in AUTHORITY:CODE form. Use GeometryType::default to build with the default
+    /// SRID (OGC:CRS84).
     pub fn try_new(srid: &str) -> DeltaResult<Self> {
-        // We only check that the SRID is non-empty; validating the value against the full set
-        // of (1000+) recognized SRIDs is future work.
-        if srid.is_empty() {
-            return Err(Error::invalid_geometry("SRID cannot be empty"));
-        }
+        validate_srid(srid)?;
         Ok(Self {
             srid: srid.to_string(),
         })
@@ -1597,23 +1618,17 @@ pub struct GeographyType {
 }
 
 impl GeographyType {
-    /// Constructs a GeographyType. Pass `None` for either argument to use the default:
-    /// SRID defaults to DEFAULT_GEO_SRID (`OGC:CRS84`); algorithm defaults to
-    /// EdgeInterpolationAlgorithm::Spherical.
-    ///
-    /// Returns `Err` if `srid` is `Some("")` (empty string is not a valid SRID).
+    /// Constructs a GeographyType. Pass None for either argument to use the default: SRID
+    /// defaults to OGC:CRS84; algorithm defaults to Spherical. Returns an error if srid is
+    /// Some(...) but not in AUTHORITY:CODE form.
     pub fn try_new(
         srid: Option<&str>,
         algorithm: Option<EdgeInterpolationAlgorithm>,
     ) -> DeltaResult<Self> {
-        // We only check that the SRID is non-empty; validating the value against the full set
-        // of (1000+) recognized SRIDs is future work.
         let srid = match srid {
             None => DEFAULT_GEO_SRID.to_string(),
             Some(s) => {
-                if s.is_empty() {
-                    return Err(Error::invalid_geography("SRID cannot be empty"));
-                }
+                validate_srid(s)?;
                 s.to_string()
             }
         };
@@ -2672,8 +2687,8 @@ mod tests {
     #[case("geography(unknown_algo)", "Unknown edge interpolation algorithm")]
     #[case("geometry(EPSG:4326", "Unsupported Delta table type")]
     #[case("geographyz", "Unsupported Delta table type")]
-    #[case("geometry()", "SRID cannot be empty")]
-    #[case("geography(, vincenty)", "SRID cannot be empty")]
+    #[case("geometry()", "must be in 'AUTHORITY:CODE' format")]
+    #[case("geography(, vincenty)", "must be in 'AUTHORITY:CODE' format")]
     fn test_invalid_geo_format(#[case] invalid_type: &str, #[case] expected_error: &str) {
         let data = format!(
             r#"{{
@@ -2689,6 +2704,42 @@ mod tests {
         assert!(
             err.to_string().contains(expected_error),
             "Expected error containing '{expected_error}', got: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case::no_colon("foo")]
+    #[case::empty_after_colon("srid:")]
+    #[case::colon_only(":")]
+    #[case::empty("")]
+    #[case::empty_before_colon(":CRS84")]
+    #[case::leading_whitespace(" EPSG:4326")]
+    #[case::trailing_whitespace("EPSG:4326 ")]
+    #[case::surrounding_whitespace(" EPSG:4326 ")]
+    fn test_geometry_try_new_rejects_invalid_srid(#[case] srid: &str) {
+        let err =
+            GeometryType::try_new(srid).expect_err(&format!("expected '{srid}' to be rejected"));
+        assert!(
+            err.to_string().contains("SRID"),
+            "expected SRID error for '{srid}', got: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case::no_colon("foo")]
+    #[case::empty_after_colon("srid:")]
+    #[case::colon_only(":")]
+    #[case::empty("")]
+    #[case::empty_before_colon(":CRS84")]
+    #[case::leading_whitespace(" EPSG:4326")]
+    #[case::trailing_whitespace("EPSG:4326 ")]
+    #[case::surrounding_whitespace(" EPSG:4326 ")]
+    fn test_geography_try_new_rejects_invalid_srid(#[case] srid: &str) {
+        let err = GeographyType::try_new(Some(srid), None)
+            .expect_err(&format!("expected '{srid}' to be rejected"));
+        assert!(
+            err.to_string().contains("SRID"),
+            "expected SRID error for '{srid}', got: {err}"
         );
     }
 
