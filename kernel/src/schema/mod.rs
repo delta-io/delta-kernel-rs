@@ -1560,6 +1560,8 @@ impl GeometryType {
     ///
     /// Returns `Err` if `srid` is empty.
     pub fn try_new(srid: &str) -> DeltaResult<Self> {
+        // We only check that the SRID is non-empty; validating the value against the full set
+        // of (1000+) recognized SRIDs is future work.
         if srid.is_empty() {
             return Err(Error::invalid_geometry("SRID cannot be empty"));
         }
@@ -1604,6 +1606,8 @@ impl GeographyType {
         srid: Option<&str>,
         algorithm: Option<EdgeInterpolationAlgorithm>,
     ) -> DeltaResult<Self> {
+        // We only check that the SRID is non-empty; validating the value against the full set
+        // of (1000+) recognized SRIDs is future work.
         let srid = match srid {
             None => DEFAULT_GEO_SRID.to_string(),
             Some(s) => {
