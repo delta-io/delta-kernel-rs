@@ -213,7 +213,65 @@ impl TryFromKernel<&StructField> for ArrowField {
 /// - `relative_path`: dot-chained path rooted at `ancestor.name()`.
 /// - `datatype`: the kernel data type at the current position.
 ///
-/// See [`lookup_nested_field_id`] for an example of the `(ancestor, path) -> id` lookup.
+/// # Example
+///
+/// Kernel field: [`StructField`] (rendered as Delta-protocol-style JSON):
+///
+/// ```json
+/// {
+///   "name": "array_in_map",
+///   "type": {
+///     "type": "map",
+///     "keyType":   "integer",
+///     "valueType": { "type": "array", "elementType": "integer", "containsNull": true },
+///     "valueContainsNull": true
+///   },
+///   "nullable": true,
+///   "metadata": {
+///     "parquet.field.nested.ids": {
+///       "array_in_map.key":           100,
+///       "array_in_map.value":         101,
+///       "array_in_map.value.element": 102
+///     }
+///   }
+/// }
+/// ```
+///
+/// Calling `kernel_map_array_into_arrow(field, "array_in_map", &field.data_type())`
+/// produces this Arrow `DataType` (each synthesized `key`/`value`/`element` Arrow Field
+/// carries `PARQUET:field_id` in its `metadata`, looked up from the JSON above):
+///
+/// ```json
+/// {
+///   "type": "map",
+///   "keys_sorted": false,
+///   "entries": {
+///     "name": "key_value",
+///     "type": "struct",
+///     "nullable": false,
+///     "fields": [
+///       {
+///         "name": "key",
+///         "type": "int32",
+///         "nullable": false,
+///         "metadata": { "PARQUET:field_id": "100" }
+///       },
+///       {
+///         "name": "value",
+///         "type": "list",
+///         "nullable": true,
+///         "metadata": { "PARQUET:field_id": "101" },
+///         "element": {
+///           "name": "element",
+///           "type": "int32",
+///           "nullable": true,
+///           "metadata": { "PARQUET:field_id": "102" }
+///         }
+///       }
+///     ]
+///   }
+/// }
+/// ```
 fn kernel_map_array_into_arrow(
     ancestor: &StructField,
     relative_path: &str,

@@ -132,6 +132,41 @@ fn apply_schema_to_struct(array: &dyn Array, kernel_fields: &Schema) -> DeltaRes
 // Apply a kernel [`ArrayType`] to an Arrow [`ListArray`].
 // This function will deconstruct the array, then rebuild the mapped version, and set parquet field
 // id.
+//
+// # Example
+//
+// The blocks below show only the *schema* of the input and output ListArrays. Data values,
+// offsets, and the null buffer pass through unchanged.
+//
+// Given an ancestor [`StructField`] `arr: array<int>` whose metadata has
+// `parquet.field.nested.ids: { "arr.element": 42 }`, and an input ListArray with schema:
+//
+// ```json
+// {
+//   "type": "list",
+//   "element": {
+//     "name": "element",
+//     "type": "int32",
+//     "nullable": true,
+//     "metadata": { /* anything; replaced by kernel-derived metadata below */ }
+//   }
+// }
+// ```
+//
+// calling `apply_schema_to_list(input, &ArrayType::new(int, true), Some(arr), "arr")` produces
+// a ListArray with the same data and the rebuilt schema:
+//
+// ```json
+// {
+//   "type": "list",
+//   "element": {
+//     "name": "element",
+//     "type": "int32",
+//     "nullable": true,
+//     "metadata": { "PARQUET:field_id": "42" }
+//   }
+// }
+// ```
 fn apply_schema_to_list(
     array: &dyn Array,
     target_inner_type: &ArrayType,
@@ -183,6 +218,53 @@ fn apply_schema_to_list(
 // Apply a kernel [`MapType`] to an Arrow [`MapArray`].
 // Deconstruct a map, then rebuild it with the specified target kernel type,
 // and set parquet field id on the synthesized `key`/`value` Arrow fields.
+//
+// # Example
+//
+// The blocks below show only the *schema* of the input and output MapArrays. Data values,
+// offsets, and null buffers pass through unchanged.
+// input.
+//
+// Given an ancestor StructField `m: map<int, int>` whose metadata has
+// `parquet.field.nested.ids: { "m.key": 100, "m.value": 101 }`, and an input MapArray with
+// schema:
+//
+// ```json
+// {
+//   "type": "map",
+//   "keys_sorted": false,
+//   "entries": {
+//     "name": "key_value",
+//     "type": "struct",
+//     "fields": [
+//       { "name": "k", "type": "int32", "nullable": false,
+//         "metadata": { /* anything; will bereplaced */ } },
+//       { "name": "v", "type": "int32", "nullable": true,
+//         "metadata": { /* anything; will bereplaced */ } }
+//     ]
+//   }
+// }
+// ```
+//
+// calling `apply_schema_to_map(input, &MapType::new(int, int, true), Some(m), "m")` produces a
+// MapArray with the same data and the rebuilt schema:
+//
+// ```json
+// {
+//   "type": "map",
+//   "keys_sorted": false,
+//   "entries": {
+//     "name": "key_value",
+//     "type": "struct",
+//     "fields": [
+//       { "name": "k", "type": "int32", "nullable": false,
+//         "metadata": { "PARQUET:field_id": "100" } },
+//       { "name": "v", "type": "int32", "nullable": true,
+//         "metadata": { "PARQUET:field_id": "101" } }
+//     ]
+//   }
+// }
+// ```
 fn apply_schema_to_map(
     array: &dyn Array,
     kernel_map_type: &MapType,
