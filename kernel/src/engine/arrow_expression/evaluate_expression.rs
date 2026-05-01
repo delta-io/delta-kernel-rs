@@ -1,6 +1,6 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -172,11 +172,6 @@ fn evaluate_transform_expression(
             .ok_or_else(|| Error::generic("Too few fields in output schema"))
     };
 
-    // Handle prepends (insertions before any field)
-    for expr in &transform.prepended_fields {
-        output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
-    }
-
     // Extract the input path, if any
     let source_array = transform
         .input_path()
@@ -198,6 +193,40 @@ fn evaluate_transform_expression(
         None => batch,
     };
 
+    // === Filter conditional inserts to those whose target field is missing from the input ===
+    //
+    // Conditional inserts model the column-defaults case: kernel emits the default expression
+    // only when the connector's batch lacks the field. When the field is present, the
+    // connector's data passes through verbatim (NULLs preserved). Targets present in the input
+    // are dropped from the active set here; the rest are bucketed by predecessor for emission.
+    let input_field_names: HashSet<&str> = source_data
+        .schema_fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    let mut prepend_conditionals: Vec<&ExpressionRef> = Vec::new();
+    let mut after_field_conditionals: HashMap<&str, Vec<&ExpressionRef>> = HashMap::new();
+    for ci in &transform.conditional_inserts {
+        if input_field_names.contains(ci.target_name.as_str()) {
+            continue;
+        }
+        match &ci.predecessor {
+            None => prepend_conditionals.push(&ci.expr),
+            Some(pred) => after_field_conditionals
+                .entry(pred.as_str())
+                .or_default()
+                .push(&ci.expr),
+        }
+    }
+
+    // Handle prepends (insertions before any field) -- both unconditional and conditional.
+    for expr in &transform.prepended_fields {
+        output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+    }
+    for expr in &prepend_conditionals {
+        output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+    }
+
     // Process each input field in order
     for input_field in source_data.schema_fields() {
         let field_name: &str = input_field.name();
@@ -216,6 +245,14 @@ fn evaluate_transform_expression(
             }
             used_field_transforms += 1;
         }
+
+        // Process any conditional inserts that come after this field (only those whose target
+        // is absent from the input; presence-skipping was applied above).
+        if let Some(exprs) = after_field_conditionals.remove(field_name) {
+            for expr in exprs {
+                output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+            }
+        }
     }
 
     // Verify that all non-optional field transforms were used
@@ -227,6 +264,16 @@ fn evaluate_transform_expression(
     if used_field_transforms < required_count {
         return Err(Error::generic(
             "Some non-optional field transforms reference invalid input field names",
+        ));
+    }
+
+    // Any conditional insert whose predecessor was not visited (i.e. the predecessor field is
+    // also absent from the input) is a transform-construction error: the predecessor must be
+    // stable enough to be present in any valid input batch. Reject rather than silently
+    // dropping the field, which would corrupt the output schema.
+    if !after_field_conditionals.is_empty() {
+        return Err(Error::generic(
+            "Conditional insert references a predecessor field that is absent from the input",
         ));
     }
 
@@ -1341,6 +1388,188 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("reference invalid input field names"));
+    }
+
+    // ==================== Conditional insert (column-defaults) tests ====================
+
+    /// Builds a 3-row test batch with only the named columns (subset of a/b/c). Used to
+    /// exercise conditional-insert semantics where the connector omits some columns.
+    fn create_partial_batch(columns: &[&str]) -> RecordBatch {
+        let mut fields = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+        if columns.contains(&"a") {
+            fields.push(ArrowField::new("a", ArrowDataType::Int32, false));
+            arrays.push(Arc::new(Int32Array::from(vec![1, 2, 3])));
+        }
+        if columns.contains(&"b") {
+            fields.push(ArrowField::new("b", ArrowDataType::Int32, true));
+            arrays.push(Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])));
+        }
+        if columns.contains(&"c") {
+            fields.push(ArrowField::new("c", ArrowDataType::Int32, false));
+            arrays.push(Arc::new(Int32Array::from(vec![100, 200, 300])));
+        }
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), arrays).unwrap()
+    }
+
+    #[test]
+    fn test_conditional_insert_fires_when_target_absent() {
+        // Connector omitted column "b". Expect kernel to inject literal 999 at b's position.
+        let batch = create_partial_batch(&["a", "c"]);
+        let transform = Transform::new_top_level().with_inserted_field_if_missing(
+            Some("a"),
+            "b",
+            Expr::literal(999).into(),
+        );
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
+        ]);
+        let expr = Expr::Transform(transform);
+        let result = evaluate_expression(
+            &expr,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema))),
+        )
+        .unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        validate_i32_column(result, 0, &[1, 2, 3]);
+        validate_i32_column(result, 1, &[999, 999, 999]);
+        validate_i32_column(result, 2, &[100, 200, 300]);
+    }
+
+    #[test]
+    fn test_conditional_insert_skipped_when_target_present_preserves_nulls() {
+        // Connector included column "b" with a NULL row. The conditional must NOT fire and the
+        // NULL must be preserved (no Coalesce-style replacement).
+        let batch = create_partial_batch(&["a", "b", "c"]);
+        let transform = Transform::new_top_level().with_inserted_field_if_missing(
+            Some("a"),
+            "b",
+            Expr::literal(999).into(),
+        );
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
+        ]);
+        let expr = Expr::Transform(transform);
+        let result = evaluate_expression(
+            &expr,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema))),
+        )
+        .unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        validate_i32_column(result, 0, &[1, 2, 3]);
+        let b = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            (0..b.len())
+                .map(|i| (!b.is_null(i)).then(|| b.value(i)))
+                .collect::<Vec<_>>(),
+            vec![Some(10), None, Some(30)],
+            "conditional insert must NOT replace NULLs when the column is present in input",
+        );
+        validate_i32_column(result, 2, &[100, 200, 300]);
+    }
+
+    #[test]
+    fn test_conditional_insert_prepend_when_target_absent() {
+        // Conditional with `predecessor = None` prepends the default before all input fields
+        // when the target is missing.
+        let batch = create_partial_batch(&["b", "c"]);
+        let transform = Transform::new_top_level().with_inserted_field_if_missing(
+            None::<&str>,
+            "a",
+            Expr::literal(7).into(),
+        );
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
+        ]);
+        let expr = Expr::Transform(transform);
+        let result = evaluate_expression(
+            &expr,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema))),
+        )
+        .unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        validate_i32_column(result, 0, &[7, 7, 7]);
+    }
+
+    #[test]
+    fn test_conditional_insert_predecessor_absent_errors() {
+        // Predecessor "ghost" is not in the input. The conditional cannot fire at its declared
+        // position, which would corrupt the output schema -- evaluator must error rather than
+        // silently drop the field.
+        let batch = create_partial_batch(&["a", "c"]);
+        let transform = Transform::new_top_level().with_inserted_field_if_missing(
+            Some("ghost"),
+            "b",
+            Expr::literal(999).into(),
+        );
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
+        ]);
+        let expr = Expr::Transform(transform);
+        let err = evaluate_expression(
+            &expr,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema))),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("predecessor"),
+            "expected predecessor-absent error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_conditional_insert_with_multiple_targets_fires_only_for_missing() {
+        // Two conditionals: one for "b" (in input), one for "c" (omitted). Only the second
+        // should fire. Demonstrates per-conditional filtering.
+        let batch = create_partial_batch(&["a", "b"]);
+        let transform = Transform::new_top_level()
+            .with_inserted_field_if_missing(Some("a"), "b", Expr::literal(999).into())
+            .with_inserted_field_if_missing(Some("b"), "c", Expr::literal(42).into());
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
+        ]);
+        let expr = Expr::Transform(transform);
+        let result = evaluate_expression(
+            &expr,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema))),
+        )
+        .unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        validate_i32_column(result, 0, &[1, 2, 3]);
+        // b: present in input, should pass through with original NULL preserved
+        let b = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            (0..b.len())
+                .map(|i| (!b.is_null(i)).then(|| b.value(i)))
+                .collect::<Vec<_>>(),
+            vec![Some(10), None, Some(30)],
+        );
+        // c: absent from input, should be filled with literal 42
+        validate_i32_column(result, 2, &[42, 42, 42]);
     }
 
     #[test]

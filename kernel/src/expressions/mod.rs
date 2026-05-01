@@ -348,6 +348,26 @@ pub struct FieldTransform {
     pub optional: bool,
 }
 
+/// A conditional field insertion: emits an expression at a specific position only if the input
+/// is missing some named field. Used for column defaults: when the connector omits a default-
+/// bearing column from its batch, the kernel injects the parsed default literal at that field's
+/// position in the output schema. When the connector includes the column, the conditional insert
+/// is skipped and the connector's data passes through verbatim (including NULLs).
+///
+/// `predecessor` controls position the same way as [`Transform::with_inserted_field`]: `None`
+/// prepends before all input fields; `Some(name)` emits after the input field of that name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConditionalInsert {
+    /// The input field whose presence gates this insertion. If the input batch contains a field
+    /// with this name, the insertion is skipped.
+    pub target_name: String,
+    /// The field after which to emit the expression. `None` means prepend (before any input
+    /// field). When the predecessor is itself absent from the input, the insertion does not fire.
+    pub predecessor: Option<String>,
+    /// The expression to evaluate and emit when `target_name` is missing from the input.
+    pub expr: ExpressionRef,
+}
+
 /// A transformation that efficiently represents sparse modifications to struct schemas.
 ///
 /// `Transform` achieves `O(changes)` space complexity instead of `O(schema_width)` by only
@@ -364,6 +384,11 @@ pub struct Transform {
     pub field_transforms: HashMap<String, FieldTransform>,
     /// A list of new fields to emit before processing the first input field.
     pub prepended_fields: Vec<ExpressionRef>,
+    /// Conditional insertions that fire only when a specific input field is absent. Each entry
+    /// is evaluated lazily by the expression evaluator: on a per-batch basis, entries whose
+    /// `target_name` is present in the input are filtered out, and the rest are emitted at their
+    /// declared positions.
+    pub conditional_inserts: Vec<ConditionalInsert>,
 }
 
 impl Transform {
@@ -423,10 +448,34 @@ impl Transform {
         self
     }
 
+    /// Specifies an expression to insert at the given position only if `target_name` is absent
+    /// from the input. Used for column defaults: when the connector omits a default-bearing
+    /// column, kernel injects the parsed default literal; when the connector includes the
+    /// column, the insertion is skipped and the connector's data passes through verbatim.
+    ///
+    /// `after` follows the same convention as [`Self::with_inserted_field`]: `None` prepends
+    /// (emit before all input fields); `Some(name)` emits after the input field with that name.
+    /// If the predecessor itself is absent from the input, the insertion does not fire.
+    pub fn with_inserted_field_if_missing(
+        mut self,
+        after: Option<impl Into<String>>,
+        target_name: impl Into<String>,
+        expr: ExpressionRef,
+    ) -> Self {
+        self.conditional_inserts.push(ConditionalInsert {
+            target_name: target_name.into(),
+            predecessor: after.map(Into::into),
+            expr,
+        });
+        self
+    }
+
     /// True if this is the identity transform (all input fields pass through unchanged, with no new
     /// fields inserted).
     pub fn is_identity(&self) -> bool {
-        self.prepended_fields.is_empty() && self.field_transforms.is_empty()
+        self.prepended_fields.is_empty()
+            && self.field_transforms.is_empty()
+            && self.conditional_inserts.is_empty()
     }
 
     /// None, if this is a top-level transform. Otherwise, the path of this nested transform.
@@ -1060,6 +1109,19 @@ impl Display for Expression {
                     }
                     sep = ", ";
                 }
+                for ci in &transform.conditional_inserts {
+                    let position = match &ci.predecessor {
+                        Some(p) => format!("after {p} "),
+                        None => String::new(),
+                    };
+                    write!(
+                        f,
+                        "{sep}{position}fill missing {} with [{expr}]",
+                        ci.target_name,
+                        expr = ci.expr,
+                    )?;
+                    sep = ", ";
+                }
                 write!(f, ")")
             }
             Unary(UnaryExpression { op, expr }) => write!(f, "{op}({expr})"),
@@ -1215,6 +1277,57 @@ mod tests {
             let result = format!("{expr}");
             assert_eq!(result, expected);
         }
+    }
+
+    #[test]
+    fn test_with_inserted_field_if_missing_records_conditional_insert() {
+        use std::sync::Arc;
+
+        use super::Transform;
+
+        let transform = Transform::new_top_level()
+            .with_inserted_field_if_missing(
+                None::<String>,
+                "first_col",
+                Arc::new(Expr::literal("default")),
+            )
+            .with_inserted_field_if_missing(
+                Some("predecessor"),
+                "later_col",
+                Arc::new(Expr::literal(42)),
+            );
+
+        assert_eq!(transform.conditional_inserts.len(), 2);
+
+        let first = &transform.conditional_inserts[0];
+        assert_eq!(first.target_name, "first_col");
+        assert_eq!(first.predecessor, None);
+        assert_eq!(*first.expr, Expr::literal("default"));
+
+        let second = &transform.conditional_inserts[1];
+        assert_eq!(second.target_name, "later_col");
+        assert_eq!(second.predecessor, Some("predecessor".to_string()));
+        assert_eq!(*second.expr, Expr::literal(42));
+    }
+
+    #[test]
+    fn test_is_identity_with_conditional_insert() {
+        use std::sync::Arc;
+
+        use super::Transform;
+
+        let identity = Transform::new_top_level();
+        assert!(identity.is_identity());
+
+        let with_conditional = Transform::new_top_level().with_inserted_field_if_missing(
+            None::<String>,
+            "col",
+            Arc::new(Expr::literal(0)),
+        );
+        assert!(
+            !with_conditional.is_identity(),
+            "transform with a conditional insert should not be the identity"
+        );
     }
 
     #[test]
@@ -1463,6 +1576,20 @@ mod tests {
                         .with_inserted_field(
                             None::<String>,
                             Arc::new(Expression::literal("prepended")),
+                        ),
+                ),
+                // Conditional inserts (column defaults)
+                Expression::transform(
+                    Transform::new_top_level()
+                        .with_inserted_field_if_missing(
+                            Some("preceding"),
+                            "default_col",
+                            Arc::new(Expression::literal(42)),
+                        )
+                        .with_inserted_field_if_missing(
+                            None::<String>,
+                            "first_col",
+                            Arc::new(Expression::literal("default")),
                         ),
                 ),
                 // Nested transform

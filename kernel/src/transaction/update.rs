@@ -9,7 +9,7 @@
 //! - Deletion vector updates
 //! - Blind append, operation setting, domain metadata removal, and file removal
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::{Arc, LazyLock, OnceLock};
 
@@ -94,6 +94,7 @@ impl Transaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
+            default_filled_columns: HashSet::new(),
             shared_write_state: OnceLock::new(),
             _state: PhantomData,
         })

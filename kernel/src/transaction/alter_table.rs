@@ -6,6 +6,7 @@
 
 #![allow(unreachable_pub)]
 
+use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::sync::OnceLock;
 
@@ -71,6 +72,7 @@ impl AlterTableTransaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             physical_clustering_columns: None,
+            default_filled_columns: HashSet::new(),
             _state: PhantomData,
         })
     }
