@@ -25,7 +25,7 @@ use super::{measuring_engine, LogState, TestTableBuilder};
 #[test]
 fn scan_execute_contributes_parquet_data_file_reads() -> DeltaResult<()> {
     let table = TestTableBuilder::new()
-        .with_log_state(LogState::with_commits(3))
+        .with_log_state(LogState::commits(3))
         .with_data(1, 1)
         .build()?;
 

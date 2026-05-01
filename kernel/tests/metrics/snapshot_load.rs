@@ -34,7 +34,7 @@ use super::{
 #[test]
 fn delta_only_snapshot_emits_expected_metrics() -> DeltaResult<()> {
     let table = TestTableBuilder::new()
-        .with_log_state(LogState::with_commits(2))
+        .with_log_state(LogState::commits(2))
         .with_data(1, 1)
         .build()?;
 
@@ -62,7 +62,7 @@ fn delta_only_snapshot_emits_expected_metrics() -> DeltaResult<()> {
 // ============================================================================
 // Scenario 2: v1 parquet checkpoint + one tail commit
 // ============================================================================
-// TODO: migrate to TestTableBuilder when checkpoint LogState variants land (#2284)
+// TODO(#2284): migrate to TestTableBuilder
 
 /// After a v1 parquet checkpoint is written at version 1 and a further commit is added,
 /// a fresh snapshot sees one checkpoint file, one tail commit, and performs a single
@@ -109,7 +109,7 @@ async fn snapshot_with_v1_checkpoint_and_tail_commit_emits_expected_metrics() ->
 // ============================================================================
 // Scenario 3: v1 parquet checkpoint at latest version (no tail commits)
 // ============================================================================
-// TODO: migrate to TestTableBuilder when checkpoint LogState variants land (#2284)
+// TODO(#2284): migrate to TestTableBuilder
 
 /// When the latest version has a checkpoint and no subsequent commits exist, the snapshot
 /// has zero commit files and the JSON handler is called with an empty file list.
@@ -150,7 +150,7 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> DeltaResult<()> 
 #[tokio::test]
 async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()> {
     let table = TestTableBuilder::new()
-        .with_log_state(LogState::with_commits(3))
+        .with_log_state(LogState::commits(3))
         .with_schema(simple_schema())
         .with_data(1, 1)
         .build()?;
@@ -197,7 +197,7 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()
 // ============================================================================
 // Scenario 5: CRC fast-path bypasses JSON replay
 // ============================================================================
-// TODO: migrate to TestTableBuilder when CRC LogState variants land (#2284)
+// TODO(#2284): migrate to TestTableBuilder
 
 /// When a CRC file exists at the target snapshot version, Protocol+Metadata are loaded
 /// directly from it, skipping all JSON log replay. The JSON handler is never called.
@@ -233,7 +233,7 @@ async fn snapshot_with_crc_at_target_version_skips_json_replay() -> DeltaResult<
 // ============================================================================
 // Scenario 6: CRC at a prior version (CRC exists but is older than latest)
 // ============================================================================
-// TODO: migrate to TestTableBuilder when CRC LogState variants land (#2284)
+// TODO(#2284): migrate to TestTableBuilder
 
 /// When a CRC file exists at an older version than the snapshot, the kernel takes the
 /// partial-replay path: it replays only the tail commits (those after the CRC version)
@@ -302,7 +302,7 @@ async fn crc_at_prior_version_triggers_tail_replay_then_falls_back_to_crc() -> D
 // ============================================================================
 // Scenario 7: checkpoint behind latest version (with multiple tail commits)
 // ============================================================================
-// TODO: migrate to TestTableBuilder when checkpoint LogState variants land (#2284)
+// TODO(#2284): migrate to TestTableBuilder
 
 /// A checkpoint that is multiple versions behind the latest forces a longer tail replay.
 /// Checkpoint at v1 plus 3 additional commits (v2, v3, v4) verifies that all tail commits
@@ -363,7 +363,7 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Delta
 #[test]
 fn get_domain_metadata_when_no_latest_crc_incurs_additional_log_replay() -> DeltaResult<()> {
     let table = TestTableBuilder::new()
-        .with_log_state(LogState::with_commits(2))
+        .with_log_state(LogState::commits(2))
         .with_data(1, 1)
         .build()?;
 
