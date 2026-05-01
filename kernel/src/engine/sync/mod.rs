@@ -8,7 +8,7 @@ use tracing::debug;
 
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::table_properties::{ParquetCompression, ParquetWriterConfig};
+use crate::table_properties::ParquetWriterConfig;
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
     JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
@@ -30,9 +30,7 @@ pub(crate) struct SyncEngine {
 
 impl SyncEngine {
     pub(crate) fn new() -> Self {
-        Self::with_parquet_writer_config(ParquetWriterConfig {
-            compression: ParquetCompression::Zstd,
-        })
+        Self::with_parquet_writer_config(Default::default())
     }
 
     pub(crate) fn with_parquet_writer_config(parquet_writer_config: ParquetWriterConfig) -> Self {

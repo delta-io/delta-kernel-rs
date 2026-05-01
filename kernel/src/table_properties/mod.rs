@@ -328,7 +328,9 @@ pub enum IsolationLevel {
 
 /// Compression codec to use when writing Parquet files.
 ///
-/// String parsing is case-insensitive.
+/// String parsing is case-insensitive. Only `snappy` and `zstd` are currently supported.
+/// Any other value (e.g. `gzip`, `lz4`, `brotli`, `uncompressed`) parsed from a table property
+/// is silently ignored and the default codec applies.
 #[derive(Debug, EnumString, Clone, Copy, PartialEq, Eq, Default)]
 #[strum(ascii_case_insensitive)]
 pub enum ParquetCompression {

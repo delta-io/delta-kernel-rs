@@ -13,6 +13,7 @@ use delta_kernel::snapshot::{ChecksumWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Engine, FileStats};
+use rand::Rng;
 use rstest::rstest;
 use test_utils::{add_commit, insert_data, test_table_setup};
 
@@ -1098,25 +1099,14 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> DeltaResul
     assert_eq!(hist.sorted_bin_boundaries().len(), 95);
 
     // ===== v2: insert large file (>= 8KB -> bin 1+) =====
-    // Use LCG-derived strings to produce high-entropy data that resists compression.
     let n = LARGE_FILE_ROW_COUNT;
     let ids: ArrayRef = Arc::new(Int32Array::from((0..n).collect::<Vec<_>>()));
+    let mut rng = rand::rng();
     let strings: Vec<String> = (0..n)
-        .map(|i| {
-            // Two steps of Knuth's multiplicative LCG produce four varied 20-digit numbers.
-            let a = (i as u64)
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let b = a
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let c = b
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let d = c
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            format!("{a:020}{b:020}{c:020}{d:020}{i:020}")
+        .map(|_| {
+            let (a, b, c, d): (u64, u64, u64, u64) =
+                (rng.random(), rng.random(), rng.random(), rng.random());
+            format!("{a:020}{b:020}{c:020}{d:020}")
         })
         .collect();
     let data: ArrayRef = Arc::new(StringArray::from(strings));
