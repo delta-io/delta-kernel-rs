@@ -27,7 +27,7 @@ The easiest way to write a checkpoint is the convenience method on `Snapshot`:
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
-let (result, new_snapshot) = snapshot.checkpoint(&engine)?;
+let (result, new_snapshot) = snapshot.checkpoint(&engine, None)?;
 match result {
     CheckpointWriteResult::Written => println!("Checkpoint written"),
     CheckpointWriteResult::AlreadyExists => println!("Checkpoint already exists"),
@@ -60,7 +60,7 @@ let committed = match txn.commit(&engine)? {
 };
 
 if let Some(snapshot) = committed.post_commit_snapshot() {
-    let (_result, _new_snapshot) = snapshot.clone().checkpoint(&engine)?;
+    let (_result, _new_snapshot) = snapshot.clone().checkpoint(&engine, None)?;
 }
 ```
 
@@ -161,7 +161,7 @@ let interval = committed
 
 if stats.commits_since_checkpoint >= interval {
     if let Some(snapshot) = committed.post_commit_snapshot() {
-        let (_result, _new_snapshot) = snapshot.clone().checkpoint(&engine)?;
+        let (_result, _new_snapshot) = snapshot.clone().checkpoint(&engine, None)?;
     }
 }
 ```
