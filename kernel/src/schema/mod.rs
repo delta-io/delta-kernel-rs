@@ -343,6 +343,55 @@ impl StructField {
         }
     }
 
+    /// Rejects malformed pre-existing column-mapping annotations on this field:
+    /// - `delta.columnMapping.id` is present but not a `MetadataValue::Number`,
+    /// - `delta.columnMapping.id` is a `Number` but is negative,
+    /// - `delta.columnMapping.physicalName` is present but not a `MetadataValue::String`,
+    /// - `delta.columnMapping.physicalName` is an empty `String`.
+    ///
+    /// Empty-name and negative-id are stricter than delta-spark (which accepts both); kernel
+    /// fails fast at write time so a connector that supplies bad metadata learns about it on
+    /// the call that produced it. Wrong-typed `id` errors take precedence over wrong-typed
+    /// `physicalName` errors (a connector that fixes the `id` and retries will then see the
+    /// `physicalName` error).
+    pub(crate) fn validate_existing_column_mapping_annotations(&self) -> DeltaResult<()> {
+        match self.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
+            Some(MetadataValue::Number(n)) if *n < 0 => {
+                return Err(Error::schema(format!(
+                    "Field '{}' has a negative `{}` annotation: {n}",
+                    self.name,
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                )));
+            }
+            Some(MetadataValue::Number(_)) | None => {}
+            Some(_) => {
+                return Err(Error::schema(format!(
+                    "Field '{}' has a non-numeric `{}` annotation",
+                    self.name,
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                )));
+            }
+        }
+        match self.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+            Some(MetadataValue::String(s)) if s.is_empty() => {
+                return Err(Error::schema(format!(
+                    "Field '{}' has an empty `{}` annotation",
+                    self.name,
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                )));
+            }
+            Some(MetadataValue::String(_)) | None => {}
+            Some(_) => {
+                return Err(Error::schema(format!(
+                    "Field '{}' has a non-string `{}` annotation",
+                    self.name,
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Recursively collects every `delta.columnMapping.id` reachable from this field --
     /// the field's own ID plus any nested struct fields under Struct/Array/Map/Variant.
     /// Test-only.
