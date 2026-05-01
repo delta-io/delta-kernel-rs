@@ -463,6 +463,7 @@ impl TableConfiguration {
     /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
     /// [`IcebergCompatV3`]: crate::table_features::TableFeature::IcebergCompatV3
     pub(crate) fn should_materialize_partition_columns(&self) -> bool {
+        // TODO(#1125): add IcebergcompatV1/V2 here when they are supported.
         self.is_feature_enabled(&TableFeature::MaterializePartitionColumns)
             || self.is_feature_enabled(&TableFeature::IcebergCompatV3)
     }
