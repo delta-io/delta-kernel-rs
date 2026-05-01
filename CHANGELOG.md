@@ -54,7 +54,8 @@
       sidecars.
 11. Replace existing metrics reporting with tracing ([#1822])
     - `MetricsReporter` is no longer part of the `Engine` APIs. Instead you can register a
-      reporter as a tracing layer. See `kernel/examples/inspect-table` for migration.
+      reporter as a tracing layer. See `kernel/examples/inspect-table` for an example of how
+      to migrate.
 12. Add CheckpointRowGroupFilter for checkpoint data skipping ([#1893])
     - `ParquetStatsProvider::get_parquet_rowcount_stat` return type changed from `i64` to
       `Option<i64>`. Engines implementing `ParquetStatsProvider` must wrap their existing return
