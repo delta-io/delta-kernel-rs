@@ -409,10 +409,14 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-// IcebergCompatV3 ensures tables can be converted to Apache Iceberg V3.
-// Spec: <https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-compat-v3.md>
-//
-// TODO: Implement the write-side requirements for IcebergCompatV3.
+/// IcebergCompatV3 ensures tables can be converted to Apache Iceberg V3.
+///
+/// Spec: <https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-compat-v3.md>
+///
+/// TODO: Implement the write-side requirements for IcebergCompatV3.
+/// TODO: Support ALTER TABLE on tables with IcebergCompatV3 enabled.
+///
+/// Tracking issue: <https://github.com/delta-io/delta-kernel-rs/issues/2492>
 static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,

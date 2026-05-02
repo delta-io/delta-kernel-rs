@@ -32,13 +32,13 @@ use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::Operation;
+use crate::table_features::{Operation, TableFeature};
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
     apply_schema_operations, SchemaEvolutionResult, SchemaOperation,
 };
-use crate::{DeltaResult, Engine};
+use crate::{DeltaResult, Engine, Error};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
 /// See [`Chainable`] for the operations available on this state.
@@ -151,6 +151,13 @@ impl AlterTableTransactionBuilder<Modifying> {
         committer: Box<dyn Committer>,
     ) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
+        // We don't support ALTER TABLE on tables with icebergCompatV3 enabled yet. See
+        // [`crate::table_features::ICEBERG_COMPAT_V3_INFO`] for the tracking issue.
+        if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
+            return Err(Error::unsupported(
+                "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
+            ));
+        }
         // Rejects writes to tables kernel can't safely commit to: writer version out of
         // kernel's supported range, unsupported writer features, or schemas with SQL-expression
         // invariants. Runs on the pre-alter snapshot; future ALTER variants that change the
