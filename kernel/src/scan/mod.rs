@@ -927,29 +927,62 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<SequentialScanMetadata> {
-        // For the sequential/parallel phase approach, we use a conservative checkpoint_info
-        // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
-        // currently support stats_parsed optimization.
+        let log_segment = self.snapshot.log_segment();
         let checkpoint_read_schema = if self.skip_stats() {
             CHECKPOINT_READ_SCHEMA_NO_STATS.clone()
         } else {
             CHECKPOINT_READ_SCHEMA.clone()
         };
-        let checkpoint_info = CheckpointReadInfo {
-            has_stats_parsed: false,
-            has_partition_values_parsed: false,
-            checkpoint_read_schema,
+        let checkpoint_info = match log_segment.listed.checkpoint_parts.as_slice() {
+            [_single_part] => log_segment.projected_single_part_checkpoint_read_info(
+                engine.as_ref(),
+                checkpoint_read_schema.clone(),
+                self.state_info
+                    .physical_stats_schema
+                    .as_ref()
+                    .map(|s| s.as_ref()),
+                self.state_info
+                    .physical_partition_schema
+                    .as_ref()
+                    .map(|s| s.as_ref()),
+            )?,
+            _ => log_segment.projected_checkpoint_read_info(
+                engine.as_ref(),
+                checkpoint_read_schema.clone(),
+                self.state_info
+                    .physical_stats_schema
+                    .as_ref()
+                    .map(|s| s.as_ref()),
+                self.state_info
+                    .physical_partition_schema
+                    .as_ref()
+                    .map(|s| s.as_ref()),
+            )?,
         };
+        let sequential_checkpoint_read_schema = checkpoint_info.checkpoint_read_schema.clone();
         let processor = ScanLogReplayProcessor::new(
             engine.as_ref(),
             self.state_info.clone(),
             checkpoint_info,
             self.skip_stats(),
         )?;
-        let sequential =
-            SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
+        let sequential = SequentialPhase::try_new(
+            processor,
+            log_segment,
+            engine.clone(),
+            sequential_checkpoint_read_schema,
+        )?;
 
-        Ok(SequentialScanMetadata::new(sequential))
+        Ok(match log_segment.listed.checkpoint_parts.as_slice() {
+            [_single_part] => {
+                SequentialScanMetadata::new_with_deferred_parallel_checkpoint_planning(
+                    sequential,
+                    engine,
+                    checkpoint_read_schema,
+                )
+            }
+            _ => SequentialScanMetadata::new(sequential),
+        })
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all

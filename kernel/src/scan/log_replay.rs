@@ -19,7 +19,7 @@ use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
     ParallelLogReplayProcessor,
 };
-use crate::log_segment::CheckpointReadInfo;
+use crate::log_segment::{CheckpointReadInfo, LogSegment};
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::scan::Scalar;
 use crate::schema::{
@@ -268,6 +268,71 @@ impl ScanLogReplayProcessor {
 
     pub(crate) fn get_metrics(&self) -> &ScanMetrics {
         self.metrics.as_ref()
+    }
+
+    pub(crate) fn set_checkpoint_info(
+        &mut self,
+        engine: &dyn Engine,
+        checkpoint_info: CheckpointReadInfo,
+    ) -> DeltaResult<()> {
+        let (stats_schema_for_transform, partition_schema_for_transform) = if self.skip_stats {
+            (None, None)
+        } else {
+            (
+                self.state_info.physical_stats_schema.clone(),
+                self.state_info.physical_partition_schema.clone(),
+            )
+        };
+
+        let output_schema = scan_row_schema_with_parsed_columns(
+            stats_schema_for_transform.clone(),
+            partition_schema_for_transform.clone(),
+        );
+        let has_stats_parsed = checkpoint_info.has_stats_parsed;
+        let has_partition_values_parsed = checkpoint_info.has_partition_values_parsed;
+
+        self.checkpoint_transform = engine.evaluation_handler().new_expression_evaluator(
+            checkpoint_info.checkpoint_read_schema.clone(),
+            get_add_transform_expr(
+                stats_schema_for_transform,
+                has_stats_parsed,
+                self.skip_stats,
+                partition_schema_for_transform,
+                has_partition_values_parsed,
+            ),
+            output_schema.into(),
+        )?;
+        self.checkpoint_info = checkpoint_info;
+
+        Ok(())
+    }
+
+    pub(crate) fn projected_checkpoint_read_info_from_files(
+        &self,
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        files: &[crate::FileMeta],
+    ) -> DeltaResult<Option<CheckpointReadInfo>> {
+        if files.is_empty() {
+            return Ok(None);
+        }
+
+        let (stats_schema, partition_schema) = if self.skip_stats {
+            (None, None)
+        } else {
+            (
+                self.state_info.physical_stats_schema.as_deref(),
+                self.state_info.physical_partition_schema.as_deref(),
+            )
+        };
+
+        Ok(Some(LogSegment::projected_checkpoint_read_info_from_files(
+            engine,
+            action_schema,
+            stats_schema,
+            partition_schema,
+            files,
+        )?))
     }
 
     /// Serialize the processor state for distributed processing.
