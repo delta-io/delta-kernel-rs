@@ -784,7 +784,7 @@ impl Snapshot {
     /// columns from domain metadata, which may have a performance cost.
     pub fn transaction(
         self: Arc<Self>,
-        committer: Box<dyn Committer>,
+        committer: Arc<dyn Committer>,
         engine: &dyn Engine,
     ) -> DeltaResult<Transaction> {
         Transaction::try_new_existing_table(self, committer, engine)
@@ -2418,7 +2418,7 @@ mod tests {
         }
 
         let _ = create_table_builder
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .build(&engine, Arc::new(FileSystemCommitter::new()))?
             .commit(&engine)?;
 
         let snapshot = Snapshot::builder_for(&table_path).build(&engine)?;
@@ -3466,7 +3466,7 @@ mod tests {
         let _ = builder
             .build(
                 &engine,
-                Box::new(crate::committer::FileSystemCommitter::new()),
+                Arc::new(crate::committer::FileSystemCommitter::new()),
             )
             .unwrap()
             .commit(&engine)

@@ -31,7 +31,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     {
         // create a transaction
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let committer = Box::new(FileSystemCommitter::new());
+        let committer = Arc::new(FileSystemCommitter::new());
         let txn = snapshot
             .transaction(committer, &engine)?
             .with_engine_info("default engine");
@@ -80,7 +80,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
         let _ = txn.commit(&engine)?;
@@ -157,7 +157,7 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
 
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
             .with_operation("WRITE".to_string())
             .with_commit_info(Box::new(ArrowEngineData::new(batch)), engine_schema);
 

@@ -819,7 +819,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
 
     let commit_domain_metadata = |domain: &str, value: &str| -> DeltaResult<()> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let txn = snapshot.transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
         let result = txn
             .with_domain_metadata(domain.to_string(), value.to_string())
             .commit(&engine)?;
@@ -870,7 +870,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         )])),
         "test",
     )
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build(&engine, Arc::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
 
     // Version 1

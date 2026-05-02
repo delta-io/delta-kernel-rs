@@ -148,7 +148,7 @@ impl AlterTableTransactionBuilder<Modifying> {
     pub fn build(
         self,
         _engine: &dyn Engine,
-        committer: Box<dyn Committer>,
+        committer: Arc<dyn Committer>,
     ) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
         // Rejects writes to tables kernel can't safely commit to: writer version out of

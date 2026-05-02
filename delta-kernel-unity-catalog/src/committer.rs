@@ -31,10 +31,10 @@ macro_rules! require {
 ///
 /// For version >= 1, the committer writes a staged commit and calls the UC commit API to ratify it.
 ///
-/// NOTE: this [`Committer`] requires a multi-threaded tokio runtime. That is, whatever
-/// implementation consumes the Committer to commit to the table, must call `commit` from within a
-/// muti-threaded tokio runtime context. Since the default engine uses tokio, this is compatible,
-/// but must ensure that the multi-threaded runtime is used.
+/// NOTE: this [`Committer`] requires a multi-threaded tokio runtime. That is, whatever code calls
+/// [`commit`](Committer::commit) on the Committer must do so from within a multi-threaded tokio
+/// runtime context. Since the default engine uses tokio, this is compatible, but must ensure that
+/// the multi-threaded runtime is used.
 #[derive(Debug, Clone)]
 pub struct UCCommitter<C: CommitClient> {
     commits_client: Arc<C>,

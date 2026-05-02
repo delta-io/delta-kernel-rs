@@ -101,7 +101,7 @@ fn commit(
     commits_client: &Arc<InMemoryCommitsClient>,
     engine: &DefaultEngine<TokioMultiThreadExecutor>,
 ) -> Result<Arc<Snapshot>, TestError> {
-    let committer = Box::new(UCCommitter::new(commits_client.clone(), TABLE_ID));
+    let committer = Arc::new(UCCommitter::new(commits_client.clone(), TABLE_ID));
     match snapshot
         .clone()
         .transaction(committer, engine)?
@@ -161,7 +161,7 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     assert_eq!(snapshot.version(), max);
 
     // Next insert should fail with MaxUnpublishedCommitsExceeded
-    let committer = Box::new(UCCommitter::new(commits_client.clone(), TABLE_ID));
+    let committer = Arc::new(UCCommitter::new(commits_client.clone(), TABLE_ID));
     let err = snapshot
         .clone()
         .transaction(committer, &engine)?

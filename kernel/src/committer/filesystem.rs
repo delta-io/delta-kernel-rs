@@ -99,6 +99,16 @@ mod tests {
     use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
 
+    // Lock in that `FileSystemCommitter` satisfies the `Send + Sync` bound required by
+    // `Committer`. Trivially true today (unit struct), but a future change that adds a
+    // non-Sync field would otherwise only fail at distant `Arc::new(...)` cast sites with
+    // a confusing error.
+    #[test]
+    fn file_system_committer_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FileSystemCommitter>();
+    }
+
     #[tokio::test]
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
         let storage = Arc::new(InMemory::new());
@@ -119,7 +129,7 @@ mod tests {
             .build(&engine)
             .unwrap();
         // Try to commit a transaction with FileSystemCommitter
-        let committer = Box::new(FileSystemCommitter::new());
+        let committer = Arc::new(FileSystemCommitter::new());
         let err = snapshot
             .transaction(committer, &engine)
             .unwrap()

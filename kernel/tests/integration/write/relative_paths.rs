@@ -25,7 +25,7 @@ async fn write_batch_to_table_simple(
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("test");
     let write_context = txn.unpartitioned_write_context()?;
     let add_meta = engine
@@ -78,7 +78,7 @@ async fn test_multiple_files_in_commit_all_use_relative_paths(
 
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("test");
     let write_context = txn.unpartitioned_write_context().unwrap();
     for values in [vec![1, 2], vec![3, 4]] {
@@ -140,7 +140,7 @@ async fn test_create_table_with_data_uses_relative_paths() -> Result<(), Box<dyn
     let table_url = Url::from_directory_path(&table_path).unwrap();
 
     let mut txn = create_table_txn(table_url.as_str(), schema.clone(), "test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?;
     let write_context = txn.unpartitioned_write_context()?;
     let add_meta = engine
         .write_parquet(
