@@ -735,3 +735,963 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_fails(
     );
     Ok(())
 }
+
+/// Chain `add_column + drop_column + set_nullable` end-to-end on a column-mapped table,
+/// split across two alter+checkpoint cycles. Verifies the chained ops compose across
+/// checkpoint boundaries, the dropped column is removed, the added column gets a fresh CM id,
+/// and the existing column's CM id is preserved through both checkpoints.
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_add_drop_set_nullable_on_cm_table(
+    #[values("name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", cm_mode)],
+    )?;
+    let original_max_id = max_column_id(&snapshot);
+    let original_id_cm_id = snapshot
+        .schema()
+        .field("id")
+        .unwrap()
+        .column_mapping_id()
+        .expect("existing field should already have a column mapping ID");
+
+    // Two alter+checkpoint cycles: (add email + drop name), then (set_nullable id).
+    let v1 = snapshot
+        .alter_table()
+        .add_column(StructField::nullable("email", DataType::STRING))
+        .drop_column(column_name!("name"))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let v1_snap = v1
+        .post_commit_snapshot()
+        .expect("post-commit snapshot at v1");
+    let (_, v1_ckpt) = v1_snap.clone().checkpoint(engine.as_ref(), None)?;
+    let v2 = v1_ckpt
+        .alter_table()
+        .set_nullable(column_name!("id"))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let v2_snap = v2
+        .post_commit_snapshot()
+        .expect("post-commit snapshot at v2");
+    v2_snap.clone().checkpoint(engine.as_ref(), None)?;
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    assert_eq!(schema.fields().count(), 2, "name dropped, email added");
+    assert!(schema.field("name").is_none());
+    assert!(schema.field("email").is_some());
+    assert!(schema.field("id").unwrap().is_nullable());
+    assert!(
+        max_column_id(&reloaded) > original_max_id,
+        "add_column must bump maxColumnId even when chained with drop"
+    );
+    let id_after = schema
+        .field("id")
+        .unwrap()
+        .column_mapping_id()
+        .expect("existing id column mapping");
+    assert_eq!(
+        id_after, original_id_cm_id,
+        "existing id CM id must not change"
+    );
+
+    Ok(())
+}
+
+/// Edge case: `add(foo) + drop(foo)` in one ALTER. The final schema matches the initial
+/// schema, but `maxColumnId` still advances
+#[tokio::test]
+async fn chain_add_then_drop_same_column_burns_id_but_no_schema_change() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+    let original_max_id = max_column_id(&snapshot);
+    let original_field_count = snapshot.schema().fields().count();
+
+    snapshot
+        .alter_table()
+        .add_column(StructField::nullable("foo", DataType::STRING))
+        .drop_column(column_name!("foo"))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    assert_eq!(
+        schema.fields().count(),
+        original_field_count,
+        "net schema unchanged"
+    );
+    assert!(schema.field("foo").is_none(), "foo should not be present");
+    assert!(
+        max_column_id(&reloaded) > original_max_id,
+        "maxColumnId must still advance (IDs never reused)"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// DROP COLUMN tests
+// ============================================================================
+
+/// End-to-end lifecycle: create a CM table, write rows, then drop columns one at a time with
+/// a checkpoint after each drop ("do some ops -> checkpoint -> do more ops -> checkpoint").
+/// Reload from scratch must rebuild from each checkpoint plus the subsequent commits and:
+/// surface only the surviving columns in the schema and scan output (no value bleed-through
+/// from physical Parquet storage), preserve remaining row data, and leave `maxColumnId`
+/// unchanged (drops never bump it). Also verifies that time travel back to the pre-drop
+/// version still surfaces the dropped columns with their original values (drops do not
+/// retroactively rewrite earlier versions).
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_column_lifecycle_removes_column_and_preserves_remaining_data(
+    #[values("name", "id")] cm_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("email", DataType::STRING),
+        StructField::nullable("age", DataType::INTEGER),
+    ])?);
+    let properties = vec![("delta.columnMapping.mode", cm_mode)];
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &properties)?;
+    let original_max_id = max_column_id(&snapshot);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow().unwrap()),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+            Arc::new(StringArray::from(vec!["a@x", "b@x"])),
+            Arc::new(Int32Array::from(vec![10, 20])),
+        ],
+    )
+    .unwrap();
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+
+    // One alter+checkpoint cycle per drop.
+    let mut current = snapshot;
+    for col in ["email", "age"] {
+        let committed = current
+            .alter_table()
+            .drop_column(ColumnName::new([col]))
+            .build(engine.as_ref(), committer())?
+            .commit(engine.as_ref())?
+            .unwrap_committed();
+        let post = committed
+            .post_commit_snapshot()
+            .expect("post-commit snapshot");
+        let (_, ckpt) = post.clone().checkpoint(engine.as_ref(), None)?;
+        current = ckpt;
+    }
+
+    // Schema: dropped columns gone, `maxColumnId` unchanged across both drops.
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    assert_eq!(schema.fields().count(), 2);
+    assert!(schema.field("email").is_none());
+    assert!(schema.field("age").is_none());
+    assert!(schema.field("id").is_some());
+    assert!(schema.field("name").is_some());
+    assert_eq!(max_column_id(&reloaded), original_max_id);
+
+    // Scan output excludes the dropped columns; remaining values survive.
+    let scan = reloaded.scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+    assert_eq!(batches[0].num_columns(), 2);
+    for dropped in ["email", "age"] {
+        assert!(
+            batches[0].column_by_name(dropped).is_none(),
+            "dropped column '{dropped}' must not appear in scan output"
+        );
+    }
+    let id_col = batches[0]
+        .column_by_name("id")
+        .expect("id column")
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("id is int");
+    assert_eq!(id_col.value(0), 1);
+    assert_eq!(id_col.value(1), 2);
+
+    // Time travel: at v1 (post-write, pre-drop) all 4 columns are still in the schema with
+    // their original values. Drops must not retroactively rewrite earlier versions.
+    let pre_drop = Snapshot::builder_for(&table_path)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    assert_eq!(pre_drop.schema().fields().count(), 4);
+    let scan = pre_drop.scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+    let email_col = batches[0]
+        .column_by_name("email")
+        .expect("v1 must surface 'email'")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("email is string");
+    assert_eq!(email_col.value(0), "a@x");
+    assert_eq!(email_col.value(1), "b@x");
+    let age_col = batches[0]
+        .column_by_name("age")
+        .expect("v1 must surface 'age'")
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("age is int");
+    assert_eq!(age_col.value(0), 10);
+    assert_eq!(age_col.value(1), 20);
+
+    Ok(())
+}
+
+/// Dropping a non-clustering column on a clustered CM table is allowed; the companion
+/// "dropping the clustering column itself" case is covered by `drop_column_failures`.
+#[tokio::test]
+async fn drop_non_clustering_column_on_clustered_table_succeeds() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let committed = create_table(&table_path, simple_schema(), "Test/1.0")
+        .with_data_layout(DataLayout::clustered(["name"]))
+        .with_table_properties([("delta.columnMapping.mode", "name")])
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let snapshot = committed
+        .post_commit_snapshot()
+        .expect("post-commit snapshot")
+        .clone();
+
+    snapshot
+        .alter_table()
+        .drop_column(column_name!("id"))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(reloaded.schema().field("id").is_none());
+    Ok(())
+}
+
+/// Dropping a top-level column whose `DataType` is non-primitive (struct, Array, Map, or a
+/// complex type containing a Struct) succeeds and removes only that column. The matching
+/// failure case for structs -- dropping a struct that is an ancestor of a clustering column
+/// -- is covered by `drop_column_failures::clustering_ancestor`.
+#[rstest]
+#[case::top_level_struct(StructField::nullable(
+    "address",
+    StructType::try_new(vec![
+        StructField::nullable("city", DataType::STRING),
+        StructField::nullable("zip", DataType::STRING),
+    ])
+    .unwrap(),
+))]
+#[case::array_of_primitive(StructField::nullable("tags", ArrayType::new(DataType::STRING, true)))]
+#[case::map_of_primitives(StructField::nullable(
+    "labels",
+    MapType::new(DataType::STRING, DataType::INTEGER, true),
+))]
+#[case::array_of_struct(StructField::nullable(
+    "items",
+    ArrayType::new(
+        DataType::Struct(Box::new(
+            StructType::try_new(vec![
+                StructField::nullable("a", DataType::STRING),
+                StructField::nullable("b", DataType::INTEGER),
+            ])
+            .unwrap(),
+        )),
+        true,
+    ),
+))]
+#[case::map_value_is_struct(StructField::nullable(
+    "by_id",
+    MapType::new(
+        DataType::STRING,
+        DataType::Struct(Box::new(
+            StructType::try_new(vec![
+                StructField::nullable("a", DataType::STRING),
+                StructField::nullable("b", DataType::INTEGER),
+            ])
+            .unwrap(),
+        )),
+        true,
+    ),
+))]
+#[tokio::test]
+async fn drop_complex_type_column(#[case] field: StructField) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let field_name = field.name().to_string();
+    // Schema is simple_schema() + the complex column, so dropping it leaves a non-empty schema.
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("name", DataType::STRING),
+        field,
+    ])?);
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+    let original_max_id = max_column_id(&snapshot);
+
+    snapshot
+        .alter_table()
+        .drop_column(ColumnName::new([field_name.as_str()]))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    assert_eq!(schema.fields().count(), 2);
+    assert!(schema.field(&field_name).is_none());
+    assert!(schema.field("id").is_some());
+    assert!(schema.field("name").is_some());
+    assert_eq!(
+        max_column_id(&reloaded),
+        original_max_id,
+        "drop must not bump maxColumnId, including for inner fields lost with a struct"
+    );
+    Ok(())
+}
+
+/// Setup-flavor selector for layout-related ALTER failure tests. Each variant creates a
+/// distinct table (CM mode, schema shape, data layout) so one rstest can exercise every
+/// layout/CM-related rejection path. Shared across drop and rename failure tests.
+enum LayoutFailureFlavor {
+    /// Plain non-CM table; any drop/rename fails because CM is required.
+    NoCm,
+    /// CM table with `simple_schema()`; used for ops on non-existent columns.
+    Cm,
+    /// CM table with a single-column schema; used for the "last field" rejection.
+    CmSingleColumn,
+    /// CM table partitioned by `name`; used for the partition-column rejection.
+    CmPartitionedByName,
+    /// CM table clustered by top-level `name`; used for the clustering-column rejection.
+    CmClusteredByName,
+    /// CM table clustered by nested `address.city`; used for the clustering-ancestor rejection.
+    CmClusteredByNestedCity,
+}
+
+fn setup_for_layout_failure(
+    table_path: &str,
+    engine: &dyn delta_kernel::Engine,
+    flavor: LayoutFailureFlavor,
+) -> DeltaResult<Arc<Snapshot>> {
+    let cm = [("delta.columnMapping.mode", "name")];
+    Ok(match flavor {
+        LayoutFailureFlavor::NoCm => {
+            create_table_and_load_snapshot(table_path, simple_schema(), engine, &[])?
+        }
+        LayoutFailureFlavor::Cm => {
+            create_table_and_load_snapshot(table_path, simple_schema(), engine, &cm)?
+        }
+        LayoutFailureFlavor::CmSingleColumn => {
+            let schema = Arc::new(
+                StructType::try_new(vec![StructField::nullable("only", DataType::STRING)]).unwrap(),
+            );
+            create_table_and_load_snapshot(table_path, schema, engine, &cm)?
+        }
+        LayoutFailureFlavor::CmPartitionedByName => {
+            let committed = create_table(table_path, simple_schema(), "Test/1.0")
+                .with_data_layout(DataLayout::partitioned(["name"]))
+                .with_table_properties(cm.to_vec())
+                .build(engine, committer())?
+                .commit(engine)?
+                .unwrap_committed();
+            committed
+                .post_commit_snapshot()
+                .expect("post-commit snapshot")
+                .clone()
+        }
+        LayoutFailureFlavor::CmClusteredByName => {
+            let committed = create_table(table_path, simple_schema(), "Test/1.0")
+                .with_data_layout(DataLayout::clustered(["name"]))
+                .with_table_properties(cm.to_vec())
+                .build(engine, committer())?
+                .commit(engine)?
+                .unwrap_committed();
+            committed
+                .post_commit_snapshot()
+                .expect("post-commit snapshot")
+                .clone()
+        }
+        LayoutFailureFlavor::CmClusteredByNestedCity => {
+            let nested = Arc::new(
+                StructType::try_new(vec![
+                    StructField::nullable("id", DataType::INTEGER),
+                    StructField::nullable(
+                        "address",
+                        StructType::try_new(vec![
+                            StructField::nullable("city", DataType::STRING),
+                            StructField::nullable("zip", DataType::STRING),
+                        ])
+                        .unwrap(),
+                    ),
+                ])
+                .unwrap(),
+            );
+            let committed = create_table(table_path, nested, "Test/1.0")
+                .with_data_layout(DataLayout::Clustered {
+                    columns: vec![column_name!("address.city")],
+                })
+                .with_table_properties(cm.to_vec())
+                .build(engine, committer())?
+                .commit(engine)?
+                .unwrap_committed();
+            committed
+                .post_commit_snapshot()
+                .expect("post-commit snapshot")
+                .clone()
+        }
+    })
+}
+
+#[rstest]
+#[case::without_cm(LayoutFailureFlavor::NoCm, column_name!("name"), "column mapping")]
+#[case::nonexistent(LayoutFailureFlavor::Cm, column_name!("nonexistent"), "does not exist")]
+#[case::last_remaining(
+    LayoutFailureFlavor::CmSingleColumn,
+    column_name!("only"),
+    "last field"
+)]
+#[case::partition_column(
+    LayoutFailureFlavor::CmPartitionedByName,
+    column_name!("name"),
+    "partition column"
+)]
+#[case::clustering_column(
+    LayoutFailureFlavor::CmClusteredByName,
+    column_name!("name"),
+    "clustering column"
+)]
+#[case::clustering_ancestor(
+    LayoutFailureFlavor::CmClusteredByNestedCity,
+    column_name!("address"),
+    "clustering column"
+)]
+#[tokio::test]
+async fn drop_column_failures(
+    #[case] flavor: LayoutFailureFlavor,
+    #[case] drop_column: delta_kernel::expressions::ColumnName,
+    #[case] error_contains: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = setup_for_layout_failure(&table_path, engine.as_ref(), flavor)?;
+
+    let err = snapshot
+        .alter_table()
+        .drop_column(drop_column)
+        .build(engine.as_ref(), committer());
+    assert!(err.is_err());
+    assert!(err.unwrap_err().to_string().contains(error_contains));
+
+    Ok(())
+}
+
+// ============================================================================
+// RENAME COLUMN tests
+// ============================================================================
+
+/// End-to-end: create a CM table, write rows, rename a column, checkpoint, reload from
+/// scratch, and verify rows surface under the NEW logical name while the column-mapping id
+/// and physical name are preserved. Under CM, this preservation is the core invariant that
+/// keeps existing Parquet files readable without rewrites. Also verifies that time travel
+/// back to the pre-rename version still surfaces the OLD logical name with the original data
+/// (renames do not retroactively rewrite earlier versions).
+#[rstest]
+#[case::cm_name_mode("name")]
+#[case::cm_id_mode("id")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_column_lifecycle(#[case] cm_mode: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let properties = vec![("delta.columnMapping.mode", cm_mode)];
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &properties)?;
+    let original_max_id = max_column_id(&snapshot);
+
+    // Capture the "name" column's CM metadata BEFORE rename.
+    let pre_schema = snapshot.schema();
+    let name_before = pre_schema.field("name").unwrap();
+    let cm_id_before = name_before
+        .column_mapping_id()
+        .expect("pre-rename CM id should be assigned");
+    let physical_before = match name_before
+        .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+        .expect("pre-rename physical name")
+    {
+        MetadataValue::String(s) => s.clone(),
+        other => panic!("expected String, got {other:?}"),
+    };
+
+    // Write two rows under the original schema.
+    let batch = RecordBatch::try_new(
+        Arc::new(simple_schema().as_ref().try_into_arrow().unwrap()),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["alice", "bob"])),
+        ],
+    )?;
+    let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+
+    // Rename `name` -> `full_name`, then checkpoint.
+    let committed = snapshot
+        .alter_table()
+        .rename_column(column_name!("name"), "full_name")
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let post = committed
+        .post_commit_snapshot()
+        .expect("post-commit snapshot");
+    post.clone().checkpoint(engine.as_ref(), None)?;
+
+    // Reload and verify: new logical name, preserved CM metadata, unchanged maxColumnId.
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    assert!(schema.field("full_name").is_some(), "new name must exist");
+    assert!(schema.field("name").is_none(), "old name must be gone");
+    assert_eq!(
+        max_column_id(&reloaded),
+        original_max_id,
+        "rename must not bump maxColumnId"
+    );
+
+    let renamed = schema.field("full_name").unwrap();
+    let cm_id_after = renamed
+        .column_mapping_id()
+        .expect("post-rename CM id should be assigned");
+    let physical_after = match renamed
+        .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+        .expect("post-rename physical name")
+    {
+        MetadataValue::String(s) => s.clone(),
+        other => panic!("expected String, got {other:?}"),
+    };
+    assert_eq!(
+        cm_id_after, cm_id_before,
+        "CM id must be preserved across rename"
+    );
+    assert_eq!(
+        physical_after, physical_before,
+        "physical name must be preserved across rename"
+    );
+
+    // Capture the evolved arrow schema before scan_builder moves `reloaded`; needed below to
+    // write more rows under the new logical name.
+    let evolved_arrow_schema: delta_kernel::arrow::datatypes::SchemaRef =
+        Arc::new(reloaded.schema().as_ref().try_into_arrow().unwrap());
+
+    // Scan: rows must surface under the NEW logical name with the original values intact.
+    let scan = reloaded.scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+    let renamed_col = batches[0]
+        .column_by_name("full_name")
+        .expect("renamed column should appear in scan output")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("renamed column is a StringArray");
+    assert_eq!(renamed_col.value(0), "alice");
+    assert_eq!(renamed_col.value(1), "bob");
+    assert!(
+        batches[0].column_by_name("name").is_none(),
+        "old logical name must not appear in scan output"
+    );
+
+    // Time travel: at v1 (post-write, pre-rename) the schema must still expose the OLD
+    // logical name with the original values. Renames must not retroactively rewrite earlier
+    // versions.
+    let pre_rename = Snapshot::builder_for(&table_path)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    assert!(
+        pre_rename.schema().field("name").is_some(),
+        "v1 must surface the old logical name"
+    );
+    assert!(
+        pre_rename.schema().field("full_name").is_none(),
+        "v1 must not surface the new logical name"
+    );
+    let scan = pre_rename.scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+    let pre_rename_col = batches[0]
+        .column_by_name("name")
+        .expect("v1 scan must surface the old logical name")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name is a StringArray");
+    assert_eq!(pre_rename_col.value(0), "alice");
+    assert_eq!(pre_rename_col.value(1), "bob");
+
+    // Write two more rows AFTER the rename to prove the table accepts writes under the new
+    // logical name. Reload first because the earlier scan moved `reloaded`. Then verify the
+    // final table has 4 rows total, all surfacing under `full_name`.
+    let post_rename_snap = Arc::new(Snapshot::builder_for(&table_path).build(engine.as_ref())?);
+    let post_rename_batch = RecordBatch::try_new(
+        evolved_arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![3, 4])),
+            Arc::new(StringArray::from(vec!["carol", "dan"])),
+        ],
+    )?;
+    write_batch_to_table(
+        &post_rename_snap,
+        engine.as_ref(),
+        post_rename_batch,
+        HashMap::new(),
+    )
+    .await?;
+
+    let final_snap = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let scan = final_snap.scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 4);
+    let mut names: Vec<&str> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column_by_name("full_name")
+                .expect("renamed column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("string");
+            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["alice", "bob", "carol", "dan"]);
+
+    Ok(())
+}
+
+#[rstest]
+#[case::without_cm(LayoutFailureFlavor::NoCm, column_name!("name"), "column mapping")]
+#[case::nonexistent(LayoutFailureFlavor::Cm, column_name!("nonexistent"), "does not exist")]
+#[case::partition(
+    LayoutFailureFlavor::CmPartitionedByName,
+    column_name!("name"),
+    "partition column"
+)]
+#[case::clustering(
+    LayoutFailureFlavor::CmClusteredByName,
+    column_name!("name"),
+    "clustering column"
+)]
+#[case::clustering_ancestor(
+    LayoutFailureFlavor::CmClusteredByNestedCity,
+    column_name!("address"),
+    "clustering column"
+)]
+#[tokio::test]
+async fn rename_column_failures(
+    #[case] flavor: LayoutFailureFlavor,
+    #[case] column: ColumnName,
+    #[case] error_contains: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = setup_for_layout_failure(&table_path, engine.as_ref(), flavor)?;
+
+    let err = snapshot
+        .alter_table()
+        .rename_column(column, "new_name")
+        .build(engine.as_ref(), committer());
+    assert!(err.is_err());
+    assert!(err.unwrap_err().to_string().contains(error_contains));
+
+    Ok(())
+}
+
+/// Renaming a top-level column whose `DataType` is non-primitive (struct, Array, Map, or a
+/// complex type containing a Struct) succeeds and renames only that column. The matching
+/// failure case for structs -- renaming a struct that is an ancestor of a clustering column
+/// -- is covered by `rename_column_failures::clustering_ancestor`.
+#[rstest]
+#[case::top_level_struct(StructField::nullable(
+    "address",
+    StructType::try_new(vec![
+        StructField::nullable("city", DataType::STRING),
+        StructField::nullable("zip", DataType::STRING),
+    ])
+    .unwrap(),
+))]
+#[case::array_of_primitive(StructField::nullable("tags", ArrayType::new(DataType::STRING, true)))]
+#[case::map_of_primitives(StructField::nullable(
+    "labels",
+    MapType::new(DataType::STRING, DataType::INTEGER, true),
+))]
+#[case::array_of_struct(StructField::nullable(
+    "items",
+    ArrayType::new(
+        DataType::Struct(Box::new(
+            StructType::try_new(vec![
+                StructField::nullable("a", DataType::STRING),
+                StructField::nullable("b", DataType::INTEGER),
+            ])
+            .unwrap(),
+        )),
+        true,
+    ),
+))]
+#[case::map_value_is_struct(StructField::nullable(
+    "by_id",
+    MapType::new(
+        DataType::STRING,
+        DataType::Struct(Box::new(
+            StructType::try_new(vec![
+                StructField::nullable("a", DataType::STRING),
+                StructField::nullable("b", DataType::INTEGER),
+            ])
+            .unwrap(),
+        )),
+        true,
+    ),
+))]
+#[tokio::test]
+async fn rename_complex_type_column(#[case] field: StructField) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let old_name = field.name().to_string();
+    let new_name = format!("{old_name}_renamed");
+    // Schema is simple_schema() + the complex column.
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("name", DataType::STRING),
+        field,
+    ])?);
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+    let original_max_id = max_column_id(&snapshot);
+
+    snapshot
+        .alter_table()
+        .rename_column(ColumnName::new([old_name.as_str()]), new_name.as_str())
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    assert_eq!(schema.fields().count(), 3);
+    assert!(schema.field(&old_name).is_none());
+    assert!(schema.field(&new_name).is_some());
+    assert!(schema.field("id").is_some());
+    assert!(schema.field("name").is_some());
+    assert_eq!(
+        max_column_id(&reloaded),
+        original_max_id,
+        "rename must not bump maxColumnId"
+    );
+    Ok(())
+}
+
+/// Drives `add_column().rename_column().build()` through the actual builder type-state
+/// pipeline (rather than building a `Vec<SchemaOperation>` directly). Locks in the
+/// `Modifying -> Renaming` transition: a refactor that removed `rename_column` from
+/// `impl<S: Chainable>` would still pass the unit-level chain test but fail to compile here.
+#[tokio::test]
+async fn chain_add_then_rename_via_builder() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+    let original_max_id = max_column_id(&snapshot);
+
+    snapshot
+        .alter_table()
+        .add_column(StructField::nullable("email", DataType::STRING))
+        .rename_column(column_name!("email"), "contact_email")
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    assert!(schema.field("email").is_none(), "old name must be gone");
+    let renamed = schema
+        .field("contact_email")
+        .expect("renamed column must exist");
+    let cm_id = renamed
+        .column_mapping_id()
+        .expect("CM id assigned by add_column survives rename");
+    assert!(
+        cm_id > original_max_id,
+        "added column was assigned a fresh CM id"
+    );
+    assert_eq!(
+        max_column_id(&reloaded),
+        cm_id,
+        "maxColumnId reflects the add_column id; rename did not bump it"
+    );
+    Ok(())
+}
+
+// ============================================================================
+// OPERATION STRING tests
+// ============================================================================
+
+// Reads the `commitInfo` object from a commit JSON written to the local filesystem.
+fn read_commit_info(table_path: &str, version: u64) -> serde_json::Value {
+    let log_file = format!("{table_path}/_delta_log/{version:020}.json");
+    let contents = std::fs::read_to_string(&log_file).expect("read log file");
+    for line in contents.lines() {
+        let action: serde_json::Value = serde_json::from_str(line).expect("parse action");
+        if let Some(ci) = action.get("commitInfo") {
+            return ci.clone();
+        }
+    }
+    panic!("no commitInfo in commit {version}");
+}
+
+fn read_commit_operation(table_path: &str, version: u64) -> String {
+    read_commit_info(table_path, version)
+        .get("operation")
+        .and_then(|v| v.as_str())
+        .expect("operation field")
+        .to_string()
+}
+
+fn read_commit_is_blind_append(table_path: &str, version: u64) -> bool {
+    read_commit_info(table_path, version)
+        .get("isBlindAppend")
+        .and_then(|v| v.as_bool())
+        .expect("isBlindAppend field")
+}
+
+/// Selector for `alter_commit_operation`. Each variant maps to a different sequence of
+/// builder ops + a different CM requirement.
+enum OpSet {
+    Add,
+    Drop,
+    Rename,
+    SetNullable,
+    AddThenSetNullable,
+}
+
+impl OpSet {
+    /// Drop and Rename require column mapping; the others don't.
+    fn requires_cm(&self) -> bool {
+        matches!(self, OpSet::Drop | OpSet::Rename)
+    }
+}
+
+#[rstest]
+#[case::add_columns(OpSet::Add, "ADD COLUMNS")]
+#[case::drop_columns(OpSet::Drop, "DROP COLUMNS")]
+#[case::rename_columns(OpSet::Rename, "RENAME COLUMNS")]
+#[case::change_column(OpSet::SetNullable, "CHANGE COLUMN")]
+#[case::mixed_add_then_change(OpSet::AddThenSetNullable, "ADD COLUMNS + CHANGE COLUMN")]
+#[tokio::test]
+async fn alter_commit_operation(#[case] op_set: OpSet, #[case] expected: &str) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let properties: &[(&str, &str)] = if op_set.requires_cm() {
+        &[("delta.columnMapping.mode", "name")]
+    } else {
+        &[]
+    };
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), properties)?;
+
+    // Each branch normalizes to the same AlterTableTransaction type via .build().
+    let builder = snapshot.alter_table();
+    let txn = match op_set {
+        OpSet::Add => builder
+            .add_column(StructField::nullable("email", DataType::STRING))
+            .build(engine.as_ref(), committer())?,
+        OpSet::Drop => builder
+            .drop_column(column_name!("name"))
+            .build(engine.as_ref(), committer())?,
+        OpSet::Rename => builder
+            .rename_column(column_name!("name"), "full_name")
+            .build(engine.as_ref(), committer())?,
+        OpSet::SetNullable => builder
+            .set_nullable(column_name!("id"))
+            .build(engine.as_ref(), committer())?,
+        OpSet::AddThenSetNullable => builder
+            .add_column(StructField::nullable("email", DataType::STRING))
+            .set_nullable(column_name!("id"))
+            .build(engine.as_ref(), committer())?,
+    };
+    txn.commit(engine.as_ref())?.unwrap_committed();
+    assert_eq!(read_commit_operation(&table_path, 1), expected);
+    Ok(())
+}
+
+/// Mirrors `alter_commit_operation` but asserts the recorded `isBlindAppend` flag.
+/// A commit is `isBlindAppend = true` iff every op in it doesn't read existing data.
+/// All currently-supported ALTER ops qualify; future constraint-tightening ops (e.g.
+/// SET NOT NULL) would return `false` and any chained commit containing one of those
+/// must also commit `false`. When that op lands, add a case here for the single op +
+/// a mixed-with-tightening case.
+#[rstest]
+#[case::add_columns(OpSet::Add, true)]
+#[case::drop_columns(OpSet::Drop, true)]
+#[case::rename_columns(OpSet::Rename, true)]
+#[case::change_column_relax(OpSet::SetNullable, true)]
+#[case::mixed_all_blind(OpSet::AddThenSetNullable, true)]
+#[tokio::test]
+async fn alter_commit_is_blind_append(
+    #[case] op_set: OpSet,
+    #[case] expected: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let properties: &[(&str, &str)] = if op_set.requires_cm() {
+        &[("delta.columnMapping.mode", "name")]
+    } else {
+        &[]
+    };
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), properties)?;
+
+    let builder = snapshot.alter_table();
+    let txn = match op_set {
+        OpSet::Add => builder
+            .add_column(StructField::nullable("email", DataType::STRING))
+            .build(engine.as_ref(), committer())?,
+        OpSet::Drop => builder
+            .drop_column(column_name!("name"))
+            .build(engine.as_ref(), committer())?,
+        OpSet::Rename => builder
+            .rename_column(column_name!("name"), "full_name")
+            .build(engine.as_ref(), committer())?,
+        OpSet::SetNullable => builder
+            .set_nullable(column_name!("id"))
+            .build(engine.as_ref(), committer())?,
+        OpSet::AddThenSetNullable => builder
+            .add_column(StructField::nullable("email", DataType::STRING))
+            .set_nullable(column_name!("id"))
+            .build(engine.as_ref(), committer())?,
+    };
+    txn.commit(engine.as_ref())?.unwrap_committed();
+    assert_eq!(read_commit_is_blind_append(&table_path, 1), expected);
+    Ok(())
+}

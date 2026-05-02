@@ -38,12 +38,14 @@ impl AlterTableTransaction {
         read_snapshot: SnapshotRef,
         effective_table_config: TableConfiguration,
         committer: Box<dyn Committer>,
+        operation: String,
+        is_blind_append: bool,
     ) -> DeltaResult<Self> {
         let span = tracing::info_span!(
             "txn",
             path = %read_snapshot.table_root(),
             read_version = read_snapshot.version(),
-            operation = "ALTER TABLE",
+            operation = %operation,
         );
 
         Ok(Transaction {
@@ -53,7 +55,7 @@ impl AlterTableTransaction {
             should_emit_protocol: false,
             should_emit_metadata: true,
             committer,
-            operation: Some("ALTER TABLE".to_string()),
+            operation: Some(operation),
             engine_info: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
@@ -65,10 +67,8 @@ impl AlterTableTransaction {
             data_change: false,
             shared_write_state: OnceLock::new(),
             engine_commit_info: None,
-            // TODO(#2446): match delta-spark's per-op isBlindAppend policy
-            // (ADD/DROP/DROP NOT NULL -> true, SET NOT NULL -> false). Hardcoded false for
-            // now: safe, but misses the true-case optimization delta-spark applies.
-            is_blind_append: false,
+            is_blind_append,
+            reads_files: false,
             dv_matched_files: vec![],
             physical_clustering_columns: None,
             _state: PhantomData,
