@@ -64,7 +64,7 @@ mod stats_verifier;
 mod update;
 mod write_context;
 
-use stats_verifier::StatsVerifier;
+use stats_verifier::StatsColumnVerifier;
 use write_context::SharedWriteState;
 pub use write_context::WriteContext;
 
@@ -992,6 +992,13 @@ impl<S> Transaction<S> {
         if add_files.is_empty() {
             return Ok(());
         }
+        // IcebergCompatV3 requires every AddFile to carry `stats.numRecords`.
+        if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::IcebergCompatV3)
+        {
+            stats_verifier::verify_num_records_present(add_files)?;
+        }
         if let Some(ref clustering_cols) = self.physical_clustering_columns {
             if !clustering_cols.is_empty() {
                 let physical_schema = self.effective_table_config.physical_schema();
@@ -1010,7 +1017,7 @@ impl<S> Transaction<S> {
                         Ok((col.clone(), data_type))
                     })
                     .collect::<DeltaResult<_>>()?;
-                let verifier = StatsVerifier::new(columns_with_types);
+                let verifier = StatsColumnVerifier::new(columns_with_types);
                 verifier.verify(add_files)?;
             }
         }
