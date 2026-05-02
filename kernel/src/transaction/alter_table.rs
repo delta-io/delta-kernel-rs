@@ -38,12 +38,13 @@ impl AlterTableTransaction {
         read_snapshot: SnapshotRef,
         effective_table_config: TableConfiguration,
         committer: Box<dyn Committer>,
+        operation: String,
     ) -> DeltaResult<Self> {
         let span = tracing::info_span!(
             "txn",
             path = %read_snapshot.table_root(),
             read_version = read_snapshot.version(),
-            operation = "ALTER TABLE",
+            operation = %operation,
         );
 
         Ok(Transaction {
@@ -53,7 +54,7 @@ impl AlterTableTransaction {
             should_emit_protocol: false,
             should_emit_metadata: true,
             committer,
-            operation: Some("ALTER TABLE".to_string()),
+            operation: Some(operation),
             engine_info: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
