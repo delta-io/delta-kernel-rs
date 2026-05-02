@@ -26,30 +26,51 @@ pub(crate) enum SchemaOperation {
     /// Add a top-level column.
     AddColumn { field: StructField },
 
+    /// Drop a column. Supports nested columns (e.g. `column_name!("address.city")`).
+    /// Requires column mapping.
+    DropColumn { column: ColumnName },
+
     /// Change a column's nullability from NOT NULL to nullable.
     SetNullable { column: ColumnName },
 }
 
+/// Signal returned by [`modify_field_at_path`] modifiers describing what to do with the leaf
+/// field after the modifier runs.
+#[must_use]
+pub(crate) enum LeafAction {
+    /// Keep the leaf in its parent IndexMap. Leaf was mutated in place (or unchanged).
+    Keep,
+    /// Remove the leaf field from its parent IndexMap. `modify_field_at_path` rejects this
+    /// action if it would leave the parent struct with zero fields.
+    Remove,
+}
+
 // Helper to modify a nested column. For each component in `path`, locates the matching field
 // (case-insensitive), then descends into the next nested struct. At the leaf, calls `modifier`
-// to mutate the field in place.
+// and applies its returned [`LeafAction`] in place.
 //
-// `modifier` is expected to mutate the field's nullability, metadata, or `data_type` -- but
-// not its name. Renames need additional handling (IndexMap re-keying + sibling-conflict check)
-// that downstream PRs will introduce alongside the rename caller.
+// `Keep` mutations leave the leaf in place after the modifier ran. `Remove` deletes the leaf
+// entry, preserving the order of remaining siblings.
 //
-// Returns an error if a field in the path does not exist or an intermediate field is not a struct.
+// Returns an error if a field in the path does not exist, an intermediate field is not a struct,
+// or a `Remove` action would leave the parent struct empty.
 //
-// Example:
-//   fields   = [ id: int not null, address: struct { city: string not null, zip: string } ]
-//   path     = ["address", "city"]
-//   modifier = |f| { f.nullable = true; Ok(()) }
+// Example (mutate):
+//   fields  = [ id: int not null, address: struct { city: string not null, zip: string } ]
+//   path    = ["address", "city"]
+//   modifier = |f| { f.nullable = true; Ok(LeafAction::Keep) }
 // yields:
 //   [ id: int not null, address: struct { city: string, zip: string } ]
+//
+// Example (remove):
+//   path    = ["address", "city"]
+//   modifier = |_| Ok(LeafAction::Remove)
+// yields:
+//   [ id: int not null, address: struct { zip: string } ]
 fn modify_field_at_path(
     fields: &mut IndexMap<String, StructField>,
     path: &[String],
-    modifier: &dyn Fn(&mut StructField) -> DeltaResult<()>,
+    modifier: &dyn Fn(&mut StructField) -> DeltaResult<LeafAction>,
 ) -> DeltaResult<()> {
     let (first, rest) = path
         .split_first()
@@ -75,10 +96,67 @@ fn modify_field_at_path(
     }
 
     // === Leaf handling ===
+    let parent_len = fields.len();
+    debug_assert!(
+        parent_len > 0,
+        "idx from position() implies non-empty fields"
+    );
     let (_, field) = fields
         .get_index_mut(idx)
         .ok_or_else(|| Error::internal_error("idx from position() invalid"))?;
-    modifier(field)
+    match modifier(field)? {
+        LeafAction::Keep => Ok(()),
+        LeafAction::Remove => {
+            // Reject drops that would leave the parent struct empty
+            // Note: Matches Spark behaviour.
+            if parent_len == 1 {
+                return Err(Error::generic(format!(
+                    "field '{}' is the last field at its level",
+                    field.name()
+                )));
+            }
+            // Preserve insertion order of remaining siblings.
+            fields.shift_remove_index(idx);
+            Ok(())
+        }
+    }
+}
+
+/// Rejects empty paths and columns the table layout locks (partition columns, clustering
+/// columns, or struct ancestors of clustering columns).
+fn reject_layout_locked_column(
+    column: &ColumnName,
+    partition_columns: &[String],
+    clustering_columns: &[ColumnName],
+    op_name: &str,
+) -> DeltaResult<()> {
+    let path = column.path();
+    if path.is_empty() {
+        return Err(Error::generic(format!(
+            "Cannot {op_name} column: empty column path"
+        )));
+    }
+    // Partition columns are always top-level. The slice pattern matches iff path.len() == 1
+    // and binds the sole element to `field_name`.
+    if let [field_name] = path {
+        let field_name_lower = field_name.to_lowercase();
+        if partition_columns
+            .iter()
+            .any(|pc| pc.to_lowercase() == field_name_lower)
+        {
+            return Err(Error::generic(format!(
+                "Cannot {op_name} column '{column}': it is a partition column"
+            )));
+        }
+    }
+    // Clustering columns may be nested; dropping an ancestor struct of one is also rejected.
+    // Matches Spark.
+    if clustering_columns.iter().any(|cc| column.is_prefix_of(cc)) {
+        return Err(Error::generic(format!(
+            "Cannot {op_name} column '{column}': it is a clustering column or an ancestor of one"
+        )));
+    }
+    Ok(())
 }
 
 /// The result of applying schema operations.
@@ -106,6 +184,8 @@ pub(crate) fn apply_schema_operations(
     operations: Vec<SchemaOperation>,
     column_mapping_mode: ColumnMappingMode,
     current_max_column_id: Option<i64>,
+    partition_columns: &[String],
+    clustering_columns: &[ColumnName],
 ) -> DeltaResult<SchemaEvolutionResult> {
     let cm_enabled = column_mapping_mode != ColumnMappingMode::None;
 
@@ -175,11 +255,29 @@ pub(crate) fn apply_schema_operations(
             SchemaOperation::SetNullable { column } => {
                 modify_field_at_path(schema.field_map_mut(), column.path(), &|f| {
                     f.nullable = true;
-                    Ok(())
+                    Ok(LeafAction::Keep)
                 })
                 .map_err(|e| {
                     Error::generic(format!("Cannot set nullable on column '{column}': {e}"))
                 })?;
+            }
+            SchemaOperation::DropColumn { column } => {
+                if !cm_enabled {
+                    return Err(Error::generic(
+                        "DROP COLUMN requires column mapping to be enabled \
+                         (delta.columnMapping.mode = 'name' or 'id')",
+                    ));
+                }
+                reject_layout_locked_column(
+                    &column,
+                    partition_columns,
+                    clustering_columns,
+                    "drop",
+                )?;
+                modify_field_at_path(schema.field_map_mut(), column.path(), &|_| {
+                    Ok(LeafAction::Remove)
+                })
+                .map_err(|e| Error::generic(format!("Cannot drop column '{column}': {e}")))?;
             }
         }
     }
@@ -224,6 +322,22 @@ mod tests {
         .unwrap()
     }
 
+    fn nested_schema() -> StructType {
+        StructType::try_new(vec![
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable(
+                "address",
+                StructType::try_new(vec![
+                    StructField::nullable("street", DataType::STRING),
+                    StructField::not_null("city", DataType::STRING),
+                    StructField::nullable("zip", DataType::STRING),
+                ])
+                .unwrap(),
+            ),
+        ])
+        .unwrap()
+    }
+
     fn add_col(name: &str, nullable: bool) -> SchemaOperation {
         let field = if nullable {
             StructField::nullable(name, DataType::STRING)
@@ -244,21 +358,6 @@ mod tests {
         }
     }
 
-    fn nested_schema() -> StructType {
-        StructType::try_new(vec![
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::nullable(
-                "address",
-                StructType::try_new(vec![
-                    StructField::not_null("city", DataType::STRING),
-                    StructField::nullable("zip", DataType::STRING),
-                ])
-                .unwrap(),
-            ),
-        ])
-        .unwrap()
-    }
-
     // === modify_field_at_path tests ===
 
     // Convert a StructType into the IndexMap<String, StructField> shape that
@@ -270,9 +369,9 @@ mod tests {
             .collect()
     }
 
-    fn set_nullable_modifier(f: &mut StructField) -> DeltaResult<()> {
+    fn set_nullable_modifier(f: &mut StructField) -> DeltaResult<LeafAction> {
         f.nullable = true;
-        Ok(())
+        Ok(LeafAction::Keep)
     }
 
     fn modify_field_at_path_test_helper(
@@ -281,6 +380,15 @@ mod tests {
     ) -> DeltaResult<IndexMap<String, StructField>> {
         let mut fields = into_field_map(schema);
         modify_field_at_path(&mut fields, path, &set_nullable_modifier)?;
+        Ok(fields)
+    }
+
+    fn remove_field_at_path_test_helper(
+        schema: StructType,
+        path: &[String],
+    ) -> DeltaResult<IndexMap<String, StructField>> {
+        let mut fields = into_field_map(schema);
+        modify_field_at_path(&mut fields, path, &|_| Ok(LeafAction::Remove))?;
         Ok(fields)
     }
 
@@ -319,19 +427,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn modify_nonexistent_field_fails() {
+    #[rstest]
+    #[case::modify(true)]
+    #[case::remove(false)]
+    fn nonexistent_field_fails(#[case] is_modify: bool) {
         let path = vec!["nope".to_string()];
-        let err = modify_field_at_path_test_helper(simple_schema(), &path).unwrap_err();
+        let err = if is_modify {
+            modify_field_at_path_test_helper(simple_schema(), &path)
+        } else {
+            remove_field_at_path_test_helper(simple_schema(), &path)
+        }
+        .unwrap_err();
         assert!(err.to_string().contains("does not exist"));
     }
 
     /// A path that descends into a non-struct intermediate field (here: `name.inner`, where
     /// `name` is a STRING, not a struct) must error rather than silently succeed or panic.
-    #[test]
-    fn modify_through_non_struct_fails() {
+    #[rstest]
+    #[case::modify(true)]
+    #[case::remove(false)]
+    fn through_non_struct_fails(#[case] is_modify: bool) {
         let path = vec!["name".to_string(), "inner".to_string()];
-        let err = modify_field_at_path_test_helper(simple_schema(), &path).unwrap_err();
+        let err = if is_modify {
+            modify_field_at_path_test_helper(simple_schema(), &path)
+        } else {
+            remove_field_at_path_test_helper(simple_schema(), &path)
+        }
+        .unwrap_err();
         assert!(err.to_string().contains("not a struct"));
     }
 
@@ -343,7 +465,188 @@ mod tests {
         assert!(id.is_nullable());
     }
 
-    // === apply_schema_operations tests ===
+    // === modify_field_at_path: remove via LeafAction::Remove ===
+
+    #[test]
+    fn remove_top_level_field() {
+        let path = vec!["name".to_string()];
+        let result = remove_field_at_path_test_helper(simple_schema(), &path).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.values().next().unwrap().name(), "id");
+    }
+
+    #[test]
+    fn remove_nested_field() {
+        let path = vec!["address".to_string(), "city".to_string()];
+        let result = remove_field_at_path_test_helper(nested_schema(), &path).unwrap();
+        let addr = result.values().find(|f| f.name() == "address").unwrap();
+        let DataType::Struct(s) = addr.data_type() else {
+            panic!("expected struct");
+        };
+        assert!(s.field("city").is_none());
+        assert!(s.field("zip").is_some());
+    }
+
+    /// After removing a field, the surviving fields must retain their original order.
+    /// `modify_field_at_path` uses `shift_remove_index` for `LeafAction::Remove`, which
+    /// preserves order. This test verifies that across drop positions (first / middle / last).
+    #[rstest]
+    #[case::first(0, &["b", "c", "d", "e"])]
+    #[case::middle(2, &["a", "b", "d", "e"])]
+    #[case::last(4, &["a", "b", "c", "d"])]
+    fn remove_preserves_order_at_position(
+        #[case] drop_idx: usize,
+        #[case] expected_order: &[&str],
+    ) {
+        let names = ["a", "b", "c", "d", "e"];
+        let schema = StructType::try_new(
+            names
+                .iter()
+                .map(|n| StructField::nullable(*n, DataType::STRING))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let drop_name = names[drop_idx].to_string();
+        let result = remove_field_at_path_test_helper(schema, &[drop_name]).unwrap();
+        let actual_order: Vec<&str> = result.values().map(|f| f.name().as_str()).collect();
+        assert_eq!(&actual_order, expected_order);
+    }
+
+    /// No-empty-struct invariant: removing the last remaining field at any level must error.
+    #[rstest]
+    #[case::top_level(
+        StructType::try_new(vec![StructField::nullable("only", DataType::STRING)]).unwrap(),
+        vec!["only".to_string()]
+    )]
+    #[case::nested(
+        StructType::try_new(vec![
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable(
+                "address",
+                StructType::try_new(vec![StructField::nullable("street", DataType::STRING)])
+                    .unwrap(),
+            ),
+        ])
+        .unwrap(),
+        vec!["address".to_string(), "street".to_string()]
+    )]
+    fn remove_last_field_fails(#[case] schema: StructType, #[case] path: Vec<String>) {
+        let err = remove_field_at_path_test_helper(schema, &path).unwrap_err();
+        assert!(err.to_string().contains("last field at its level"));
+    }
+
+    #[test]
+    fn remove_case_insensitive_lookup() {
+        let path = vec!["NAME".to_string()];
+        let result = remove_field_at_path_test_helper(simple_schema(), &path).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.values().next().unwrap().name(), "id");
+    }
+
+    /// Removing one nested leaf (`address.city`) must not touch any other field. Guards against
+    /// the recursion accidentally replacing siblings when it descends and returns.
+    #[test]
+    fn remove_nested_leaf_preserves_other_fields() {
+        let path = vec!["address".to_string(), "city".to_string()];
+        let result = remove_field_at_path_test_helper(nested_schema(), &path).unwrap();
+        // Top-level "id" unchanged
+        let id = result.values().find(|f| f.name() == "id").unwrap();
+        assert!(!id.is_nullable());
+        // "address" still present, inner "zip" survived, inner "city" gone
+        let addr = result.values().find(|f| f.name() == "address").unwrap();
+        let DataType::Struct(s) = addr.data_type() else {
+            panic!("expected struct");
+        };
+        assert!(s.field("zip").is_some());
+        assert!(s.field("city").is_none());
+    }
+
+    /// Covers 4-level recursion: `a.b.c.d`. Exercises the recursion for both modify and remove.
+    fn four_level_nested_schema() -> StructType {
+        StructType::try_new(vec![StructField::nullable(
+            "a",
+            StructType::try_new(vec![StructField::nullable(
+                "b",
+                StructType::try_new(vec![StructField::nullable(
+                    "c",
+                    StructType::try_new(vec![
+                        StructField::not_null("d", DataType::INTEGER),
+                        StructField::nullable("sibling", DataType::STRING),
+                    ])
+                    .unwrap(),
+                )])
+                .unwrap(),
+            )])
+            .unwrap(),
+        )])
+        .unwrap()
+    }
+
+    /// Walk to `result`'s `a.b.c` leaf struct. The 4-level helpers above produce schemas where
+    /// the modified/removed leaf lives there, so tests just assert on the resulting `d_struct`.
+    fn walk_to_d_struct(result: &IndexMap<String, StructField>) -> &StructType {
+        let a = result.values().next().unwrap();
+        let DataType::Struct(b_struct) = a.data_type() else {
+            panic!("a should be struct");
+        };
+        let DataType::Struct(c_struct) = b_struct.field("b").unwrap().data_type() else {
+            panic!("b should be struct");
+        };
+        let DataType::Struct(d_struct) = c_struct.field("c").unwrap().data_type() else {
+            panic!("c should be struct");
+        };
+        d_struct
+    }
+
+    /// 4-level recursion (`a.b.c.d`) for both modify and remove. The helper must descend
+    /// through each level, apply the leaf action, and rebuild on the way back up without
+    /// disturbing the sibling.
+    #[rstest]
+    #[case::modify(true)]
+    #[case::remove(false)]
+    fn deeply_nested_4_levels(#[case] is_modify: bool) {
+        let path = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ];
+        let result = if is_modify {
+            modify_field_at_path_test_helper(four_level_nested_schema(), &path).unwrap()
+        } else {
+            remove_field_at_path_test_helper(four_level_nested_schema(), &path).unwrap()
+        };
+        let d_struct = walk_to_d_struct(&result);
+        if is_modify {
+            assert!(d_struct.field("d").unwrap().is_nullable());
+            assert!(d_struct.field("sibling").unwrap().is_nullable());
+        } else {
+            assert!(d_struct.field("d").is_none());
+            assert!(d_struct.field("sibling").is_some());
+        }
+    }
+
+    // Shorthand for apply_schema_operations with no column mapping and no partition/clustering.
+    // Used by AddColumn, SetNullable, and DropColumn tests below.
+    fn apply_ops(
+        schema: StructType,
+        ops: Vec<SchemaOperation>,
+    ) -> DeltaResult<SchemaEvolutionResult> {
+        apply_schema_operations(schema, ops, ColumnMappingMode::None, None, &[], &[])
+    }
+
+    // Shorthand for apply_schema_operations with column mapping enabled and a given max id, but
+    // no partition/clustering columns.
+    fn apply_ops_with_cm(
+        schema: StructType,
+        ops: Vec<SchemaOperation>,
+        mode: ColumnMappingMode,
+        current_max_column_id: Option<i64>,
+    ) -> DeltaResult<SchemaEvolutionResult> {
+        apply_schema_operations(schema, ops, mode, current_max_column_id, &[], &[])
+    }
+
+    // === apply_schema_operations: AddColumn tests ===
 
     #[rstest]
     #[case::dup_exact(vec![add_col("name", true)], "already exists")]
@@ -368,8 +671,7 @@ mod tests {
         #[case] ops: Vec<SchemaOperation>,
         #[case] error_contains: &str,
     ) {
-        let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::None, None)
-            .unwrap_err();
+        let err = apply_ops(simple_schema(), ops).unwrap_err();
         assert!(err.to_string().contains(error_contains));
     }
 
@@ -383,8 +685,7 @@ mod tests {
         #[case] ops: Vec<SchemaOperation>,
         #[case] expected_names: &[&str],
     ) {
-        let result =
-            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::None, None).unwrap();
+        let result = apply_ops(simple_schema(), ops).unwrap();
         let actual: Vec<&str> = result.schema.fields().map(|f| f.name().as_str()).collect();
         assert_eq!(&actual, expected_names);
     }
@@ -417,7 +718,7 @@ mod tests {
         let ops = vec![SchemaOperation::SetNullable {
             column: column.clone(),
         }];
-        let result = apply_schema_operations(schema, ops, ColumnMappingMode::None, None).unwrap();
+        let result = apply_ops(schema, ops).unwrap();
         assert!(result.schema.field_at_path(column.path()).is_nullable());
     }
 
@@ -427,8 +728,7 @@ mod tests {
     #[case::empty_path(ColumnName::new(Vec::<String>::new()), "empty column path")]
     fn set_nullable_fails(#[case] column: ColumnName, #[case] error_contains: &str) {
         let ops = vec![SchemaOperation::SetNullable { column }];
-        let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::None, None)
-            .unwrap_err();
+        let err = apply_ops(simple_schema(), ops).unwrap_err();
         assert!(
             err.to_string().contains(error_contains),
             "expected error to contain '{error_contains}', got: {err}"
@@ -447,7 +747,7 @@ mod tests {
         let ops = vec![SchemaOperation::SetNullable {
             column: column_name!("address"),
         }];
-        let result = apply_schema_operations(schema, ops, ColumnMappingMode::None, None).unwrap();
+        let result = apply_ops(schema, ops).unwrap();
         let addr = result.schema.field("address").unwrap();
         assert!(addr.is_nullable(), "struct itself must be nullable");
         match addr.data_type() {
@@ -469,36 +769,11 @@ mod tests {
                 column: column_name!("id"),
             },
         ];
-        let result =
-            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::None, None).unwrap();
+        let result = apply_ops(simple_schema(), ops).unwrap();
         assert_eq!(result.schema.fields().count(), 3);
         assert!(result.schema.field("email").is_some());
         assert!(result.schema.field("id").unwrap().is_nullable());
     }
-
-    #[test]
-    fn set_nullable_nested_preserves_top_level_order() {
-        // SetNullable on a nested field within a middle top-level field must not reorder
-        // the top-level IndexMap.
-        let schema = StructType::try_new(vec![
-            StructField::not_null("alpha", DataType::INTEGER),
-            StructField::nullable(
-                "beta",
-                StructType::try_new(vec![StructField::not_null("nested", DataType::STRING)])
-                    .unwrap(),
-            ),
-            StructField::not_null("gamma", DataType::STRING),
-        ])
-        .unwrap();
-        let ops = vec![SchemaOperation::SetNullable {
-            column: column_name!("beta.nested"),
-        }];
-        let result = apply_schema_operations(schema, ops, ColumnMappingMode::None, None).unwrap();
-        let names: Vec<&String> = result.schema.fields().map(|f| f.name()).collect();
-        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
-    }
-
-    // === Column mapping tests ===
 
     fn get_cm_id(field: &StructField) -> i64 {
         field
@@ -527,8 +802,7 @@ mod tests {
         let ops = vec![SchemaOperation::AddColumn {
             field: StructField::nullable("email", DataType::STRING),
         }];
-        let result =
-            apply_schema_operations(simple_schema(), ops, mode, Some(current_max)).unwrap();
+        let result = apply_ops_with_cm(simple_schema(), ops, mode, Some(current_max)).unwrap();
         let email_field = result.schema.field("email").unwrap();
 
         assert_eq!(get_cm_id(email_field), expected_id);
@@ -541,8 +815,8 @@ mod tests {
         let ops = vec![SchemaOperation::AddColumn {
             field: StructField::nullable("email", DataType::STRING),
         }];
-        let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, None)
-            .unwrap_err();
+        let err =
+            apply_ops_with_cm(simple_schema(), ops, ColumnMappingMode::Name, None).unwrap_err();
         assert!(matches!(err, Error::InvalidProtocol(_)));
         assert!(err.to_string().contains("maxColumnId"));
     }
@@ -564,8 +838,7 @@ mod tests {
             },
         ];
         let result =
-            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(10))
-                .unwrap();
+            apply_ops_with_cm(simple_schema(), ops, ColumnMappingMode::Name, Some(10)).unwrap();
 
         let id_a = get_cm_id(result.schema.field("a").unwrap());
         let id_b = get_cm_id(result.schema.field("b").unwrap());
@@ -635,8 +908,7 @@ mod tests {
             field: StructField::nullable("col", data_type),
         }];
         let result =
-            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(10))
-                .unwrap();
+            apply_ops_with_cm(simple_schema(), ops, ColumnMappingMode::Name, Some(10)).unwrap();
 
         let added = result.schema.field("col").unwrap();
         let ids = added.collect_column_mapping_ids();
@@ -675,8 +947,8 @@ mod tests {
     ))]
     fn add_column_with_preexisting_cm_metadata_is_rejected_under_cm(#[case] field: StructField) {
         let ops = vec![SchemaOperation::AddColumn { field }];
-        let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(2))
-            .unwrap_err();
+        let err =
+            apply_ops_with_cm(simple_schema(), ops, ColumnMappingMode::Name, Some(2)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("pre-populated"));
         assert!(
@@ -700,13 +972,223 @@ mod tests {
             field: StructField::nullable("new", DataType::STRING),
         }];
         // Persisted maxColumnId is stale at 5, but the schema actually contains id=42.
-        let result =
-            apply_schema_operations(schema, ops, ColumnMappingMode::Name, Some(5)).unwrap();
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(5)).unwrap();
         let new_id = get_cm_id(result.schema.field("new").unwrap());
         assert_eq!(
             new_id, 43,
             "new id must follow schema max (42), not stale property (5)"
         );
         assert_eq!(result.new_max_column_id, Some(43));
+    }
+
+    // === apply_schema_operations: DropColumn tests ===
+
+    /// Schema flavor selector for `drop_column_failures`. Each variant builds a distinct
+    /// schema so one rstest can exercise drops across simple, single-column, and nested shapes.
+    enum DropSchema {
+        /// `simple_schema()` = { id: int not null, name: string }
+        Simple,
+        /// { only: string }
+        SingleColumn,
+        /// { id: int not null, address: struct { street: string } }
+        AddressStreetOnly,
+        /// `nested_schema()` = { id: int not null, address: struct { street, city, zip } }
+        NestedThreeFields,
+    }
+
+    fn build_drop_schema(flavor: DropSchema) -> StructType {
+        match flavor {
+            DropSchema::Simple => simple_schema(),
+            DropSchema::SingleColumn => {
+                StructType::try_new(vec![StructField::nullable("only", DataType::STRING)]).unwrap()
+            }
+            DropSchema::AddressStreetOnly => StructType::try_new(vec![
+                StructField::not_null("id", DataType::INTEGER),
+                StructField::nullable(
+                    "address",
+                    StructType::try_new(vec![StructField::nullable("street", DataType::STRING)])
+                        .unwrap(),
+                ),
+            ])
+            .unwrap(),
+            DropSchema::NestedThreeFields => nested_schema(),
+        }
+    }
+
+    #[rstest]
+    #[case::without_cm(
+        DropSchema::Simple, ColumnMappingMode::None, None,
+        column_name!("name"), vec![], vec![], "column mapping"
+    )]
+    #[case::nonexistent(
+        DropSchema::Simple, ColumnMappingMode::Name, Some(2),
+        column_name!("nonexistent"), vec![], vec![], "does not exist"
+    )]
+    #[case::partition_same_case(
+        DropSchema::Simple, ColumnMappingMode::Name, Some(2),
+        column_name!("name"), vec!["name".to_string()], vec![], "partition column"
+    )]
+    #[case::partition_diff_case(
+        DropSchema::Simple, ColumnMappingMode::Name, Some(2),
+        column_name!("NAME"), vec!["name".to_string()], vec![], "partition column"
+    )]
+    #[case::last_column(
+        DropSchema::SingleColumn, ColumnMappingMode::Name, Some(1),
+        column_name!("only"), vec![], vec![], "last field"
+    )]
+    #[case::last_nested_field(
+        DropSchema::AddressStreetOnly, ColumnMappingMode::Name, Some(3),
+        column_name!("address.street"), vec![], vec![], "last field"
+    )]
+    #[case::clustering_same_case(
+        DropSchema::Simple, ColumnMappingMode::Name, Some(4),
+        column_name!("name"), vec![], vec![column_name!("name")], "clustering column"
+    )]
+    #[case::clustering_diff_case(
+        DropSchema::Simple, ColumnMappingMode::Name, Some(4),
+        column_name!("NAME"), vec![], vec![column_name!("name")], "clustering column"
+    )]
+    #[case::clustering_ancestor(
+        DropSchema::NestedThreeFields, ColumnMappingMode::Name, Some(4),
+        column_name!("address"), vec![], vec![column_name!("address.city")], "clustering column"
+    )]
+    #[case::nested_nonexistent(
+        DropSchema::NestedThreeFields, ColumnMappingMode::Name, Some(4),
+        column_name!("address.country"), vec![], vec![], "does not exist"
+    )]
+    #[case::nested_through_non_struct(
+        DropSchema::Simple, ColumnMappingMode::Name, Some(2),
+        column_name!("name.inner"), vec![], vec![], "not a struct"
+    )]
+    #[case::empty_path(
+        DropSchema::Simple, ColumnMappingMode::Name, Some(2),
+        ColumnName::new(Vec::<String>::new()), vec![], vec![], "empty column path"
+    )]
+    fn drop_column_failures(
+        #[case] schema_flavor: DropSchema,
+        #[case] cm: ColumnMappingMode,
+        #[case] max_id: Option<i64>,
+        #[case] drop_column: ColumnName,
+        #[case] partition: Vec<String>,
+        #[case] clustering: Vec<ColumnName>,
+        #[case] error_contains: &str,
+    ) {
+        let ops = vec![SchemaOperation::DropColumn {
+            column: drop_column,
+        }];
+        let err = apply_schema_operations(
+            build_drop_schema(schema_flavor),
+            ops,
+            cm,
+            max_id,
+            &partition,
+            &clustering,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains(error_contains));
+    }
+
+    #[test]
+    fn drop_column_succeeds() {
+        let schema = simple_schema();
+        let ops = vec![SchemaOperation::DropColumn {
+            column: column_name!("name"),
+        }];
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(2)).unwrap();
+        assert_eq!(result.schema.fields().count(), 1);
+        assert!(result.schema.field("name").is_none());
+        assert!(result.schema.field("id").is_some());
+    }
+
+    #[test]
+    fn chain_add_drop_set_nullable() {
+        let schema = StructType::try_new(vec![
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
+        ])
+        .unwrap();
+        let ops = vec![
+            SchemaOperation::AddColumn {
+                field: StructField::nullable("email", DataType::STRING),
+            },
+            SchemaOperation::DropColumn {
+                column: column_name!("age"),
+            },
+            SchemaOperation::SetNullable {
+                column: column_name!("id"),
+            },
+        ];
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(3)).unwrap();
+        assert_eq!(result.schema.fields().count(), 3);
+        assert!(result.schema.field("email").is_some());
+        assert!(result.schema.field("age").is_none());
+        assert!(result.schema.field("id").unwrap().is_nullable());
+    }
+
+    #[test]
+    fn drop_then_re_add_same_column_name() {
+        // Pre-assign a column-mapping id to "name" so we can verify that after drop + re-add
+        // the new "name" gets a fresh id strictly greater than the dropped column's id.
+        let dropped_name_id: i64 = 2;
+        let mut name_field = StructField::nullable("name", DataType::STRING);
+        name_field.metadata.insert(
+            ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+            MetadataValue::Number(dropped_name_id),
+        );
+        name_field.metadata.insert(
+            ColumnMetadataKey::ColumnMappingPhysicalName
+                .as_ref()
+                .to_string(),
+            MetadataValue::String("col-existing".to_string()),
+        );
+        let schema = StructType::try_new(vec![
+            StructField::not_null("id", DataType::INTEGER),
+            name_field,
+        ])
+        .unwrap();
+        let ops = vec![
+            SchemaOperation::DropColumn {
+                column: column_name!("name"),
+            },
+            SchemaOperation::AddColumn {
+                field: StructField::nullable("name", DataType::INTEGER),
+            },
+        ];
+        let result =
+            apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(dropped_name_id)).unwrap();
+        assert_eq!(result.schema.fields().count(), 2);
+        let re_added = result.schema.field("name").unwrap();
+        assert_eq!(re_added.data_type(), &DataType::INTEGER);
+        let expected_new_id = dropped_name_id + 1;
+        assert_eq!(get_cm_id(re_added), expected_new_id);
+        assert_eq!(result.new_max_column_id, Some(expected_new_id));
+        let new_physical_name = get_physical_name(re_added);
+        assert_ne!(
+            new_physical_name, "col-existing",
+            "re-added column must get a fresh physical name distinct from the dropped column's"
+        );
+    }
+
+    #[test]
+    fn drop_nested_column_succeeds() {
+        let schema = nested_schema();
+        let ops = vec![SchemaOperation::DropColumn {
+            column: column_name!("address.city"),
+        }];
+        let result = apply_ops_with_cm(schema, ops, ColumnMappingMode::Name, Some(4)).unwrap();
+        // Top level still has 2 fields
+        assert_eq!(result.schema.fields().count(), 2);
+        // address struct should have 2 fields (street, zip) -- city removed
+        let addr = result.schema.field("address").unwrap();
+        match addr.data_type() {
+            DataType::Struct(s) => {
+                assert_eq!(s.fields().count(), 2);
+                assert!(s.field("city").is_none());
+                assert!(s.field("street").is_some());
+                assert!(s.field("zip").is_some());
+            }
+            other => panic!("Expected Struct, got: {other:?}"),
+        }
     }
 }
