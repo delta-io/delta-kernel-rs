@@ -439,7 +439,7 @@ fn compute_column_stats(
 
             // When min/max is None (all nulls or unsupported type), emit a null-valued
             // single-element array to keep the field present in the stats struct. This
-            // allows downstream consumers (like StatsVerifier) to find the column and
+            // allows downstream consumers (like StatsColumnVerifier) to find the column and
             // check nullCount == numRecords. The JSON serializer omits null fields, so
             // the on-disk format still matches Spark's ignoreNullFields behavior.
             let null_fallback = || -> ArrayRef { Arc::new(new_null_array(column.data_type(), 1)) };
@@ -778,7 +778,7 @@ mod tests {
         assert_eq!(value_null_count.value(0), 3);
 
         // All-null columns are present in minValues/maxValues but with null values.
-        // The field must exist so that StatsVerifier can find it via visit_rows and
+        // The field must exist so that StatsColumnVerifier can find it via visit_rows and
         // check nullCount == numRecords. The JSON serializer omits null fields, so
         // the on-disk format still matches Spark's ignoreNullFields behavior.
         let min_values = stats

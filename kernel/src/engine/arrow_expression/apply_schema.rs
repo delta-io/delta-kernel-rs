@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
-use super::super::arrow_conversion::kernel_metadata_to_arrow_metadata;
+use super::super::arrow_conversion::{
+    kernel_metadata_to_arrow_metadata, lookup_nested_field_id, parquet_field_id_metadata,
+    LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_VALUE_DEFAULT,
+};
 use super::super::arrow_utils::make_arrow_error;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
@@ -73,7 +76,12 @@ fn transform_struct(
         .zip(target_fields)
         .map(|((sa_col, input_field), target_field)| -> DeltaResult<_> {
             let target_field = target_field.borrow();
-            let transformed_col = apply_schema_to(&sa_col, target_field.data_type())?;
+            let transformed_col = apply_schema_to_inner(
+                &sa_col,
+                target_field.data_type(),
+                Some(target_field),
+                &target_field.name,
+            )?;
             let arrow_metadata = kernel_metadata_to_arrow_metadata(target_field)?;
             // If both the input field and the target field carry a field ID they must agree,
             // otherwise we would silently overwrite one field ID with another.
@@ -99,7 +107,7 @@ fn transform_struct(
     let (transformed_fields, transformed_cols): (Vec<ArrowField>, Vec<ArrayRef>) =
         result_iter.process_results(|iter| iter.unzip())?;
     if transformed_cols.len() != input_col_count {
-        return Err(Error::InternalError(format!(
+        return Err(Error::internal_error(format!(
             "Passed struct had {input_col_count} columns, but transformed column has {}",
             transformed_cols.len()
         )));
@@ -121,76 +129,262 @@ fn apply_schema_to_struct(array: &dyn Array, kernel_fields: &Schema) -> DeltaRes
     transform_struct(sa, kernel_fields.fields())
 }
 
-// deconstruct the array, then rebuild the mapped version
+// Apply a kernel [`ArrayType`] to an Arrow [`ListArray`].
+// This function will deconstruct the array, then rebuild the mapped version, and set parquet field
+// id.
+//
+// # Example
+//
+// The blocks below show only the *schema* of the input and output ListArrays. Data values,
+// offsets, and the null buffer pass through unchanged.
+//
+// Given an ancestor [`StructField`] `arr: array<int>` whose metadata has
+// `parquet.field.nested.ids: { "arr.element": 42 }`, and an input ListArray with schema:
+//
+// ```json
+// {
+//   "type": "list",
+//   "element": {
+//     "name": "element",
+//     "type": "int32",
+//     "nullable": true,
+//     "metadata": { /* anything; replaced by kernel-derived metadata below */ }
+//   }
+// }
+// ```
+//
+// calling `apply_schema_to_list(input, &ArrayType::new(int, true), Some(arr), "arr")` produces
+// a ListArray with the same data and the rebuilt schema:
+//
+// ```json
+// {
+//   "type": "list",
+//   "element": {
+//     "name": "element",
+//     "type": "int32",
+//     "nullable": true,
+//     "metadata": { "PARQUET:field_id": "42" }
+//   }
+// }
+// ```
 fn apply_schema_to_list(
     array: &dyn Array,
     target_inner_type: &ArrayType,
+    nearest_ancestor_struct_field: Option<&StructField>,
+    relative_path: &str,
 ) -> DeltaResult<ListArray> {
     let Some(la) = array.as_list_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a list but isn't a ListArray",
         ));
     };
-    let (field, offset_buffer, values, nulls) = la.clone().into_parts();
+    // 1. Deconstruct the input ListArray into its parts.
+    let (arrow_element_field, offset_buffer, arrow_values, nulls) = la.clone().into_parts();
 
-    let transformed_values = apply_schema_to(&values, &target_inner_type.element_type)?;
-    let transformed_field = ArrowField::new(
-        field.name(),
-        transformed_values.data_type().clone(),
+    // 2. Look up the synthesized `element` field's nested id from the ancestor, and recurse on the
+    //    values column.
+    let element_path = format!("{relative_path}.{LIST_ARRAY_ROOT}");
+    let element_id = nearest_ancestor_struct_field
+        .map(|f| lookup_nested_field_id(f, &element_path))
+        .transpose()?
+        .flatten();
+    let transformed_arrow_values = apply_schema_to_inner(
+        &arrow_values,
+        &target_inner_type.element_type,
+        nearest_ancestor_struct_field,
+        &element_path,
+    )?;
+
+    // 3. Rebuild the element field. `apply_schema` applies kernel's schema, so the input arrow
+    //    field's metadata comes entirely from the kernel side. Parquet field ID is the only
+    //    metadata that should be set on the element field here. Since kernel's
+    //    `ArrayType::element_type` is a bare `DataType` (not a `StructField`), there is no
+    //    per-element metadata on the kernel side. The element's Parquet field ID comes from the
+    //    ancestor's metadata.
+    let transformed_arrow_element_field = ArrowField::new(
+        arrow_element_field.name(),
+        transformed_arrow_values.data_type().clone(),
         target_inner_type.contains_null,
-    );
+    )
+    .with_metadata(parquet_field_id_metadata(element_id));
     Ok(ListArray::try_new(
-        Arc::new(transformed_field),
+        Arc::new(transformed_arrow_element_field),
         offset_buffer,
-        transformed_values,
+        transformed_arrow_values,
         nulls,
     )?)
 }
 
-// deconstruct a map, and rebuild it with the specified target kernel type
-fn apply_schema_to_map(array: &dyn Array, kernel_map_type: &MapType) -> DeltaResult<MapArray> {
+// Apply a kernel [`MapType`] to an Arrow [`MapArray`].
+// Deconstruct a map, then rebuild it with the specified target kernel type,
+// and set parquet field id on the synthesized `key`/`value` Arrow fields.
+//
+// # Example
+//
+// The blocks below show only the *schema* of the input and output MapArrays. Data values,
+// offsets, and null buffers pass through unchanged.
+// input.
+//
+// Given an ancestor StructField `m: map<int, int>` whose metadata has
+// `parquet.field.nested.ids: { "m.key": 100, "m.value": 101 }`, and an input MapArray with
+// schema:
+//
+// ```json
+// {
+//   "type": "map",
+//   "keys_sorted": false,
+//   "entries": {
+//     "name": "key_value",
+//     "type": "struct",
+//     "fields": [
+//       { "name": "k", "type": "int32", "nullable": false,
+//         "metadata": { /* anything; will bereplaced */ } },
+//       { "name": "v", "type": "int32", "nullable": true,
+//         "metadata": { /* anything; will bereplaced */ } }
+//     ]
+//   }
+// }
+// ```
+//
+// calling `apply_schema_to_map(input, &MapType::new(int, int, true), Some(m), "m")` produces a
+// MapArray with the same data and the rebuilt schema:
+//
+// ```json
+// {
+//   "type": "map",
+//   "keys_sorted": false,
+//   "entries": {
+//     "name": "key_value",
+//     "type": "struct",
+//     "fields": [
+//       { "name": "k", "type": "int32", "nullable": false,
+//         "metadata": { "PARQUET:field_id": "100" } },
+//       { "name": "v", "type": "int32", "nullable": true,
+//         "metadata": { "PARQUET:field_id": "101" } }
+//     ]
+//   }
+// }
+// ```
+fn apply_schema_to_map(
+    array: &dyn Array,
+    kernel_map_type: &MapType,
+    ancestor: Option<&StructField>,
+    relative_path: &str,
+) -> DeltaResult<MapArray> {
     let Some(ma) = array.as_map_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a map but isn't a MapArray",
         ));
     };
-    let (map_field, offset_buffer, map_struct_array, nulls, ordered) = ma.clone().into_parts();
-    let target_fields = map_struct_array
-        .fields()
-        .iter()
-        .zip([&kernel_map_type.key_type, &kernel_map_type.value_type])
-        .zip([false, kernel_map_type.value_contains_null])
-        .map(|((arrow_field, target_type), nullable)| {
-            StructField::new(arrow_field.name(), target_type.clone(), nullable)
-        });
+    // 1. Deconstruct the input MapArray and its inner entries struct.
+    let (arrow_map_field, offset_buffer, arrow_map_struct_array, nulls, ordered) =
+        ma.clone().into_parts();
+    let (arrow_input_fields, mut arrow_cols, arrow_struct_nulls) =
+        arrow_map_struct_array.into_parts();
+    if arrow_cols.len() != 2 || arrow_input_fields.len() != 2 {
+        return Err(Error::internal_error(format!(
+            "Map entries struct must have exactly 2 columns (key, value), got {}",
+            arrow_cols.len()
+        )));
+    }
+    let arrow_value_col = arrow_cols.remove(1);
+    let arrow_key_col = arrow_cols.remove(0);
+    let arrow_input_key_name = arrow_input_fields[0].name().clone();
+    let arrow_input_value_name = arrow_input_fields[1].name().clone();
 
-    // Arrow puts the key type/val as the first field/col and the value type/val as the second. So
-    // we just transform like a 'normal' struct, but we know there are two fields/cols and we
-    // specify the key/value types as the target type iterator.
-    let transformed_map_struct_array = transform_struct(&map_struct_array, target_fields)?;
+    // 2. Look up nested field ids for the synthesized key/value fields from the ancestor, and
+    //    recurse on each column.
+    let key_path = format!("{relative_path}.{MAP_KEY_DEFAULT}");
+    let value_path = format!("{relative_path}.{MAP_VALUE_DEFAULT}");
+    let key_id = ancestor
+        .map(|a| lookup_nested_field_id(a, &key_path))
+        .transpose()?
+        .flatten();
+    let value_id = ancestor
+        .map(|a| lookup_nested_field_id(a, &value_path))
+        .transpose()?
+        .flatten();
+    let transformed_arrow_key = apply_schema_to_inner(
+        &arrow_key_col,
+        &kernel_map_type.key_type,
+        ancestor,
+        &key_path,
+    )?;
+    let transformed_arrow_value = apply_schema_to_inner(
+        &arrow_value_col,
+        &kernel_map_type.value_type,
+        ancestor,
+        &value_path,
+    )?;
 
-    let transformed_map_field = ArrowField::new(
-        map_field.name().clone(),
-        transformed_map_struct_array.data_type().clone(),
-        map_field.is_nullable(),
+    // 3. Rebuild the key/value fields, repack the entries struct, and wrap in a new MapArray.
+    //    `apply_schema` applies kernel's schema, so the synthesized fields' metadata comes entirely
+    //    from the kernel side. Parquet field IDs are the only metadata that should be set on the
+    //    key/value fields here. Since kernel's `MapType::{key,value}_type` are bare `DataType`s
+    //    (not `StructField`s), there is no per-key/per-value metadata on the kernel side. The IDs
+    //    come from the ancestor's metadata.
+    // Map keys are never nullable.
+    let arrow_key_field = ArrowField::new(
+        arrow_input_key_name,
+        transformed_arrow_key.data_type().clone(),
+        false,
+    )
+    .with_metadata(parquet_field_id_metadata(key_id));
+    let arrow_value_field = ArrowField::new(
+        arrow_input_value_name,
+        transformed_arrow_value.data_type().clone(),
+        kernel_map_type.value_contains_null,
+    )
+    .with_metadata(parquet_field_id_metadata(value_id));
+    let arrow_entries_struct = StructArray::try_new(
+        vec![arrow_key_field.clone(), arrow_value_field.clone()].into(),
+        vec![transformed_arrow_key, transformed_arrow_value],
+        arrow_struct_nulls,
+    )?;
+    let arrow_entries_field = ArrowField::new(
+        arrow_map_field.name(),
+        ArrowDataType::Struct(vec![arrow_key_field, arrow_value_field].into()),
+        arrow_map_field.is_nullable(),
     );
     Ok(MapArray::try_new(
-        Arc::new(transformed_map_field),
+        Arc::new(arrow_entries_field),
         offset_buffer,
-        transformed_map_struct_array,
+        arrow_entries_struct,
         nulls,
         ordered,
     )?)
 }
 
 // apply `schema` to `array`. This handles renaming, and adjusting nullability and metadata. if the
-// actual data types don't match, this will return an error
+// actual data types don't match, this will return an error.
 pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResult<ArrayRef> {
+    apply_schema_to_inner(array, schema, None, "")
+}
+
+/// Recursive worker for `apply_schema_to`. Rebuilds `array` to match `schema`, threading nested
+/// field-id metadata onto the synthesized `element` / `key` / `value` Arrow fields of any
+/// list/map types it visits.
+///
+/// # Parameters
+/// - `array`: the Arrow input to transform.
+/// - `schema`: the target kernel data type.
+/// - `ancestor`: the nearest ancestor kernel [`StructField`]; its metadata holds the nested-ids
+///   JSON map.
+/// - `relative_path`: dot-chained path rooted at `ancestor`'s name.
+///
+/// See [`crate::engine::arrow_conversion::lookup_nested_field_id`] for an example of the
+/// `(ancestor, path) -> id` lookup.
+fn apply_schema_to_inner(
+    array: &ArrayRef,
+    schema: &DataType,
+    ancestor: Option<&StructField>,
+    relative_path: &str,
+) -> DeltaResult<ArrayRef> {
     use DataType::*;
     let array: ArrayRef = match schema {
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),
-        Array(atype) => Arc::new(apply_schema_to_list(array, atype)?),
-        Map(mtype) => Arc::new(apply_schema_to_map(array, mtype)?),
+        Array(atype) => Arc::new(apply_schema_to_list(array, atype, ancestor, relative_path)?),
+        Map(mtype) => Arc::new(apply_schema_to_map(array, mtype, ancestor, relative_path)?),
         _ => {
             ensure_data_types(schema, array.data_type(), ValidationMode::Full)?;
             array.clone()
@@ -201,17 +395,24 @@ pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResul
 
 #[cfg(test)]
 mod apply_schema_validation_tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
+    use rstest::rstest;
+
     use super::*;
-    use crate::arrow::array::{Int32Array, StructArray};
+    use crate::arrow::array::{Int32Array, RecordBatch, StructArray};
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::utils::test_utils::{
+        array_in_map_arrow_data_without_field_ids, array_in_map_kernel_schema,
+        array_in_map_with_field_ids, assert_result_error_with_message,
+        collect_arrow_field_metadata, complex_nested_with_field_ids,
+    };
 
     #[test]
     fn test_apply_schema_basic_functionality() {
@@ -410,5 +611,165 @@ mod apply_schema_validation_tests {
             apply_schema_to_struct(&input_array, &target_schema),
             "conflicts with",
         );
+    }
+
+    // === Nested-id propagation tests ===
+
+    #[rstest]
+    #[case::parquet_field_nested_ids(ColumnMetadataKey::ParquetFieldNestedIds.as_ref())]
+    #[case::delta_column_mapping_nested_ids(ColumnMetadataKey::ColumnMappingNestedIds.as_ref())]
+    fn test_apply_schema_threads_nested_ids_onto_arrow_schema(#[case] meta_key: &str) {
+        let fixture = complex_nested_with_field_ids(meta_key);
+        let kernel_type = DataType::Struct(Box::new(fixture.kernel_schema));
+        let result = apply_schema(&fixture.input_arrow_data, &kernel_type).unwrap();
+
+        assert_eq!(
+            result.schema().as_ref(),
+            &fixture.expected_arrow_schema,
+            "apply_schema should attach nested field ids to synthesized map/array fields",
+        );
+    }
+
+    /// Custom field names on the input arrow schema should survive `apply_schema`. The
+    /// metadata from the input arrow schema is replaced by kernel-derived metadata.
+    #[test]
+    fn test_apply_schema_retains_synthesized_field_names_and_metadata() {
+        let one = |k: &str, v: &str| HashMap::from([(k.to_string(), v.to_string())]);
+        let input = array_in_map_arrow_data_with_custom_names_and_meta(
+            one("custom.key", "key_val"),
+            one("custom.value", "value_val"),
+            one("custom.element", "elem_val"),
+        );
+        let kernel_schema =
+            array_in_map_with_field_ids(ColumnMetadataKey::ParquetFieldNestedIds.as_ref());
+        let result = apply_schema(&input, &DataType::Struct(Box::new(kernel_schema))).unwrap();
+
+        let result_schema = result.schema();
+        let ArrowDataType::Map(entries_field, _) = result_schema.field(0).data_type() else {
+            panic!("array_in_map should remain a map");
+        };
+        assert_eq!(entries_field.name(), "custom_entries");
+        let ArrowDataType::Struct(fields) = entries_field.data_type() else {
+            panic!("map entries should remain a struct");
+        };
+        assert_eq!(fields[0].name(), "custom_key");
+        assert_eq!(fields[1].name(), "custom_value");
+        let ArrowDataType::List(element_field) = fields[1].data_type() else {
+            panic!("map value should remain a list");
+        };
+        assert_eq!(element_field.name(), "custom_item");
+
+        // Kernel-derived `PARQUET:field_id` is the *only* metadata on each synthesized field
+        // (input metadata is replaced wholesale).
+        let expect_only_field_id = |f: &ArrowField, id: &str| {
+            assert_eq!(
+                f.metadata(),
+                &HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]),
+            );
+        };
+        expect_only_field_id(&fields[0], "100");
+        expect_only_field_id(&fields[1], "101");
+        expect_only_field_id(element_field, "102");
+    }
+
+    #[rstest]
+    /// The whole nested ids JSON map is missing(i.e. neither `delta.columnMapping.nested.ids`
+    /// nor `parquet.field.nested.ids` are present).
+    #[case::without_nested_id_metadata(array_in_map_kernel_schema(std::iter::empty::<(
+        String,
+        MetadataValue,
+    )>()), /* expected_field_ids */ &[])]
+    /// Only some of the nested ids are present.
+    #[case::only_partial_nested_ids_match(array_in_map_kernel_schema([(
+        ColumnMetadataKey::ParquetFieldNestedIds.as_ref().to_string(),
+        MetadataValue::Other(test_utils::nested_ids_json(&[
+            ("array_in_map.key", 100),
+            ("array_in_map.value.element", 102),
+            ("array_in_map.notTheKey", 999),
+        ])),
+    )]), &[("element", "102"), ("key", "100")])]
+    fn test_apply_schema_sets_field_ids_for_matched_nested_ids_only(
+        #[case] schema: StructType,
+        #[case] expected_field_ids: &[(&str, &str)],
+    ) {
+        let kernel_type = DataType::Struct(Box::new(schema));
+        let result =
+            apply_schema(&array_in_map_arrow_data_without_field_ids(), &kernel_type).unwrap();
+        let field_ids: HashMap<String, String> =
+            collect_arrow_field_metadata(result.schema().as_ref(), PARQUET_FIELD_ID_META_KEY)
+                .into_iter()
+                .collect();
+
+        assert_eq!(field_ids.len(), expected_field_ids.len());
+        for (field_name, expected_id) in expected_field_ids {
+            assert_eq!(
+                field_ids.get(*field_name).map(String::as_str),
+                Some(*expected_id),
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::not_json_object(
+        MetadataValue::String("not a json object".to_string()),
+        "must be a JSON object",
+    )]
+    #[case::entry_not_an_integer(
+        MetadataValue::Other(serde_json::json!({ "array_in_map.key": "oops" })),
+        "must be an integer",
+    )]
+    fn test_apply_schema_invalid_nested_ids_metadata_errors(
+        #[case] value: MetadataValue,
+        #[case] expected_error_substring: &str,
+    ) {
+        let schema = array_in_map_kernel_schema([(
+            ColumnMetadataKey::ParquetFieldNestedIds
+                .as_ref()
+                .to_string(),
+            value,
+        )]);
+        let kernel_type = DataType::Struct(Box::new(schema));
+
+        assert_result_error_with_message(
+            apply_schema(&array_in_map_arrow_data_without_field_ids(), &kernel_type),
+            expected_error_substring,
+        );
+    }
+
+    /// Build a StructArray for `array_in_map: map<int, list<int>>` with custom Arrow names and
+    /// caller-provided metadata.
+    fn array_in_map_arrow_data_with_custom_names_and_meta(
+        key_metadata: HashMap<String, String>,
+        value_metadata: HashMap<String, String>,
+        element_metadata: HashMap<String, String>,
+    ) -> StructArray {
+        let element_field = ArrowField::new("custom_item", ArrowDataType::Int32, true)
+            .with_metadata(element_metadata);
+        let key_field =
+            ArrowField::new("custom_key", ArrowDataType::Int32, false).with_metadata(key_metadata);
+        let value_field = ArrowField::new(
+            "custom_value",
+            ArrowDataType::List(Arc::new(element_field)),
+            true,
+        )
+        .with_metadata(value_metadata);
+        let entries_field = ArrowField::new(
+            "custom_entries",
+            ArrowDataType::Struct(vec![key_field, value_field].into()),
+            false,
+        );
+        let array_in_map_field = ArrowField::new(
+            "array_in_map",
+            ArrowDataType::Map(Arc::new(entries_field), false),
+            true,
+        );
+        let input_batch =
+            RecordBatch::new_empty(Arc::new(ArrowSchema::new(vec![array_in_map_field])));
+        StructArray::try_new(
+            input_batch.schema().fields.clone(),
+            input_batch.columns().to_vec(),
+            None,
+        )
+        .unwrap()
     }
 }

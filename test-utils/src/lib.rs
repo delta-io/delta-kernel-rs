@@ -1262,6 +1262,21 @@ pub fn remove_all_and_get_remove_actions(
     read_actions_from_commit(table_url, committed.commit_version(), "remove")
 }
 
+/// Build a `serde_json::Value` mapping nested dot-paths to ids.
+///
+/// For example, `nested_ids_json(&[("array_in_map.key", 100)])` builds:
+///
+/// ```json
+/// { "array_in_map.key": 100 }
+/// ```
+pub fn nested_ids_json(entries: &[(&str, i64)]) -> serde_json::Value {
+    let obj: serde_json::Map<String, serde_json::Value> = entries
+        .iter()
+        .map(|(k, v)| (k.to_string(), serde_json::Value::from(*v)))
+        .collect();
+    serde_json::Value::Object(obj)
+}
+
 /// Asserts that `action["partitionValues"]` contains the given key with the expected value.
 pub fn assert_partition_values(action: &serde_json::Value, key: &str, expected_value: &str) {
     let pv = action["partitionValues"]
