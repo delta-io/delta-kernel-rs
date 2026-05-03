@@ -97,6 +97,8 @@ pub(crate) fn strip_void_from_field(field: &StructField) -> StructField {
     struct StripVoidFields;
 
     impl<'a> SchemaTransform<'a> for StripVoidFields {
+        transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
         fn transform_struct_field(
             &mut self,
             field: &'a StructField,
@@ -128,6 +130,8 @@ pub(crate) fn validate_schema_for_write(schema: &Schema) -> DeltaResult<()> {
     }
 
     impl<'a> SchemaTransform<'a> for CheckAllVoidStructs {
+        transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
         fn transform_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
             if self.error_message.is_some() {
                 return Some(Cow::Borrowed(stype));
