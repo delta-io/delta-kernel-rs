@@ -2852,9 +2852,9 @@ async fn read_with_predicate_on_void_column() -> Result<(), Box<dyn std::error::
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 3, "IS NULL on void should return all rows");
 
-    // Predicate: void_col IS NOT NULL — always false for void. Since kernel predicates are
-    // used for data skipping (row group level) not row filtering, all rows still appear.
-    // The void column has no Parquet stats, so the predicate cannot skip any row groups.
+    // Predicate: void_col IS NOT NULL — always false for void. The Add action above has no
+    // `stats` string, so kernel has nothing to skip on. All rows are returned.
+    // Skipping driven by `nullCount` is exercised by `void_predicate_skips_via_null_count`.
     let predicate_not_null = Arc::new(column_expr!("void_col").is_not_null());
     let scan_not_null = snapshot
         .scan_builder()
@@ -2867,5 +2867,59 @@ async fn read_with_predicate_on_void_column() -> Result<(), Box<dyn std::error::
         "IS NOT NULL on void: no row-level filtering, all rows returned"
     );
 
+    Ok(())
+}
+
+// File-level skipping via the `nullCount` Delta stat for void columns. The Spark fixture's 3
+// Add actions each carry stats with `nullCount.void_col == numRecords == 1`, so kernel can prune
+// every file for `IS NOT NULL`. Contrast with `read_with_predicate_on_void_column`, whose Add
+// action has no `stats` and consequently returns all 3 rows for the same predicate -- confirming
+// that pruning (not row-level filtering) is what produces the empty result here.
+#[rstest::rstest]
+#[case::is_null(
+    column_expr!("void_col").is_null(),
+    vec![
+        "+----+----------+",
+        "| id | void_col |",
+        "+----+----------+",
+        "| 1  |          |",
+        "| 2  |          |",
+        "| 3  |          |",
+        "+----+----------+",
+    ]
+)]
+#[case::is_not_null(column_expr!("void_col").is_not_null(), vec![])]
+fn void_predicate_skips_via_null_count(
+    #[case] predicate: Pred,
+    #[case] expected: Vec<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data_str("./tests/data/void-column", None, Some(predicate), expected)
+}
+
+// Direct evidence that void-column predicates drive file-level pruning: count the surviving
+// ScanFiles after `scan_metadata` rather than relying on the empty-batches contrast. With the
+// Spark fixture's `nullCount.void_col == numRecords` stats, `IS NOT NULL` prunes all 3 files
+// and `IS NULL` keeps all 3.
+#[rstest::rstest]
+#[case::is_null_keeps_all(column_expr!("void_col").is_null(), 3)]
+#[case::is_not_null_prunes_all(column_expr!("void_col").is_not_null(), 0)]
+fn void_predicate_pruning_scan_file_count(
+    #[case] predicate: Pred,
+    #[case] expected_files: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/void-column"))?;
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let mut scan_files: Vec<ScanFile> = vec![];
+    for res in scan.scan_metadata(engine.as_ref())? {
+        scan_files = res?.visit_scan_files(scan_files, scan_metadata_callback)?;
+    }
+    assert_eq!(scan_files.len(), expected_files);
     Ok(())
 }
