@@ -1125,6 +1125,161 @@ fn checkpoint_filter_multi_row_group_skipping() {
     assert_eq!(batches[0].num_rows(), 2);
 }
 
+/// Builds a 2-row-group parquet file with a `txn.appId` column. Each row group has the
+/// caller-supplied per-row appId values. Returns the temp file holding the parquet bytes.
+fn write_checkpoint_with_txn_column(
+    rg0: &[Option<&str>],
+    rg1: &[Option<&str>],
+) -> tempfile::NamedTempFile {
+    let appid_field = Arc::new(Field::new("appId", ArrowDataType::Utf8, true));
+    let txn_field = Arc::new(Field::new(
+        "txn",
+        ArrowDataType::Struct(Fields::from(vec![appid_field.clone()])),
+        true,
+    ));
+    let schema = Arc::new(ArrowSchema::new(vec![txn_field.clone()]));
+
+    let make_batch = |vals: &[Option<&str>]| {
+        let appid = Arc::new(StringArray::from(vals.to_vec()));
+        let txn = StructArray::from(vec![(appid_field.clone(), appid as _)]);
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(txn)]).unwrap()
+    };
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    #[allow(deprecated)]
+    let props = WriterProperties::builder()
+        .set_max_row_group_size(rg0.len().max(rg1.len()))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        tmp.as_file().try_clone().unwrap(),
+        schema.clone(),
+        Some(props),
+    )
+    .unwrap();
+    writer.write(&make_batch(rg0)).unwrap();
+    writer.write(&make_batch(rg1)).unwrap();
+    writer.close().unwrap();
+    tmp
+}
+
+/// `apply` with only `action_predicate=Some` prunes a row group whose action-identifier column
+/// is all-null and keeps one with non-null values. This exercises the path where there is no
+/// user data predicate, only the schema-derived `IS NOT NULL` guard kernel emits for replays
+/// like `set_transaction` lookup.
+#[test]
+fn checkpoint_filter_apply_action_predicate_only() {
+    // RG0: all txn.appId null (no txn rows) → must be pruned.
+    // RG1: at least one non-null appId → must be kept.
+    let tmp = write_checkpoint_with_txn_column(&[None, None], &[Some("a"), Some("b")]);
+    let metadata =
+        ArrowReaderMetadata::load(&File::open(tmp.path()).unwrap(), Default::default()).unwrap();
+    assert_eq!(metadata.metadata().num_row_groups(), 2);
+
+    let action_pred = Predicate::is_not_null(column_expr!("txn.appId"));
+    let rg0 = metadata.metadata().row_group(0);
+    let rg1 = metadata.metadata().row_group(1);
+
+    assert!(
+        !CheckpointRowGroupFilter::apply(rg0, None, Some(&action_pred), &NO_PARTITIONS),
+        "RG0 has all-null appId; should be pruned"
+    );
+    assert!(
+        CheckpointRowGroupFilter::apply(rg1, None, Some(&action_pred), &NO_PARTITIONS),
+        "RG1 has non-null appId; should be kept"
+    );
+}
+
+/// `apply` with no predicates is a no-op (always keep). Pins the contract.
+#[test]
+fn checkpoint_filter_apply_no_predicates_keeps_all() {
+    let tmp = write_checkpoint_with_txn_column(&[None, None], &[Some("a")]);
+    let metadata =
+        ArrowReaderMetadata::load(&File::open(tmp.path()).unwrap(), Default::default()).unwrap();
+    let rg = metadata.metadata().row_group(0);
+    assert!(CheckpointRowGroupFilter::apply(
+        rg,
+        None,
+        None,
+        &NO_PARTITIONS
+    ));
+}
+
+/// Cartesian coverage of `apply` with both predicates `Some`. Verifies the AND-of-prunes
+/// semantics: row group is pruned if either predicate decides `Some(false)`, kept otherwise.
+/// Uses a checkpoint with both `add.stats_parsed.maxValues.x` (data stat) and `txn.appId`
+/// (action-identifier) columns so each predicate channel sees something to evaluate.
+#[test]
+fn checkpoint_filter_apply_combined_predicates() {
+    // Build schema with both `add.stats_parsed.maxValues.x` and `txn.appId` columns.
+    let x_field = Arc::new(Field::new("x", ArrowDataType::Int64, true));
+    let max_field = Arc::new(Field::new(
+        "maxValues",
+        ArrowDataType::Struct(Fields::from(vec![x_field.clone()])),
+        true,
+    ));
+    let stats_field = Arc::new(Field::new(
+        "stats_parsed",
+        ArrowDataType::Struct(Fields::from(vec![max_field.clone()])),
+        true,
+    ));
+    let add_field = Arc::new(Field::new(
+        "add",
+        ArrowDataType::Struct(Fields::from(vec![stats_field.clone()])),
+        true,
+    ));
+    let appid_field = Arc::new(Field::new("appId", ArrowDataType::Utf8, true));
+    let txn_field = Arc::new(Field::new(
+        "txn",
+        ArrowDataType::Struct(Fields::from(vec![appid_field.clone()])),
+        true,
+    ));
+    let schema = Arc::new(ArrowSchema::new(vec![add_field, txn_field]));
+
+    // Single row group: max(x) = 100, one non-null appId. The user predicate `x > 200` would
+    // prune (max=100 < 200). Action predicate `txn.appId IS NOT NULL` keeps. Combined AND
+    // semantics: row group pruned because user predicate prunes.
+    let max_arr = Arc::new(Int64Array::from(vec![Some(100i64)]));
+    let max_struct = StructArray::from(vec![(x_field.clone(), max_arr as _)]);
+    let stats_struct = StructArray::from(vec![(max_field.clone(), Arc::new(max_struct) as _)]);
+    let add_struct = StructArray::from(vec![(stats_field.clone(), Arc::new(stats_struct) as _)]);
+    let appid_arr = Arc::new(StringArray::from(vec![Some("a")]));
+    let txn_struct = StructArray::from(vec![(appid_field.clone(), appid_arr as _)]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(add_struct), Arc::new(txn_struct)],
+    )
+    .unwrap();
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer =
+        ArrowWriter::try_new(tmp.as_file().try_clone().unwrap(), schema.clone(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let metadata =
+        ArrowReaderMetadata::load(&File::open(tmp.path()).unwrap(), Default::default()).unwrap();
+    let rg = metadata.metadata().row_group(0);
+
+    let data_keeps = Predicate::gt(column_expr!("x"), Scalar::from(50i64)); // max=100, kept
+    let data_prunes = Predicate::gt(column_expr!("x"), Scalar::from(200i64)); // max=100, pruned
+    let action_keeps = Predicate::is_not_null(column_expr!("txn.appId")); // non-null, kept
+
+    // Both keep → keep.
+    assert!(CheckpointRowGroupFilter::apply(
+        rg,
+        Some(&data_keeps),
+        Some(&action_keeps),
+        &NO_PARTITIONS
+    ));
+    // Data prunes, action keeps → prune.
+    assert!(!CheckpointRowGroupFilter::apply(
+        rg,
+        Some(&data_prunes),
+        Some(&action_keeps),
+        &NO_PARTITIONS
+    ));
+}
+
 #[test]
 fn checkpoint_filter_nested_struct_column_stats() {
     // Per-file statistics mirror the data schema structure (Delta protocol spec, "Per-file

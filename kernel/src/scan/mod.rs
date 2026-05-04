@@ -565,6 +565,12 @@ impl Scan {
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
+    ///
+    /// Reports metrics: [`MetricEvent::ScanMetadataCompleted`] when the returned iterator is
+    /// fully exhausted.
+    ///
+    /// [`MetricEvent::ScanMetadataCompleted`]: crate::metrics::MetricEvent::ScanMetadataCompleted
+    ///
     /// Each item in the returned iterator is a struct of:
     /// - `Box<dyn EngineData>`: Data in engine format, where each row represents a file to be
     ///   scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
@@ -712,10 +718,7 @@ impl Scan {
         let (checkpoint_schema, meta_predicate) = if self.skip_stats() {
             (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
         } else {
-            (
-                CHECKPOINT_READ_SCHEMA.clone(),
-                self.build_actions_meta_predicate(),
-            )
+            (CHECKPOINT_READ_SCHEMA.clone(), self.physical_predicate())
         };
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
@@ -787,10 +790,7 @@ impl Scan {
         let (checkpoint_schema, meta_predicate) = if self.skip_stats() {
             (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
         } else {
-            (
-                CHECKPOINT_READ_SCHEMA.clone(),
-                self.build_actions_meta_predicate(),
-            )
+            (CHECKPOINT_READ_SCHEMA.clone(), self.physical_predicate())
         };
         self.snapshot
             .log_segment()
@@ -811,23 +811,11 @@ impl Scan {
             )
     }
 
-    /// Builds a predicate for checkpoint row group skipping. Returns the original physical
-    /// predicate (with bare column names), which the [`CheckpointRowGroupFilter`] will evaluate
-    /// directly against checkpoint footer statistics.
-    ///
-    /// Returns `None` if the scan has no predicate or no stats schema.
-    fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
-        let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
-            return None;
-        };
-        self.state_info.physical_stats_schema.as_ref()?;
-        Some(predicate.clone())
-    }
-
-    /// Returns the physical names of the table's partition columns. These match the column names
-    /// used in the physical predicate and in the checkpoint parquet schema under
-    /// `add.partitionValues_parsed.*`.
-    fn physical_partition_column_names(&self) -> Vec<String> {
+    /// Returns the physical names of partition columns referenced by the scan predicate. These
+    /// match the column names used in the physical predicate and in the checkpoint parquet schema
+    /// under `add.partitionValues_parsed.*`. Returns an empty set when the scan has no predicate
+    /// or no predicate references a partition column.
+    fn physical_partition_column_names(&self) -> HashSet<String> {
         self.state_info
             .physical_partition_schema
             .as_ref()

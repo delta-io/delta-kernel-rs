@@ -861,31 +861,33 @@ pub trait ParquetHandler: AsAny {
     /// - `predicate`: user data predicate with physical column names (e.g. `x > 10`, or
     ///   `col-abc-123 > 10` under column mapping). Evaluated against checkpoint-internal stat
     ///   columns (`add.stats_parsed.*`, `add.partitionValues_parsed.*`).
+    /// - `action_predicate`: optional predicate referencing only top-level action-identifier
+    ///   columns (e.g. `txn.appId IS NOT NULL`). Evaluated directly against the checkpoint parquet
+    ///   schema to skip row groups containing no rows of the caller's action types of interest.
+    ///   MUST NOT reference user data columns: user column paths can alias Delta action leaves
+    ///   (e.g. user column `protocol.minReaderVersion` collides with the protocol action's field),
+    ///   and routing the user predicate through this channel would risk false pruning. Engines
+    ///   should keep this on a separate evaluation path from `predicate`. The only kernel
+    ///   construction site is `log_segment::schema_to_is_not_null_predicate`, which builds the
+    ///   predicate from a checkpoint read schema of recognized action types only.
     /// - `partition_columns`: physical names of the table's partition columns, used to distinguish
     ///   partition-value stats from data column stats.
     ///
     /// The default implementation falls back to [`read_parquet_files`](Self::read_parquet_files)
-    /// without any predicate: the user `predicate` uses bare physical column names that can
-    /// alias Delta action leaves in the checkpoint parquet schema (e.g. a user column path
-    /// `protocol.minReaderVersion` collides with the protocol action's field), so forwarding
-    /// it to an engine that performs row group filtering would risk false pruning. The
-    /// `partition_columns` is also dropped. Engines that want row group skipping on checkpoints
-    /// should override this method.
-    ///
-    /// Engines that want additional pruning of row groups containing no rows of the caller's
-    /// action types of interest (e.g. `protocol`/`metaData` replay, `txn` lookup) can derive an
-    /// IS NOT NULL predicate from the read schema via
-    /// `log_segment::checkpoint_action_identifier_predicate` and apply it as a secondary
-    /// row-group filter. This MUST be applied independently from `predicate` to avoid aliasing
-    /// user column paths to Delta action leaves.
+    /// without any predicate. The user `predicate` is dropped because its bare physical column
+    /// names can alias Delta action leaves in the checkpoint parquet schema, so forwarding it to
+    /// an engine that performs row group filtering would risk false pruning. The
+    /// `action_predicate` and `partition_columns` are also dropped. Engines that want row group
+    /// skipping on checkpoints should override this method.
     fn read_checkpoint_parquet_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
+        action_predicate: Option<PredicateRef>,
         partition_columns: &HashSet<String>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let _ = (predicate, partition_columns);
+        let _ = (predicate, action_predicate, partition_columns);
         self.read_parquet_files(files, physical_schema, None)
     }
 
@@ -992,9 +994,13 @@ mod doctests;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
     use rstest::rstest;
 
     use super::*;
+    use crate::expressions::{column_expr, Predicate, Scalar};
 
     #[rstest]
     #[case::zero(0, Some(0))]
@@ -1014,5 +1020,66 @@ mod tests {
                 .to_string()
                 .contains("exceeds i64::MAX")),
         }
+    }
+
+    /// A `ParquetHandler` whose `read_parquet_files` records the predicate it was called with.
+    /// All other methods are unimplemented; only the default `read_checkpoint_parquet_files`
+    /// path is exercised in this test.
+    struct RecordingHandler {
+        last_predicate: Mutex<Option<Option<PredicateRef>>>,
+    }
+
+    impl ParquetHandler for RecordingHandler {
+        fn read_parquet_files(
+            &self,
+            _files: &[FileMeta],
+            _physical_schema: SchemaRef,
+            predicate: Option<PredicateRef>,
+        ) -> DeltaResult<FileDataReadResultIterator> {
+            *self.last_predicate.lock().unwrap() = Some(predicate);
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        fn write_parquet_file(
+            &self,
+            _location: url::Url,
+            _data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        ) -> DeltaResult<()> {
+            unimplemented!()
+        }
+
+        fn read_parquet_footer(&self, _file: &FileMeta) -> DeltaResult<ParquetFooter> {
+            unimplemented!()
+        }
+    }
+
+    /// The default implementation of [`ParquetHandler::read_checkpoint_parquet_files`] MUST drop
+    /// the user `predicate`, the `action_predicate`, and `partition_columns` and forward `None`
+    /// to [`ParquetHandler::read_parquet_files`]. Anything else risks false pruning when a user
+    /// column path aliases a Delta action leaf in the checkpoint parquet schema.
+    #[test]
+    fn default_read_checkpoint_parquet_files_drops_all_predicates() {
+        let handler = RecordingHandler {
+            last_predicate: Mutex::new(None),
+        };
+        let user_pred: PredicateRef = Arc::new(Predicate::gt(column_expr!("x"), Scalar::Long(10)));
+        let action_pred: PredicateRef = Arc::new(Predicate::is_not_null(column_expr!("txn.appId")));
+        let partition_columns: HashSet<String> = ["p".to_string()].into_iter().collect();
+        let schema = Arc::new(StructType::new_unchecked(Vec::<StructField>::new()));
+
+        let _ = handler.read_checkpoint_parquet_files(
+            &[],
+            schema,
+            Some(user_pred),
+            Some(action_pred),
+            &partition_columns,
+        );
+
+        let captured = handler.last_predicate.lock().unwrap().take();
+        let inner = captured.expect("read_parquet_files was not called");
+        assert!(
+            inner.is_none(),
+            "default impl must drop the predicate to avoid aliasing user column paths to action leaves"
+        );
     }
 }

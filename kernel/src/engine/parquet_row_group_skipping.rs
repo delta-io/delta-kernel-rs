@@ -21,20 +21,21 @@ use crate::PredicateRef;
 mod tests;
 
 /// Engine-internal context for checkpoint parquet reads. Carries the inputs needed by
-/// [`CheckpointRowGroupFilter`] when an engine implementation routes a checkpoint or sidecar
+/// `CheckpointRowGroupFilter` when an engine implementation routes a checkpoint or sidecar
 /// read through its row-group-skipping pass.
 ///
 /// `partition_columns` is `Arc`-wrapped so the set isn't cloned for each per-file future the
 /// engine spawns.
 #[derive(Clone)]
+#[internal_api]
 pub(crate) struct CheckpointReadCtx {
     /// Schema-derived `IS NOT NULL` predicate over action-identifier columns (e.g.
-    /// `txn.appId IS NOT NULL`). Evaluated via the plain [`RowGroupFilter`] to skip row groups
+    /// `txn.appId IS NOT NULL`). Evaluated via the plain `RowGroupFilter` to skip row groups
     /// containing no rows of the caller's action types of interest.
-    pub action_predicate: Option<PredicateRef>,
-    /// Physical names of the table's partition columns. Used by [`CheckpointRowGroupFilter`] to
+    pub(crate) action_predicate: Option<PredicateRef>,
+    /// Physical names of the table's partition columns. Used by `CheckpointRowGroupFilter` to
     /// distinguish partition-value stats (`add.partitionValues_parsed.<col>`) from data stats.
-    pub partition_columns: Arc<HashSet<String>>,
+    pub(crate) partition_columns: Arc<HashSet<String>>,
 }
 
 /// An extension trait for [`ArrowReaderBuilder`] that injects row group skipping capability.
@@ -73,6 +74,35 @@ pub(crate) trait ParquetRowGroupSkipping {
         partition_columns: &HashSet<String>,
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self;
+
+    /// Convenience routing method that picks between [`with_row_group_filter`] (data files) and
+    /// [`with_checkpoint_row_group_filter`] (checkpoint/sidecar files) based on whether
+    /// `checkpoint_ctx` is provided. When neither a `predicate` nor any predicate inside
+    /// `checkpoint_ctx` is meaningful, returns `self` unchanged.
+    ///
+    /// [`with_row_group_filter`]: Self::with_row_group_filter
+    /// [`with_checkpoint_row_group_filter`]: Self::with_checkpoint_row_group_filter
+    fn with_optional_filters(
+        self,
+        predicate: Option<&Predicate>,
+        checkpoint_ctx: Option<&CheckpointReadCtx>,
+        row_indexes: Option<&mut RowIndexBuilder>,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        match (predicate, checkpoint_ctx) {
+            (pred, Some(ctx)) if pred.is_some() || ctx.action_predicate.is_some() => self
+                .with_checkpoint_row_group_filter(
+                    pred,
+                    ctx.action_predicate.as_deref(),
+                    &ctx.partition_columns,
+                    row_indexes,
+                ),
+            (Some(pred), None) => self.with_row_group_filter(pred, row_indexes),
+            _ => self,
+        }
+    }
 }
 impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
     fn with_row_group_filter(
@@ -119,7 +149,7 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
                 .then_some(ordinal)
             })
             .collect();
-        debug!("with_checkpoint_row_group_filter({predicate:#?}, {action_predicate:#?}) = {ordinals:?})");
+        debug!("with_checkpoint_row_group_filter({predicate:#?}, {action_predicate:#?}) = {ordinals:?}");
         if let Some(row_indexes) = row_indexes {
             row_indexes.select_row_groups(&ordinals);
         }
@@ -309,11 +339,6 @@ fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
 
 /// Checks whether a parquet column has any null values in a row group, based on its footer stats.
 /// Returns `true` if the column has nulls, or if nullcount stats are unavailable (conservative).
-///
-/// Trusts `Some(0)` as "no nulls". This relies on the checkpoint parquet writer having written
-/// an accurate null count; see https://github.com/apache/arrow-rs/issues/9451 for an arrow-rs
-/// decoding bug where missing nullcount stats were returned as `Some(0)`. Kernel's own checkpoint
-/// writer emits per-column null counts, so this is safe for kernel-written checkpoints.
 fn column_has_nulls(row_group: &RowGroupMetaData, col_index: usize) -> bool {
     row_group
         .column(col_index)
@@ -401,18 +426,22 @@ impl<'a> CheckpointRowGroupFilter<'a> {
         partition_columns: &'a HashSet<String>,
     ) -> bool {
         use crate::kernel_predicates::KernelPredicateEvaluator as _;
-        let checkpoint_ok = match predicate {
-            Some(p) => {
-                CheckpointRowGroupFilter::new(row_group, p, partition_columns).eval_sql_where(p)
-                    != Some(false)
+        // Evaluate the action predicate first: it's typically smaller (a few IS NOT NULL guards
+        // over action-identifier columns) and short-circuits if the row group contains no rows
+        // of any relevant action type.
+        if let Some(p) = action_predicate {
+            if RowGroupFilter::new(row_group, p).eval_sql_where(p) == Some(false) {
+                return false;
             }
-            None => true,
-        };
-        let direct_ok = match action_predicate {
-            Some(p) => RowGroupFilter::new(row_group, p).eval_sql_where(p) != Some(false),
-            None => true,
-        };
-        checkpoint_ok && direct_ok
+        }
+        if let Some(p) = predicate {
+            if CheckpointRowGroupFilter::new(row_group, p, partition_columns).eval_sql_where(p)
+                == Some(false)
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Returns `true` if the column is a partition column.
@@ -461,7 +490,7 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
             return extract_max_scalar(data_type, self.get_stats_at(idx)?);
         }
         let max = self.get_guarded_stat(col, data_type, |i| i.max_index, extract_max_scalar)?;
-        Some(widen_max_stat_for_truncation(max))
+        Some(adjust_stats_for_truncation(max))
     }
 
     fn get_parquet_nullcount_stat(&self, col: &ColumnName) -> Option<i64> {
@@ -492,16 +521,14 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
     }
 }
 
-/// Widens a max stat value to account for millisecond truncation in JSON-serialized stats.
+/// Adjusts a max stat value to account for millisecond truncation in JSON-serialized stats.
 /// `stats_parsed` inherits from JSON stats which truncate timestamps to millisecond precision:
-/// `stored_max <= actual_max <= stored_max + 999us`. Adding 999us ensures we never falsely
-/// prune files whose actual max exceeds the truncated value. Non-timestamp values pass through
-/// unchanged.
-///
-/// The scan-side counterpart is `adjust_stats_for_truncation` in `scan/data_skipping.rs`, which
-/// handles the same truncation issue from the predicate side (subtracting 999us from the
-/// comparison value instead of adding to the stat).
-fn widen_max_stat_for_truncation(val: Scalar) -> Scalar {
+/// `stored_max <= actual_max <= stored_max + 999us`. Adding 999us to the stored max avoids
+/// falsely pruning files whose actual max exceeds the truncated value. Non-timestamp values
+/// pass through unchanged. The scan-side counterpart in `scan/data_skipping.rs` adjusts the
+/// comparison value rather than the stat (subtracts 999us); the two are inverse operations on
+/// opposite sides of the comparison.
+fn adjust_stats_for_truncation(val: Scalar) -> Scalar {
     match val {
         Scalar::Timestamp(us) => Scalar::Timestamp(us.saturating_add(999)),
         Scalar::TimestampNtz(us) => Scalar::TimestampNtz(us.saturating_add(999)),

@@ -831,62 +831,16 @@ fn test_scan_metadata_stats_columns_with_predicate() {
     );
 }
 
-#[test]
-fn test_build_actions_meta_predicate_with_predicate() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = SyncEngine::new();
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-
-    // Build a scan with a predicate eligible for data skipping
-    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
-    let scan = snapshot
-        .scan_builder()
-        .with_predicate(predicate.clone())
-        .build()
-        .unwrap();
-
-    let meta_pred = scan.build_actions_meta_predicate();
-    assert!(
-        meta_pred.is_some(),
-        "Should produce an actions meta predicate for a data-skipping-eligible predicate"
-    );
-
-    // build_actions_meta_predicate returns the original physical predicate (bare column names).
-    // The CheckpointRowGroupFilter handles mapping to checkpoint stat columns internally.
-    let pred = meta_pred.unwrap();
-    assert_eq!(
-        *pred, *predicate,
-        "Meta predicate should be the original physical predicate"
-    );
-}
-
-#[test]
-fn test_build_actions_meta_predicate_no_predicate() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = SyncEngine::new();
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-
-    // Build a scan with no predicate
-    let scan = snapshot.scan_builder().build().unwrap();
-
-    assert!(
-        scan.build_actions_meta_predicate().is_none(),
-        "Should return None when there is no predicate"
-    );
-}
-
-#[test]
-fn test_physical_partition_column_names_with_column_mapping() {
-    // Partition columns are stored as logical names in metadata.partitionColumns, but the
-    // physical predicate passed to CheckpointRowGroupFilter uses physical names. The filter
-    // matches partition columns by physical name against `add.partitionValues_parsed.<col>`,
-    // so the partition column set must also be physical.
-    //
-    // This table has column mapping (name mode) with one partition column "category" whose
-    // physical name is a UUID-style identifier.
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/partition_cm/name/")).unwrap();
+/// Partition columns are stored as logical names in metadata.partitionColumns, but the
+/// physical predicate passed to `CheckpointRowGroupFilter` uses physical names. The filter
+/// matches partition columns by physical name against `add.partitionValues_parsed.<col>`,
+/// so the partition column set must also be physical. Both `name` and `id` column-mapping
+/// modes use UUID-style physical names that differ from the logical name.
+#[rstest]
+#[case::name_mode("./tests/data/partition_cm/name/")]
+#[case::id_mode("./tests/data/partition_cm/id/")]
+fn test_physical_partition_column_names_with_column_mapping(#[case] table_path: &str) {
+    let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
@@ -901,36 +855,10 @@ fn test_physical_partition_column_names_with_column_mapping() {
 
     let names = scan.physical_partition_column_names();
     assert_eq!(names.len(), 1);
-    let physical_name = &names[0];
+    let physical_name = names.iter().next().unwrap();
     assert_ne!(
         physical_name, "category",
-        "Expected a physical (UUID-style) name, not the logical name"
-    );
-    assert!(
-        physical_name.starts_with("col-"),
-        "Expected physical name to start with 'col-', got {physical_name:?}"
-    );
-}
-
-#[test]
-fn test_build_actions_meta_predicate_static_skip_all() {
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = SyncEngine::new();
-    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-
-    // A predicate that statically evaluates to false should produce StaticSkipAll,
-    // which means build_actions_meta_predicate returns None.
-    let predicate = Arc::new(Pred::literal(false));
-    let scan = snapshot
-        .scan_builder()
-        .with_predicate(predicate)
-        .build()
-        .unwrap();
-
-    assert!(
-        scan.build_actions_meta_predicate().is_none(),
-        "StaticSkipAll predicate should return None"
+        "Expected a physical name, not the logical name"
     );
 }
 

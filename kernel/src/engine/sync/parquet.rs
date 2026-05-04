@@ -13,7 +13,6 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::parquet_row_group_skipping::{CheckpointReadCtx, ParquetRowGroupSkipping};
 use crate::engine::{reader_options, writer_options};
-use crate::log_segment::checkpoint_action_identifier_predicate;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
@@ -46,20 +45,11 @@ fn try_create_from_parquet_inner(
         .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
 
     // Filter row groups and row indexes if a predicate is provided
-    match (predicate.as_deref(), &checkpoint_ctx) {
-        (pred, Some(ctx)) if pred.is_some() || ctx.action_predicate.is_some() => {
-            builder = builder.with_checkpoint_row_group_filter(
-                pred,
-                ctx.action_predicate.as_deref(),
-                &ctx.partition_columns,
-                row_indexes.as_mut(),
-            );
-        }
-        (Some(pred), None) => {
-            builder = builder.with_row_group_filter(pred, row_indexes.as_mut());
-        }
-        _ => {}
-    }
+    builder = builder.with_optional_filters(
+        predicate.as_deref(),
+        checkpoint_ctx.as_ref(),
+        row_indexes.as_mut(),
+    );
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.build()?;
@@ -91,10 +81,11 @@ impl ParquetHandler for SyncParquetHandler {
         files: &[FileMeta],
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
+        action_predicate: Option<PredicateRef>,
         partition_columns: &HashSet<String>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         let ctx = CheckpointReadCtx {
-            action_predicate: checkpoint_action_identifier_predicate(&schema),
+            action_predicate,
             partition_columns: Arc::new(partition_columns.clone()),
         };
         read_files(files, schema, predicate, move |file, schema, pred, loc| {
