@@ -194,6 +194,7 @@ fn sync_parquet_handler_with_config(config: ParquetWriterConfig) -> Box<dyn Parq
 #[rstest]
 #[case(ParquetCompression::Snappy, Compression::SNAPPY)]
 #[case(ParquetCompression::Zstd, Compression::ZSTD(Default::default()))]
+#[case(ParquetCompression::Uncompressed, Compression::UNCOMPRESSED)]
 fn test_parquet_writer_config_controls_compression(
     #[case] kernel_compression: ParquetCompression,
     #[case] expected_compression: Compression,

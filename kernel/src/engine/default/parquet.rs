@@ -833,6 +833,7 @@ mod tests {
     #[rstest::rstest]
     #[case(ParquetCompression::Snappy, Compression::SNAPPY)]
     #[case(ParquetCompression::Zstd, Compression::ZSTD(Default::default()))]
+    #[case(ParquetCompression::Uncompressed, Compression::UNCOMPRESSED)]
     #[tokio::test]
     async fn test_write_parquet_compression(
         #[case] kernel_compression: ParquetCompression,

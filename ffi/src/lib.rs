@@ -1332,6 +1332,7 @@ mod tests {
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStoreExt as _;
     use delta_kernel::schema::StructType;
+    use delta_kernel::table_properties::{ParquetCompression, ParquetWriterConfig};
     use rstest::rstest;
     use serde_json::Value;
     use test_utils::{
@@ -1807,6 +1808,58 @@ mod tests {
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
+    }
+
+    // Test that set_builder_parquet_compression applies valid codec strings.
+    #[cfg(feature = "default-engine-base")]
+    #[rstest]
+    #[case("snappy", ParquetCompression::Snappy)]
+    #[case("SNAPPY", ParquetCompression::Snappy)]
+    #[case("uncompressed", ParquetCompression::Uncompressed)]
+    #[case("UNCOMPRESSED", ParquetCompression::Uncompressed)]
+    #[case("zstd", ParquetCompression::Zstd)]
+    fn test_set_builder_parquet_valid_codec(
+        #[case] codec: &str,
+        #[case] expected: ParquetCompression,
+    ) {
+        let table_root = "memory:///test_table/";
+        let builder_ptr = unsafe {
+            ok_or_panic(get_engine_builder(
+                kernel_string_slice!(table_root),
+                allocate_err,
+            ))
+        };
+        let builder = unsafe { builder_ptr.as_mut().unwrap() };
+        unsafe { set_builder_parquet_compression(builder, kernel_string_slice!(codec)) };
+        assert_eq!(
+            builder.parquet_writer_config,
+            ParquetWriterConfig {
+                compression: expected
+            }
+        );
+        unsafe { drop(Box::from_raw(builder_ptr)) };
+    }
+
+    // Test that set_builder_parquet_compression silently ignores an unrecognized codec string.
+    #[cfg(feature = "default-engine-base")]
+    #[test]
+    fn test_set_builder_parquet_invalid_codec_ignored() {
+        let table_root = "memory:///test_table/";
+        let builder_ptr = unsafe {
+            ok_or_panic(get_engine_builder(
+                kernel_string_slice!(table_root),
+                allocate_err,
+            ))
+        };
+        let builder = unsafe { builder_ptr.as_mut().unwrap() };
+        let codec = "invalid_codec";
+        unsafe { set_builder_parquet_compression(builder, kernel_string_slice!(codec)) };
+        assert_eq!(
+            builder.parquet_writer_config,
+            ParquetWriterConfig { compression: ParquetCompression::Zstd },
+            "unrecognized codec should leave config unchanged"
+        );
+        unsafe { drop(Box::from_raw(builder_ptr)) };
     }
 
     #[tokio::test]
