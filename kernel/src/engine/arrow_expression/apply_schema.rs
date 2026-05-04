@@ -277,6 +277,8 @@ pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResul
 ///   [`ArrayType::element_type`] / [`MapType::key_type`] / [`MapType::value_type`] are bare
 ///   [`DataType`]s with no name).
 /// - Nullability: use the kernel-side nullability.
+/// - Metadata: take the kernel side for most keys; translate the few that have an Arrow-native form
+///   (e.g. `parquet.field.id` -> `PARQUET:field_id`). Input Arrow metadata is dropped.
 ///
 /// `ancestor` is the nearest ancestor kernel [`StructField`]; its metadata holds the nested-ids
 /// JSON map (`None` at the top level). `relative_path` is the dot-chained path rooted at
@@ -607,7 +609,7 @@ mod apply_schema_validation_tests {
     /// Custom field names on the input arrow schema should survive `apply_schema`. The
     /// metadata from the input arrow schema is replaced by kernel-derived metadata.
     #[test]
-    fn test_apply_schema_retains_synthesized_field_names_and_metadata() {
+    fn test_apply_schema_retains_field_names() {
         let one = |k: &str, v: &str| HashMap::from([(k.to_string(), v.to_string())]);
         let input = array_in_map_arrow_data_with_custom_names_and_meta(
             one("custom.key", "key_val"),
