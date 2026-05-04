@@ -600,7 +600,9 @@ mod tests {
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
-    use delta_kernel::schema::{DataType, MetadataValue, StructField, StructType};
+    use delta_kernel::schema::{
+        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    };
     use delta_kernel::table_features::TableFeature;
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
     use delta_kernel_ffi::error::KernelError;
@@ -617,7 +619,7 @@ mod tests {
     use write_context::{
         create_table_get_unpartitioned_write_context, free_write_context, get_logical_to_physical,
         get_physical_write_schema, get_unpartitioned_write_context, get_write_path,
-        get_write_schema,
+        get_write_schema, SharedWriteContext,
     };
 
     use super::*;
@@ -1525,100 +1527,93 @@ mod tests {
         unsafe { free_engine(engine) };
     }
 
-    #[rstest]
-    #[case::name_mode("name")]
-    #[case::id_mode("id")]
-    #[cfg_attr(miri, ignore)]
-    fn test_cm_write_context_accessors(#[case] cm_mode: &str) {
-        let tmp_dir = tempdir().unwrap();
-        let (_table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+    /// Builds a create-table transaction and its unpartitioned write context, optionally
+    /// enabling column mapping. Returns handles the caller must free.
+    fn cm_table_write_context(
+        tmp_dir: &tempfile::TempDir,
+        cm_mode: Option<&str>,
+    ) -> (
+        Handle<SharedExternEngine>,
+        Handle<ExclusiveCreateTransaction>,
+        Handle<SharedWriteContext>,
+    ) {
+        let (_table_path, engine, mut builder) = create_table_builder(
+            tmp_dir,
             vec![
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::nullable("name", DataType::STRING),
             ],
         );
-
-        let cm_key = "delta.columnMapping.mode";
-        let builder = ok_or_panic(unsafe {
-            create_table_builder_with_table_property(
-                builder,
-                kernel_string_slice!(cm_key),
-                kernel_string_slice!(cm_mode),
-                engine.shallow_copy(),
-            )
-        });
+        if let Some(mode) = cm_mode {
+            let cm_key = "delta.columnMapping.mode";
+            builder = ok_or_panic(unsafe {
+                create_table_builder_with_table_property(
+                    builder,
+                    kernel_string_slice!(cm_key),
+                    kernel_string_slice!(mode),
+                    engine.shallow_copy(),
+                )
+            });
+        }
         let txn =
             ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
         let write_context = ok_or_panic(unsafe {
             create_table_get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
         });
+        (engine, txn, write_context)
+    }
+
+    #[rstest]
+    #[case::no_column_mapping(None)]
+    #[case::name_mode(Some("name"))]
+    #[case::id_mode(Some("id"))]
+    #[cfg_attr(miri, ignore)]
+    fn test_write_context_accessors(#[case] cm_mode: Option<&str>) {
+        let tmp_dir = tempdir().unwrap();
+        let (engine, txn, write_context) = cm_table_write_context(&tmp_dir, cm_mode);
 
         let logical = unsafe { get_write_schema(write_context.shallow_copy()) };
+        let physical = unsafe { get_physical_write_schema(write_context.shallow_copy()) };
+        let l2p = unsafe { get_logical_to_physical(write_context.shallow_copy()) };
+
         let logical_ref = unsafe { logical.as_ref() };
+        let physical_ref = unsafe { physical.as_ref() };
         assert_eq!(logical_ref.num_fields(), 2);
+        assert_eq!(physical_ref.num_fields(), 2);
         assert_eq!(logical_ref.field_at_index(0).unwrap().name, "id");
         assert_eq!(logical_ref.field_at_index(1).unwrap().name, "name");
 
-        let physical = unsafe { get_physical_write_schema(write_context.shallow_copy()) };
-        let physical_ref = unsafe { physical.as_ref() };
-        assert_eq!(physical_ref.num_fields(), 2);
+        let field_id_key = ColumnMetadataKey::ParquetFieldId.as_ref();
         for (i, logical_name) in ["id", "name"].iter().enumerate() {
             let field = physical_ref.field_at_index(i).unwrap();
-            assert_ne!(
-                &field.name, logical_name,
-                "physical name for field {i} must differ from logical name {logical_name}"
-            );
-            let field_id = field.metadata.get("parquet.field.id");
-            assert!(
-                matches!(field_id, Some(MetadataValue::Number(_))),
-                "field {i} must carry parquet.field.id metadata as a Number, got {field_id:?}"
-            );
+            let field_id = field.metadata.get(field_id_key);
+            match cm_mode {
+                Some(_) => {
+                    // Column mapping rewrites each logical name to a fresh `col-<uuid>` per
+                    // the Delta protocol's column-mapping section, and stamps a numeric
+                    // `parquet.field.id` so the field id reaches the parquet file.
+                    assert!(
+                        field.name.starts_with("col-"),
+                        "field {i}: expected `col-<uuid>` physical name, got {:?}",
+                        field.name,
+                    );
+                    assert_ne!(&field.name, logical_name);
+                    assert!(
+                        matches!(field_id, Some(MetadataValue::Number(_))),
+                        "field {i}: parquet.field.id should be a Number, got {field_id:?}",
+                    );
+                }
+                None => {
+                    assert_eq!(&field.name, logical_name);
+                    assert!(
+                        field_id.is_none(),
+                        "field {i}: parquet.field.id should be absent without column mapping, got {field_id:?}",
+                    );
+                }
+            }
         }
 
-        let l2p = unsafe { get_logical_to_physical(write_context.shallow_copy()) };
-
-        unsafe { free_kernel_expression(l2p) };
-        unsafe { free_schema(physical) };
-        unsafe { free_schema(logical) };
-        unsafe { free_write_context(write_context) };
-        unsafe { create_table_free_transaction(txn) };
-        unsafe { free_engine(engine) };
-    }
-
-    /// Builds an evaluator from (logical, l2p, physical) to verify the three FFI write-context
-    /// accessors compose correctly.
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn test_cm_write_context_evaluator_composition() {
-        let tmp_dir = tempdir().unwrap();
-        let (_table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
-            vec![
-                StructField::nullable("id", DataType::INTEGER),
-                StructField::nullable("name", DataType::STRING),
-            ],
-        );
-        let cm_key = "delta.columnMapping.mode";
-        let cm_val = "name";
-        let builder = ok_or_panic(unsafe {
-            create_table_builder_with_table_property(
-                builder,
-                kernel_string_slice!(cm_key),
-                kernel_string_slice!(cm_val),
-                engine.shallow_copy(),
-            )
-        });
-        let txn =
-            ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
-        let write_context = ok_or_panic(unsafe {
-            create_table_get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
-        });
-
-        let logical = unsafe { get_write_schema(write_context.shallow_copy()) };
-        let physical = unsafe { get_physical_write_schema(write_context.shallow_copy()) };
-        let l2p = unsafe { get_logical_to_physical(write_context.shallow_copy()) };
-
+        // Smoke-check that (logical, l2p, physical) compose into a valid evaluator.
         let evaluator = ok_or_panic(unsafe {
             new_expression_evaluator(
                 engine.shallow_copy(),
