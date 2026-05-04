@@ -598,7 +598,7 @@ mod tests {
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
-    use crate::schema::ColumnMetadataKey;
+    use crate::schema::{ColumnMetadataKey, MetadataValue};
     use crate::utils::current_time_ms;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::EngineData;
@@ -1286,12 +1286,13 @@ mod tests {
             .find(|f| f.name() == "value")
             .unwrap();
 
-        // Field ID is transformed to kernel key when reading
+        // Field ID is transformed to kernel key when reading. arrow->kernel parses the
+        // `PARQUET:field_id` string back into kernel's canonical `MetadataValue::Number(i64)`.
         assert_eq!(
             field
                 .metadata()
                 .get(ColumnMetadataKey::ParquetFieldId.as_ref()),
-            Some(&"42".into())
+            Some(&MetadataValue::Number(42))
         );
 
         // Field ID should be accessible via documented API
