@@ -236,8 +236,8 @@ pub(crate) fn get_column_mapping_mode_from_properties(
 ///
 /// This function recursively processes all fields in the schema, including nested structs,
 /// arrays, and maps. Each field is assigned a new unique ID and physical name. When
-/// `with_nested_ids`  is true, each element/key/value in Array/Map is assigned a new unique parquet
-/// field id and  stored in the `delta.columnMapping.nested.ids` metadata of the nearest ancestor
+/// `with_nested_ids` is true, each element/key/value in Array/Map is assigned a new unique parquet
+/// field id and stored in the `delta.columnMapping.nested.ids` metadata of the nearest ancestor
 /// `StructField`.
 ///
 /// Fields with pre-existing column mapping metadata (id or physicalName) are rejected to avoid
@@ -342,9 +342,8 @@ pub(crate) fn try_assign_field_column_mapping(
         MetadataValue::String(physical_name.clone()),
     );
 
-    // Recursively process nested types.
-    // Note: The walker accumulates nested ids directly into a `serde_json::Map` instead of a
-    // `HashMap`, because MetadataValue::Other requires a `serde_json::Value::Object`.
+    // Recursively process nested types. Accumulate directly into a `serde_json::Map` so we
+    // can wrap it as `MetadataValue::Other(Value::Object(_))` without a post-walk conversion.
     let mut nested_ids: Option<serde_json::Map<String, serde_json::Value>> =
         with_nested_ids.then(serde_json::Map::new);
     new_field.data_type =

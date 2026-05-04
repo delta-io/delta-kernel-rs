@@ -554,6 +554,19 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
         }
     }
 
+    // Row tracking must not be suspended (suspension cannot coexist with row tracking actively
+    // enabled, which V3 requires).
+    if validated
+        .properties
+        .get(ROW_TRACKING_SUSPENDED)
+        .map(String::as_str)
+        == Some("true")
+    {
+        return Err(Error::generic(format!(
+            "IcebergCompatV3 cannot be enabled while '{ROW_TRACKING_SUSPENDED}' is 'true'"
+        )));
+    }
+
     // Row tracking enablement: require `true`; default to `true`.
     match validated
         .properties
@@ -571,19 +584,6 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
                 "IcebergCompatV3 requires '{ENABLE_ROW_TRACKING}' to be 'true', got '{other}'"
             )));
         }
-    }
-
-    // Row tracking must not be suspended (suspension cannot coexist with row tracking
-    // actively enabled, which V3 requires).
-    if validated
-        .properties
-        .get(ROW_TRACKING_SUSPENDED)
-        .map(String::as_str)
-        == Some("true")
-    {
-        return Err(Error::generic(format!(
-            "IcebergCompatV3 cannot be enabled while '{ROW_TRACKING_SUSPENDED}' is 'true'"
-        )));
     }
 
     // V1/V2 must not be active.
@@ -1771,7 +1771,7 @@ mod tests {
         );
     }
 
-    /// Builds the V3 create-table test schema:
+    /// Builds the icebergCompatV3 create-table test schema:
     ///
     /// ```json
     /// {
@@ -1793,7 +1793,7 @@ mod tests {
     ///   ]
     /// }
     /// ```
-    fn build_v3_test_schema() -> SchemaRef {
+    fn build_iceberg_compat_v3_test_schema() -> SchemaRef {
         let with_metadata =
             build_complex_nested_kernel_schema(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
         let complex = StripFieldMetadataTransform
@@ -1804,8 +1804,8 @@ mod tests {
         Arc::new(StructType::try_new(fields).unwrap())
     }
 
-    /// V3 create-table flow with the same schema for minumum feature set and maximum feature set.
-    /// Validates final features and physical name/parquet field id assignments.
+    /// V3 create-table flow with the same schema for minimum and maximum feature sets.
+    /// Validates final features, CM id assignments, and nested-id JSON contents.
     #[rstest]
     #[case::v3_only(
         /* extra_props */ &[],
@@ -1836,11 +1836,11 @@ mod tests {
             TableFeature::ChangeDataFeed,
         ],
     )]
-    fn test_create_table_v3(
+    fn test_create_table_iceberg_compat_v3(
         #[case] extra_props: &[(&str, &str)],
         #[case] expected_features: &[TableFeature],
     ) {
-        let schema = build_v3_test_schema();
+        let schema = build_iceberg_compat_v3_test_schema();
         let mut props: HashMap<String, String> =
             HashMap::from([(ENABLE_ICEBERG_COMPAT_V3.to_string(), "true".to_string())]);
         for (k, v) in extra_props {

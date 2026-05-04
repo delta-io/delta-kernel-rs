@@ -161,8 +161,8 @@ pub(crate) fn apply_schema_operations(
                              is not set in table properties",
                         )
                     })?;
-                    // We don't support icebergCompatV3 on alter table yet, with_nested_ids is
-                    // always false here Tracking issue:
+                    // ALTER TABLE doesn't support icebergCompatV3 yet, so `with_nested_ids` is
+                    // always false. Tracking issue:
                     // <https://github.com/delta-io/delta-kernel-rs/issues/2492>
                     try_assign_field_column_mapping(&field, id, /* with_nested_ids */ false)?
                 } else {
