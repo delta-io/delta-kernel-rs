@@ -776,16 +776,10 @@ impl<S> Transaction<S> {
         &BASE_ADD_FILES_SCHEMA
     }
 
-    /// The [`TableConfiguration`] this transaction will commit.
-    ///
-    /// For writes that don't change the table configuration (e.g. blind appends), this is a clone
-    /// of the read snapshot's configuration. For configuration-changing writes (CREATE TABLE,
-    /// ALTER TABLE, schema-evolving writes), it reflects the new state that will be visible after
-    /// commit.
-    ///
-    /// This is the canonical source of schema, protocol, and table properties for writers
-    /// planning a commit; it works uniformly for both [`ExistingTable`] and [`CreateTable`]
-    /// transactions.
+    /// The [`TableConfiguration`] this transaction will commit, reflecting the schema, protocol,
+    /// and table properties that will be visible after commit (including any changes made by
+    /// CREATE TABLE or ALTER TABLE).
+    #[allow(unused)]
     #[internal_api]
     pub(crate) fn effective_table_configuration(&self) -> &TableConfiguration {
         &self.effective_table_config
