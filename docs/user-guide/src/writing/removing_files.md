@@ -149,7 +149,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 // 2. Create a transaction
 let mut txn = snapshot
     .clone()
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
     .with_operation("DELETE".to_string());
 
 // 3. Build a scan and get file metadata

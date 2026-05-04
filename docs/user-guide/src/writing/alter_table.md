@@ -57,7 +57,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let result = snapshot
     .alter_table()
     .add_column(StructField::nullable("country", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build(&engine, Arc::new(FileSystemCommitter::new()))?
     .with_engine_info("my-app/1.0")
     .commit(&engine)?;
 
@@ -106,7 +106,7 @@ let result = snapshot
     .alter_table()
     .add_column(StructField::nullable("country", DataType::STRING))
     .add_column(StructField::nullable("postal_code", DataType::STRING))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build(&engine, Arc::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
 ```
 

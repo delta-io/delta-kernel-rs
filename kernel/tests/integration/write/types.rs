@@ -505,7 +505,7 @@ async fn test_not_null_data_column_rejects_null_in_batch(
     )])?);
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
     let _ = kernel_create_table(&table_path, schema.clone(), "test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -520,7 +520,7 @@ async fn test_not_null_data_column_rejects_null_in_batch(
     );
 
     let write_context = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("default engine")
         .unpartitioned_write_context()?;
 

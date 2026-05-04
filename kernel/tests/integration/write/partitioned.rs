@@ -872,7 +872,7 @@ async fn test_partition_null_validation_non_materialized(
     let snapshot = create_partitioned_table(&table_path, engine.as_ref(), schema, &["p"], cm_mode)?;
 
     let result = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("default engine")
         .partitioned_write_context(HashMap::from([("p".to_string(), value)]));
 
@@ -927,7 +927,7 @@ async fn test_partition_null_validation_mixed_nullability(
 
     snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("default engine")
         .partitioned_write_context(HashMap::from([
             ("p_required".to_string(), Scalar::String("a".into())),
@@ -936,7 +936,7 @@ async fn test_partition_null_validation_mixed_nullability(
 
     snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("default engine")
         .partitioned_write_context(HashMap::from([
             ("p_required".to_string(), Scalar::String("a".into())),
@@ -944,7 +944,7 @@ async fn test_partition_null_validation_mixed_nullability(
         ]))?;
 
     let err = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("default engine")
         .partitioned_write_context(HashMap::from([
             ("p_required".to_string(), Scalar::Null(DataType::STRING)),
@@ -976,7 +976,7 @@ async fn test_partition_null_validation_in_batch_materialized(
     let _ = create_table(&table_path, schema.clone(), "test/1.0")
         .with_data_layout(DataLayout::partitioned(["p"]))
         .with_table_properties([("delta.feature.materializePartitionColumns", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -994,7 +994,7 @@ async fn test_partition_null_validation_in_batch_materialized(
     // in a `nullable: false` field is rejected at batch construction below, independent of
     // whatever value the mock map carries here.
     let txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("default engine");
     let _write_context = txn.partitioned_write_context(HashMap::from([(
         "p".to_string(),

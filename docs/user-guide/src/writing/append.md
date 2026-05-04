@@ -41,7 +41,7 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // 2. Create a transaction
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
     .with_operation("INSERT".to_string())
     .with_engine_info("my-app/1.0")
     .with_data_change(true);
@@ -85,7 +85,7 @@ writing against:
 
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
     .with_operation("INSERT".to_string())
     .with_engine_info("my-app/1.0")
     .with_data_change(true);
@@ -183,7 +183,7 @@ construction:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
     .with_operation("INSERT".to_string())
     .with_blind_append();
 ```
@@ -215,7 +215,7 @@ that action, call `with_commit_info()` with your custom data and its schema:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
     .with_operation("INSERT".to_string())
     .with_commit_info(engine_commit_info, commit_info_schema);
 ```

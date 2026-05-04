@@ -155,7 +155,7 @@ A `Transaction` writes data to a table. It is built from a snapshot:
 
 ```rust,ignore
 let mut txn = snapshot                              // Arc<Snapshot>
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
     .with_operation("INSERT".to_string())
     .with_data_change(true);
 

@@ -59,7 +59,7 @@ async fn main() -> DeltaResult<()> {
     ])?);
 
     create_table(url.as_str(), schema.clone(), "quick-start/1.0")
-        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .build(&engine, Arc::new(FileSystemCommitter::new()))?
         .commit(&engine)?;
     println!("Created table at {url}");
 
@@ -67,7 +67,7 @@ async fn main() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
         .with_operation("INSERT".to_string())
         .with_engine_info("quick-start/1.0")
         .with_data_change(true);
@@ -130,7 +130,7 @@ let schema = Arc::new(StructType::try_new(vec![
 ])?);
 
 create_table(url.as_str(), schema.clone(), "quick-start/1.0")
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build(&engine, Arc::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
 ```
 
@@ -152,7 +152,7 @@ The write flow has four parts:
 **Start a transaction:**
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
     .with_operation("INSERT".to_string())
     .with_data_change(true);
 ```

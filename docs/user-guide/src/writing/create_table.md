@@ -28,7 +28,7 @@ let schema = Arc::new(StructType::try_new([
 ])?);
 
 create_table(url.as_str(), schema, "my-app/1.0")
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build(&engine, Arc::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -111,7 +111,7 @@ create_table(url.as_str(), schema, "my-app/1.0")
         ("myapp.version", "2.0"),
         ("myapp.owner", "data-team"),
     ])
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build(&engine, Arc::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -147,7 +147,7 @@ let schema = Arc::new(StructType::try_new([
 
 create_table(url.as_str(), schema, "my-app/1.0")
     .with_data_layout(DataLayout::clustered(["region", "timestamp"]))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build(&engine, Arc::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
 # Ok(())
 # }
@@ -203,7 +203,7 @@ let schema = Arc::new(StructType::try_new([
 
 create_table(url.as_str(), schema, "my-app/1.0")
     .with_data_layout(DataLayout::partitioned(["year", "month"]))
-    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .build(&engine, Arc::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
 # Ok(())
 # }

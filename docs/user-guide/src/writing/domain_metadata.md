@@ -32,7 +32,7 @@ transactions.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
     .with_domain_metadata(
         "myConnector.settings".to_string(),
         r#"{"version": 1, "compress": true}"#.to_string(),
@@ -78,7 +78,7 @@ exist yet.
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
     .with_domain_metadata_removed("myConnector.settings".to_string())
     .with_operation("REMOVE METADATA".to_string());
 

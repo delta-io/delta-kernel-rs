@@ -361,7 +361,7 @@ async fn test_v2_checkpoint_with_sidecars() -> DeltaResult<()> {
     .unwrap_post_commit_snapshot();
 
     let post_ckpt_snapshot = post_ckpt_snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_domain_metadata("app.settings".to_string(), r#"{"version":3}"#.to_string())
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -777,7 +777,7 @@ async fn test_checkpoint_spec_rejected(
         builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
     }
     let _ = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -808,7 +808,7 @@ async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
     // v2 table, no data commits -> only protocol + metadata at version 0.
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -914,7 +914,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
             ("delta.feature.v2Checkpoint", "supported"),
             ("delta.feature.domainMetadata", "supported"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     // Insert 8 files (one per commit) -> ids 1..=8
@@ -931,7 +931,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     // Domain metadata commit (no data) -- exercises the empty-file-batch skip path in the
     // sidecar splitter. Sets two domains initially.
     snapshot = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_domain_metadata("app.settings".to_string(), r#"{"version":1}"#.to_string())
         .with_domain_metadata(
             "app.feature_flags".to_string(),
@@ -943,7 +943,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     // Another domain metadata commit -- updates "app.settings" to verify reconciliation
     // picks the latest value, and adds a new domain.
     snapshot = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_domain_metadata(
             "app.analytics".to_string(),
             r#"{"tracking":false}"#.to_string(),
@@ -956,7 +956,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     // plus a second update to `app1` to verify reconciliation picks the latest version.
     for (app_id, version) in [("app1", 1i64), ("app2", 5), ("app1", 3)] {
         snapshot = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_transaction_id(app_id.to_string(), version)
             .commit(engine.as_ref())?
             .unwrap_post_commit_snapshot();
@@ -965,7 +965,7 @@ async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     // Remove all 8 files -> 8 remove tombstones
     let scan = snapshot.clone().scan_builder().build()?;
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("DELETE".to_string())
         .with_data_change(true);
     for sm in scan.scan_metadata(engine.as_ref())? {
@@ -1159,7 +1159,7 @@ async fn create_partitioned_stats_table<E: TaskExecutor>(
             ("delta.checkpoint.writeStatsAsStruct", "true"),
         ])
         .with_data_layout(DataLayout::partitioned(["part_key"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let data_schema = StructType::try_new(vec![
@@ -1444,7 +1444,7 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
             ("delta.feature.deletionVectors", "supported"),
             ("delta.enableRowTracking", "true"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     // === Step 2: Append one batch. ===
@@ -1476,7 +1476,7 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
         .map_ok(|sm| sm.scan_files)
         .try_collect()?;
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_data_change(true);
     txn.update_deletion_vectors(
         HashMap::from([(path, dv.clone())]),
@@ -1538,14 +1538,14 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std:
     // === Step 1: Create v2Checkpoint table. ===
     let _ = create_table(&table_path, get_simple_schema(), "Test/1.0")
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     // === Step 2: Run 60 commits of 1_000 synthetic adds each (60_000 total). ===
     let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     for c in 0..COMMITS {
         let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_data_change(true);
         let add_files_schema = txn.add_files_schema().clone();
         let paths: Vec<String> = (0..PER_COMMIT)
@@ -1648,7 +1648,7 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
         builder = builder.with_data_layout(layout);
     }
     let _ = builder
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     // For partitioned tables, the data batches must NOT include the partition column --
