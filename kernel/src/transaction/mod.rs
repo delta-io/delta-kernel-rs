@@ -775,6 +775,21 @@ impl<S> Transaction<S> {
     pub fn add_files_schema(&self) -> &'static SchemaRef {
         &BASE_ADD_FILES_SCHEMA
     }
+
+    /// The [`TableConfiguration`] this transaction will commit.
+    ///
+    /// For writes that don't change the table configuration (e.g. blind appends), this is a clone
+    /// of the read snapshot's configuration. For configuration-changing writes (CREATE TABLE,
+    /// ALTER TABLE, schema-evolving writes), it reflects the new state that will be visible after
+    /// commit.
+    ///
+    /// This is the canonical source of schema, protocol, and table properties for writers
+    /// planning a commit; it works uniformly for both [`ExistingTable`] and [`CreateTable`]
+    /// transactions.
+    #[internal_api]
+    pub(crate) fn effective_table_configuration(&self) -> &TableConfiguration {
+        &self.effective_table_config
+    }
 }
 
 // =============================================================================
@@ -2173,6 +2188,50 @@ mod tests {
             !debug_str.contains("create_table"),
             "Existing table debug should not contain create_table: {debug_str}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_effective_table_configuration_existing_table() -> DeltaResult<()> {
+        let (_engine, txn, _tempdir) = create_existing_table_txn()?;
+        let snapshot = txn.read_snapshot()?;
+        let snapshot_config = snapshot.table_configuration().clone();
+        let effective = txn.effective_table_configuration();
+        // For non-config-changing writes, the effective config equals the read snapshot's.
+        assert_eq!(effective, &snapshot_config);
+        Ok(())
+    }
+
+    #[test]
+    fn test_effective_table_configuration_create_table() -> DeltaResult<()> {
+        let tempdir = tempfile::tempdir()?;
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )])?);
+        let store = Arc::new(LocalFileSystem::new());
+        let engine = Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
+        let txn = create_table(
+            tempdir.path().to_str().expect("valid temp path"),
+            schema.clone(),
+            "test_engine",
+        )
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        // Create-table transactions have no read snapshot, but still expose the effective
+        // configuration that the commit will produce.
+        let effective = txn.effective_table_configuration();
+        assert_eq!(effective.version(), 0);
+        assert_eq!(effective.logical_schema(), schema);
+        // No column mapping configured -> physical schema is identical to logical.
+        assert_eq!(effective.physical_schema(), schema);
+        assert_eq!(effective.column_mapping_mode(), ColumnMappingMode::None);
+        assert!(effective.partition_columns().is_empty());
+        assert!(effective.metadata().partition_columns().is_empty());
+        assert!(effective.metadata().name().is_none());
+        assert!(effective.metadata().description().is_none());
+        // create_table uses Protocol::try_new_modern -> (3, 7) with explicit table features.
+        assert_eq!(effective.protocol().min_reader_version(), 3);
+        assert_eq!(effective.protocol().min_writer_version(), 7);
         Ok(())
     }
 
