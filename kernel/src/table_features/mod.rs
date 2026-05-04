@@ -431,7 +431,7 @@ static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV2),
     ],
-    kernel_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v3 == Some(true)
     }),
