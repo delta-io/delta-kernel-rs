@@ -129,44 +129,9 @@ fn apply_schema_to_struct(array: &dyn Array, kernel_fields: &Schema) -> DeltaRes
     transform_struct(sa, kernel_fields.fields())
 }
 
-// Apply a kernel [`ArrayType`] to an Arrow [`ListArray`].
-// This function will deconstruct the array, then rebuild the mapped version, and set parquet field
-// id.
-//
-// # Example
-//
-// The blocks below show only the *schema* of the input and output ListArrays. Data values,
-// offsets, and the null buffer pass through unchanged.
-//
-// Given an ancestor [`StructField`] `arr: array<int>` whose metadata has
-// `parquet.field.nested.ids: { "arr.element": 42 }`, and an input ListArray with schema:
-//
-// ```json
-// {
-//   "type": "list",
-//   "element": {
-//     "name": "element",
-//     "type": "int32",
-//     "nullable": true,
-//     "metadata": { /* anything; replaced by kernel-derived metadata below */ }
-//   }
-// }
-// ```
-//
-// calling `apply_schema_to_list(input, &ArrayType::new(int, true), Some(arr), "arr")` produces
-// a ListArray with the same data and the rebuilt schema:
-//
-// ```json
-// {
-//   "type": "list",
-//   "element": {
-//     "name": "element",
-//     "type": "int32",
-//     "nullable": true,
-//     "metadata": { "PARQUET:field_id": "42" }
-//   }
-// }
-// ```
+// Rebuild a [`ListArray`] under the contract of [`apply_schema_to_inner`] (see that fn's doc
+// for an example). The inner value field's `PARQUET:field_id` (if any) is looked up at
+// `<relative_path>.element` on `nearest_ancestor_struct_field`'s nested-ids JSON.
 fn apply_schema_to_list(
     array: &dyn Array,
     target_inner_type: &ArrayType,
@@ -178,11 +143,8 @@ fn apply_schema_to_list(
             "Arrow claimed to be a list but isn't a ListArray",
         ));
     };
-    // 1. Deconstruct the input ListArray into its parts.
     let (arrow_element_field, offset_buffer, arrow_values, nulls) = la.clone().into_parts();
 
-    // 2. Look up the synthesized `element` field's nested id from the ancestor, and recurse on the
-    //    values column.
     let element_path = format!("{relative_path}.{LIST_ARRAY_ROOT}");
     let element_id = nearest_ancestor_struct_field
         .map(|f| lookup_nested_field_id(f, &element_path))
@@ -195,12 +157,8 @@ fn apply_schema_to_list(
         &element_path,
     )?;
 
-    // 3. Rebuild the element field. `apply_schema` applies kernel's schema, so the input arrow
-    //    field's metadata comes entirely from the kernel side. Parquet field ID is the only
-    //    metadata that should be set on the element field here. Since kernel's
-    //    `ArrayType::element_type` is a bare `DataType` (not a `StructField`), there is no
-    //    per-element metadata on the kernel side. The element's Parquet field ID comes from the
-    //    ancestor's metadata.
+    // Bare element type carries no kernel-side metadata; `PARQUET:field_id` is the only
+    // metadata to set, looked up from the ancestor's nested-ids JSON.
     let transformed_arrow_element_field = ArrowField::new(
         arrow_element_field.name(),
         transformed_arrow_values.data_type().clone(),
@@ -215,56 +173,9 @@ fn apply_schema_to_list(
     )?)
 }
 
-// Apply a kernel [`MapType`] to an Arrow [`MapArray`].
-// Deconstruct a map, then rebuild it with the specified target kernel type,
-// and set parquet field id on the synthesized `key`/`value` Arrow fields.
-//
-// # Example
-//
-// The blocks below show only the *schema* of the input and output MapArrays. Data values,
-// offsets, and null buffers pass through unchanged.
-// input.
-//
-// Given an ancestor StructField `m: map<int, int>` whose metadata has
-// `parquet.field.nested.ids: { "m.key": 100, "m.value": 101 }`, and an input MapArray with
-// schema:
-//
-// ```json
-// {
-//   "type": "map",
-//   "keys_sorted": false,
-//   "entries": {
-//     "name": "key_value",
-//     "type": "struct",
-//     "fields": [
-//       { "name": "k", "type": "int32", "nullable": false,
-//         "metadata": { /* anything; will bereplaced */ } },
-//       { "name": "v", "type": "int32", "nullable": true,
-//         "metadata": { /* anything; will bereplaced */ } }
-//     ]
-//   }
-// }
-// ```
-//
-// calling `apply_schema_to_map(input, &MapType::new(int, int, true), Some(m), "m")` produces a
-// MapArray with the same data and the rebuilt schema:
-//
-// ```json
-// {
-//   "type": "map",
-//   "keys_sorted": false,
-//   "entries": {
-//     "name": "key_value",
-//     "type": "struct",
-//     "fields": [
-//       { "name": "k", "type": "int32", "nullable": false,
-//         "metadata": { "PARQUET:field_id": "100" } },
-//       { "name": "v", "type": "int32", "nullable": true,
-//         "metadata": { "PARQUET:field_id": "101" } }
-//     ]
-//   }
-// }
-// ```
+// Rebuild a [`MapArray`] under the contract of [`apply_schema_to_inner`] (see that fn's doc
+// for an example). The inner key and value fields' `PARQUET:field_id` (if any) are looked
+// up at `<relative_path>.key` and `<relative_path>.value` on `ancestor`'s nested-ids JSON.
 fn apply_schema_to_map(
     array: &dyn Array,
     kernel_map_type: &MapType,
@@ -276,7 +187,7 @@ fn apply_schema_to_map(
             "Arrow claimed to be a map but isn't a MapArray",
         ));
     };
-    // 1. Deconstruct the input MapArray and its inner entries struct.
+    // Deconstruct the input MapArray and its inner entries struct.
     let (arrow_map_field, offset_buffer, arrow_map_struct_array, nulls, ordered) =
         ma.clone().into_parts();
     let (arrow_input_fields, mut arrow_cols, arrow_struct_nulls) =
@@ -292,7 +203,7 @@ fn apply_schema_to_map(
     let arrow_input_key_name = arrow_input_fields[0].name().clone();
     let arrow_input_value_name = arrow_input_fields[1].name().clone();
 
-    // 2. Look up nested field ids for the synthesized key/value fields from the ancestor, and
+    // Look up nested field ids for the synthesized key/value fields from the ancestor, and
     //    recurse on each column.
     let key_path = format!("{relative_path}.{MAP_KEY_DEFAULT}");
     let value_path = format!("{relative_path}.{MAP_VALUE_DEFAULT}");
@@ -317,13 +228,8 @@ fn apply_schema_to_map(
         &value_path,
     )?;
 
-    // 3. Rebuild the key/value fields, repack the entries struct, and wrap in a new MapArray.
-    //    `apply_schema` applies kernel's schema, so the synthesized fields' metadata comes entirely
-    //    from the kernel side. Parquet field IDs are the only metadata that should be set on the
-    //    key/value fields here. Since kernel's `MapType::{key,value}_type` are bare `DataType`s
-    //    (not `StructField`s), there is no per-key/per-value metadata on the kernel side. The IDs
-    //    come from the ancestor's metadata.
-    // Map keys are never nullable.
+    // Bare key/value types carry no kernel-side metadata; `PARQUET:field_id` is the only
+    // metadata to set, looked up from the ancestor's nested-ids JSON.
     let arrow_key_field = ArrowField::new(
         arrow_input_key_name,
         transformed_arrow_key.data_type().clone(),
@@ -361,19 +267,87 @@ pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResul
     apply_schema_to_inner(array, schema, None, "")
 }
 
-/// Recursive worker for `apply_schema_to`. Rebuilds `array` to match `schema`, threading nested
-/// field-id metadata onto the synthesized `element` / `key` / `value` Arrow fields of any
-/// list/map types it visits.
+/// Recursive worker for [`apply_schema_to`]. Rebuilds `array` recursively so that its schema is
+/// aligned with the kernel-side schema. This will try to change the name, nullability, and
+/// metadata of the input `array` to match the kernel-side schema. Data values, offsets, and null
+/// buffers pass through unchanged. Specifically:
 ///
-/// # Parameters
-/// - `array`: the Arrow input to transform.
-/// - `schema`: the target kernel data type.
-/// - `ancestor`: the nearest ancestor kernel [`StructField`]; its metadata holds the nested-ids
-///   JSON map.
-/// - `relative_path`: dot-chained path rooted at `ancestor`'s name.
+/// - Name: use the kernel-side name when kernel has one (e.g. on a [`StructField`]); retain the
+///   input Arrow name when kernel has none (e.g. on a list `element` or map `key`/`value`; kernel's
+///   [`ArrayType::element_type`] / [`MapType::key_type`] / [`MapType::value_type`] are bare
+///   [`DataType`]s with no name).
+/// - Nullability: use the kernel-side nullability.
 ///
-/// See [`crate::engine::arrow_conversion::lookup_nested_field_id`] for an example of the
-/// `(ancestor, path) -> id` lookup.
+/// `ancestor` is the nearest ancestor kernel [`StructField`]; its metadata holds the nested-ids
+/// JSON map (`None` at the top level). `relative_path` is the dot-chained path rooted at
+/// `ancestor`'s name (empty at the top level).
+///
+/// # Example
+///
+/// `arr_in_map: map<int, array<int>>`. Kernel side dictates the top-level field's name,
+/// nullability, and metadata. Inner field names
+/// are producer-defined and pass through unchanged; their nullability comes from the kernel
+/// side.
+///
+/// Kernel [`StructField`]:
+///
+/// ```json
+/// {
+///   "name": "arr_in_map",
+///   "type": {
+///     "type": "map",
+///     "keyType": "integer",
+///     "valueType": {"type": "array", "elementType": "integer", "containsNull": true},
+///     "valueContainsNull": true
+///   },
+///   "nullable": true,
+///   "metadata": {
+///     "parquet.field.id": 1,
+///     "parquet.field.nested.ids": {
+///       "arr_in_map.key": 100,
+///       "arr_in_map.value": 101,
+///       "arr_in_map.value.element": 102
+///     }
+///   }
+/// }
+/// ```
+///
+/// Input Arrow schema (custom names, mismatched nullability, stale field id):
+///
+/// ```json
+/// {
+///   "name": "stale_name", "type": "map", "nullable": false,
+///   "metadata": {"PARQUET:field_id": "999"},
+///   "entries": {
+///     "name": "custom_entries", "type": "struct", "nullable": false,
+///     "fields": [
+///       {"name": "custom_key", "type": "int32", "nullable": false},
+///       {"name": "custom_value", "type": "list", "nullable": false,
+///        "element": {"name": "custom_item", "type": "int32", "nullable": false}}
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Rebuilt Arrow schema:
+///
+/// ```json
+/// {
+///   "name": "arr_in_map", "type": "map", "nullable": true,
+///   "metadata": {"PARQUET:field_id": "1"},
+///   "entries": {
+///     "name": "custom_entries", "type": "struct", "nullable": false,
+///     "fields": [
+///       {"name": "custom_key", "type": "int32", "nullable": false,
+///        "metadata": {"PARQUET:field_id": "100"}},
+///       {"name": "custom_value", "type": "list", "nullable": true,
+///        "metadata": {"PARQUET:field_id": "101"},
+///        "element": {"name": "custom_item", "type": "int32", "nullable": true,
+///                    "metadata": {"PARQUET:field_id": "102"}}}
+///     ]
+///   }
+/// }
+/// ```
 fn apply_schema_to_inner(
     array: &ArrayRef,
     schema: &DataType,

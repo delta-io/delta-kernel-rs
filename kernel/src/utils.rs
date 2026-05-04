@@ -625,24 +625,56 @@ pub(crate) mod test_utils {
     ///
     /// What `try_into_arrow(kernel schema)` and
     /// `apply_schema(input arrow schema, kernel schema)` should both produce:
-    /// - `top` and `inner` carry `PARQUET:field_id` (rewritten from `parquet.field.id`) plus the
-    ///   nested-ids JSON.
+    /// - `top` and `inner` carry `PARQUET:field_id` (rewritten from `parquet.field.id`).
     /// - Synthesized list/map `key`/`value`/`element` fields each carry `PARQUET:field_id` pulled
     ///   from the corresponding nested-ids JSON entry. `top.key.element` has `101` (kernel's), not
     ///   the stale `999` from the input.
+    ///
+    /// ```json
+    /// {
+    ///   "fields": [{
+    ///     "name": "top", "type": "map",
+    ///     "metadata": {"PARQUET:field_id": "1"},
+    ///     "entries": { "name": "key_value", "type": "struct", "fields": [
+    ///       {
+    ///         "name": "key", "type": "list",
+    ///         "metadata": {"PARQUET:field_id": "100"},
+    ///         "element": {
+    ///           "name": "element", "type": "int32",
+    ///           "metadata": {"PARQUET:field_id": "101"}
+    ///         }
+    ///       },
+    ///       {
+    ///         "name": "value", "type": "struct",
+    ///         "metadata": {"PARQUET:field_id": "102"},
+    ///         "fields": [{
+    ///           "name": "inner", "type": "map",
+    ///           "metadata": {"PARQUET:field_id": "2"},
+    ///           "entries": { "name": "key_value", "type": "struct", "fields": [
+    ///             {
+    ///               "name": "key", "type": "int32",
+    ///               "metadata": {"PARQUET:field_id": "200"}
+    ///             },
+    ///             {
+    ///               "name": "value", "type": "list",
+    ///               "metadata": {"PARQUET:field_id": "201"},
+    ///               "element": {
+    ///                 "name": "element", "type": "int32",
+    ///                 "metadata": {"PARQUET:field_id": "202"}
+    ///               }
+    ///             }
+    ///           ]}
+    ///         }]
+    ///       }
+    ///     ]}
+    ///   }]
+    /// }
+    /// ```
     pub(crate) fn complex_nested_with_field_ids(nested_ids_meta_key: &str) -> NestedFieldIdFixture {
-        let (kernel_schema, top_nested_ids, inner_nested_ids) =
-            build_complex_nested_kernel_schema(nested_ids_meta_key);
-        let input_arrow_data = build_arrow_input_with_stale_element_id();
-        let expected_arrow_schema = expected_complex_nested_arrow_schema(
-            nested_ids_meta_key,
-            top_nested_ids,
-            inner_nested_ids,
-        );
         NestedFieldIdFixture {
-            kernel_schema,
-            input_arrow_data,
-            expected_arrow_schema,
+            kernel_schema: build_complex_nested_kernel_schema(nested_ids_meta_key),
+            input_arrow_data: build_arrow_input_with_stale_element_id(),
+            expected_arrow_schema: expected_complex_nested_arrow_schema(),
         }
     }
 
@@ -716,12 +748,8 @@ pub(crate) mod test_utils {
         )))
     }
 
-    /// Build the kernel schema described by [`complex_nested_with_field_ids`], returning the
-    /// schema and the two nested-id JSON maps (top + inner) so the expected-Arrow-schema helper
-    /// can reuse them without re-deriving.
-    fn build_complex_nested_kernel_schema(
-        nested_ids_meta_key: &str,
-    ) -> (StructType, serde_json::Value, serde_json::Value) {
+    /// Build the kernel schema described by [`complex_nested_with_field_ids`].
+    fn build_complex_nested_kernel_schema(nested_ids_meta_key: &str) -> StructType {
         let top_nested_ids = test_utils::nested_ids_json(&[
             ("top.key", 100),
             ("top.key.element", 101),
@@ -741,7 +769,7 @@ pub(crate) mod test_utils {
                 ),
                 (
                     nested_ids_meta_key.to_string(),
-                    MetadataValue::Other(inner_nested_ids.clone()),
+                    MetadataValue::Other(inner_nested_ids),
                 ),
             ]);
         let top_field = StructField::nullable(
@@ -755,19 +783,14 @@ pub(crate) mod test_utils {
             ),
             (
                 nested_ids_meta_key.to_string(),
-                MetadataValue::Other(top_nested_ids.clone()),
+                MetadataValue::Other(top_nested_ids),
             ),
         ]);
-        let schema = StructType::try_new(vec![top_field]).unwrap();
-        (schema, top_nested_ids, inner_nested_ids)
+        StructType::try_new(vec![top_field]).unwrap()
     }
 
     /// Build the expected output Arrow schema for [`complex_nested_with_field_ids`].
-    fn expected_complex_nested_arrow_schema(
-        nested_ids_meta_key: &str,
-        top_nested_ids: serde_json::Value,
-        inner_nested_ids: serde_json::Value,
-    ) -> ArrowSchema {
+    fn expected_complex_nested_arrow_schema() -> ArrowSchema {
         // top.value.inner.value.element: int (PARQUET:field_id=202).
         let inner_list_element = Field::new("element", DataType::Int32, true)
             .with_metadata(parquet_field_id_metadata(Some(202)));
@@ -783,17 +806,9 @@ pub(crate) mod test_utils {
             DataType::Struct(vec![inner_key, inner_value].into()),
             false,
         );
-        // top.value.inner: map<int, list<int>> (PARQUET:field_id=2 + nested-ids JSON).
-        let inner_field_metadata = [
-            (PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string()),
-            (
-                nested_ids_meta_key.to_string(),
-                serde_json::to_string(&inner_nested_ids).unwrap(),
-            ),
-        ]
-        .into();
+        // top.value.inner: map<int, list<int>> (PARQUET:field_id=2).
         let inner_field = Field::new("inner", DataType::Map(Arc::new(inner_entries), false), true)
-            .with_metadata(inner_field_metadata);
+            .with_metadata(parquet_field_id_metadata(Some(2)));
         // top.value: struct<inner: ...> (PARQUET:field_id=102).
         let struct_value_field =
             Field::new("value", DataType::Struct(vec![inner_field].into()), true)
@@ -810,17 +825,9 @@ pub(crate) mod test_utils {
             DataType::Struct(vec![outer_key, struct_value_field].into()),
             false,
         );
-        // top: map<list<int>, struct<...>> (PARQUET:field_id=1 + nested-ids JSON).
-        let top_field_metadata = [
-            (PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string()),
-            (
-                nested_ids_meta_key.to_string(),
-                serde_json::to_string(&top_nested_ids).unwrap(),
-            ),
-        ]
-        .into();
+        // top: map<list<int>, struct<...>> (PARQUET:field_id=1).
         let top_field = Field::new("top", DataType::Map(Arc::new(outer_entries), false), true)
-            .with_metadata(top_field_metadata);
+            .with_metadata(parquet_field_id_metadata(Some(1)));
         ArrowSchema::new(vec![top_field])
     }
 
