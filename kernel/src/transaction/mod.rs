@@ -31,7 +31,9 @@ use crate::scan::log_replay::{
     PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
-use crate::schema::void_utils::validate_schema_for_write;
+use crate::schema::void_utils::{
+    add_void_stripping, strip_void_from_schema, validate_schema_for_write,
+};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
@@ -320,39 +322,6 @@ where
         )?;
         adds_evaluator.evaluate(add_files_batch?.deref())
     })
-}
-
-/// Returns true if the struct (or any nested struct) contains void fields.
-fn contains_void(st: &StructType) -> bool {
-    st.fields().any(|f| {
-        *f.data_type() == DataType::VOID
-            || matches!(f.data_type(), DataType::Struct(inner) if contains_void(inner))
-    })
-}
-
-/// Recursively builds a nested StructPatch that drops void fields from a struct type.
-/// Returns `None` if the struct contains no void fields (no patch needed).
-/// The `path` parameter specifies the column path to the struct being transformed.
-fn build_void_stripping_transform(st: &StructType, path: &[&str]) -> Option<ExpressionStructPatch> {
-    if !contains_void(st) {
-        return None;
-    }
-
-    let mut patch = ExpressionStructPatch::new_nested(path.iter().copied());
-    for field in st.fields() {
-        if *field.data_type() == DataType::VOID {
-            patch = patch.with_dropped_field_if_exists(field.name());
-        } else if let DataType::Struct(inner) = field.data_type() {
-            // Build path for the nested struct: parent_path + field_name
-            let mut child_path: Vec<&str> = path.to_vec();
-            child_path.push(field.name());
-            if let Some(nested) = build_void_stripping_transform(inner, &child_path) {
-                patch =
-                    patch.with_replaced_field(field.name(), Arc::new(Expression::struct_patch(nested)));
-            }
-        }
-    }
-    Some(patch)
 }
 
 // =============================================================================
@@ -920,26 +889,15 @@ impl<S: SupportsDataFiles> Transaction<S> {
         let should_materialize_partition_columns = self
             .effective_table_config
             .should_materialize_partition_columns();
-        // Build a StructPatch expression that drops partition columns (unless they should be
-        // materialized) and void columns (never written to Parquet). Void columns are dropped
-        // at all nesting levels: top-level void fields are dropped directly, and void sub-fields
-        // inside structs are dropped via nested patches.
+        // Build a StructPatch expression that drops partition columns (unless materialized) and
+        // void columns at all nesting levels.
         let mut patch = ExpressionStructPatch::new_top_level();
         if !should_materialize_partition_columns {
             for col in &partition_cols {
                 patch = patch.with_dropped_field_if_exists(col);
             }
         }
-        for field in self.effective_table_config.logical_schema().fields() {
-            if *field.data_type() == DataType::VOID {
-                patch = patch.with_dropped_field_if_exists(field.name());
-            } else if let DataType::Struct(inner) = field.data_type() {
-                if let Some(nested) = build_void_stripping_transform(inner, &[field.name()]) {
-                    patch = patch
-                        .with_replaced_field(field.name(), Arc::new(Expression::struct_patch(nested)));
-                }
-            }
-        }
+        let patch = add_void_stripping(patch, &self.effective_table_config.logical_schema(), &[]);
         Ok(Expression::struct_patch(patch))
     }
 
@@ -954,12 +912,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         let props = table_config.table_properties();
         // Strip void fields from the physical write schema: they are never written to Parquet.
         let physical_write_schema = table_config.physical_write_schema();
-        let physical_schema = Arc::new(StructType::new_unchecked(
-            physical_write_schema
-                .fields()
-                .filter(|f| *f.data_type() != DataType::VOID)
-                .map(crate::schema::void_utils::strip_void_from_field),
-        ));
+        let physical_schema = Arc::new(strip_void_from_schema(&physical_write_schema));
         Ok(Arc::new(SharedWriteState {
             table_root: table_config.table_root().clone(),
             logical_schema: table_config.logical_schema(),

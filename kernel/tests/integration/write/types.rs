@@ -579,78 +579,79 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         .expect_err("commit should fail for invalid void schema")
 }
 
-#[tokio::test]
-async fn write_rejects_void_in_array() {
-    let schema = Arc::new(StructType::new_unchecked([
+#[rstest]
+#[case::void_array_element(
+    Arc::new(StructType::new_unchecked([
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "arr",
             DataType::Array(Box::new(ArrayType::new(DataType::VOID, true))),
         ),
-    ]));
-    let err = try_write_with_void_schema(schema).await;
-    assert!(
-        err.to_string().contains("array element type"),
-        "Expected error about void in array, got: {err}"
-    );
-}
-
-#[tokio::test]
-async fn write_rejects_void_in_map() {
-    let schema = Arc::new(StructType::new_unchecked([
+    ])),
+    "array element type"
+)]
+#[case::void_map_value(
+    Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "m",
+            DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::VOID, true))),
+        ),
+    ])),
+    "map value type"
+)]
+#[case::void_map_key(
+    Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "m",
+            DataType::Map(Box::new(MapType::new(DataType::VOID, DataType::STRING, true))),
+        ),
+    ])),
+    "map key type"
+)]
+#[case::void_in_struct_in_array(
+    Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "arr",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Struct(Box::new(StructType::new_unchecked([
+                    StructField::nullable("a", DataType::INTEGER),
+                    StructField::nullable("b", DataType::VOID),
+                ]))),
+                true,
+            ))),
+        ),
+    ])),
+    "Void type is not allowed inside"
+)]
+#[case::void_in_struct_in_map_value(
+    Arc::new(StructType::new_unchecked([
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "m",
             DataType::Map(Box::new(MapType::new(
                 DataType::STRING,
-                DataType::VOID,
+                DataType::Struct(Box::new(StructType::new_unchecked([
+                    StructField::nullable("a", DataType::INTEGER),
+                    StructField::nullable("b", DataType::VOID),
+                ]))),
                 true,
             ))),
         ),
-    ]));
-    let err = try_write_with_void_schema(schema).await;
-    assert!(
-        err.to_string().contains("map value type"),
-        "Expected error about void in map, got: {err}"
-    );
-}
-
-#[tokio::test]
-async fn write_rejects_void_in_map_key() {
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "m",
-            DataType::Map(Box::new(MapType::new(
-                DataType::VOID,
-                DataType::STRING,
-                true,
-            ))),
-        ),
-    ]));
-    let err = try_write_with_void_schema(schema).await;
-    assert!(
-        err.to_string().contains("map key type"),
-        "Expected error about void in map key, got: {err}"
-    );
-}
-
-#[tokio::test]
-async fn write_rejects_all_void_table() {
-    let schema = Arc::new(StructType::new_unchecked([
+    ])),
+    "Void type is not allowed inside"
+)]
+#[case::all_void_table(
+    Arc::new(StructType::new_unchecked([
         StructField::nullable("a", DataType::VOID),
         StructField::nullable("b", DataType::VOID),
-    ]));
-    let err = try_write_with_void_schema(schema).await;
-    assert!(
-        err.to_string().contains("all fields are void"),
-        "Expected error about all-void table, got: {err}"
-    );
-}
-
-#[tokio::test]
-async fn write_rejects_all_void_struct() {
-    let schema = Arc::new(StructType::new_unchecked([
+    ])),
+    "at least one non-void column"
+)]
+#[case::all_void_struct(
+    Arc::new(StructType::new_unchecked([
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "s",
@@ -659,11 +660,45 @@ async fn write_rejects_all_void_struct() {
                 StructField::nullable("y", DataType::VOID),
             ]))),
         ),
-    ]));
+    ])),
+    "contains no non-void fields"
+)]
+#[case::empty_struct_top_level(
+    Arc::new(StructType::new_unchecked(Vec::<StructField>::new())),
+    "at least one non-void column"
+)]
+#[case::nested_empty_struct(
+    Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "s",
+            DataType::Struct(Box::new(StructType::new_unchecked(Vec::<StructField>::new()))),
+        ),
+    ])),
+    "contains no non-void fields"
+)]
+#[case::empty_struct_in_array(
+    Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable(
+            "arr",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Struct(Box::new(StructType::new_unchecked(Vec::<StructField>::new()))),
+                true,
+            ))),
+        ),
+    ])),
+    "struct nested in Array or Map must contain at least one non-void field"
+)]
+#[tokio::test]
+async fn write_rejects_invalid_void_placement(
+    #[case] schema: SchemaRef,
+    #[case] expected_msg: &str,
+) {
     let err = try_write_with_void_schema(schema).await;
     assert!(
-        err.to_string().contains("all fields are void"),
-        "Expected error about all-void struct, got: {err}"
+        err.to_string().contains(expected_msg),
+        "Expected error containing '{expected_msg}', got: {err}"
     );
 }
 
