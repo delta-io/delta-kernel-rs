@@ -161,7 +161,10 @@ pub(crate) fn apply_schema_operations(
                              is not set in table properties",
                         )
                     })?;
-                    try_assign_field_column_mapping(&field, id)?
+                    // We don't support icebergCompatV3 on alter table yet, with_nested_ids is
+                    // always false here Tracking issue:
+                    // <https://github.com/delta-io/delta-kernel-rs/issues/2492>
+                    try_assign_field_column_mapping(&field, id, /* with_nested_ids */ false)?
                 } else {
                     // No upfront reject for stray CM metadata: the recursive walk in
                     // `StructType::make_physical` (called from
