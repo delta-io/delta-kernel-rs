@@ -1520,13 +1520,12 @@ mod scan_metadata_completed_tests {
     use std::time::Duration;
 
     use rstest::rstest;
-    use tracing_subscriber::util::SubscriberInitExt as _;
 
     use crate::engine::default::DefaultEngineBuilder;
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
-    use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
+    use crate::metrics::MetricEvent;
     use crate::object_store::local::LocalFileSystem;
-    use crate::utils::test_utils::CapturingReporter;
+    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::Snapshot;
 
     fn run_scan(
@@ -1541,12 +1540,7 @@ mod scan_metadata_completed_tests {
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
         let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
-        // Install a real global default before the per-test thread-local subscriber. See
-        // `test_utils::ensure_metrics_compatible_global_subscriber` for the rationale.
-        test_utils::ensure_metrics_compatible_global_subscriber();
-        let guard = tracing_subscriber::registry()
-            .with_metrics_reporter_layer(reporter.clone())
-            .set_default();
+        let guard = install_thread_local_metrics_reporter(reporter.clone());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let mut builder = snapshot.scan_builder();
         if let Some(pred) = predicate {
@@ -1619,12 +1613,7 @@ mod scan_metadata_completed_tests {
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
         let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
-        // Install a real global default before the per-test thread-local subscriber. See
-        // `test_utils::ensure_metrics_compatible_global_subscriber` for the rationale.
-        test_utils::ensure_metrics_compatible_global_subscriber();
-        let _guard = tracing_subscriber::registry()
-            .with_metrics_reporter_layer(reporter.clone())
-            .set_default();
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
         {

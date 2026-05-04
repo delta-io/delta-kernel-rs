@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
-    ensure_metrics_compatible_global_subscriber, CountingReporter, RelaxedCounter,
+    ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
+    CountingReporter, RelaxedCounter,
 };
 use delta_kernel::actions::get_log_add_schema;
 use delta_kernel::arrow::array::{

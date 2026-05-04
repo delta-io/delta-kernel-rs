@@ -5,19 +5,48 @@
 //! inspect the counters or call [`CountingReporter::print_summary`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-use delta_kernel::metrics::{MetricEvent, MetricsReporter};
+use delta_kernel::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
+use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::util::SubscriberInitExt as _;
+
+/// Install `reporter` as a thread-local metrics-collecting subscriber, with the safety net
+/// required to avoid tracing callsite-cache poisoning. Returns a guard that uninstalls the
+/// subscriber when dropped.
+///
+/// This is the recommended way to wire a [`MetricsReporter`] into a test. Use it instead
+/// of hand-rolling [`ensure_metrics_compatible_global_subscriber`] +
+/// [`tracing_subscriber::registry()`] + [`set_default`] -- forgetting the first call
+/// silently produces flaky tests where counters intermittently read zero (see the
+/// [`ensure_metrics_compatible_global_subscriber`] doc for the underlying mechanism).
+///
+/// # Example
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use test_utils::{install_thread_local_metrics_reporter, CountingReporter};
+///
+/// let reporter = Arc::new(CountingReporter::new());
+/// let _guard = install_thread_local_metrics_reporter(reporter.clone());
+/// // ... run kernel operations; `reporter`'s counters now reflect their I/O ...
+/// ```
+///
+/// [`set_default`]: tracing_subscriber::util::SubscriberInitExt::set_default
+pub fn install_thread_local_metrics_reporter(reporter: Arc<dyn MetricsReporter>) -> DefaultGuard {
+    ensure_metrics_compatible_global_subscriber();
+    tracing_subscriber::registry()
+        .with_metrics_reporter_layer(reporter)
+        .set_default()
+}
 
 /// Ensure a process-global tracing subscriber is installed exactly once for the lifetime
 /// of the test binary.
 ///
-/// **Tests that use `tracing_subscriber::set_default` (thread-local) to install a
-/// metrics-bearing subscriber MUST call this first**, before installing their thread-local
-/// subscriber. Without it, kernel metrics emitted from `Drop` impls (notably storage
-/// list/read in the default engine, and the JSON/Parquet emit helpers) can be silently
-/// disabled for the entire process.
+/// Most tests should call [`install_thread_local_metrics_reporter`] instead -- it bundles
+/// this call with the thread-local subscriber install. Reach for this directly only when
+/// you need to layer additional `tracing_subscriber` layers (e.g. `fmt`) alongside the
+/// metrics layer.
 ///
 /// # Why
 ///

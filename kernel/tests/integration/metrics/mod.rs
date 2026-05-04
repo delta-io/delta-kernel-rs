@@ -20,15 +20,13 @@ use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
-use delta_kernel::metrics::WithMetricsReporterLayer as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{
-    ensure_metrics_compatible_global_subscriber, insert_data, test_table_setup_mt, CountingReporter,
+    insert_data, install_thread_local_metrics_reporter, test_table_setup_mt, CountingReporter,
 };
-use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
 
 mod scan;
@@ -46,12 +44,9 @@ fn measuring_engine(
     Arc<CountingReporter>,
     tracing::subscriber::DefaultGuard,
 ) {
-    ensure_metrics_compatible_global_subscriber();
     let reporter = Arc::new(CountingReporter::default());
     let engine = DefaultEngineBuilder::new(store).build();
-    let guard = tracing_subscriber::registry()
-        .with_metrics_reporter_layer(reporter.clone())
-        .set_default();
+    let guard = install_thread_local_metrics_reporter(reporter.clone());
     (engine, reporter, guard)
 }
 
