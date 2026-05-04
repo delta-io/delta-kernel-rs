@@ -59,7 +59,7 @@ async fn test_checkpoint_non_kernel_written_table() {
     let batches_before = test_utils::read_scan(&scan_before, engine.clone()).unwrap();
 
     // Create checkpoint via snapshot.checkpoint()
-    snapshot.checkpoint(engine.as_ref()).unwrap();
+    snapshot.checkpoint(engine.as_ref(), None).unwrap();
 
     // Read data after checkpoint
     let snapshot_after = Snapshot::builder_for(url.clone())
@@ -288,7 +288,7 @@ async fn test_clustered_table_write_has_stats_parsed(
     )?
     .into_inner();
 
-    snapshot.checkpoint(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
 
     // Read checkpoint parquet directly to verify stats_parsed contains only clustering columns.
     // ScanBuilder::include_all_stats_columns() doesn't support stats_parsed when

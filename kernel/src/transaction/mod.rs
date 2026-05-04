@@ -833,14 +833,14 @@ impl<S: SupportsDataFiles> Transaction<S> {
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
         let partition_cols = self.effective_table_config.partition_columns().to_vec();
-        // Check if materializePartitionColumns feature is enabled
-        let materialize_partition_columns = self
+        // Check if partition columns should be materialized into data files.
+        let should_materialize_partition_columns = self
             .effective_table_config
-            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
+            .should_materialize_partition_columns();
         // Build a Transform expression that drops partition columns from the input
-        // (unless materializePartitionColumns is enabled).
+        // (unless they should be materialized).
         let mut transform = Transform::new_top_level();
-        if !materialize_partition_columns {
+        if !should_materialize_partition_columns {
             for col in &partition_cols {
                 transform = transform.with_dropped_field_if_exists(col);
             }
@@ -884,7 +884,10 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// - **Type checking**: rejects non-primitive partition column types (struct, array, map) and
     ///   validates that each non-null `Scalar`'s type matches the partition column's schema type.
     ///   For example, passing `Scalar::String("2024")` for an `INTEGER` column returns an error.
-    ///   Null scalars skip the value type check (null is valid for any primitive partition column).
+    ///   Null-equivalent scalars (null scalars, empty strings, and empty binary) all of which
+    ///   collapse to JSON null in `partitionValues`) skip the value type check, but they are only
+    ///   legal when the partition column is nullable; passing any of these for a `nullable: false`
+    ///   partition column returns an error.
     ///
     /// - **Value serialization**: serializes each `Scalar` to a protocol-compliant string per the
     ///   Delta protocol's "Partition Value Serialization" rules. `Scalar::Null(...)` becomes `None`
@@ -1255,7 +1258,7 @@ impl<S> Transaction<S> {
         }
 
         let input_schema = scan_row_schema();
-        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema())?;
+        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema());
         let evaluation_handler = engine.evaluation_handler();
 
         let make_eval = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {
@@ -1427,6 +1430,18 @@ impl<S: std::fmt::Debug> CommitResult<S> {
             CommitResult::CommittedTransaction(c) => c,
             other => panic!("Expected CommittedTransaction, got: {other:?}"),
         }
+    }
+
+    /// Unwraps the post-commit snapshot of the [`CommittedTransaction`], panicking if the
+    /// commit was not successful or the post-commit snapshot is missing.
+    /// TODO(#2494): Refactor existing tests to use this.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::panic, clippy::expect_used)]
+    pub fn unwrap_post_commit_snapshot(self) -> SnapshotRef {
+        self.unwrap_committed()
+            .post_commit_snapshot()
+            .expect("expected post-commit snapshot")
+            .clone()
     }
 }
 
