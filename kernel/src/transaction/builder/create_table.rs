@@ -2008,12 +2008,20 @@ mod tests {
     #[test]
     fn test_create_table_v3_supported_but_not_enabled_skips_nested_ids() {
         let schema = build_iceberg_compat_v3_test_schema();
-        // Explicit CM mode "name", but V3 is NOT enabled (no delta.enableIcebergCompatV3=true).
-        let mut validated = validate_extract_table_features_and_properties(HashMap::from([(
-            COLUMN_MAPPING_MODE.to_string(),
-            "name".to_string(),
-        )]))
+        let mut validated = validate_extract_table_features_and_properties(HashMap::from([
+            (
+                "delta.feature.icebergCompatV3".to_string(),
+                "supported".to_string(),
+            ),
+            (COLUMN_MAPPING_MODE.to_string(), "name".to_string()),
+        ]))
         .unwrap();
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::IcebergCompatV3),
+            "V3 must be in writerFeatures (supported) for this test to be meaningful",
+        );
         let pre_cm = maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
         let (effective_schema, mode) =
             maybe_apply_column_mapping_for_table_create(&schema, &mut validated, pre_cm).unwrap();
