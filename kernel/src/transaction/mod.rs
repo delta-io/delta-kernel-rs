@@ -999,6 +999,8 @@ impl<S> Transaction<S> {
             return Ok(());
         }
         if self.effective_table_config.requires_stats_num_records() {
+            // TODO: Likely it's better to merge this with the clustering column validation below,
+            // benchmark it and see if it's faster. If so, refactor this to do both validations in one pass.
             stats_verifier::verify_num_records_present(add_files)?;
         }
         if let Some(ref clustering_cols) = self.physical_clustering_columns {

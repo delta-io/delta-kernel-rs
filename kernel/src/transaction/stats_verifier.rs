@@ -164,10 +164,9 @@ static COL_TYPES_DECIMAL: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
     (names, types).into()
 });
 
-/// [`ColumnNamesAndTypes`] for [`NumRecordsValidator`]. The `names` is
-/// just a placeholder, the actual column names are provided by `EngineData::visit_rows`.
+/// [`ColumnNamesAndTypes`] for [`NumRecordsValidator`].
 static NUM_RECORDS_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-    let names = vec![column_name!("path"), column_name!("nr")];
+    let names = vec![column_name!("path"), column_name!("stats.numRecords")];
     let types = vec![DataType::STRING, DataType::LONG];
     (names, types).into()
 });
