@@ -866,6 +866,10 @@ pub trait ParquetHandler: AsAny {
     /// For how to use these keys, refer to the Delta protocol's [Column Mapping] and
     /// [IcebergCompatV2] sections.
     ///
+    /// **Non-compliance produces files with incorrect `field_id`s**, which may lead to
+    /// read failures when column mapping mode is `id` and to failures when converting
+    /// the table to Iceberg.   
+    ///
     /// # Parameters
     ///
     /// - `url` - The full URL path where the Parquet file should be written (e.g.,

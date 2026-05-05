@@ -143,8 +143,8 @@ pub(crate) fn validate_iceberg_compat_v3_no_legacy_nested_id(
         return Ok(());
     };
     Err(Error::generic(format!(
-        "icebergCompatV3: field `{offender}` carries deprecated `{}` metadata; \
-         use `{}` instead. See https://github.com/delta-io/delta/issues/6688",
+        "field `{offender}` carries deprecated `{}` metadata; use `{}` instead. \
+         See https://github.com/delta-io/delta/issues/6688",
         ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
         ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
     )))

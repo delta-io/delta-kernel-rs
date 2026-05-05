@@ -7,6 +7,12 @@
 //!
 //! - **kernel -> arrow** ([`TryFromKernel`] / [`TryIntoArrow`]): an example usage is materializing
 //!   a kernel `StructType` as an `ArrowSchema` to build a `RecordBatch` on the write path.
+//!
+//! These conversions can be used on both logical and physical schemas. E.g. when writing a parquet
+//! file, the default engine converts the physical kernel schema to an Arrow schema and writes the
+//! data. When transforming physical data to logical data via an [`Expression`],
+//! [`DefaultExpressionEvaluator`] converts the logical schema to an Arrow schema as the output
+//! schema.
 
 pub mod scalar;
 
