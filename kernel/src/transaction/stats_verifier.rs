@@ -187,7 +187,7 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
         &DataType::TIMESTAMP => Ok(&COL_TYPES_TIMESTAMP),
         &DataType::TIMESTAMP_NTZ => Ok(&COL_TYPES_TIMESTAMP_NTZ),
         DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(&COL_TYPES_DECIMAL),
-        DataType::Primitive(PrimitiveType::Void)
+        &DataType::VOID
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)
@@ -221,7 +221,7 @@ fn is_stat_present<'b>(
         DataType::Primitive(PrimitiveType::Decimal(_)) => {
             Ok(getter.get_decimal(row_idx, field_name)?.is_some())
         }
-        DataType::Primitive(PrimitiveType::Void)
+        &DataType::VOID
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)

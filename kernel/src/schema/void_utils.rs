@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use super::{DataType, Schema, StructField, StructType};
+use super::{DataType, PrimitiveType, Schema, StructField, StructType};
 use crate::expressions::Transform;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Error, Expression};
@@ -30,11 +30,8 @@ struct StripVoidFields;
 impl<'a> SchemaTransform<'a> for StripVoidFields {
     transform_output_type!(|'a, T| Option<Cow<'a, T>>);
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        if *field.data_type() == DataType::VOID {
-            return None;
-        }
-        self.recurse_into_struct_field(field)
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
+        (*ptype != PrimitiveType::Void).then_some(Cow::Borrowed(ptype))
     }
 }
 
@@ -46,7 +43,7 @@ impl<'a> SchemaTransform<'a> for StripVoidFields {
 pub(crate) fn strip_void_from_schema(schema: &Schema) -> StructType {
     StripVoidFields
         .transform_struct(schema)
-        .map(|cow| cow.into_owned())
+        .map(Cow::into_owned)
         .unwrap_or_else(|| StructType::new_unchecked(Vec::<StructField>::new()))
 }
 
@@ -71,7 +68,12 @@ struct ValidateForWrite {
 }
 
 impl ValidateForWrite {
-    fn descend_into_container(&mut self, etype: &DataType) -> Result<(), Error> {
+    fn descend_into_container(&mut self, etype: &DataType, position: &str) -> DeltaResult<()> {
+        if *etype == DataType::VOID {
+            return Err(Error::schema(format!(
+                "Void type is not allowed as {position}"
+            )));
+        }
         self.container_depth += 1;
         let result = self.transform(etype);
         self.container_depth -= 1;
@@ -80,9 +82,9 @@ impl ValidateForWrite {
 }
 
 impl<'a> SchemaTransform<'a> for ValidateForWrite {
-    transform_output_type!(|'a, T| Result<(), Error>);
+    transform_output_type!(|'a, T| DeltaResult<()>);
 
-    fn transform_struct(&mut self, stype: &'a StructType) -> Result<(), Error> {
+    fn transform_struct(&mut self, stype: &'a StructType) -> DeltaResult<()> {
         if has_no_non_void_fields(stype) {
             return Err(Error::schema(if self.container_depth > 0 {
                 "A struct nested in Array or Map must contain at least one non-void field"
@@ -98,7 +100,7 @@ impl<'a> SchemaTransform<'a> for ValidateForWrite {
         result
     }
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), Error> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
         if self.container_depth > 0 && *field.data_type() == DataType::VOID {
             return Err(Error::schema(
                 "Void type is not allowed inside a struct nested in Array or Map",
@@ -107,29 +109,16 @@ impl<'a> SchemaTransform<'a> for ValidateForWrite {
         self.recurse_into_struct_field(field)
     }
 
-    fn transform_array_element(&mut self, etype: &'a DataType) -> Result<(), Error> {
-        if *etype == DataType::VOID {
-            return Err(Error::schema(
-                "Void type is not allowed as an array element type",
-            ));
-        }
-        self.descend_into_container(etype)
+    fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<()> {
+        self.descend_into_container(etype, "an array element type")
     }
 
-    fn transform_map_key(&mut self, etype: &'a DataType) -> Result<(), Error> {
-        if *etype == DataType::VOID {
-            return Err(Error::schema("Void type is not allowed as a map key type"));
-        }
-        self.descend_into_container(etype)
+    fn transform_map_key(&mut self, etype: &'a DataType) -> DeltaResult<()> {
+        self.descend_into_container(etype, "a map key type")
     }
 
-    fn transform_map_value(&mut self, etype: &'a DataType) -> Result<(), Error> {
-        if *etype == DataType::VOID {
-            return Err(Error::schema(
-                "Void type is not allowed as a map value type",
-            ));
-        }
-        self.descend_into_container(etype)
+    fn transform_map_value(&mut self, etype: &'a DataType) -> DeltaResult<()> {
+        self.descend_into_container(etype, "a map value type")
     }
 }
 
@@ -157,7 +146,7 @@ fn add_void_stripping_inner(
     let mut changed = false;
     for field in st.fields() {
         if *field.data_type() == DataType::VOID {
-            transform = transform.with_dropped_field_if_exists(field.name());
+            transform = transform.with_dropped_field(field.name());
             changed = true;
         } else if let DataType::Struct(inner) = field.data_type() {
             let mut child_path: Vec<&str> = path.to_vec();
@@ -168,8 +157,8 @@ fn add_void_stripping_inner(
                 &child_path,
             );
             if nested_changed {
-                transform = transform
-                    .with_replaced_field(field.name(), Arc::new(Expression::transform(nested)));
+                let nested = Arc::new(Expression::transform(nested));
+                transform = transform.with_replaced_field(field.name(), nested);
                 changed = true;
             }
         }
@@ -216,38 +205,29 @@ mod tests {
     #[rstest::rstest]
     #[case(
         "void in array",
-        StructField::nullable(
-            "f",
-            DataType::Array(Box::new(ArrayType::new(DataType::VOID, true)))
-        ),
+        StructField::nullable("f", ArrayType::new(DataType::VOID, true)),
         "array element type"
     )]
     #[case(
         "void in map value",
-        StructField::nullable(
-            "f",
-            DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::VOID, true)))
-        ),
+        StructField::nullable("f", MapType::new(DataType::STRING, DataType::VOID, true)),
         "map value type"
     )]
     #[case(
         "void in map key",
-        StructField::nullable(
-            "f",
-            DataType::Map(Box::new(MapType::new(DataType::VOID, DataType::STRING, true)))
-        ),
+        StructField::nullable("f", MapType::new(DataType::VOID, DataType::STRING, true)),
         "map key type"
     )]
     #[case(
         "void in array inside struct",
         StructField::nullable(
             "outer",
-            DataType::Struct(Box::new(StructType::new_unchecked([
+            StructType::new_unchecked([
                 StructField::nullable(
                     "inner",
                     DataType::Array(Box::new(ArrayType::new(DataType::VOID, true))),
                 ),
-            ])))
+            ])
         ),
         "array element type"
     )]
@@ -255,10 +235,10 @@ mod tests {
         "void in map inside array",
         StructField::nullable(
             "col",
-            DataType::Array(Box::new(ArrayType::new(
+            ArrayType::new(
                 DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::VOID, true,))),
                 true,
-            ))),
+            ),
         ),
         "map value type"
     )]
@@ -266,13 +246,13 @@ mod tests {
         "void inside struct nested in array",
         StructField::nullable(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
+            ArrayType::new(
                 DataType::Struct(Box::new(StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable("b", DataType::VOID),
                 ]))),
                 true,
-            ))),
+            ),
         ),
         "Void type is not allowed inside"
     )]
@@ -280,14 +260,14 @@ mod tests {
         "void inside struct nested in map value",
         StructField::nullable(
             "m",
-            DataType::Map(Box::new(MapType::new(
+            MapType::new(
                 DataType::STRING,
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable("b", DataType::VOID),
-                ]))),
+                ]),
                 true,
-            ))),
+            ),
         ),
         "Void type is not allowed inside"
     )]
@@ -295,14 +275,14 @@ mod tests {
         "void inside struct nested in map key",
         StructField::nullable(
             "m",
-            DataType::Map(Box::new(MapType::new(
-                DataType::Struct(Box::new(StructType::new_unchecked([
+            MapType::new(
+                StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable("b", DataType::VOID),
-                ]))),
+                ]),
                 DataType::STRING,
                 true,
-            ))),
+            ),
         ),
         "Void type is not allowed inside"
     )]
@@ -310,7 +290,7 @@ mod tests {
         "void inside struct nested in array inside array",
         StructField::nullable(
             "outer",
-            DataType::Array(Box::new(ArrayType::new(
+            ArrayType::new(
                 DataType::Array(Box::new(ArrayType::new(
                     DataType::Struct(Box::new(StructType::new_unchecked([
                         StructField::nullable("a", DataType::INTEGER),
@@ -319,7 +299,7 @@ mod tests {
                     true,
                 ))),
                 true,
-            ))),
+            ),
         ),
         "Void type is not allowed inside"
     )]
@@ -327,7 +307,7 @@ mod tests {
         "void in deeply nested struct inside array",
         StructField::nullable(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
+            ArrayType::new(
                 DataType::Struct(Box::new(StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable(
@@ -339,7 +319,7 @@ mod tests {
                     ),
                 ]))),
                 true,
-            ))),
+            ),
         ),
         "Void type is not allowed inside"
     )]
@@ -347,7 +327,7 @@ mod tests {
         "void in struct inside array inside struct inside array",
         StructField::nullable(
             "outer",
-            DataType::Array(Box::new(ArrayType::new(
+            ArrayType::new(
                 DataType::Struct(Box::new(StructType::new_unchecked([StructField::nullable(
                     "inner",
                     DataType::Array(Box::new(ArrayType::new(
@@ -358,7 +338,7 @@ mod tests {
                     ))),
                 )]))),
                 true,
-            ))),
+            ),
         ),
         "must contain at least one non-void field"
     )]
@@ -366,12 +346,12 @@ mod tests {
         "empty struct nested in array",
         StructField::nullable(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
+            ArrayType::new(
                 DataType::Struct(Box::new(StructType::new_unchecked(
                     Vec::<StructField>::new(),
                 ))),
                 true,
-            ))),
+            ),
         ),
         "struct nested in Array or Map must contain at least one non-void field"
     )]
@@ -379,14 +359,14 @@ mod tests {
         "all-void struct nested in map value",
         StructField::nullable(
             "m",
-            DataType::Map(Box::new(MapType::new(
+            MapType::new(
                 DataType::STRING,
-                DataType::Struct(Box::new(StructType::new_unchecked([StructField::nullable(
+                StructType::new_unchecked([StructField::nullable(
                     "x",
                     DataType::VOID,
-                )]))),
+                )]),
                 true,
-            ))),
+            ),
         ),
         "struct nested in Array or Map must contain at least one non-void field"
     )]
@@ -422,37 +402,37 @@ mod tests {
         "void in nested struct",
         StructType::new_unchecked([StructField::nullable(
             "s",
-            DataType::Struct(Box::new(StructType::new_unchecked([
+            StructType::new_unchecked([
                 StructField::nullable("a", DataType::INTEGER),
                 StructField::nullable("b", DataType::VOID),
-            ]))),
+            ]),
         )])
     )]
     #[case(
         "array of struct without void",
         StructType::new_unchecked([StructField::nullable(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
+            ArrayType::new(
                 DataType::Struct(Box::new(StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable("b", DataType::STRING),
                 ]))),
                 true,
-            ))),
+            ),
         )])
     )]
     #[case(
         "map of struct without void",
         StructType::new_unchecked([StructField::nullable(
             "m",
-            DataType::Map(Box::new(MapType::new(
+            MapType::new(
                 DataType::STRING,
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable("b", DataType::STRING),
-                ]))),
+                ]),
                 true,
-            ))),
+            ),
         )])
     )]
     fn test_valid_schema_for_complex_types(#[case] desc: &str, #[case] schema: StructType) {
@@ -481,10 +461,10 @@ mod tests {
         "struct with mixed void",
         StructType::new_unchecked([StructField::nullable(
             "s",
-            DataType::Struct(Box::new(StructType::new_unchecked([
+            StructType::new_unchecked([
                 StructField::nullable("a", DataType::INTEGER),
                 StructField::nullable("b", DataType::VOID),
-            ]))),
+            ]),
         )])
     )]
     fn test_write_valid_schemas(#[case] desc: &str, #[case] schema: StructType) {
@@ -507,10 +487,10 @@ mod tests {
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable(
                 "s",
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::nullable("x", DataType::VOID),
                     StructField::nullable("y", DataType::VOID),
-                ]))),
+                ]),
             ),
         ]),
         "contains no non-void fields"
@@ -519,7 +499,7 @@ mod tests {
         "void in array",
         StructType::new_unchecked([StructField::nullable(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(DataType::VOID, true))),
+            ArrayType::new(DataType::VOID, true),
         )]),
         "array element type"
     )]
@@ -527,11 +507,11 @@ mod tests {
         "void in map",
         StructType::new_unchecked([StructField::nullable(
             "m",
-            DataType::Map(Box::new(MapType::new(
+            MapType::new(
                 DataType::STRING,
                 DataType::VOID,
                 true,
-            ))),
+            ),
         )]),
         "map value type"
     )]
@@ -541,14 +521,14 @@ mod tests {
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable(
                 "outer",
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::nullable(
                         "inner",
                         DataType::Struct(Box::new(StructType::new_unchecked([
                             StructField::nullable("x", DataType::VOID),
                         ]))),
                     ),
-                ]))),
+                ]),
             ),
         ]),
         "contains no non-void fields"
@@ -564,9 +544,9 @@ mod tests {
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable(
                 "s",
-                DataType::Struct(Box::new(StructType::new_unchecked(
+                StructType::new_unchecked(
                     Vec::<StructField>::new(),
-                ))),
+                ),
             ),
         ]),
         "contains no non-void fields"
@@ -613,41 +593,41 @@ mod tests {
         "nested struct with mixed void",
         StructType::new_unchecked([StructField::nullable(
             "s",
-            DataType::Struct(Box::new(StructType::new_unchecked([
+            StructType::new_unchecked([
                 StructField::nullable("a", DataType::INTEGER),
                 StructField::nullable("b", DataType::VOID),
                 StructField::nullable("c", DataType::STRING),
-            ]))),
+            ]),
         )]),
         StructType::new_unchecked([StructField::nullable(
             "s",
-            DataType::Struct(Box::new(StructType::new_unchecked([
+            StructType::new_unchecked([
                 StructField::nullable("a", DataType::INTEGER),
                 StructField::nullable("c", DataType::STRING),
-            ]))),
+            ]),
         )])
     )]
     #[case(
         "deeply nested void",
         StructType::new_unchecked([StructField::nullable(
             "outer",
-            DataType::Struct(Box::new(StructType::new_unchecked([StructField::nullable(
+            StructType::new_unchecked([StructField::nullable(
                 "inner",
                 DataType::Struct(Box::new(StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable("v", DataType::VOID),
                 ]))),
-            )]))),
+            )]),
         )]),
         StructType::new_unchecked([StructField::nullable(
             "outer",
-            DataType::Struct(Box::new(StructType::new_unchecked([StructField::nullable(
+            StructType::new_unchecked([StructField::nullable(
                 "inner",
                 DataType::Struct(Box::new(StructType::new_unchecked([StructField::nullable(
                     "a",
                     DataType::INTEGER,
                 )]))),
-            )]))),
+            )]),
         )])
     )]
     fn test_strip_void_from_schema(
@@ -660,13 +640,51 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_drops_array_of_void_field() {
+        // Array<Void> has nowhere for the void to live: stripping the void primitive
+        // from the element type collapses the ArrayType, which collapses the field.
+        let schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("arr", ArrayType::new(DataType::VOID, true)),
+        ]);
+        let stripped = strip_void_from_schema(&schema);
+        assert!(stripped.field("id").is_some());
+        assert!(stripped.field("arr").is_none());
+    }
+
+    #[test]
+    fn test_strip_drops_map_with_void_value_field() {
+        // Map<_, Void> collapses for the same reason as Array<Void>.
+        let schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("m", MapType::new(DataType::STRING, DataType::VOID, true)),
+        ]);
+        let stripped = strip_void_from_schema(&schema);
+        assert!(stripped.field("id").is_some());
+        assert!(stripped.field("m").is_none());
+    }
+
+    #[test]
+    fn test_strip_drops_map_with_void_key_field() {
+        // Map<Void, _> collapses too -- the void key type is filtered, the MapType cannot
+        // be reconstructed, so the field disappears.
+        let schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("m", MapType::new(DataType::VOID, DataType::STRING, true)),
+        ]);
+        let stripped = strip_void_from_schema(&schema);
+        assert!(stripped.field("id").is_some());
+        assert!(stripped.field("m").is_none());
+    }
+
+    #[test]
     fn test_strip_preserves_metadata() {
         let mut s_field = StructField::nullable(
             "s",
-            DataType::Struct(Box::new(StructType::new_unchecked([
+            StructType::new_unchecked([
                 StructField::nullable("a", DataType::INTEGER),
                 StructField::nullable("b", DataType::VOID),
-            ]))),
+            ]),
         );
         s_field.metadata.insert(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),

@@ -877,11 +877,10 @@ impl<S: SupportsDataFiles> Transaction<S> {
             let random_prefix_length = props.random_prefix_length();
             // Strip void fields from the physical write schema: they are never written to Parquet.
             let physical_write_schema = table_config.physical_write_schema();
-            let physical_schema = Arc::new(strip_void_from_schema(&physical_write_schema));
             Arc::new(SharedWriteState {
                 table_root: table_config.table_root().clone(),
                 logical_schema: table_config.logical_schema(),
-                physical_schema,
+                physical_schema: Arc::new(strip_void_from_schema(&physical_write_schema)),
                 logical_to_physical: Arc::new(self.generate_logical_to_physical()),
                 column_mapping_mode: table_config.column_mapping_mode(),
                 stats_columns: self.stats_columns(),
