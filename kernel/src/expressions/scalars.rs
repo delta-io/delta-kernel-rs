@@ -711,7 +711,6 @@ impl PrimitiveType {
             Long => self.parse_str_as_scalar(raw, Scalar::Long),
             Float => self.parse_str_as_scalar(raw, Scalar::Float),
             Double => self.parse_str_as_scalar(raw, Scalar::Double),
-            Void if raw.is_empty() => Ok(Scalar::Null(DataType::VOID)),
             Void => Err(self.parse_error(raw)),
             Boolean => {
                 if raw.eq_ignore_ascii_case("true") {
