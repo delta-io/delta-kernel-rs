@@ -180,28 +180,23 @@ impl TryFromKernel<&StructField> for ArrowField {
     fn try_from_kernel(f: &StructField) -> Result<Self, ArrowError> {
         let mut metadata = kernel_flat_parquet_id_to_arrow(f)?;
         // `ColumnMetadataKey::ColumnMappingNestedIds` is a kernel-side metadata key, not
-        // retained in Arrow; its content is processed by `kernel_map_array_into_arrow`.
+        // retained in Arrow; its content is processed by `kernel_field_into_arrow`.
         metadata.remove(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
-        let arrow_type = match f.data_type() {
-            DataType::Array(_) | DataType::Map(_) => {
-                kernel_map_array_into_arrow(f, f.name(), f.data_type())?
-            }
-            _ => f.data_type().try_into_arrow()?,
-        };
-        let field = ArrowField::new(f.name(), arrow_type, f.is_nullable()).with_metadata(metadata);
-
-        Ok(field)
+        let arrow_type = kernel_field_into_arrow(f, f.name(), f.data_type())?;
+        Ok(ArrowField::new(f.name(), arrow_type, f.is_nullable()).with_metadata(metadata))
     }
 }
 
-/// Recursive Arrow-type builder that propagates nested field IDs from `ancestor`'s
-/// `delta.columnMapping.nested.ids` metadata onto the synthesized `element` / `key` / `value`
-/// Arrow fields.
+/// Recursive Arrow-type builder. For Array/Map types, it propagates nested field IDs from
+/// `ancestor`'s `delta.columnMapping.nested.ids` metadata onto the synthesized
+/// `element` / `key` / `value` Arrow fields. For Struct/Primitive/Variant types it delegates to
+/// the standard `DataType -> ArrowDataType` conversion.
 ///
 /// # Parameters
 /// - `ancestor`: the nearest ancestor kernel [`StructField`]; its metadata holds the nested-ids
-///   JSON map.
-/// - `relative_path`: dot-chained path rooted at `ancestor.name()`.
+///   JSON map. Unused for Struct/Primitive/Variant types, only consulted on Array/Map recursion.
+/// - `relative_path`: dot-chained path rooted at `ancestor.name()`. Only consulted for Array/Map
+///   recursion.
 /// - `datatype`: the kernel data type at the current position.
 ///
 /// # Example
@@ -228,7 +223,7 @@ impl TryFromKernel<&StructField> for ArrowField {
 /// }
 /// ```
 ///
-/// Calling `kernel_map_array_into_arrow(field, "array_in_map", &field.data_type())`
+/// Calling `kernel_field_into_arrow(field, "array_in_map", &field.data_type())`
 /// produces this Arrow `DataType` (each synthesized `key`/`value`/`element` Arrow Field
 /// carries `PARQUET:field_id` in its `metadata`, looked up from the JSON above):
 ///
@@ -263,7 +258,7 @@ impl TryFromKernel<&StructField> for ArrowField {
 ///   }
 /// }
 /// ```
-fn kernel_map_array_into_arrow(
+fn kernel_field_into_arrow(
     ancestor: &StructField,
     relative_path: &str,
     datatype: &DataType,
@@ -273,7 +268,7 @@ fn kernel_map_array_into_arrow(
             let element_path = format!("{relative_path}.{LIST_ARRAY_ROOT}");
             let element_id = lookup_nested_field_id(ancestor, &element_path)?;
             let arrow_element_type =
-                kernel_map_array_into_arrow(ancestor, &element_path, a.element_type())?;
+                kernel_field_into_arrow(ancestor, &element_path, a.element_type())?;
             // Kernel's array element field is anonymous; we use `LIST_ARRAY_ROOT` as the
             // synthesized field name by convention. Same below for map's `key`/`value` fields.
             let arrow_element_field =
@@ -286,9 +281,8 @@ fn kernel_map_array_into_arrow(
             let value_path = format!("{relative_path}.{MAP_VALUE_DEFAULT}");
             let key_id = lookup_nested_field_id(ancestor, &key_path)?;
             let value_id = lookup_nested_field_id(ancestor, &value_path)?;
-            let arrow_key_type = kernel_map_array_into_arrow(ancestor, &key_path, m.key_type())?;
-            let arrow_value_type =
-                kernel_map_array_into_arrow(ancestor, &value_path, m.value_type())?;
+            let arrow_key_type = kernel_field_into_arrow(ancestor, &key_path, m.key_type())?;
+            let arrow_value_type = kernel_field_into_arrow(ancestor, &value_path, m.value_type())?;
             // Map keys are never nullable.
             let arrow_key_field = ArrowField::new(MAP_KEY_DEFAULT, arrow_key_type, false)
                 .with_metadata(parquet_field_id_metadata(key_id));
@@ -483,7 +477,7 @@ impl TryFromArrow<&ArrowField> for StructField {
     }
 }
 
-/// Inverse of [`kernel_map_array_into_arrow`]: walks `arrow_type` and aggregates
+/// Inverse of [`kernel_field_into_arrow`]: walks `arrow_type` and aggregates
 /// `PARQUET:field_id` from the element/key/value fields of any list/map, keyed by dot-path
 /// rooted at `relative_path`.
 ///

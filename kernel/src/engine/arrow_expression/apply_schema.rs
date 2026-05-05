@@ -265,7 +265,7 @@ fn apply_schema_to_map(
     )?)
 }
 
-// apply `schema` to `array`. This handles renaming, and adjusting nullability and metadata. if the
+// Apply `schema` to `array`. This handles renaming, and adjusting nullability and metadata. if the
 // actual data types don't match, this will return an error.
 pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResult<ArrayRef> {
     apply_schema_to_inner(array, schema, None, "")
