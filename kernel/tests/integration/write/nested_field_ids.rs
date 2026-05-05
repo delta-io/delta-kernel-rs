@@ -13,17 +13,14 @@ use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
 };
 use delta_kernel::{EngineData, ParquetHandler};
-use rstest::rstest;
 use test_utils::nested_ids_json;
 use url::Url;
 
 use crate::common::write_utils::collect_all_parquet_field_ids;
 
-#[rstest]
-#[case::parquet_field_nested_ids(ColumnMetadataKey::ParquetFieldNestedIds.as_ref())]
-#[case::delta_column_mapping_nested_ids(ColumnMetadataKey::ColumnMappingNestedIds.as_ref())]
 #[tokio::test]
-async fn test_nested_field_ids_round_trip(#[case] nested_ids_meta_key: &str) {
+async fn test_nested_field_ids_round_trip() {
+    let nested_ids_meta_key = ColumnMetadataKey::ColumnMappingNestedIds.as_ref();
     let kernel_schema = build_kernel_schema(nested_ids_meta_key);
     let arrow_schema: ArrowSchema = (&kernel_schema).try_into_arrow().unwrap();
 
@@ -54,8 +51,7 @@ async fn test_nested_field_ids_round_trip(#[case] nested_ids_meta_key: &str) {
     );
 }
 
-/// Build a kernel schema with two doubly nested top-level fields. `nested_ids_meta_key` chooses
-/// which metadata key carries the nested-id JSON on each top-level field.
+/// Build a kernel schema with two doubly nested top-level fields.
 ///
 /// Layout:
 /// - `array_in_map: map<int, array<int>>`

@@ -305,7 +305,7 @@ pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResul
 ///   "nullable": true,
 ///   "metadata": {
 ///     "parquet.field.id": 1,
-///     "parquet.field.nested.ids": {
+///     "delta.columnMapping.nested.ids": {
 ///       "arr_in_map.key": 100,
 ///       "arr_in_map.value": 101,
 ///       "arr_in_map.value.element": 102
@@ -591,10 +591,9 @@ mod apply_schema_validation_tests {
 
     // === Nested-id propagation tests ===
 
-    #[rstest]
-    #[case::parquet_field_nested_ids(ColumnMetadataKey::ParquetFieldNestedIds.as_ref())]
-    #[case::delta_column_mapping_nested_ids(ColumnMetadataKey::ColumnMappingNestedIds.as_ref())]
-    fn test_apply_schema_threads_nested_ids_onto_arrow_schema(#[case] meta_key: &str) {
+    #[test]
+    fn test_apply_schema_threads_nested_ids_onto_arrow_schema() {
+        let meta_key = ColumnMetadataKey::ColumnMappingNestedIds.as_ref();
         let fixture = complex_nested_with_field_ids(meta_key);
         let kernel_type = DataType::Struct(Box::new(fixture.kernel_schema));
         let result = apply_schema(&fixture.input_arrow_data, &kernel_type).unwrap();
@@ -617,7 +616,7 @@ mod apply_schema_validation_tests {
             one("custom.element", "elem_val"),
         );
         let kernel_schema =
-            array_in_map_with_field_ids(ColumnMetadataKey::ParquetFieldNestedIds.as_ref());
+            array_in_map_with_field_ids(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
         let result = apply_schema(&input, &DataType::Struct(Box::new(kernel_schema))).unwrap();
 
         let result_schema = result.schema();
@@ -649,15 +648,14 @@ mod apply_schema_validation_tests {
     }
 
     #[rstest]
-    /// The whole nested ids JSON map is missing(i.e. neither `delta.columnMapping.nested.ids`
-    /// nor `parquet.field.nested.ids` are present).
+    /// The nested ids JSON map is missing (i.e. `delta.columnMapping.nested.ids` is not present).
     #[case::without_nested_id_metadata(array_in_map_kernel_schema(std::iter::empty::<(
         String,
         MetadataValue,
     )>()), /* expected_field_ids */ &[])]
     /// Only some of the nested ids are present.
     #[case::only_partial_nested_ids_match(array_in_map_kernel_schema([(
-        ColumnMetadataKey::ParquetFieldNestedIds.as_ref().to_string(),
+        ColumnMetadataKey::ColumnMappingNestedIds.as_ref().to_string(),
         MetadataValue::Other(test_utils::nested_ids_json(&[
             ("array_in_map.key", 100),
             ("array_in_map.value.element", 102),
@@ -699,7 +697,7 @@ mod apply_schema_validation_tests {
         #[case] expected_error_substring: &str,
     ) {
         let schema = array_in_map_kernel_schema([(
-            ColumnMetadataKey::ParquetFieldNestedIds
+            ColumnMetadataKey::ColumnMappingNestedIds
                 .as_ref()
                 .to_string(),
             value,
