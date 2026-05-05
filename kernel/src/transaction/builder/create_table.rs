@@ -178,6 +178,13 @@ struct ValidatedTableProperties {
     writer_features: Vec<TableFeature>,
 }
 
+impl ValidatedTableProperties {
+    /// Returns `true` iff `properties[key] == "true"`.
+    fn is_property_true(&self, key: &str) -> bool {
+        self.properties.get(key).map(String::as_str) == Some("true")
+    }
+}
+
 /// Adds a feature to the appropriate reader/writer feature lists based on its type.
 ///
 /// - ReaderWriter features are added to both reader and writer lists
@@ -511,6 +518,12 @@ fn maybe_enable_ict_for_catalog_managed(
     Ok(())
 }
 
+/// Witness that all property-flipping passes which must run before column mapping is applied
+/// have completed.
+#[must_use]
+#[derive(Debug)]
+struct PreColumnMappingResolved;
+
 /// When `delta.enableIcebergCompatV3=true` is set, auto-enables V3's required dependencies in
 /// `validated.properties` (defaulting them when absent, rejecting conflicting values).
 ///
@@ -520,18 +533,13 @@ fn maybe_enable_ict_for_catalog_managed(
 ///   * Reject if `delta.rowTrackingSuspended` is `true`.
 ///   * Reject if `delta.enableIcebergCompatV1` or `delta.enableIcebergCompatV2` is `true`.
 ///
-/// Must be called BEFORE [`maybe_apply_column_mapping_for_table_create`] so the column-mapping
-/// mode is in place by the time column mapping is applied.
+/// Returns a [`PreColumnMappingResolved`] witness that
+/// [`maybe_apply_column_mapping_for_table_create`] requires, ensuring this pass runs first.
 fn maybe_enable_iceberg_compat_v3_dependencies(
     validated: &mut ValidatedTableProperties,
-) -> DeltaResult<()> {
-    if validated
-        .properties
-        .get(ENABLE_ICEBERG_COMPAT_V3)
-        .map(String::as_str)
-        != Some("true")
-    {
-        return Ok(());
+) -> DeltaResult<PreColumnMappingResolved> {
+    if !validated.is_property_true(ENABLE_ICEBERG_COMPAT_V3) {
+        return Ok(PreColumnMappingResolved);
     }
 
     // Column mapping: require `name` or `id`; default to `name`.
@@ -556,12 +564,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
 
     // Row tracking must not be suspended (suspension cannot coexist with row tracking actively
     // enabled, which V3 requires).
-    if validated
-        .properties
-        .get(ROW_TRACKING_SUSPENDED)
-        .map(String::as_str)
-        == Some("true")
-    {
+    if validated.is_property_true(ROW_TRACKING_SUSPENDED) {
         return Err(Error::generic(format!(
             "IcebergCompatV3 cannot be enabled while '{ROW_TRACKING_SUSPENDED}' is 'true'"
         )));
@@ -588,14 +591,14 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
 
     // V1/V2 must not be active.
     for key in [ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2] {
-        if validated.properties.get(key).map(String::as_str) == Some("true") {
+        if validated.is_property_true(key) {
             return Err(Error::generic(format!(
                 "IcebergCompatV3 cannot be enabled together with '{key}'"
             )));
         }
     }
 
-    Ok(())
+    Ok(PreColumnMappingResolved)
 }
 
 /// Conditionally applies column mapping for table creation based on the mode in properties.
@@ -619,6 +622,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
 fn maybe_apply_column_mapping_for_table_create(
     schema: &SchemaRef,
     validated: &mut ValidatedTableProperties,
+    _pre_cm: PreColumnMappingResolved,
 ) -> DeltaResult<(SchemaRef, ColumnMappingMode)> {
     let column_mapping_mode = get_column_mapping_mode_from_properties(&validated.properties)?;
 
@@ -634,11 +638,7 @@ fn maybe_apply_column_mapping_for_table_create(
             // Transform schema: assign IDs and physical names to all fields. When
             // IcebergCompatV3 is enabled, allocated nested ids for element/key/value in Array/Map
             // as well.
-            let with_nested_ids = validated
-                .properties
-                .get(ENABLE_ICEBERG_COMPAT_V3)
-                .map(String::as_str)
-                == Some("true");
+            let with_nested_ids = validated.is_property_true(ENABLE_ICEBERG_COMPAT_V3);
             let mut max_id = 0i64;
             let transformed_schema =
                 assign_column_mapping_metadata(schema, &mut max_id, with_nested_ids)?;
@@ -904,12 +904,13 @@ impl CreateTableTransactionBuilder {
         let mut validated = validate_extract_table_features_and_properties(self.table_properties)?;
 
         // When IcebergCompatV3 is enabled, fill in / validate required dependencies before
-        // column mapping is applied so the CM mode is in place.
-        maybe_enable_iceberg_compat_v3_dependencies(&mut validated)?;
+        // column mapping is applied so the CM mode is in place. The returned witness is
+        // required by `maybe_apply_column_mapping_for_table_create` below.
+        let pre_cm = maybe_enable_iceberg_compat_v3_dependencies(&mut validated)?;
 
         // Apply column mapping if mode is name or id (must happen BEFORE data layout)
         let (effective_schema, column_mapping_mode) =
-            maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated)?;
+            maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated, pre_cm)?;
 
         // Validate schema (non-empty, column names, duplicates, no `delta.invariants` metadata)
         validate_schema(&effective_schema, column_mapping_mode)?;
@@ -1849,7 +1850,7 @@ mod tests {
         let mut validated = validate_extract_table_features_and_properties(props).unwrap();
 
         // === V3 dependency defaults ===
-        maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
+        let pre_cm = maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
         assert_eq!(
             validated
                 .properties
@@ -1867,7 +1868,7 @@ mod tests {
 
         // === Column mapping + nested-id assignment ===
         let (effective_schema, mode) =
-            maybe_apply_column_mapping_for_table_create(&schema, &mut validated).unwrap();
+            maybe_apply_column_mapping_for_table_create(&schema, &mut validated, pre_cm).unwrap();
         assert_eq!(mode, ColumnMappingMode::Name);
 
         // top: CM id=1, nested-ids = {<top_physical>.{key:2, value:3, key.element:4}}
@@ -1977,26 +1978,59 @@ mod tests {
         );
     }
 
-    /// `assign_column_mapping_metadata` rejects schemas where any field has pre-populated CM
-    /// or nested-ids metadata.
-    #[test]
-    fn test_create_table_v3_rejects_pre_existing_nested_ids() {
-        // The fixture's kernel schema already carries `delta.columnMapping.nested.ids` on the
+    /// `assign_column_mapping_metadata` rejects schemas where any field has pre-populated
+    /// nested-ids metadata under either the canonical or the legacy key.
+    #[rstest]
+    #[case::canonical_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref())]
+    #[case::legacy_key(ColumnMetadataKey::ParquetFieldNestedIds.as_ref())]
+    fn test_create_table_v3_rejects_pre_existing_nested_ids(#[case] nested_ids_meta_key: &str) {
+        // The fixture's kernel schema already carries the chosen nested-ids key on the
         // `top` and `inner` StructFields, so feeding it through the V3 create path must
         // surface the pre-population error.
-        let schema = Arc::new(build_complex_nested_kernel_schema(
-            ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
-        ));
+        let schema = Arc::new(build_complex_nested_kernel_schema(nested_ids_meta_key));
         let mut validated = validate_extract_table_features_and_properties(HashMap::from([(
             ENABLE_ICEBERG_COMPAT_V3.to_string(),
             "true".to_string(),
         )]))
         .unwrap();
-        maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
-        let err = maybe_apply_column_mapping_for_table_create(&schema, &mut validated).unwrap_err();
+        let pre_cm = maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
+        let err = maybe_apply_column_mapping_for_table_create(&schema, &mut validated, pre_cm)
+            .unwrap_err();
         assert!(
             err.to_string().contains("has pre-populated"),
             "expected pre-populated metadata error, got: {err}",
+        );
+    }
+
+    /// Listing IcebergCompatV3 in writerFeatures (i.e. "supported") without setting
+    /// `delta.enableIcebergCompatV3=true` does NOT activate V3 behavior: column mapping is
+    /// applied per the explicit property, but no nested ids are stamped on Array/Map fields.
+    #[test]
+    fn test_create_table_v3_supported_but_not_enabled_skips_nested_ids() {
+        let schema = build_iceberg_compat_v3_test_schema();
+        // Explicit CM mode "name", but V3 is NOT enabled (no delta.enableIcebergCompatV3=true).
+        let mut validated = validate_extract_table_features_and_properties(HashMap::from([(
+            COLUMN_MAPPING_MODE.to_string(),
+            "name".to_string(),
+        )]))
+        .unwrap();
+        let pre_cm = maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
+        let (effective_schema, mode) =
+            maybe_apply_column_mapping_for_table_create(&schema, &mut validated, pre_cm).unwrap();
+        assert_eq!(mode, ColumnMappingMode::Name);
+
+        // Top-level Map field gets CM id + physicalName but no nested-ids metadata under
+        // either the canonical or the legacy key.
+        let top = effective_schema.field("top").expect("missing field top");
+        assert!(
+            !top.metadata()
+                .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref()),
+            "top should not carry delta.columnMapping.nested.ids when V3 is not enabled",
+        );
+        assert!(
+            !top.metadata()
+                .contains_key(ColumnMetadataKey::ParquetFieldNestedIds.as_ref()),
+            "top should not carry parquet.field.nested.ids when V3 is not enabled",
         );
     }
 

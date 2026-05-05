@@ -266,11 +266,15 @@ pub(crate) fn get_column_mapping_mode_from_properties(
 ///   "delta.columnMapping.physicalName": "<pname>",
 ///   "delta.columnMapping.nested.ids": {
 ///     "<pname>.key":         2,
-///     "<pname>.key.element": 3,
-///     "<pname>.value":       4
+///     "<pname>.value":       3,
+///     "<pname>.key.element": 4
 ///   }
 /// }
 /// ```
+///
+/// Note the assignment order: the Map walker stamps both `<pname>.key` and `<pname>.value` ids
+/// first, then recurses into the key/value subtypes (here, `<pname>.key.element` for the inner
+/// list).
 ///
 /// `max_id` ends at `4`. With `with_nested_ids = false` the same field gets only the CM
 /// metadata and `max_id` ends at `1`:
@@ -302,8 +306,8 @@ pub(crate) fn assign_column_mapping_metadata(
 ///
 /// # Errors
 ///
-/// - Field carries a pre-existing `delta.columnMapping.id` or `delta.columnMapping.physicalName`
-///   annotation.
+/// - Field carries a pre-existing `delta.columnMapping.id`, `delta.columnMapping.physicalName`,
+///   `delta.columnMapping.nested.ids`, or `parquet.field.nested.ids` annotation.
 pub(crate) fn try_assign_field_column_mapping(
     field: &StructField,
     max_id: &mut i64,
@@ -360,24 +364,43 @@ pub(crate) fn try_assign_field_column_mapping(
     Ok(new_field)
 }
 
-/// Returns the largest `delta.columnMapping.id` found anywhere in `schema`, including nested
-/// data types. Returns `None` if no field carries a column mapping ID.
+/// Returns the largest column mapping id found anywhere in `schema`. This includes both
+/// per-field `delta.columnMapping.id` annotations and the nested ids in
+/// `delta.columnMapping.nested.ids` metadata.
 pub(crate) fn find_max_column_id_in_schema(schema: &StructType) -> Option<i64> {
     let mut visitor = MaxColumnId(None);
     visitor.transform_struct(schema);
     visitor.0
 }
 
-/// Visitor that walks a schema and records the largest `delta.columnMapping.id` seen on any
-/// field (including nested struct, array, map, and variant fields).
+/// Visitor that walks a schema and records the largest column mapping id seen on any field,
+/// counting both `delta.columnMapping.id` (per-field) and the integer values inside any
+/// `delta.columnMapping.nested.ids` JSON map (for element/key/value of Array/Map).
 struct MaxColumnId(Option<i64>);
+
+impl MaxColumnId {
+    fn observe(&mut self, n: i64) {
+        self.0 = Some(self.0.map_or(n, |prev| prev.max(n)));
+    }
+}
 
 impl<'a> SchemaTransform<'a> for MaxColumnId {
     transform_output_type!(|'a, T| ());
 
     fn transform_struct_field(&mut self, field: &'a StructField) {
         if let Some(n) = field.column_mapping_id() {
-            self.0 = Some(self.0.map_or(n, |prev| prev.max(n)));
+            self.observe(n);
+        }
+        // Nested-ids JSON holds ids for element/key/value of Array/Map.
+        if let Some(MetadataValue::Other(serde_json::Value::Object(obj))) = field
+            .metadata()
+            .get(ColumnMetadataKey::ColumnMappingNestedIds.as_ref())
+        {
+            for v in obj.values() {
+                if let Some(n) = v.as_i64() {
+                    self.observe(n);
+                }
+            }
         }
         // Recurse into the field's data type so we also visit nested struct/array/map members.
         self.recurse_into_struct_field(field)
@@ -1505,5 +1528,31 @@ mod tests {
         ));
         let schema = StructType::try_new(vec![field_with_id("v", variant, 4)]).unwrap();
         assert_eq!(find_max_column_id_in_schema(&schema), Some(23));
+    }
+
+    /// Nested-ids JSON entries (assigned to element/key/value of Array/Map) are real column-mapping
+    /// ids and must beat the per-field `delta.columnMapping.id` when larger.
+    #[test]
+    fn find_max_column_id_picks_up_nested_ids_metadata() {
+        let mut field = field_with_id(
+            "m",
+            DataType::Map(Box::new(MapType::new(
+                DataType::INTEGER,
+                DataType::INTEGER,
+                false,
+            ))),
+            1,
+        );
+        field.metadata.insert(
+            ColumnMetadataKey::ColumnMappingNestedIds
+                .as_ref()
+                .to_string(),
+            MetadataValue::Other(serde_json::json!({
+                "m.key":   2,
+                "m.value": 99,
+            })),
+        );
+        let schema = StructType::try_new(vec![field]).unwrap();
+        assert_eq!(find_max_column_id_in_schema(&schema), Some(99));
     }
 }
