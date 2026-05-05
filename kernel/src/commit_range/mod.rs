@@ -30,13 +30,12 @@
 mod actions;
 mod builder;
 
-pub use actions::{CommitActions, DeltaAction};
-pub use builder::CommitRangeBuilder;
-
 use std::collections::HashSet;
 use std::slice;
 use std::sync::Arc;
 
+pub use actions::{CommitActions, DeltaAction};
+pub use builder::{CommitOrdering, CommitRangeBuilder};
 use url::Url;
 
 use crate::actions::{
@@ -44,7 +43,6 @@ use crate::actions::{
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::expressions::Expression;
-use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
@@ -75,13 +73,15 @@ pub enum CommitBoundary {
 
 /// A plan over a contiguous range of Delta commits.
 ///
-/// `CommitRange` holds resolved `[start_version, end_version]` bounds plus the listed
-/// commit-file metadata in a [`LogSegment`]. It does not own a snapshot. Reading the
-/// underlying actions is lazy via [`CommitRange::commits`].
+/// `CommitRange` holds resolved `[start_version, end_version]` bounds plus the materialized
+/// commit-file pointers in `commit_files`. The pointer order matches the
+/// [`CommitOrdering`] requested at build time (ascending by default; reversed if
+/// `DescendingOrder`). It does not own a snapshot. Reading the underlying actions is
+/// lazy via [`CommitRange::commits`].
 #[derive(Debug)]
 pub struct CommitRange {
     pub(crate) table_root: Url,
-    pub(crate) log_segment: LogSegment,
+    pub(crate) commit_files: Vec<ParsedLogPath>,
     pub(crate) start_version: Version,
     pub(crate) end_version: Version,
     pub(crate) start_boundary: CommitBoundary,
@@ -108,8 +108,7 @@ impl CommitRange {
         snapshot: SnapshotRef,
         start_boundary: CommitBoundary,
     ) -> CommitRangeBuilder {
-        let _ = (snapshot, start_boundary);
-        todo!("CommitRange::builder_from")
+        CommitRangeBuilder::new_from(snapshot, start_boundary)
     }
 
     /// First version (inclusive) in the range.
@@ -146,10 +145,6 @@ impl CommitRange {
     /// the set are dropped during projection by the engine. No auto-injection of
     /// `protocol` or `commitInfo` happens here — protocol validation and ICT resolution
     /// are the caller's responsibility.
-    ///
-    /// The returned iterator owns its dependencies (an `Arc<dyn JsonHandler>` cloned from
-    /// `engine`, an owned `Vec<ParsedLogPath>` cloned from the log segment), so it does
-    /// not borrow from `&self` or `&engine` after this call returns.
     pub fn commits(
         &self,
         engine: &dyn Engine,
@@ -158,7 +153,7 @@ impl CommitRange {
         let action_kinds: Vec<DeltaAction> = actions.iter().copied().collect();
         let read_schema = build_read_schema(&action_kinds);
         let json_handler = engine.json_handler();
-        let commit_files = self.log_segment.listed.ascending_commit_files().clone();
+        let commit_files = self.commit_files.clone();
 
         commit_files
             .into_iter()
@@ -332,7 +327,7 @@ mod tests {
     #[test]
     fn commits_yields_one_per_commit_in_range() {
         let (range, engine) = open_test_range();
-        let files = range.log_segment.listed.ascending_commit_files();
+        let files = &range.commit_files;
         assert_eq!(
             files.len(),
             2,
@@ -475,7 +470,7 @@ mod tests {
     #[test]
     fn actions_yields_metadata_columns_prepended() {
         let (range, engine) = open_test_range();
-        let files = range.log_segment.listed.ascending_commit_files().clone();
+        let files = range.commit_files.clone();
 
         let actions = HashSet::from([DeltaAction::Add, DeltaAction::Remove]);
         let mut visitor = ActionsTaggedVisitor::default();

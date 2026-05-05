@@ -2,7 +2,7 @@
 //! [`CommitActions`] — per-commit handle exposing version, timestamp, and a lazy
 //! iterator over the commit's action batches.
 
-use crate::{DeltaResult, EngineData, FileDataReadResultIterator, Version};
+use crate::{FileDataReadResultIterator, Version};
 
 /// A Delta log action kind.
 ///

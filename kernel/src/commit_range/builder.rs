@@ -3,7 +3,7 @@ use url::Url;
 use crate::commit_range::{CommitBoundary, CommitRange};
 use crate::log_segment::LogSegment;
 use crate::snapshot::SnapshotRef;
-use crate::{DeltaResult, Engine, Error, LogPath, Version};
+use crate::{DeltaResult, Engine, Error, Version};
 
 /// Builder for a [`CommitRange`].
 ///
@@ -15,15 +15,16 @@ use crate::{DeltaResult, Engine, Error, LogPath, Version};
 /// A snapshot is required when any boundary is [`CommitBoundary::Timestamp`]. Path-based
 /// builders that want to use timestamp boundaries should use [`CommitRange::builder_from`]
 /// instead, which captures the snapshot at construction time.
-#[derive(Debug)]
+///
+/// TODO: support UC catalog commit via with_log_tail(self, Vec<LogPath>) and
+/// with_max_catalog_version(self, Version)
+//#[derive(Debug)]
 pub struct CommitRangeBuilder {
     pub(crate) table_root: String,
     pub(crate) start_boundary: CommitBoundary,
     pub(crate) end_boundary: Option<CommitBoundary>,
-    // pub(crate) snapshot: Option<SnapshotRef>,
-    // pub(crate) log_tail: Option<Vec<LogPath>>,
-    // pub(crate) max_catalog_version: Option<Version>,
-    // TODO: add commit ordering low_version->high_version or high_version->low_version
+    pub(crate) snapshot: Option<SnapshotRef>,
+    pub(crate) commit_ordering: CommitOrdering,
 }
 
 impl CommitRangeBuilder {
@@ -32,12 +33,19 @@ impl CommitRangeBuilder {
             table_root: table_root.as_ref().to_string(),
             start_boundary,
             end_boundary: None,
+            snapshot: None,
+            commit_ordering: CommitOrdering::AscendingOrder,
         }
     }
 
     pub(crate) fn new_from(snapshot: SnapshotRef, start_boundary: CommitBoundary) -> Self {
-        let _ = (&snapshot, &start_boundary);
-        todo!("CommitRangeBuilder::new_from")
+        CommitRangeBuilder {
+            table_root: snapshot.table_root().to_string(),
+            start_boundary,
+            end_boundary: None,
+            snapshot: Some(snapshot.clone()),
+            commit_ordering: CommitOrdering::AscendingOrder,
+        }
     }
 
     /// Pin the end of the range. Without this, the range extends to the latest committed
@@ -47,20 +55,9 @@ impl CommitRangeBuilder {
         self
     }
 
-    // Inject catalog-staged commits (e.g. Unity Catalog managed tables). These override
-    // published deltas at the same version when both exist.
-    //
-    // Mirrors the Java `CommitRangeBuilder.withLogData(...)` API.
-    pub fn with_log_tail(self, _log_tail: Vec<LogPath>) -> Self {
-        todo!("CommitRangeBuilder::with_log_tail")
-    }
-
-    /// Cap the resolved end version at `version`. Validated against the resolved end
-    /// boundary at build time.
-    ///
-    /// Mirrors the Java `CommitRangeBuilder.withMaxCatalogVersion(...)` API.
-    pub fn with_max_catalog_version(self, _version: Version) -> Self {
-        todo!("CommitRangeBuilder::with_max_catalog_version")
+    pub fn with_ordering(mut self, commit_ordering: CommitOrdering) -> Self {
+        self.commit_ordering = commit_ordering;
+        self
     }
 
     /// Resolve boundaries, list `_delta_log/`, validate contiguity, and produce a
@@ -81,23 +78,30 @@ impl CommitRangeBuilder {
             CommitBoundary::Version(v) => v,
         });
 
-        let log_segment = LogSegment::for_table_changes(
-            engine.storage_handler().as_ref(),
-            log_root,
-            start_version,
-            end_version,
-        )?;
+        let log_segment = match &self.snapshot {
+            Some(snapshot) => snapshot.log_segment().clone(),
+            None => LogSegment::for_table_changes(
+                engine.storage_handler().as_ref(),
+                log_root,
+                start_version,
+                end_version,
+            )?,
+        };
         let end_version = log_segment.end_version;
+        // Extract the commit-file list from the log segment. The log segment is no longer
+        // needed after this point.
+        let mut commit_files = log_segment.listed.ascending_commit_files;
 
         validate_version_range(start_version, end_version)?;
-        validate_number_of_commit_files(
-            start_version,
-            end_version,
-            log_segment.listed.ascending_commit_files().len(),
-        )?;
+        validate_number_of_commit_files(start_version, end_version, commit_files.len())?;
+
+        if matches!(self.commit_ordering, CommitOrdering::DescendingOrder) {
+            commit_files.reverse();
+        }
+
         Ok(CommitRange {
             table_root,
-            log_segment,
+            commit_files,
             start_version,
             end_version,
             start_boundary: self.start_boundary,
@@ -109,6 +113,16 @@ impl CommitRangeBuilder {
     fn parse_table_root(table_root: &str) -> DeltaResult<Url> {
         crate::try_parse_uri(table_root)
     }
+}
+
+/// Direction in which [`CommitRange::commits`] / [`CommitRange::actions`] yield commits.
+/// Default is [`CommitOrdering::AscendingOrder`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitOrdering {
+    /// Yield commits in increasing version order (e.g. `v=0, v=1, v=2, ...`).
+    AscendingOrder,
+    /// Yield commits in decreasing version order (e.g. `v=N, v=N-1, ..., v=0`).
+    DescendingOrder,
 }
 
 /// Validate that `start_version <= end_version` when an end version is provided.
