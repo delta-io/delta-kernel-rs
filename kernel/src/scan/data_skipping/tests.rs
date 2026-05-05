@@ -393,30 +393,30 @@ fn test_timestamp_stats_enabled() {
 }
 
 #[test]
-fn test_adjust_stats_for_truncation() {
+fn test_adjust_scalar_for_max_stat_truncation() {
     // Timestamp: subtracts 999us
     assert_eq!(
-        adjust_stats_for_truncation(&Scalar::Timestamp(1_000_000)),
+        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(1_000_000)),
         Scalar::Timestamp(999_001)
     );
     // TimestampNtz: subtracts 999us
     assert_eq!(
-        adjust_stats_for_truncation(&Scalar::TimestampNtz(1_000_000)),
+        adjust_scalar_for_max_stat_truncation(&Scalar::TimestampNtz(1_000_000)),
         Scalar::TimestampNtz(999_001)
     );
     // Non-timestamp: unchanged
     assert_eq!(
-        adjust_stats_for_truncation(&Scalar::from(42i64)),
+        adjust_scalar_for_max_stat_truncation(&Scalar::from(42i64)),
         Scalar::from(42i64)
     );
     // Saturating at i64::MIN
     assert_eq!(
-        adjust_stats_for_truncation(&Scalar::Timestamp(i64::MIN)),
+        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(i64::MIN)),
         Scalar::Timestamp(i64::MIN)
     );
     // Near-zero: goes negative
     assert_eq!(
-        adjust_stats_for_truncation(&Scalar::Timestamp(500)),
+        adjust_scalar_for_max_stat_truncation(&Scalar::Timestamp(500)),
         Scalar::Timestamp(-499)
     );
 }

@@ -356,7 +356,7 @@ fn collect_junction_preds(
 /// higher than the stored (truncated) max.
 ///
 /// Non-timestamp values pass through unchanged.
-fn adjust_stats_for_truncation(val: &Scalar) -> Scalar {
+fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Scalar {
     match val {
         Scalar::Timestamp(micros) => Scalar::Timestamp(micros.saturating_sub(999)),
         Scalar::TimestampNtz(micros) => Scalar::TimestampNtz(micros.saturating_sub(999)),
@@ -422,7 +422,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     /// Compares a column's max stat against a literal value, adjusting for timestamp
     /// truncation on non-partition columns. Partition values are exact and not subject to
     /// JSON stats truncation, so no adjustment is needed. For data columns, the comparison
-    /// value is adjusted by [`adjust_stats_for_truncation`].
+    /// value is adjusted by [`adjust_scalar_for_max_stat_truncation`].
     fn partial_cmp_max_stat(
         &self,
         col: &ColumnName,
@@ -434,7 +434,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         if self.is_partition_column(col) {
             return self.eval_partial_cmp(ord, max, val, inverted);
         }
-        let adjusted = adjust_stats_for_truncation(val);
+        let adjusted = adjust_scalar_for_max_stat_truncation(val);
         self.eval_partial_cmp(ord, max, &adjusted, inverted)
     }
 

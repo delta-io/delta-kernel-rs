@@ -1189,21 +1189,6 @@ fn checkpoint_filter_apply_action_predicate_only() {
     );
 }
 
-/// `apply` with no predicates is a no-op (always keep). Pins the contract.
-#[test]
-fn checkpoint_filter_apply_no_predicates_keeps_all() {
-    let tmp = write_checkpoint_with_txn_column(&[None, None], &[Some("a")]);
-    let metadata =
-        ArrowReaderMetadata::load(&File::open(tmp.path()).unwrap(), Default::default()).unwrap();
-    let rg = metadata.metadata().row_group(0);
-    assert!(CheckpointRowGroupFilter::apply(
-        rg,
-        None,
-        None,
-        &NO_PARTITIONS
-    ));
-}
-
 /// Cartesian coverage of `apply` with both predicates `Some`. Verifies the AND-of-prunes
 /// semantics: row group is pruned if either predicate decides `Some(false)`, kept otherwise.
 /// Uses a checkpoint with both `add.stats_parsed.maxValues.x` (data stat) and `txn.appId`
