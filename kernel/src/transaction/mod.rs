@@ -904,6 +904,18 @@ impl<S: SupportsDataFiles> Transaction<S> {
         self.effective_table_config.partition_columns()
     }
 
+    /// Validates that the table's logical schema supports data writes.
+    ///
+    /// Called at the top of [`partitioned_write_context`](Self::partitioned_write_context) and
+    /// [`unpartitioned_write_context`](Self::unpartitioned_write_context), before any Parquet is
+    /// written, so connectors fail fast when the schema contains void placements that cannot
+    /// produce valid files (void inside Array/Map, all-void structs, all-void tables).
+    /// The commit-time check in [`commit`](Self::commit) remains as defense-in-depth for callers
+    /// that reach [`add_files`](Self::add_files) without going through a write context.
+    fn validate_for_data_write(&self) -> DeltaResult<()> {
+        validate_schema_for_write(&self.effective_table_config.logical_schema())
+    }
+
     /// Builds the [`SharedWriteState`] for a write context.
     fn shared_write_state(&self) -> DeltaResult<Arc<SharedWriteState>> {
         let table_config = &self.effective_table_config;
@@ -962,6 +974,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
+        self.validate_for_data_write()?;
         let shared = self.shared_write_state()?;
         require!(
             !shared.logical_partition_columns.is_empty(),
@@ -1010,6 +1023,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
+        self.validate_for_data_write()?;
         let shared = self.shared_write_state()?;
         require!(
             shared.logical_partition_columns.is_empty(),
