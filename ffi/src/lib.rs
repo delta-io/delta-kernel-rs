@@ -21,6 +21,7 @@ use url::Url;
 #[cfg(feature = "default-engine-base")]
 use {
     delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor,
+    delta_kernel::table_properties::{ParquetCompression, ParquetWriterConfig},
     std::collections::HashMap,
 };
 
@@ -482,7 +483,7 @@ pub struct EngineBuilder {
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
     /// If None, use the default single-threaded background executor.
     multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
-    parquet_writer_config: delta_kernel::table_properties::ParquetWriterConfig,
+    parquet_writer_config: ParquetWriterConfig,
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -598,7 +599,6 @@ pub unsafe extern "C" fn set_builder_parquet_compression(
     builder: &mut EngineBuilder,
     codec: KernelStringSlice,
 ) {
-    use delta_kernel::table_properties::{ParquetCompression, ParquetWriterConfig};
     if let Ok(s) = unsafe { String::try_from_slice(&codec) } {
         if let Ok(compression) = ParquetCompression::try_from(s.as_str()) {
             builder.parquet_writer_config = ParquetWriterConfig { compression };
@@ -682,7 +682,7 @@ fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
     executor_config: Option<MultithreadedExecutorConfig>,
-    parquet_writer_config: delta_kernel::table_properties::ParquetWriterConfig,
+    parquet_writer_config: ParquetWriterConfig,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel::engine::default::storage::store_from_url_opts;
@@ -1856,7 +1856,9 @@ mod tests {
         unsafe { set_builder_parquet_compression(builder, kernel_string_slice!(codec)) };
         assert_eq!(
             builder.parquet_writer_config,
-            ParquetWriterConfig { compression: ParquetCompression::Zstd },
+            ParquetWriterConfig {
+                compression: ParquetCompression::Zstd
+            },
             "unrecognized codec should leave config unchanged"
         );
         unsafe { drop(Box::from_raw(builder_ptr)) };

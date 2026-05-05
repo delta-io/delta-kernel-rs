@@ -221,8 +221,7 @@ pub struct TableProperties {
     /// to `"1.0.0"` when absent. Connectors read this to configure their Parquet writers.
     pub parquet_format_version: Option<String>,
 
-    /// The compression codec to use when writing Parquet data files.
-    /// If absent, the default codec for [`ParquetWriterConfig`] applies.
+    /// The compression codec to use when writing Parquet data files. Defaults to Zstd when absent.
     pub parquet_compression: Option<ParquetCompression>,
 
     /// Whether to enable [In-Commit Timestamps]. The in-commit timestamps writer feature strongly
@@ -259,7 +258,15 @@ impl TableProperties {
     /// Returns the [`ParquetWriterConfig`] derived from table properties.
     ///
     /// If `delta.parquet.compression.codec` is set, the returned config uses that codec.
-    /// Otherwise the [`ParquetWriterConfig`] default applies.
+    /// Otherwise defaults to Zstd.
+    ///
+    /// Connectors and engines should apply this config when writing Parquet data files so that
+    /// writes respect the table's configured compression. For example, when using
+    /// [`DefaultEngineBuilder`], pass the result to
+    /// [`DefaultEngineBuilder::with_parquet_writer_config`].
+    ///
+    /// [`DefaultEngineBuilder`]: crate::engine::default::DefaultEngineBuilder
+    /// [`DefaultEngineBuilder::with_parquet_writer_config`]: crate::engine::default::DefaultEngineBuilder::with_parquet_writer_config
     pub fn parquet_writer_config(&self) -> ParquetWriterConfig {
         ParquetWriterConfig {
             compression: self.parquet_compression.unwrap_or_default(),
@@ -328,9 +335,9 @@ pub enum IsolationLevel {
 
 /// Compression codec to use when writing Parquet files.
 ///
-/// String parsing is case-insensitive. Only `snappy`, `zstd`, and `uncompressed` are currently
-/// supported. Any other value (e.g. `gzip`, `lz4`, `brotli`) parsed from a table property is
-/// silently ignored and the default codec applies.
+/// String parsing is case-insensitive. Only `snappy`, `zstd`, and `uncompressed` are
+/// supported. Unrecognized values are ignored and [`TableProperties::parquet_compression`]
+/// is left unset.
 #[derive(Debug, EnumString, Clone, Copy, PartialEq, Eq, Default)]
 #[strum(ascii_case_insensitive)]
 pub enum ParquetCompression {

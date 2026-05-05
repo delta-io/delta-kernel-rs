@@ -192,12 +192,11 @@ fn sync_parquet_handler_with_config(config: ParquetWriterConfig) -> Box<dyn Parq
 /// Verifies that a configured [`ParquetWriterConfig`] controls the compression codec used for
 /// parquet writes. Covers both the default (async) and sync handlers.
 #[rstest]
-#[case(ParquetCompression::Snappy, Compression::SNAPPY)]
-#[case(ParquetCompression::Zstd, Compression::ZSTD(Default::default()))]
-#[case(ParquetCompression::Uncompressed, Compression::UNCOMPRESSED)]
+#[case(ParquetCompression::Snappy)]
+#[case(ParquetCompression::Zstd)]
+#[case(ParquetCompression::Uncompressed)]
 fn test_parquet_writer_config_controls_compression(
     #[case] kernel_compression: ParquetCompression,
-    #[case] expected_compression: Compression,
     #[values(default_parquet_handler_with_config, sync_parquet_handler_with_config)]
     make_handler: HandlerFactory,
 ) {
@@ -221,5 +220,5 @@ fn test_parquet_writer_config_controls_compression(
 
     let reader = SerializedFileReader::new(File::open(&file_path).unwrap()).unwrap();
     let actual_compression = reader.metadata().row_group(0).column(0).compression();
-    assert_eq!(actual_compression, expected_compression);
+    assert_eq!(actual_compression, Compression::from(kernel_compression));
 }

@@ -32,6 +32,7 @@ use crate::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use crate::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
 use crate::parquet::basic::Compression;
+use crate::parquet::file::properties::WriterProperties;
 use crate::schema::{SchemaRef, StructType};
 use crate::table_properties::{ParquetCompression, ParquetWriterConfig};
 use crate::transaction::WriteContext;
@@ -40,6 +41,16 @@ use crate::{
     ParquetHandler, PredicateRef,
 };
 
+impl From<ParquetCompression> for Compression {
+    fn from(c: ParquetCompression) -> Self {
+        match c {
+            ParquetCompression::Snappy => Compression::SNAPPY,
+            ParquetCompression::Zstd => Compression::ZSTD(Default::default()),
+            ParquetCompression::Uncompressed => Compression::UNCOMPRESSED,
+        }
+    }
+}
+
 /// Returns [`ArrowWriterOptions`] for kernel parquet writes.
 ///
 /// Sets the compression codec from the provided config and disables embedding of the
@@ -47,13 +58,8 @@ use crate::{
 /// the files compatible with pure-Parquet readers and is consistent with how kernel
 /// reads parquet files (which also skip Arrow schema metadata).
 pub(crate) fn writer_options(config: &ParquetWriterConfig) -> ArrowWriterOptions {
-    let compression = match config.compression {
-        ParquetCompression::Snappy => Compression::SNAPPY,
-        ParquetCompression::Zstd => Compression::ZSTD(Default::default()),
-        ParquetCompression::Uncompressed => Compression::UNCOMPRESSED,
-    };
-    let props = crate::parquet::file::properties::WriterProperties::builder()
-        .set_compression(compression)
+    let props = WriterProperties::builder()
+        .set_compression(config.compression.into())
         .build();
     ArrowWriterOptions::new()
         .with_properties(props)
@@ -831,14 +837,11 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case(ParquetCompression::Snappy, Compression::SNAPPY)]
-    #[case(ParquetCompression::Zstd, Compression::ZSTD(Default::default()))]
-    #[case(ParquetCompression::Uncompressed, Compression::UNCOMPRESSED)]
+    #[case(ParquetCompression::Snappy)]
+    #[case(ParquetCompression::Zstd)]
+    #[case(ParquetCompression::Uncompressed)]
     #[tokio::test]
-    async fn test_write_parquet_compression(
-        #[case] kernel_compression: ParquetCompression,
-        #[case] expected: Compression,
-    ) {
+    async fn test_write_parquet_compression(#[case] kernel_compression: ParquetCompression) {
         let store = Arc::new(InMemory::new());
         let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
             store.clone(),
@@ -872,7 +875,7 @@ mod tests {
             .metadata()
             .clone();
         let actual = metadata.row_group(0).column(0).compression();
-        assert_eq!(actual, expected);
+        assert_eq!(actual, Compression::from(kernel_compression));
     }
 
     #[tokio::test]
