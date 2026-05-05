@@ -30,9 +30,7 @@ use crate::scan::log_replay::{
     PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
-use crate::schema::void_utils::{
-    add_void_stripping, strip_void_from_schema, validate_schema_for_write,
-};
+use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
@@ -875,12 +873,10 @@ impl<S: SupportsDataFiles> Transaction<S> {
             let props = table_config.table_properties();
             let randomize_file_prefixes = props.should_randomize_file_prefixes();
             let random_prefix_length = props.random_prefix_length();
-            // Strip void fields from the physical write schema: they are never written to Parquet.
-            let physical_write_schema = table_config.physical_write_schema();
             Arc::new(SharedWriteState {
                 table_root: table_config.table_root().clone(),
                 logical_schema: table_config.logical_schema(),
-                physical_schema: Arc::new(strip_void_from_schema(&physical_write_schema)),
+                physical_schema: table_config.physical_write_schema(),
                 logical_to_physical: Arc::new(self.generate_logical_to_physical()),
                 column_mapping_mode: table_config.column_mapping_mode(),
                 stats_columns: self.stats_columns(),

@@ -23,6 +23,7 @@ use crate::scan::data_skipping::stats_schema::{
 };
 use crate::schema::validation::validate_iceberg_compat_v3_no_legacy_nested_id;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
+use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
     column_mapping_mode, get_any_level_column_physical_name,
@@ -474,15 +475,17 @@ impl TableConfiguration {
     ///
     /// When [`should_materialize_partition_columns`] is true, returns the full physical schema
     /// (partition columns are materialized in data files). Otherwise, returns the physical
-    /// schema with partition columns excluded.
+    /// schema with partition columns excluded. Void columns are always stripped from the
+    /// returned schema, since they are never written to Parquet.
     ///
     /// [`should_materialize_partition_columns`]: Self::should_materialize_partition_columns
     pub(crate) fn physical_write_schema(&self) -> SchemaRef {
-        if self.should_materialize_partition_columns() {
+        let with_partition_cols = if self.should_materialize_partition_columns() {
             self.physical_schema()
         } else {
             self.physical_data_schema_without_partition_columns()
-        }
+        };
+        Arc::new(strip_void_from_schema(&with_partition_cols))
     }
 
     /// The [`TableProperties`] of this table at this version.
