@@ -20,11 +20,19 @@ use crate::{DeltaResult, Error, Expression};
 /// it does not recurse into nested structs, because the caller (`ValidateForWrite`) walks every
 /// struct in the schema and applies this predicate at each level. Empty structs also qualify
 /// (they would produce an unwriteable empty Parquet struct).
+///
+/// This predicate is the validator's responsibility, not the stripper's. The stripper could
+/// derive a reduced physical schema for an all-void struct, but write semantics require
+/// rejecting the schema before that derivation happens.
 fn has_no_non_void_fields(st: &StructType) -> bool {
     st.fields().all(|f| *f.data_type() == DataType::VOID)
 }
 
-/// Schema visitor that drops void fields at every nesting level inside structs.
+/// Schema visitor that drops void fields at every nesting level.
+///
+/// This is intentionally separate from `ValidateForWrite`: validation decides whether a
+/// logical write schema is allowed, while this transform derives the physical schema used
+/// for Parquet writes, including metadata-only paths.
 struct StripVoidFields;
 
 impl<'a> SchemaTransform<'a> for StripVoidFields {

@@ -500,8 +500,11 @@ impl NullTypeTag {
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
-                // Void has no dedicated tag; engines should not receive void-typed literal nulls
-                // across the FFI boundary, so we map it to NonPrimitive.
+                // Void has no dedicated FFI tag. The current predicate-construction path is
+                // not expected to produce a void-typed literal null; if one ever reaches this
+                // code we want it represented as a non-primitive null rather than a missing
+                // case, so this arm is a defensive fallback rather than part of the normal
+                // void-column path.
                 PrimitiveType::Void => (Self::NonPrimitive, 0, 0),
             },
             _ => (Self::NonPrimitive, 0, 0),
