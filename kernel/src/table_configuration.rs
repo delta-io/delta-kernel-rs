@@ -2290,6 +2290,49 @@ mod test {
     }
 
     #[test]
+    fn test_physical_write_schema_strips_void_columns() {
+        // Pins the invariant that `physical_write_schema()` strips void columns from the
+        // returned schema (top level and nested), so callers receive a Parquet-writable
+        // schema without needing to apply `strip_void_from_schema` themselves.
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("v", DataType::VOID),
+            StructField::nullable(
+                "s",
+                StructType::new_unchecked([
+                    StructField::nullable("a", DataType::INTEGER),
+                    StructField::nullable("nested_void", DataType::VOID),
+                ]),
+            ),
+        ]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(Vec::<TableFeature>::new()),
+            Some(Vec::<TableFeature>::new()),
+        )
+        .unwrap();
+        let config =
+            TableConfiguration::try_new(metadata, protocol, Url::try_from("file:///").unwrap(), 0)
+                .unwrap();
+
+        let write_schema = config.physical_write_schema();
+
+        // Top-level void is dropped.
+        let top_names: Vec<&str> = write_schema.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(top_names, vec!["id", "s"]);
+
+        // Nested void is also dropped, leaving only `a` inside `s`.
+        let s_field = write_schema.field("s").expect("s present after strip");
+        let DataType::Struct(s_inner) = s_field.data_type() else {
+            panic!("s should still be a struct");
+        };
+        let s_names: Vec<&str> = s_inner.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(s_names, vec!["a"]);
+    }
+
+    #[test]
     fn test_iceberg_compat_v3_write_supported() {
         let config = create_mock_table_config_with_cm(
             &[

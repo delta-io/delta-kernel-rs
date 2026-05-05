@@ -816,15 +816,17 @@ mod tests {
         assert!(max_col.is_null(0));
     }
 
-    #[test]
-    fn test_collect_stats_void_column_synthesizes_full_null_count() {
-        // A void column reaches stats only if a connector or direct caller bypasses the
-        // kernel-side physical write schema, which strips void columns. Even so, we must
-        // publish nullCount = numRecords rather than 0, because `NullArray` has no null
-        // buffer and the inherited `Array::null_count` default returns 0. Min/max are not
-        // meaningful for void.
+    // A void column reaches stats only if a connector or direct caller bypasses the
+    // kernel-side physical write schema, which strips void columns. Even so, we must
+    // publish nullCount = numRecords rather than 0, because `NullArray` has no null
+    // buffer and the inherited `Array::null_count` default returns 0. Min/max are not
+    // meaningful for void.
+    #[rstest::rstest]
+    #[case::non_empty(5)]
+    #[case::empty(0)]
+    fn test_collect_stats_void_column_synthesizes_full_null_count(#[case] length: usize) {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Null, true)]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(5))]).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(length))]).unwrap();
 
         let stats = collect_stats(&batch, &[column_name!("v")]).unwrap();
 
@@ -840,7 +842,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(v_null_count.value(0), 5);
+        assert_eq!(v_null_count.value(0), length as i64);
 
         // Void columns do not participate in min/max stats. With void as the only stats
         // column, both struct accumulators stay empty and the fields are omitted entirely.
