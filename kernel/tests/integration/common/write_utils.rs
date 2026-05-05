@@ -72,7 +72,7 @@ pub fn load_existing_single_file_checkpoint_path(
 }
 
 /// Open a parquet file and return its root schema.
-fn read_parquet_root_schema(parquet_file: &std::path::Path) -> ParquetType {
+pub fn read_parquet_root_schema(parquet_file: &std::path::Path) -> ParquetType {
     let file = std::fs::File::open(parquet_file).unwrap();
     let reader = SerializedFileReader::new(file).unwrap();
     reader
