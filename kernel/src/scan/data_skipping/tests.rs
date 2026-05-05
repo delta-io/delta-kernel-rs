@@ -421,142 +421,6 @@ fn test_adjust_scalar_for_max_stat_truncation() {
     );
 }
 
-// Verifies the guarded checkpoint skipping predicate:
-// - Prunes when stats are present and below threshold
-// - Keeps when stats are present and above threshold
-// - Conservatively keeps when stats are null (IS NULL guard fires)
-#[rstest]
-#[case::stats_below_threshold(Scalar::from(50), FALSE, "max=50, col>100 should skip")]
-#[case::stats_above_threshold(Scalar::from(150), TRUE, "max=150, col>100 should keep")]
-#[case::stats_null(
-    Scalar::Null(DataType::INTEGER),
-    TRUE,
-    "null max should keep (IS NULL guard)"
-)]
-fn test_checkpoint_skipping_semantic(
-    #[case] max_val: Scalar,
-    #[case] expected: Option<bool>,
-    #[case] description: &str,
-) {
-    let pred = Pred::gt(column_expr!("x"), Scalar::from(100));
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
-    let resolver = HashMap::from_iter([(column_name!("maxValues.x"), max_val)]);
-    let filter = DefaultKernelPredicateEvaluator::from(resolver);
-    expect_eq!(filter.eval(&skipping_pred), expected, "{description}");
-}
-
-// Verifies that the IS NULL guard changes behavior compared to a regular data skipping predicate:
-// without the guard, null stats produce NULL (unknown); with the guard, they produce TRUE (keep).
-#[test]
-fn test_checkpoint_skipping_null_guard_vs_regular() {
-    let pred = Pred::gt(column_expr!("x"), Scalar::from(100));
-    let resolver =
-        HashMap::from_iter([(column_name!("maxValues.x"), Scalar::Null(DataType::INTEGER))]);
-    let filter = DefaultKernelPredicateEvaluator::from(resolver);
-
-    let guarded = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
-    expect_eq!(
-        filter.eval(&guarded),
-        TRUE,
-        "guarded pred with null stats -> TRUE (keep)"
-    );
-
-    let regular = as_data_skipping_predicate(&pred).unwrap();
-    expect_eq!(
-        filter.eval(&regular),
-        NULL,
-        "regular pred with null stats -> NULL (unknown)"
-    );
-}
-
-// Verifies that a conjunction can still prune when one column has null stats but the other
-// column's stats are sufficient. For `col_a > 100 AND col_b < 50`, the guarded predicate is:
-//
-//   AND(
-//     OR(maxValues.col_a IS NULL, maxValues.col_a > 100),
-//     OR(minValues.col_b IS NULL, minValues.col_b < 50)
-//   )
-//
-// Even if col_a's stats are null, col_b's stats alone can prune the row group.
-#[test]
-fn test_checkpoint_skipping_conjunction_partial_null_stats() {
-    let pred = Pred::and(
-        Pred::gt(column_expr!("col_a"), Scalar::from(100)),
-        Pred::lt(column_expr!("col_b"), Scalar::from(50)),
-    );
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
-
-    // Both stats present and both allow pruning -> skip
-    let resolver = HashMap::from_iter([
-        (column_name!("maxValues.col_a"), Scalar::from(50)),
-        (column_name!("minValues.col_b"), Scalar::from(60)),
-    ]);
-    let filter = DefaultKernelPredicateEvaluator::from(resolver);
-    expect_eq!(
-        filter.eval(&skipping_pred),
-        FALSE,
-        "both cols prunable -> skip"
-    );
-
-    // col_a stats null, but col_b stats alone are enough to prune -> still skip
-    let resolver = HashMap::from_iter([
-        (
-            column_name!("maxValues.col_a"),
-            Scalar::Null(DataType::INTEGER),
-        ),
-        (column_name!("minValues.col_b"), Scalar::from(60)),
-    ]);
-    let filter = DefaultKernelPredicateEvaluator::from(resolver);
-    expect_eq!(
-        filter.eval(&skipping_pred),
-        FALSE,
-        "col_a null but col_b prunable -> still skip"
-    );
-
-    // col_a stats null and col_b doesn't allow pruning -> keep
-    let resolver = HashMap::from_iter([
-        (
-            column_name!("maxValues.col_a"),
-            Scalar::Null(DataType::INTEGER),
-        ),
-        (column_name!("minValues.col_b"), Scalar::from(30)),
-    ]);
-    let filter = DefaultKernelPredicateEvaluator::from(resolver);
-    expect_eq!(
-        filter.eval(&skipping_pred),
-        TRUE,
-        "col_a null and col_b not prunable -> keep"
-    );
-}
-
-// Verifies the null-guarded checkpoint skipping path also applies the 999us timestamp
-// truncation adjustment to max stat comparisons.
-#[rstest]
-fn test_checkpoint_skipping_timestamp_adjustment(
-    #[values(Scalar::Timestamp(1_000_000), Scalar::TimestampNtz(1_000_000))] timestamp: Scalar,
-) {
-    let col = &column_expr!("ts_col");
-
-    // GT: should produce OR(maxValues.ts_col IS NULL, maxValues.ts_col > 999001)
-    let pred = Pred::gt(col.clone(), timestamp.clone());
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
-    assert_eq!(
-        skipping_pred.to_string(),
-        "OR(Column(maxValues.ts_col) IS NULL, Column(maxValues.ts_col) > 999001)"
-    );
-
-    // EQ: max stat leg should use adjusted literal
-    let pred = Pred::eq(col.clone(), timestamp.clone());
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]).unwrap();
-    assert_eq!(
-        skipping_pred.to_string(),
-        "AND(OR(Column(minValues.ts_col) IS NULL, NOT(Column(minValues.ts_col) > 1000000)), \
-         OR(Column(maxValues.ts_col) IS NULL, NOT(Column(maxValues.ts_col) < 999001)))"
-    );
-}
-
-// Timestamp predicates use max stats with a 999us adjustment to account for millisecond
-// truncation in Delta JSON stats.
 #[rstest]
 fn test_timestamp_predicates_use_adjusted_max_stats(
     #[values(Scalar::Timestamp(1_000_000), Scalar::TimestampNtz(1_000_000))] timestamp: Scalar,
@@ -1078,20 +942,6 @@ fn multiple_partition_columns_rewrite_and_evaluation() {
     );
 }
 
-// Without normalization, `AND([unknown])` would become `AND([NULL])` via
-// `collect_junction_preds`, which evaluates to `Some(false)` under `eval_sql_where` and
-// incorrectly prunes all row groups. The junction constructor normalizes `AND([unknown])`
-// to just `unknown`, which correctly returns `None` (no pushdown).
-#[test]
-fn single_unsupported_pred_in_junction_disables_checkpoint_pushdown() {
-    let pred = Pred::and_from([Pred::unknown("unsupported")]);
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[]);
-    assert!(
-        skipping_pred.is_none(),
-        "Single unsupported predicate in a junction should disable pushdown, got: {skipping_pred:?}"
-    );
-}
-
 // -- Integration tests: end-to-end data skipping with real tables -------------------
 //
 // Two test tables are used:
@@ -1265,9 +1115,8 @@ fn parsed_stats_skipping() {
     assert_eq!(count_selected(STATS_TABLE, pred), 2);
 }
 
-// -- Timestamp predicate skipping (parsed-stats table) ------------------------
-// Timestamp predicates now use max stats with a 999us adjustment for truncation.
-// Table has 6 files with ts_col ranges: [1M,2M], [3M,4M], [5M,6M], [7M,8M], [9M,10M], [11M,12M]
+// -- Timestamp predicate handling (parsed-stats table) ------------------------
+// Timestamp max stats use adjustment (-999us) to account for millisecond truncation.
 
 #[rstest]
 #[case::bare_ts_gt_keeps_all(

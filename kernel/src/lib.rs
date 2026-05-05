@@ -75,6 +75,7 @@ extern crate self as delta_kernel;
 
 use std::any::Any;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fs::DirEntry;
 use std::ops::Range;
 use std::sync::Arc;
@@ -848,6 +849,31 @@ pub trait ParquetHandler: AsAny {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
+
+    /// Read checkpoint or sidecar parquet files, with checkpoint-aware row group skipping.
+    ///
+    /// `predicate` is a user data predicate with physical column names; the engine evaluates it
+    /// against checkpoint-internal stat columns (`add.stats_parsed.*`,
+    /// `add.partitionValues_parsed.*`). `action_predicate` references top-level
+    /// action-identifier columns only (e.g. `txn.appId IS NOT NULL`) and MUST be evaluated on a
+    /// separate path from `predicate`, because user column paths can alias Delta action leaves.
+    /// `partition_columns` lists physical partition column names so the engine can distinguish
+    /// partition-value stats from data column stats.
+    ///
+    /// The default impl drops all three and forwards `None` to
+    /// [`read_parquet_files`](Self::read_parquet_files); engines that want row group skipping on
+    /// checkpoints must override this method.
+    fn read_checkpoint_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        action_predicate: Option<PredicateRef>,
+        partition_columns: &HashSet<String>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        let _ = (predicate, action_predicate, partition_columns);
+        self.read_parquet_files(files, physical_schema, None)
+    }
 
     /// Write data to a Parquet file at the specified URL.
     ///

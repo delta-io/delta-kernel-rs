@@ -1,5 +1,6 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
+use std::collections::HashSet;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
@@ -644,52 +645,47 @@ impl LogSegment {
             .collect()
     }
 
-    /// Read a stream of actions from this log segment. This returns an iterator of
-    /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
-    /// the data was read from a commit file (true) or a checkpoint file (false).
+    /// Read a stream of actions from this log segment. Returns an iterator of [`ActionsBatch`]s
+    /// (EngineData + a boolean flag indicating whether the data was read from a commit file
+    /// (true) or a checkpoint file (false)), along with `CheckpointReadInfo` describing
+    /// stats_parsed compatibility and the checkpoint schema.
     ///
-    /// The log files will be read from most recent to oldest.
+    /// The log files will be read from most recent to oldest. The engine data returned may
+    /// include extra non-log actions (e.g. sidecar actions) that are not part of the schema --
+    /// this is an implementation detail and may change.
     ///
-    /// `commit_read_schema` is the (physical) schema to read the commit files with, and
-    /// `checkpoint_read_schema` is the (physical) schema to read checkpoint files with. This can be
-    /// used to project the log files to a subset of the columns. Having two different
-    /// schemas can be useful as a cheap way of doing additional filtering on the checkpoint files
-    /// (e.g. filtering out remove actions).
+    /// # Parameters
     ///
-    ///  The engine data returned might have extra non-log actions (e.g. sidecar
-    ///  actions) that are not part of the schema but this is an implementation
-    ///  detail that should not be relied on and will likely change.
-    ///
-    /// Read a stream of actions from this log segment. This returns an iterator of
-    /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
-    /// the data was read from a commit file (true) or a checkpoint file (false).
-    ///
-    /// Also returns `CheckpointReadInfo` with stats_parsed compatibility and the checkpoint schema.
-    ///
-    /// `meta_predicate` is an optional expression for row group skipping in checkpoint parquet
-    /// files. It is _NOT_ the query's data predicate, but a hint for skipping irrelevant data.
-    /// IS NOT NULL predicates are automatically derived from `checkpoint_read_schema` and combined
-    /// (AND) with `meta_predicate`, so callers only need to supply query-based skipping predicates.
+    /// - `commit_read_schema`: physical schema to read commit files with.
+    /// - `checkpoint_read_schema`: physical schema to read checkpoint files with. Two schemas allow
+    ///   additional filtering of checkpoint files (e.g. skipping remove actions).
+    /// - `meta_predicate`: optional physical user data predicate. Forwarded to
+    ///   `ParquetHandler::read_checkpoint_parquet_files` for checkpoint-aware row group skipping
+    ///   via stat columns under `add.stats_parsed.*` and `add.partitionValues_parsed.*`.
+    /// - `partition_columns`: physical names of the table's partition columns. Forwarded to
+    ///   `ParquetHandler::read_checkpoint_parquet_files` to enable partition-aware row group
+    ///   skipping on checkpoint files.
+    /// - `stats_schema` / `partition_schema`: augment the checkpoint read schema with
+    ///   `stats_parsed` / `partitionValues_parsed` when present, enabling data-skipping on those
+    ///   typed columns.
     #[internal_api]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
+        partition_columns: HashSet<String>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        // Combine schema-derived IS NOT NULL predicate with any caller-supplied predicate so
-        // checkpoint parquet row groups without any relevant action type can be skipped.
-        // TODO: The semantics of `meta_predicate` will change in a follow-up PR.
-        let is_not_null_pred = schema_to_is_not_null_predicate(&checkpoint_read_schema);
-        let effective_predicate = match (is_not_null_pred, meta_predicate) {
-            (None, x) | (x, None) => x,
-            (Some(a), Some(b)) => Some(Arc::new(Predicate::and((*a).clone(), (*b).clone()))),
-        };
+        // The schema-derived IS NOT NULL predicate references only top-level action-identifier
+        // columns. Pass it to the engine on a separate channel from the user predicate so that
+        // user column paths can never alias to Delta action leaves.
+        let action_predicate = schema_to_is_not_null_predicate(&checkpoint_read_schema);
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
@@ -698,7 +694,9 @@ impl LogSegment {
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
             checkpoint_read_schema,
-            effective_predicate,
+            meta_predicate,
+            action_predicate,
+            partition_columns,
             stats_schema,
             partition_schema,
         )?;
@@ -723,6 +721,7 @@ impl LogSegment {
             action_schema.clone(),
             action_schema,
             None,
+            HashSet::new(),
             None,
             None,
         )?;
@@ -867,11 +866,14 @@ impl LogSegment {
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
     ///
     /// Returns a tuple of the actions iterator and [`CheckpointReadInfo`].
+    #[allow(clippy::too_many_arguments)]
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
+        action_predicate: Option<PredicateRef>,
+        partition_columns: HashSet<String>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
     ) -> DeltaResult<
@@ -966,23 +968,26 @@ impl LogSegment {
 
         let parquet_handler = engine.parquet_handler();
 
-        // Historically, we had a shared file reader trait for JSON and Parquet handlers,
-        // but it was removed to avoid unnecessary coupling. This is a concrete case
-        // where it *could* have been useful, but for now, we're keeping them separate.
-        // If similar patterns start appearing elsewhere, we should reconsider that decision.
         let actions = match self.listed.checkpoint_parts.first() {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
+                // JSON checkpoints don't do parquet row group skipping. Only `action_predicate`
+                // (top-level action-identifier columns) is meaningful to forward, since
+                // `meta_predicate` references user data columns whose physical names don't
+                // resolve under the JSON checkpoint's nested layout. Most JSON handlers ignore
+                // the predicate anyway.
                 engine.json_handler().read_json_files(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
-                    meta_predicate.clone(),
+                    action_predicate.clone(),
                 )?
             }
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
-                .read_parquet_files(
+                .read_checkpoint_parquet_files(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
+                    action_predicate.clone(),
+                    &partition_columns,
                 )?,
             Some(parsed_log_path) => {
                 return Err(Error::generic(format!(
@@ -1000,10 +1005,12 @@ impl LogSegment {
         // Both checkpoint and sidecar parquet files share the same `add.stats_parsed.*` column
         // layout, so we reuse the same predicate for row group skipping.
         let sidecar_batches = if !sidecar_files.is_empty() {
-            parquet_handler.read_parquet_files(
+            parquet_handler.read_checkpoint_parquet_files(
                 &sidecar_files,
                 augmented_checkpoint_read_schema.clone(),
                 meta_predicate,
+                action_predicate,
+                &partition_columns,
             )?
         } else {
             Box::new(std::iter::empty())
