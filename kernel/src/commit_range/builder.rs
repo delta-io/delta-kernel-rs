@@ -1,6 +1,6 @@
 use url::Url;
 
-use super::commit_range::{CommitBoundary, CommitRange};
+use crate::commit_range::{CommitBoundary, CommitRange};
 use crate::log_segment::LogSegment;
 use crate::snapshot::SnapshotRef;
 use crate::{DeltaResult, Engine, Error, LogPath, Version};
