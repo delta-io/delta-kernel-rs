@@ -94,16 +94,12 @@ pub(crate) fn lookup_nested_field_id(
     let Some(value) = field.metadata().get(key) else {
         return Ok(None);
     };
-    let obj = match value {
-        MetadataValue::Other(serde_json::Value::Object(obj)) => Some(obj),
-        _ => None,
-    }
-    .ok_or_else(|| {
-        ArrowError::SchemaError(format!(
+    let MetadataValue::Other(serde_json::Value::Object(obj)) = value else {
+        return Err(ArrowError::SchemaError(format!(
             "'{key}' on field '{}' must be a JSON object",
             field.name()
-        ))
-    })?;
+        )));
+    };
     // Missing entry returns Ok(None) rather than Err. The JSON map's keys are rooted at the
     // *physical* field name, so when this function is invoked on a logical schema, it's
     // expected that the lookup misses.
