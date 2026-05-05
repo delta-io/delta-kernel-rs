@@ -818,11 +818,11 @@ mod tests {
 
     #[test]
     fn test_collect_stats_void_column_synthesizes_full_null_count() {
-        // A void column reaches stats only if a connector bypasses the kernel-side strip
-        // (`Transaction::shared_write_state` removes void from the physical write schema
-        // today). Even so, we must publish nullCount = numRecords rather than 0, because
-        // `NullArray` has no null buffer and the inherited `Array::null_count` default
-        // returns 0. Min/max are not meaningful for void.
+        // A void column reaches stats only if a connector or direct caller bypasses the
+        // kernel-side physical write schema, which strips void columns. Even so, we must
+        // publish nullCount = numRecords rather than 0, because `NullArray` has no null
+        // buffer and the inherited `Array::null_count` default returns 0. Min/max are not
+        // meaningful for void.
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Null, true)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(5))]).unwrap();
 

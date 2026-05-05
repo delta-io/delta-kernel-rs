@@ -30,9 +30,9 @@ fn has_no_non_void_fields(st: &StructType) -> bool {
 
 /// Schema visitor that drops void fields at every nesting level.
 ///
-/// This is intentionally separate from `ValidateForWrite`: validation decides whether a
-/// logical write schema is allowed, while this transform derives the physical schema used
-/// for Parquet writes, including metadata-only paths.
+/// This is intentionally separate from `ValidateForWrite`: validation decides
+/// whether a logical write schema is allowed, while this transform derives the
+/// physical schema used for Parquet writes, including metadata-only paths.
 struct StripVoidFields;
 
 impl<'a> SchemaTransform<'a> for StripVoidFields {
