@@ -10,9 +10,10 @@
 //!
 //! These conversions can be used on both logical and physical schemas. E.g. when writing a parquet
 //! file, the default engine converts the physical kernel schema to an Arrow schema and writes the
-//! data. When transforming physical data to logical data via an [`Expression`],
-//! [`DefaultExpressionEvaluator`] converts the logical schema to an Arrow schema as the output
-//! schema.
+//! data. When transforming physical data to logical data via an
+//! [`Expression`][crate::expressions::Expression],
+//! [`DefaultExpressionEvaluator`][crate::engine::arrow_expression::DefaultExpressionEvaluator]
+//! converts the logical schema to an Arrow schema as the output schema.
 
 pub mod scalar;
 
