@@ -5,7 +5,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use super::super::arrow_conversion::{
-    kernel_flat_parquet_id_to_arrow, lookup_nested_field_id, parquet_field_id_metadata,
+    kernel_flat_parquet_id_to_arrow_metadata, lookup_nested_field_id, parquet_field_id_metadata,
     LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_VALUE_DEFAULT,
 };
 use super::super::arrow_utils::make_arrow_error;
@@ -82,7 +82,7 @@ fn transform_struct(
                 Some(target_field),
                 &target_field.name,
             )?;
-            let mut arrow_metadata = kernel_flat_parquet_id_to_arrow(target_field)?;
+            let mut arrow_metadata = kernel_flat_parquet_id_to_arrow_metadata(target_field)?;
             // `ColumnMetadataKey::ColumnMappingNestedIds` is a kernel-side metadata key, not
             // retained in Arrow; its content is processed by `apply_schema_to_list` /
             // `apply_schema_to_map`.

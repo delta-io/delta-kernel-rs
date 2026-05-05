@@ -42,7 +42,7 @@ pub(crate) const MAP_VALUE_DEFAULT: &str = "value";
 /// Translate a kernel [`StructField`]'s flat (non-nested) parquet field id metadata into Arrow
 /// field metadata: rewrites kernel-side `"parquet.field.id"` to arrow-side `"PARQUET:field_id"`
 /// (see [`PARQUET_FIELD_ID_META_KEY`]). All other entries pass through unchanged.
-pub(crate) fn kernel_flat_parquet_id_to_arrow(
+pub(crate) fn kernel_flat_parquet_id_to_arrow_metadata(
     field: &StructField,
 ) -> Result<HashMap<String, String>, ArrowError> {
     field
@@ -178,7 +178,7 @@ impl TryFromKernel<&StructType> for ArrowSchema {
 
 impl TryFromKernel<&StructField> for ArrowField {
     fn try_from_kernel(f: &StructField) -> Result<Self, ArrowError> {
-        let mut metadata = kernel_flat_parquet_id_to_arrow(f)?;
+        let mut metadata = kernel_flat_parquet_id_to_arrow_metadata(f)?;
         // `ColumnMetadataKey::ColumnMappingNestedIds` is a kernel-side metadata key, not
         // retained in Arrow; its content is processed by `kernel_field_into_arrow`.
         metadata.remove(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
