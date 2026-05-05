@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use super::{DataType, PrimitiveType, Schema, StructField, StructType};
+use super::{DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType};
 use crate::expressions::Transform;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Error, Expression};
@@ -43,19 +43,29 @@ impl<'a> SchemaTransform<'a> for StripVoidFields {
     }
 }
 
-/// Returns a copy of `schema` with all void fields removed from structs at every nesting level.
-/// This is paired with `validate_schema_for_write`, which rejects void placements inside Array
-/// or Map that this stripper cannot safely handle. An all-void or empty input yields an empty
-/// StructType; write callers are expected to run `validate_schema_for_write` before using the
-/// stripped schema.
-pub(crate) fn strip_void_from_schema(schema: &Schema) -> StructType {
-    StripVoidFields
-        .transform_struct(schema)
-        .map(Cow::into_owned)
-        .unwrap_or_else(|| StructType::new_unchecked(Vec::<StructField>::new()))
+/// Returns `schema` with all void fields removed from structs at every nesting level.
+/// In the common case where the schema contains no void fields, returns the same `Arc`
+/// without copying.
+///
+/// Pairs with `validate_schema_for_write`, which rejects void placements inside Array or Map
+/// before the stripped physical schema is used for writing. An all-void or empty input yields
+/// an empty schema; write callers are expected to run `validate_schema_for_write` before using
+/// the stripped schema.
+pub(crate) fn strip_void_from_schema(schema: SchemaRef) -> SchemaRef {
+    match StripVoidFields.transform_struct(&schema) {
+        Some(Cow::Owned(stripped)) => Arc::new(stripped),
+        Some(Cow::Borrowed(_)) => schema,
+        None => Arc::new(StructType::new_unchecked(Vec::<StructField>::new())),
+    }
 }
 
-/// Validates that a schema is suitable for writing data. Writes are rejected when:
+/// Validates that a schema is suitable for writing data. This is the kernel-internal write-time
+/// rejection point for invalid void placements: [`StructType::try_new`] validates structural
+/// properties only (field-name uniqueness, metadata-column rules) and accepts schemas like
+/// `Array<Void>` or all-void structs. Both JSON-deserialized metadata (which round-trips through
+/// `try_new`) and any `new_unchecked` paths therefore rely on this validator.
+///
+/// Writes are rejected when:
 /// - Void is nested inside Array or Map. Parquet's UNKNOWN logical type can in principle annotate
 ///   any physical type with all-null values, but Delta itself does not materialize void columns in
 ///   data files, and our logical-to-physical transform does not descend into Array elements or Map
@@ -130,8 +140,14 @@ impl<'a> SchemaTransform<'a> for ValidateForWrite {
     }
 }
 
-/// Adds void-field-stripping operations to the given Transform, recursing into nested structs.
-/// Returns the input transform unchanged when the schema contains no void.
+/// Appends void-field-stripping operations to `transform`, recursing through struct fields in
+/// `st` (the logical schema). Returns `transform` unchanged when `st` contains no void fields.
+///
+/// Composition: `st` is read directly to locate void fields, not the partial result of applying
+/// `transform`. Composing `transform` first with operations on disjoint columns (e.g. partition
+/// column drops) is therefore safe, but composing with operations that already drop or replace
+/// the same void-named columns is not -- the resulting transform would double-drop or conflict.
+/// Don't reorder this relative to such operations.
 pub(crate) fn add_void_stripping(
     transform: Transform,
     st: &StructType,
@@ -643,8 +659,8 @@ mod tests {
         #[case] input: StructType,
         #[case] expected: StructType,
     ) {
-        let stripped = strip_void_from_schema(&input);
-        assert_eq!(stripped, expected, "{desc}");
+        let stripped = strip_void_from_schema(Arc::new(input));
+        assert_eq!(*stripped, expected, "{desc}");
     }
 
     // A container that has Void as its only "interior" type collapses when the void
@@ -663,11 +679,11 @@ mod tests {
         true
     ))))]
     fn test_strip_drops_container_with_void(#[case] field_type: DataType) {
-        let schema = StructType::new_unchecked([
+        let schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("c", field_type),
-        ]);
-        let stripped = strip_void_from_schema(&schema);
+        ]));
+        let stripped = strip_void_from_schema(schema);
         assert!(stripped.field("id").is_some());
         assert!(stripped.field("c").is_none());
     }
@@ -685,8 +701,8 @@ mod tests {
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
             MetadataValue::String("phys_s".into()),
         );
-        let schema = StructType::new_unchecked([s_field]);
-        let stripped = strip_void_from_schema(&schema);
+        let schema = Arc::new(StructType::new_unchecked([s_field]));
+        let stripped = strip_void_from_schema(schema);
         assert_eq!(
             stripped
                 .field("s")

@@ -1,5 +1,6 @@
 //! Integration tests for type-specific writes (timestampNtz, variant, shredded variant).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
@@ -13,6 +14,7 @@ use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
+use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{ArrayType, DataType, MapType, SchemaRef, StructField, StructType};
@@ -548,6 +550,13 @@ async fn test_not_null_data_column_rejects_null_in_batch(
 }
 
 // ---- Void type write-time validation tests ----
+//
+// The rstest cases below use `StructType::new_unchecked` for convenience; `StructType::try_new`
+// would also accept them, since it validates structural properties (field-name uniqueness,
+// metadata-column rules) and does not reject void placements. The validator
+// (`validate_schema_for_write`) is the kernel-internal write-time rejection point for void in
+// `Array`/`Map` and all-void structs, and it also protects schemas loaded from existing table
+// metadata (JSON-deserialized from the log) and any `new_unchecked` paths.
 
 /// Helper to create a table with a given schema and attempt a commit with dummy add_files.
 /// Returns the commit error (panics if commit succeeds).
@@ -694,6 +703,84 @@ async fn write_rejects_invalid_void_placement(
     assert!(
         err.to_string().contains(expected_msg),
         "Expected error containing '{expected_msg}', got: {err}"
+    );
+}
+
+// Validation must trigger when the connector requests a write context, before any Parquet is
+// written. Both public entry points (partitioned and unpartitioned) are covered, and the
+// `all_void_table` case is included because it is the shape where `strip_void_from_schema`
+// would otherwise silently produce an empty physical schema -- so the fail-fast guard is most
+// load-bearing there. The commit-time check (exercised by `write_rejects_invalid_void_placement`)
+// remains as defense-in-depth.
+#[rstest]
+#[case::unpartitioned_void_array(
+    "void_fail_fast_unpartitioned_array",
+    vec![],
+    HashMap::new(),
+    Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("arr", ArrayType::new(DataType::VOID, true)),
+    ])),
+    "array element type",
+)]
+#[case::partitioned_void_array(
+    "void_fail_fast_partitioned_array",
+    vec!["id"],
+    HashMap::from([("id".to_string(), Scalar::Integer(1))]),
+    Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("arr", ArrayType::new(DataType::VOID, true)),
+    ])),
+    "array element type",
+)]
+#[case::unpartitioned_all_void(
+    "void_fail_fast_unpartitioned_all_void",
+    vec![],
+    HashMap::new(),
+    Arc::new(StructType::new_unchecked([
+        StructField::nullable("a", DataType::VOID),
+        StructField::nullable("b", DataType::VOID),
+    ])),
+    "at least one non-void column",
+)]
+#[tokio::test]
+async fn write_context_creation_fails_fast_on_invalid_void_schema(
+    #[case] test_name: &str,
+    #[case] partition_columns: Vec<&str>,
+    #[case] partition_values: HashMap<String, Scalar>,
+    #[case] schema: SchemaRef,
+    #[case] expected_msg: &str,
+) {
+    let (store, engine, table_location) = engine_store_setup(test_name, None);
+    let table_url = create_table(
+        store,
+        table_location,
+        schema,
+        &partition_columns,
+        false,
+        vec![],
+        vec![],
+    )
+    .await
+    .expect("table creation should succeed");
+    let engine = Arc::new(engine);
+    let snapshot = Snapshot::builder_for(table_url)
+        .build(engine.as_ref())
+        .expect("snapshot should build");
+    let txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
+        .expect("transaction should create");
+
+    let err = if partition_columns.is_empty() {
+        txn.unpartitioned_write_context()
+            .expect_err("unpartitioned_write_context should reject invalid void schema")
+    } else {
+        txn.partitioned_write_context(partition_values)
+            .expect_err("partitioned_write_context should reject invalid void schema")
+    };
+    assert!(
+        err.to_string().contains(expected_msg),
+        "expected error containing '{expected_msg}', got: {err}"
     );
 }
 

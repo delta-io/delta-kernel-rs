@@ -485,7 +485,7 @@ impl TableConfiguration {
         } else {
             self.physical_data_schema_without_partition_columns()
         };
-        Arc::new(strip_void_from_schema(&with_partition_cols))
+        strip_void_from_schema(with_partition_cols)
     }
 
     /// The [`TableProperties`] of this table at this version.
