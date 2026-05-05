@@ -81,7 +81,10 @@ impl EnsureDataTypes {
             (&DataType::Variant(_), _) => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
-            // strings, bools, binary, and void aren't primitive in arrow
+            // Arrow's `is_primitive()` covers only numeric/temporal/decimal types and
+            // excludes Boolean, the string and binary variants, and Null -- even though
+            // kernel models all of these as `PrimitiveType` variants. Match them
+            // explicitly here so they are still recognized as compatible.
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
             | (&DataType::STRING, ArrowDataType::LargeUtf8)
             | (&DataType::STRING, ArrowDataType::Utf8)
