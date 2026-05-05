@@ -140,13 +140,15 @@ impl fmt::Display for LastCheckpointHintState {
     }
 }
 
-/// Shape of a Delta table's `_delta_log/` directory along three axes:
+/// Shape of a Delta table's `_delta_log/` directory along four axes:
 ///
 /// 1. `total_versions`: number of JSON commit files (versions `0..total_versions`).
 /// 2. `checkpoints_at`: zero or more versions at which a checkpoint is written. Whether each
 ///    checkpoint lands as V1 or V2 is feature-driven (the `v2Checkpoint` table feature on the
 ///    paired [`FeatureSet`]), not encoded here.
-/// 3. `last_checkpoint_hint`: state of the `_delta_log/_last_checkpoint` hint file. See
+/// 3. `crc_at`: an optional version at which a `.crc` file is written (via kernel's
+///    `Snapshot::write_checksum`).
+/// 4. `last_checkpoint_hint`: state of the `_delta_log/_last_checkpoint` hint file. See
 ///    [`LastCheckpointHintState`].
 ///
 /// # Example
@@ -160,6 +162,9 @@ impl fmt::Display for LastCheckpointHintState {
 ///
 /// // two checkpoints (v=2 mid-stream and v=4 latest)
 /// LogState::with_commits(5).with_checkpoint_at(2).with_checkpoint_at(4);
+///
+/// // checkpoint at v=3 + CRC at v=4 (common production layout)
+/// LogState::with_commits(5).with_checkpoint_at(3).with_crc_at(4);
 ///
 /// // stale hint: kernel writes _last_checkpoint pointing at v=4, then the builder
 /// // rewrites it to point at v=2 (the older real checkpoint)
@@ -175,7 +180,6 @@ impl fmt::Display for LastCheckpointHintState {
 ///
 /// # Out of scope (deferred)
 ///
-/// - `crc_at`: CRC files (separate PR layered on this one).
 /// - `log_compaction_at`: kernel currently has compaction disabled.
 /// - `schema_history`: requires metadata-only commits that the data-write builder path does not
 ///   emit.
@@ -186,6 +190,7 @@ pub struct LogState {
     total_versions: u64,
     /// Sorted ascending, distinct, all `< total_versions`.
     checkpoints_at: Vec<u64>,
+    crc_at: Option<u64>,
     last_checkpoint_hint: LastCheckpointHintState,
 }
 
@@ -203,6 +208,7 @@ impl LogState {
         Self {
             total_versions: n,
             checkpoints_at: Vec::new(),
+            crc_at: None,
             last_checkpoint_hint: LastCheckpointHintState::Present,
         }
     }
@@ -234,6 +240,28 @@ impl LogState {
     pub fn maybe_with_checkpoint_at(self, v: Option<u64>) -> Self {
         match v {
             Some(v) => self.with_checkpoint_at(v),
+            None => self,
+        }
+    }
+
+    /// Write a CRC file at version `v` via kernel's `Snapshot::write_checksum`.
+    /// `v` must be `< total_versions`. The builder captures the post-commit
+    /// snapshot at `v` (whose `lazy_crc` is populated by the kernel commit
+    /// pipeline) and asks kernel to write a spec-complete CRC at that version.
+    pub fn with_crc_at(mut self, v: u64) -> Self {
+        assert!(
+            v < self.total_versions,
+            "crc_at ({v}) must be < total_versions ({})",
+            self.total_versions,
+        );
+        self.crc_at = Some(v);
+        self
+    }
+
+    /// Optionally write a CRC file at the given version. No-op when `None`.
+    pub fn maybe_with_crc_at(self, v: Option<u64>) -> Self {
+        match v {
+            Some(v) => self.with_crc_at(v),
             None => self,
         }
     }
@@ -271,6 +299,9 @@ impl LogState {
     /// 4. two checkpoints (v=2 and v=4): newer checkpoint supersedes older
     /// 5. checkpoint at v=2, hint missing: listing fallback discovers the checkpoint
     /// 6. two checkpoints + stale hint: hint at v=2, real latest at v=4; reader recovers
+    /// 7. CRC at v=4 (latest): CRC fast-path at the target version
+    /// 8. checkpoint at v=3 + CRC at v=4: production layout (CRC after newest checkpoint)
+    /// 9. CRC at v=0: stale CRC, trailing commits replay over it
     pub fn common() -> Vec<Self> {
         const N: u64 = 5;
         vec![
@@ -287,6 +318,11 @@ impl LogState {
                 .with_checkpoint_at(2)
                 .with_checkpoint_at(N - 1)
                 .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
+            Self::with_commits(N).with_crc_at(N - 1),
+            Self::with_commits(N)
+                .with_checkpoint_at(N - 2)
+                .with_crc_at(N - 1),
+            Self::with_commits(N).with_crc_at(0),
         ]
     }
 
@@ -303,6 +339,11 @@ impl LogState {
         &self.checkpoints_at
     }
 
+    /// Version at which a CRC file is written, if any.
+    pub(crate) fn crc_at(&self) -> Option<u64> {
+        self.crc_at
+    }
+
     /// State of the `_last_checkpoint` hint file on the built table.
     pub(crate) fn last_checkpoint_hint(&self) -> LastCheckpointHintState {
         self.last_checkpoint_hint
@@ -314,6 +355,9 @@ impl fmt::Display for LogState {
         write!(f, "commits({})", self.total_versions)?;
         for v in &self.checkpoints_at {
             write!(f, "+checkpoint_at({v})")?;
+        }
+        if let Some(v) = self.crc_at {
+            write!(f, "+crc_at({v})")?;
         }
         if self.last_checkpoint_hint != LastCheckpointHintState::Present {
             write!(f, "+hint({})", self.last_checkpoint_hint)?;
@@ -1008,6 +1052,13 @@ impl TestTableBuilder {
             .unwrap_committed();
         let mut snapshot = committed.post_commit_snapshot().unwrap().clone();
 
+        // `Snapshot::write_checksum` requires a post-commit snapshot whose in-memory
+        // `lazy_crc` was populated by the kernel commit pipeline. Capture the snapshot
+        // at `crc_at` as we go: v=0 is the create-table commit captured here; v>=1 is
+        // captured inside the data-commit loop below.
+        let crc_at = self.log_state.crc_at();
+        let mut crc_snapshot = (crc_at == Some(0)).then(|| snapshot.clone());
+
         // Data commits (versions 1..N)
         let total = self.log_state.num_versions();
         for v in 1..total {
@@ -1025,6 +1076,9 @@ impl TestTableBuilder {
                 .post_commit_snapshot()
                 .unwrap()
                 .clone();
+            if crc_at == Some(v) {
+                crc_snapshot = Some(snapshot.clone());
+            }
         }
 
         // Write checkpoints in ascending version order. Each `Snapshot::checkpoint`
@@ -1035,6 +1089,13 @@ impl TestTableBuilder {
                 .at_version(checkpoint_at)
                 .build(engine.as_ref())?;
             snap.checkpoint(engine.as_ref(), None)?;
+        }
+
+        // Write the CRC via kernel's `write_checksum`, which produces a spec-complete
+        // CRC including `inCommitTimestampOpt`, `domainMetadata`, `setTransactions`,
+        // `fileSizeHistogram`, etc.
+        if let Some(snap) = crc_snapshot {
+            snap.write_checksum(engine.as_ref())?;
         }
 
         // Override the `_last_checkpoint` hint if the caller asked for a non-default
@@ -1637,11 +1698,12 @@ mod tests {
         Ok(())
     }
 
-    /// Cartesian-product check that every checkpoint configuration the builder
+    /// Cartesian-product check that every LogState configuration the builder
     /// permits actually lands on disk and rebuilds correctly. Covers single
     /// checkpoints at every legal version (None, 0, mid, latest), a
-    /// multi-checkpoint case (mid + latest), and the three hint states
-    /// (Present/Missing/Stale).
+    /// multi-checkpoint case (mid + latest), the three hint states
+    /// (Present/Missing/Stale), and CRC at None/0/mid/latest plus
+    /// checkpoint+CRC.
     #[rstest::rstest]
     #[case::no_checkpoint(LogState::with_commits(3))]
     #[case::checkpoint_at_v0(LogState::with_commits(3).with_checkpoint_at(0))]
@@ -1663,6 +1725,12 @@ mod tests {
             .with_checkpoint_at(1)
             .with_checkpoint_at(2)
             .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
+    )]
+    #[case::crc_at_v0(LogState::with_commits(3).with_crc_at(0))]
+    #[case::crc_at_v1(LogState::with_commits(3).with_crc_at(1))]
+    #[case::crc_at_latest(LogState::with_commits(3).with_crc_at(2))]
+    #[case::checkpoint_then_crc(
+        LogState::with_commits(3).with_checkpoint_at(1).with_crc_at(2),
     )]
     fn test_log_state_checkpoint_shapes_land_on_disk(
         #[case] log_state: LogState,
@@ -1710,6 +1778,47 @@ mod tests {
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
         assert_eq!(snap.version(), 4);
         Ok(())
+    }
+
+    /// CRC content asserts: the kernel-written CRC reports counts and sizes
+    /// consistent with the builder's actual on-disk file layout (default 1 data
+    /// file per data commit -> 2 adds at v=1 and v=2 for `commits(3)`).
+    #[rstest::rstest]
+    #[case::v1_format(FeatureSet::empty())]
+    #[case::v2_format(FeatureSet::new().v2_checkpoint())]
+    fn test_builder_writes_crc_with_correct_content(
+        #[case] features: FeatureSet,
+    ) -> DeltaResult<()> {
+        let log_state = LogState::with_commits(3)
+            .with_checkpoint_at(2)
+            .with_crc_at(2);
+        let table = TestTableBuilder::new()
+            .with_log_state(log_state.clone())
+            .with_features(features)
+            .build()?;
+        assert_log_state_files_on_disk(&table, &log_state)?;
+
+        let crc = read_crc_json(table.store(), 2)?;
+        assert_eq!(
+            crc["numFiles"].as_u64().unwrap(),
+            2,
+            "numFiles should match the 2 data adds emitted at v=1 and v=2",
+        );
+        assert!(
+            crc["tableSizeBytes"].as_u64().unwrap() > 0,
+            "tableSizeBytes should be positive for a table with 2 data files",
+        );
+        Ok(())
+    }
+
+    /// CRC at v=N must be `< total_versions`; equal/greater versions panic at
+    /// configuration time.
+    #[rstest::rstest]
+    #[case::equal_total(3)]
+    #[case::greater_than_total(4)]
+    #[should_panic(expected = "must be < total_versions")]
+    fn test_with_crc_at_rejects_out_of_bounds(#[case] crc_at: u64) {
+        LogState::with_commits(3).with_crc_at(crc_at);
     }
 
     // Whether a checkpoint at `checkpoint_at` is written in V1 or V2 format is
@@ -1889,6 +1998,26 @@ mod tests {
             );
         }
 
+        if let Some(v) = log_state.crc_at() {
+            let crc_name = format!("{v:020}.crc");
+            assert!(
+                entries.iter().any(|name| name == &crc_name),
+                "no CRC file at v={v} for {log_state}: {entries:?}",
+            );
+            // Parse to confirm field-name compatibility with kernel's CRC reader.
+            let crc = read_crc_json(table.store(), v)?;
+            assert!(
+                crc.get("tableSizeBytes").is_some(),
+                "CRC at v={v} missing tableSizeBytes",
+            );
+            assert!(
+                crc.get("numFiles").is_some(),
+                "CRC at v={v} missing numFiles"
+            );
+            assert!(crc["protocol"].is_object(), "CRC at v={v} missing protocol");
+            assert!(crc["metadata"].is_object(), "CRC at v={v} missing metadata");
+        }
+
         let hint = read_last_checkpoint_hint(table.store())?;
         match log_state.last_checkpoint_hint() {
             LastCheckpointHintState::Present => {
@@ -1943,6 +2072,22 @@ mod tests {
                 Err(ObjectStoreError::NotFound { .. }) => Ok(None),
                 Err(e) => Err(delta_kernel::Error::from(e)),
             }
+        })
+    }
+
+    /// Read and parse a CRC file at `version`.
+    fn read_crc_json(store: &Arc<DynObjectStore>, version: u64) -> DeltaResult<serde_json::Value> {
+        let store = store.clone();
+        block_on_sync(move || async move {
+            let path = Path::from(format!("_delta_log/{version:020}.crc"));
+            let bytes = store
+                .get(&path)
+                .await
+                .map_err(delta_kernel::Error::from)?
+                .bytes()
+                .await
+                .map_err(delta_kernel::Error::from)?;
+            serde_json::from_slice(&bytes).map_err(|e| delta_kernel::Error::generic(e.to_string()))
         })
     }
 
