@@ -639,42 +639,29 @@ mod tests {
         assert_eq!(stripped, expected, "{desc}");
     }
 
-    #[test]
-    fn test_strip_drops_array_of_void_field() {
-        // Array<Void> has nowhere for the void to live: stripping the void primitive
-        // from the element type collapses the ArrayType, which collapses the field.
+    // A container that has Void as its only "interior" type collapses when the void
+    // primitive is filtered: ArrayType / MapType cannot be reconstructed without their
+    // element / key / value, so the containing field disappears.
+    #[rstest::rstest]
+    #[case::array_of_void(DataType::Array(Box::new(ArrayType::new(DataType::VOID, true))))]
+    #[case::map_with_void_value(DataType::Map(Box::new(MapType::new(
+        DataType::STRING,
+        DataType::VOID,
+        true
+    ))))]
+    #[case::map_with_void_key(DataType::Map(Box::new(MapType::new(
+        DataType::VOID,
+        DataType::STRING,
+        true
+    ))))]
+    fn test_strip_drops_container_with_void(#[case] field_type: DataType) {
         let schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("arr", ArrayType::new(DataType::VOID, true)),
+            StructField::nullable("c", field_type),
         ]);
         let stripped = strip_void_from_schema(&schema);
         assert!(stripped.field("id").is_some());
-        assert!(stripped.field("arr").is_none());
-    }
-
-    #[test]
-    fn test_strip_drops_map_with_void_value_field() {
-        // Map<_, Void> collapses for the same reason as Array<Void>.
-        let schema = StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("m", MapType::new(DataType::STRING, DataType::VOID, true)),
-        ]);
-        let stripped = strip_void_from_schema(&schema);
-        assert!(stripped.field("id").is_some());
-        assert!(stripped.field("m").is_none());
-    }
-
-    #[test]
-    fn test_strip_drops_map_with_void_key_field() {
-        // Map<Void, _> collapses too -- the void key type is filtered, the MapType cannot
-        // be reconstructed, so the field disappears.
-        let schema = StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("m", MapType::new(DataType::VOID, DataType::STRING, true)),
-        ]);
-        let stripped = strip_void_from_schema(&schema);
-        assert!(stripped.field("id").is_some());
-        assert!(stripped.field("m").is_none());
+        assert!(stripped.field("c").is_none());
     }
 
     #[test]
