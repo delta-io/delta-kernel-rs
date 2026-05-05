@@ -272,10 +272,6 @@ pub(crate) fn get_column_mapping_mode_from_properties(
 /// }
 /// ```
 ///
-/// Note the assignment order: the Map walker stamps both `<pname>.key` and `<pname>.value` ids
-/// first, then recurses into the key/value subtypes (here, `<pname>.key.element` for the inner
-/// list).
-///
 /// `max_id` ends at `4`. With `with_nested_ids = false` the same field gets only the CM
 /// metadata and `max_id` ends at `1`:
 ///
