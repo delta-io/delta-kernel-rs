@@ -431,6 +431,21 @@ fn compute_column_stats(
                 max_value: None,
             })
         }
+        // Void columns (Arrow `Null` / kernel `VOID`): every value is null by definition,
+        // and the column has no parquet representation. We still need to publish nullCount
+        // for IS NULL / IS NOT NULL data skipping, so synthesize it from the array length.
+        // Use `column.len()` rather than `column.null_count()` because `NullArray` has no
+        // null buffer and the inherited `Array::null_count` default returns 0.
+        DataType::Null => {
+            if !filter.contains_prefix_of(path) {
+                return Ok(ColumnStats::default());
+            }
+            Ok(ColumnStats {
+                null_count: Some(Arc::new(Int64Array::from(vec![column.len() as i64]))),
+                min_value: None,
+                max_value: None,
+            })
+        }
         _ => {
             // Leaf: check filter, compute all stats together
             if !filter.contains_prefix_of(path) {
@@ -557,7 +572,8 @@ pub(crate) fn collect_stats(
 mod tests {
     use super::*;
     use crate::arrow::array::{
-        Array, AsArray, BinaryArray, Int32Array, Int64Array, ListArray, MapArray, StringArray,
+        Array, AsArray, BinaryArray, Int32Array, Int64Array, ListArray, MapArray, NullArray,
+        StringArray,
     };
     use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
     use crate::arrow::compute::concat_batches;
@@ -798,6 +814,101 @@ mod tests {
             .unwrap();
         let max_col = max_values.column_by_name("value").unwrap();
         assert!(max_col.is_null(0));
+    }
+
+    #[test]
+    fn test_collect_stats_void_column_synthesizes_full_null_count() {
+        // A void column reaches stats only if a connector bypasses the kernel-side strip
+        // (`Transaction::shared_write_state` removes void from the physical write schema
+        // today). Even so, we must publish nullCount = numRecords rather than 0, because
+        // `NullArray` has no null buffer and the inherited `Array::null_count` default
+        // returns 0. Min/max are not meaningful for void.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Null, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(5))]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("v")]).unwrap();
+
+        let null_count = stats
+            .column_by_name("nullCount")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let v_null_count = null_count
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(v_null_count.value(0), 5);
+
+        // Void columns do not participate in min/max stats. With void as the only stats
+        // column, both struct accumulators stay empty and the fields are omitted entirely.
+        assert!(stats.column_by_name("minValues").is_none());
+        assert!(stats.column_by_name("maxValues").is_none());
+    }
+
+    #[test]
+    fn test_collect_stats_void_column_nested_in_struct() {
+        // Worst realistic shape for the latent bug: void buried inside a struct alongside
+        // a non-void sibling. The recursion must reach the `DataType::Null` arm so that
+        // `s.v` records `nullCount = numRecords`, while `s.a` still gets full min/max.
+        let inner_fields = Fields::from(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("v", DataType::Null, true),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(inner_fields.clone()),
+            false,
+        )]));
+        let inner = StructArray::try_new(
+            inner_fields,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+                Arc::new(NullArray::new(4)) as ArrayRef,
+            ],
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(inner) as ArrayRef]).unwrap();
+
+        let stats = collect_stats(&batch, &[column_name!("s.a"), column_name!("s.v")]).unwrap();
+
+        let s_null_count = stats
+            .column_by_name("nullCount")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let v_null_count = s_null_count
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(v_null_count.value(0), 4);
+
+        // `s.a` keeps its min/max; `s.v` does not appear under min/max because void has no
+        // ordering.
+        let s_min = stats
+            .column_by_name("minValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(s_min.column_by_name("a").is_some());
+        assert!(s_min.column_by_name("v").is_none());
     }
 
     #[test]
