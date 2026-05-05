@@ -64,7 +64,8 @@ use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{DynObjectStore, Error as ObjectStoreError, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
@@ -106,12 +107,47 @@ where
 // LogState
 // ===========================================================================
 
-/// Shape of a Delta table's `_delta_log/` directory along two axes:
+/// State of the `_delta_log/_last_checkpoint` hint file on disk.
+///
+/// Three states a kernel reader must handle:
+///
+/// - [`Present`](Self::Present): hint file exists and points at the highest checkpoint on disk.
+///   Default; what `Snapshot::checkpoint` writes.
+/// - [`Missing`](Self::Missing): no hint file. Forces the reader's listing fallback to discover the
+///   latest checkpoint.
+/// - [`Stale`](Self::Stale): hint file exists but points at an OLDER real checkpoint, not the
+///   latest. The reader follows the hint, lists from there, and picks up the actual latest
+///   checkpoint by listing forward (logging an info on the version mismatch).
+///
+/// `Stale` is only meaningful with at least two checkpoints in the [`LogState`] -- the hint
+/// rewrites to point at the lowest checkpoint, leaving the highest checkpoint as the actual
+/// "latest" the reader should discover. Pairing `Stale` with fewer than two checkpoints
+/// panics at build time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LastCheckpointHintState {
+    Present,
+    Missing,
+    Stale,
+}
+
+impl fmt::Display for LastCheckpointHintState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Present => write!(f, "present"),
+            Self::Missing => write!(f, "missing"),
+            Self::Stale => write!(f, "stale"),
+        }
+    }
+}
+
+/// Shape of a Delta table's `_delta_log/` directory along three axes:
 ///
 /// 1. `total_versions`: number of JSON commit files (versions `0..total_versions`).
 /// 2. `checkpoints_at`: zero or more versions at which a checkpoint is written. Whether each
 ///    checkpoint lands as V1 or V2 is feature-driven (the `v2Checkpoint` table feature on the
 ///    paired [`FeatureSet`]), not encoded here.
+/// 3. `last_checkpoint_hint`: state of the `_delta_log/_last_checkpoint` hint file. See
+///    [`LastCheckpointHintState`].
 ///
 /// # Example
 ///
@@ -125,6 +161,13 @@ where
 /// // two checkpoints (v=2 mid-stream and v=4 latest)
 /// LogState::with_commits(5).with_checkpoint_at(2).with_checkpoint_at(4);
 ///
+/// // stale hint: kernel writes _last_checkpoint pointing at v=4, then the builder
+/// // rewrites it to point at v=2 (the older real checkpoint)
+/// LogState::with_commits(5)
+///     .with_checkpoint_at(2)
+///     .with_checkpoint_at(4)
+///     .with_last_checkpoint_hint(LastCheckpointHintState::Stale);
+///
 /// // for true cartesian-product rstest axes:
 /// #[values(None, Some(4))] checkpoint_at: Option<u64>,
 /// let log_state = LogState::with_commits(5).maybe_with_checkpoint_at(checkpoint_at);
@@ -133,8 +176,6 @@ where
 /// # Out of scope (deferred)
 ///
 /// - `crc_at`: CRC files (separate PR layered on this one).
-/// - `last_checkpoint_hint` overrides: forcing the `_last_checkpoint` hint to be missing or stale
-///   (separate PR).
 /// - `log_compaction_at`: kernel currently has compaction disabled.
 /// - `schema_history`: requires metadata-only commits that the data-write builder path does not
 ///   emit.
@@ -145,13 +186,15 @@ pub struct LogState {
     total_versions: u64,
     /// Sorted ascending, distinct, all `< total_versions`.
     checkpoints_at: Vec<u64>,
+    last_checkpoint_hint: LastCheckpointHintState,
 }
 
 impl LogState {
     /// Commits-only table with `n` total versions (`0..n`).
     ///
     /// `n` must be `>= 1`. Version 0 is the create-table commit; versions
-    /// `1..n` contain data. No checkpoints by default.
+    /// `1..n` contain data. No checkpoints by default; hint state defaults to
+    /// [`LastCheckpointHintState::Present`] (a no-op when no checkpoint is written).
     pub fn with_commits(n: u64) -> Self {
         assert!(
             n >= 1,
@@ -160,6 +203,7 @@ impl LogState {
         Self {
             total_versions: n,
             checkpoints_at: Vec::new(),
+            last_checkpoint_hint: LastCheckpointHintState::Present,
         }
     }
 
@@ -194,6 +238,29 @@ impl LogState {
         }
     }
 
+    /// Set the `_delta_log/_last_checkpoint` hint state.
+    ///
+    /// `Stale` requires at least two checkpoints in the LogState; the builder
+    /// asserts on the precondition at `build()` time.
+    pub fn with_last_checkpoint_hint(mut self, state: LastCheckpointHintState) -> Self {
+        self.last_checkpoint_hint = state;
+        self
+    }
+
+    /// Sugar for the binary present/missing case.
+    /// `true` -> [`LastCheckpointHintState::Present`],
+    /// `false` -> [`LastCheckpointHintState::Missing`].
+    /// Use [`Self::with_last_checkpoint_hint`] directly to set
+    /// [`LastCheckpointHintState::Stale`].
+    pub fn keep_last_checkpoint_hint(self, keep: bool) -> Self {
+        let state = if keep {
+            LastCheckpointHintState::Present
+        } else {
+            LastCheckpointHintState::Missing
+        };
+        self.with_last_checkpoint_hint(state)
+    }
+
     /// Canonical log shapes for snapshot reader-path tests. Built against a
     /// 5-version table (v0 create + v1..=v4 data). Each shape exercises a
     /// distinct read path:
@@ -202,6 +269,8 @@ impl LogState {
     /// 2. checkpoint at v=4 (latest): no JSON tail
     /// 3. checkpoint at v=2 (mid-stream): checkpoint + 2 trailing JSON commits
     /// 4. two checkpoints (v=2 and v=4): newer checkpoint supersedes older
+    /// 5. checkpoint at v=2, hint missing: listing fallback discovers the checkpoint
+    /// 6. two checkpoints + stale hint: hint at v=2, real latest at v=4; reader recovers
     pub fn common() -> Vec<Self> {
         const N: u64 = 5;
         vec![
@@ -211,6 +280,13 @@ impl LogState {
             Self::with_commits(N)
                 .with_checkpoint_at(2)
                 .with_checkpoint_at(N - 1),
+            Self::with_commits(N)
+                .with_checkpoint_at(2)
+                .with_last_checkpoint_hint(LastCheckpointHintState::Missing),
+            Self::with_commits(N)
+                .with_checkpoint_at(2)
+                .with_checkpoint_at(N - 1)
+                .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
         ]
     }
 
@@ -226,6 +302,11 @@ impl LogState {
     pub(crate) fn checkpoints_at(&self) -> &[u64] {
         &self.checkpoints_at
     }
+
+    /// State of the `_last_checkpoint` hint file on the built table.
+    pub(crate) fn last_checkpoint_hint(&self) -> LastCheckpointHintState {
+        self.last_checkpoint_hint
+    }
 }
 
 impl fmt::Display for LogState {
@@ -234,7 +315,22 @@ impl fmt::Display for LogState {
         for v in &self.checkpoints_at {
             write!(f, "+checkpoint_at({v})")?;
         }
+        if self.last_checkpoint_hint != LastCheckpointHintState::Present {
+            write!(f, "+hint({})", self.last_checkpoint_hint)?;
+        }
         Ok(())
+    }
+}
+
+/// Validate up-front in `build()` so panic messages surface synchronously rather than
+/// through the worker-thread join boundary in [`block_on_sync`].
+fn validate_log_state(log_state: &LogState) {
+    if log_state.last_checkpoint_hint() == LastCheckpointHintState::Stale {
+        assert!(
+            log_state.checkpoints_at().len() >= 2,
+            "Stale hint requires at least 2 checkpoints (one to be stale relative to); \
+             pair with `with_checkpoint_at` at two distinct versions",
+        );
     }
 }
 
@@ -862,7 +958,12 @@ impl TestTableBuilder {
     /// underlying write path.
     ///
     /// # Panics
+    /// Panics if `LastCheckpointHintState::Stale` is paired with fewer than two
+    /// checkpoints (Stale needs a real older checkpoint for the hint to point at).
+    /// Validated up-front so the message surfaces directly rather than through the
+    /// background runtime's worker-thread join boundary.
     pub fn build(self) -> DeltaResult<TestTable> {
+        validate_log_state(&self.log_state);
         block_on_sync(|| self.build_async())
     }
 
@@ -934,6 +1035,42 @@ impl TestTableBuilder {
                 .at_version(checkpoint_at)
                 .build(engine.as_ref())?;
             snap.checkpoint(engine.as_ref(), None)?;
+        }
+
+        // Override the `_last_checkpoint` hint if the caller asked for a non-default
+        // state. `Snapshot::checkpoint` always wrote a fresh hint pointing at the
+        // highest checkpoint, so producing Missing or Stale requires post-fact
+        // mutation of the hint.
+        match self.log_state.last_checkpoint_hint() {
+            LastCheckpointHintState::Present => {}
+            LastCheckpointHintState::Missing => {
+                let hint_path = Path::from("_delta_log/_last_checkpoint");
+                let resolved = crate::resolve_table_path(table_root, &hint_path)?;
+                match store.delete(&resolved).await {
+                    Ok(()) | Err(ObjectStoreError::NotFound { .. }) => {}
+                    Err(e) => return Err(delta_kernel::Error::from(e)),
+                }
+            }
+            LastCheckpointHintState::Stale => {
+                // Rewrite the hint to point at the LOWEST checkpoint (rather than the
+                // highest one kernel just wrote). The reader will follow the hint, list
+                // forward from that version, find the actual highest checkpoint, and
+                // log an info about the version mismatch -- exactly the "stale older
+                // hint" recovery path the spec calls out.
+                let stale_version = self
+                    .log_state
+                    .checkpoints_at()
+                    .first()
+                    .copied()
+                    .expect("validate_log_state should have caught Stale + 0 checkpoints");
+                let hint_path = Path::from("_delta_log/_last_checkpoint");
+                let resolved = crate::resolve_table_path(table_root, &hint_path)?;
+                let body = format!(r#"{{"version":{stale_version},"size":1}}"#);
+                store
+                    .put(&resolved, body.into_bytes().into())
+                    .await
+                    .map_err(delta_kernel::Error::from)?;
+            }
         }
 
         Ok(TestTable {
@@ -1502,8 +1639,9 @@ mod tests {
 
     /// Cartesian-product check that every checkpoint configuration the builder
     /// permits actually lands on disk and rebuilds correctly. Covers single
-    /// checkpoints at every legal version (None, 0, mid, latest) plus a
-    /// multi-checkpoint case (mid + latest).
+    /// checkpoints at every legal version (None, 0, mid, latest), a
+    /// multi-checkpoint case (mid + latest), and the three hint states
+    /// (Present/Missing/Stale).
     #[rstest::rstest]
     #[case::no_checkpoint(LogState::with_commits(3))]
     #[case::checkpoint_at_v0(LogState::with_commits(3).with_checkpoint_at(0))]
@@ -1511,6 +1649,20 @@ mod tests {
     #[case::checkpoint_at_latest(LogState::with_commits(3).with_checkpoint_at(2))]
     #[case::two_checkpoints(
         LogState::with_commits(3).with_checkpoint_at(1).with_checkpoint_at(2),
+    )]
+    #[case::hint_missing_no_checkpoint(
+        LogState::with_commits(3).keep_last_checkpoint_hint(false),
+    )]
+    #[case::hint_missing_with_checkpoint(
+        LogState::with_commits(3)
+            .with_checkpoint_at(1)
+            .keep_last_checkpoint_hint(false),
+    )]
+    #[case::hint_stale_two_checkpoints(
+        LogState::with_commits(3)
+            .with_checkpoint_at(1)
+            .with_checkpoint_at(2)
+            .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
     )]
     fn test_log_state_checkpoint_shapes_land_on_disk(
         #[case] log_state: LogState,
@@ -1527,6 +1679,36 @@ mod tests {
             "rebuild lost commits for {}",
             table.description(),
         );
+        Ok(())
+    }
+
+    /// Stale hint must point at a real older checkpoint (not the latest); pairing
+    /// `Stale` with fewer than two checkpoints is rejected at build time.
+    #[rstest::rstest]
+    #[case::no_checkpoint(LogState::with_commits(3))]
+    #[case::single_checkpoint(LogState::with_commits(3).with_checkpoint_at(1))]
+    #[should_panic(expected = "Stale hint requires at least 2 checkpoints")]
+    fn test_stale_hint_requires_two_checkpoints(#[case] base: LogState) {
+        let log_state = base.with_last_checkpoint_hint(LastCheckpointHintState::Stale);
+        let _ = TestTableBuilder::new().with_log_state(log_state).build();
+    }
+
+    /// Stale hint behavioral check: kernel must follow the stale (older) hint, list
+    /// forward, and pick up the actual latest checkpoint at the higher version --
+    /// not the stale-hinted older one.
+    #[test]
+    fn test_stale_hint_recovery_resolves_to_actual_latest_checkpoint() -> DeltaResult<()> {
+        let log_state = LogState::with_commits(5)
+            .with_checkpoint_at(2)
+            .with_checkpoint_at(4)
+            .with_last_checkpoint_hint(LastCheckpointHintState::Stale);
+        let table = TestTableBuilder::new()
+            .with_log_state(log_state.clone())
+            .build()?;
+        assert_log_state_files_on_disk(&table, &log_state)?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 4);
         Ok(())
     }
 
@@ -1688,11 +1870,13 @@ mod tests {
         assert_eq!(log_state.num_versions(), expected);
     }
 
-    /// Asserts that every checkpoint version in `log_state.checkpoints_at()`
-    /// produced an on-disk checkpoint file. Snapshot rebuilds can silently
-    /// succeed via JSON-replay fallback even when a checkpoint is missing, so
-    /// any LogState-driven test should call this to verify the fixture's
-    /// contract before asserting anything else.
+    /// Asserts that the on-disk log directory matches the contract advertised by
+    /// `log_state`: every checkpoint version produces a checkpoint file, and the
+    /// `_last_checkpoint` hint file is in the requested state (Present pointing at
+    /// the highest checkpoint, Missing, or Stale pointing at the lowest checkpoint).
+    /// Snapshot rebuilds can silently succeed via JSON-replay fallback even when
+    /// these files are wrong, so any LogState-driven test should call this to
+    /// verify the fixture's contract.
     fn assert_log_state_files_on_disk(table: &TestTable, log_state: &LogState) -> DeltaResult<()> {
         let entries = list_log_dir_filenames(table.store())?;
         for &v in log_state.checkpoints_at() {
@@ -1704,7 +1888,62 @@ mod tests {
                 "no checkpoint file at v={v} for {log_state}: {entries:?}",
             );
         }
+
+        let hint = read_last_checkpoint_hint(table.store())?;
+        match log_state.last_checkpoint_hint() {
+            LastCheckpointHintState::Present => {
+                let want = log_state.checkpoints_at().last().copied();
+                assert_eq!(
+                    hint.map(|h| h.version),
+                    want,
+                    "Present hint should point at the highest checkpoint for {log_state}",
+                );
+            }
+            LastCheckpointHintState::Missing => {
+                assert!(
+                    hint.is_none(),
+                    "Missing hint should leave no _last_checkpoint file for {log_state}, got {hint:?}",
+                );
+            }
+            LastCheckpointHintState::Stale => {
+                let want = log_state.checkpoints_at().first().copied();
+                assert_eq!(
+                    hint.map(|h| h.version),
+                    want,
+                    "Stale hint should point at the lowest checkpoint for {log_state}",
+                );
+            }
+        }
         Ok(())
+    }
+
+    #[derive(Debug)]
+    struct HintFile {
+        version: u64,
+    }
+
+    /// Read and parse the `_last_checkpoint` hint, if present.
+    fn read_last_checkpoint_hint(store: &Arc<DynObjectStore>) -> DeltaResult<Option<HintFile>> {
+        let store = store.clone();
+        block_on_sync(move || async move {
+            let path = Path::from("_delta_log/_last_checkpoint");
+            match store.get(&path).await {
+                Ok(get_result) => {
+                    let bytes = get_result
+                        .bytes()
+                        .await
+                        .map_err(delta_kernel::Error::from)?;
+                    let parsed: serde_json::Value = serde_json::from_slice(&bytes)
+                        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+                    let version = parsed["version"].as_u64().ok_or_else(|| {
+                        delta_kernel::Error::generic("hint missing `version` field")
+                    })?;
+                    Ok(Some(HintFile { version }))
+                }
+                Err(ObjectStoreError::NotFound { .. }) => Ok(None),
+                Err(e) => Err(delta_kernel::Error::from(e)),
+            }
+        })
     }
 
     /// Helper: list filenames (basenames only) directly under `_delta_log/` in
