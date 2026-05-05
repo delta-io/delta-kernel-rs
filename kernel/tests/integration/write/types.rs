@@ -585,7 +585,7 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(DataType::VOID, true))),
+            ArrayType::new(DataType::VOID, true),
         ),
     ])),
     "array element type"
@@ -595,7 +595,7 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "m",
-            DataType::Map(Box::new(MapType::new(DataType::STRING, DataType::VOID, true))),
+            MapType::new(DataType::STRING, DataType::VOID, true),
         ),
     ])),
     "map value type"
@@ -605,7 +605,7 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "m",
-            DataType::Map(Box::new(MapType::new(DataType::VOID, DataType::STRING, true))),
+            MapType::new(DataType::VOID, DataType::STRING, true),
         ),
     ])),
     "map key type"
@@ -615,13 +615,13 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
+            ArrayType::new(
                 DataType::Struct(Box::new(StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable("b", DataType::VOID),
                 ]))),
                 true,
-            ))),
+            ),
         ),
     ])),
     "Void type is not allowed inside"
@@ -631,14 +631,14 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "m",
-            DataType::Map(Box::new(MapType::new(
+            MapType::new(
                 DataType::STRING,
-                DataType::Struct(Box::new(StructType::new_unchecked([
+                StructType::new_unchecked([
                     StructField::nullable("a", DataType::INTEGER),
                     StructField::nullable("b", DataType::VOID),
-                ]))),
+                ]),
                 true,
-            ))),
+            ),
         ),
     ])),
     "Void type is not allowed inside"
@@ -655,10 +655,10 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "s",
-            DataType::Struct(Box::new(StructType::new_unchecked([
+            StructType::new_unchecked([
                 StructField::nullable("x", DataType::VOID),
                 StructField::nullable("y", DataType::VOID),
-            ]))),
+            ]),
         ),
     ])),
     "contains no non-void fields"
@@ -672,7 +672,7 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "s",
-            DataType::Struct(Box::new(StructType::new_unchecked(Vec::<StructField>::new()))),
+            StructType::new_unchecked(Vec::<StructField>::new()),
         ),
     ])),
     "contains no non-void fields"
@@ -682,10 +682,10 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
+            ArrayType::new(
                 DataType::Struct(Box::new(StructType::new_unchecked(Vec::<StructField>::new()))),
                 true,
-            ))),
+            ),
         ),
     ])),
     "struct nested in Array or Map must contain at least one non-void field"
@@ -743,10 +743,7 @@ async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dy
 {
     let schema = Arc::new(StructType::new_unchecked([
         StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "arr",
-            DataType::Array(Box::new(ArrayType::new(DataType::VOID, true))),
-        ),
+        StructField::nullable("arr", ArrayType::new(DataType::VOID, true)),
     ]));
     let (store, engine, table_location) = engine_store_setup("void_metadata_test", None);
     let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
@@ -775,10 +772,10 @@ async fn write_context_excludes_nested_void_from_physical_schema(
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "s",
-            DataType::Struct(Box::new(StructType::new_unchecked([
+            StructType::new_unchecked([
                 StructField::nullable("a", DataType::INTEGER),
                 StructField::nullable("b", DataType::VOID),
-            ]))),
+            ]),
         ),
     ]));
     let (store, engine, table_location) = engine_store_setup("void_nested_physical_test", None);
@@ -829,10 +826,10 @@ async fn write_transform_drops_nested_void_fields() -> Result<(), Box<dyn std::e
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable(
             "s",
-            DataType::Struct(Box::new(StructType::new_unchecked([
+            StructType::new_unchecked([
                 StructField::nullable("a", DataType::INTEGER),
                 StructField::nullable("b", DataType::VOID),
-            ]))),
+            ]),
         ),
     ]));
     let (store, engine, table_location) = engine_store_setup("void_nested_transform_test", None);
