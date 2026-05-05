@@ -100,7 +100,27 @@ impl From<bool> for MetadataValue {
 pub enum ColumnMetadataKey {
     ColumnMappingId,
     ColumnMappingPhysicalName,
+    /// Parquet field IDs for the synthesized `element` / `key` / `value` fields of an Array or
+    /// Map. Stored on the *nearest ancestor* StructField as a JSON object whose keys are
+    /// dot-paths rooted at that field's name.
+    ///
+    /// # Example: list-in-map
+    ///
+    /// For `m: map<int, array<int>>` and the key/value/element fields having field ids
+    /// 100/101/102, the metadata on `m` should be:
+    ///
+    /// ```json
+    /// {
+    ///   "delta.columnMapping.nested.ids": {
+    ///     "m.key":           100,
+    ///     "m.value":         101,
+    ///     "m.value.element": 102
+    ///   }
+    /// }
+    /// ```
+    ColumnMappingNestedIds,
     ParquetFieldId,
+    ParquetFieldNestedIds,
     GenerationExpression,
     IdentityStart,
     IdentityStep,
@@ -116,10 +136,16 @@ impl AsRef<str> for ColumnMetadataKey {
         match self {
             Self::ColumnMappingId => "delta.columnMapping.id",
             Self::ColumnMappingPhysicalName => "delta.columnMapping.physicalName",
+            Self::ColumnMappingNestedIds => "delta.columnMapping.nested.ids",
             // "parquet.field.id" is not defined by the Delta protocol, but follows the convention
             // established by delta-spark and other Delta ecosystem implementations for storing
             // Parquet field IDs in StructField metadata.
             Self::ParquetFieldId => "parquet.field.id",
+            // The Delta protocol defines this key for IcebergCompatV2/V3 nested field ids. It is
+            // legacy and will be replaced by `delta.columnMapping.nested.ids` (which kernel
+            // uses everywhere). Kept here for protocol compatibility only.
+            // Tracking issue: <https://github.com/delta-io/delta/issues/6688>
+            Self::ParquetFieldNestedIds => "parquet.field.nested.ids",
             Self::GenerationExpression => "delta.generationExpression",
             Self::IdentityAllowExplicitInsert => "delta.identity.allowExplicitInsert",
             Self::IdentityHighWaterMark => "delta.identity.highWaterMark",

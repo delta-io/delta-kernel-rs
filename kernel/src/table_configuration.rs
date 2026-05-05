@@ -21,6 +21,7 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
+use crate::schema::validation::validate_iceberg_compat_v3_no_legacy_nested_id;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
@@ -196,6 +197,7 @@ impl TableConfiguration {
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
+        validate_iceberg_compat_v3_no_legacy_nested_id(&table_config)?;
 
         Ok(table_config)
     }
@@ -2237,7 +2239,7 @@ mod test {
         vec!["value", "pcol"],
     )]
     #[case::v3_supported_but_property_unset(&[], vec!["value"])]
-    fn test_physical_write_schema_materializes_pv_when_iceberg_compact_v3_enabled(
+    fn test_physical_write_schema_materializes_pv_when_iceberg_compat_v3_enabled(
         #[case] extra_props: &[(&str, &str)],
         #[case] expected_field_names: Vec<&str>,
     ) {
