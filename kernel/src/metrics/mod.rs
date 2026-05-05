@@ -115,12 +115,15 @@ pub trait WithMetricsReporterLayer: Subscriber + for<'lookup> LookupSpan<'lookup
     /// If you need thread-local isolation -- e.g. per-test
     /// [`tracing_subscriber::util::SubscriberInitExt::set_default`] guards in a
     /// multi-threaded test binary -- also install a bare global default subscriber
-    /// (e.g. `tracing_subscriber::registry().init()`) up front. Several kernel metrics
-    /// are emitted from `Drop` impls (notably storage list/read completion in the
-    /// default engine), and those `Drop` sites can run on threads that have no
-    /// subscriber installed -- for example tokio worker threads owned by the
-    /// `DefaultEngine`'s background runtime. If a no-subscriber thread is the first to
-    /// hit such a callsite, tracing caches its `Interest` as `never` process-globally,
+    /// (e.g. `tracing_subscriber::registry().init()`) up front. Test code should
+    /// prefer `test_utils::install_thread_local_metrics_reporter`, which bundles
+    /// the global-subscriber install with the thread-local `set_default` so callers
+    /// cannot accidentally skip the first step. Several kernel metrics are emitted
+    /// from `Drop` impls (notably storage list/read completion in the default
+    /// engine), and those `Drop` sites can run on threads that have no subscriber
+    /// installed -- for example tokio worker threads owned by the `DefaultEngine`'s
+    /// background runtime. If a no-subscriber thread is the first to hit such a
+    /// callsite, tracing caches its `Interest` as `never` process-globally,
     /// silently disabling that metric for the rest of the process. Keeping a real
     /// global default active means every thread's "current dispatcher" is a real
     /// subscriber, so the cached interest stays in the `always`/`sometimes` regime.
