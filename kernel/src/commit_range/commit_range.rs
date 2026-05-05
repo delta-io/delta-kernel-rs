@@ -17,7 +17,7 @@ use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
-use crate::{DeltaResult, Engine, EngineData, Error, Version};
+use crate::{DeltaResult, Engine, EngineData, Error, JsonHandler, Version};
 
 /// Output column name for the per-row commit version emitted by [`CommitRange::actions`].
 const COMMIT_VERSION_COL: &str = "_commit_version";
@@ -116,21 +116,22 @@ impl CommitRange {
     /// `protocol` or `commitInfo` happens here — protocol validation and ICT resolution
     /// are the caller's responsibility.
     ///
-    /// `engine` is captured by the returned iterator and must outlive its consumption.
-    pub fn commits<'a>(
-        &'a self,
-        engine: &'a dyn Engine,
+    /// The returned iterator owns its dependencies (an `Arc<dyn JsonHandler>` cloned from
+    /// `engine`, an owned `Vec<ParsedLogPath>` cloned from the log segment), so it does
+    /// not borrow from `&self` or `&engine` after this call returns.
+    pub fn commits(
+        &self,
+        engine: &dyn Engine,
         actions: &HashSet<DeltaAction>,
-    ) -> Box<dyn Iterator<Item = DeltaResult<CommitActions>> + 'a> {
+    ) -> impl Iterator<Item = DeltaResult<CommitActions>> + Send {
         let action_kinds: Vec<DeltaAction> = actions.iter().copied().collect();
         let read_schema = build_read_schema(&action_kinds);
-        Box::new(
-            self.log_segment
-                .listed
-                .ascending_commit_files()
-                .iter()
-                .map(move |file| open_commit_actions(engine, file, read_schema.clone())),
-        )
+        let json_handler = engine.json_handler();
+        let commit_files = self.log_segment.listed.ascending_commit_files().clone();
+
+        commit_files
+            .into_iter()
+            .map(move |file| open_commit_actions(json_handler.as_ref(), &file, read_schema.clone()))
     }
 
     /// Yield action batches across all commits as [`crate::EngineData`], with
@@ -141,18 +142,19 @@ impl CommitRange {
     /// `EvaluationHandler` to inject the commit's version and timestamp as literal
     /// columns. The original action columns (`add`, `remove`, ...) are passed through
     /// unchanged in the order driven by `actions`.
-    #[allow(clippy::type_complexity)]
-    pub fn actions<'a>(
-        &'a self,
-        engine: &'a dyn Engine,
+    pub fn actions(
+        &self,
+        engine: &dyn Engine,
         actions: &HashSet<DeltaAction>,
-    ) -> Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a> {
+    ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send {
         let action_kinds: Vec<DeltaAction> = actions.iter().copied().collect();
         let input_schema = build_read_schema(&action_kinds);
         let output_schema = actions_output_schema(&action_kinds);
+        let evaluation_handler = engine.evaluation_handler();
+        let commits_iter = self.commits(engine, actions);
 
-        Box::new(self.commits(engine, actions).flat_map(
-            move |commit_res| -> Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+        commits_iter.flat_map(
+            move |commit_res| -> Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
                 let commit = match commit_res {
                     Ok(c) => c,
                     Err(e) => return Box::new(std::iter::once(Err(e))),
@@ -168,7 +170,7 @@ impl CommitRange {
                 };
                 let expr =
                     actions_transform_expression(&action_kinds, version_i64, commit.timestamp());
-                let evaluator = match engine.evaluation_handler().new_expression_evaluator(
+                let evaluator = match evaluation_handler.new_expression_evaluator(
                     input_schema.clone(),
                     Arc::new(expr),
                     output_schema.clone().into(),
@@ -180,7 +182,7 @@ impl CommitRange {
                     batch_res.and_then(|batch| evaluator.evaluate(batch.as_ref()))
                 }))
             },
-        ))
+        )
     }
 }
 
@@ -254,15 +256,12 @@ fn actions_transform_expression(
 /// `last_modified`; ICT extraction is intentionally deferred (TODO) since it requires
 /// either a snapshot to check ICT enablement or a single-read peek+rewind.
 fn open_commit_actions(
-    engine: &dyn Engine,
+    json_handler: &dyn JsonHandler,
     file: &ParsedLogPath,
     read_schema: SchemaRef,
 ) -> DeltaResult<CommitActions> {
-    let actions = engine.json_handler().read_json_files(
-        slice::from_ref(&file.location),
-        read_schema,
-        None,
-    )?;
+    let actions =
+        json_handler.read_json_files(slice::from_ref(&file.location), read_schema, None)?;
     Ok(CommitActions {
         version: file.version,
         // TODO: extract `commitInfo.inCommitTimestamp` from the first batch (peek+rewind)

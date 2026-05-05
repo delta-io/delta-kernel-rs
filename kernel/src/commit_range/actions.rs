@@ -2,7 +2,7 @@
 //! [`CommitActions`] — per-commit handle exposing version, timestamp, and a lazy
 //! iterator over the commit's action batches.
 
-use crate::{DeltaResult, EngineData, Version};
+use crate::{DeltaResult, EngineData, FileDataReadResultIterator, Version};
 
 /// A Delta log action kind.
 ///
@@ -36,9 +36,7 @@ pub enum DeltaAction {
 pub struct CommitActions {
     pub(crate) version: Version,
     pub(crate) timestamp: i64,
-    // Iterator can only be only one here. Double check on the java kernel. Double check how the
-    // engine's json_handler read.
-    pub(crate) actions: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+    pub(crate) actions: FileDataReadResultIterator,
 }
 
 impl CommitActions {
@@ -56,7 +54,7 @@ impl CommitActions {
     }
 
     /// Consume self and return the iterator over action batches.
-    pub fn into_actions(self) -> Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
+    pub fn into_actions(self) -> FileDataReadResultIterator {
         self.actions
     }
 }
