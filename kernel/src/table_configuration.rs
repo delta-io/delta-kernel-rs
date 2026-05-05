@@ -850,6 +850,12 @@ impl TableConfiguration {
             EnablementCheck::EnabledIf(check_fn) => check_fn(&self.table_properties),
         }
     }
+
+    /// Returns true when the table requires every AddFile to carry a non-null
+    /// `stats.numRecords`.
+    pub(crate) fn requires_stats_num_records(&self) -> bool {
+        self.is_feature_enabled(&TableFeature::IcebergCompatV3)
+    }
 }
 
 #[cfg(test)]

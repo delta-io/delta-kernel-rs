@@ -15,6 +15,9 @@ use crate::schema::{
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::DeltaResult;
 
+/// Sub-field of an AddFile's `stats` struct: total number of rows in the file.
+pub(crate) const STATS_NUM_RECORDS: &str = "numRecords";
+
 /// Generates the expected schema for file statistics.
 ///
 /// The base stats schema is dependent on the current table configuration and derived via:

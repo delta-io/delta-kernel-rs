@@ -10,6 +10,7 @@ use std::sync::LazyLock;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
+use crate::scan::data_skipping::stats_schema::STATS_NUM_RECORDS;
 use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
 use crate::DeltaResult;
@@ -67,7 +68,7 @@ impl StatsColumnVerifier {
         let mut missing_max: Vec<String> = Vec::new();
 
         for batch in add_files {
-            let mut visitor = ColumnStatsVisitor {
+            let mut visitor = ColumnStatsValidator {
                 data_type,
                 types,
                 missing_null_count: &mut missing_null_count,
@@ -227,7 +228,7 @@ fn is_stat_present<'b>(
 
 /// Visitor that checks nullCount, minValues, and maxValues for a single column in one pass.
 /// Expects 5 getters: [path, numRecords, nullCount, minValues, maxValues].
-struct ColumnStatsVisitor<'a> {
+struct ColumnStatsValidator<'a> {
     data_type: &'a DataType,
     types: &'static ColumnNamesAndTypes,
     missing_null_count: &'a mut Vec<String>,
@@ -235,7 +236,7 @@ struct ColumnStatsVisitor<'a> {
     missing_max: &'a mut Vec<String>,
 }
 
-impl RowVisitor for ColumnStatsVisitor<'_> {
+impl RowVisitor for ColumnStatsValidator<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         self.types.as_ref()
     }
@@ -280,7 +281,7 @@ pub(crate) fn verify_num_records_present(
 ) -> DeltaResult<()> {
     let column_names = vec![
         ColumnName::new(["path"]),
-        ColumnName::new(["stats", "numRecords"]),
+        ColumnName::new(["stats", STATS_NUM_RECORDS]),
     ];
     let mut first_missing: Option<String> = None;
     for batch in add_files {
@@ -294,7 +295,8 @@ pub(crate) fn verify_num_records_present(
     }
     if let Some(path) = first_missing {
         return Err(Error::stats_validation(format!(
-            "'stats.numRecords' is required by icebergCompatV3, but is missing for file '{path}'",
+            "'stats.numRecords' is required for this table (see \
+             `TableConfiguration::requires_stats_num_records`), but is missing for file '{path}'",
         )));
     }
     Ok(())
@@ -320,7 +322,7 @@ impl RowVisitor for NumRecordsValidator<'_> {
             ))
         );
         for row_idx in 0..row_count {
-            if getters[1].get_long(row_idx, "numRecords")?.is_none() {
+            if getters[1].get_long(row_idx, STATS_NUM_RECORDS)?.is_none() {
                 *self.first_missing = Some(getters[0].get(row_idx, "path")?);
                 return Ok(());
             }
@@ -933,6 +935,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_verify_num_records_present_flags_add_without_stats() {
+        let batch = create_add_file_batch_with_stats_mask(
+            vec!["a.parquet", "b.parquet"],
+            vec![true, false],
+        );
+        let err = verify_num_records_present(&[batch])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'stats.numRecords' is required") && err.contains("b.parquet"),
+            "expected error naming b.parquet, got: {err}",
+        );
+        assert!(
+            !err.contains("a.parquet"),
+            "row with stats present should not be flagged: {err}",
+        );
+    }
+
     fn create_add_file_batch_with_num_records(
         paths: Vec<&str>,
         num_records: Vec<Option<i64>>,
@@ -945,5 +966,62 @@ mod tests {
             vec![None; n],
             vec![None; n],
         )
+    }
+
+    /// Build an add-file batch where rows with `stats_present[i] == false` carry no `stats`
+    /// at all; other rows get `numRecords = 10`.
+    fn create_add_file_batch_with_stats_mask(
+        paths: Vec<&str>,
+        stats_present: Vec<bool>,
+    ) -> Box<dyn EngineData> {
+        assert_eq!(paths.len(), stats_present.len());
+        let n = paths.len();
+        let num_records: Vec<Option<i64>> = stats_present.iter().map(|p| p.then_some(10)).collect();
+        let path_array = StringArray::from(paths);
+
+        let col_field = Arc::new(ArrowField::new("col", ArrowDataType::Int64, true));
+        let inner_struct_type = |name: &str| {
+            ArrowField::new(
+                name,
+                ArrowDataType::Struct(Fields::from(vec![ArrowField::new(
+                    "col",
+                    ArrowDataType::Int64,
+                    true,
+                )])),
+                true,
+            )
+        };
+        let stats_fields = Fields::from(vec![
+            ArrowField::new("numRecords", ArrowDataType::Int64, true),
+            inner_struct_type("nullCount"),
+            inner_struct_type("minValues"),
+            inner_struct_type("maxValues"),
+        ]);
+        let zero_inner_struct_array = StructArray::new(
+            Fields::from(vec![col_field]),
+            vec![Arc::new(Int64Array::from(vec![None as Option<i64>; n])) as ArrayRef],
+            None, /* null buffer */
+        );
+        let stats_struct_array = StructArray::new(
+            stats_fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(num_records)) as ArrayRef,
+                Arc::new(zero_inner_struct_array.clone()) as ArrayRef,
+                Arc::new(zero_inner_struct_array.clone()) as ArrayRef,
+                Arc::new(zero_inner_struct_array) as ArrayRef,
+            ],
+            // null buffer: rows with stats_present[i] == false are null
+            Some(stats_present.into_iter().collect()),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("path", ArrowDataType::Utf8, false),
+            ArrowField::new("stats", ArrowDataType::Struct(stats_fields), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(path_array), Arc::new(stats_struct_array)],
+        )
+        .unwrap();
+        Box::new(ArrowEngineData::new(batch))
     }
 }

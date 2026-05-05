@@ -981,22 +981,24 @@ impl<S: SupportsDataFiles> Transaction<S> {
 // Internal methods available on ALL transaction types (used by commit path)
 // =============================================================================
 impl<S> Transaction<S> {
-    /// Validate that add files have required statistics for clustering columns.
+    /// Validate that add files carry the per-file statistics required by the table's protocol.
     ///
-    /// Per the Delta protocol, writers MUST collect per-file statistics for clustering columns
-    /// when the `ClusteredTable` feature is enabled. Other stat columns (e.g. the conventional
-    /// "first 32 columns") are not validated here because they are not protocol-required.
+    /// Currently checks two protocol requirements:
+    /// - `stats.numRecords` must be present when [`requires_stats_num_records`] returns true.
+    /// - Per-file min/max/nullCount must be present for clustering columns when the
+    ///   `ClusteredTable` feature is enabled.
     ///
-    /// Only add files are validated — remove files do not carry statistics.
+    /// Other stat columns (e.g. the conventional "first 32 columns") are not validated here
+    /// because they are not protocol-required.
+    ///
+    /// Only add files are validated(remove files do not carry statistics).
+    ///
+    /// [`requires_stats_num_records`]: crate::table_configuration::TableConfiguration::requires_stats_num_records
     fn validate_add_files_stats(&self, add_files: &[Box<dyn EngineData>]) -> DeltaResult<()> {
         if add_files.is_empty() {
             return Ok(());
         }
-        // IcebergCompatV3 requires every AddFile to carry `stats.numRecords`.
-        if self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::IcebergCompatV3)
-        {
+        if self.effective_table_config.requires_stats_num_records() {
             stats_verifier::verify_num_records_present(add_files)?;
         }
         if let Some(ref clustering_cols) = self.physical_clustering_columns {
