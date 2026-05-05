@@ -2,8 +2,8 @@
 //!
 //! Two directions, used at the engine <-> kernel boundary:
 //!
-//! - **arrow -> kernel** ([`TryFromArrow`] / [`TryIntoKernel`]): an example usage is parsing a
-//!   parquet footer's Arrow schema into a kernel `StructType` for checkpoint introspection.
+//! - **arrow -> kernel** ([`TryFromArrow`] / [`TryIntoKernel`]): an example usage is converting a
+//!   checkpoint Parquet file's Arrow footer schema into a kernel `StructType` during log replay.
 //!
 //! - **kernel -> arrow** ([`TryFromKernel`] / [`TryIntoArrow`]): an example usage is materializing
 //!   a kernel `StructType` as an `ArrowSchema` to build a `RecordBatch` on the write path.
@@ -32,22 +32,15 @@ pub(crate) const MAP_ROOT_DEFAULT: &str = "key_value";
 pub(crate) const MAP_KEY_DEFAULT: &str = "key";
 pub(crate) const MAP_VALUE_DEFAULT: &str = "value";
 
-/// Converts kernel [`StructField`] metadata to Arrow field metadata format.
-///
-/// Specifically:
-/// - Transforms the `"parquet.field.id"` key (used by kernel/delta-spark) to `"PARQUET:field_id"`
-///   (the native Parquet/Arrow metadata key), enabling correct field ID handling by the
-///   Arrow/Parquet writer.
-/// - Strips the nested-ids JSON key (`"delta.columnMapping.nested.ids"`). Its content is already
-///   projected onto the synthesized list/map fields' `"PARQUET:field_id"` by
-///   [`kernel_map_array_into_arrow`].
-pub(crate) fn kernel_metadata_to_arrow_metadata(
+/// Translate a kernel [`StructField`]'s flat (non-nested) parquet field id metadata into Arrow
+/// field metadata: rewrites kernel-side `"parquet.field.id"` to arrow-side `"PARQUET:field_id"`
+/// (see [`PARQUET_FIELD_ID_META_KEY`]). All other entries pass through unchanged.
+pub(crate) fn kernel_flat_parquet_id_to_arrow(
     field: &StructField,
 ) -> Result<HashMap<String, String>, ArrowError> {
     field
         .metadata()
         .iter()
-        .filter(|(key, _)| *key != ColumnMetadataKey::ColumnMappingNestedIds.as_ref())
         .map(|(key, val)| {
             let transformed_key = if key == ColumnMetadataKey::ParquetFieldId.as_ref() {
                 PARQUET_FIELD_ID_META_KEY.to_string()
@@ -178,11 +171,10 @@ impl TryFromKernel<&StructType> for ArrowSchema {
 
 impl TryFromKernel<&StructField> for ArrowField {
     fn try_from_kernel(f: &StructField) -> Result<Self, ArrowError> {
-        let metadata = kernel_metadata_to_arrow_metadata(f)?;
-        // For Array/Map fields, recurse via `kernel_map_array_into_arrow` so that any
-        // `delta.columnMapping.nested.ids` metadata on this StructField gets threaded onto the
-        // synthesized element/key/value Arrow fields. Other types (Struct, Primitive, Variant)
-        // keep using the default conversion.
+        let mut metadata = kernel_flat_parquet_id_to_arrow(f)?;
+        // `ColumnMetadataKey::ColumnMappingNestedIds` is a kernel-side metadata key, not
+        // retained in Arrow; its content is processed by `kernel_map_array_into_arrow`.
+        metadata.remove(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
         let arrow_type = match f.data_type() {
             DataType::Array(_) | DataType::Map(_) => {
                 kernel_map_array_into_arrow(f, f.name(), f.data_type())?

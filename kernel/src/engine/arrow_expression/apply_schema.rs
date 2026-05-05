@@ -5,7 +5,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use super::super::arrow_conversion::{
-    kernel_metadata_to_arrow_metadata, lookup_nested_field_id, parquet_field_id_metadata,
+    kernel_flat_parquet_id_to_arrow, lookup_nested_field_id, parquet_field_id_metadata,
     LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_VALUE_DEFAULT,
 };
 use super::super::arrow_utils::make_arrow_error;
@@ -18,7 +18,7 @@ use crate::arrow::datatypes::{
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use crate::schema::{ArrayType, DataType, MapType, Schema, StructField};
+use crate::schema::{ArrayType, ColumnMetadataKey, DataType, MapType, Schema, StructField};
 
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch` where
 // the names of fields, nullable, and metadata in the struct have been transformed to match those
@@ -82,7 +82,11 @@ fn transform_struct(
                 Some(target_field),
                 &target_field.name,
             )?;
-            let arrow_metadata = kernel_metadata_to_arrow_metadata(target_field)?;
+            let mut arrow_metadata = kernel_flat_parquet_id_to_arrow(target_field)?;
+            // `ColumnMetadataKey::ColumnMappingNestedIds` is a kernel-side metadata key, not
+            // retained in Arrow; its content is processed by `apply_schema_to_list` /
+            // `apply_schema_to_map`.
+            arrow_metadata.remove(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
             // If both the input field and the target field carry a field ID they must agree,
             // otherwise we would silently overwrite one field ID with another.
             if let (Some(input_id), Some(target_id)) = (
