@@ -392,8 +392,6 @@ fn open_commit_actions(
     let raw_iter =
         json_handler.read_json_files(slice::from_ref(&file.location), read_schema, None)?;
 
-    // Spec guarantees at most one Protocol action per commit, so we only need to scan
-    // batches until we find it. After the first hit, skip subsequent visitor walks.
     let mut seen_protocol = false;
     let actions = Box::new(raw_iter.map(move |batch_res| {
         let batch = batch_res?;
