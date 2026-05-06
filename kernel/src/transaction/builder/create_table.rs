@@ -638,10 +638,10 @@ fn maybe_apply_column_mapping_for_table_create(
             // Transform schema: assign IDs and physical names to all fields. When
             // IcebergCompatV3 is enabled, allocated nested ids for element/key/value in Array/Map
             // as well.
-            let with_nested_ids = validated.is_property_true(ENABLE_ICEBERG_COMPAT_V3);
+            let assign_nested_field_ids = validated.is_property_true(ENABLE_ICEBERG_COMPAT_V3);
             let mut max_id = 0i64;
             let transformed_schema =
-                assign_column_mapping_metadata(schema, &mut max_id, with_nested_ids)?;
+                assign_column_mapping_metadata(schema, &mut max_id, assign_nested_field_ids)?;
 
             // Add maxColumnId to properties
             validated
@@ -982,10 +982,13 @@ mod tests {
     use super::*;
     use crate::expressions::ColumnName;
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
-    use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    };
     use crate::table_features::FeatureType;
     use crate::table_properties::{
-        ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3, PARQUET_FORMAT_VERSION,
+        COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3,
+        PARQUET_FORMAT_VERSION,
     };
     use crate::transforms::SchemaTransform;
     use crate::utils::test_utils::{
@@ -1871,15 +1874,17 @@ mod tests {
             maybe_apply_column_mapping_for_table_create(&schema, &mut validated, pre_cm).unwrap();
         assert_eq!(mode, ColumnMappingMode::Name);
 
-        // top: CM id=1, nested-ids = {<top_physical>.{key:2, value:3, key.element:4}}
+        // top: CM id=1, nested-ids = {<top_physical>.{key:2, key.element:3, value:4}}
+        // DFS order: top-level (1) -> Map.key (2) -> recurse into key
+        // (Array<int>): key.element (3) -> Map.value (4). Matches delta-spark's behavior.
         let top = effective_schema.field("top").expect("missing top");
         let top_physical = expect_field_id_and_physical_name(top, 1);
         assert_eq!(
             extract_nested_ids(top),
             serde_json::json!({
                 format!("{top_physical}.key"): 2,
-                format!("{top_physical}.value"): 3,
-                format!("{top_physical}.key.element"): 4,
+                format!("{top_physical}.key.element"): 3,
+                format!("{top_physical}.value"): 4,
             }),
             "top's nested-ids JSON",
         );
@@ -2004,7 +2009,7 @@ mod tests {
 
     /// Listing IcebergCompatV3 in writerFeatures (i.e. "supported") without setting
     /// `delta.enableIcebergCompatV3=true` does NOT activate V3 behavior: column mapping is
-    /// applied per the explicit property, but no nested ids are stamped on Array/Map fields.
+    /// applied per the explicit property, but no nested ids are set on Array/Map fields.
     #[test]
     fn test_create_table_v3_supported_but_not_enabled_skips_nested_ids() {
         let schema = build_iceberg_compat_v3_test_schema();
