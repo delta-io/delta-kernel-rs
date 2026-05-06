@@ -982,13 +982,10 @@ mod tests {
     use super::*;
     use crate::expressions::ColumnName;
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
-    use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
-    };
+    use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
     use crate::table_features::FeatureType;
     use crate::table_properties::{
-        COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3,
-        PARQUET_FORMAT_VERSION,
+        ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3, PARQUET_FORMAT_VERSION,
     };
     use crate::transforms::SchemaTransform;
     use crate::utils::test_utils::{
