@@ -46,7 +46,8 @@ pub struct TableChangesScan {
 /// # use delta_kernel::table_changes::TableChanges;
 /// # let path = "./tests/data/table-with-cdf";
 /// # let url = delta_kernel::try_parse_uri(path).unwrap();
-/// # use delta_kernel::engine::default::{storage::store_from_url, DefaultEngineBuilder};
+/// # use delta_kernel::engine::default::storage::store_from_url;
+/// # use delta_kernel::engine::default::DefaultEngineBuilder;
 /// # let engine = DefaultEngineBuilder::new(store_from_url(&url).unwrap()).build();
 /// # let table_changes = TableChanges::try_new(url, &engine, 0, Some(1)).unwrap();
 /// let schema = table_changes

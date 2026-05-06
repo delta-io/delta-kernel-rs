@@ -6,10 +6,9 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::StructType;
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
@@ -39,7 +38,7 @@ async fn test_checkpoint_non_kernel_written_table() {
     test_utils::copy_directory(source_path, &table_path).unwrap();
 
     let url = Url::from_directory_path(&table_path).unwrap();
-    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let store = store_from_url(&url).unwrap();
     let executor = Arc::new(
         delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),

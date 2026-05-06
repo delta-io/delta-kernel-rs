@@ -19,8 +19,10 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel::engine::default::storage::PrefixedStore;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::metrics::WithMetricsReporterLayer as _;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -45,7 +47,7 @@ fn measuring_engine(
     tracing::subscriber::DefaultGuard,
 ) {
     let reporter = Arc::new(CountingReporter::default());
-    let engine = DefaultEngineBuilder::new(store).build();
+    let engine = DefaultEngineBuilder::new(PrefixedStore::new(store, Path::from(""))).build();
     let guard = tracing_subscriber::registry()
         .with_metrics_reporter_layer(reporter.clone())
         .set_default();

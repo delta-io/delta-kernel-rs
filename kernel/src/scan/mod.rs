@@ -881,11 +881,11 @@ impl Scan {
     /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
+    /// # use delta_kernel::engine::default::storage::store_from_url;
     /// # use delta_kernel::engine::default::DefaultEngineBuilder;
-    /// # use delta_kernel::object_store::local::LocalFileSystem;
     /// # fn main() -> DeltaResult<()> {
-    /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
     /// let table_root = Url::parse("file:///path/to/table")?;
+    /// let engine = Arc::new(DefaultEngineBuilder::new(store_from_url(&table_root)?).build());
     ///
     /// // Build a snapshot
     /// let snapshot = Snapshot::builder_for(table_root.clone())

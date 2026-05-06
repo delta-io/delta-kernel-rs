@@ -3,7 +3,6 @@ use crate::action_reconciliation::RetentionCalculator;
 use crate::engine::sync::SyncEngine;
 use crate::snapshot::Snapshot;
 use crate::SnapshotRef;
-
 fn create_mock_snapshot() -> SnapshotRef {
     let path = std::fs::canonicalize(std::path::PathBuf::from(
         "./tests/data/table-with-dv-small/",
@@ -247,6 +246,7 @@ async fn test_no_compaction_staged_commits() {
     use std::sync::Arc;
 
     use crate::actions::Add;
+    use crate::engine::default::storage::PrefixedStore;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
@@ -255,7 +255,8 @@ async fn test_no_compaction_staged_commits() {
 
     // Set up in-memory store
     let store = Arc::new(InMemory::new());
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
 
     // Create basic commits with proper metadata and protocol
     use crate::actions::{Metadata, Protocol};

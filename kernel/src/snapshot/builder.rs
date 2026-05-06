@@ -9,7 +9,6 @@ use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
 use crate::utils::{require, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
-
 /// Builder for creating [`Snapshot`] instances.
 ///
 /// # Example
@@ -333,6 +332,7 @@ mod tests {
 
     use super::*;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::storage::PrefixedStore;
     use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
     use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
     use crate::object_store::memory::InMemory;
@@ -347,7 +347,9 @@ mod tests {
     ) {
         let table_root = String::from("memory:///");
         let store = Arc::new(InMemory::new());
-        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build(),
+        );
         (engine, store, table_root)
     }
 

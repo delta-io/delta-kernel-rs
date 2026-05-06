@@ -2,8 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel::engine::default::storage::PrefixedStore;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::Snapshot;
 use delta_kernel_unity_catalog::{UCCommitter, UCKernelClient};
@@ -63,9 +65,12 @@ async fn setup() -> Result<TestSetup, TestError> {
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
     ));
-    let engine = delta_kernel::engine::default::DefaultEngineBuilder::new(store)
-        .with_task_executor(executor)
-        .build();
+    let engine = delta_kernel::engine::default::DefaultEngineBuilder::new(PrefixedStore::new(
+        store,
+        Path::from(""),
+    ))
+    .with_task_executor(executor)
+    .build();
     let table_uri = url::Url::from_directory_path(tmp_dir.path()).map_err(|_| "invalid path")?;
     let snapshot = UCKernelClient::new(commits_client.as_ref())
         .load_snapshot_at(TABLE_ID, table_uri.as_str(), 2, &engine)

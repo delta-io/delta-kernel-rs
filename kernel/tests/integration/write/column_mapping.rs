@@ -9,11 +9,11 @@ use delta_kernel::arrow::array::{
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{ColumnName, Scalar};
-use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
+use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::{Engine, FileMeta, Snapshot};
@@ -43,15 +43,17 @@ use crate::common::write_utils::{
 async fn test_column_mapping_write(
     #[case] cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::engine::default::storage::store_from_url;
+
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = nested_schema()?;
 
     let (_tmp_dir, table_path, _) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
-    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let prefixed = store_from_url(&table_url)?;
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(prefixed.clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
                 tokio::runtime::Handle::current(),
             )))
@@ -187,7 +189,8 @@ async fn test_column_mapping_write(
         let parquet_url = table_url.join(parquet_path)?;
         let local_path = parquet_url.to_file_path().unwrap();
 
-        let obj_meta = store
+        let obj_meta = prefixed
+            .store
             .head(&Path::from_url_path(parquet_url.path())?)
             .await?;
         let file_meta = FileMeta::new(
@@ -318,7 +321,7 @@ async fn test_column_mapping_partitioned_write(
     let tmp_dir = tempfile::tempdir()?;
     copy_directory(std::path::Path::new(table_dir), tmp_dir.path())?;
     let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
-    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let store = store_from_url(&table_url)?;
     let engine = Arc::new(
         DefaultEngineBuilder::new(store.clone())
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(

@@ -10,7 +10,6 @@ use tracing::warn;
 use super::{try_read_crc_file, Crc};
 use crate::path::ParsedLogPath;
 use crate::{Engine, Version};
-
 /// Result of attempting to load a CRC file.
 ///
 /// The "not yet loaded" state is represented by `OnceLock::get()` returning `None`, not as an enum
@@ -146,15 +145,21 @@ mod tests {
 
     use super::*;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::storage::PrefixedStore;
     use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
     use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
 
     fn table_root() -> url::Url {
         url::Url::parse("memory:///").unwrap()
     }
 
     fn test_engine() -> DefaultEngine<TokioBackgroundExecutor> {
-        DefaultEngineBuilder::new(Arc::new(InMemory::new())).build()
+        DefaultEngineBuilder::new(PrefixedStore::new(
+            Arc::new(InMemory::new()),
+            Path::from(""),
+        ))
+        .build()
     }
 
     // ===== CrcLoadResult Tests =====

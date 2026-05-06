@@ -17,6 +17,7 @@ use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
+use crate::engine::default::storage::PrefixedStore;
 use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
@@ -27,7 +28,7 @@ use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
-use crate::object_store::ObjectStoreExt as _;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::parquet::arrow::ArrowWriter;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
@@ -114,27 +115,20 @@ async fn build_log_with_paths_and_checkpoint(
             .expect("Write _last_checkpoint");
     }
 
-    let storage = ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+    let storage = ObjectStoreStorageHandler::new(
+        store,
+        Arc::new(TokioBackgroundExecutor::new()),
+        Path::from(""),
+    );
 
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
     (Box::new(storage), log_root)
 }
 
-// Create an in-memory store and return the store and the URL for the store's _delta_log directory.
-fn new_in_memory_store() -> (Arc<InMemory>, Url) {
-    (
-        Arc::new(InMemory::new()),
-        Url::parse("memory:///")
-            .unwrap()
-            .join("_delta_log/")
-            .unwrap(),
-    )
-}
-
 // Writes a record batch obtained from engine data to the in-memory store at a given path.
 async fn write_parquet_to_store(
-    store: &Arc<InMemory>,
+    store: &Arc<DynObjectStore>,
     path: String,
     data: Box<dyn EngineData>,
 ) -> DeltaResult<()> {
@@ -154,7 +148,7 @@ async fn write_parquet_to_store(
 /// Writes all actions to a _delta_log parquet checkpoint file in the store.
 /// This function formats the provided filename into the _delta_log directory.
 pub(crate) async fn add_checkpoint_to_store(
-    store: &Arc<InMemory>,
+    store: &Arc<DynObjectStore>,
     data: Box<dyn EngineData>,
     filename: &str,
 ) -> DeltaResult<()> {
@@ -165,7 +159,7 @@ pub(crate) async fn add_checkpoint_to_store(
 /// Writes all actions to a _delta_log/_sidecars file in the store and return the [`FileMeta`].
 /// This function formats the provided filename into the _sidecars subdirectory.
 async fn add_sidecar_to_store(
-    store: &Arc<InMemory>,
+    store: &Arc<DynObjectStore>,
     data: Box<dyn EngineData>,
     filename: &str,
 ) -> DeltaResult<FileMeta> {
@@ -183,7 +177,7 @@ async fn add_sidecar_to_store(
 /// Writes all actions to a _delta_log json checkpoint file in the store.
 /// This function formats the provided filename into the _delta_log directory.
 async fn write_json_to_store(
-    store: &Arc<InMemory>,
+    store: &Arc<DynObjectStore>,
     actions: Vec<Action>,
     filename: &str,
 ) -> DeltaResult<()> {
@@ -216,7 +210,7 @@ fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
 }
 
 /// Gets the file size from the store for use in FileMeta
-async fn get_file_size(store: &Arc<InMemory>, path: &str) -> u64 {
+async fn get_file_size(store: &Arc<DynObjectStore>, path: &str) -> u64 {
     let object_meta = store.head(&Path::from(path)).await.unwrap();
     object_meta.size
 }
@@ -1029,7 +1023,8 @@ fn test_sidecar_to_filemeta_valid_paths(
 
 #[test]
 fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
-    let (_, log_root) = new_in_memory_store();
+    let (_, table_root) = test_utils::in_memory_store();
+    let log_root = table_root.join("_delta_log/").unwrap();
     let engine = Arc::new(SyncEngine::new());
     let checkpoint_batch = add_batch_simple(get_all_actions_schema().clone());
 
@@ -1051,8 +1046,10 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let (store, table_root) = test_utils::in_memory_store();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     let sidecar1_size = add_sidecar_to_store(
@@ -1099,8 +1096,10 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
 
 #[test]
 fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let (store, table_root) = test_utils::in_memory_store();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
@@ -1126,8 +1125,10 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 
 #[tokio::test]
 async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let (store, table_root) = test_utils::in_memory_store();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     // Add a sidecar file with only add actions
@@ -1170,8 +1171,10 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let (store, table_root) = test_utils::in_memory_store();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
     add_checkpoint_to_store(
         &store,
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are
@@ -1224,8 +1227,10 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
 #[tokio::test]
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
 ) -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let (store, table_root) = test_utils::in_memory_store();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
 
     // Multi-part checkpoints should never contain sidecar actions.
     // This test intentionally includes batches with sidecar actions in multi-part checkpoints
@@ -1302,8 +1307,10 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let (store, table_root) = test_utils::in_memory_store();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
 
     add_checkpoint_to_store(
         &store,
@@ -1359,8 +1366,10 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let (store, table_root) = test_utils::in_memory_store();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
 
     let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
 
@@ -1422,8 +1431,10 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let (store, table_root) = test_utils::in_memory_store();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
 
     // Write sidecars first so we can get their actual sizes
     let sidecar1_size = add_sidecar_to_store(
@@ -2005,7 +2016,11 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
         .await
         .expect("put empty compaction");
 
-    let storage = ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+    let storage = ObjectStoreStorageHandler::new(
+        store,
+        Arc::new(TokioBackgroundExecutor::new()),
+        Path::from(""),
+    );
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
 
@@ -2780,8 +2795,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     #[case] hint_version: u64,
     #[case] expect_hint_schema_used: bool,
 ) -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let (store, table_root) = test_utils::in_memory_store();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
 
     // Build a checkpoint with an initial v1 schema
     let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
@@ -2854,8 +2871,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
 #[case::without_hint(false)]
 #[tokio::test]
 async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let (store, table_root) = test_utils::in_memory_store();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
 
     let checkpoint_part_1 = "00000000000000000001.checkpoint.0000000001.0000000002.parquet";
     let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
@@ -3585,8 +3604,10 @@ fn add_batch_with_partition_values_parsed(output_schema: SchemaRef) -> Box<Arrow
 
 #[tokio::test]
 async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let (store, table_root) = test_utils::in_memory_store();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
 
     // Build a schema that includes add.partitionValues_parsed.id: integer
     let partition_parsed_struct =
@@ -3698,8 +3719,10 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
 
 #[tokio::test]
 async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -> DeltaResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let (store, table_root) = test_utils::in_memory_store();
+    let log_root = table_root.join("_delta_log/").unwrap();
+    let engine =
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
 
     // Write a checkpoint WITHOUT partitionValues_parsed
     add_checkpoint_to_store(
@@ -4478,7 +4501,7 @@ async fn read_actions_with_null_map_values(
         .unwrap();
 
     // Build engine and read actions -- same as DeltaActionExtractor::get_actions.
-    let engine = DefaultEngineBuilder::new(store).build();
+    let engine = DefaultEngineBuilder::new(PrefixedStore::new(store, Path::from(""))).build();
     let log_segment =
         LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, Some(0))
             .unwrap();

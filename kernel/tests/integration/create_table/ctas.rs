@@ -11,6 +11,7 @@ use delta_kernel::arrow::array::{Array, Int64Array, StringArray, StructArray};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel::engine::default::storage::PrefixedStore;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -205,7 +206,7 @@ async fn run_ctas_test(
     let src_url = Url::from_directory_path(&src_table_path).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(
-        DefaultEngineBuilder::new(store.clone())
+        DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from("")))
             .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
                 tokio::runtime::Handle::current(),
             )))

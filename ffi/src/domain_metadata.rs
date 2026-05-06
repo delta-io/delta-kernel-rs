@@ -93,8 +93,10 @@ mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
+    use delta_kernel::engine::default::storage::PrefixedStore;
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::path::Path;
     use delta_kernel::DeltaResult;
     use serde_json::json;
     use test_utils::add_commit;
@@ -111,7 +113,8 @@ mod tests {
     async fn test_domain_metadata() -> DeltaResult<()> {
         let storage = Arc::new(InMemory::new());
 
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine =
+            DefaultEngineBuilder::new(PrefixedStore::new(storage.clone(), Path::from(""))).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let table_root = "memory:///test_table/";
 

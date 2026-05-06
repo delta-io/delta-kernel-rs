@@ -124,9 +124,11 @@ mod tests {
     use std::env;
     use std::sync::Arc;
 
+    use delta_kernel::engine::default::storage::PrefixedStore;
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store;
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::path::Path;
     use delta_kernel::transaction::CommitResult;
     use tracing::info;
     use unity_catalog_delta_client_api::{Commit, InMemoryCommitsClient, Operation, TableData};
@@ -194,7 +196,8 @@ mod tests {
 
         info!("created object store: {:?}\npath: {:?}\n", store, path);
 
-        let engine = DefaultEngineBuilder::new(store.into()).build();
+        let engine =
+            DefaultEngineBuilder::new(PrefixedStore::new(store.into(), Path::from(""))).build();
 
         // read table
         let snapshot = catalog
@@ -249,7 +252,8 @@ mod tests {
         let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
         let store = Arc::new(store);
 
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine =
+            DefaultEngineBuilder::new(PrefixedStore::new(store.clone(), Path::from(""))).build();
         let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
         let snapshot = catalog
             .load_snapshot(&table_id, &table_uri, &engine)
@@ -288,7 +292,7 @@ mod tests {
             },
         );
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = DefaultEngineBuilder::new(PrefixedStore::new(store, Path::from(""))).build();
         let catalog = UCKernelClient::new(&client);
 
         // Request version 5 but catalog only reports version 3
@@ -327,7 +331,7 @@ mod tests {
             },
         );
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store).build();
+        let engine = DefaultEngineBuilder::new(PrefixedStore::new(store, Path::from(""))).build();
         let catalog = UCKernelClient::new(&client);
 
         let result = catalog
