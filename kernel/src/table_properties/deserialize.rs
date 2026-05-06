@@ -92,6 +92,11 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         }
         ROW_TRACKING_SUSPENDED => props.row_tracking_suspended = Some(parse_bool(v)?),
         PARQUET_FORMAT_VERSION => props.parquet_format_version = Some(v.to_string()),
+        PARQUET_COMPRESSION_CODEC => {
+            // Preserve unrecognized codecs in `unknown_properties` so connectors can fall back
+            // themselves.
+            props.parquet_compression_codec = Some(ParquetCompressionCodec::try_from(v).ok()?)
+        }
         ENABLE_IN_COMMIT_TIMESTAMPS => props.enable_in_commit_timestamps = Some(parse_bool(v)?),
         IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION => {
             props.in_commit_timestamp_enablement_version = Some(parse_non_negative(v)?)
@@ -374,6 +379,72 @@ mod tests {
                 .unwrap()
                 .to_string(),
             "Interval 'interval -25 hours' cannot be negative".to_string()
+        );
+    }
+
+    #[test]
+    fn test_parse_compression_codec_accepts_all_variants_case_insensitively() {
+        use ParquetCompressionCodec::*;
+        for (input, expected) in [
+            ("uncompressed", Uncompressed),
+            ("UNCOMPRESSED", Uncompressed),
+            ("UnCoMpReSsEd", Uncompressed),
+            ("none", Uncompressed),
+            ("NONE", Uncompressed),
+            ("nOnE", Uncompressed),
+            ("snappy", Snappy),
+            ("SNAPPY", Snappy),
+            ("sNaPpY", Snappy),
+            ("gzip", Gzip),
+            ("GZIP", Gzip),
+            ("gZiP", Gzip),
+            ("lz4", Lz4),
+            ("LZ4", Lz4),
+            ("lZ4", Lz4),
+            ("lz4_raw", Lz4Raw),
+            ("LZ4_RAW", Lz4Raw),
+            ("Lz4_Raw", Lz4Raw),
+            ("zstd", Zstd),
+            ("ZSTD", Zstd),
+            ("zStD", Zstd),
+        ] {
+            let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, input)]);
+            assert_eq!(props.parquet_compression_codec, Some(expected), "{input}");
+            assert!(props.unknown_properties.is_empty(), "{input}");
+        }
+    }
+
+    #[test]
+    fn test_compression_codec_round_trips_to_canonical_protocol_string() {
+        use ParquetCompressionCodec::*;
+        // Each variant must Display-format to its Delta-protocol canonical name (lowercased,
+        // snake_case). The `Uncompressed` variant has `none` as a parser-only alias; its
+        // canonical output is `uncompressed`.
+        for (variant, expected) in [
+            (Zstd, "zstd"),
+            (Uncompressed, "uncompressed"),
+            (Snappy, "snappy"),
+            (Gzip, "gzip"),
+            (Lz4, "lz4"),
+            (Lz4Raw, "lz4_raw"),
+        ] {
+            assert_eq!(variant.to_string(), expected);
+            assert_eq!(<&'static str>::from(variant), expected);
+            // And the canonical string parses back to the same variant.
+            assert_eq!(
+                ParquetCompressionCodec::try_from(expected).unwrap(),
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_compression_codec_unknown_falls_through_to_unknown_properties() {
+        let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, "brotli")]);
+        assert_eq!(props.parquet_compression_codec, None);
+        assert_eq!(
+            props.unknown_properties.get(PARQUET_COMPRESSION_CODEC),
+            Some(&"brotli".to_string())
         );
     }
 }
