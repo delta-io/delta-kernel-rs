@@ -142,8 +142,8 @@ async fn test_clustered_table_write_and_checkpoint(
 /// Regression test: writing a batch where a clustering column has ALL null values should succeed.
 ///
 /// `collect_stats` emits null-valued min/max entries for all-null columns, allowing
-/// `StatsVerifier` to find the field and confirm `nullCount == numRecords`. The JSON serializer
-/// omits null fields on disk, matching Spark's `ignoreNullFields` behavior.
+/// `StatsColumnVerifier` to find the field and confirm `nullCount == numRecords`. The JSON
+/// serializer omits null fields on disk, matching Spark's `ignoreNullFields` behavior.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_clustered_table_write_all_null_clustering_column() {
     let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();

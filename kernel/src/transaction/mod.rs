@@ -64,7 +64,7 @@ mod stats_verifier;
 mod update;
 mod write_context;
 
-use stats_verifier::StatsVerifier;
+use stats_verifier::StatsColumnVerifier;
 use write_context::SharedWriteState;
 pub use write_context::WriteContext;
 
@@ -981,16 +981,28 @@ impl<S: SupportsDataFiles> Transaction<S> {
 // Internal methods available on ALL transaction types (used by commit path)
 // =============================================================================
 impl<S> Transaction<S> {
-    /// Validate that add files have required statistics for clustering columns.
+    /// Validate that add files carry the per-file statistics required by the table's protocol.
     ///
-    /// Per the Delta protocol, writers MUST collect per-file statistics for clustering columns
-    /// when the `ClusteredTable` feature is enabled. Other stat columns (e.g. the conventional
-    /// "first 32 columns") are not validated here because they are not protocol-required.
+    /// Currently checks two protocol requirements:
+    /// - `stats.numRecords` must be present when [`requires_stats_num_records`] returns true.
+    /// - Per-file min/max/nullCount must be present for clustering columns when the
+    ///   `ClusteredTable` feature is enabled.
     ///
-    /// Only add files are validated — remove files do not carry statistics.
+    /// Other stat columns (e.g. the conventional "first 32 columns") are not validated here
+    /// because they are not protocol-required.
+    ///
+    /// Only add files are validated(remove files do not carry statistics).
+    ///
+    /// [`requires_stats_num_records`]: crate::table_configuration::TableConfiguration::requires_stats_num_records
     fn validate_add_files_stats(&self, add_files: &[Box<dyn EngineData>]) -> DeltaResult<()> {
         if add_files.is_empty() {
             return Ok(());
+        }
+        if self.effective_table_config.requires_stats_num_records() {
+            // TODO: Likely it's better to merge this with the clustering column validation below,
+            // benchmark it and see if it's faster. If so, refactor this to do both validations in
+            // one pass.
+            stats_verifier::verify_num_records_present(add_files)?;
         }
         if let Some(ref clustering_cols) = self.physical_clustering_columns {
             if !clustering_cols.is_empty() {
@@ -1010,7 +1022,7 @@ impl<S> Transaction<S> {
                         Ok((col.clone(), data_type))
                     })
                     .collect::<DeltaResult<_>>()?;
-                let verifier = StatsVerifier::new(columns_with_types);
+                let verifier = StatsColumnVerifier::new(columns_with_types);
                 verifier.verify(add_files)?;
             }
         }
