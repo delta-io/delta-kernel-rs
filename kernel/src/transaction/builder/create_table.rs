@@ -985,7 +985,8 @@ mod tests {
     use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
     use crate::table_features::FeatureType;
     use crate::table_properties::{
-        ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3, PARQUET_FORMAT_VERSION,
+        COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3,
+        PARQUET_FORMAT_VERSION,
     };
     use crate::transforms::SchemaTransform;
     use crate::utils::test_utils::{
@@ -1871,22 +1872,23 @@ mod tests {
             maybe_apply_column_mapping_for_table_create(&schema, &mut validated, pre_cm).unwrap();
         assert_eq!(mode, ColumnMappingMode::Name);
 
-        // top: CM id=1, nested-ids = {<top_physical>.{key:2, key.element:3, value:4}}
-        // DFS order: top-level (1) -> Map.key (2) -> recurse into key
-        // (Array<int>): key.element (3) -> Map.value (4). Matches delta-spark's behavior.
+        // Spark-aligned two-pass numbering:
+        //   Pass 1 (CM ids, DFS over StructFields): top=1, inner=2, region=3.
+        //   Pass 2 (nested ids, per StructField, starting from max=3):
+        //     top:   {key:4, key.element:5, value:6}
+        //     inner: {key:7, value:8, value.element:9}
         let top = effective_schema.field("top").expect("missing top");
         let top_physical = expect_field_id_and_physical_name(top, 1);
         assert_eq!(
             extract_nested_ids(top),
             serde_json::json!({
-                format!("{top_physical}.key"): 2,
-                format!("{top_physical}.key.element"): 3,
-                format!("{top_physical}.value"): 4,
+                format!("{top_physical}.key"): 4,
+                format!("{top_physical}.key.element"): 5,
+                format!("{top_physical}.value"): 6,
             }),
             "top's nested-ids JSON",
         );
 
-        // inner: CM id=5, nested-ids = {<inner_physical>.{key:6, value:7, value.element:8}}
         let DataType::Map(top_map) = top.data_type() else {
             panic!("top must be a map");
         };
@@ -1894,23 +1896,31 @@ mod tests {
             panic!("top's value must be a struct");
         };
         let inner = value_struct.fields().next().expect("missing inner");
-        let inner_physical = expect_field_id_and_physical_name(inner, 5);
+        let inner_physical = expect_field_id_and_physical_name(inner, 2);
         assert_eq!(
             extract_nested_ids(inner),
             serde_json::json!({
-                format!("{inner_physical}.key"): 6,
-                format!("{inner_physical}.value"): 7,
-                format!("{inner_physical}.value.element"): 8,
+                format!("{inner_physical}.key"): 7,
+                format!("{inner_physical}.value"): 8,
+                format!("{inner_physical}.value.element"): 9,
             }),
             "inner's nested-ids JSON",
         );
 
-        // region: CM id=9, primitive (no nested-ids).
         let region = effective_schema.field("region").expect("missing region");
-        let _ = expect_field_id_and_physical_name(region, 9);
+        let _ = expect_field_id_and_physical_name(region, 3);
         assert!(!region
             .metadata
             .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref()));
+
+        // maxColumnId tracks the largest assigned CM id, including nested ids.
+        assert_eq!(
+            validated
+                .properties
+                .get(COLUMN_MAPPING_MAX_COLUMN_ID)
+                .map(String::as_str),
+            Some("9"),
+        );
 
         // === Property-driven feature enablement + Invariants ===
         maybe_enable_invariants(&effective_schema, &mut validated);
