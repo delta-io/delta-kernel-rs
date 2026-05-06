@@ -1519,7 +1519,6 @@ mod scan_metadata_completed_tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
     use crate::metrics::MetricEvent;
-    use crate::object_store::local::LocalFileSystem;
     use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::Snapshot;
 
@@ -1534,7 +1533,7 @@ mod scan_metadata_completed_tests {
         let path = std::fs::canonicalize(PathBuf::from(table)).unwrap();
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
-        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(LocalFileSystem::new())));
+        let engine = Arc::new(SyncEngine::new());
         let guard = install_thread_local_metrics_reporter(reporter.clone());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let mut builder = snapshot.scan_builder();
@@ -1607,7 +1606,7 @@ mod scan_metadata_completed_tests {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
-        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(LocalFileSystem::new())));
+        let engine = Arc::new(SyncEngine::new());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
