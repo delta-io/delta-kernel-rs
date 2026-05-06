@@ -250,6 +250,20 @@ impl TableProperties {
     pub fn should_write_stats_as_struct(&self) -> bool {
         self.checkpoint_write_stats_as_struct.unwrap_or(false)
     }
+
+    /// Returns whether to emit a random alphanumeric prefix in file paths regardless of column
+    /// mapping mode. Default: `false` per the Delta protocol.
+    pub fn should_randomize_file_prefixes(&self) -> bool {
+        self.randomize_file_prefixes.unwrap_or(false)
+    }
+
+    /// Returns the number of characters to use for random file path prefixes.
+    /// Default: `2`, matching Delta-Spark's `delta.randomPrefixLength` default.
+    pub fn random_prefix_length(&self) -> usize {
+        self.random_prefix_length
+            .map(|n| n.get() as usize)
+            .unwrap_or(2)
+    }
 }
 
 /// Default number of leaf columns to collect statistics on when `dataSkippingNumIndexedCols`
