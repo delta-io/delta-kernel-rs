@@ -99,13 +99,28 @@ int main() {
       .get_expression_fn = get_simple_testing_kernel_expression,
       .get_predicate_fn = get_simple_testing_kernel_predicate,
       .validate_roundtrip = true,
-      .description = 
+      .description =
         "This test validates expressions/predicates with full support.\n"
         "Supported types: primitives (int, long, float, double, bool, "
         "string),\n  temporal (date, timestamp, timestamp_ntz), binary, "
         "decimal, null,\n  binary operations (+, -, *, /), struct "
         "expressions, predicates (eq, ne, lt, le,\n  gt, ge, distinct, "
         "is_null, is_not_null, not, and, or)"
+    },
+    {
+      .name = "Opaque Predicate Round-trip Test",
+      // Reuse the simple expression -- only the predicate side exercises the new
+      // visit_predicate_opaque builder. (The expression-side equivalent for
+      // OpaqueExpression is not yet wired.)
+      .get_expression_fn = get_simple_testing_kernel_expression,
+      .get_predicate_fn = get_opaque_kernel_predicate,
+      .validate_roundtrip = true,
+      .description =
+        "This test validates the engine-defined opaque-predicate path. The kernel\n"
+        "predicate STARTS_WITH(col(\"name\"), \"test\") -- backed by\n"
+        "NamedOpaquePredicateOp -- is walked back into the engine AST and\n"
+        "reconstructed via visit_predicate_opaque, exercising the builder added for\n"
+        "engines that route ops the kernel does not evaluate (STARTS_WITH, LIKE, ...)."
     }
   };
   
