@@ -46,7 +46,7 @@ use crate::expressions::Expression;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{KernelSupport, MAX_VALID_READER_VERSION, MIN_VALID_RW_VERSION};
+use crate::table_features::{KernelSupport, MAX_VALID_READER_VERSION};
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator, JsonHandler, Version};
 
 /// Output column name for the per-row commit version emitted by [`CommitRange::actions`].
@@ -173,7 +173,7 @@ impl CommitRange {
         engine: &dyn Engine,
         actions: &[DeltaAction],
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<CommitActions>> + Send> {
-        let action_kinds: Vec<DeltaAction> = actions.to_vec();
+        let action_kinds = actions.to_vec();
         let inject_protocol =
             self.validate_protocol && !action_kinds.contains(&DeltaAction::Protocol);
         let read_schema = build_read_schema(
@@ -208,7 +208,7 @@ impl CommitRange {
     }
 
     /// Yield action batches across all commits as [`crate::EngineData`], with
-    /// `_commit_version` and `_commit_timestamp` columns prepended to each batch's
+    /// `version` and `timestamp` columns prepended to each batch's
     /// struct schema.
     ///
     /// Built on top of [`Self::commits`]: every batch is transformed via the engine's
@@ -223,7 +223,7 @@ impl CommitRange {
         engine: &dyn Engine,
         actions: &[DeltaAction],
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
-        let action_kinds: Vec<DeltaAction> = actions.to_vec();
+        let action_kinds = actions.to_vec();
         let input_schema = build_read_schema(action_kinds.iter().copied());
         let output_schema = actions_output_schema(&action_kinds);
         let evaluation_handler = engine.evaluation_handler();
@@ -318,12 +318,16 @@ fn build_drop_protocol_evaluator(
 }
 
 /// Validate that Kernel can read a table governed by `protocol`.
+///
+/// Lower-bound (`min_reader_version >= 1`) is enforced by [`Protocol::try_new`] during
+/// deserialization, so this helper only checks the upper bound and the `reader_features`
+/// list.
 fn validate_protocol_for_read(protocol: &Protocol) -> DeltaResult<()> {
     let version = protocol.min_reader_version();
-    if !(MIN_VALID_RW_VERSION..=MAX_VALID_READER_VERSION).contains(&version) {
+    if version > MAX_VALID_READER_VERSION {
         return Err(Error::unsupported(format!(
             "Unsupported minimum reader version {version}; \
-             kernel supports {MIN_VALID_RW_VERSION}..={MAX_VALID_READER_VERSION}",
+             kernel supports up to {MAX_VALID_READER_VERSION}",
         )));
     }
     if let Some(features) = protocol.reader_features() {
@@ -422,13 +426,14 @@ mod tests {
     use test_utils::add_commit;
 
     use super::*;
+    use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
     use crate::object_store::memory::InMemory;
     use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes};
 
-    /// Open a `CommitRange` over the well-known `table-with-dv-small` test table.
+    /// Open a `CommitRange` over the `table-with-dv-small` test table.
     ///
     /// The table has two commits with mixed action kinds:
     /// - v=0: protocol + metaData + add (initial file)
@@ -456,7 +461,7 @@ mod tests {
         );
 
         let actions = [DeltaAction::Add, DeltaAction::Remove];
-        let collected: Vec<CommitActions> = range
+        let collected = range
             .commits(&engine, &actions)
             .unwrap()
             .collect::<DeltaResult<Vec<_>>>()
@@ -529,16 +534,16 @@ mod tests {
             visitor.visit_rows_of(batch_res.unwrap().as_ref()).unwrap();
         }
 
-        let adds: Vec<&str> = visitor
+        let adds = visitor
             .rows
             .iter()
             .filter_map(|(a, _)| a.as_deref())
-            .collect();
-        let removes: Vec<&str> = visitor
+            .collect::<Vec<_>>();
+        let removes = visitor
             .rows
             .iter()
             .filter_map(|(_, r)| r.as_deref())
-            .collect();
+            .collect::<Vec<_>>();
         assert_eq!(adds.len(), 1, "v=1 has exactly one add");
         assert_eq!(removes.len(), 1, "v=1 has exactly one remove");
         // DV rewrite: the same physical file path appears on both sides.
@@ -685,8 +690,6 @@ mod tests {
 
     #[tokio::test]
     async fn commits_errors_on_unsupported_reader_feature() {
-        // Valid version range but an unknown reader feature (KernelSupport::NotSupported)
-        // exercises the per-feature loop in validate_protocol_for_read.
         let body = format!(
             "{}\n{}",
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#,
@@ -703,20 +706,22 @@ mod tests {
         assert_unsupported_with_substring(&range, engine.as_ref(), &actions, "futureFeature");
     }
 
-    #[test]
-    fn commits_strips_auto_injected_protocol_column() {
-        // Path-based ranges auto-inject `protocol` for validation. The drop-evaluator must
-        // strip it back out so the emitted batch schema matches what the caller asked for.
-        use crate::engine::arrow_data::ArrowEngineData;
-
+    #[rstest::rstest]
+    #[case::strips_injected_protocol(
+        &[DeltaAction::Add, DeltaAction::Remove],
+        &["add", "remove"],
+    )]
+    #[case::preserves_caller_requested_protocol(
+        &[DeltaAction::Add, DeltaAction::Remove, DeltaAction::Protocol],
+        &["add", "remove", "protocol"],
+    )]
+    fn commits_emitted_schema_matches_caller_actions(
+        #[case] actions: &[DeltaAction],
+        #[case] expected_columns: &[&str],
+    ) {
         let (range, engine) = open_test_range();
-        assert!(
-            range.validate_protocol,
-            "path-based range must enable validation",
-        );
-
-        let actions = [DeltaAction::Add, DeltaAction::Remove];
-        for commit in range.commits(&engine, &actions).unwrap() {
+        let mut saw_batch = false;
+        for commit in range.commits(&engine, actions).unwrap() {
             let commit = commit.unwrap();
             for batch in commit.into_actions() {
                 let batch = batch.unwrap();
@@ -724,59 +729,22 @@ mod tests {
                     .any_ref()
                     .downcast_ref::<ArrowEngineData>()
                     .expect("default engine returns ArrowEngineData");
-                let names: Vec<String> = arrow
+                let names = arrow
                     .record_batch()
                     .schema()
                     .fields()
                     .iter()
                     .map(|f| f.name().to_string())
-                    .collect();
-                assert_eq!(
-                    names,
-                    vec!["add".to_string(), "remove".to_string()],
-                    "auto-injected protocol must be stripped before emission",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn commits_passes_through_caller_requested_protocol() {
-        // When the caller explicitly includes Protocol, no drop-evaluator runs and the
-        // protocol column passes through to the emitted batches.
-        use crate::engine::arrow_data::ArrowEngineData;
-
-        let (range, engine) = open_test_range();
-        let actions = [DeltaAction::Add, DeltaAction::Remove, DeltaAction::Protocol];
-        let mut saw_protocol_column = false;
-        for commit in range.commits(&engine, &actions).unwrap() {
-            let commit = commit.unwrap();
-            for batch in commit.into_actions() {
-                let batch = batch.unwrap();
-                let arrow = batch
-                    .any_ref()
-                    .downcast_ref::<ArrowEngineData>()
-                    .expect("default engine returns ArrowEngineData");
-                let names: Vec<String> = arrow
-                    .record_batch()
-                    .schema()
-                    .fields()
+                    .collect::<Vec<_>>();
+                let expected = expected_columns
                     .iter()
-                    .map(|f| f.name().to_string())
-                    .collect();
-                assert_eq!(
-                    names,
-                    vec![
-                        "add".to_string(),
-                        "remove".to_string(),
-                        "protocol".to_string(),
-                    ],
-                    "caller-requested protocol must be preserved",
-                );
-                saw_protocol_column = true;
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<_>>();
+                assert_eq!(names, expected, "emitted schema must match caller actions");
+                saw_batch = true;
             }
         }
-        assert!(saw_protocol_column, "expected at least one emitted batch");
+        assert!(saw_batch, "expected at least one emitted batch");
     }
 
     #[tokio::test]
@@ -825,23 +793,21 @@ mod tests {
             visitor.visit_rows_of(batch_res.unwrap().as_ref()).unwrap();
         }
 
-        // v=0 contributes one add (initial file).
-        // v=1 contributes one remove + one add (DV rewrite).
-        let mut add_versions: Vec<i64> = visitor
+        let mut add_versions = visitor
             .rows
             .iter()
             .filter_map(|r| r.2.as_ref().map(|_| r.0))
-            .collect();
+            .collect::<Vec<_>>();
         add_versions.sort();
-        let remove_versions: Vec<i64> = visitor
+        let remove_versions = visitor
             .rows
             .iter()
             .filter_map(|r| r.3.as_ref().map(|_| r.0))
-            .collect();
+            .collect::<Vec<_>>();
         assert_eq!(add_versions, vec![0, 1], "adds appear in v=0 and v=1");
         assert_eq!(remove_versions, vec![1], "remove appears only in v=1");
 
-        // _commit_timestamp matches each commit file's last_modified.
+        // timestamp matches each commit file's last_modified.
         for (version, timestamp, _, _) in &visitor.rows {
             let v_ix = *version as usize;
             assert_eq!(

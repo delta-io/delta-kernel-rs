@@ -2,6 +2,7 @@ use url::Url;
 
 use crate::commit_range::{CommitBoundary, CommitRange};
 use crate::log_segment::LogSegment;
+use crate::path::ParsedLogPath;
 use crate::snapshot::SnapshotRef;
 use crate::{DeltaResult, Engine, Error, Version};
 
@@ -15,11 +16,11 @@ use crate::{DeltaResult, Engine, Error, Version};
 /// TODO: support UC catalog commit via with_log_tail(self, Vec<LogPath>) and
 /// with_max_catalog_version(self, Version)
 pub struct CommitRangeBuilder {
-    pub(crate) table_root: String,
-    pub(crate) start_boundary: CommitBoundary,
-    pub(crate) end_boundary: Option<CommitBoundary>,
-    pub(crate) snapshot: Option<SnapshotRef>,
-    pub(crate) commit_ordering: CommitOrdering,
+    table_root: String,
+    start_boundary: CommitBoundary,
+    end_boundary: Option<CommitBoundary>,
+    snapshot: Option<SnapshotRef>,
+    commit_ordering: CommitOrdering,
 }
 
 impl CommitRangeBuilder {
@@ -95,7 +96,27 @@ impl CommitRangeBuilder {
 
         let end_version = end_version.unwrap_or(log_segment.end_version);
 
-        let mut commit_files = log_segment.listed.ascending_commit_files;
+        // Snapshot-derived ranges must not extend past the snapshot's version: the snapshot's
+        // protocol validation only covers commits within its log segment. Without this check, a
+        // user-supplied `end_boundary > snapshot.version()` falls through to a misleading
+        // "wrong number of commit files" error from `validate_number_of_commit_files`.
+        if self.snapshot.is_some() && end_version > log_segment.end_version {
+            return Err(Error::generic(format!(
+                "end_version ({end_version}) cannot exceed snapshot version ({})",
+                log_segment.end_version
+            )));
+        }
+
+        // Filter to the requested `[start_version, end_version]`. For path-based ranges this is a
+        // no-op (the segment was already listed with these bounds). For snapshot-based ranges
+        // the snapshot's log segment may extend past the user's requested end (or include
+        // checkpoints before the user's start), so filtering selects the intended sub-range.
+        let mut commit_files: Vec<ParsedLogPath> = log_segment
+            .listed
+            .ascending_commit_files
+            .into_iter()
+            .filter(|f| f.version >= start_version && f.version <= end_version)
+            .collect();
 
         validate_version_range(start_version, end_version)?;
         validate_number_of_commit_files(start_version, end_version, commit_files.len())?;
@@ -211,22 +232,112 @@ mod tests {
         assert!(range.end_boundary().is_none());
     }
 
-    #[test]
-    fn build_errors_on_start_past_snapshot_version() {
+    /// Snapshot-based ranges must reject any boundary that lands past the snapshot's
+    /// version. Both the start-past-snapshot and end-past-snapshot cases surface as a
+    /// generic error before the iterator is constructed.
+    #[rstest::rstest]
+    #[case::start_past_snapshot_version(
+        CommitBoundary::Version(5),
+        None,
+        &["start_version (5)", "end_version"],
+    )]
+    #[case::end_past_snapshot_version(
+        CommitBoundary::Version(0),
+        Some(CommitBoundary::Version(99)),
+        &["99", "snapshot"],
+    )]
+    fn build_errors_on_boundary_past_snapshot_version(
+        #[case] start: CommitBoundary,
+        #[case] end: Option<CommitBoundary>,
+        #[case] expected_substrings: &[&str],
+    ) {
         let table_root = dv_small_table_root();
         let engine = SyncEngine::new();
         let snapshot = Snapshot::builder_for(table_root.as_str())
             .build(&engine)
             .unwrap();
-        // The snapshot's log segment ends at snapshot.version() (= 1). Requesting
-        // start_version > snapshot.version() makes validate_version_range fire.
-        let err = CommitRange::builder_from(snapshot, CommitBoundary::Version(5))
-            .build(&engine)
-            .expect_err("start past snapshot version must error");
+        let mut builder = CommitRange::builder_from(snapshot, start);
+        if let Some(end) = end {
+            builder = builder.with_end_boundary(end);
+        }
+        let err = builder.build(&engine).expect_err("must error");
         let msg = format!("{err}");
-        assert!(
-            msg.contains("start_version (5)") && msg.contains("end_version"),
-            "expected start>end error, got: {msg}",
+        for needle in expected_substrings {
+            assert!(
+                msg.contains(needle),
+                "expected message to contain {needle:?}, got: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn build_snapshot_based_with_explicit_end_boundary_is_honored() {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(table_root.as_str())
+            .build(&engine)
+            .unwrap();
+        let range = CommitRange::builder_from(snapshot, CommitBoundary::Version(0))
+            .with_end_boundary(CommitBoundary::Version(0))
+            .build(&engine)
+            .unwrap();
+        assert_eq!(
+            range.end_version(),
+            0,
+            "explicit end_boundary must be honored"
         );
+        assert!(matches!(
+            range.end_boundary(),
+            Some(CommitBoundary::Version(0)),
+        ));
+    }
+
+    #[test]
+    fn build_path_based_without_end_boundary_extends_to_latest() {
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let range = CommitRange::builder_for(table_root.as_str(), CommitBoundary::Version(0))
+            .build(&engine)
+            .unwrap();
+        assert_eq!(range.start_version(), 0);
+        assert_eq!(
+            range.end_version(),
+            1,
+            "table-with-dv-small latest commit is v=1"
+        );
+        assert!(range.end_boundary().is_none());
+    }
+
+    #[test]
+    fn build_descending_ordering_yields_commits_in_reverse_order() {
+        use crate::commit_range::DeltaAction;
+
+        let table_root = dv_small_table_root();
+        let engine = SyncEngine::new();
+        let actions = [DeltaAction::Add, DeltaAction::Remove];
+
+        let asc_range = CommitRange::builder_for(table_root.as_str(), CommitBoundary::Version(0))
+            .with_end_boundary(CommitBoundary::Version(1))
+            .build(&engine)
+            .unwrap();
+        let desc_range = CommitRange::builder_for(table_root.as_str(), CommitBoundary::Version(0))
+            .with_end_boundary(CommitBoundary::Version(1))
+            .with_ordering(CommitOrdering::DescendingOrder)
+            .build(&engine)
+            .unwrap();
+
+        let asc_versions = asc_range
+            .commits(&engine, &actions)
+            .unwrap()
+            .map(|c| c.unwrap().version())
+            .collect::<Vec<_>>();
+        let desc_versions = desc_range
+            .commits(&engine, &actions)
+            .unwrap()
+            .map(|c| c.unwrap().version())
+            .collect::<Vec<_>>();
+
+        assert_eq!(asc_versions, vec![0, 1]);
+        assert_eq!(desc_versions, vec![1, 0]);
     }
 }

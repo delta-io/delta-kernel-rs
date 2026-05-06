@@ -41,10 +41,11 @@ impl CommitActions {
         self.version
     }
 
-    /// Resolved commit timestamp in milliseconds since epoch.
+    /// Commit timestamp in milliseconds since epoch.
     ///
-    /// Source of truth: `commitInfo.inCommitTimestamp` if present in the commit;
-    /// otherwise the commit file's modification time.
+    /// Currently always the commit file's `last_modified` time. In-commit timestamp (ICT)
+    /// extraction from `commitInfo.inCommitTimestamp` is planned (TODO) and will become the
+    /// source of truth when the table has ICT enabled.
     pub fn timestamp(&self) -> i64 {
         self.timestamp
     }
