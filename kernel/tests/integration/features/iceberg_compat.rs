@@ -1,4 +1,4 @@
-//! Integration tests for icebergCompat (V3) write- and load-time validations.
+//! Integration tests for icebergCompat
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,7 +29,9 @@ use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::table_features::{
+    get_any_level_column_physical_name, ColumnMappingMode, TableFeature,
+};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transforms::{transform_output_type, SchemaTransform};
@@ -134,6 +136,63 @@ async fn snapshot_blocked_when_v3_schema_has_legacy_nested_ids() {
             && err.contains("delta.columnMapping.nested.ids")
             && err.contains("data"),
         "expected error mentioning the legacy key, replacement key, and field path, got: {err}",
+    );
+}
+
+/// Listing IcebergCompatV3 in writerFeatures (i.e. "supported") without setting
+/// `delta.enableIcebergCompatV3=true` must not activate V3: column mapping stays off and
+/// no nested-id metadata is stamped on the Map field.
+#[tokio::test]
+async fn v3_supported_but_not_enabled_skips_cm_and_nested_ids() {
+    let (_, engine) = make_engine();
+    let schema = Arc::new(
+        StructType::try_new(vec![StructField::nullable(
+            "data",
+            DataType::Map(Box::new(MapType::new(
+                DataType::INTEGER,
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+                true,
+            ))),
+        )])
+        .unwrap(),
+    );
+
+    let _ = create_table(TABLE_ROOT, schema, "Test/1.0")
+        .with_table_properties([("delta.feature.icebergCompatV3", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(engine.as_ref())
+        .unwrap();
+    let snapshot = Snapshot::builder_for(TABLE_ROOT)
+        .build(engine.as_ref())
+        .unwrap();
+
+    // 1. V3 is in writerFeatures (supported).
+    let writer_features = snapshot
+        .table_configuration()
+        .protocol()
+        .writer_features()
+        .expect("writerFeatures present");
+    assert!(
+        writer_features.contains(&TableFeature::IcebergCompatV3),
+        "expected icebergCompatV3 in writerFeatures, got: {writer_features:?}",
+    );
+
+    // 2. CM is not enabled (no auto-enable from V3 being merely supported).
+    assert_eq!(
+        snapshot.table_configuration().column_mapping_mode(),
+        ColumnMappingMode::None,
+    );
+
+    // 3. No nested-id metadata stamped on the Map field.
+    let loaded_schema = snapshot.schema();
+    let data_field = loaded_schema.field("data").expect("data field present");
+    assert!(
+        !data_field
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref()),
+        "unexpected delta.columnMapping.nested.ids on data: {:?}",
+        data_field.metadata,
     );
 }
 
@@ -353,7 +412,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
         let parquet_url = table_url.join(&add.path).unwrap();
         let local_path = parquet_url.to_file_path().unwrap();
         let ids = collect_all_parquet_field_ids(&local_path);
-        let root = read_parquet_root_schema(&local_path);
+        let parquet_root_schema = read_parquet_root_schema(&local_path);
 
         // Top-level + nested column-mapping IDs all appear as expected.
         // Expected count for `nested_schema_with_all_delta_types`:
@@ -374,7 +433,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
         let region_physical =
             get_top_level_physical_name(logical_schema.as_ref(), "region", cm_mode);
         assert!(
-            find_top_level_field_in_parquet(&root, &region_physical).is_some(),
+            find_top_level_field_in_parquet(&parquet_root_schema, &region_physical).is_some(),
             "partition column `region` (physical {region_physical}) not materialized in {parquet_url}",
         );
 
@@ -382,14 +441,14 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
         for col in ["timestamp_col", "timestamp_ntz_col"] {
             let physical = get_top_level_physical_name(logical_schema.as_ref(), col, cm_mode);
             assert_eq!(
-                find_top_level_physical_type_in_parquet(&root, &physical),
+                find_top_level_physical_type_in_parquet(&parquet_root_schema, &physical),
                 ParquetPhysicalType::INT64,
                 "{col} must be INT64 in parquet",
             );
         }
     }
 
-    // === (5) Exact scan contents ===
+    // === Exact scan contents ===
     verify_scan_contents(final_snap.clone(), engine.clone());
 }
 
@@ -602,7 +661,7 @@ fn build_all_null_complex_array(rows: usize) -> ArrayRef {
         ArrowDataType::Struct(fields) => fields.clone(),
         other => panic!("map entries must be struct, got {other:?}"),
     };
-    // Empty entries struct: no rows since every map is null.
+    // Empty entries struct.
     let empty_entries = StructArray::new(
         entries_struct_fields,
         entries_field_arrays_empty(entries_field.as_ref()),
@@ -878,11 +937,7 @@ impl<'a> SchemaTransform<'a> for ExpectedFieldIdMap {
 }
 
 /// Translate a `delta.columnMapping.nested.ids` key (e.g. `<phys>.key.element`) to its
-/// parquet_schema_path. The first segment of `physical_nested_path` is the field's physical
-/// name -- the same as the last segment of `field_parquet_schema_path` -- so we replace the
-/// whole prefix wholesale with `field_parquet_schema_path` and translate the remaining
-/// synthetic segments: `key`/`value` -> `key_value.key`/`key_value.value` (Map wrapper),
-/// `element` -> `list.element` (Array wrapper).
+/// `parquet_schema_path` for map/array element/key/value fields.
 fn translate_nested_path(field_parquet_schema_path: &str, physical_nested_path: &str) -> String {
     let segs: Vec<&str> = physical_nested_path.split('.').collect();
     let mut out = field_parquet_schema_path.to_string();
