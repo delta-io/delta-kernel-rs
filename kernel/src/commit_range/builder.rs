@@ -8,17 +8,12 @@ use crate::{DeltaResult, Engine, Error, Version};
 /// Builder for a [`CommitRange`].
 ///
 /// Created via [`CommitRange::builder_for`] (path-based) or
-/// [`CommitRange::builder_from`] (snapshot-based). Supports configuring an end boundary,
-/// catalog-supplied commits, and a maximum catalog version. [`Self::build`] performs
-/// boundary resolution, delta-log listing, and contiguity validation.
-///
-/// A snapshot is required when any boundary is [`CommitBoundary::Timestamp`]. Path-based
-/// builders that want to use timestamp boundaries should use [`CommitRange::builder_from`]
-/// instead, which captures the snapshot at construction time.
+/// [`CommitRange::builder_from`] (snapshot-based). Supports configuring an end boundary, ordering
+/// of the commits, [`Self::build`] performs boundary resolution, delta-log listing, and contiguity
+/// validation.
 ///
 /// TODO: support UC catalog commit via with_log_tail(self, Vec<LogPath>) and
 /// with_max_catalog_version(self, Version)
-//#[derive(Debug)]
 pub struct CommitRangeBuilder {
     pub(crate) table_root: String,
     pub(crate) start_boundary: CommitBoundary,
@@ -78,18 +73,20 @@ impl CommitRangeBuilder {
             CommitBoundary::Version(v) => v,
         });
 
-        let log_segment = match &self.snapshot {
-            Some(snapshot) => snapshot.log_segment().clone(),
-            None => LogSegment::for_table_changes(
-                engine.storage_handler().as_ref(),
-                log_root,
-                start_version,
-                end_version,
-            )?,
+        let (log_segment, validate_protocol) = match &self.snapshot {
+            Some(snapshot) => (snapshot.log_segment().clone(), false),
+            None => (
+                LogSegment::for_table_changes(
+                    engine.storage_handler().as_ref(),
+                    log_root,
+                    start_version,
+                    end_version,
+                )?,
+                true,
+            ),
         };
         let end_version = log_segment.end_version;
-        // Extract the commit-file list from the log segment. The log segment is no longer
-        // needed after this point.
+
         let mut commit_files = log_segment.listed.ascending_commit_files;
 
         validate_version_range(start_version, end_version)?;
@@ -106,6 +103,7 @@ impl CommitRangeBuilder {
             end_version,
             start_boundary: self.start_boundary,
             end_boundary: self.end_boundary,
+            validate_protocol,
         })
     }
 

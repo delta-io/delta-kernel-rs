@@ -8,10 +8,6 @@ use crate::{FileDataReadResultIterator, Version};
 ///
 /// Callers that need to read multiple action types pass a slice
 /// (e.g. `&[DeltaAction::Add, DeltaAction::Remove]`).
-///
-/// `Protocol` and `CommitInfo` are always read internally — protocol for per-batch
-/// validation, commit-info to extract the in-commit timestamp. They are stripped from
-/// emitted batches unless the caller explicitly includes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeltaAction {
     /// AddFile action.

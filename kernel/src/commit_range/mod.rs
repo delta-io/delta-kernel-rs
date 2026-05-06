@@ -30,7 +30,6 @@
 mod actions;
 mod builder;
 
-use std::collections::HashSet;
 use std::slice;
 use std::sync::Arc;
 
@@ -46,7 +45,8 @@ use crate::expressions::Expression;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
-use crate::{DeltaResult, Engine, EngineData, Error, JsonHandler, Version};
+use crate::table_features::{KernelSupport, MAX_VALID_READER_VERSION, MIN_VALID_RW_VERSION};
+use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator, JsonHandler, Version};
 
 /// Output column name for the per-row commit version emitted by [`CommitRange::actions`].
 const COMMIT_VERSION_COL: &str = "_commit_version";
@@ -74,9 +74,9 @@ pub enum CommitBoundary {
 /// A plan over a contiguous range of Delta commits.
 ///
 /// `CommitRange` holds resolved `[start_version, end_version]` bounds plus the materialized
-/// commit-file pointers in `commit_files`. The pointer order matches the
+/// commit-file in `commit_files`. The pointer order matches the
 /// [`CommitOrdering`] requested at build time (ascending by default; reversed if
-/// `DescendingOrder`). It does not own a snapshot. Reading the underlying actions is
+/// [`CommitOrdering::DescendingOrder`]). Reading the underlying actions is
 /// lazy via [`CommitRange::commits`].
 #[derive(Debug)]
 pub struct CommitRange {
@@ -86,6 +86,7 @@ pub struct CommitRange {
     pub(crate) end_version: Version,
     pub(crate) start_boundary: CommitBoundary,
     pub(crate) end_boundary: Option<CommitBoundary>,
+    validate_protocol: bool,
 }
 
 impl CommitRange {
@@ -141,23 +142,48 @@ impl CommitRange {
     /// iterator over the commit's action batches projected to `actions`.
     ///
     /// `actions` drives the read schema literally: the engine projects each commit JSON to
-    /// a struct with one nullable field per requested [`DeltaAction`]. Action kinds not in
-    /// the set are dropped during projection by the engine. No auto-injection of
-    /// `protocol` or `commitInfo` happens here — protocol validation and ICT resolution
-    /// are the caller's responsibility.
+    /// a struct with one nullable field per requested [`DeltaAction`].
+    ///
+    /// When `self.validate_protocol` is `true` (set automatically for path-based ranges
+    /// where no snapshot was supplied), `Protocol` is auto-injected into the read schema
+    /// and every batch is scanned for non-null protocol rows. Each is checked via
+    /// `validate_protocol_for_read`; the iterator yields `Err` and stops on the first
+    /// unsupported protocol. The auto-injected `protocol` column is stripped from
+    /// emitted batches if the caller didn't explicitly include `DeltaAction::Protocol`.
     pub fn commits(
         &self,
         engine: &dyn Engine,
-        actions: &HashSet<DeltaAction>,
-    ) -> impl Iterator<Item = DeltaResult<CommitActions>> + Send {
-        let action_kinds: Vec<DeltaAction> = actions.iter().copied().collect();
-        let read_schema = build_read_schema(&action_kinds);
+        actions: &[DeltaAction],
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<CommitActions>> + Send> {
+        let action_kinds: Vec<DeltaAction> = actions.to_vec();
+        let inject_protocol =
+            self.validate_protocol && !action_kinds.contains(&DeltaAction::Protocol);
+        let read_schema = build_read_schema_with_extras(&action_kinds, inject_protocol);
         let json_handler = engine.json_handler();
+        let validate = self.validate_protocol;
         let commit_files = self.commit_files.clone();
 
-        commit_files
-            .into_iter()
-            .map(move |file| open_commit_actions(json_handler.as_ref(), &file, read_schema.clone()))
+        // Build the drop-protocol evaluator once per `commits()` call. Construction errors
+        // surface as the outer `DeltaResult::Err` so callers see them before iteration begins.
+        let drop_evaluator = if inject_protocol {
+            Some(build_drop_protocol_evaluator(
+                engine,
+                &action_kinds,
+                read_schema.clone(),
+            )?)
+        } else {
+            None
+        };
+
+        Ok(commit_files.into_iter().map(move |file| {
+            open_commit_actions(
+                json_handler.as_ref(),
+                &file,
+                read_schema.clone(),
+                validate,
+                drop_evaluator.clone(),
+            )
+        }))
     }
 
     /// Yield action batches across all commits as [`crate::EngineData`], with
@@ -171,15 +197,15 @@ impl CommitRange {
     pub fn actions(
         &self,
         engine: &dyn Engine,
-        actions: &HashSet<DeltaAction>,
-    ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send {
-        let action_kinds: Vec<DeltaAction> = actions.iter().copied().collect();
+        actions: &[DeltaAction],
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
+        let action_kinds: Vec<DeltaAction> = actions.to_vec();
         let input_schema = build_read_schema(&action_kinds);
         let output_schema = actions_output_schema(&action_kinds);
         let evaluation_handler = engine.evaluation_handler();
-        let commits_iter = self.commits(engine, actions);
+        let commits_iter = self.commits(engine, actions)?;
 
-        commits_iter.flat_map(
+        Ok(commits_iter.flat_map(
             move |commit_res| -> Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
                 let commit = match commit_res {
                     Ok(c) => c,
@@ -208,7 +234,7 @@ impl CommitRange {
                     batch_res.and_then(|batch| evaluator.evaluate(batch.as_ref()))
                 }))
             },
-        )
+        ))
     }
 }
 
@@ -242,6 +268,73 @@ fn action_to_field(action: DeltaAction) -> StructField {
 fn build_read_schema(actions: &[DeltaAction]) -> SchemaRef {
     let fields = actions.iter().copied().map(action_to_field);
     Arc::new(StructType::new_unchecked(fields))
+}
+
+/// Same as [`build_read_schema`], but also includes a `protocol` column when
+/// `inject_protocol` is `true` and the user didn't already include
+/// [`DeltaAction::Protocol`]. Used for per-batch protocol validation.
+fn build_read_schema_with_extras(actions: &[DeltaAction], inject_protocol: bool) -> SchemaRef {
+    let mut fields = actions
+        .iter()
+        .copied()
+        .map(action_to_field)
+        .collect::<Vec<_>>();
+    if inject_protocol {
+        fields.push(action_to_field(DeltaAction::Protocol));
+    }
+    Arc::new(StructType::new_unchecked(fields))
+}
+
+/// Build an evaluator that projects a batch (with auto-injected `protocol`) onto the
+/// user's requested action columns only. Built once per `commits()` call and reused
+/// across every batch in the range.
+fn build_drop_protocol_evaluator(
+    engine: &dyn Engine,
+    user_actions: &[DeltaAction],
+    input_schema: SchemaRef,
+) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
+    let output_schema = build_read_schema(user_actions);
+    let projection = Expression::struct_from(
+        user_actions
+            .iter()
+            .copied()
+            .map(|a| Expression::column([action_column_name(a)])),
+    );
+    engine.evaluation_handler().new_expression_evaluator(
+        input_schema,
+        Arc::new(projection),
+        output_schema.into(),
+    )
+}
+
+/// Validate that Kernel can read a table governed by `protocol`.
+fn validate_protocol_for_read(protocol: &Protocol) -> DeltaResult<()> {
+    let version = protocol.min_reader_version();
+    if !(MIN_VALID_RW_VERSION..=MAX_VALID_READER_VERSION).contains(&version) {
+        return Err(Error::unsupported(format!(
+            "Unsupported minimum reader version {version}; \
+             kernel supports {MIN_VALID_RW_VERSION}..={MAX_VALID_READER_VERSION}",
+        )));
+    }
+    if let Some(features) = protocol.reader_features() {
+        for feature in features {
+            if matches!(feature.info().kernel_support, KernelSupport::NotSupported) {
+                return Err(Error::unsupported(format!(
+                    "Reader feature '{feature}' is not supported by kernel",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk `batch` for a non-null `protocol` row; if found, run [`validate_protocol_for_read`].
+/// Stateless — every batch is checked independently.
+fn validate_protocol_in_batch(batch: &dyn EngineData) -> DeltaResult<()> {
+    if let Some(protocol) = Protocol::try_new_from_data(batch)? {
+        validate_protocol_for_read(&protocol)?;
+    }
+    Ok(())
 }
 
 /// Output schema produced by [`CommitRange::actions`]:
@@ -278,16 +371,35 @@ fn actions_transform_expression(
 /// Open a single commit JSON file via the engine and package its batch iterator into a
 /// [`CommitActions`].
 ///
-/// The version is taken from the parsed filename. The timestamp is currently the file's
+/// The version is taken from the [`ParsedLogPath`]. The timestamp is currently the file's
 /// `last_modified`; ICT extraction is intentionally deferred (TODO) since it requires
 /// either a snapshot to check ICT enablement or a single-read peek+rewind.
+///
+/// When `validate_protocol` is `true`, every batch is scanned for a `protocol` row and
+/// validated via [`validate_protocol_for_read`] before emission. When `drop_evaluator` is
+/// `Some`, each batch is projected through it to strip the auto-injected `protocol`
+/// column so the emitted schema matches the caller's original action set.
 fn open_commit_actions(
     json_handler: &dyn JsonHandler,
     file: &ParsedLogPath,
     read_schema: SchemaRef,
+    validate_protocol: bool,
+    drop_evaluator: Option<Arc<dyn ExpressionEvaluator>>,
 ) -> DeltaResult<CommitActions> {
-    let actions =
+    let raw_iter =
         json_handler.read_json_files(slice::from_ref(&file.location), read_schema, None)?;
+
+    let actions = Box::new(raw_iter.map(move |batch_res| {
+        let batch = batch_res?;
+        if validate_protocol {
+            validate_protocol_in_batch(batch.as_ref())?;
+        }
+        match &drop_evaluator {
+            Some(eval) => eval.evaluate(batch.as_ref()),
+            None => Ok(batch),
+        }
+    }));
+
     Ok(CommitActions {
         version: file.version,
         // TODO: extract `commitInfo.inCommitTimestamp` from the first batch (peek+rewind)
@@ -300,11 +412,15 @@ fn open_commit_actions(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::LazyLock;
+    use std::sync::{Arc, LazyLock};
+
+    use test_utils::add_commit;
 
     use super::*;
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+    use crate::object_store::memory::InMemory;
     use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes};
 
     /// Open a `CommitRange` over the well-known `table-with-dv-small` test table.
@@ -334,9 +450,10 @@ mod tests {
             "table-with-dv-small has 2 commits (v=0..=1)"
         );
 
-        let actions = HashSet::from([DeltaAction::Add, DeltaAction::Remove]);
+        let actions = [DeltaAction::Add, DeltaAction::Remove];
         let collected: Vec<CommitActions> = range
             .commits(&engine, &actions)
+            .unwrap()
             .collect::<DeltaResult<Vec<_>>>()
             .unwrap();
 
@@ -396,8 +513,8 @@ mod tests {
             .build(&engine)
             .unwrap();
 
-        let actions = HashSet::from([DeltaAction::Add, DeltaAction::Remove]);
-        let mut iter = range.commits(&engine, &actions);
+        let actions = [DeltaAction::Add, DeltaAction::Remove];
+        let mut iter = range.commits(&engine, &actions).unwrap();
         let commit = iter.next().expect("v=1 commit").unwrap();
         assert_eq!(commit.version(), 1);
         assert!(iter.next().is_none(), "single-commit range yields only v=1");
@@ -467,14 +584,58 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn commits_errors_on_unsupported_protocol() {
+        const BAD_PROTOCOL_COMMIT: &str = r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}
+{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1000}}"#;
+
+        let store = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        add_commit(
+            table_root,
+            store.as_ref(),
+            0,
+            BAD_PROTOCOL_COMMIT.to_string(),
+        )
+        .await
+        .unwrap();
+
+        let range = CommitRange::builder_for(table_root, CommitBoundary::Version(0))
+            .with_end_boundary(CommitBoundary::Version(0))
+            .build(&engine)
+            .expect("CommitRange::build should succeed; validation runs during iteration");
+
+        // Iterating triggers per-batch validation. The unsupported reader version surfaces
+        // as an Err on the first batch consumed.
+        let actions = [DeltaAction::Add, DeltaAction::Remove];
+        let collected: DeltaResult<Vec<_>> = range
+            .commits(&engine, &actions)
+            .unwrap()
+            .map(|commit_res| {
+                let commit = commit_res?;
+                // Drain the action batches to trigger validation.
+                let batches: DeltaResult<Vec<_>> = commit.into_actions().collect();
+                batches.map(|_| ())
+            })
+            .collect();
+
+        let err = collected.expect_err("validation must reject minReaderVersion=99");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("99") || msg.to_lowercase().contains("unsupported"),
+            "error must mention the unsupported version, got: {msg}",
+        );
+    }
+
     #[test]
     fn actions_yields_metadata_columns_prepended() {
         let (range, engine) = open_test_range();
         let files = range.commit_files.clone();
 
-        let actions = HashSet::from([DeltaAction::Add, DeltaAction::Remove]);
+        let actions = [DeltaAction::Add, DeltaAction::Remove];
         let mut visitor = ActionsTaggedVisitor::default();
-        for batch_res in range.actions(&engine, &actions) {
+        for batch_res in range.actions(&engine, &actions).unwrap() {
             visitor.visit_rows_of(batch_res.unwrap().as_ref()).unwrap();
         }
 
