@@ -13,8 +13,8 @@ use crate::{DeltaResult, Engine, Error, Version};
 /// and the commit ordering. [`Self::build`] performs boundary resolution, delta-log
 /// listing, and contiguity validation.
 ///
-/// TODO: support UC catalog commit via with_log_tail(self, Vec<LogPath>) and
-/// with_max_catalog_version(self, Version)
+/// TODO: support UC catalog commit via `with_log_tail(self, Vec<LogPath>)` and
+/// `with_max_catalog_version(self, Version)`
 pub struct CommitRangeBuilder {
     table_root: String,
     start_boundary: CommitBoundary,
@@ -138,7 +138,7 @@ impl CommitRangeBuilder {
 
     /// Parse the stored table-root string into a [`Url`].
     fn parse_table_root(table_root: &str) -> DeltaResult<Url> {
-        crate::try_parse_uri(table_root)
+        crate::utils::try_parse_uri(table_root)
     }
 }
 

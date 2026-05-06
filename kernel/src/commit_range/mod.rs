@@ -2,7 +2,7 @@
 //!
 //! A [`CommitRange`] is a *plan* over an inclusive `[start_version, end_version]` range of
 //! commits. Construction performs a single delta-log listing (plus an optional merge with
-//! catalog-supplied commits via [`CommitRangeBuilder::with_log_tail`]); no JSON is read until
+//! catalog-supplied commits via `CommitRangeBuilder::with_log_tail`); no JSON is read until
 //! the caller iterates [`CommitRange::commits`].
 //!
 //! Unlike [`crate::table_changes::TableChanges`], `CommitRange` does not load a snapshot at
@@ -66,11 +66,11 @@ static METADATA_FIELDS: LazyLock<[StructField; 2]> = LazyLock::new(|| {
 /// A boundary specification for a [`CommitRange`].
 ///
 /// Use [`CommitBoundary::Version`] for a known commit version (no resolution required).
-/// Use [`CommitBoundary::Timestamp`] when the boundary must be resolved against the
-/// table's history.
+/// A planned `CommitBoundary::Timestamp` variant (TODO) will support resolving boundaries
+/// against the table's history.
 ///
-/// Resolving a [`CommitBoundary::Timestamp`] requires a snapshot; the caller must enter
-/// the builder via [`CommitRange::builder_from`] (which captures a snapshot) when using
+/// Resolving a timestamp boundary will require a snapshot; the caller must enter the
+/// builder via [`CommitRange::builder_from`] (which captures a snapshot) when using
 /// timestamp boundaries. [`CommitRange::builder_for`] (path-only) supports only
 /// [`CommitBoundary::Version`].
 #[derive(Debug, Clone, Copy)]
@@ -105,7 +105,7 @@ impl CommitRange {
     /// Begin building a [`CommitRange`] rooted at `table_root`.
     ///
     /// Path-based entry: only [`CommitBoundary::Version`] boundaries are supported.
-    /// To use [`CommitBoundary::Timestamp`] boundaries, use [`Self::builder_from`] instead.
+    /// Future timestamp boundaries (TODO) will require entering via [`Self::builder_from`].
     pub fn builder_for(
         table_root: impl AsRef<str>,
         start_boundary: CommitBoundary,
