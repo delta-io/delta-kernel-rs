@@ -1303,7 +1303,6 @@ mod tests {
     use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
-    use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -1827,8 +1826,7 @@ mod tests {
         .unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = SyncEngine::new_with_store(store);
+        let engine = SyncEngine::new();
         let storage = engine.storage_handler();
         let cp = LastCheckpointHint::try_read(storage.as_ref(), &url).unwrap();
         assert!(cp.is_none());
@@ -2398,8 +2396,7 @@ mod tests {
         let table_path = Url::from_directory_path(temp_dir.path())
             .unwrap()
             .to_string();
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = SyncEngine::new_with_store(store);
+        let engine = SyncEngine::new();
 
         let schema = Arc::new(StructType::try_new(vec![StructField::new(
             "id",

@@ -1545,7 +1545,6 @@ mod tests {
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{MapData, Scalar, StructData};
-    use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -2084,8 +2083,7 @@ mod tests {
             "id",
             DataType::INTEGER,
         )])?);
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(crate::engine::sync::SyncEngine::new_with_store(store));
+        let engine = Arc::new(crate::engine::sync::SyncEngine::new());
         let mut txn = create_table(
             tempdir.path().to_str().expect("valid temp path"),
             schema,
