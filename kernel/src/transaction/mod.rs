@@ -858,12 +858,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
         self.shared_write_state.get_or_init(|| {
             let table_config = &self.effective_table_config;
             let props = table_config.table_properties();
-            let randomize_file_prefixes = props.randomize_file_prefixes.unwrap_or(false);
-            // Default prefix length matches Delta-Spark's `delta.randomPrefixLength` default.
-            let random_prefix_length = props
-                .random_prefix_length
-                .map(|n| n.get() as usize)
-                .unwrap_or(2);
+            let randomize_file_prefixes = props.should_randomize_file_prefixes();
+            let random_prefix_length = props.random_prefix_length();
             Arc::new(SharedWriteState {
                 table_root: table_config.table_root().clone(),
                 logical_schema: table_config.logical_schema(),

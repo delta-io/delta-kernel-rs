@@ -258,6 +258,20 @@ impl TableProperties {
         self.checkpoint_write_stats_as_struct.unwrap_or(false)
     }
 
+    /// Returns whether to emit a random alphanumeric prefix in file paths regardless of column
+    /// mapping mode. Default: `false` per the Delta protocol.
+    pub fn should_randomize_file_prefixes(&self) -> bool {
+        self.randomize_file_prefixes.unwrap_or(false)
+    }
+
+    /// Returns the number of characters to use for random file path prefixes.
+    /// Default: `2`, matching Delta-Spark's `delta.randomPrefixLength` default.
+    pub fn random_prefix_length(&self) -> usize {
+        self.random_prefix_length
+            .map(|n| n.get() as usize)
+            .unwrap_or(2)
+    }
+
     /// Returns the Parquet compression codec for new data and checkpoint files, applying the
     /// Delta protocol's recommended fallback ([`ParquetCompressionCodec::Zstd`]) when the
     /// table property is absent.

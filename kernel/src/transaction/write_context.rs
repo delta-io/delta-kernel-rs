@@ -307,14 +307,6 @@ mod tests {
     use crate::expressions::Expression;
     use crate::schema::{DataType, StructField, StructType};
 
-    fn make_write_context(
-        cm_mode: ColumnMappingMode,
-        partition_columns: Vec<String>,
-        partition_values: HashMap<String, Option<String>>,
-    ) -> WriteContext {
-        make_write_context_with_randomize(cm_mode, partition_columns, partition_values, false, 2)
-    }
-
     fn make_write_context_with_randomize(
         cm_mode: ColumnMappingMode,
         partition_columns: Vec<String>,
@@ -365,7 +357,7 @@ mod tests {
         } else {
             (vec![], HashMap::new())
         };
-        let wc = make_write_context(cm_mode, cols, pvs);
+        let wc = make_write_context_with_randomize(cm_mode, cols, pvs, false, 2);
         let path = wc.write_dir().path().to_string();
 
         match cm_mode {
@@ -407,7 +399,13 @@ mod tests {
 
     #[test]
     fn test_write_dir_cm_on_generates_different_prefixes_per_call() {
-        let wc = make_write_context(ColumnMappingMode::Name, vec![], HashMap::new());
+        let wc = make_write_context_with_randomize(
+            ColumnMappingMode::Name,
+            vec![],
+            HashMap::new(),
+            false,
+            2,
+        );
         let dirs: Vec<String> = (0..20).map(|_| wc.write_dir().path().to_string()).collect();
         let unique: HashSet<_> = dirs.iter().collect();
         assert!(
@@ -418,10 +416,12 @@ mod tests {
 
     #[test]
     fn test_write_dir_cm_off_partitioned_null_value_uses_hive_default() {
-        let wc = make_write_context(
+        let wc = make_write_context_with_randomize(
             ColumnMappingMode::None,
             vec!["region".into()],
             HashMap::from([("region".into(), None)]),
+            false,
+            2,
         );
         let path = wc.write_dir().path().to_string();
         assert!(
@@ -443,10 +443,12 @@ mod tests {
         #[case] value: &str,
         #[case] expected_path: &str,
     ) {
-        let wc = make_write_context(
+        let wc = make_write_context_with_randomize(
             ColumnMappingMode::None,
             vec![col.into()],
             HashMap::from([(col.into(), Some(value.into()))]),
+            false,
+            2,
         );
         assert_eq!(wc.write_dir().path(), expected_path);
     }
@@ -458,7 +460,8 @@ mod tests {
     #[case::name_mode(ColumnMappingMode::Name)]
     #[case::id_mode(ColumnMappingMode::Id)]
     fn test_write_dir_cm_on_prefix_is_uri_safe(#[case] cm_mode: ColumnMappingMode) {
-        let wc = make_write_context(cm_mode, vec!["p".into()], HashMap::new());
+        let wc =
+            make_write_context_with_randomize(cm_mode, vec!["p".into()], HashMap::new(), false, 2);
         let path = wc.write_dir().path().to_string();
         assert!(
             !path.contains('%'),
@@ -496,7 +499,12 @@ mod tests {
     /// pins the matrix described in the `write_dir` doc comment.
     #[rstest]
     fn test_write_dir_with_randomize_property(
-        #[values(ColumnMappingMode::None, ColumnMappingMode::Name)] cm_mode: ColumnMappingMode,
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        cm_mode: ColumnMappingMode,
         #[values(true, false)] randomize: bool,
         #[values(true, false)] is_partitioned: bool,
     ) {
@@ -575,7 +583,7 @@ mod tests {
     /// Pins the decision that for CM=None + partitioned + randomize=true, the random prefix
     /// REPLACES the Hive path (matching Delta-Spark's `DelayedCommitProtocol.getFilename`).
     /// Partition values are still recorded in `add.partitionValues`; this test only asserts
-    /// the on-disk layout. If the maintainer prefers prefix-then-Hive, flip this assertion.
+    /// the on-disk layout.
     #[test]
     fn test_write_dir_cm_off_randomize_suppresses_hive() {
         let wc = make_write_context_with_randomize(
@@ -626,7 +634,13 @@ mod tests {
     #[case::error_outside_table_root("s3://bucket/other/abc.parquet", Err(()))]
     #[test]
     fn test_resolve_file_path(#[case] file_url: &str, #[case] expected: Result<&str, ()>) {
-        let wc = make_write_context(ColumnMappingMode::None, vec![], HashMap::new());
+        let wc = make_write_context_with_randomize(
+            ColumnMappingMode::None,
+            vec![],
+            HashMap::new(),
+            false,
+            2,
+        );
         let file = Url::parse(file_url).unwrap();
         match expected {
             Ok(exp) => assert_eq!(wc.resolve_file_path(&file).unwrap(), exp),
