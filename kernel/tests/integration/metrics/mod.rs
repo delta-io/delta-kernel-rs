@@ -21,12 +21,12 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{DeltaResult, Snapshot};
-use test_utils::table_builder::{LogState, TestTableBuilder};
-use test_utils::{
+use delta_kernel::test_utils::table_builder::{LogState, TestTableBuilder};
+use delta_kernel::test_utils::{
     insert_data, install_thread_local_metrics_reporter, test_table_setup_mt, CountingReporter,
 };
+use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::{DeltaResult, Snapshot};
 use url::Url;
 
 mod scan;

@@ -26,13 +26,12 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    use test_utils::assert_result_error_with_message;
-
     use super::*;
     use crate::actions::{Format, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
     use crate::path::ParsedLogPath;
     use crate::table_features::TableFeature;
+    use crate::test_utils::assert_result_error_with_message;
 
     fn test_table_root(dir: &str) -> url::Url {
         let path = std::fs::canonicalize(PathBuf::from(dir)).unwrap();

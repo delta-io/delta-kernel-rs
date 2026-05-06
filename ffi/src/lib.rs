@@ -1295,13 +1295,13 @@ mod tests {
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStoreExt as _;
     use delta_kernel::schema::StructType;
-    use rstest::rstest;
-    use serde_json::Value;
-    use test_utils::{
+    use delta_kernel::test_utils::{
         actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
         actions_to_string_with_metadata, add_commit, add_staged_commit, create_table, TestAction,
         METADATA, METADATA_WITH_FEATURES, METADATA_WITH_TABLE_PROPERTIES,
     };
+    use rstest::rstest;
+    use serde_json::Value;
     use url::Url;
 
     use super::*;

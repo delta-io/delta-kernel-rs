@@ -10,11 +10,11 @@ use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::{ChecksumWriteResult, Snapshot, SnapshotRef};
+use delta_kernel::test_utils::{add_commit, insert_data, test_table_setup};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Engine, FileStats};
 use rstest::rstest;
-use test_utils::{add_commit, insert_data, test_table_setup};
 
 // ============================================================================
 // File stats from CRC on disk
@@ -64,7 +64,7 @@ async fn test_get_file_stats_no_crc() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_get_file_stats_crc_not_at_snapshot_version() -> DeltaResult<()> {
-    use test_utils::copy_directory;
+    use delta_kernel::test_utils::copy_directory;
 
     // ===== GIVEN =====
     let (_temp_dir, table_path, engine) = test_table_setup()?;

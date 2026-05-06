@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::json;
-use test_utils::{assert_result_error_with_message, delta_path_for_version};
 use url::Url;
 
 use crate::actions::{CommitInfo, Format, Metadata, Protocol};
@@ -15,6 +14,7 @@ use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
+use crate::test_utils::{assert_result_error_with_message, delta_path_for_version};
 use crate::Snapshot;
 
 // ============================================================================

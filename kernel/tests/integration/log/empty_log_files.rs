@@ -11,8 +11,10 @@ use std::sync::Arc;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::test_utils::{
+    add_commit, compacted_log_path_for_versions, create_table, engine_store_setup,
+};
 use delta_kernel::Snapshot;
-use test_utils::{add_commit, compacted_log_path_for_versions, create_table, engine_store_setup};
 
 fn simple_schema() -> Arc<StructType> {
     Arc::new(

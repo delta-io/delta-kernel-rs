@@ -13,15 +13,15 @@ use delta_kernel::expressions::{column_expr, Scalar};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::test_utils::{
+    copy_directory, create_default_engine, create_default_engine_mt_executor,
+    read_actions_from_commit, setup_test_tables,
+};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Expression as Expr, Predicate as Pred, Snapshot};
 use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-use test_utils::{
-    copy_directory, create_default_engine, create_default_engine_mt_executor,
-    read_actions_from_commit, setup_test_tables,
-};
 use url::Url;
 
 use crate::common::write_utils::{

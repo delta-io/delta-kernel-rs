@@ -10,7 +10,7 @@ use delta_kernel::engine::default::DefaultEngineBuilder;
 #[cfg(test)]
 use delta_kernel::object_store::memory::InMemory;
 #[cfg(test)]
-use test_utils::add_commit;
+use delta_kernel::test_utils::add_commit;
 
 use crate::error::{EngineError, ExternResult, KernelError};
 #[cfg(test)]

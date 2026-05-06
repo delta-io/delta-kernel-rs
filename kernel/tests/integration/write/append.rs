@@ -14,10 +14,10 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::test_utils::{set_json_value, setup_test_tables, test_read};
 use delta_kernel::{DeltaResult, Error as KernelError, Snapshot};
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
-use test_utils::{set_json_value, setup_test_tables, test_read};
 
 use crate::common::write_utils::{
     check_action_timestamps, get_and_check_all_parquet_sizes, get_simple_int_schema,

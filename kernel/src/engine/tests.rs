@@ -12,7 +12,6 @@ use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
 use tempfile::{tempdir, NamedTempFile};
-use test_utils::delta_path_for_version;
 use url::Url;
 
 use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
@@ -26,6 +25,7 @@ use crate::schema::{
     column_name, ColumnMetadataKey, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
     StructField, StructType,
 };
+use crate::test_utils::delta_path_for_version;
 use crate::{DeltaResult, Engine, EngineData, FileMeta, JsonHandler, ParquetHandler};
 
 // ---------------------------------------------------------------------------

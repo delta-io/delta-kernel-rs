@@ -660,7 +660,7 @@ mod apply_schema_validation_tests {
     /// Only some of the nested ids are present.
     #[case::only_partial_nested_ids_match(array_in_map_kernel_schema([(
         ColumnMetadataKey::ColumnMappingNestedIds.as_ref().to_string(),
-        MetadataValue::Other(test_utils::nested_ids_json(&[
+        MetadataValue::Other(crate::test_utils::nested_ids_json(&[
             ("array_in_map.key", 100),
             ("array_in_map.value.element", 102),
             ("array_in_map.notTheKey", 999),

@@ -23,9 +23,9 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::test_utils::load_test_data;
 use delta_kernel::try_parse_uri;
 use tempfile::TempDir;
-use test_utils::load_test_data;
 use url::Url;
 
 // force scan metadata bench to use smaller sample size so test runs faster (100 -> 20)

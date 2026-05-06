@@ -16,11 +16,11 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::test_utils::{read_scan, test_table_setup_mt, write_batch_to_table};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::Snapshot;
 use rstest::rstest;
-use test_utils::{read_scan, test_table_setup_mt, write_batch_to_table};
 
 // ==============================================================================
 // Tests

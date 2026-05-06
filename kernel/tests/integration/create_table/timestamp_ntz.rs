@@ -13,11 +13,11 @@ use delta_kernel::table_features::{
     ColumnMappingMode, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
     TABLE_FEATURES_MIN_WRITER_VERSION,
 };
-use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::DeltaResult;
-use test_utils::{
+use delta_kernel::test_utils::{
     cm_properties, multiple_ntz_schema, nested_ntz_schema, test_table_setup, top_level_ntz_schema,
 };
+use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::DeltaResult;
 
 /// Asserts the snapshot's protocol includes timestampNtz with correct reader/writer versions.
 fn assert_timestamp_ntz_protocol(snapshot: &Snapshot) {

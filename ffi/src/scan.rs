@@ -813,7 +813,7 @@ mod scan_builder_tests {
 
     use std::ffi::c_void;
 
-    use test_utils::{actions_to_string, TestAction};
+    use delta_kernel::test_utils::{actions_to_string, TestAction};
 
     use super::{
         free_scan, free_scan_builder, scan_builder, scan_builder_build,
@@ -1093,7 +1093,7 @@ mod scan_metadata_arrow_tests {
 
     use delta_kernel::arrow::array::ffi::from_ffi;
     use delta_kernel::arrow::array::{RecordBatch, StructArray};
-    use test_utils::{actions_to_string, TestAction};
+    use delta_kernel::test_utils::{actions_to_string, TestAction};
 
     use super::{
         free_scan, free_scan_metadata_arrow_result, free_scan_metadata_iter, get_transform_for_row,
@@ -1286,10 +1286,12 @@ mod scan_metadata_arrow_tests {
 
     #[tokio::test]
     async fn partitioned_table_has_transforms() {
-        let (engine, snapshot) = setup_snapshot(test_utils::actions_to_string_partitioned(vec![
-            TestAction::Metadata,
-            TestAction::Add("val=a/file1.parquet".into()),
-        ]))
+        let (engine, snapshot) = setup_snapshot(
+            delta_kernel::test_utils::actions_to_string_partitioned(vec![
+                TestAction::Metadata,
+                TestAction::Add("val=a/file1.parquet".into()),
+            ]),
+        )
         .await
         .unwrap();
 

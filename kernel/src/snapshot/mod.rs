@@ -1290,8 +1290,6 @@ mod tests {
 
     use rstest::rstest;
     use serde_json::json;
-    use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
-    use test_utils::{add_commit, delta_path_for_version};
 
     use super::*;
     use crate::actions::{DomainMetadata, Protocol};
@@ -1319,6 +1317,8 @@ mod tests {
         TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
+    use crate::test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
+    use crate::test_utils::{add_commit, delta_path_for_version};
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
 
@@ -2520,7 +2520,7 @@ mod tests {
     // (crosses the crate type boundary via macro expansion).
     #[test]
     fn test_context_macro_works_in_unit_test() {
-        let (_engine, snap, _table) = test_utils::test_context!(
+        let (_engine, snap, _table) = crate::test_utils::test_context!(
             LogState::with_commits(3),
             FeatureSet::empty(),
             VersionTarget::Latest
@@ -2778,7 +2778,7 @@ mod tests {
         let content = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
         store
             .put(
-                &test_utils::compacted_log_path_for_versions(start, end, "json"),
+                &crate::test_utils::compacted_log_path_for_versions(start, end, "json"),
                 content.into(),
             )
             .await?;

@@ -5,10 +5,10 @@ use std::sync::Arc;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::{CheckpointWriteResult, ChecksumWriteResult};
+use delta_kernel::test_utils::test_table_setup_mt;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
 use rstest::rstest;
-use test_utils::test_table_setup_mt;
 
 #[rstest]
 #[case::v1_checkpoint(false)]

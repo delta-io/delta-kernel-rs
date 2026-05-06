@@ -25,10 +25,10 @@ use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::test_utils::{create_add_files_metadata, create_table, engine_store_setup};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
-use test_utils::{create_add_files_metadata, create_table, engine_store_setup};
 use url::Url;
 use uuid::Uuid;
 

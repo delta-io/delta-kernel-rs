@@ -13,13 +13,13 @@ use delta_kernel::table_features::{
     ColumnMappingMode, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
     TABLE_FEATURES_MIN_WRITER_VERSION,
 };
-use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::DeltaResult;
-use test_utils::{
+use delta_kernel::test_utils::{
     assert_result_error_with_message, cm_properties, multiple_variant_schema,
     nested_variant_schema, test_table_setup, top_level_variant_schema,
 };
+use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::DeltaResult;
 
 /// Asserts the snapshot's protocol includes variantType with correct reader/writer versions.
 fn assert_variant_protocol(snapshot: &Snapshot) {

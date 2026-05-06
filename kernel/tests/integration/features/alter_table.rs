@@ -16,14 +16,14 @@ use delta_kernel::schema::{
     StructType,
 };
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::test_utils::{
+    add_commit, create_table_and_load_snapshot, test_table_setup, test_table_setup_mt,
+    write_batch_to_table,
+};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
-use test_utils::{
-    add_commit, create_table_and_load_snapshot, test_table_setup, test_table_setup_mt,
-    write_batch_to_table,
-};
 
 fn simple_schema() -> SchemaRef {
     Arc::new(
@@ -145,7 +145,7 @@ async fn add_columns_lifecycle(
     let evolved_arrow_schema: delta_kernel::arrow::datatypes::SchemaRef =
         Arc::new(reloaded.schema().as_ref().try_into_arrow().unwrap());
     let scan = reloaded.scan_builder().build()?;
-    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let batches = delta_kernel::test_utils::read_scan(&scan, engine.clone())?;
     assert!(!batches.is_empty());
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2);
@@ -172,7 +172,7 @@ async fn add_columns_lifecycle(
     let final_snap = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(final_snap.version(), alter_end_version + 1);
     let scan = final_snap.scan_builder().build()?;
-    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let batches = delta_kernel::test_utils::read_scan(&scan, engine.clone())?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 4);
     for name in &new_col_names {
@@ -409,7 +409,7 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
 
     // Scan the row back and verify values in both newly-added columns.
     let scan = reloaded.scan_builder().build()?;
-    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let batches = delta_kernel::test_utils::read_scan(&scan, engine.clone())?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 1);
     let a_col = batches[0]
@@ -583,7 +583,7 @@ async fn set_nullable_on_layout_column_with_checkpoint(
     assert!(reloaded.schema().field(col_name).unwrap().is_nullable());
 
     let scan = reloaded.scan_builder().build()?;
-    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let batches = delta_kernel::test_utils::read_scan(&scan, engine.clone())?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 1);
     let col = batches[0]

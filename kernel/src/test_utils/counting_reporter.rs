@@ -7,9 +7,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use delta_kernel::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::util::SubscriberInitExt as _;
+
+use crate::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
 
 /// Install `reporter` as a thread-local metrics-collecting subscriber, with the safety net
 /// required to avoid tracing callsite-cache poisoning. Returns a guard that uninstalls the
@@ -25,7 +26,7 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 ///
 /// ```ignore
 /// use std::sync::Arc;
-/// use test_utils::{install_thread_local_metrics_reporter, CountingReporter};
+/// use delta_kernel::test_utils::{install_thread_local_metrics_reporter, CountingReporter};
 ///
 /// let reporter = Arc::new(CountingReporter::new());
 /// let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -295,9 +296,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use delta_kernel::metrics::MetricId;
-
     use super::*;
+    use crate::metrics::MetricId;
 
     fn dur() -> Duration {
         Duration::from_millis(1)

@@ -2,9 +2,6 @@ use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
 use rstest::rstest;
-use test_utils::{
-    compacted_log_path_for_versions, delta_path_for_version, staged_commit_path_for_version,
-};
 use url::Url;
 
 use super::*;
@@ -35,6 +32,9 @@ use crate::scan::test_utils::{
     sidecar_batch_with_given_paths_and_sizes,
 };
 use crate::schema::{DataType, StructField, StructType};
+use crate::test_utils::{
+    compacted_log_path_for_versions, delta_path_for_version, staged_commit_path_for_version,
+};
 use crate::utils::test_utils::{
     assert_batch_matches, assert_result_error_with_message, string_array_to_engine_data, Action,
 };

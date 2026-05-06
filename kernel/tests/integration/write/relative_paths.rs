@@ -8,11 +8,11 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::transaction::create_table::create_table as create_table_txn;
-use delta_kernel::Snapshot;
-use test_utils::{
+use delta_kernel::test_utils::{
     create_table_and_load_snapshot, read_add_infos, test_table_setup, write_batch_to_table,
 };
+use delta_kernel::transaction::create_table::create_table as create_table_txn;
+use delta_kernel::Snapshot;
 use url::Url;
 
 use crate::common::write_utils::{get_simple_schema, simple_id_batch};
@@ -61,7 +61,7 @@ async fn test_write_uses_relative_paths_and_readback() -> Result<(), Box<dyn std
 
     // Verify data is readable via scan
     let scan = snapshot.scan_builder().build()?;
-    let batches = test_utils::read_scan(&scan, engine)?;
+    let batches = delta_kernel::test_utils::read_scan(&scan, engine)?;
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 3);
 
@@ -125,7 +125,7 @@ async fn test_multiple_commits_with_relative_paths_all_readable(
     }
 
     let scan = snapshot.scan_builder().build()?;
-    let batches = test_utils::read_scan(&scan, engine)?;
+    let batches = delta_kernel::test_utils::read_scan(&scan, engine)?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 6);
 
@@ -162,7 +162,7 @@ async fn test_create_table_with_data_uses_relative_paths() -> Result<(), Box<dyn
 
     // Verify data is readable
     let scan = snapshot.scan_builder().build()?;
-    let batches = test_utils::read_scan(&scan, engine)?;
+    let batches = delta_kernel::test_utils::read_scan(&scan, engine)?;
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 2);
 

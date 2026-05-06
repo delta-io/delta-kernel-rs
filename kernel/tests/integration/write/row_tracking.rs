@@ -9,12 +9,12 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::test_utils::{create_table, engine_store_setup};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-use test_utils::{create_table, engine_store_setup};
 use url::Url;
 
 /// Test that verifies baseRowId and defaultRowCommitVersion are correctly populated

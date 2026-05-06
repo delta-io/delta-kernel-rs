@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use serde_json::{from_slice, json, Value};
 use tempfile::tempdir;
-use test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
 use url::Url;
 
 use crate::action_reconciliation::{
@@ -29,6 +28,7 @@ use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
+use crate::test_utils::{actions_to_string, add_commit, delta_path_for_version, TestAction};
 use crate::transaction::create_table::create_table;
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};

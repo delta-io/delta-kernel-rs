@@ -3,10 +3,12 @@
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::test_utils::{
+    assert_result_error_with_message, create_table, engine_store_setup,
+};
 use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::Deserializer;
-use test_utils::{assert_result_error_with_message, create_table, engine_store_setup};
 
 use crate::common::write_utils::get_simple_int_schema;
 

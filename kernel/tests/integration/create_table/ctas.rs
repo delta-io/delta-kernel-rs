@@ -22,14 +22,14 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     get_any_level_column_physical_name, ColumnMappingMode, TableFeature,
 };
+use delta_kernel::test_utils::{
+    assert_schema_has_field, nested_batches, nested_schema, read_add_infos, test_table_setup,
+    write_batch_to_table,
+};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Engine, FileMeta};
-use test_utils::{
-    assert_schema_has_field, nested_batches, nested_schema, read_add_infos, test_table_setup,
-    write_batch_to_table,
-};
 use url::Url;
 
 const VERIFIED_PATHS: &[&[&str]] = &[&["row_number"], &["address", "street"]];
@@ -241,7 +241,7 @@ async fn run_ctas_test(
     // 3. Scan all data from the source table
     let src_snapshot_for_scan = Snapshot::builder_for(src_url.clone()).build(engine.as_ref())?;
     let src_scan = src_snapshot_for_scan.scan_builder().build()?;
-    let src_batches = test_utils::read_scan(&src_scan, engine.clone())?;
+    let src_batches = delta_kernel::test_utils::read_scan(&src_scan, engine.clone())?;
     let src_arrow_schema = src_batches[0].schema();
     let source_data =
         delta_kernel::arrow::compute::concat_batches(&src_arrow_schema, &src_batches)?;
@@ -305,7 +305,7 @@ async fn run_ctas_test(
     //    address.street values all match the source
     let tgt_snapshot_for_scan = Snapshot::builder_for(tgt_url.clone()).build(engine.as_ref())?;
     let tgt_scan = tgt_snapshot_for_scan.scan_builder().build()?;
-    let tgt_batches = test_utils::read_scan(&tgt_scan, engine.clone())?;
+    let tgt_batches = delta_kernel::test_utils::read_scan(&tgt_scan, engine.clone())?;
     let tgt_arrow_schema = tgt_batches[0].schema();
     let tgt_combined =
         delta_kernel::arrow::compute::concat_batches(&tgt_arrow_schema, &tgt_batches)?;

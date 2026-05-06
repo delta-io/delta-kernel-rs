@@ -12,10 +12,10 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::SchemaRef;
+use delta_kernel::test_utils::engine_store_setup;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::Snapshot;
 use tempfile::TempDir;
-use test_utils::engine_store_setup;
 use url::Url;
 
 use crate::common::write_utils::get_simple_int_schema;
@@ -88,7 +88,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         engine_store_setup("test_ict_first_commit", Some(&tmp_test_dir_url));
 
     // Create table with ICT enabled (writer version 7)
-    let table_url = test_utils::create_table(
+    let table_url = delta_kernel::test_utils::create_table(
         store.clone(),
         table_location,
         schema.clone(),

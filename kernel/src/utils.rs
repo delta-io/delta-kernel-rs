@@ -173,9 +173,6 @@ pub(crate) mod test_utils {
     use itertools::Itertools;
     use serde::Serialize;
     use tempfile::TempDir;
-    use test_utils::{delta_path_for_version, load_test_data};
-    use tracing::subscriber::DefaultGuard;
-    use tracing_subscriber::util::SubscriberInitExt as _;
     use url::Url;
 
     use crate::actions::{
@@ -188,12 +185,13 @@ pub(crate) mod test_utils {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
-    use crate::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
+    use crate::metrics::{MetricEvent, MetricsReporter};
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::table_features::ColumnMappingMode;
+    use crate::test_utils::{delta_path_for_version, load_test_data};
     use crate::transaction::create_table::create_table;
     use crate::transaction::{CreateTable, Transaction};
     use crate::{DeltaResult, Engine, EngineData, Error, Snapshot, SnapshotRef};
@@ -215,22 +213,6 @@ pub(crate) mod test_utils {
         pub(crate) fn events(&self) -> Vec<MetricEvent> {
             self.events.lock().unwrap().clone()
         }
-    }
-
-    /// Kernel-internal twin of [`test_utils::install_thread_local_metrics_reporter`].
-    ///
-    /// Internal tests need their own helper because the trait identity of `MetricsReporter`
-    /// differs across the test_utils <-> kernel path-dep boundary. Both helpers wrap
-    /// [`test_utils::ensure_metrics_compatible_global_subscriber`] + a thread-local
-    /// `set_default` and serve the same purpose: install a metrics-collecting subscriber
-    /// in a way that is robust against tracing callsite-cache poisoning.
-    pub(crate) fn install_thread_local_metrics_reporter(
-        reporter: Arc<dyn MetricsReporter>,
-    ) -> DefaultGuard {
-        test_utils::ensure_metrics_compatible_global_subscriber();
-        tracing_subscriber::registry()
-            .with_metrics_reporter_layer(reporter)
-            .set_default()
     }
 
     #[derive(Serialize)]
@@ -566,7 +548,7 @@ pub(crate) mod test_utils {
     /// Build an [`array_in_map_kernel_schema`] with `parquet.field.id` on the top-level field
     /// and a nested-ids JSON map (key/value/element) under `nested_ids_meta_key`.
     pub(crate) fn array_in_map_with_field_ids(nested_ids_meta_key: &str) -> StructType {
-        let nested_ids = MetadataValue::Other(test_utils::nested_ids_json(&[
+        let nested_ids = MetadataValue::Other(crate::test_utils::nested_ids_json(&[
             ("array_in_map.key", 100),
             ("array_in_map.value", 101),
             ("array_in_map.value.element", 102),
@@ -768,12 +750,12 @@ pub(crate) mod test_utils {
 
     /// Build the kernel schema described by [`complex_nested_with_field_ids`].
     fn build_complex_nested_kernel_schema(nested_ids_meta_key: &str) -> StructType {
-        let top_nested_ids = test_utils::nested_ids_json(&[
+        let top_nested_ids = crate::test_utils::nested_ids_json(&[
             ("top.key", 100),
             ("top.key.element", 101),
             ("top.value", 102),
         ]);
-        let inner_nested_ids = test_utils::nested_ids_json(&[
+        let inner_nested_ids = crate::test_utils::nested_ids_json(&[
             ("inner.key", 200),
             ("inner.value", 201),
             ("inner.value.element", 202),

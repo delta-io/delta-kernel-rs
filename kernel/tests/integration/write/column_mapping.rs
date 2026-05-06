@@ -16,13 +16,13 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
-use delta_kernel::{Engine, FileMeta, Snapshot};
-use test_utils::{
+use delta_kernel::test_utils::{
     assert_partition_values, assert_schema_has_field, copy_directory,
     create_table_and_load_snapshot, nested_batches, nested_schema, read_actions_from_commit,
     read_add_infos, remove_all_and_get_remove_actions, resolve_field, test_table_setup,
     write_batch_to_table,
 };
+use delta_kernel::{Engine, FileMeta, Snapshot};
 use url::Url;
 
 use crate::common::write_utils::{

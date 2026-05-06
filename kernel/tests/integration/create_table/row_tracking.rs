@@ -16,14 +16,14 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
+use delta_kernel::test_utils::{
+    get_materialized_row_tracking_column_names, get_row_tracking_add_actions, insert_data,
+    read_actions_from_commit, test_table_setup,
+};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
-use test_utils::{
-    get_materialized_row_tracking_column_names, get_row_tracking_add_actions, insert_data,
-    read_actions_from_commit, test_table_setup,
-};
 use url::Url;
 
 /// Asserts protocol features are correct for row tracking on a snapshot.

@@ -630,7 +630,8 @@ fn acceptance_workloads_test(spec_path: &Path) -> datatest_stable::Result<()> {
     // Load and execute test case
     let test_case = TestCase::from_spec_path(&spec_path_abs);
     let table_root = test_case.table_root().expect("Failed to get table URL");
-    let engine = test_utils::create_default_engine(&table_root).expect("Failed to create engine");
+    let engine = delta_kernel::test_utils::create_default_engine(&table_root)
+        .expect("Failed to create engine");
     let result = execute_and_validate_workload(
         engine,
         &table_root,

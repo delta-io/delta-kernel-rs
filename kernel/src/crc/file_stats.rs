@@ -230,10 +230,10 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use test_utils::{generate_batch, IntoArray};
 
     use super::*;
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::test_utils::{generate_batch, IntoArray};
 
     fn size_batch(sizes: Vec<i64>) -> Box<dyn EngineData> {
         let batch = generate_batch(vec![("size", sizes.into_array())]).unwrap();

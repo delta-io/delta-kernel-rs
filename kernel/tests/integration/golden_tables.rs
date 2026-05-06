@@ -19,12 +19,12 @@ use delta_kernel::object_store::ObjectStore;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
+use delta_kernel::test_utils::load_test_data;
 use delta_kernel::{DeltaResult, Snapshot};
 use futures::stream::TryStreamExt;
 use futures::StreamExt;
 use itertools::Itertools;
 use paste::paste;
-use test_utils::load_test_data;
 use url::Url;
 
 // NB adapted from DAT: read all parquet files in the directory and concatenate them
@@ -199,7 +199,7 @@ fn setup_golden_table(
     let table_path = test_path.join("delta");
     let url = delta_kernel::try_parse_uri(table_path.to_str().expect("table path to string"))
         .expect("table from uri");
-    let engine = Arc::try_unwrap(test_utils::create_default_engine(&url).unwrap())
+    let engine = Arc::try_unwrap(delta_kernel::test_utils::create_default_engine(&url).unwrap())
         .expect("Arc should have single reference");
     let expected_path = test_path.join("expected");
     let expected_path = expected_path.exists().then_some(expected_path);

@@ -1,4 +1,9 @@
-//! A number of utilities useful for testing that we want to use in multiple crates
+//! Test helpers shared across kernel and downstream crates. Gated by the
+//! `test-utils` feature.
+
+// Test fixtures panic on contract violations by design; opt out of the
+// crate-wide unwrap/expect/panic deny within this module.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod counting_reporter;
 pub mod table_builder;
@@ -9,40 +14,42 @@ pub use counting_reporter::{
     ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
     CountingReporter, RelaxedCounter,
 };
-use delta_kernel::actions::get_log_add_schema;
-use delta_kernel::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
-    StringArray, StructArray,
-};
-use delta_kernel::arrow::buffer::OffsetBuffer;
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-use delta_kernel::arrow::error::ArrowError;
-use delta_kernel::arrow::util::pretty::pretty_format_batches;
-use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::arrow_conversion::TryFromKernel;
-use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
-use delta_kernel::engine::default::executor::tokio::{
-    TokioBackgroundExecutor, TokioMultiThreadExecutor,
-};
-use delta_kernel::engine::default::executor::TaskExecutor;
-use delta_kernel::engine::default::storage::store_from_url;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
-use delta_kernel::expressions::Scalar;
-use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
-use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
-use delta_kernel::parquet::file::properties::WriterProperties;
-use delta_kernel::scan::Scan;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
-use delta_kernel::transaction::CommitResult;
-use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot};
 use itertools::Itertools;
 use serde_json::{json, to_vec, Deserializer};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use url::Url;
+
+use crate::actions::get_log_add_schema;
+use crate::arrow::array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
+    StringArray, StructArray,
+};
+use crate::arrow::buffer::OffsetBuffer;
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use crate::arrow::error::ArrowError;
+use crate::arrow::util::pretty::pretty_format_batches;
+use crate::committer::FileSystemCommitter;
+use crate::engine::arrow_conversion::TryFromKernel;
+use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
+use crate::engine::default::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
+use crate::engine::default::executor::TaskExecutor;
+use crate::engine::default::storage::store_from_url;
+use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use crate::expressions::Scalar;
+use crate::object_store::local::LocalFileSystem;
+use crate::object_store::memory::InMemory;
+use crate::object_store::path::Path;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::file::properties::WriterProperties;
+use crate::scan::Scan;
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::transaction::CommitResult;
+// Re-export the #[macro_export]ed macros from this module so callers can write
+// `use delta_kernel::test_utils::test_context` rather than digging at the crate root.
+pub use crate::{build_snapshot, test_context};
+use crate::{try_parse_uri, DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot};
 
 /// unpack the test data from {test_parent_dir}/{test_name}.tar.zst into a temp dir, and return the
 /// dir it was unpacked into
@@ -378,14 +385,14 @@ pub fn test_table_setup() -> DeltaResult<(
     String,
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
 )> {
-    let temp_dir = tempfile::tempdir().map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let temp_dir = tempfile::tempdir().map_err(|e| crate::Error::generic(e.to_string()))?;
     let table_path = temp_dir
         .path()
         .to_str()
-        .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?
+        .ok_or_else(|| crate::Error::generic("Invalid path"))?
         .to_string();
     let table_url = url::Url::from_directory_path(&table_path)
-        .map_err(|_| delta_kernel::Error::generic("Invalid URL"))?;
+        .map_err(|_| crate::Error::generic("Invalid URL"))?;
     let engine = create_default_engine(&table_url)?;
     Ok((temp_dir, table_path, engine))
 }
@@ -400,14 +407,14 @@ pub fn test_table_setup_mt() -> DeltaResult<(
     String,
     Arc<DefaultEngine<TokioMultiThreadExecutor>>,
 )> {
-    let temp_dir = tempfile::tempdir().map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+    let temp_dir = tempfile::tempdir().map_err(|e| crate::Error::generic(e.to_string()))?;
     let table_path = temp_dir
         .path()
         .to_str()
-        .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?
+        .ok_or_else(|| crate::Error::generic("Invalid path"))?
         .to_string();
     let table_url = url::Url::from_directory_path(&table_path)
-        .map_err(|_| delta_kernel::Error::generic("Invalid URL"))?;
+        .map_err(|_| crate::Error::generic("Invalid URL"))?;
     let engine = create_default_engine_mt_executor(&table_url)?;
     Ok((temp_dir, table_path, engine))
 }
@@ -670,7 +677,7 @@ pub async fn insert_data<E: TaskExecutor>(
 ) -> DeltaResult<CommitResult> {
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
-        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        .map_err(|e| crate::Error::generic(e.to_string()))?;
     let mut txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())
@@ -855,9 +862,9 @@ pub fn cm_properties(mode: &str) -> Vec<(&str, &str)> {
 /// Resolves a nested field in a [`StructType`] schema by path. Returns an error if any
 /// segment is missing or a non-terminal segment is not a struct type.
 pub fn resolve_field<'a>(
-    schema: &'a delta_kernel::schema::StructType,
+    schema: &'a crate::schema::StructType,
     path: &[impl AsRef<str>],
-) -> Result<&'a delta_kernel::schema::StructField, String> {
+) -> Result<&'a crate::schema::StructField, String> {
     let path_str: Vec<&str> = path.iter().map(|s| s.as_ref()).collect();
     let display = path_str.join(".");
     let (last, rest) = path.split_last().ok_or_else(|| "empty path".to_string())?;
@@ -867,7 +874,7 @@ pub fn resolve_field<'a>(
             .field(name.as_ref())
             .ok_or_else(|| format!("schema missing field '{display}'"))?;
         current = match field.data_type() {
-            delta_kernel::schema::DataType::Struct(s) => s,
+            crate::schema::DataType::Struct(s) => s,
             _ => return Err(format!("expected struct at '{display}'")),
         };
     }
@@ -885,7 +892,7 @@ pub fn resolve_field<'a>(
 /// // Given schema: { address: { street: string, city: string } }
 /// assert_schema_has_field(&schema, &["address".into(), "street".into()]);
 /// ```
-pub fn assert_schema_has_field(schema: &delta_kernel::schema::StructType, path: &[String]) {
+pub fn assert_schema_has_field(schema: &crate::schema::StructType, path: &[String]) {
     resolve_field(schema, path).unwrap();
 }
 
@@ -907,7 +914,7 @@ pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, messa
 pub fn create_add_files_metadata(
     add_files_schema: &SchemaRef,
     files: Vec<(&str, i64, i64, i64)>,
-) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
+) -> Result<Box<dyn crate::EngineData>, Box<dyn std::error::Error>> {
     let num_files = files.len();
 
     // Build arrays for each file
@@ -952,8 +959,7 @@ pub fn create_add_files_metadata(
 
     // Build stats struct with all fields: numRecords, nullCount, minValues, maxValues, tightBounds
     // nullCount, minValues, maxValues are empty structs (structure depends on data schema)
-    let empty_struct_fields: delta_kernel::arrow::datatypes::Fields =
-        Vec::<Arc<Field>>::new().into();
+    let empty_struct_fields: crate::arrow::datatypes::Fields = Vec::<Arc<Field>>::new().into();
     let empty_struct = StructArray::new_empty_fields(num_files, None);
     let tight_bounds_array = BooleanArray::from(vec![true; num_files]);
 
@@ -1010,7 +1016,7 @@ pub fn create_add_files_metadata(
 /// snapshot.
 pub async fn write_batch_to_table(
     snapshot: &Arc<Snapshot>,
-    engine: &DefaultEngine<impl delta_kernel::engine::default::executor::TaskExecutor>,
+    engine: &DefaultEngine<impl crate::engine::default::executor::TaskExecutor>,
     data: RecordBatch,
     partition_values: HashMap<String, Scalar>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
@@ -1033,7 +1039,7 @@ pub async fn write_batch_to_table(
         .await?;
     txn.add_files(add_meta);
     match txn.commit(engine)? {
-        delta_kernel::transaction::CommitResult::CommittedTransaction(c) => Ok(c
+        crate::transaction::CommitResult::CommittedTransaction(c) => Ok(c
             .post_commit_snapshot()
             .expect("Failed to get post_commit_snapshot")
             .clone()),
@@ -1109,15 +1115,15 @@ pub fn create_table_and_load_snapshot(
     engine: &dyn Engine,
     properties: &[(&str, &str)],
 ) -> DeltaResult<Arc<Snapshot>> {
-    use delta_kernel::committer::FileSystemCommitter;
-    use delta_kernel::transaction::create_table::create_table;
+    use crate::committer::FileSystemCommitter;
+    use crate::transaction::create_table::create_table;
 
     let _ = create_table(table_path, schema, "Test/1.0")
         .with_table_properties(properties.to_vec())
         .build(engine, Box::new(FileSystemCommitter::new()))?
         .commit(engine)?;
 
-    let table_url = delta_kernel::try_parse_uri(table_path)?;
+    let table_url = crate::try_parse_uri(table_path)?;
     Snapshot::builder_for(table_url).build(engine)
 }
 

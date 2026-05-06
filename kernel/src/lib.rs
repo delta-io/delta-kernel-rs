@@ -113,6 +113,9 @@ pub mod table_properties;
 pub mod transaction;
 pub mod transforms;
 
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
+
 pub use crc::{FileSizeHistogram, FileStats};
 pub use log_path::LogPath;
 

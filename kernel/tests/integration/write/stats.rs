@@ -13,11 +13,11 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{column_expr, ColumnName};
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
-use delta_kernel::{Expression as Expr, Predicate as Pred, Snapshot};
-use test_utils::{
+use delta_kernel::test_utils::{
     create_table_and_load_snapshot, read_actions_from_commit, test_table_setup,
     test_table_setup_mt, write_batch_to_table,
 };
+use delta_kernel::{Expression as Expr, Predicate as Pred, Snapshot};
 use url::Url;
 
 use crate::common::write_utils::set_table_properties;

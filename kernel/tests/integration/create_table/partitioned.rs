@@ -5,11 +5,11 @@
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
+use delta_kernel::test_utils::test_table_setup;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
-use test_utils::test_table_setup;
 
 use super::{partition_test_schema, simple_schema};
 

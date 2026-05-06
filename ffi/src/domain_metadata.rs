@@ -95,9 +95,9 @@ mod tests {
 
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::test_utils::add_commit;
     use delta_kernel::DeltaResult;
     use serde_json::json;
-    use test_utils::add_commit;
 
     use super::*;
     use crate::error::KernelError;

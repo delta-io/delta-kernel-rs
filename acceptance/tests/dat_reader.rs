@@ -24,7 +24,7 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
         .block_on(async {
             let case = read_dat_case(root_dir).unwrap();
             let table_root = case.table_root().unwrap();
-            let engine = test_utils::create_default_engine(&table_root).unwrap();
+            let engine = delta_kernel::test_utils::create_default_engine(&table_root).unwrap();
 
             case.assert_metadata(engine.clone()).await.unwrap();
             acceptance::data::assert_scan_metadata(engine.clone(), &case)

@@ -1520,7 +1520,8 @@ mod scan_metadata_completed_tests {
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
     use crate::metrics::MetricEvent;
     use crate::object_store::local::LocalFileSystem;
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::test_utils::install_thread_local_metrics_reporter;
+    use crate::utils::test_utils::CapturingReporter;
     use crate::Snapshot;
 
     fn run_scan(

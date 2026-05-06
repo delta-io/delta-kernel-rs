@@ -556,7 +556,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
-    use test_utils::delta_path_for_version;
     use url::Url;
 
     use super::*;
@@ -565,6 +564,7 @@ mod tests {
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
+    use crate::test_utils::delta_path_for_version;
     use crate::utils::test_utils::{Action, LocalMockTable};
     use crate::Version;
 

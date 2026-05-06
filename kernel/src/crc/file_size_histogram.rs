@@ -278,9 +278,9 @@ impl FileSizeHistogram {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use test_utils::assert_result_error_with_message;
 
     use super::*;
+    use crate::test_utils::assert_result_error_with_message;
 
     // ===== Construction =====
 

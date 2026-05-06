@@ -9,10 +9,10 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::test_utils::{set_json_value, setup_test_tables};
 use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
-use test_utils::{set_json_value, setup_test_tables};
 
 use crate::common::write_utils::{
     get_simple_int_schema, validate_timestamp, validate_txn_id, ZERO_UUID,

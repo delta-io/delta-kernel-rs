@@ -328,7 +328,6 @@ mod tests {
 
     use itertools::Itertools;
     use serde_json::json;
-    use test_utils::{actions_to_string, add_commit, TestAction};
 
     use super::*;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -337,7 +336,10 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::test_utils::{
+        actions_to_string, add_commit, install_thread_local_metrics_reporter, TestAction,
+    };
+    use crate::utils::test_utils::CapturingReporter;
 
     fn setup_test() -> (
         Arc<DefaultEngine<TokioBackgroundExecutor>>,
@@ -615,13 +617,12 @@ mod tests {
     }
 
     mod catalog_managed_tests {
-        use test_utils::{
+        use super::*;
+        use crate::log_path::LogPath;
+        use crate::test_utils::{
             actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
             TestAction,
         };
-
-        use super::*;
-        use crate::log_path::LogPath;
         use crate::utils::try_parse_uri;
         use crate::FileMeta;
 
@@ -705,8 +706,14 @@ mod tests {
             add_commit(&table_root, store.as_ref(), 2, actions_to_string(actions)).await?;
 
             let log_tail = vec![
-                create_log_path(&table_root, test_utils::delta_path_for_version(1, "json")),
-                create_log_path(&table_root, test_utils::delta_path_for_version(2, "json")),
+                create_log_path(
+                    &table_root,
+                    crate::test_utils::delta_path_for_version(1, "json"),
+                ),
+                create_log_path(
+                    &table_root,
+                    crate::test_utils::delta_path_for_version(2, "json"),
+                ),
             ];
 
             // log_tail ends at v2, max_catalog_version=3, no time-travel -> error
@@ -767,7 +774,7 @@ mod tests {
 
             let log_tail = vec![create_log_path(
                 &table_root,
-                test_utils::delta_path_for_version(1, "json"),
+                crate::test_utils::delta_path_for_version(1, "json"),
             )];
 
             // Time travel to v2, but log tail only goes up to v1
@@ -861,7 +868,10 @@ mod tests {
             let log_tail: Vec<_> = log_tail_versions
                 .iter()
                 .map(|v| {
-                    create_log_path(&table_root, test_utils::delta_path_for_version(*v, "json"))
+                    create_log_path(
+                        &table_root,
+                        crate::test_utils::delta_path_for_version(*v, "json"),
+                    )
                 })
                 .collect();
 

@@ -12,14 +12,14 @@ use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
+use delta_kernel::test_utils::{
+    create_default_engine_mt_executor, create_table, engine_store_setup, read_scan, test_read,
+};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Error, Snapshot};
 use itertools::Itertools;
 use serde_json::{Deserializer, Value};
 use tempfile::{tempdir, TempDir};
-use test_utils::{
-    create_default_engine_mt_executor, create_table, engine_store_setup, read_scan, test_read,
-};
 use url::Url;
 
 /// Helper function to create a simple table with row tracking enabled.

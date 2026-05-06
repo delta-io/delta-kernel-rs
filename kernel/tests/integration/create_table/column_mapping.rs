@@ -13,10 +13,10 @@ use delta_kernel::schema::{
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
+use delta_kernel::test_utils::{create_table_and_load_snapshot, test_table_setup};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
-use test_utils::{create_table_and_load_snapshot, test_table_setup};
 
 use super::simple_schema;
 

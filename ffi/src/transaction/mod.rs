@@ -576,6 +576,7 @@ mod tests {
     use delta_kernel::parquet::file::properties::WriterProperties;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::table_features::TableFeature;
+    use delta_kernel::test_utils::{set_json_value, setup_test_tables, test_read};
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
     use delta_kernel_ffi::error::KernelError;
     use delta_kernel_ffi::ffi_test_utils::{
@@ -586,7 +587,6 @@ mod tests {
     use itertools::Itertools;
     use serde_json::{json, Deserializer};
     use tempfile::tempdir;
-    use test_utils::{set_json_value, setup_test_tables, test_read};
     use write_context::{
         free_write_context, get_unpartitioned_write_context, get_write_path, get_write_schema,
     };
@@ -868,8 +868,8 @@ mod tests {
             DataType::INTEGER,
         )])?);
         let (store, _test_engine, table_location) =
-            test_utils::engine_store_setup(name, Some(dir_url));
-        let table_url = test_utils::create_table(
+            delta_kernel::test_utils::engine_store_setup(name, Some(dir_url));
+        let table_url = delta_kernel::test_utils::create_table(
             store.clone(),
             table_location,
             schema,
@@ -1042,8 +1042,8 @@ mod tests {
             DataType::INTEGER,
         )])?);
         let (store, _test_engine, table_location) =
-            test_utils::engine_store_setup("test_dm_no_feature", Some(&tmp_dir_url));
-        let table_url = test_utils::create_table(
+            delta_kernel::test_utils::engine_store_setup("test_dm_no_feature", Some(&tmp_dir_url));
+        let table_url = delta_kernel::test_utils::create_table(
             store.clone(),
             table_location,
             schema,
@@ -1132,8 +1132,8 @@ mod tests {
 
         // Create a catalog-managed table so UCCommitter (a catalog committer) is allowed.
         let (store, _test_engine, table_location) =
-            test_utils::engine_store_setup("test_uc_table", Some(&tmp_dir_local_url));
-        let table_url = test_utils::create_table(
+            delta_kernel::test_utils::engine_store_setup("test_uc_table", Some(&tmp_dir_local_url));
+        let table_url = delta_kernel::test_utils::create_table(
             store.clone(),
             table_location,
             schema,

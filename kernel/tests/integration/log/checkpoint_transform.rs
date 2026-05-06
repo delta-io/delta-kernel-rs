@@ -22,9 +22,9 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use delta_kernel::test_utils::{insert_data, read_scan, write_batch_to_table};
 use delta_kernel::{DeltaResult, Expression, Snapshot};
 use serde_json::json;
-use test_utils::{insert_data, read_scan, write_batch_to_table};
 use url::Url;
 
 /// Creates an in-memory store and the table root URL.

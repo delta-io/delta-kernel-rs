@@ -17,15 +17,15 @@ use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::test_utils::{
+    create_add_files_metadata, create_table_and_load_snapshot, insert_data, load_test_data,
+    read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
+};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use itertools::Itertools;
-use test_utils::{
-    create_add_files_metadata, create_table_and_load_snapshot, insert_data, load_test_data,
-    read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
-};
 
 use crate::common::write_utils::{
     get_simple_schema, load_existing_single_file_checkpoint_path, resolve_struct_field,
@@ -38,7 +38,7 @@ fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<Recor
 
     let url =
         delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string")).unwrap();
-    let engine = test_utils::create_default_engine(&url)?;
+    let engine = delta_kernel::test_utils::create_default_engine(&url)?;
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
     let scan = snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;

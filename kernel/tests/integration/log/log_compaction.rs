@@ -5,8 +5,8 @@ use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::test_utils::{create_table, engine_store_setup};
 use delta_kernel::Snapshot;
-use test_utils::{create_table, engine_store_setup};
 use url::Url;
 
 /// Convert a URL to a `delta_kernel::object_store::Path`

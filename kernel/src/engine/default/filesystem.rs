@@ -367,13 +367,13 @@ mod tests {
     use std::time::Duration;
 
     use itertools::Itertools;
-    use test_utils::delta_path_for_version;
 
     use super::*;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
+    use crate::test_utils::delta_path_for_version;
     use crate::utils::current_time_duration;
     use crate::Engine as _;
 

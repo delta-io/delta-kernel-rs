@@ -21,8 +21,8 @@
 //!
 //! ```ignore
 //! use rstest::rstest;
-//! use test_utils::table_builder::*;
-//! use test_utils::test_context;
+//! use delta_kernel::test_utils::table_builder::*;
+//! use delta_kernel::test_utils::test_context;
 //!
 //! #[rstest]
 //! fn test_scan(
@@ -48,25 +48,25 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{
+use crate::arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
     TimestampMicrosecondArray,
 };
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
-use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::arrow_conversion::TryFromKernel;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
-use delta_kernel::expressions::Scalar;
-use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::object_store::DynObjectStore;
-use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
-use delta_kernel::table_features::TableFeature;
-use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{DeltaResult, Snapshot};
+use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
+use crate::committer::FileSystemCommitter;
+use crate::engine::arrow_conversion::TryFromKernel;
+use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use crate::expressions::Scalar;
+use crate::object_store::memory::InMemory;
+use crate::object_store::DynObjectStore;
+use crate::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
+use crate::table_features::TableFeature;
+use crate::transaction::create_table::create_table;
+use crate::transaction::data_layout::DataLayout;
+use crate::{DeltaResult, Snapshot};
 
 // ===========================================================================
 // LogState
@@ -391,7 +391,7 @@ impl fmt::Display for TableConfig {
 // ```ignore
 // use rstest::rstest;
 // use rstest_reuse::apply;
-// use test_utils::table_builder::*;
+// use delta_kernel::test_utils::table_builder::*;
 //
 // #[apply(feature_sets)]
 // #[apply(table_configs)]
@@ -725,7 +725,7 @@ impl TestTableBuilder {
         std::thread::scope(|s| {
             s.spawn(|| {
                 tokio::runtime::Runtime::new()
-                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?
+                    .map_err(|e| crate::Error::generic(e.to_string()))?
                     .block_on(self.build_async())
             })
             .join()
@@ -817,10 +817,10 @@ async fn write_data_commit(
     rows_per_file: usize,
     partition_columns: &[String],
     version: u64,
-) -> DeltaResult<delta_kernel::transaction::CommitResult> {
+) -> DeltaResult<crate::transaction::CommitResult> {
     let logical_schema = snapshot.schema().clone();
     let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(logical_schema.as_ref())
-        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        .map_err(|e| crate::Error::generic(e.to_string()))?;
 
     let mut txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
@@ -843,7 +843,7 @@ async fn write_data_commit(
             })
             .collect();
         let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns)
-            .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+            .map_err(|e| crate::Error::generic(e.to_string()))?;
 
         let write_context = if partition_columns.is_empty() {
             txn.unpartitioned_write_context()?
@@ -1084,16 +1084,16 @@ pub fn test_table(log_state: LogState, feature_set: FeatureSet) -> TestTable {
 macro_rules! build_snapshot {
     ($version_target:expr, $table_root:expr, $engine:expr) => {
         match &$version_target {
-            $crate::table_builder::VersionTarget::Latest => {
+            $crate::test_utils::table_builder::VersionTarget::Latest => {
                 Snapshot::builder_for($table_root).build($engine).unwrap()
             }
-            $crate::table_builder::VersionTarget::AtVersion(v) => {
+            $crate::test_utils::table_builder::VersionTarget::AtVersion(v) => {
                 Snapshot::builder_for($table_root)
                     .at_version(*v)
                     .build($engine)
                     .unwrap()
             }
-            $crate::table_builder::VersionTarget::IncrementalToLatest { from } => {
+            $crate::test_utils::table_builder::VersionTarget::IncrementalToLatest { from } => {
                 let base = Snapshot::builder_for($table_root)
                     .at_version(*from)
                     .build($engine)
@@ -1117,7 +1117,7 @@ macro_rules! build_snapshot {
 #[macro_export]
 macro_rules! test_context {
     ($log_state:expr, $feature_set:expr, $version_target:expr) => {{
-        let table = $crate::table_builder::test_table($log_state, $feature_set);
+        let table = $crate::test_utils::table_builder::test_table($log_state, $feature_set);
         let engine = DefaultEngineBuilder::new(table.store().clone()).build();
         let snap = $crate::build_snapshot!($version_target, table.table_root(), &engine);
         (engine, snap, table)
@@ -1316,11 +1316,11 @@ mod tests {
             .with_features(FeatureSet::new().column_mapping("name"))
             .with_data(1, 5)
             .build()?;
-        let engine: Arc<dyn delta_kernel::Engine> =
+        let engine: Arc<dyn crate::Engine> =
             Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
         let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
         let scan = snap.scan_builder().build()?;
-        let batches = crate::read_scan(&scan, engine)?;
+        let batches = crate::test_utils::read_scan(&scan, engine)?;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 5);
         Ok(())
@@ -1332,11 +1332,11 @@ mod tests {
             .with_log_state(LogState::with_commits(2))
             .with_data(2, 5)
             .build()?;
-        let engine: Arc<dyn delta_kernel::Engine> =
+        let engine: Arc<dyn crate::Engine> =
             Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
         let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
         let scan = snap.scan_builder().build()?;
-        let batches = crate::read_scan(&scan, engine)?;
+        let batches = crate::test_utils::read_scan(&scan, engine)?;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 10);
         Ok(())
@@ -1359,9 +1359,9 @@ mod tests {
         assert_eq!(snap.version(), 1);
         assert_eq!(snap.schema(), expected_schema);
         let scan = snap.scan_builder().build()?;
-        let engine_arc: Arc<dyn delta_kernel::Engine> =
+        let engine_arc: Arc<dyn crate::Engine> =
             Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
-        let batches = crate::read_scan(&scan, engine_arc)?;
+        let batches = crate::test_utils::read_scan(&scan, engine_arc)?;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 10);
         Ok(())
@@ -1378,9 +1378,9 @@ mod tests {
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
         assert_eq!(snap.version(), 3);
         let scan = snap.scan_builder().build()?;
-        let engine_arc: Arc<dyn delta_kernel::Engine> =
+        let engine_arc: Arc<dyn crate::Engine> =
             Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
-        let batches = crate::read_scan(&scan, engine_arc)?;
+        let batches = crate::test_utils::read_scan(&scan, engine_arc)?;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 30);
         Ok(())

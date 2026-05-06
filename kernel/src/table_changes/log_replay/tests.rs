@@ -3,7 +3,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use itertools::Itertools;
-use test_utils::LoggingTest;
 
 use super::{table_changes_action_iter, TableChangesScanMetadata};
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
@@ -18,6 +17,7 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::test_utils::LoggingTest;
 use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::{DeltaResult, Engine, Error, Predicate, Version};
 

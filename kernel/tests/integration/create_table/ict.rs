@@ -11,9 +11,9 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
+use delta_kernel::test_utils::test_table_setup;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Engine};
-use test_utils::test_table_setup;
 
 /// Asserts the ICT protocol and enablement state of a snapshot, returning the ICT value.
 fn assert_ict_state(

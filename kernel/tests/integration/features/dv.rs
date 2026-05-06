@@ -12,14 +12,14 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::test_utils::{
+    create_add_files_metadata, create_table, engine_store_setup, generate_batch, into_record_batch,
+    record_batch_to_bytes, IntoArray,
+};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
 use itertools::Itertools;
 use tempfile::tempdir;
-use test_utils::{
-    create_add_files_metadata, create_table, engine_store_setup, generate_batch, into_record_batch,
-    record_batch_to_bytes, IntoArray,
-};
 
 /// Helper to write a parquet file with the given data to the table.
 /// Returns the file path (relative to table root) that was written.
@@ -60,7 +60,7 @@ fn test_table_scan(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from(table_path))?;
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = test_utils::create_default_engine(&url)?;
+    let engine = delta_kernel::test_utils::create_default_engine(&url)?;
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;

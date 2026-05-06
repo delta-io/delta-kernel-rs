@@ -11,10 +11,12 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::schema::SchemaRef;
+use delta_kernel::test_utils::{
+    assert_result_error_with_message, create_table, engine_store_setup,
+};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Snapshot, Version};
 use tempfile::{tempdir, TempDir};
-use test_utils::{assert_result_error_with_message, create_table, engine_store_setup};
 use url::Url;
 
 use crate::common::write_utils::get_simple_int_schema;

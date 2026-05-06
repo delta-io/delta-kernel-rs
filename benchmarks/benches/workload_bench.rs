@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
+use delta_kernel::test_utils::CountingReporter;
 use delta_kernel_benchmarks::models::{
     default_read_configs, ParallelScan, ReadConfig, ReadOperation, Spec,
 };
@@ -9,7 +10,6 @@ use delta_kernel_benchmarks::runners::{
     create_read_runner, SnapshotConstructionRunner, WorkloadRunner,
 };
 use delta_kernel_benchmarks::utils::load_all_workloads;
-use test_utils::CountingReporter;
 
 // Loads all workloads and sets up a shared runtime, then registers each as a top-level benchmark.
 // For each workload, builds a runner that encapsulates the state (table info, engine, config, etc.)

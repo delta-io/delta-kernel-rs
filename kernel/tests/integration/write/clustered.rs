@@ -12,14 +12,14 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::StructType;
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::test_utils::{
+    create_default_engine_mt_executor, nested_batches, nested_schema, read_actions_from_commit,
+    test_table_setup, write_batch_to_table,
+};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::Snapshot;
 use itertools::Itertools;
 use tempfile::TempDir;
-use test_utils::{
-    create_default_engine_mt_executor, nested_batches, nested_schema, read_actions_from_commit,
-    test_table_setup, write_batch_to_table,
-};
 use url::Url;
 
 use crate::common::write_utils::{
@@ -36,7 +36,7 @@ async fn test_checkpoint_non_kernel_written_table() {
     let source_path = std::path::Path::new("./tests/data/external-table-different-nullability");
     let temp_dir = tempfile::tempdir().unwrap();
     let table_path = temp_dir.path().join("test-checkpoint-table");
-    test_utils::copy_directory(source_path, &table_path).unwrap();
+    delta_kernel::test_utils::copy_directory(source_path, &table_path).unwrap();
 
     let url = Url::from_directory_path(&table_path).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
@@ -56,7 +56,7 @@ async fn test_checkpoint_non_kernel_written_table() {
         .build(engine.as_ref())
         .unwrap();
     let scan_before = Arc::clone(&snapshot).scan_builder().build().unwrap();
-    let batches_before = test_utils::read_scan(&scan_before, engine.clone()).unwrap();
+    let batches_before = delta_kernel::test_utils::read_scan(&scan_before, engine.clone()).unwrap();
 
     // Create checkpoint via snapshot.checkpoint()
     snapshot.checkpoint(engine.as_ref(), None).unwrap();
@@ -66,7 +66,7 @@ async fn test_checkpoint_non_kernel_written_table() {
         .build(engine.as_ref())
         .unwrap();
     let scan_after = snapshot_after.scan_builder().build().unwrap();
-    let batches_after = test_utils::read_scan(&scan_after, engine.clone()).unwrap();
+    let batches_after = delta_kernel::test_utils::read_scan(&scan_after, engine.clone()).unwrap();
 
     // Verify data unchanged
     let formatted_before =

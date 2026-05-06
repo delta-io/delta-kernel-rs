@@ -9,11 +9,11 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::test_utils::{create_default_engine, setup_test_tables, write_batch_to_table};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Snapshot};
 use tempfile::tempdir;
-use test_utils::{create_default_engine, setup_test_tables, write_batch_to_table};
 use url::Url;
 
 use crate::common::write_utils::get_simple_int_schema;

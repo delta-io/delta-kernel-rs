@@ -18,11 +18,11 @@ use delta_kernel::table_features::{
     TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use delta_kernel::table_properties::TableProperties;
+use delta_kernel::test_utils::{assert_result_error_with_message, test_table_setup};
 use delta_kernel::transaction::create_table::{create_table, CreateTableTransaction};
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use serde_json::Value;
-use test_utils::{assert_result_error_with_message, test_table_setup};
 
 /// Helper to create a simple two-column schema for tests.
 /// Shared with sub-modules.

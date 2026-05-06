@@ -16,13 +16,13 @@ use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::test_utils::{create_table, engine_store_setup, test_read, test_table_setup};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::{Engine, Error as KernelError, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-use test_utils::{create_table, engine_store_setup, test_read, test_table_setup};
 use url::Url;
 
 #[tokio::test]

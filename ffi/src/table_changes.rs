@@ -348,13 +348,13 @@ mod tests {
     #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
     use delta_kernel::object_store::ObjectStoreExt as _;
     use delta_kernel::schema::{DataType, StructField, StructType};
-    use delta_kernel::Engine;
-    use delta_kernel_ffi::engine_data::get_engine_data;
-    use itertools::Itertools;
-    use test_utils::{
+    use delta_kernel::test_utils::{
         actions_to_string_with_metadata, add_commit, generate_batch, record_batch_to_bytes,
         IntoArray as _, TestAction,
     };
+    use delta_kernel::Engine;
+    use delta_kernel_ffi::engine_data::get_engine_data;
+    use itertools::Itertools;
 
     use super::*;
     use crate::ffi_test_utils::{allocate_err, allocate_str, ok_or_panic, recover_string};

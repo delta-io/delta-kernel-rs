@@ -147,9 +147,8 @@ mod tests {
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::{
-        install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
-    };
+    use crate::test_utils::install_thread_local_metrics_reporter;
+    use crate::utils::test_utils::{load_test_table, parse_json_batch, CapturingReporter};
     use crate::{PredicateRef, SnapshotRef};
 
     // ============================================================
@@ -853,7 +852,7 @@ mod tests {
         #[values(false, true)] with_serde: bool,
         #[values(false, true)] one_file_per_worker: bool,
     ) -> DeltaResult<()> {
-        use test_utils::LoggingTest;
+        use crate::test_utils::LoggingTest;
 
         // Set up log capture
         let logging_test = LoggingTest::new();

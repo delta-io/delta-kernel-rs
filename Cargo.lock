@@ -18,7 +18,6 @@ dependencies = [
  "tempfile",
  "test-case",
  "test-log",
- "test_utils",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1289,13 +1288,14 @@ dependencies = [
  "reqwest 0.13.2",
  "roaring",
  "rstest",
+ "rstest_reuse",
  "rustc_version",
  "serde",
  "serde_json",
  "strum 0.27.2",
+ "tar",
  "tempfile",
  "test-log",
- "test_utils",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1304,6 +1304,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "z85",
+ "zstd",
 ]
 
 [[package]]
@@ -1322,7 +1323,6 @@ dependencies = [
  "serde_json",
  "sqlparser",
  "tar",
- "test_utils",
  "tokio",
  "unity-catalog-delta-client-api",
  "unity-catalog-delta-rest-client",
@@ -1355,7 +1355,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "test_utils",
  "tokio",
  "tracing",
  "tracing-core",
@@ -4102,25 +4101,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "test_utils"
-version = "0.22.0"
-dependencies = [
- "delta_kernel",
- "itertools 0.14.0",
- "rstest",
- "rstest_reuse",
- "serde_json",
- "tar",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "zstd",
 ]
 
 [[package]]

@@ -12,13 +12,13 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::test_utils::{
+    generate_batch, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table, IntoArray,
+};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use rstest::rstest;
-use test_utils::{
-    generate_batch, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table, IntoArray,
-};
 
 /// Full lifecycle: create a clustered table, write data, verify stats include clustering columns,
 /// checkpoint, and verify clustering metadata and data survive. When `use_fresh_snapshot` is true,

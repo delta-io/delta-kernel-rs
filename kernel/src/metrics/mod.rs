@@ -116,7 +116,7 @@ pub trait WithMetricsReporterLayer: Subscriber + for<'lookup> LookupSpan<'lookup
     /// [`tracing_subscriber::util::SubscriberInitExt::set_default`] guards in a
     /// multi-threaded test binary -- also install a bare global default subscriber
     /// (e.g. `tracing_subscriber::registry().init()`) up front. Test code should
-    /// prefer `test_utils::install_thread_local_metrics_reporter`, which bundles
+    /// prefer `crate::test_utils::install_thread_local_metrics_reporter`, which bundles
     /// the global-subscriber install with the thread-local `set_default` so callers
     /// cannot accidentally skip the first step. Several kernel metrics are emitted
     /// from `Drop` impls (notably storage list/read completion in the default

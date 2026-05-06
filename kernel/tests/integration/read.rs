@@ -22,13 +22,13 @@ use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
-use delta_kernel::{Engine, FileMeta, Snapshot};
-use itertools::Itertools;
-use test_utils::{
+use delta_kernel::test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
     load_test_data, read_scan, record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray,
     TestAction, METADATA,
 };
+use delta_kernel::{Engine, FileMeta, Snapshot};
+use itertools::Itertools;
 use url::Url;
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
@@ -465,7 +465,7 @@ fn read_table_data(
     let path = std::fs::canonicalize(PathBuf::from(path))?;
     let predicate = predicate.map(Arc::new);
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = test_utils::create_default_engine(&url)?;
+    let engine = delta_kernel::test_utils::create_default_engine(&url)?;
 
     let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
 

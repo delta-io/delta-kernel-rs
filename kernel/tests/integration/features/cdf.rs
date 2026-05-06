@@ -5,9 +5,9 @@ use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::table_changes::TableChanges;
+use delta_kernel::test_utils::load_test_data;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
 use itertools::Itertools;
-use test_utils::load_test_data;
 
 fn read_cdf_for_table(
     test_name: impl AsRef<str>,
@@ -18,7 +18,7 @@ fn read_cdf_for_table(
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
     let test_path = delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string"))?;
-    let engine = test_utils::create_default_engine(&test_path)?;
+    let engine = delta_kernel::test_utils::create_default_engine(&test_path)?;
     let table_changes = TableChanges::try_new(
         test_path,
         engine.as_ref(),

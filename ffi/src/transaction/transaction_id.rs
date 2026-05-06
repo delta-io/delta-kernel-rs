@@ -77,9 +77,9 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::test_utils::setup_test_tables;
     use delta_kernel::Snapshot;
     use tempfile::tempdir;
-    use test_utils::setup_test_tables;
     use url::Url;
 
     use super::*;

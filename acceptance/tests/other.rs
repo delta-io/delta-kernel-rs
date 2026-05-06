@@ -38,7 +38,7 @@ async fn test_read_table_with_checkpoint() {
     ))
     .unwrap();
     let location = url::Url::from_directory_path(path).unwrap();
-    let engine = test_utils::create_default_engine(&location).unwrap();
+    let engine = delta_kernel::test_utils::create_default_engine(&location).unwrap();
     let snapshot = Snapshot::try_new(location, engine, None)
         .await
         .unwrap();
