@@ -753,7 +753,7 @@ mod tests {
                 )
             });
 
-            // ensure we get the correct schema
+            // Ensure we get the correct schema
             let write_schema = unsafe { get_write_schema(write_context.shallow_copy()) };
             let write_schema_ref = unsafe { write_schema.as_ref() };
             assert_eq!(write_schema_ref.num_fields(), 2);
