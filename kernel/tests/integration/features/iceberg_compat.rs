@@ -235,11 +235,11 @@ async fn v3_create_table_rejects_incompatible_props(
 ///
 /// IcebergCompatV3 supports all delta types, so we use a schema with all delta types here.
 /// Two test cases:
-/// - `min`: minimum feature set. Enables only `delta.enableIcebergCompatV3=true` and relies on
-///   V3's auto-enablement of `columnMapping=name` + `rowTracking=true`.
+/// - `min`: minimum feature set. Enables only `delta.enableIcebergCompatV3=true` and relies on V3's
+///   auto-enablement of `columnMapping=name` + `rowTracking=true`.
 /// - `max`: maximum feature set we are able to enable through create table, with exceptions for:
-///   `materializePartitionColumns` (omitted so the partition-materialization check below proves
-///   V3 implies it), `typeWidening` (kernel rejects writes against tables declaring it), and
+///   `materializePartitionColumns` (omitted so the partition-materialization check below proves V3
+///   implies it), `typeWidening` (kernel rejects writes against tables declaring it), and
 ///   `catalogManaged` (requires a catalog committer).
 #[rstest::rstest]
 #[case::min(&[], &[])]
@@ -371,7 +371,8 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
         );
 
         // Partition column is physically materialized (V3 invariant).
-        let region_physical = get_top_level_physical_name(logical_schema.as_ref(), "region", cm_mode);
+        let region_physical =
+            get_top_level_physical_name(logical_schema.as_ref(), "region", cm_mode);
         assert!(
             find_top_level_field_in_parquet(&root, &region_physical).is_some(),
             "partition column `region` (physical {region_physical}) not materialized in {parquet_url}",
@@ -463,9 +464,9 @@ fn complex_nested_data_type() -> DataType {
 const ROWS_PER_PARTITION: i32 = 3;
 const PARTITION_REGIONS: &[&str] = &["a", "b"];
 
-/// Build a [`RecordBatch`] with [`ROWS_PER_PARTITION`] rows for the given `region` following the schema of
-/// [`nested_schema_with_all_delta_types`]. `random_seed` is used directly to produce different values
-/// so different calls produce distinguishable rows;
+/// Build a [`RecordBatch`] with [`ROWS_PER_PARTITION`] rows for the given `region` following the
+/// schema of [`nested_schema_with_all_delta_types`]. `random_seed` is used directly to produce
+/// different values so different calls produce distinguishable rows;
 fn build_partition_batch(random_seed: i32, region: &str) -> RecordBatch {
     let rows = ROWS_PER_PARTITION as usize;
 
@@ -474,30 +475,44 @@ fn build_partition_batch(random_seed: i32, region: &str) -> RecordBatch {
 
     let region_partition_col: ArrayRef = Arc::new(StringArray::from(vec![region; rows]));
     let int_col: ArrayRef = Arc::new(Int32Array::from(
-        (0..ROWS_PER_PARTITION).map(|i| random_seed + i).collect::<Vec<_>>(),
+        (0..ROWS_PER_PARTITION)
+            .map(|i| random_seed + i)
+            .collect::<Vec<_>>(),
     ));
     let bool_col: ArrayRef = Arc::new(BooleanArray::from(
         (0..rows).map(|i| i % 2 == 0).collect::<Vec<_>>(),
     ));
     let byte_col: ArrayRef = Arc::new(Int8Array::from(
-        (0..ROWS_PER_PARTITION).map(|i| (random_seed + i) as i8).collect::<Vec<_>>(),
+        (0..ROWS_PER_PARTITION)
+            .map(|i| (random_seed + i) as i8)
+            .collect::<Vec<_>>(),
     ));
     let short_col: ArrayRef = Arc::new(Int16Array::from(
-        (0..ROWS_PER_PARTITION).map(|i| (random_seed + i) as i16).collect::<Vec<_>>(),
+        (0..ROWS_PER_PARTITION)
+            .map(|i| (random_seed + i) as i16)
+            .collect::<Vec<_>>(),
     ));
     let long_col: ArrayRef = Arc::new(Int64Array::from(
-        (0..ROWS_PER_PARTITION).map(|i| (random_seed + i) as i64).collect::<Vec<_>>(),
+        (0..ROWS_PER_PARTITION)
+            .map(|i| (random_seed + i) as i64)
+            .collect::<Vec<_>>(),
     ));
     let float_col: ArrayRef = Arc::new(Float32Array::from(
-        (0..ROWS_PER_PARTITION).map(|i| (random_seed + i) as f32 + 0.5).collect::<Vec<_>>(),
+        (0..ROWS_PER_PARTITION)
+            .map(|i| (random_seed + i) as f32 + 0.5)
+            .collect::<Vec<_>>(),
     ));
     let double_col: ArrayRef = Arc::new(Float64Array::from(
-        (0..ROWS_PER_PARTITION).map(|i| (random_seed + i) as f64 + 0.25).collect::<Vec<_>>(),
+        (0..ROWS_PER_PARTITION)
+            .map(|i| (random_seed + i) as f64 + 0.25)
+            .collect::<Vec<_>>(),
     ));
     // Decimal(10, 2): values stored as scaled i128.
     let decimal_col: ArrayRef = Arc::new(
         Decimal128Array::from(
-            (0..ROWS_PER_PARTITION).map(|i| (random_seed + i) as i128 * 100).collect::<Vec<_>>(),
+            (0..ROWS_PER_PARTITION)
+                .map(|i| (random_seed + i) as i128 * 100)
+                .collect::<Vec<_>>(),
         )
         .with_precision_and_scale(10, 2)
         .unwrap(),
@@ -512,7 +527,9 @@ fn build_partition_batch(random_seed: i32, region: &str) -> RecordBatch {
     ));
     // Days since 1970-01-01.
     let date_col: ArrayRef = Arc::new(Date32Array::from(
-        (0..ROWS_PER_PARTITION).map(|i| 19000 + random_seed + i).collect::<Vec<_>>(),
+        (0..ROWS_PER_PARTITION)
+            .map(|i| 19000 + random_seed + i)
+            .collect::<Vec<_>>(),
     ));
     // Microseconds since epoch: TIMESTAMP carries UTC ("+00:00"), TIMESTAMP_NTZ has no zone.
     let timestamp_col: ArrayRef = Arc::new(
@@ -576,8 +593,7 @@ fn build_all_null_variant_array(rows: usize) -> ArrayRef {
 /// Builds an all-null `complex` MapArray of length `rows` matching [`complex_nested_data_type`].
 /// All map entries are null; the underlying entries struct is empty.
 fn build_all_null_complex_array(rows: usize) -> ArrayRef {
-    let complex_arrow_type: ArrowDataType =
-        (&complex_nested_data_type()).try_into_arrow().unwrap();
+    let complex_arrow_type: ArrowDataType = (&complex_nested_data_type()).try_into_arrow().unwrap();
     let (entries_field, _sorted) = match complex_arrow_type {
         ArrowDataType::Map(entries, sorted) => (entries, sorted),
         other => panic!("complex must be a Map type, got {other:?}"),
@@ -630,8 +646,10 @@ async fn write_partitioned_data(
     let actual_schema = snapshot.schema();
     let expected_schema = nested_schema_with_all_delta_types();
     let actual_fields: Vec<&str> = actual_schema.fields().map(|f| f.name().as_str()).collect();
-    let expected_fields: Vec<&str> =
-        expected_schema.fields().map(|f| f.name().as_str()).collect();
+    let expected_fields: Vec<&str> = expected_schema
+        .fields()
+        .map(|f| f.name().as_str())
+        .collect();
     assert_eq!(
         actual_fields, expected_fields,
         "table schema does not match `nested_schema_with_all_delta_types`",
@@ -712,7 +730,11 @@ fn verify_protocol(snapshot: &Snapshot, expected_features: &[&str]) {
 }
 
 /// Look up the physical name of a top-level logical column. Panics if not found.
-fn get_top_level_physical_name(schema: &StructType, logical: &str, mode: ColumnMappingMode) -> String {
+fn get_top_level_physical_name(
+    schema: &StructType,
+    logical: &str,
+    mode: ColumnMappingMode,
+) -> String {
     let physical = get_any_level_column_physical_name(schema, &ColumnName::new([logical]), mode)
         .unwrap()
         .into_inner();
@@ -768,12 +790,15 @@ fn verify_column_mapping_ids_in_parquet(
         parquet_ids.len(),
     );
     for (parquet_schema_path, expected_id) in &visitor.expected {
-        let actual_id = parquet_ids.get(parquet_schema_path).copied().unwrap_or_else(|| {
-            panic!(
-                "expected field_id {expected_id} at parquet_schema_path \
+        let actual_id = parquet_ids
+            .get(parquet_schema_path)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected field_id {expected_id} at parquet_schema_path \
                  '{parquet_schema_path}' in {parquet_url}; actual ids: {parquet_ids:?}",
-            )
-        });
+                )
+            });
         assert_eq!(
             actual_id, *expected_id,
             "parquet field_id mismatch at parquet_schema_path \
@@ -816,10 +841,7 @@ impl<'a> SchemaTransform<'a> for ExpectedFieldIdMap {
                 for (physical_nested_path, value) in obj {
                     if let Some(id) = value.as_i64() {
                         self.expected.insert(
-                            translate_nested_path(
-                                &field_parquet_schema_path,
-                                physical_nested_path,
-                            ),
+                            translate_nested_path(&field_parquet_schema_path, physical_nested_path),
                             id,
                         );
                     }
@@ -861,10 +883,7 @@ impl<'a> SchemaTransform<'a> for ExpectedFieldIdMap {
 /// whole prefix wholesale with `field_parquet_schema_path` and translate the remaining
 /// synthetic segments: `key`/`value` -> `key_value.key`/`key_value.value` (Map wrapper),
 /// `element` -> `list.element` (Array wrapper).
-fn translate_nested_path(
-    field_parquet_schema_path: &str,
-    physical_nested_path: &str,
-) -> String {
+fn translate_nested_path(field_parquet_schema_path: &str, physical_nested_path: &str) -> String {
     let segs: Vec<&str> = physical_nested_path.split('.').collect();
     let mut out = field_parquet_schema_path.to_string();
     for seg in &segs[1..] {
@@ -872,9 +891,9 @@ fn translate_nested_path(
             "key" => out.push_str(".key_value.key"),
             "value" => out.push_str(".key_value.value"),
             "element" => out.push_str(".list.element"),
-            other => panic!(
-                "unexpected nested-id path segment '{other}' in '{physical_nested_path}'"
-            ),
+            other => {
+                panic!("unexpected nested-id path segment '{other}' in '{physical_nested_path}'")
+            }
         }
     }
     out
@@ -893,10 +912,7 @@ fn find_top_level_field_in_parquet<'a>(
 
 /// Get the parquet physical type of a top-level field (looked up by physical name). Panics if
 /// the field is missing or is a group (i.e. not a primitive leaf).
-fn find_top_level_physical_type_in_parquet(
-    root: &ParquetType,
-    name: &str,
-) -> ParquetPhysicalType {
+fn find_top_level_physical_type_in_parquet(root: &ParquetType, name: &str) -> ParquetPhysicalType {
     let field = find_top_level_field_in_parquet(root, name)
         .unwrap_or_else(|| panic!("top-level field {name} not found in parquet schema"));
     match field {

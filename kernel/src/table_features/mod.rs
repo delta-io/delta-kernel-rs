@@ -420,15 +420,14 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 /// TODO: Support ALTER TABLE on tables with IcebergCompatV3 enabled.
 ///
 /// Attention in the future:
-/// - Geo types: when supported, they must not be usable as partition columns on
-///   IcebergCompatV3 tables.
+/// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3
+///   tables.
 /// - Column defaults: when supported, only literal expressions are allowed.
-/// - REPLACE TABLE: when supported, partition columns must not change across
-///   the replace.
-/// - Timestamp parquet encoding: when kernel can write INT96 or INT64,
-///   IcebergCompatV3 tables must always use INT64; INT96 is forbidden.
-/// - ALTER TABLE SET/UNSET TBLPROPERTIES: when supported, reject any property
-///   change that would disable IcebergCompatV3 on an existing table.
+/// - REPLACE TABLE: when supported, partition columns must not change across the replace.
+/// - Timestamp parquet encoding: when kernel can write INT96 or INT64, IcebergCompatV3 tables must
+///   always use INT64; INT96 is forbidden.
+/// - ALTER TABLE SET/UNSET TBLPROPERTIES: when supported, reject any property change that would
+///   disable IcebergCompatV3 on an existing table.
 /// - Void type: when supported, it must not appear inside map or array types.
 ///
 /// Tracking issue: <https://github.com/delta-io/delta-kernel-rs/issues/2492>

@@ -1552,8 +1552,10 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std:
             .map(|i| format!("part-{c:03}-{i:04}.parquet"))
             .collect();
         // Each tuple is (path, size_bytes, modification_time, num_records).
-        let files: Vec<(&str, i64, i64, Option<i64>)> =
-            paths.iter().map(|p| (p.as_str(), 100, 0, Some(1))).collect();
+        let files: Vec<(&str, i64, i64, Option<i64>)> = paths
+            .iter()
+            .map(|p| (p.as_str(), 100, 0, Some(1)))
+            .collect();
         txn.add_files(create_add_files_metadata(&add_files_schema, files)?);
         snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
     }
