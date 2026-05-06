@@ -22,7 +22,6 @@ use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::HasSelectionVector;
-use crate::object_store::local::LocalFileSystem;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
@@ -803,8 +802,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
     .unwrap();
 
     // ===== Create Engine =====
-    let store = Arc::new(LocalFileSystem::new());
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::new();
 
     let commit_domain_metadata = |domain: &str, value: &str| -> DeltaResult<()> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;

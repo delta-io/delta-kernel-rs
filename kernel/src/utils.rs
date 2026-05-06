@@ -1195,8 +1195,7 @@ pub(crate) mod test_utils {
         let url = Url::from_directory_path(&path)
             .map_err(|_| Error::Generic("Failed to create URL from path".to_string()))?;
 
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(SyncEngine::new_with_store(store));
+        let engine = Arc::new(SyncEngine::new());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
         Ok((engine, snapshot, tempdir))
     }

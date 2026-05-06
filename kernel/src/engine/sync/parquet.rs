@@ -13,7 +13,12 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::{reader_options, writer_options};
-use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
+use crate::object_store::DynObjectStore;
+// `ObjectStoreExt` is needed for `store.get()` etc. in arrow-58 mode where these methods moved
+// off the `ObjectStore` trait. In arrow-57 mode the compat shim makes the import a no-op, so
+// silence the resulting unused-import warning.
+#[allow(unused_imports)]
+use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
