@@ -887,7 +887,14 @@ async fn test_partition_null_validation_non_materialized(
     ])?);
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let snapshot = create_partitioned_table(&table_path, engine.as_ref(), schema, &["p"], cm_mode)?;
+    let snapshot = create_partitioned_table(
+        &table_path,
+        engine.as_ref(),
+        schema,
+        &["p"],
+        cm_mode,
+        false, // write_partition_values_parsed; unused, no checkpoint in this test
+    )?;
 
     let result = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
@@ -941,6 +948,7 @@ async fn test_partition_null_validation_mixed_nullability(
         schema,
         &["p_required", "p_optional"],
         cm_mode,
+        false, // write_partition_values_parsed; unused, no checkpoint in this test
     )?;
 
     snapshot
