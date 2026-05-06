@@ -47,7 +47,7 @@ async fn test_clustered_table_write_and_checkpoint(
         .with_data_layout(DataLayout::Clustered {
             columns: expected_clustering.clone(),
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let snapshot = if use_fresh_snapshot {
@@ -163,7 +163,7 @@ async fn test_clustered_table_write_all_null_clustering_column() {
                 ColumnName::new(["region_id"]),
             ],
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))
         .unwrap()
         .commit(engine.as_ref())
         .unwrap();

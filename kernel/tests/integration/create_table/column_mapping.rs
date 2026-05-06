@@ -232,7 +232,7 @@ fn test_column_mapping_feature_only_without_mode() -> DeltaResult<()> {
     // Create table with ONLY the feature flag, no delta.columnMapping.mode
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.columnMapping", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -263,7 +263,7 @@ fn test_column_mapping_invalid_mode_rejected() {
     // Try to create table with invalid column mapping mode
     let result = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.columnMapping.mode", "invalid")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()));
 
     assert!(result.is_err());
     assert!(result
@@ -290,7 +290,7 @@ fn test_create_clustered_table_with_column_mapping(
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.columnMapping.mode", "name")])
         .with_data_layout(DataLayout::clustered(clustering_cols.iter().copied()))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     // Load snapshot (validates column mapping annotations on read)
@@ -511,7 +511,7 @@ fn test_create_clustered_table_nested_with_column_mapping(
         .with_data_layout(DataLayout::Clustered {
             columns: expected_cols.clone(),
         })
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
@@ -571,7 +571,7 @@ fn test_partitioned_table_stores_logical_column_names_with_column_mapping(
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.columnMapping.mode", "name")])
         .with_data_layout(DataLayout::partitioned(partition_cols.iter().copied()))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;

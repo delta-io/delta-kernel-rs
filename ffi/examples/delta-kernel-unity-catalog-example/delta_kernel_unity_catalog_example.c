@@ -132,17 +132,17 @@ int main(int argc, char* argv[])
     const char* table_id = "64dcd182-b3b4-4ee0-88e0-63c159a4121c";
     KernelStringSlice table_id_slice = { .ptr = table_id, .len = strlen(table_id) };
 
-    ExternResultHandleMutableCommitter committer_res =
+    ExternResultHandleSharedCommitter committer_res =
         get_uc_committer(uc_client, table_id_slice, allocate_error);
 
-    if (committer_res.tag != OkHandleMutableCommitter) {
+    if (committer_res.tag != OkHandleSharedCommitter) {
         print_error("Failed to create UC committer", (Error*)committer_res.err);
         free_error((Error*)committer_res.err);
         free_uc_commit_client(uc_client);
         return -1;
     }
 
-    HandleMutableCommitter uc_committer = committer_res.ok;
+    HandleSharedCommitter uc_committer = committer_res.ok;
 
     // Get the default engine
     KernelStringSlice table_path_slice = { .ptr = table_path, .len = strlen(table_path) };
@@ -152,6 +152,7 @@ int main(int argc, char* argv[])
     if (engine_builder_res.tag != OkEngineBuilder) {
         print_error("Could not get engine builder", (Error*)engine_builder_res.err);
         free_error((Error*)engine_builder_res.err);
+        free_uc_committer(uc_committer);
         free_uc_commit_client(uc_client);
         return -1;
     }
@@ -162,6 +163,7 @@ int main(int argc, char* argv[])
     if (engine_res.tag != OkHandleSharedExternEngine) {
         print_error("Failed to build engine", (Error*)engine_res.err);
         free_error((Error*)engine_res.err);
+        free_uc_committer(uc_committer);
         free_uc_commit_client(uc_client);
         return -1;
     }
@@ -172,6 +174,7 @@ int main(int argc, char* argv[])
     if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
       print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
       free_error((Error*)snapshot_builder_res.err);
+      free_uc_committer(uc_committer);
       free_engine(engine);
       free_uc_commit_client(uc_client);
       return -1;
@@ -183,6 +186,7 @@ int main(int argc, char* argv[])
     if (snapshot_res.tag != OkHandleSharedSnapshot) {
       print_error("Failed to create snapshot.", (Error*)snapshot_res.err);
       free_error((Error*)snapshot_res.err);
+      free_uc_committer(uc_committer);
       free_engine(engine);
       free_uc_commit_client(uc_client);
       return -1;
@@ -197,6 +201,8 @@ int main(int argc, char* argv[])
     if (txn_res.tag != OkHandleExclusiveTransaction) {
         print_error("Failed to create transaction with UC committer", (Error*)txn_res.err);
         free_error((Error*)txn_res.err);
+        free_uc_committer(uc_committer);
+        free_snapshot(snapshot);
         free_engine(engine);
         free_uc_commit_client(uc_client);
         return -1;
@@ -216,6 +222,8 @@ int main(int argc, char* argv[])
     if (txn_with_info_res.tag != OkHandleExclusiveTransaction) {
         print_error("Failed to set engine info", (Error*)txn_with_info_res.err);
         free_error((Error*)txn_with_info_res.err);
+        free_uc_committer(uc_committer);
+        free_snapshot(snapshot);
         free_engine(engine);
         free_uc_commit_client(uc_client);
         return -1;
@@ -228,6 +236,8 @@ int main(int argc, char* argv[])
     if (commit_res.tag != Oku64) {
         print_error("Commit failed", (Error*)commit_res.err);
         free_error((Error*)commit_res.err);
+        free_uc_committer(uc_committer);
+        free_snapshot(snapshot);
         free_engine(engine);
         free_uc_commit_client(uc_client);
         return -1;
@@ -235,8 +245,10 @@ int main(int argc, char* argv[])
 
     printf("\nCommitted version: %lu\n", (unsigned long)commit_res.ok);
 
-    // Cleanup
-    // Note: txn_with_info was consumed by commit(), so we don't free it
+    // Cleanup.
+    // Note: txn_with_info was consumed by commit(), so we don't free it. The committer
+    // handle is NOT consumed by transaction_with_committer -- we own it and must free it.
+    free_uc_committer(uc_committer);
     free_engine(engine);
     free_uc_commit_client(uc_client);
     free_snapshot(snapshot);

@@ -148,7 +148,7 @@ impl AlterTableTransactionBuilder<Modifying> {
     pub fn build(
         self,
         _engine: &dyn Engine,
-        committer: Box<dyn Committer>,
+        committer: Arc<dyn Committer>,
     ) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
         // We don't support ALTER TABLE on tables with icebergCompatV3 enabled yet. See

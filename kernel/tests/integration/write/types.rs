@@ -50,7 +50,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
         .with_engine_info("default engine");
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
@@ -169,7 +169,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
         .with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
@@ -376,7 +376,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
         .with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant

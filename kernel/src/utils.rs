@@ -1073,7 +1073,7 @@ pub(crate) mod test_utils {
 
         let txn = create_table("memory:///test_table", schema, "DefaultEngine")
             .with_table_properties([("delta.columnMapping.mode", mode_str)])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+            .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?;
         Ok((engine, txn))
     }
 

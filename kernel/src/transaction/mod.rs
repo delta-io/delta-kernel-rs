@@ -229,7 +229,7 @@ pub struct Transaction<S = ExistingTable> {
     should_emit_protocol: bool,
     // Whether to emit a Metadata action. True for CREATE TABLE and ALTER TABLE, false otherwise.
     should_emit_metadata: bool,
-    committer: Box<dyn Committer>,
+    committer: Arc<dyn Committer>,
     operation: Option<String>,
     engine_info: Option<String>,
     engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
@@ -1658,7 +1658,7 @@ mod tests {
         engine: &dyn Engine,
     ) -> DeltaResult<Transaction> {
         Ok(snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine)?
+            .transaction(Arc::new(FileSystemCommitter::new()), engine)?
             .with_operation("DELETE".to_string())
             .with_engine_info("test_engine"))
     }
@@ -1675,7 +1675,7 @@ mod tests {
             .build(&engine)
             .unwrap();
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
         let schema = txn.add_files_schema();
@@ -1713,7 +1713,7 @@ mod tests {
             .build(&engine)
             .unwrap();
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
         let write_context = txn.unpartitioned_write_context().unwrap();
 
@@ -1744,7 +1744,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
         let write_context = txn.partitioned_write_context(HashMap::from([(
@@ -1793,7 +1793,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
         let txn = snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
         let partition_cols = txn.logical_partition_columns();
         assert!(
             !partition_cols.is_empty(),
@@ -1890,7 +1890,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
 
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let txn = snapshot.transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
         let write_context = txn.partitioned_write_context(HashMap::from([(
             "letter".to_string(),
             Scalar::String("a".into()),
@@ -1929,7 +1929,7 @@ mod tests {
         let path = std::fs::canonicalize(PathBuf::from(table_path)).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let snapshot = Snapshot::builder_for(url).build(&engine)?;
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let txn = snapshot.transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
         let result = if call_partitioned {
             txn.partitioned_write_context(HashMap::from([("x".to_string(), Scalar::Integer(1))]))
         } else {
@@ -2016,7 +2016,7 @@ mod tests {
     fn create_existing_table_txn(
     ) -> DeltaResult<(Arc<dyn Engine>, Transaction, Option<tempfile::TempDir>)> {
         let (engine, snapshot, tempdir) = load_test_table("table-without-dv-small")?;
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+        let txn = snapshot.transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?;
         Ok((engine, txn, tempdir))
     }
 
@@ -2091,7 +2091,7 @@ mod tests {
             schema,
             "test_engine",
         )
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?;
         // CreateTableTransaction does not expose with_blind_append() (compile-time
         // prevention per #1768). Directly set the field to test the runtime check.
         txn.is_blind_append = true;
@@ -2154,7 +2154,7 @@ mod tests {
     #[test]
     fn test_commit_io_error_returns_retryable_transaction() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let mut txn = snapshot.transaction(Box::new(IoErrorCommitter), engine.as_ref())?;
+        let mut txn = snapshot.transaction(Arc::new(IoErrorCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
         assert!(
@@ -2433,7 +2433,7 @@ mod tests {
     fn test_stats_validation_allows_all_null_clustering_column() {
         let (engine, snapshot) = setup_non_dv_table();
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)
             .unwrap()
             .with_operation("WRITE".to_string())
             .with_clustering_columns_for_test(vec![ColumnName::new(["value"])]);
@@ -2452,7 +2452,7 @@ mod tests {
     fn test_stats_validation_when_clustering_cols_missing_stats() {
         let (engine, snapshot) = setup_non_dv_table();
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)
             .unwrap()
             .with_operation("WRITE".to_string())
             // Enable clustering columns for this test
@@ -2480,7 +2480,7 @@ mod tests {
     fn test_stats_validation_when_clustering_stats_present() {
         let (engine, snapshot) = setup_non_dv_table();
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)
             .unwrap()
             .with_operation("WRITE".to_string())
             // Enable clustering columns for this test
@@ -2502,7 +2502,7 @@ mod tests {
     fn test_stats_validation_skipped_without_clustering() {
         let (engine, snapshot) = setup_non_dv_table();
         let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)
             .unwrap()
             .with_operation("WRITE".to_string());
         // No clustering columns set (default)
@@ -2540,7 +2540,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
         // Try to commit with a catalog committer to a non-catalog-managed table
-        let committer = Box::new(MockCatalogCommitter);
+        let committer = Arc::new(MockCatalogCommitter);
         let err = snapshot
             .transaction(committer, &engine)
             .unwrap()
@@ -2561,7 +2561,7 @@ mod tests {
         let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![
             crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, true),
         ]));
-        let committer = Box::new(MockCatalogCommitter);
+        let committer = Arc::new(MockCatalogCommitter);
         let err = create_table("memory:///", schema, "test-engine")
             .build(&engine, committer)
             .unwrap()
@@ -2670,7 +2670,7 @@ mod tests {
         assert_eq!(prev_ict, Some(future_ict));
 
         let (committer, captured_ts) = CapturingCommitter::new();
-        let mut txn = snapshot.transaction(Box::new(committer), &engine)?;
+        let mut txn = snapshot.transaction(Arc::new(committer), &engine)?;
         add_dummy_file(&mut txn);
 
         let result = txn.commit(&engine)?;

@@ -221,7 +221,7 @@ async fn run_ctas_test(
             builder = builder.with_data_layout(DataLayout::clustered(["row_number"]));
         }
         let result = builder
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?;
         match result {
             CommitResult::CommittedTransaction(c) => c
@@ -259,7 +259,7 @@ async fn run_ctas_test(
     if tgt_clustered {
         tgt_builder = tgt_builder.with_data_layout(DataLayout::clustered(["row_number"]));
     }
-    let mut tgt_txn = tgt_builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let mut tgt_txn = tgt_builder.build(engine.as_ref(), Arc::new(FileSystemCommitter::new()))?;
 
     let write_context = Arc::new(tgt_txn.unpartitioned_write_context()?);
     let add_meta = engine

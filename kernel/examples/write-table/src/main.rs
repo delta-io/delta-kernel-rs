@@ -86,7 +86,7 @@ async fn try_main() -> DeltaResult<()> {
     let sample_data = create_sample_data(&snapshot.schema(), cli.num_rows)?;
 
     // Write sample data to the table
-    let committer = Box::new(FileSystemCommitter::new());
+    let committer = Arc::new(FileSystemCommitter::new());
     let mut txn = snapshot
         .transaction(committer, &engine)?
         .with_operation("INSERT".to_string())
@@ -197,7 +197,7 @@ async fn create_table(table_url: &Url, schema: &SchemaRef, engine: &dyn Engine) 
     // Use the create_table API to create the table
     let table_path = table_url.as_str();
     let _result = create_delta_table(table_path, schema.clone(), "write-table-example/1.0")
-        .build(engine, Box::new(FileSystemCommitter::new()))?
+        .build(engine, Arc::new(FileSystemCommitter::new()))?
         .commit(engine)?;
 
     println!("✓ Created Delta table with schema: {schema:#?}");

@@ -108,7 +108,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
         .with_engine_info("ict test");
 
     // Add some data
@@ -152,7 +152,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut txn2 = snapshot2
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
         .with_engine_info("ict test 2");
 
     // Add more data

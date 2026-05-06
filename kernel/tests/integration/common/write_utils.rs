@@ -205,7 +205,7 @@ pub async fn write_data_and_check_result_and_stats(
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let committer = Box::new(FileSystemCommitter::new());
+    let committer = Arc::new(FileSystemCommitter::new());
     let mut txn = snapshot
         .transaction(committer, engine.as_ref())?
         .with_data_change(true);
@@ -391,7 +391,7 @@ pub async fn create_dv_table_with_files(
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction(Arc::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_engine_info("test engine")
         .with_operation("WRITE".to_string())
         .with_data_change(true);

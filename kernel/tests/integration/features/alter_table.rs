@@ -35,8 +35,8 @@ fn simple_schema() -> SchemaRef {
     )
 }
 
-fn committer() -> Box<FileSystemCommitter> {
-    Box::new(FileSystemCommitter::new())
+fn committer() -> Arc<FileSystemCommitter> {
+    Arc::new(FileSystemCommitter::new())
 }
 
 fn max_column_id(snap: &Snapshot) -> i64 {

@@ -97,7 +97,7 @@ mod tests {
             "test",
         )
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
-        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .build(&engine, Arc::new(FileSystemCommitter::new()))
         .unwrap()
         .with_domain_metadata("domainC".to_string(), "cfgC".to_string())
         .commit(&engine)
@@ -106,7 +106,7 @@ mod tests {
         // Commit 1: add domainA and domainB via an existing-table transaction.
         let snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
         let _ = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
+            .transaction(Arc::new(FileSystemCommitter::new()), &engine)
             .unwrap()
             .with_domain_metadata("domainA".to_string(), "cfgA".to_string())
             .with_domain_metadata("domainB".to_string(), "cfgB".to_string())

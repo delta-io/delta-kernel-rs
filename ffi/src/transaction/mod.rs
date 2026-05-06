@@ -36,9 +36,12 @@ pub struct ExclusiveTransaction;
 #[handle_descriptor(target=CreateTableTransaction, mutable=true, sized=true)]
 pub struct ExclusiveCreateTransaction;
 
-/// Handle for a mutable boxed committer that can be passed across FFI
-#[handle_descriptor(target = dyn Committer, mutable = true, sized = false)]
-pub struct MutableCommitter;
+/// Handle for a shared committer (Arc) that can be passed across FFI.
+///
+/// Committers are held as `Arc<dyn Committer>` so a single committer instance can be
+/// constructed once and shared across many transactions.
+#[handle_descriptor(target=dyn Committer, mutable=false, sized=false)]
+pub struct SharedCommitter;
 
 /// Start a transaction on the latest snapshot of the table.
 ///
@@ -61,13 +64,15 @@ fn transaction_impl(
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
     let snapshot = Snapshot::builder_for(url?).build(engine.as_ref())?;
-    let committer = Box::new(FileSystemCommitter::new());
+    let committer = Arc::new(FileSystemCommitter::new());
     let transaction = snapshot.transaction(committer, engine.as_ref());
     Ok(Box::new(transaction?).into())
 }
 
-/// Start a transaction with a custom committer
-/// NOTE: This consumes the committer handle
+/// Start a transaction with a custom committer.
+///
+/// Clones the committer's underlying `Arc<dyn Committer>`; the caller still owns the handle and
+/// must free it with the appropriate `free_*` function (e.g. `free_uc_committer`).
 ///
 /// # Safety
 ///
@@ -76,18 +81,18 @@ fn transaction_impl(
 pub unsafe extern "C" fn transaction_with_committer(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
-    committer: Handle<MutableCommitter>,
+    committer: Handle<SharedCommitter>,
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
     let snapshot = unsafe { snapshot.clone_as_arc() };
     let engine = unsafe { engine.as_ref() };
-    let committer = unsafe { committer.into_inner() };
+    let committer = unsafe { committer.clone_as_arc() };
     transaction_with_committer_impl(snapshot, engine, committer).into_extern_result(&engine)
 }
 
 fn transaction_with_committer_impl(
     snapshot: Arc<Snapshot>,
     extern_engine: &dyn ExternEngine,
-    committer: Box<dyn Committer>,
+    committer: Arc<dyn Committer>,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
     let transaction = snapshot.transaction(committer, engine.as_ref());
@@ -458,7 +463,7 @@ pub unsafe extern "C" fn create_table_builder_build(
 ) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
     let builder = unsafe { *builder.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    let committer = Box::new(FileSystemCommitter::new());
+    let committer = Arc::new(FileSystemCommitter::new());
     create_table_builder_build_impl(builder, committer, extern_engine)
         .into_extern_result(&extern_engine)
 }
@@ -466,18 +471,21 @@ pub unsafe extern "C" fn create_table_builder_build(
 /// Build a create-table transaction with a custom committer. Same as
 /// [`create_table_builder_build`] but uses the provided committer instead of the default.
 ///
+/// Clones the committer's underlying `Arc<dyn Committer>`; the caller still owns the committer
+/// handle and must free it with the appropriate `free_*` function (e.g. `free_uc_committer`).
+///
 /// # Safety
 ///
-/// Caller is responsible for passing valid handles.
-/// CONSUMES both the builder and committer handles -- caller must not use them after this call.
+/// Caller is responsible for passing valid handles. CONSUMES the builder handle -- caller must
+/// not use the builder after this call.
 #[no_mangle]
 pub unsafe extern "C" fn create_table_builder_build_with_committer(
     builder: Handle<ExclusiveCreateTableBuilder>,
-    committer: Handle<MutableCommitter>,
+    committer: Handle<SharedCommitter>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCreateTransaction>> {
     let builder = unsafe { *builder.into_inner() };
-    let committer = unsafe { committer.into_inner() };
+    let committer = unsafe { committer.clone_as_arc() };
     let extern_engine = unsafe { engine.as_ref() };
     create_table_builder_build_impl(builder, committer, extern_engine)
         .into_extern_result(&extern_engine)
@@ -485,7 +493,7 @@ pub unsafe extern "C" fn create_table_builder_build_with_committer(
 
 fn create_table_builder_build_impl(
     builder: CreateTableTransactionBuilder,
-    committer: Box<dyn Committer>,
+    committer: Arc<dyn Committer>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveCreateTransaction>> {
     let engine = extern_engine.engine();
@@ -1096,7 +1104,8 @@ mod tests {
             cast_test_context, get_test_context, recover_test_context,
         };
         use crate::delta_kernel_unity_catalog::{
-            free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
+            free_uc_commit_client, free_uc_committer, get_uc_commit_client, get_uc_committer,
+            CommitRequest,
         };
         use crate::{Handle, NullableCvoid, OptionalValue};
 
@@ -1171,7 +1180,11 @@ mod tests {
             };
 
             let txn = ok_or_panic(unsafe {
-                transaction_with_committer(snapshot, engine.shallow_copy(), uc_committer)
+                transaction_with_committer(
+                    snapshot,
+                    engine.shallow_copy(),
+                    uc_committer.shallow_copy(),
+                )
             });
             unsafe { set_data_change(txn.shallow_copy(), false) };
 
@@ -1299,6 +1312,9 @@ mod tests {
             );
 
             unsafe { free_write_context(write_context) };
+            // The committer handle is NOT consumed by transaction_with_committer -- the caller
+            // owns it and must free it explicitly.
+            unsafe { free_uc_committer(uc_committer) };
             unsafe { free_engine(engine) };
             unsafe { free_uc_commit_client(uc_client) };
         }
@@ -1572,39 +1588,46 @@ mod tests {
         Ok(())
     }
 
+    // Exercises the motivating property of `SharedCommitter`: a single committer handle can
+    // drive multiple independent transactions via `shallow_copy`. If either of the FFI entry
+    // points accidentally reverted to consume-on-use semantics, this test would fault at the
+    // second use. Also verifies the resulting table is loadable at version 0.
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
-    async fn test_create_table_with_custom_committer() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
-        let (table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
-            vec![StructField::nullable("id", DataType::INTEGER)],
-        );
-        let table_path_str = table_path.as_str();
+    async fn test_shared_committer_handle_drives_multiple_tables(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let committer: Arc<dyn delta_kernel::committer::Committer> =
+            Arc::new(FileSystemCommitter::new());
+        let committer_handle: Handle<SharedCommitter> = committer.into();
 
-        // Create a FileSystemCommitter handle and pass it to build_with_committer
-        let committer: Box<dyn delta_kernel::committer::Committer> =
-            Box::new(FileSystemCommitter::new());
-        let committer_handle: Handle<MutableCommitter> = committer.into();
+        for _ in 0..2 {
+            let tmp_dir = tempdir()?;
+            let (table_path, engine, builder) = create_table_builder(
+                &tmp_dir,
+                vec![StructField::nullable("id", DataType::INTEGER)],
+            );
+            let table_path_str = table_path.as_str();
+            let txn = ok_or_panic(unsafe {
+                create_table_builder_build_with_committer(
+                    builder,
+                    committer_handle.shallow_copy(),
+                    engine.shallow_copy(),
+                )
+            });
+            let committed_version =
+                ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
+            assert_eq!(committed_version, 0);
 
-        let txn = ok_or_panic(unsafe {
-            create_table_builder_build_with_committer(
-                builder,
-                committer_handle,
-                engine.shallow_copy(),
-            )
-        });
-        let committed_version =
-            ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
-        assert_eq!(committed_version, 0);
+            let snap = unsafe {
+                build_snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy())
+            };
+            assert_eq!(unsafe { version(snap.shallow_copy()) }, 0);
+            unsafe { free_snapshot(snap) };
+            unsafe { free_engine(engine) };
+        }
 
-        // Verify the table was created
-        let snap =
-            unsafe { build_snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy()) };
-        assert_eq!(unsafe { version(snap.shallow_copy()) }, 0);
-
-        unsafe { free_snapshot(snap) };
-        unsafe { free_engine(engine) };
+        // Committer handle was not consumed by either build_with_committer call, still valid.
+        unsafe { committer_handle.drop_handle() };
         Ok(())
     }
 

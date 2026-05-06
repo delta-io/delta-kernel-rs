@@ -1,5 +1,7 @@
 //! Integration tests for domain metadata set/remove flows.
 
+use std::sync::Arc;
+
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
@@ -32,7 +34,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
 
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn = snapshot.transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
 
     // write context does not conflict with domain metadata
     let _write_context = txn.unpartitioned_write_context().unwrap();
@@ -110,7 +112,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     // System domain rejection
     let txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
     let res = txn
         .with_domain_metadata("delta.system".to_string(), "config".to_string())
         .commit(&engine);
@@ -122,7 +124,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     // Duplicate domain rejection
     let txn2 = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
     let res = txn2
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata("app.config".to_string(), "v2".to_string())
@@ -159,7 +161,7 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let res = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
         .with_domain_metadata("app.config".to_string(), "test_config".to_string())
         .commit(&engine);
 
@@ -192,7 +194,7 @@ async fn test_remove_domain_metadata_unsupported_writer_feature(
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let res = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?
         .with_domain_metadata_removed("app.config".to_string())
         .commit(&engine);
 
@@ -223,7 +225,7 @@ async fn test_remove_domain_metadata_non_existent_domain() -> Result<(), Box<dyn
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn = snapshot.transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
 
     let domain = "app.deprecated";
 
@@ -281,7 +283,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     // set then remove same domain
     let txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
     let err = txn
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata_removed("app.config".to_string())
@@ -294,7 +296,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     // remove then set same domain
     let txn2 = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
     let err = txn2
         .with_domain_metadata_removed("test.domain".to_string())
         .with_domain_metadata("test.domain".to_string(), "v1".to_string())
@@ -307,7 +309,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     // remove same domain twice
     let txn3 = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
     let err = txn3
         .with_domain_metadata_removed("another.domain".to_string())
         .with_domain_metadata_removed("another.domain".to_string())
@@ -320,7 +322,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     // remove system domain
     let txn4 = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        .transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
     let err = txn4
         .with_domain_metadata_removed("delta.system".to_string())
         .commit(&engine)
@@ -357,14 +359,14 @@ async fn test_domain_metadata_set_then_remove() -> Result<(), Box<dyn std::error
 
     // txn 1: set domain metadata
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn = snapshot.transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
     let _ = txn
         .with_domain_metadata(domain.to_string(), configuration.to_string())
         .commit(&engine)?;
 
     // txn 2: remove the same domain metadata
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let txn = snapshot.transaction(Arc::new(FileSystemCommitter::new()), &engine)?;
     let _ = txn
         .with_domain_metadata_removed(domain.to_string())
         .commit(&engine)?;
