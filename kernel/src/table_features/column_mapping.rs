@@ -290,27 +290,28 @@ pub(crate) fn assign_column_mapping_metadata(
     assign_nested_field_ids: bool,
 ) -> DeltaResult<StructType> {
     // Assign CM id + physical name to every StructField (top-level and nested).
+    // `delta.columnMapping.nested.ids` is assigned later separately, this is to
+    // align with delta-spark's behavior.
     let new_fields: Vec<StructField> = schema
         .fields()
         .map(|field| try_assign_flat_column_mapping_info(field, max_id))
         .collect::<DeltaResult<Vec<_>>>()?;
-    let with_cm_ids = StructType::try_new(new_fields)?;
+    let with_flat_cm_info = StructType::try_new(new_fields)?;
     if !assign_nested_field_ids {
-        return Ok(with_cm_ids);
+        return Ok(with_flat_cm_info);
     }
     // Then populate `delta.columnMapping.nested.ids` per StructField.
-    assign_nested_cm_ids(&with_cm_ids, max_id)
+    assign_nested_cm_ids(&with_flat_cm_info, max_id)
 }
 
 /// JSON object holding [`ColumnMetadataKey::ColumnMappingNestedIds`] entries for an Array/Map
 /// field.
 type NestedFieldIds = serde_json::Map<String, serde_json::Value>;
 
-/// Assigns flat column mapping metadata(id and physical name) to a single field under the contract of
-/// [`assign_column_mapping_metadata`], recursively processing nested struct fields. Returns a
-/// new field with a fresh `delta.columnMapping.id` and a UUID-based
-/// `delta.columnMapping.physicalName`.
-/// 
+/// Assigns flat column mapping metadata(id and physical name) to a single field, recursively
+/// processing nested types. Returns a new field with a fresh unique ID and a UUID-based physical
+/// name, and increments `max_id` to reflect the assignment.
+///
 /// `delta.columnMapping.nested.ids` is not assigned here.
 ///
 /// # Errors
@@ -336,38 +337,57 @@ pub(crate) fn try_assign_flat_column_mapping_info(
             )));
         }
     }
+    // Start with the existing field and assign new ID
     let mut new_field = field.clone();
     *max_id += 1;
     new_field.metadata.insert(
         ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
         MetadataValue::Number(*max_id),
     );
+    // Assign physical name
+    let physical_name = format!("col-{}", Uuid::new_v4());
     new_field.metadata.insert(
         ColumnMetadataKey::ColumnMappingPhysicalName
             .as_ref()
             .to_string(),
-        MetadataValue::String(format!("col-{}", Uuid::new_v4())),
+        MetadataValue::String(physical_name),
     );
+    // Recursively process nested types
     new_field.data_type = flat_cm_info_for_nested_data_type(&field.data_type, max_id)?;
     Ok(new_field)
 }
 
 /// Recurses through `data_type`, descending into struct/array/map members so any nested
 /// StructFields receive CM id + physical name via [`assign_column_mapping_metadata`].
-fn flat_cm_info_for_nested_data_type(data_type: &DataType, max_id: &mut i64) -> DeltaResult<DataType> {
+fn flat_cm_info_for_nested_data_type(
+    data_type: &DataType,
+    max_id: &mut i64,
+) -> DeltaResult<DataType> {
     match data_type {
-        DataType::Struct(inner) => Ok(DataType::Struct(Box::new(
-            assign_column_mapping_metadata(inner, max_id, false)?,
-        ))),
-        DataType::Array(at) => Ok(DataType::Array(Box::new(ArrayType::new(
-            flat_cm_info_for_nested_data_type(at.element_type(), max_id)?,
-            at.contains_null(),
-        )))),
-        DataType::Map(mt) => Ok(DataType::Map(Box::new(MapType::new(
-            flat_cm_info_for_nested_data_type(mt.key_type(), max_id)?,
-            flat_cm_info_for_nested_data_type(mt.value_type(), max_id)?,
-            mt.value_contains_null(),
-        )))),
+        DataType::Struct(inner) => {
+            let new_inner = assign_column_mapping_metadata(
+                inner, max_id, /* assign_nested_field_ids */ false,
+            )?;
+            Ok(DataType::Struct(Box::new(new_inner)))
+        }
+        DataType::Array(array_type) => {
+            let new_element_type =
+                flat_cm_info_for_nested_data_type(array_type.element_type(), max_id)?;
+            Ok(DataType::Array(Box::new(ArrayType::new(
+                new_element_type,
+                array_type.contains_null(),
+            ))))
+        }
+        DataType::Map(map_type) => {
+            let new_key_type = flat_cm_info_for_nested_data_type(map_type.key_type(), max_id)?;
+            let new_value_type = flat_cm_info_for_nested_data_type(map_type.value_type(), max_id)?;
+            Ok(DataType::Map(Box::new(MapType::new(
+                new_key_type,
+                new_value_type,
+                map_type.value_contains_null(),
+            ))))
+        }
+        // Primitive and Variant types don't contain nested struct fields - return as-is
         DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
     }
 }
@@ -375,9 +395,10 @@ fn flat_cm_info_for_nested_data_type(data_type: &DataType, max_id: &mut i64) -> 
 /// Walks `schema` (already carrying CM id + physical name on every StructField) and populates
 /// `delta.columnMapping.nested.ids` on Array/Map fields.
 ///
-/// `delta.columnMapping.nested.ids` is a JSON object on a StructField that records the parquet field ids
-/// for the synthetic Array `element` and Map `key`/`value` slots inside that field's subtree.
-/// Keys are dotted paths anchored at the field's physical name; values are parquet field ids.
+/// `delta.columnMapping.nested.ids` is a JSON object on a StructField that records the parquet
+/// field ids for the synthetic Array `element` and Map `key`/`value` slots inside that field's
+/// subtree. Keys are dotted paths anchored at the field's physical name; values are parquet field
+/// ids.
 ///
 /// Example for `m: Map<List<int>, int>` with physical name `<phys>`:
 ///
@@ -399,29 +420,30 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> DeltaResult<St
             DataType::Struct(inner) => Ok(DataType::Struct(Box::new(assign_nested_cm_ids(
                 inner, max_id,
             )?))),
-            DataType::Array(at) => {
+            DataType::Array(array_type) => {
                 let element_path = format!("{path}.element");
                 *max_id += 1;
                 nested_ids.insert(element_path.clone(), serde_json::Value::from(*max_id));
-                let new_element = walk(at.element_type(), max_id, &element_path, nested_ids)?;
+                let new_element =
+                    walk(array_type.element_type(), max_id, &element_path, nested_ids)?;
                 Ok(DataType::Array(Box::new(ArrayType::new(
                     new_element,
-                    at.contains_null(),
+                    array_type.contains_null(),
                 ))))
             }
-            DataType::Map(mt) => {
+            DataType::Map(map_type) => {
                 let key_path = format!("{path}.key");
                 let value_path = format!("{path}.value");
                 *max_id += 1;
                 nested_ids.insert(key_path.clone(), serde_json::Value::from(*max_id));
-                let new_key = walk(mt.key_type(), max_id, &key_path, nested_ids)?;
+                let new_key = walk(map_type.key_type(), max_id, &key_path, nested_ids)?;
                 *max_id += 1;
                 nested_ids.insert(value_path.clone(), serde_json::Value::from(*max_id));
-                let new_value = walk(mt.value_type(), max_id, &value_path, nested_ids)?;
+                let new_value = walk(map_type.value_type(), max_id, &value_path, nested_ids)?;
                 Ok(DataType::Map(Box::new(MapType::new(
                     new_key,
                     new_value,
-                    mt.value_contains_null(),
+                    map_type.value_contains_null(),
                 ))))
             }
             DataType::Primitive(_) | DataType::Variant(_) => Ok(data_type.clone()),
