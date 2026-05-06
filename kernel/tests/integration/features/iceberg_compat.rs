@@ -10,7 +10,7 @@ use delta_kernel::arrow::array::{
 };
 use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
@@ -32,8 +32,8 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::EngineData;
-use test_utils::{add_commit, read_add_infos, test_table_setup_mt, write_batch_to_table};
+use delta_kernel::transforms::{transform_output_type, SchemaTransform};
+use test_utils::{add_commit, create_add_files_metadata, read_add_infos, test_table_setup_mt};
 use url::Url;
 
 use crate::common::write_utils::{collect_all_parquet_field_ids, read_parquet_root_schema};
@@ -41,8 +41,7 @@ use crate::common::write_utils::{collect_all_parquet_field_ids, read_parquet_roo
 const TABLE_ROOT: &str = "memory:///";
 
 /// Hand-crafts a V0 create commit on an icebergCompatV3 table whose `data` field carries the
-/// deprecated `parquet.field.nested.ids` metadata. Loading the snapshot must fail because the
-/// validator runs in `TableConfiguration::try_new`.
+/// to-be-deprecated `parquet.field.nested.ids` metadata. Loading the snapshot must fail.
 #[tokio::test]
 async fn snapshot_blocked_when_v3_schema_has_legacy_nested_ids() {
     let (storage, engine) = make_engine();
@@ -149,7 +148,7 @@ async fn v3_commit_validates_num_records(
     let (_, engine) = make_engine();
 
     let _ = create_table(TABLE_ROOT, simple_schema(), "Test/1.0")
-        .with_table_properties(v3_table_properties())
+        .with_table_properties([("delta.enableIcebergCompatV3", "true")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .unwrap()
         .commit(engine.as_ref())
@@ -163,8 +162,12 @@ async fn v3_commit_validates_num_records(
         .unwrap()
         .with_engine_info("Test/1.0")
         .with_data_change(true);
-    let add_schema = ArrowSchema::try_from_kernel(txn.add_files_schema().as_ref()).unwrap();
-    txn.add_files(synthetic_add_files_metadata(&add_schema, num_records));
+    let add_files = create_add_files_metadata(
+        txn.add_files_schema(),
+        vec![("part-fake.parquet", 1024, 1_000_000, num_records)],
+    )
+    .unwrap();
+    txn.add_files(add_files);
 
     match expected {
         Ok(expected_version) => {
@@ -181,68 +184,85 @@ async fn v3_commit_validates_num_records(
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn write_succeeds_on_v3_table() {
+/// V3 create-table negative paths: enabling V3 alongside an incompatible property must fail at
+/// `.build(...)` with a clear error.
+///
+/// `cm_mode_none` and `row_tracking_disabled` are blocked by V3's dependency check
+/// (`maybe_enable_iceberg_compat_v3_dependencies`); the others are blocked earlier because
+/// the property is not in `ALLOWED_DELTA_PROPERTIES` for CREATE TABLE. Keep them here
+/// so that in the future when we support these properties for create table, we will remember to
+/// update this test.
+#[rstest::rstest]
+#[case::cm_mode_none(
+    &[("delta.columnMapping.mode", "none")],
+    "to be 'name' or 'id', got 'none'",
+)]
+#[case::row_tracking_disabled(
+    &[("delta.enableRowTracking", "false")],
+    "to be 'true', got 'false'",
+)]
+#[case::iceberg_compat_v1_active(
+    &[("delta.enableIcebergCompatV1", "true")],
+    "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
+)]
+#[case::iceberg_compat_v2_active(
+    &[("delta.enableIcebergCompatV2", "true")],
+    "Setting delta property 'delta.enableIcebergCompatV2' is not supported",
+)]
+#[tokio::test]
+async fn v3_create_table_rejects_incompatible_props(
+    #[case] extra_props: &[(&str, &str)],
+    #[case] err_substring: &str,
+) {
     let (_, engine) = make_engine();
+    let mut props: Vec<(&str, &str)> = vec![("delta.enableIcebergCompatV3", "true")];
+    props.extend_from_slice(extra_props);
 
-    let schema = simple_schema();
-    let _ = create_table(TABLE_ROOT, schema.clone(), "Test/1.0")
-        .with_table_properties(v3_table_properties())
+    let err = create_table(TABLE_ROOT, simple_schema(), "Test/1.0")
+        .with_table_properties(props)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
-        .unwrap()
-        .commit(engine.as_ref())
-        .unwrap();
-    let snapshot = Snapshot::builder_for(TABLE_ROOT)
-        .build(engine.as_ref())
-        .unwrap();
-
-    // Real write through the default engine: stats are auto-collected and include numRecords.
-    let arrow_schema: ArrowSchema = (schema.as_ref()).try_into_arrow().unwrap();
-    let id_col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
-    let name_col: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
-    let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![id_col, name_col]).unwrap();
-
-    let new_snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new())
-        .await
-        .expect("V3 write should succeed");
-    assert_eq!(new_snapshot.version(), 1);
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(err_substring),
+        "expected error containing {err_substring:?}, got: {err}",
+    );
 }
 
-/// End-to-end V3 round-trip on a partitioned table with a kitchen-sink schema:
+/// V3 partitioned end-to-end: create + 4 commits with a checkpoint between, then validate
+/// protocol features, parquet field IDs (top-level + nested), partition materialization,
+/// timestamp physical type, and exact scan content.
 ///
-/// - Schema covers every primitive Delta type plus an unshredded VARIANT and a deeply nested
-///   `map<list<int>, struct<inner_map: map<list<int>, int>, n: int>>` column.
-/// - Partition column is `region: STRING`. V3 forces partition values to be materialized into the
-///   parquet data files (no `MaterializePartitionColumns` flag needed).
-/// - Two parameterized cases:
-///     - `min`: only `delta.enableIcebergCompatV3=true` (auto-pulls columnMapping=name,
-///       rowTracking, domainMetadata; the schema auto-pulls timestampNtz + variantType). Checkpoint
-///       at version 2 lands as a V1 single-parquet checkpoint.
-///     - `max`: same as `min` plus `delta.feature.{deletionVectors, v2Checkpoint,
-///       inCommitTimestamp, vacuumProtocolCheck}=supported`. Checkpoint at version 2 lands as a V2
-///       multi-part checkpoint.
-/// - Four commits, each writing 2 partitions x 3 rows = 6 rows. A checkpoint runs after commits
-///   1-2; commits 3-4 land after the checkpoint.
-///
-/// Validations after the final write:
-///   1. Protocol contains the expected reader/writer features for the case.
-///   2. Every parquet data file has `field_id` set on every leaf, including map keys/values and
-///      list elements. The total number of field-id-bearing nodes equals the count of typed leaves
-///      in the kernel schema (15 + 3 nested-map leaves).
-///   3. The partition column is physically materialized in each data file.
-///   4. `ts` (TIMESTAMP) and `ts_ntz` (TIMESTAMP_NTZ) are written with parquet physical type INT64
-///      (microseconds).
-///   5. A full scan returns all 24 rows.
-///   6. Parquet field IDs match `delta.columnMapping.id` from the table schema for every top-level
-///      column and for the nested map/list leaves of `complex`.
+/// IcebergCompatV3 supports all delta types, so we use a schema with all delta types here.
+/// Two test cases:
+/// - `min`: minimum feature set. Enables only `delta.enableIcebergCompatV3=true` and relies on
+///   V3's auto-enablement of `columnMapping=name` + `rowTracking=true`.
+/// - `max`: maximum feature set we are able to enable through create table, with exceptions for:
+///   `materializePartitionColumns` (omitted so the partition-materialization check below proves
+///   V3 implies it), `typeWidening` (kernel rejects writes against tables declaring it), and
+///   `catalogManaged` (requires a catalog committer).
 #[rstest::rstest]
-#[case::min(false)]
-#[case::max(true)]
+#[case::min(&[], &[])]
+#[case::max(
+    // Features enabled through properties.
+    // Intentionally set `delta.columnMapping.mode=id`, as the `min` case tests 
+    // `name` mode(auto-enabled as a default by V3).
+    &[
+        ("delta.columnMapping.mode", "id"),
+        ("delta.enableDeletionVectors", "true"),
+        ("delta.enableInCommitTimestamps", "true"),
+        ("delta.enableChangeDataFeed", "true"),
+        ("delta.appendOnly", "true"),
+    ],
+    // Enablement through feature signals(i.e. delta.feature.X=supported).
+    &["v2Checkpoint", "vacuumProtocolCheck", "invariants"],
+)]
 #[tokio::test(flavor = "multi_thread")]
-async fn v3_e2e_partitioned_writes_with_field_ids(#[case] max_features: bool) {
-    let _ = tracing_subscriber::fmt::try_init();
-
-    // === Setup: filesystem-backed engine on a temp dir ===
+async fn v3_e2e_partitioned_writes_with_field_ids(
+    #[case] extra_props: &[(&str, &str)],
+    #[case] extra_feature_signals: &[&str],
+) {
+    // === Setup ===
     let (_tmp_dir, table_path, _) = test_table_setup_mt().unwrap();
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
@@ -255,20 +275,14 @@ async fn v3_e2e_partitioned_writes_with_field_ids(#[case] max_features: bool) {
     );
 
     // === Create partitioned V3 table ===
-    let schema = kitchen_sink_schema();
-    let mut props: Vec<(&str, &str)> = vec![
-        ("delta.enableIcebergCompatV3", "true"),
-        ("delta.columnMapping.mode", "name"),
-        ("delta.enableRowTracking", "true"),
-    ];
-    if max_features {
-        props.extend([
-            ("delta.feature.deletionVectors", "supported"),
-            ("delta.feature.v2Checkpoint", "supported"),
-            ("delta.feature.inCommitTimestamp", "supported"),
-            ("delta.feature.vacuumProtocolCheck", "supported"),
-        ]);
-    }
+    let schema = nested_schema_with_all_delta_types();
+    let signal_props: Vec<(String, String)> = extra_feature_signals
+        .iter()
+        .map(|f| (format!("delta.feature.{f}"), "supported".to_string()))
+        .collect();
+    let mut props: Vec<(&str, &str)> = vec![("delta.enableIcebergCompatV3", "true")];
+    props.extend(extra_props.iter().copied());
+    props.extend(signal_props.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     let _ = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties(props)
         .with_data_layout(DataLayout::partitioned(["region"]))
@@ -277,9 +291,9 @@ async fn v3_e2e_partitioned_writes_with_field_ids(#[case] max_features: bool) {
         .commit(engine.as_ref())
         .unwrap();
 
-    // === 2 commits, then checkpoint, then 2 more commits ===
+    // === 2 commits, checkpoint, 2 more commits ===
     for commit_idx in 0..2_i32 {
-        write_partitioned_v3_commit(&table_url, engine.clone(), &schema, commit_idx).await;
+        write_partitioned_data(&table_url, engine.clone(), commit_idx).await;
     }
     Snapshot::builder_for(table_url.clone())
         .build(engine.as_ref())
@@ -287,176 +301,95 @@ async fn v3_e2e_partitioned_writes_with_field_ids(#[case] max_features: bool) {
         .checkpoint(engine.as_ref(), None)
         .unwrap();
     for commit_idx in 2..4_i32 {
-        write_partitioned_v3_commit(&table_url, engine.clone(), &schema, commit_idx).await;
+        write_partitioned_data(&table_url, engine.clone(), commit_idx).await;
     }
 
     let final_snap = Snapshot::builder_for(table_url.clone())
         .build(engine.as_ref())
         .unwrap();
 
-    // === (1) Protocol features ===
-    let protocol = final_snap.table_configuration().protocol();
-    let writer_features: Vec<String> = protocol
-        .writer_features()
-        .expect("V3 table must publish writerFeatures")
-        .iter()
-        .map(|f| f.as_ref().to_string())
-        .collect();
-    for f in [
+    // === Verify protocol features and column mapping mode ===
+    let baseline_features = [
         "icebergCompatV3",
         "columnMapping",
         "rowTracking",
         "domainMetadata",
         "timestampNtz",
         "variantType",
-    ] {
-        assert!(
-            writer_features.iter().any(|w| w == f),
-            "writerFeatures missing {f}; got {writer_features:?}",
-        );
-    }
-    if max_features {
-        for f in [
-            "deletionVectors",
-            "v2Checkpoint",
-            "inCommitTimestamp",
-            "vacuumProtocolCheck",
-        ] {
-            assert!(
-                writer_features.iter().any(|w| w == f),
-                "writerFeatures missing {f} for max case; got {writer_features:?}",
-            );
-        }
-    }
-    assert_eq!(
-        final_snap
-            .table_properties()
-            .column_mapping_mode
-            .unwrap_or(ColumnMappingMode::None),
-        ColumnMappingMode::Name,
-    );
+    ];
+    let auto_enabled_features: Vec<&str> = extra_props
+        .iter()
+        .filter(|(_, v)| *v == "true")
+        .map(|(k, _)| feature_for_enable_property(k))
+        .collect();
+    let mut expected_features: Vec<&str> = baseline_features.to_vec();
+    expected_features.extend(auto_enabled_features);
+    expected_features.extend(extra_feature_signals.iter().copied());
+    verify_protocol(&final_snap, &expected_features);
+    let cm_mode = final_snap
+        .table_properties()
+        .column_mapping_mode
+        .expect("V3 must enable column mapping");
+    let expected_cm_mode = extra_props
+        .iter()
+        .find(|(k, _)| *k == "delta.columnMapping.mode")
+        .map(|(_, v)| match *v {
+            "id" => ColumnMappingMode::Id,
+            "name" => ColumnMappingMode::Name,
+            other => panic!("unexpected column mapping mode {other:?}"),
+        })
+        .unwrap_or(ColumnMappingMode::Name);
+    assert_eq!(cm_mode, expected_cm_mode);
 
-    // === (2)-(4) Per-data-file validations ===
+    // === Per-data-file validations ===
     let add_actions = read_add_infos(&final_snap, engine.as_ref()).unwrap();
     assert_eq!(
         add_actions.len(),
         8,
         "expected 4 commits x 2 partitions = 8 add files",
     );
+    let logical_schema = final_snap.schema();
     for add in &add_actions {
         let parquet_url = table_url.join(&add.path).unwrap();
         let local_path = parquet_url.to_file_path().unwrap();
         let ids = collect_all_parquet_field_ids(&local_path);
+        let root = read_parquet_root_schema(&local_path);
 
-        // Field IDs match column mapping IDs from the logical schema for top-level columns.
-        let logical_schema = final_snap.schema();
-        for field in logical_schema.fields() {
-            let physical = get_any_level_column_physical_name(
-                logical_schema.as_ref(),
-                &ColumnName::new([field.name()]),
-                ColumnMappingMode::Name,
-            )
-            .unwrap()
-            .into_inner();
-            let id_in_parquet = ids.get(&physical[0]).copied().unwrap_or_else(|| {
-                panic!(
-                    "missing field_id for top-level column {} (physical {:?}) in {}",
-                    field.name(),
-                    physical,
-                    parquet_url
-                )
-            });
-            let expected = field.column_mapping_id().unwrap_or_else(|| {
-                panic!(
-                    "logical field {} missing column mapping id; metadata: {:?}",
-                    field.name(),
-                    field.metadata()
-                )
-            });
+        // Top-level + nested column-mapping IDs all appear as expected.
+        // Expected count for `nested_schema_with_all_delta_types`:
+        //   16 top-level fields
+        //   + 3 nested.ids on `complex` (`complex.{key, key.element, value}`)
+        //   + 2 struct fields inside `complex.value` (`inner_map`, `n`)
+        //   + 3 nested.ids on `inner_map` (`inner_map.{key, key.element, value}`)
+        //   = 24
+        verify_column_mapping_ids_in_parquet(
+            logical_schema.as_ref(),
+            cm_mode,
+            &ids,
+            &parquet_url,
+            24, /* expected_num_ids */
+        );
+
+        // Partition column is physically materialized (V3 invariant).
+        let region_physical = get_top_level_physical_name(logical_schema.as_ref(), "region", cm_mode);
+        assert!(
+            find_top_level_field_in_parquet(&root, &region_physical).is_some(),
+            "partition column `region` (physical {region_physical}) not materialized in {parquet_url}",
+        );
+
+        // timestamp / timestamp_ntz are INT64 in parquet.
+        for col in ["timestamp_col", "timestamp_ntz_col"] {
+            let physical = get_top_level_physical_name(logical_schema.as_ref(), col, cm_mode);
             assert_eq!(
-                id_in_parquet,
-                expected,
-                "parquet field_id mismatch for top-level {}: parquet={id_in_parquet}, schema={expected}",
-                field.name()
+                find_top_level_physical_type_in_parquet(&root, &physical),
+                ParquetPhysicalType::INT64,
+                "{col} must be INT64 in parquet",
             );
         }
-
-        // Field IDs are present on every leaf inside the deeply nested `complex` column.
-        // The leaves below correspond to: outer map key (list<int>) -> int element,
-        // outer map value (struct) -> inner_map key (list<int>) -> int element,
-        // outer map value -> inner_map value (int), outer map value -> n (int).
-        let complex_physical = get_any_level_column_physical_name(
-            logical_schema.as_ref(),
-            &ColumnName::new(["complex"]),
-            ColumnMappingMode::Name,
-        )
-        .unwrap()
-        .into_inner();
-        let complex_paths = collect_paths_with_prefix(&ids, &complex_physical[0]);
-        assert!(
-            complex_paths.len() >= 7,
-            "expected >=7 field-id-bearing nodes under `complex` (physical {complex_physical:?}), got {complex_paths:?}",
-        );
-
-        // Partition column physically materialized in each data file (V3 invariant).
-        let region_physical = get_any_level_column_physical_name(
-            logical_schema.as_ref(),
-            &ColumnName::new(["region"]),
-            ColumnMappingMode::Name,
-        )
-        .unwrap()
-        .into_inner();
-        let root = read_parquet_root_schema(&local_path);
-        assert!(
-            top_level_field(&root, &region_physical[0]).is_some(),
-            "partition column `region` (physical {region_physical:?}) is not materialized in {parquet_url}",
-        );
-
-        // ts / ts_ntz physical type is INT64.
-        let ts_physical = get_any_level_column_physical_name(
-            logical_schema.as_ref(),
-            &ColumnName::new(["ts"]),
-            ColumnMappingMode::Name,
-        )
-        .unwrap()
-        .into_inner();
-        let ts_ntz_physical = get_any_level_column_physical_name(
-            logical_schema.as_ref(),
-            &ColumnName::new(["ts_ntz"]),
-            ColumnMappingMode::Name,
-        )
-        .unwrap()
-        .into_inner();
-        assert_eq!(
-            top_level_physical_type(&root, &ts_physical[0]),
-            ParquetPhysicalType::INT64,
-            "ts must be INT64 in parquet",
-        );
-        assert_eq!(
-            top_level_physical_type(&root, &ts_ntz_physical[0]),
-            ParquetPhysicalType::INT64,
-            "ts_ntz must be INT64 in parquet",
-        );
     }
 
-    // === (5) Scan returns all 24 rows ===
-    let scan = final_snap.scan_builder().build().unwrap();
-    let total_rows: usize = scan
-        .execute(engine.clone())
-        .unwrap()
-        .map(|res| -> usize {
-            let raw = res.unwrap();
-            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(raw)
-                .unwrap()
-                .record_batch()
-                .clone();
-            batch.num_rows()
-        })
-        .sum();
-    assert_eq!(
-        total_rows, 24,
-        "expected 4 commits x 2 partitions x 3 rows = 24 rows",
-    );
+    // === (5) Exact scan contents ===
+    verify_scan_contents(final_snap.clone(), engine.clone());
 }
 
 // === Helpers ===
@@ -466,14 +399,6 @@ fn make_engine() -> (Arc<InMemory>, Arc<DefaultEngine<TokioBackgroundExecutor>>)
     let engine =
         Arc::new(DefaultEngineBuilder::<TokioBackgroundExecutor>::new(storage.clone()).build());
     (storage, engine)
-}
-
-fn v3_table_properties() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("delta.enableIcebergCompatV3", "true"),
-        ("delta.columnMapping.mode", "name"),
-        ("delta.enableRowTracking", "true"),
-    ]
 }
 
 fn simple_schema() -> Arc<StructType> {
@@ -486,103 +411,36 @@ fn simple_schema() -> Arc<StructType> {
     )
 }
 
-/// Build add_files metadata for one synthetic file matching the schema returned by
-/// `Transaction::add_files_schema()`. `num_records` controls the `stats.numRecords` field
-/// (`None` -> NULL, `Some(n)` -> `n`); the other stats fields are populated with empty
-/// structs / `tightBounds=true`.
-fn synthetic_add_files_metadata(
-    arrow_schema: &ArrowSchema,
-    num_records: Option<i64>,
-) -> Box<dyn EngineData> {
-    let path_array = StringArray::from(vec!["part-fake.parquet"]);
-    let size_array = Int64Array::from(vec![1024_i64]);
-    let mod_time_array = Int64Array::from(vec![1_000_000_i64]);
-
-    // partitionValues: empty Map<string, string>.
-    let entries_field = Arc::new(ArrowField::new(
-        "key_value",
-        ArrowDataType::Struct(Fields::from(vec![
-            ArrowField::new("key", ArrowDataType::Utf8, false),
-            ArrowField::new("value", ArrowDataType::Utf8, true),
-        ])),
-        false,
-    ));
-    let empty_keys = StringArray::from(Vec::<&str>::new());
-    let empty_values = StringArray::from(Vec::<Option<&str>>::new());
-    let empty_entries = StructArray::from(vec![
-        (
-            Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false)),
-            Arc::new(empty_keys) as ArrayRef,
-        ),
-        (
-            Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true)),
-            Arc::new(empty_values) as ArrayRef,
-        ),
-    ]);
-    let partition_values_array = Arc::new(MapArray::new(
-        entries_field,
-        OffsetBuffer::from_lengths(vec![0]),
-        empty_entries,
-        None,
-        false,
-    ));
-
-    let empty_struct_fields: Fields = Vec::<Arc<ArrowField>>::new().into();
-    let empty_struct = StructArray::new_empty_fields(1, None);
-    let stats_struct = StructArray::from(vec![
-        (
-            Arc::new(ArrowField::new("numRecords", ArrowDataType::Int64, true)),
-            Arc::new(Int64Array::from(vec![num_records])) as ArrayRef,
-        ),
-        (
-            Arc::new(ArrowField::new(
-                "nullCount",
-                ArrowDataType::Struct(empty_struct_fields.clone()),
-                true,
-            )),
-            Arc::new(empty_struct.clone()) as ArrayRef,
-        ),
-        (
-            Arc::new(ArrowField::new(
-                "minValues",
-                ArrowDataType::Struct(empty_struct_fields.clone()),
-                true,
-            )),
-            Arc::new(empty_struct.clone()) as ArrayRef,
-        ),
-        (
-            Arc::new(ArrowField::new(
-                "maxValues",
-                ArrowDataType::Struct(empty_struct_fields),
-                true,
-            )),
-            Arc::new(empty_struct) as ArrayRef,
-        ),
-        (
-            Arc::new(ArrowField::new("tightBounds", ArrowDataType::Boolean, true)),
-            Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
-        ),
-    ]);
-
-    let batch = RecordBatch::try_new(
-        Arc::new(arrow_schema.clone()),
-        vec![
-            Arc::new(path_array) as ArrayRef,
-            partition_values_array as ArrayRef,
-            Arc::new(size_array) as ArrayRef,
-            Arc::new(mod_time_array) as ArrayRef,
-            Arc::new(stats_struct) as ArrayRef,
-        ],
+/// Schema covering every Delta types(primitive, struct, map, array, variant)
+/// Including a deeply nested map<list<int>, struct<inner_map: map<list<int>, int>, n: int>> column.
+/// `region` is the partition column.
+fn nested_schema_with_all_delta_types() -> Arc<StructType> {
+    Arc::new(
+        StructType::try_new(vec![
+            StructField::nullable("region", DataType::STRING),
+            StructField::nullable("int_col", DataType::INTEGER),
+            StructField::nullable("bool_col", DataType::BOOLEAN),
+            StructField::nullable("byte_col", DataType::BYTE),
+            StructField::nullable("short_col", DataType::SHORT),
+            StructField::nullable("long_col", DataType::LONG),
+            StructField::nullable("float_col", DataType::FLOAT),
+            StructField::nullable("double_col", DataType::DOUBLE),
+            StructField::nullable("decimal_col", DataType::decimal(10, 2).unwrap()),
+            StructField::nullable("string_col", DataType::STRING),
+            StructField::nullable("binary_col", DataType::BINARY),
+            StructField::nullable("date_col", DataType::DATE),
+            StructField::nullable("timestamp_col", DataType::TIMESTAMP),
+            StructField::nullable("timestamp_ntz_col", DataType::TIMESTAMP_NTZ),
+            StructField::nullable("variant_col", DataType::unshredded_variant()),
+            StructField::nullable("complex", complex_nested_data_type()),
+        ])
+        .unwrap(),
     )
-    .unwrap();
-
-    Box::new(ArrowEngineData::new(batch))
 }
 
-/// Schema covering every primitive Delta type plus an unshredded VARIANT and a deeply nested
-/// map<list<int>, struct<inner_map: map<list<int>, int>, n: int>> column. `region` is the
-/// partition column.
-fn kitchen_sink_schema() -> Arc<StructType> {
+/// `map<list<int>, struct<inner_map: map<list<int>, int>, n: int>>`. A deeply nested
+/// type used to validate field-id propagation through every level of map/list/struct.
+fn complex_nested_data_type() -> DataType {
     let inner_struct = StructType::try_new(vec![
         StructField::nullable(
             "inner_map",
@@ -595,132 +453,109 @@ fn kitchen_sink_schema() -> Arc<StructType> {
         StructField::nullable("n", DataType::INTEGER),
     ])
     .unwrap();
-
-    Arc::new(
-        StructType::try_new(vec![
-            StructField::nullable("region", DataType::STRING),
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("b", DataType::BOOLEAN),
-            StructField::nullable("byte_c", DataType::BYTE),
-            StructField::nullable("short_c", DataType::SHORT),
-            StructField::nullable("long_c", DataType::LONG),
-            StructField::nullable("f", DataType::FLOAT),
-            StructField::nullable("d", DataType::DOUBLE),
-            StructField::nullable("dec", DataType::decimal(10, 2).unwrap()),
-            StructField::nullable("s", DataType::STRING),
-            StructField::nullable("bin", DataType::BINARY),
-            StructField::nullable("date_c", DataType::DATE),
-            StructField::nullable("ts", DataType::TIMESTAMP),
-            StructField::nullable("ts_ntz", DataType::TIMESTAMP_NTZ),
-            StructField::nullable("v", DataType::unshredded_variant()),
-            StructField::nullable(
-                "complex",
-                DataType::Map(Box::new(MapType::new(
-                    DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
-                    DataType::Struct(Box::new(inner_struct)),
-                    true,
-                ))),
-            ),
-        ])
-        .unwrap(),
-    )
+    DataType::Map(Box::new(MapType::new(
+        DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+        DataType::Struct(Box::new(inner_struct)),
+        true,
+    )))
 }
 
-/// Build a 3-row record batch for the partition `region`. Column data is keyed off `commit_idx`
-/// so different commits produce distinguishable rows. The deeply nested `complex` column and
-/// the `v` (VARIANT) column are written as all-null -- this exercises the schema (field IDs
-/// at every nested leaf) without requiring per-row binary/struct construction.
-///
-/// V3 materializes partition values into data files, so the `region` column is included in
-/// the data with the partition value repeated for every row.
-fn build_partition_batch(
-    schema: &StructType,
-    commit_idx: i32,
-    region: &str,
-    rows: usize,
-) -> RecordBatch {
-    let n = rows as i32;
-    let base = commit_idx * 100
-        + match region {
-            "a" => 0,
-            "b" => 50,
-            _ => panic!("unsupported region {region}"),
-        };
+const ROWS_PER_PARTITION: i32 = 3;
+const PARTITION_REGIONS: &[&str] = &["a", "b"];
 
-    let arrow_schema: ArrowSchema = schema.try_into_arrow().unwrap();
+/// Build a [`RecordBatch`] with [`ROWS_PER_PARTITION`] rows for the given `region` following the schema of
+/// [`nested_schema_with_all_delta_types`]. `random_seed` is used directly to produce different values
+/// so different calls produce distinguishable rows;
+fn build_partition_batch(random_seed: i32, region: &str) -> RecordBatch {
+    let rows = ROWS_PER_PARTITION as usize;
 
-    let region_col: ArrayRef = Arc::new(StringArray::from(vec![region; rows]));
-    let id: ArrayRef = Arc::new(Int32Array::from(
-        (0..n).map(|i| base + i).collect::<Vec<_>>(),
+    let schema = nested_schema_with_all_delta_types();
+    let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow().unwrap();
+
+    let region_partition_col: ArrayRef = Arc::new(StringArray::from(vec![region; rows]));
+    let int_col: ArrayRef = Arc::new(Int32Array::from(
+        (0..ROWS_PER_PARTITION).map(|i| random_seed + i).collect::<Vec<_>>(),
     ));
-    let b: ArrayRef = Arc::new(BooleanArray::from(
+    let bool_col: ArrayRef = Arc::new(BooleanArray::from(
         (0..rows).map(|i| i % 2 == 0).collect::<Vec<_>>(),
     ));
-    let byte_c: ArrayRef = Arc::new(Int8Array::from(
-        (0..n).map(|i| (base + i) as i8).collect::<Vec<_>>(),
+    let byte_col: ArrayRef = Arc::new(Int8Array::from(
+        (0..ROWS_PER_PARTITION).map(|i| (random_seed + i) as i8).collect::<Vec<_>>(),
     ));
-    let short_c: ArrayRef = Arc::new(Int16Array::from(
-        (0..n).map(|i| (base + i) as i16).collect::<Vec<_>>(),
+    let short_col: ArrayRef = Arc::new(Int16Array::from(
+        (0..ROWS_PER_PARTITION).map(|i| (random_seed + i) as i16).collect::<Vec<_>>(),
     ));
-    let long_c: ArrayRef = Arc::new(Int64Array::from(
-        (0..n).map(|i| (base + i) as i64).collect::<Vec<_>>(),
+    let long_col: ArrayRef = Arc::new(Int64Array::from(
+        (0..ROWS_PER_PARTITION).map(|i| (random_seed + i) as i64).collect::<Vec<_>>(),
     ));
-    let f: ArrayRef = Arc::new(Float32Array::from(
-        (0..n).map(|i| (base + i) as f32 + 0.5).collect::<Vec<_>>(),
+    let float_col: ArrayRef = Arc::new(Float32Array::from(
+        (0..ROWS_PER_PARTITION).map(|i| (random_seed + i) as f32 + 0.5).collect::<Vec<_>>(),
     ));
-    let d: ArrayRef = Arc::new(Float64Array::from(
-        (0..n).map(|i| (base + i) as f64 + 0.25).collect::<Vec<_>>(),
+    let double_col: ArrayRef = Arc::new(Float64Array::from(
+        (0..ROWS_PER_PARTITION).map(|i| (random_seed + i) as f64 + 0.25).collect::<Vec<_>>(),
     ));
     // Decimal(10, 2): values stored as scaled i128.
-    let dec: ArrayRef = Arc::new(
-        Decimal128Array::from((0..n).map(|i| (base + i) as i128 * 100).collect::<Vec<_>>())
-            .with_precision_and_scale(10, 2)
-            .unwrap(),
+    let decimal_col: ArrayRef = Arc::new(
+        Decimal128Array::from(
+            (0..ROWS_PER_PARTITION).map(|i| (random_seed + i) as i128 * 100).collect::<Vec<_>>(),
+        )
+        .with_precision_and_scale(10, 2)
+        .unwrap(),
     );
-    let s: ArrayRef = Arc::new(StringArray::from(
+    let string_col: ArrayRef = Arc::new(StringArray::from(
         (0..rows)
-            .map(|i| format!("s-{base}-{i}"))
+            .map(|i| format!("s-{random_seed}-{i}"))
             .collect::<Vec<_>>(),
     ));
-    let bin: ArrayRef = Arc::new(BinaryArray::from_iter_values(
-        (0..rows).map(|i| vec![(base as u8).wrapping_add(i as u8)]),
+    let binary_col: ArrayRef = Arc::new(BinaryArray::from_iter_values(
+        (0..rows).map(|i| vec![(random_seed as u8).wrapping_add(i as u8)]),
     ));
     // Days since 1970-01-01.
-    let date_c: ArrayRef = Arc::new(Date32Array::from(
-        (0..n).map(|i| 19000 + base + i).collect::<Vec<_>>(),
+    let date_col: ArrayRef = Arc::new(Date32Array::from(
+        (0..ROWS_PER_PARTITION).map(|i| 19000 + random_seed + i).collect::<Vec<_>>(),
     ));
     // Microseconds since epoch: TIMESTAMP carries UTC ("+00:00"), TIMESTAMP_NTZ has no zone.
-    let ts: ArrayRef = Arc::new(
+    let timestamp_col: ArrayRef = Arc::new(
         TimestampMicrosecondArray::from(
-            (0..n)
-                .map(|i| 1_700_000_000_000_000_i64 + (base + i) as i64)
+            (0..ROWS_PER_PARTITION)
+                .map(|i| 1_700_000_000_000_000_i64 + (random_seed + i) as i64)
                 .collect::<Vec<_>>(),
         )
         .with_timezone("UTC"),
     );
-    let ts_ntz: ArrayRef = Arc::new(TimestampMicrosecondArray::from(
-        (0..n)
-            .map(|i| 1_700_000_000_000_000_i64 + (base + i) as i64 + 1)
+    let timestamp_ntz_col: ArrayRef = Arc::new(TimestampMicrosecondArray::from(
+        (0..ROWS_PER_PARTITION)
+            .map(|i| 1_700_000_000_000_000_i64 + (random_seed + i) as i64 + 1)
             .collect::<Vec<_>>(),
     ));
-    let v: ArrayRef = build_all_null_variant_array(rows);
-    let complex: ArrayRef = build_all_null_complex_array(schema, rows);
+    let variant_col: ArrayRef = build_all_null_variant_array(rows);
+    let complex: ArrayRef = build_all_null_complex_array(rows);
 
     RecordBatch::try_new(
         Arc::new(arrow_schema),
         vec![
-            region_col, id, b, byte_c, short_c, long_c, f, d, dec, s, bin, date_c, ts, ts_ntz, v,
+            region_partition_col,
+            int_col,
+            bool_col,
+            byte_col,
+            short_col,
+            long_col,
+            float_col,
+            double_col,
+            decimal_col,
+            string_col,
+            binary_col,
+            date_col,
+            timestamp_col,
+            timestamp_ntz_col,
+            variant_col,
             complex,
         ],
     )
     .unwrap()
 }
 
-/// Builds an all-null unshredded variant column (struct<metadata: binary, value: binary>) of
-/// length `rows`. Mirrors the shape used by `test_append_variant`. The struct fields are
-/// non-null physically (kernel's unshredded variant schema marks them required), so we provide
-/// empty placeholder bytes for every row and rely on the outer null bitmap to mark all rows
-/// null at the variant level.
+/// Builds an all-null unshredded variant column with [`rows`] rows.
 fn build_all_null_variant_array(rows: usize) -> ArrayRef {
     let metadata_bytes: Vec<&[u8]> = (0..rows).map(|_| &[0x01, 0x00, 0x00][..]).collect();
     let value_bytes: Vec<&[u8]> = (0..rows).map(|_| &[0x0C, 0x01][..]).collect();
@@ -738,17 +573,13 @@ fn build_all_null_variant_array(rows: usize) -> ArrayRef {
     )
 }
 
-/// Builds an all-null `complex` MapArray matching the kitchen-sink schema's `complex` field.
-/// All `rows` map entries are null; the underlying entries struct is empty. This is enough to
-/// exercise schema/field-id paths through the deeply nested type without per-row construction.
-fn build_all_null_complex_array(schema: &StructType, rows: usize) -> ArrayRef {
-    let complex_field = schema
-        .fields()
-        .find(|f| f.name() == "complex")
-        .expect("schema must include `complex`");
-    let arrow_field: ArrowField = complex_field.try_into_arrow().unwrap();
-    let (entries_field, _sorted) = match arrow_field.data_type() {
-        ArrowDataType::Map(entries, sorted) => (entries.clone(), *sorted),
+/// Builds an all-null `complex` MapArray of length `rows` matching [`complex_nested_data_type`].
+/// All map entries are null; the underlying entries struct is empty.
+fn build_all_null_complex_array(rows: usize) -> ArrayRef {
+    let complex_arrow_type: ArrowDataType =
+        (&complex_nested_data_type()).try_into_arrow().unwrap();
+    let (entries_field, _sorted) = match complex_arrow_type {
+        ArrowDataType::Map(entries, sorted) => (entries, sorted),
         other => panic!("complex must be a Map type, got {other:?}"),
     };
     let entries_struct_fields = match entries_field.data_type() {
@@ -772,9 +603,6 @@ fn build_all_null_complex_array(schema: &StructType, rows: usize) -> ArrayRef {
     ))
 }
 
-/// Produce empty arrays for each field of a map's `entries` struct. Each array has length 0
-/// and matches the field's declared arrow data type. Recurses into nested struct/list/map
-/// types via Arrow's `new_empty_array` factory.
 fn entries_field_arrays_empty(entries_field: &ArrowField) -> Vec<ArrayRef> {
     match entries_field.data_type() {
         ArrowDataType::Struct(fields) => fields
@@ -787,25 +615,36 @@ fn entries_field_arrays_empty(entries_field: &ArrowField) -> Vec<ArrayRef> {
 
 /// Open a transaction on `table_url`, write 2 partitions x 3 rows (regions "a" and "b") via the
 /// engine's parquet handler, and commit. Stats and `numRecords` are auto-collected by the
-/// default engine, so the V3 numRecords invariant is satisfied.
-async fn write_partitioned_v3_commit(
+/// default engine, so the numRecords invariant is satisfied.
+/// Assume the table schema is [`nested_schema_with_all_delta_types`].
+async fn write_partitioned_data(
     table_url: &Url,
     engine: Arc<DefaultEngine<TokioMultiThreadExecutor>>,
-    schema: &StructType,
-    commit_idx: i32,
+    random_seed: i32,
 ) {
     let snapshot = Snapshot::builder_for(table_url.clone())
         .build(engine.as_ref())
         .unwrap();
+    // Defensive sanity check: confirm the table schema matches what `build_partition_batch`
+    // produces. We compare top-level field names rather than full structs for simplicity.
+    let actual_schema = snapshot.schema();
+    let expected_schema = nested_schema_with_all_delta_types();
+    let actual_fields: Vec<&str> = actual_schema.fields().map(|f| f.name().as_str()).collect();
+    let expected_fields: Vec<&str> =
+        expected_schema.fields().map(|f| f.name().as_str()).collect();
+    assert_eq!(
+        actual_fields, expected_fields,
+        "table schema does not match `nested_schema_with_all_delta_types`",
+    );
     let mut txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
         .unwrap()
-        .with_engine_info(format!("Test/v3-commit-{commit_idx}"))
+        .with_engine_info(format!("Test/v3-commit-seed-{random_seed}"))
         .with_data_change(true);
 
     // Each partition gets its own write_parquet call with a partitioned WriteContext.
-    for region in ["a", "b"] {
-        let batch = build_partition_batch(schema, commit_idx, region, 3 /* rows */);
+    for region in PARTITION_REGIONS {
+        let batch = build_partition_batch(random_seed, region);
         let write_context = txn
             .partitioned_write_context(HashMap::from([(
                 "region".to_string(),
@@ -821,8 +660,231 @@ async fn write_partitioned_v3_commit(
     let _ = txn.commit(engine.as_ref()).unwrap().unwrap_committed();
 }
 
+/// Map a `delta.enable*` (or `delta.appendOnly`) enablement-property key to the feature
+/// name. Panics on unknown keys to surface case-input typos.
+fn feature_for_enable_property(key: &str) -> &'static str {
+    match key {
+        "delta.enableDeletionVectors" => "deletionVectors",
+        "delta.enableInCommitTimestamps" => "inCommitTimestamp",
+        "delta.enableChangeDataFeed" => "changeDataFeed",
+        "delta.appendOnly" => "appendOnly",
+        "delta.enableRowTracking" => "rowTracking",
+        other => panic!("unknown enablement property '{other}'"),
+    }
+}
+
+/// ReaderWriter features used in this test file.
+const READER_WRITER_FEATURES: &[&str] = &[
+    "columnMapping",
+    "deletionVectors",
+    "timestampNtz",
+    "v2Checkpoint",
+    "vacuumProtocolCheck",
+    "variantType",
+];
+
+/// Assert each name in `expected_features` appears in `writerFeatures`, plus that any
+/// reader+writer feature also appears in `readerFeatures`.
+fn verify_protocol(snapshot: &Snapshot, expected_features: &[&str]) {
+    let protocol = snapshot.table_configuration().protocol();
+    let writer_features: Vec<String> = protocol
+        .writer_features()
+        .expect("V3 table must publish writerFeatures")
+        .iter()
+        .map(|f| f.as_ref().to_string())
+        .collect();
+    let reader_features: Vec<String> = protocol
+        .reader_features()
+        .map(|fs| fs.iter().map(|f| f.as_ref().to_string()).collect())
+        .unwrap_or_default();
+    for f in expected_features {
+        assert!(
+            writer_features.iter().any(|w| w == f),
+            "writerFeatures missing {f}; got {writer_features:?}",
+        );
+        if READER_WRITER_FEATURES.contains(f) {
+            assert!(
+                reader_features.iter().any(|r| r == f),
+                "readerFeatures missing {f} (reader+writer feature); got {reader_features:?}",
+            );
+        }
+    }
+}
+
+/// Look up the physical name of a top-level logical column. Panics if not found.
+fn get_top_level_physical_name(schema: &StructType, logical: &str, mode: ColumnMappingMode) -> String {
+    let physical = get_any_level_column_physical_name(schema, &ColumnName::new([logical]), mode)
+        .unwrap()
+        .into_inner();
+    physical
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no physical path for column {logical}"))
+}
+
+/// Assert that every column-mapping ID lands at the right `parquet_schema_path` in the parquet
+/// schema. Walks the kernel schema, builds an expected `parquet_schema_path -> id` map (from
+/// both `delta.columnMapping.id` and `delta.columnMapping.nested.ids`), then for each entry
+/// asserts the parquet file has the same id at that path.
+///
+/// A `parquet_schema_path` is the dot-joined path of a field from the parquet schema root.
+///
+/// Example. A kernel schema with one column `m: map<list<int>, int>` carrying:
+/// ```text
+/// delta.columnMapping.id           = 1
+/// delta.columnMapping.physicalName = "col-X"
+/// delta.columnMapping.nested.ids   = {
+///     "col-X.key":         2,
+///     "col-X.key.element": 3,
+///     "col-X.value":       4,
+/// }
+/// ```
+/// produces the expected `parquet_schema_path -> id` map:
+/// ```text
+/// {
+///   "col-X":                            1,
+///   "col-X.key_value.key":              2,
+///   "col-X.key_value.key.list.element": 3,
+///   "col-X.key_value.value":            4,
+/// }
+/// ```
+fn verify_column_mapping_ids_in_parquet(
+    logical_schema: &StructType,
+    mode: ColumnMappingMode,
+    parquet_ids: &HashMap<String, i64>,
+    parquet_url: &Url,
+    expected_num_ids: usize,
+) {
+    let mut visitor = ExpectedFieldIdMap {
+        mode,
+        parquet_schema_path_stack: Vec::new(),
+        expected: HashMap::new(),
+    };
+    visitor.transform_struct(logical_schema);
+    assert_eq!(
+        parquet_ids.len(),
+        expected_num_ids,
+        "expected {expected_num_ids} field IDs in {parquet_url}, got {}: {parquet_ids:?}",
+        parquet_ids.len(),
+    );
+    for (parquet_schema_path, expected_id) in &visitor.expected {
+        let actual_id = parquet_ids.get(parquet_schema_path).copied().unwrap_or_else(|| {
+            panic!(
+                "expected field_id {expected_id} at parquet_schema_path \
+                 '{parquet_schema_path}' in {parquet_url}; actual ids: {parquet_ids:?}",
+            )
+        });
+        assert_eq!(
+            actual_id, *expected_id,
+            "parquet field_id mismatch at parquet_schema_path \
+             '{parquet_schema_path}' in {parquet_url}: expected {expected_id}, got {actual_id}",
+        );
+    }
+}
+
+/// Schema visitor that builds `parquet_schema_path -> id` for
+/// [`verify_column_mapping_ids_in_parquet`].
+struct ExpectedFieldIdMap {
+    mode: ColumnMappingMode,
+    parquet_schema_path_stack: Vec<String>,
+    expected: HashMap<String, i64>,
+}
+
+impl ExpectedFieldIdMap {
+    fn current_parquet_schema_path(&self) -> String {
+        self.parquet_schema_path_stack.join(".")
+    }
+}
+
+impl<'a> SchemaTransform<'a> for ExpectedFieldIdMap {
+    transform_output_type!(|'a, T| ());
+
+    fn transform_struct_field(&mut self, field: &'a StructField) {
+        self.parquet_schema_path_stack
+            .push(field.physical_name(self.mode).to_string());
+        let field_parquet_schema_path = self.current_parquet_schema_path();
+        if let Some(id) = field.column_mapping_id() {
+            self.expected.insert(field_parquet_schema_path.clone(), id);
+        }
+        if let Some(MetadataValue::Other(json)) =
+            field.get_config_value(&ColumnMetadataKey::ColumnMappingNestedIds)
+        {
+            if let Some(obj) = json.as_object() {
+                // Each key is a relative path rooted at the field's physical name, e.g.
+                // `<phys>.key`, `<phys>.key.element`. We translate it to its corresponding
+                // `parquet_schema_path`.
+                for (physical_nested_path, value) in obj {
+                    if let Some(id) = value.as_i64() {
+                        self.expected.insert(
+                            translate_nested_path(
+                                &field_parquet_schema_path,
+                                physical_nested_path,
+                            ),
+                            id,
+                        );
+                    }
+                }
+            }
+        }
+        self.recurse_into_struct_field(field);
+        self.parquet_schema_path_stack.pop();
+    }
+
+    fn transform_map(&mut self, mtype: &'a MapType) {
+        self.parquet_schema_path_stack.push("key_value".to_string());
+        self.parquet_schema_path_stack.push("key".to_string());
+        self.transform_map_key(&mtype.key_type);
+        self.parquet_schema_path_stack.pop();
+        self.parquet_schema_path_stack.push("value".to_string());
+        self.transform_map_value(&mtype.value_type);
+        self.parquet_schema_path_stack.pop();
+        self.parquet_schema_path_stack.pop();
+    }
+
+    fn transform_array(&mut self, atype: &'a ArrayType) {
+        self.parquet_schema_path_stack.push("list".to_string());
+        self.parquet_schema_path_stack.push("element".to_string());
+        self.transform_array_element(&atype.element_type);
+        self.parquet_schema_path_stack.pop();
+        self.parquet_schema_path_stack.pop();
+    }
+
+    // Variant has its own internal struct (metadata/value) but the kernel parquet writer
+    // does not carry column-mapping IDs into it; skip recursion to avoid recording paths
+    // that don't correspond to parquet field IDs.
+    fn transform_variant(&mut self, _stype: &'a StructType) {}
+}
+
+/// Translate a `delta.columnMapping.nested.ids` key (e.g. `<phys>.key.element`) to its
+/// parquet_schema_path. The first segment of `physical_nested_path` is the field's physical
+/// name -- the same as the last segment of `field_parquet_schema_path` -- so we replace the
+/// whole prefix wholesale with `field_parquet_schema_path` and translate the remaining
+/// synthetic segments: `key`/`value` -> `key_value.key`/`key_value.value` (Map wrapper),
+/// `element` -> `list.element` (Array wrapper).
+fn translate_nested_path(
+    field_parquet_schema_path: &str,
+    physical_nested_path: &str,
+) -> String {
+    let segs: Vec<&str> = physical_nested_path.split('.').collect();
+    let mut out = field_parquet_schema_path.to_string();
+    for seg in &segs[1..] {
+        match *seg {
+            "key" => out.push_str(".key_value.key"),
+            "value" => out.push_str(".key_value.value"),
+            "element" => out.push_str(".list.element"),
+            other => panic!(
+                "unexpected nested-id path segment '{other}' in '{physical_nested_path}'"
+            ),
+        }
+    }
+    out
+}
+
 /// Find a top-level field by physical name in a parquet root schema, or `None` if absent.
-fn top_level_field<'a>(root: &'a ParquetType, name: &str) -> Option<&'a ParquetType> {
+fn find_top_level_field_in_parquet<'a>(
+    root: &'a ParquetType,
+    name: &str,
+) -> Option<&'a ParquetType> {
     root.get_fields()
         .iter()
         .find(|f| f.name() == name)
@@ -831,8 +893,11 @@ fn top_level_field<'a>(root: &'a ParquetType, name: &str) -> Option<&'a ParquetT
 
 /// Get the parquet physical type of a top-level field (looked up by physical name). Panics if
 /// the field is missing or is a group (i.e. not a primitive leaf).
-fn top_level_physical_type(root: &ParquetType, name: &str) -> ParquetPhysicalType {
-    let field = top_level_field(root, name)
+fn find_top_level_physical_type_in_parquet(
+    root: &ParquetType,
+    name: &str,
+) -> ParquetPhysicalType {
+    let field = find_top_level_field_in_parquet(root, name)
         .unwrap_or_else(|| panic!("top-level field {name} not found in parquet schema"));
     match field {
         ParquetType::PrimitiveType { physical_type, .. } => *physical_type,
@@ -842,11 +907,85 @@ fn top_level_physical_type(root: &ParquetType, name: &str) -> ParquetPhysicalTyp
     }
 }
 
-/// Collect every entry from `ids` whose path starts with `prefix.` or equals `prefix`. Used to
-/// count field-id-bearing nodes under a nested column.
-fn collect_paths_with_prefix(ids: &HashMap<String, i64>, prefix: &str) -> Vec<String> {
-    ids.keys()
-        .filter(|k| k.as_str() == prefix || k.starts_with(&format!("{prefix}.")))
-        .cloned()
-        .collect()
+/// Run a full scan and assert exact `(region, int_col, bool_col)` content for every row, plus
+/// that `variant_col` and `complex` are entirely null. `int_col` derives from the writer's
+/// `random_seed`, so the expected list is reproduced by replaying the same seeds (0..4) and
+/// regions; sorting both sides by `(region, int_col)` makes the comparison order-independent.
+fn verify_scan_contents(
+    snapshot: Arc<Snapshot>,
+    engine: Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+) {
+    let scan = snapshot.scan_builder().build().unwrap();
+    let mut rows: Vec<(String, i32, bool)> = Vec::new();
+    let mut variant_null_count = 0_usize;
+    let mut complex_null_count = 0_usize;
+    let mut total_rows = 0_usize;
+
+    for res in scan.execute(engine).unwrap() {
+        let raw = res.unwrap();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(raw)
+            .unwrap()
+            .record_batch()
+            .clone();
+
+        let region_arr = batch
+            .column_by_name("region")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("region column missing or wrong type");
+        let int_arr = batch
+            .column_by_name("int_col")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("int_col column missing or wrong type");
+        let bool_arr = batch
+            .column_by_name("bool_col")
+            .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+            .expect("bool_col column missing or wrong type");
+        let variant_arr = batch
+            .column_by_name("variant_col")
+            .expect("variant_col column missing");
+        let complex_arr = batch
+            .column_by_name("complex")
+            .expect("complex column missing");
+
+        for i in 0..batch.num_rows() {
+            rows.push((
+                region_arr.value(i).to_string(),
+                int_arr.value(i),
+                bool_arr.value(i),
+            ));
+            if variant_arr.is_null(i) {
+                variant_null_count += 1;
+            }
+            if complex_arr.is_null(i) {
+                complex_null_count += 1;
+            }
+            total_rows += 1;
+        }
+    }
+
+    // Sort by (region, int_col): same `random_seed` produces equal `int_col` across regions,
+    // so `(region, int_col)` is the unique row key.
+    rows.sort();
+
+    let mut expected: Vec<(String, i32, bool)> = Vec::new();
+    for random_seed in 0..4_i32 {
+        for region in PARTITION_REGIONS {
+            for i in 0..ROWS_PER_PARTITION {
+                expected.push((region.to_string(), random_seed + i, i % 2 == 0));
+            }
+        }
+    }
+    expected.sort();
+
+    let total_expected = expected.len();
+    assert_eq!(rows, expected, "scan contents mismatch");
+    assert_eq!(total_rows, total_expected);
+    assert_eq!(
+        variant_null_count, total_expected,
+        "all variant_col values must be null",
+    );
+    assert_eq!(
+        complex_null_count, total_expected,
+        "all complex (map) values must be null",
+    );
 }

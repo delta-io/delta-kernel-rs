@@ -903,10 +903,12 @@ pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, messa
 }
 
 /// Creates add file metadata for one or more files without partition values.
-/// Each tuple contains: (file_path, file_size, mod_time, num_records)
+///
+/// Each tuple contains `(file_path, file_size, mod_time, num_records)`. `num_records` is
+/// `Option<i64>` so callers can produce a NULL `stats.numRecords` cell.
 pub fn create_add_files_metadata(
     add_files_schema: &SchemaRef,
-    files: Vec<(&str, i64, i64, i64)>,
+    files: Vec<(&str, i64, i64, Option<i64>)>,
 ) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
     let num_files = files.len();
 

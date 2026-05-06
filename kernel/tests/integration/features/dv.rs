@@ -259,8 +259,8 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     let add_metadata = create_add_files_metadata(
         add_files_schema,
         vec![
-            (&data_file_path_1, parquet_data_len_1 as i64, 1000000, 10),
-            (&data_file_path_2, parquet_data_len_2 as i64, 1000000, 10),
+            (&data_file_path_1, parquet_data_len_1 as i64, 1000000, Some(10)),
+            (&data_file_path_2, parquet_data_len_2 as i64, 1000000, Some(10)),
         ],
     )?;
 

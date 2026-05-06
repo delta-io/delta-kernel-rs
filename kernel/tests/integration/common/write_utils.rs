@@ -399,7 +399,7 @@ pub async fn create_dv_table_with_files(
     let add_files_schema = txn.add_files_schema();
 
     // Build metadata for all files at once
-    let files: Vec<(&str, i64, i64, i64)> = file_paths
+    let files: Vec<(&str, i64, i64, Option<i64>)> = file_paths
         .iter()
         .enumerate()
         .map(|(i, &path)| {
@@ -407,7 +407,7 @@ pub async fn create_dv_table_with_files(
                 path,
                 1024 + i as i64 * 100, // size
                 1000000 + i as i64,    // mod_time
-                3,                     // num_records
+                Some(3),               // num_records
             )
         })
         .collect();
