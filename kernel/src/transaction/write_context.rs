@@ -399,7 +399,13 @@ mod tests {
 
     #[test]
     fn test_write_dir_cm_on_generates_different_prefixes_per_call() {
-        let wc = make_write_context_with_randomize(ColumnMappingMode::Name, vec![], HashMap::new(), false, 2);
+        let wc = make_write_context_with_randomize(
+            ColumnMappingMode::Name,
+            vec![],
+            HashMap::new(),
+            false,
+            2,
+        );
         let dirs: Vec<String> = (0..20).map(|_| wc.write_dir().path().to_string()).collect();
         let unique: HashSet<_> = dirs.iter().collect();
         assert!(
@@ -454,7 +460,8 @@ mod tests {
     #[case::name_mode(ColumnMappingMode::Name)]
     #[case::id_mode(ColumnMappingMode::Id)]
     fn test_write_dir_cm_on_prefix_is_uri_safe(#[case] cm_mode: ColumnMappingMode) {
-        let wc = make_write_context_with_randomize(cm_mode, vec!["p".into()], HashMap::new(), false, 2);
+        let wc =
+            make_write_context_with_randomize(cm_mode, vec!["p".into()], HashMap::new(), false, 2);
         let path = wc.write_dir().path().to_string();
         assert!(
             !path.contains('%'),
@@ -492,7 +499,11 @@ mod tests {
     /// pins the matrix described in the `write_dir` doc comment.
     #[rstest]
     fn test_write_dir_with_randomize_property(
-        #[values(ColumnMappingMode::None, ColumnMappingMode::Name, ColumnMappingMode::Id)]
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
         cm_mode: ColumnMappingMode,
         #[values(true, false)] randomize: bool,
         #[values(true, false)] is_partitioned: bool,
@@ -623,7 +634,13 @@ mod tests {
     #[case::error_outside_table_root("s3://bucket/other/abc.parquet", Err(()))]
     #[test]
     fn test_resolve_file_path(#[case] file_url: &str, #[case] expected: Result<&str, ()>) {
-        let wc = make_write_context_with_randomize(ColumnMappingMode::None, vec![], HashMap::new(), false, 2);
+        let wc = make_write_context_with_randomize(
+            ColumnMappingMode::None,
+            vec![],
+            HashMap::new(),
+            false,
+            2,
+        );
         let file = Url::parse(file_url).unwrap();
         match expected {
             Ok(exp) => assert_eq!(wc.resolve_file_path(&file).unwrap(), exp),
