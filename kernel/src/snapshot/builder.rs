@@ -329,16 +329,15 @@ mod tests {
     use itertools::Itertools;
     use serde_json::json;
     use test_utils::{actions_to_string, add_commit, TestAction};
-    use tracing_subscriber::util::SubscriberInitExt as _;
 
     use super::*;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
-    use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
+    use crate::metrics::MetricEvent;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-    use crate::utils::test_utils::CapturingReporter;
+    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     fn setup_test() -> (
         Arc<DefaultEngine<TokioBackgroundExecutor>>,
@@ -446,9 +445,7 @@ mod tests {
 
     fn measuring_reporter() -> (Arc<CapturingReporter>, tracing::subscriber::DefaultGuard) {
         let reporter = Arc::new(CapturingReporter::default());
-        let guard = tracing_subscriber::registry()
-            .with_metrics_reporter_layer(reporter.clone())
-            .set_default();
+        let guard = install_thread_local_metrics_reporter(reporter.clone());
         (reporter, guard)
     }
 

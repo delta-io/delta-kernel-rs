@@ -147,7 +147,9 @@ mod tests {
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::{load_test_table, parse_json_batch, CapturingReporter};
+    use crate::utils::test_utils::{
+        install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
+    };
     use crate::{PredicateRef, SnapshotRef};
 
     // ============================================================
@@ -952,9 +954,7 @@ mod tests {
     #[test]
     fn sequential_done_phase_emits_sequential_scan_metadata_completed_event() -> DeltaResult<()> {
         let reporter = Arc::new(CapturingReporter::default());
-        let _guard = tracing_subscriber::registry()
-            .with_metrics_reporter_layer(reporter.clone())
-            .set_default();
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let scan = snapshot.scan_builder().build()?;
@@ -991,9 +991,7 @@ mod tests {
     #[test]
     fn parallel_scan_emits_correlated_sequential_and_parallel_events() -> DeltaResult<()> {
         let reporter = Arc::new(CapturingReporter::default());
-        let _guard = tracing_subscriber::registry()
-            .with_metrics_reporter_layer(reporter.clone())
-            .set_default();
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
         let scan = snapshot.scan_builder().build()?;
