@@ -1428,21 +1428,21 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// On a table with `deletionVectors` + `rowTracking` enabled, insert data, apply DV and write a
-/// V2 sidecar checkpoint. Scan back and make sure the DV and row-tracking columns are present.
+/// On a table with `deletionVectors` enabled, insert data, apply DV and write a V2 sidecar
+/// checkpoint. Scan back and make sure the DV columns survive. Row tracking is intentionally
+/// not enabled here -- kernel currently blocks Remove-emitting transactions (including
+/// `update_deletion_vectors`) on row-tracking tables.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_v2_sidecar_preserves_dv_on_add() -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let schema = get_simple_schema();
 
-    // === Step 1: Create v2 + DV + row-tracking table. ===
+    // === Step 1: Create v2 + DV table. ===
     let _ = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties([
             ("delta.feature.v2Checkpoint", "supported"),
             ("delta.feature.deletionVectors", "supported"),
-            ("delta.enableRowTracking", "true"),
         ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
@@ -1516,10 +1516,6 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
     assert_eq!(read_i32(&["deletionVector", "offset"]), 7);
     assert_eq!(read_i32(&["deletionVector", "sizeInBytes"]), 42);
     assert_eq!(read_i64(&["deletionVector", "cardinality"]), 1);
-    // `update_deletion_vectors` preserves the original `baseRowId` (0 -- first file) and
-    // `defaultRowCommitVersion` (1 -- version that first wrote the file).
-    assert_eq!(read_i64(&["baseRowId"]), 0);
-    assert_eq!(read_i64(&["defaultRowCommitVersion"]), 1);
 
     Ok(())
 }

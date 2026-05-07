@@ -857,6 +857,23 @@ impl TableConfiguration {
         // TODO(#1125): Add icebergCompatV2 to the list when it is supported.
         self.is_feature_enabled(&TableFeature::IcebergCompatV3)
     }
+
+    /// Row-tracking is not fully supported for remove actions currently. Because kernel
+    /// doesn't support materializing stable row IDs yet.
+    /// TODO(#2538): Support materializing stable row IDs.
+    pub(crate) fn validate_feature_support_for_remove(&self) -> DeltaResult<()> {
+        // Row-tracking is a prerequisite for IcebergCompatV3. Technically we don't need
+        // IcebergCompatV3 in this list, just be conservative here to check both.
+        for feature in [TableFeature::RowTracking, TableFeature::IcebergCompatV3] {
+            if self.is_feature_enabled(&feature) {
+                return Err(Error::generic(format!(
+                    "Remove actions are not supported on tables with {} enabled yet",
+                    feature.as_ref(),
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

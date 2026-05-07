@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
@@ -14,24 +16,12 @@ use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-use test_utils::{create_table, engine_store_setup};
+use test_utils::{create_table, engine_store_setup, read_add_infos};
 use url::Url;
 
-/// Test that verifies baseRowId and defaultRowCommitVersion are correctly populated
-/// when row tracking is enabled on the table when a remove action is generated for a
-/// a file that had row tracking enabled.
-///
-/// This test creates a table with row tracking enabled, writes data to it, and then
-/// removes the data. It then verifies the remove action row ID fields. Propogating the
-/// values is required by the delta protocol [1].
-///
-/// This complements the existing test `test_remove_files_adds_expected_entries` which
-/// verifies that baseRowId and defaultRowCommitVersion are absent when row tracking is NOT enabled.
-///
-/// [1]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-row-tracking
+/// Validates that kernel rejects remove actions on row-tracking tables.
 #[tokio::test]
-async fn test_row_tracking_fields_in_add_and_remove_actions(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_row_tracking_blocks_remove_files() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
@@ -139,45 +129,89 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
 
     txn2.remove_files(remove_metadata);
 
-    let result2 = txn2.commit(engine_arc.as_ref())?;
-    match result2 {
-        CommitResult::CommittedTransaction(committed) => {
-            assert_eq!(committed.commit_version(), 2);
-        }
-        _ => panic!("Second commit should be committed"),
-    }
-
-    // ===== VERIFY: Check remove action contains row tracking fields =====
-    let commit2_url = tmp_test_dir_url
-        .join("test_row_tracking/_delta_log/00000000000000000002.json")
-        .unwrap();
-    let commit2 = store
-        .get(&Path::from_url_path(commit2_url.path()).unwrap())
-        .await?;
-
-    let parsed_commits2: Vec<_> = Deserializer::from_slice(&commit2.bytes().await?)
-        .into_iter::<serde_json::Value>()
-        .try_collect()?;
-
-    let remove_actions: Vec<_> = parsed_commits2
-        .iter()
-        .filter(|action| action.get("remove").is_some())
-        .collect();
-
-    assert_eq!(remove_actions.len(), 1);
-
-    let remove = &remove_actions[0]["remove"];
-
-    let remove_base_row_id = remove["baseRowId"].as_i64().expect("Missing baseRowId");
-    assert_eq!(remove_base_row_id, base_row_id);
-
-    let remove_default_row_commit_version = remove["defaultRowCommitVersion"]
-        .as_i64()
-        .expect("Missing defaultRowCommitVersion");
-    assert_eq!(
-        remove_default_row_commit_version,
-        default_row_commit_version
+    // ===== VERIFY: kernel rejects the commit because row tracking blocks remove actions. =====
+    let err = txn2
+        .commit(engine_arc.as_ref())
+        .expect_err("commit must fail when remove_files is staged on a row-tracking table");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Remove actions are not supported") && msg.contains("rowTracking"),
+        "expected remove-block error mentioning rowTracking, got: {msg}",
     );
 
+    Ok(())
+}
+
+/// Validates that kernel rejects DV updates on row-tracking tables.
+/// DV updates internally emit Remove+Add pairs, so the same gate fires.
+#[tokio::test]
+async fn test_row_tracking_blocks_dv_update() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+    let (store, engine, table_location) = engine_store_setup("test_rt_dv_block", None);
+    let engine = Arc::new(engine);
+    let table_url = create_table(
+        store.clone(),
+        table_location,
+        schema.clone(),
+        &[],
+        true,
+        vec!["deletionVectors"],
+        vec!["rowTracking", "domainMetadata", "deletionVectors"],
+    )
+    .await?;
+
+    // Blind-append one file.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    test_utils::insert_data(
+        snapshot,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_committed();
+
+    // Stage a DV update for the freshly-added file.
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let file_path = read_add_infos(&snapshot, engine.as_ref())
+        .map_err(|e| format!("read_add_infos: {e}"))?
+        .into_iter()
+        .next()
+        .expect("one add file")
+        .path;
+    let scan_files: Vec<FilteredEngineData> = snapshot
+        .clone()
+        .scan_builder()
+        .build()?
+        .scan_metadata(engine.as_ref())?
+        .map(|sm| sm.map(|x| x.scan_files))
+        .collect::<Result<_, _>>()?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_data_change(true);
+    txn.update_deletion_vectors(
+        HashMap::from([(
+            file_path,
+            DeletionVectorDescriptor {
+                storage_type: DeletionVectorStorageType::Inline,
+                path_or_inline_dv: "AAAA".to_string(),
+                offset: None,
+                size_in_bytes: 0,
+                cardinality: 0,
+            },
+        )]),
+        scan_files.into_iter().map(Ok),
+    )?;
+
+    let msg = txn
+        .commit(engine.as_ref())
+        .expect_err("DV update must be rejected on row-tracking tables")
+        .to_string();
+    assert!(
+        msg.contains("rowTracking"),
+        "expected rowTracking-block error, got: {msg}",
+    );
     Ok(())
 }

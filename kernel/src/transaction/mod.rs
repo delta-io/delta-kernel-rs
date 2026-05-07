@@ -346,6 +346,13 @@ impl<S> Transaction<S> {
             num_remove_files = self.remove_files_metadata.len(),
             num_dv_updates = self.dv_matched_files.len(),
         );
+
+        // Some table features are not supported for remove actions yet, reject here.
+        if !self.remove_files_metadata.is_empty() || !self.dv_matched_files.is_empty() {
+            self.effective_table_config
+                .validate_feature_support_for_remove()?;
+        }
+
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
         // step 2 to fail early on duplicate transaction appIds
