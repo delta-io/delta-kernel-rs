@@ -119,6 +119,13 @@ impl<'a> SchemaTransform<'a> for ValidateForWrite {
     }
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
+        // Reject void inside a struct nested in Array or Map. `StripVoidFields` can drop
+        // the field from the physical schema, but the logical-to-physical write transform
+        // built by `add_void_stripping_inner` descends only through struct fields. Allowing
+        // this case would leave the runtime expression passing the void field through while
+        // the physical schema no longer expects it, putting the two out of sync at write
+        // time. Lifting this restriction requires extending the runtime transform to descend
+        // into Array elements and Map keys/values.
         if self.container_depth > 0 && *field.data_type() == DataType::VOID {
             return Err(Error::schema(
                 "Void type is not allowed inside a struct nested in Array or Map",
