@@ -97,10 +97,14 @@ impl Engine for SyncEngine {
 /// listed [`Path`]s back into URLs.
 ///
 /// When `default_store` is `None`, only `file://` URLs are accepted: a [`LocalFileSystem`]
-/// rooted at the URL's filesystem root (e.g. `/` on Unix, `C:\` on Windows) is created and
-/// the returned path is relative to that root. This avoids a known url-crate quirk where
-/// extending `file:///` with a Windows drive-letter segment (`["D:", "a", ...]`) drops the
-/// drive letter on Windows.
+/// is constructed rooted at the URL's resolved directory (the URL itself if it ends with
+/// `/`, otherwise the parent), and the returned path is the simple filename (or empty for
+/// directory URLs). Rooting at the parent avoids a url-crate quirk where path segments
+/// containing reserved-looking characters (e.g. `:` in Windows drive letters or `~` in 8.3
+/// short names like `RUNNER~1`) get URL-encoded by `path_segments_mut.extend(...)` but not
+/// decoded back by `to_file_path`. By keeping such characters inside the store's base URL
+/// (which is built once from a `PathBuf` and not re-processed), only simple filenames flow
+/// through the broken round-trip.
 pub(super) fn resolve_scope(
     default_store: Option<&Arc<DynObjectStore>>,
     url: &Url,
@@ -116,58 +120,39 @@ pub(super) fn resolve_scope(
             "SyncEngine without an explicit store can only access file:// URLs, got: {url}"
         )));
     }
-    let raw_path = url
+    let file_path = url
         .to_file_path()
         .map_err(|()| Error::generic(format!("Invalid file URL: {url}")))?;
-    // On Windows the path may contain 8.3 short-name components such as `RUNNER~1`. The url
-    // crate URL-encodes `~` to `%7E` when round-tripping through `path_segments_mut`, but
-    // `to_file_path` does not decode it back, so `LocalFileSystem` ends up looking up the
-    // wrong path. Canonicalize so short names get resolved to their long form.
-    let file_path = canonicalize_for_localfs(&raw_path)?;
-    // Every absolute path has at least one ancestor: itself. The last ancestor is the
-    // filesystem root (`/` on Unix, drive root like `C:\` on Windows).
-    let root = file_path
-        .ancestors()
-        .last()
-        .expect("PathBuf::ancestors always yields at least one element");
-    let base_url = Url::from_directory_path(root)
-        .map_err(|()| Error::generic(format!("Could not URL-encode root {root:?}")))?;
-    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(root)?);
+    // Use the deepest existing ancestor of the URL's directory as the store prefix:
+    // `LocalFileSystem::new_with_prefix` canonicalizes its argument (which requires the path
+    // to exist), and operating on a non-existent path is a valid case for `list_from` on a
+    // not-yet-written `_delta_log/` directory or `head` on a missing file.
+    let target_dir = if url.path().ends_with('/') {
+        file_path.clone()
+    } else {
+        file_path
+            .parent()
+            .ok_or_else(|| Error::generic(format!("File URL has no parent: {url}")))?
+            .to_path_buf()
+    };
+    let mut prefix = target_dir.as_path();
+    while !prefix.exists() {
+        prefix = prefix
+            .parent()
+            .ok_or_else(|| Error::generic(format!("No existing ancestor for {target_dir:?}")))?;
+    }
+    let prefix = prefix.to_path_buf();
     let relative = file_path
-        .strip_prefix(root)
-        .map_err(|e| Error::generic(format!("Failed to strip root from path: {e}")))?;
+        .strip_prefix(&prefix)
+        .map_err(|e| Error::generic(format!("Failed to strip prefix: {e}")))?;
     let path = Path::from_iter(relative.components().filter_map(|c| match c {
         std::path::Component::Normal(s) => s.to_str().map(String::from),
         _ => None,
     }));
+    let base_url = Url::from_directory_path(&prefix)
+        .map_err(|()| Error::generic(format!("Could not URL-encode prefix {prefix:?}")))?;
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(&prefix)?);
     Ok((store, base_url, path))
-}
-
-/// On Windows, canonicalize `path` (or its parent if `path` itself does not exist) so 8.3
-/// short-name components such as `RUNNER~1` are resolved to their long form. The url crate
-/// URL-encodes `~` to `%7E` when round-tripping a path through `path_segments_mut`, but
-/// `to_file_path` does not decode it back, so `LocalFileSystem` would otherwise look up the
-/// wrong path. On non-Windows platforms canonicalization would resolve symlinks (e.g.
-/// `/var` -> `/private/var` on macOS) and break the URL round-trip, so it is a no-op.
-fn canonicalize_for_localfs(path: &std::path::Path) -> DeltaResult<std::path::PathBuf> {
-    #[cfg(not(windows))]
-    {
-        Ok(path.to_path_buf())
-    }
-    #[cfg(windows)]
-    {
-        if path.exists() {
-            return Ok(path.canonicalize()?);
-        }
-        let parent = path
-            .parent()
-            .ok_or_else(|| Error::generic(format!("Path has no parent: {path:?}")))?;
-        let canonical_parent = parent.canonicalize()?;
-        Ok(match path.file_name() {
-            Some(name) => canonical_parent.join(name),
-            None => canonical_parent,
-        })
-    }
 }
 
 /// Fetch the contents of a file via [`resolve_scope`] and return them as bytes.
