@@ -14,7 +14,6 @@ use delta_kernel::arrow::datatypes::{
 };
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
@@ -209,6 +208,7 @@ async fn v3_commit_validates_num_records(
     // Intentionally set `delta.columnMapping.mode=id`, since the `min` case already covers the
     // V3-default `name` mode.
     /* extra_props */ &[("delta.columnMapping.mode", "id")],
+    // Some features are enabled via schema content (e.g. TS_NTZ) so not in this list.
     /* enable_features */ &[
         "deletionVectors", "inCommitTimestamp", "changeDataFeed", "appendOnly",
         "v2Checkpoint", "vacuumProtocolCheck", "invariants",
@@ -235,9 +235,8 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
 
     // === Create partitioned V3 table ===
     let schema = nested_schema_with_all_delta_types();
-    // Features without an enable property are added via `delta.feature.X=supported`. Build
-    // the signal strings up front so the property tuples below can borrow them.
-    let signal_props: Vec<(String, String)> = enable_features
+    // Features without an enable property are added via `delta.feature.X=supported`.
+    let feature_enabled_by_supported: Vec<(String, String)> = enable_features
         .iter()
         .filter(|f| enable_property_for(f).is_none())
         .map(|f| (format!("delta.feature.{f}"), "supported".to_string()))
@@ -249,7 +248,11 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
             .iter()
             .filter_map(|f| enable_property_for(f).map(|p| (p, "true"))),
     );
-    props.extend(signal_props.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    props.extend(
+        feature_enabled_by_supported
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
     let _ = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties(props)
         .with_data_layout(DataLayout::partitioned(["region"]))
@@ -298,11 +301,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
 
     // === Per-data-file validations ===
     let add_actions = read_add_infos(&final_snap, engine.as_ref()).unwrap();
-    assert_eq!(
-        add_actions.len(),
-        8,
-        "expected 4 outer iters x 2 partitions = 8 add files",
-    );
+    assert_eq!(add_actions.len(), 8, "expected 8 add files",);
     let logical_schema = final_snap.schema();
     for add in &add_actions {
         let parquet_url = table_url.join(&add.path).unwrap();
