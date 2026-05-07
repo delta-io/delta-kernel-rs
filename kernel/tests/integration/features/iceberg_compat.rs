@@ -186,9 +186,9 @@ async fn v3_commit_validates_num_records(
     }
 }
 
-/// V3 partitioned end-to-end: create + 4 commits with a checkpoint between, then validate
-/// protocol features, parquet field IDs (top-level + nested), partition materialization,
-/// timestamp physical type, and exact scan content.
+/// V3 partitioned end-to-end: create + 8 commits with a checkpoint in the middle, then validate
+/// protocol features, parquet field IDs (top-level + nested), partition materialization, timestamp
+/// physical type, and exact scan content.
 ///
 /// IcebergCompatV3 supports all delta types, so we use a schema with all delta types here.
 /// Two test cases:
