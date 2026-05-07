@@ -7,7 +7,6 @@ use delta_kernel::arrow::array::{Array, Int32Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{column_name, ColumnName, Scalar};
 use delta_kernel::object_store::memory::InMemory;
