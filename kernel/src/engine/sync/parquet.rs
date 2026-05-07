@@ -1,10 +1,9 @@
-use std::fs::File;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use url::Url;
 
-use super::{get_bytes, read_files};
+use super::{get_bytes, read_files, resolve_scope};
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
@@ -32,12 +31,8 @@ pub(crate) struct SyncParquetHandler {
 }
 
 impl SyncParquetHandler {
-    pub(crate) fn new() -> Self {
-        Self { store: None }
-    }
-
-    pub(crate) fn with_store(store: Arc<DynObjectStore>) -> Self {
-        Self { store: Some(store) }
+    pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
+        Self { store }
     }
 }
 
@@ -95,78 +90,54 @@ impl ParquetHandler for SyncParquetHandler {
 
     /// Writes engine data to a Parquet file at the specified location.
     ///
-    /// This implementation uses synchronous file I/O to write the Parquet file.
+    /// Buffers the entire file in memory and `put`s it to the underlying [`ObjectStore`].
     /// If a file already exists at the given location, it will be overwritten.
     ///
     /// # Parameters
     ///
-    /// - `location` - The full URL path where the Parquet file should be written (e.g., `file:///path/to/file.parquet`).
+    /// - `location` - The full URL path where the Parquet file should be written (e.g. `file:///path/to/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
-    ///
-    /// # Returns
-    ///
-    /// A [`DeltaResult`] indicating success or failure.
     fn write_parquet_file(
         &self,
         location: Url,
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn crate::EngineData>>> + Send>,
     ) -> DeltaResult<()> {
-        // Get first batch to initialize writer with schema
         let first_batch = data.next().ok_or_else(|| {
             crate::Error::generic("Cannot write parquet file with empty data iterator")
         })??;
         let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
-        if let Some(store) = &self.store {
-            // Write to an in-memory buffer, then put to store
-            let mut buf = Vec::new();
-            let mut writer = ArrowWriter::try_new_with_options(
-                &mut buf,
-                first_record_batch.schema(),
-                writer_options(),
-            )?;
-            writer.write(&first_record_batch)?;
-            for result in data {
-                let engine_data = result?;
-                let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
-                let batch: crate::arrow::array::RecordBatch = (*arrow_data).into();
-                writer.write(&batch)?;
-            }
-            writer.close()?;
-
-            let object_path = crate::object_store::path::Path::from(location.path());
-            futures::executor::block_on(store.put(&object_path, buf.into()))?;
-            return Ok(());
-        }
-
-        // Local filesystem path
-        let path = location
-            .to_file_path()
-            .map_err(|_| crate::Error::generic(format!("Invalid file URL: {location}")))?;
-
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-
-        let mut file = File::create(&path)?;
+        let mut buf = Vec::new();
         let mut writer = ArrowWriter::try_new_with_options(
-            &mut file,
+            &mut buf,
             first_record_batch.schema(),
             writer_options(),
         )?;
         writer.write(&first_record_batch)?;
-
         for result in data {
             let engine_data = result?;
             let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
             let batch: crate::arrow::array::RecordBatch = (*arrow_data).into();
             writer.write(&batch)?;
         }
-
         writer.close()?;
+
+        let (store, _, object_path) = resolve_scope(self.store.as_ref(), &location)?;
+
+        // For local writes, ensure parent directories exist; `LocalFileSystem::put` does not
+        // create them. No-op for non-file:// URLs.
+        if location.scheme() == "file" {
+            if let Ok(file_path) = location.to_file_path() {
+                if let Some(parent) = file_path.parent() {
+                    if !parent.exists() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                }
+            }
+        }
+
+        futures::executor::block_on(store.put(&object_path, buf.into()))?;
         Ok(())
     }
 
@@ -182,6 +153,7 @@ impl ParquetHandler for SyncParquetHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::sync::Arc;
 
     use tempfile::tempdir;
@@ -211,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file() {
-        let handler = SyncParquetHandler::new();
+        let handler = SyncParquetHandler::new(None);
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -270,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file_multiple_batches() {
-        let handler = SyncParquetHandler::new();
+        let handler = SyncParquetHandler::new(None);
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_multi_batch.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -342,7 +314,7 @@ mod tests {
 
     #[test]
     fn write_parquet_creates_parent_directories() {
-        let handler = SyncParquetHandler::new();
+        let handler = SyncParquetHandler::new(None);
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("a/b/c/test.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -356,7 +328,7 @@ mod tests {
     #[test]
     fn parquet_store_write_and_footer_roundtrip() {
         let store = Arc::new(crate::object_store::memory::InMemory::new());
-        let handler = SyncParquetHandler::with_store(store);
+        let handler = SyncParquetHandler::new(Some(store));
         let url = Url::parse("memory:///t/data.parquet").unwrap();
 
         handler

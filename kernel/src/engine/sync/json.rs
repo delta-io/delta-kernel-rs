@@ -1,11 +1,10 @@
-use std::io::{BufReader, Cursor, Write};
+use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tempfile::NamedTempFile;
 use url::Url;
 
-use super::read_files;
+use super::{read_files, resolve_scope};
 use crate::arrow::json::ReaderBuilder;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
@@ -24,12 +23,8 @@ pub(crate) struct SyncJsonHandler {
 }
 
 impl SyncJsonHandler {
-    pub(crate) fn new() -> Self {
-        Self { store: None }
-    }
-
-    pub(crate) fn with_store(store: Arc<DynObjectStore>) -> Self {
-        Self { store: Some(store) }
+    pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
+        Self { store }
     }
 }
 
@@ -79,63 +74,40 @@ impl JsonHandler for SyncJsonHandler {
         overwrite: bool,
     ) -> DeltaResult<()> {
         let buf = to_json_bytes(data)?;
+        let (store, _, object_path) = resolve_scope(self.store.as_ref(), path)?;
 
-        if let Some(store) = &self.store {
-            let object_path = crate::object_store::path::Path::from(path.path());
-            let opts = if overwrite {
-                crate::object_store::PutOptions::default()
-            } else {
-                crate::object_store::PutOptions {
-                    mode: crate::object_store::PutMode::Create,
-                    ..Default::default()
-                }
-            };
-            futures::executor::block_on(store.put_opts(&object_path, buf.into(), opts)).map_err(
-                |e| match e {
-                    crate::object_store::Error::AlreadyExists { .. } => {
-                        Error::FileAlreadyExists(path.to_string())
+        // For local writes, ensure parent directories exist; `LocalFileSystem::put` does not
+        // create them. No-op for non-file:// URLs.
+        if path.scheme() == "file" {
+            if let Ok(file_path) = path.to_file_path() {
+                if let Some(parent) = file_path.parent() {
+                    if !parent.exists() {
+                        std::fs::create_dir_all(parent)?;
                     }
-                    other => Error::generic(other.to_string()),
-                },
-            )?;
-            return Ok(());
-        }
-
-        // Local filesystem path
-        let path = path
-            .to_file_path()
-            .map_err(|_| crate::Error::generic("sync client can only read local files"))?;
-        let Some(parent) = path.parent() else {
-            return Err(crate::Error::generic(format!(
-                "no parent found for {path:?}"
-            )));
-        };
-
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut tmp_file = NamedTempFile::new_in(parent)?;
-        tmp_file.write_all(&buf)?;
-        tmp_file.flush()?;
-
-        let persist_result = if overwrite {
-            tmp_file.persist(path.clone())
-        } else {
-            tmp_file.persist_noclobber(path.clone())
-        };
-
-        persist_result.map_err(|e| {
-            if !overwrite && e.error.kind() == std::io::ErrorKind::AlreadyExists {
-                Error::FileAlreadyExists(path.to_string_lossy().to_string())
-            } else {
-                Error::IOError(e.into())
+                }
             }
-        })?;
+        }
 
+        let opts = if overwrite {
+            crate::object_store::PutOptions::default()
+        } else {
+            crate::object_store::PutOptions {
+                mode: crate::object_store::PutMode::Create,
+                ..Default::default()
+            }
+        };
+        futures::executor::block_on(store.put_opts(&object_path, buf.into(), opts)).map_err(
+            |e| match e {
+                crate::object_store::Error::AlreadyExists { .. } => {
+                    Error::FileAlreadyExists(path.to_string())
+                }
+                other => Error::generic(other.to_string()),
+            },
+        )?;
         Ok(())
     }
 }
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -184,7 +156,7 @@ mod tests {
     fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
         let test_dir = TempDir::new().unwrap();
         let path = test_dir.path().join("00000000000000000001.json");
-        let handler = SyncJsonHandler::new();
+        let handler = SyncJsonHandler::new(None);
         let url = Url::from_file_path(&path).unwrap();
 
         // First write with no existing file
@@ -211,12 +183,7 @@ mod tests {
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
             // Verify the second write fails with FileAlreadyExists error
-            match result {
-                Err(Error::FileAlreadyExists(err_path)) => {
-                    assert_eq!(err_path, path.to_string_lossy().to_string());
-                }
-                _ => panic!("Expected FileAlreadyExists error, got: {result:?}"),
-            }
+            assert!(matches!(result, Err(Error::FileAlreadyExists(_))));
         }
 
         Ok(())

@@ -3578,7 +3578,7 @@ fn test_stats_parsed_mixed_with_one_incompatible_rejects_all() {
 
 /// Creates a checkpoint batch with `add.partitionValues_parsed` in the parquet schema.
 fn add_batch_with_partition_values_parsed(output_schema: SchemaRef) -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler::new();
+    let handler = SyncJsonHandler::new(None);
     let json_strings: StringArray = vec![
         r#"{"add":{"path":"part-00000.parquet","partitionValues":{"id":"1"},"partitionValues_parsed":{"id":1},"size":635,"modificationTime":1677811178336,"dataChange":true}}"#,
         r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["id"],"configuration":{},"createdTime":1677811175819}}"#,

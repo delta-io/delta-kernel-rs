@@ -29,22 +29,24 @@ use crate::{EngineData, ParquetHandler};
 
 #[test]
 fn test_reads_footer() {
-    super::tests::test_parquet_handler_reads_footer(&SyncParquetHandler::new());
+    super::tests::test_parquet_handler_reads_footer(&SyncParquetHandler::new(None));
 }
 
 #[test]
 fn test_footer_errors_on_missing_file() {
-    super::tests::test_parquet_handler_footer_errors_on_missing_file(&SyncParquetHandler::new());
+    super::tests::test_parquet_handler_footer_errors_on_missing_file(&SyncParquetHandler::new(
+        None,
+    ));
 }
 
 #[test]
 fn test_footer_preserves_field_ids() {
-    super::tests::test_parquet_handler_footer_preserves_field_ids(&SyncParquetHandler::new());
+    super::tests::test_parquet_handler_footer_preserves_field_ids(&SyncParquetHandler::new(None));
 }
 
 #[test]
 fn test_write_always_overwrites() {
-    super::tests::test_parquet_handler_write_always_overwrites(&SyncParquetHandler::new());
+    super::tests::test_parquet_handler_write_always_overwrites(&SyncParquetHandler::new(None));
 }
 
 // Both kernel engines configure their parquet readers and writers to skip the Arrow IPC schema
@@ -119,15 +121,15 @@ fn assert_reads_file_with_arrow_schema_metadata(handler: &dyn ParquetHandler) {
 
 #[test]
 fn test_write_file_omits_arrow_schema() {
-    assert_no_arrow_schema(&SyncParquetHandler::new());
+    assert_no_arrow_schema(&SyncParquetHandler::new(None));
 }
 
 #[test]
 fn test_reads_file_with_arrow_schema_metadata() {
-    assert_reads_file_with_arrow_schema_metadata(&SyncParquetHandler::new());
+    assert_reads_file_with_arrow_schema_metadata(&SyncParquetHandler::new(None));
 }
 
 #[test]
 fn test_json_file_path_contract() {
-    super::tests::test_json_handler_file_path_contract(&SyncJsonHandler::new());
+    super::tests::test_json_handler_file_path_contract(&SyncJsonHandler::new(None));
 }

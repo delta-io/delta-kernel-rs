@@ -1,25 +1,30 @@
 //! A simple, single threaded, test-only [`Engine`].
 //!
-//! Supports both local filesystem and [`ObjectStore`]-backed reads. Use [`SyncEngine::new`] for
-//! local-only access, or [`SyncEngine::new_with_store`] to read from any [`ObjectStore`]
-//! implementation (e.g. `InMemory`).
+//! All I/O goes through an [`ObjectStore`]. [`SyncEngine::new`] uses a [`LocalFileSystem`]
+//! built lazily per-URL (rooted at the URL's drive on Windows, or `/` on Unix), so any
+//! `file://` URL is supported. [`SyncEngine::new_with_store`] takes any other store
+//! (e.g. `InMemory`) and uses it directly for all URLs.
 //!
-//! Async work in `ObjectStore` calls is driven via [`futures::executor::block_on`], which is
-//! sufficient for stores that do not require a tokio reactor (e.g. `LocalFileSystem`,
-//! `InMemory`). Cloud-backed stores are NOT supported here -- they would deadlock because
-//! `block_on` parks the calling thread with no reactor to wake it. That's acceptable for this
-//! test-only engine; production code should use [`DefaultEngine`] instead.
+//! Async work is driven via [`futures::executor::block_on`], which is sufficient for stores
+//! that do not require a tokio reactor (`LocalFileSystem`, `InMemory`). Cloud-backed stores
+//! are NOT supported here -- they would deadlock because `block_on` parks the calling thread
+//! with no reactor to wake it. That's acceptable for this test-only engine; production code
+//! should use [`DefaultEngine`] instead.
 //!
 //! [`DefaultEngine`]: crate::engine::default::DefaultEngine
+//! [`LocalFileSystem`]: crate::object_store::local::LocalFileSystem
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use itertools::Itertools;
 use tracing::debug;
+use url::Url;
 
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
+use crate::object_store::local::LocalFileSystem;
+use crate::object_store::path::Path;
 use crate::object_store::DynObjectStore;
 // `ObjectStoreExt` is needed for `store.get()` etc. in arrow-58 mode where these methods moved
 // off the `ObjectStore` trait. In arrow-57 mode the compat shim makes the import a no-op, so
@@ -36,8 +41,7 @@ mod parquet;
 pub(crate) use parquet::SyncParquetHandler;
 mod storage;
 
-/// A simple (test-only) implementation of [`Engine`]. Supports both local filesystem reads
-/// via [`SyncEngine::new`] and [`ObjectStore`]-backed reads via [`SyncEngine::new_with_store`].
+/// A simple (test-only) implementation of [`Engine`]. See module docs for supported stores.
 pub(crate) struct SyncEngine {
     storage_handler: Arc<storage::SyncStorageHandler>,
     json_handler: Arc<json::SyncJsonHandler>,
@@ -46,24 +50,23 @@ pub(crate) struct SyncEngine {
 }
 
 impl SyncEngine {
-    /// Create a SyncEngine that only reads from the local filesystem.
+    /// Create a SyncEngine that reads from the local filesystem via [`LocalFileSystem`].
     pub(crate) fn new() -> Self {
-        SyncEngine {
-            storage_handler: Arc::new(storage::SyncStorageHandler::new()),
-            json_handler: Arc::new(json::SyncJsonHandler::new()),
-            parquet_handler: Arc::new(parquet::SyncParquetHandler::new()),
-            evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
-        }
+        Self::new_inner(None)
     }
 
-    /// Create a SyncEngine backed by an [`ObjectStore`]. All I/O is performed synchronously
-    /// via [`futures::executor::block_on`]. See module docs for the deadlock caveat on
+    /// Create a SyncEngine backed by `store`. All I/O is performed synchronously via
+    /// [`futures::executor::block_on`]. See module docs for the deadlock caveat on
     /// reactor-dependent stores.
     pub(crate) fn new_with_store(store: Arc<DynObjectStore>) -> Self {
+        Self::new_inner(Some(store))
+    }
+
+    fn new_inner(store: Option<Arc<DynObjectStore>>) -> Self {
         SyncEngine {
-            storage_handler: Arc::new(storage::SyncStorageHandler::with_store(store.clone())),
-            json_handler: Arc::new(json::SyncJsonHandler::with_store(store.clone())),
-            parquet_handler: Arc::new(parquet::SyncParquetHandler::with_store(store)),
+            storage_handler: Arc::new(storage::SyncStorageHandler::new(store.clone())),
+            json_handler: Arc::new(json::SyncJsonHandler::new(store.clone())),
+            parquet_handler: Arc::new(parquet::SyncParquetHandler::new(store)),
             evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
         }
     }
@@ -87,27 +90,65 @@ impl Engine for SyncEngine {
     }
 }
 
-/// Fetch the contents of a file synchronously, either from an [`ObjectStore`] when present or
-/// from the local filesystem otherwise.
-pub(super) fn get_bytes(
-    store: Option<&Arc<DynObjectStore>>,
-    location: &url::Url,
-) -> DeltaResult<Bytes> {
-    if let Some(store) = store {
-        let path = crate::object_store::path::Path::from(location.path());
-        let get_result = futures::executor::block_on(store.get(&path))?;
-        let bytes = futures::executor::block_on(get_result.bytes())?;
-        return Ok(bytes);
+/// Resolve the store, base URL, and path for `url`.
+///
+/// When `default_store` is `Some`, the user-provided store is returned with `url`'s decoded
+/// path. The base URL is `url` with its path replaced by `/`, suitable for re-joining
+/// listed [`Path`]s back into URLs.
+///
+/// When `default_store` is `None`, only `file://` URLs are accepted: a [`LocalFileSystem`]
+/// rooted at the URL's filesystem root (e.g. `/` on Unix, `C:\` on Windows) is created and
+/// the returned path is relative to that root. This avoids a known url-crate quirk where
+/// extending `file:///` with a Windows drive-letter segment (`["D:", "a", ...]`) drops the
+/// drive letter on Windows.
+pub(super) fn resolve_scope(
+    default_store: Option<&Arc<DynObjectStore>>,
+    url: &Url,
+) -> DeltaResult<(Arc<DynObjectStore>, Url, Path)> {
+    if let Some(store) = default_store {
+        let mut base_url = url.clone();
+        base_url.set_path("/");
+        let path = Path::from_url_path(url.path())?;
+        return Ok((store.clone(), base_url, path));
     }
-    let path = location
+    if url.scheme() != "file" {
+        return Err(Error::generic(format!(
+            "SyncEngine without an explicit store can only access file:// URLs, got: {url}"
+        )));
+    }
+    let file_path = url
         .to_file_path()
-        .map_err(|_| Error::generic("can only read local files"))?;
-    Ok(std::fs::read(path)?.into())
+        .map_err(|()| Error::generic(format!("Invalid file URL: {url}")))?;
+    // Every absolute path has at least one ancestor: itself. The last ancestor is the
+    // filesystem root (`/` on Unix, drive root like `D:\` on Windows).
+    let root = file_path
+        .ancestors()
+        .last()
+        .expect("PathBuf::ancestors always yields at least one element");
+    let base_url = Url::from_directory_path(root)
+        .map_err(|()| Error::generic(format!("Could not URL-encode root {root:?}")))?;
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(root)?);
+    let relative = file_path
+        .strip_prefix(root)
+        .map_err(|e| Error::generic(format!("Failed to strip root from path: {e}")))?;
+    let path = Path::from_iter(relative.components().filter_map(|c| match c {
+        std::path::Component::Normal(s) => s.to_str().map(String::from),
+        _ => None,
+    }));
+    Ok((store, base_url, path))
 }
 
-/// Read each file as bytes (from store or local FS) and feed it to `try_create_from_bytes` to
-/// produce data batches. Consolidates the dispatch so callers don't have to branch on the
-/// presence of an [`ObjectStore`].
+/// Fetch the contents of a file via [`resolve_scope`] and return them as bytes.
+pub(super) fn get_bytes(
+    default_store: Option<&Arc<DynObjectStore>>,
+    location: &Url,
+) -> DeltaResult<Bytes> {
+    let (store, _, path) = resolve_scope(default_store, location)?;
+    let get_result = futures::executor::block_on(store.get(&path))?;
+    Ok(futures::executor::block_on(get_result.bytes())?)
+}
+
+/// Read each file as bytes and feed it to `try_create_from_bytes` to produce data batches.
 fn read_files<F, I>(
     store: Option<&Arc<DynObjectStore>>,
     files: &[FileMeta],
@@ -145,7 +186,7 @@ mod tests {
     #[test]
     fn test_sync_engine() {
         let tmp = tempfile::tempdir().unwrap();
-        let url = url::Url::from_directory_path(tmp.path()).unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
         let engine = SyncEngine::new();
         test_arrow_engine(&engine, &url);
     }
@@ -154,7 +195,7 @@ mod tests {
     fn test_sync_engine_with_store() {
         let store = Arc::new(crate::object_store::memory::InMemory::new());
         let engine = SyncEngine::new_with_store(store);
-        let url = url::Url::parse("memory:///test/").unwrap();
+        let url = Url::parse("memory:///test/").unwrap();
         test_arrow_engine(&engine, &url);
     }
 }
