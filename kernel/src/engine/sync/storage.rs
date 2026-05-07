@@ -29,34 +29,29 @@ impl StorageHandler for SyncStorageHandler {
         &self,
         url_path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        let (store, base_url, path) = resolve_scope(self.store.as_ref(), url_path)?;
-        let url_is_directory = url_path.path().ends_with('/');
+        let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)?;
 
-        // If the URL is a directory, list everything underneath. Otherwise treat the final
-        // segment as a lower-bound filename and list its parent. We use recursive `list` (not
-        // `list_with_delimiter`) so subdirectories are walked.
-        let (list_prefix, filter_path) = if url_is_directory {
-            (path, None)
+        // For directory URLs, prefix == offset and the offset acts as a lower bound that still
+        // includes everything underneath (since `dir/a` > `dir` lexicographically). For file
+        // URLs, the prefix is the parent directory and the offset filters out files at-or-below.
+        let prefix = if url_path.path().ends_with('/') {
+            offset.clone()
         } else {
-            let parent = path
-                .parts()
-                .take(path.parts().count().saturating_sub(1))
-                .collect::<Path>();
-            (parent, Some(path.to_string()))
+            let mut parts: Vec<_> = offset.parts().collect();
+            parts.pop();
+            Path::from_iter(parts)
         };
 
-        let mut metas: Vec<_> =
-            futures::executor::block_on(store.list(Some(&list_prefix)).collect::<Vec<_>>())
-                .into_iter()
-                .filter_map(|res| match res {
-                    Ok(meta) => filter_path
-                        .as_ref()
-                        .is_none_or(|fp| meta.location.to_string() > *fp)
-                        .then_some(Ok(meta)),
-                    Err(e) => Some(Err(e)),
-                })
-                .collect::<Result<_, _>>()?;
-        metas.sort_by(|a, b| a.location.cmp(&b.location));
+        // LocalFileSystem and InMemory do not return sorted listings, so we collect and sort
+        // to give callers a deterministic order.
+        let mut metas: Vec<_> = futures::executor::block_on(
+            store
+                .list_with_offset(Some(&prefix), &offset)
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .collect::<Result<_, _>>()?;
+        metas.sort_unstable_by(|a, b| a.location.cmp(&b.location));
 
         let iter = metas.into_iter().map(move |meta| {
             let location = base_url
