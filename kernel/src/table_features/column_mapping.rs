@@ -357,8 +357,7 @@ pub(crate) fn try_assign_flat_column_mapping_info(
     Ok(new_field)
 }
 
-/// Recurses through `data_type`, descending into struct/array/map members so any nested
-/// StructFields receive CM id + physical name via [`assign_column_mapping_metadata`].
+/// Process nested data types to assign flat column mapping metadata to any nested struct fields.
 fn flat_cm_info_for_nested_data_type(
     data_type: &DataType,
     max_id: &mut i64,
@@ -467,6 +466,7 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> DeltaResult<St
     StructType::try_new(new_fields)
 }
 
+// Get the physical name for a field. Error if the field is missing the physical name annotation.
 fn expect_physical_name(field: &StructField) -> DeltaResult<String> {
     match field
         .metadata
@@ -474,8 +474,7 @@ fn expect_physical_name(field: &StructField) -> DeltaResult<String> {
     {
         Some(MetadataValue::String(s)) => Ok(s.clone()),
         _ => Err(Error::internal_error(format!(
-            "nested-id assignment requires every StructField to already carry a physical \
-             name; '{}' is missing one",
+            "Expect field '{}' to have a physical name annotation",
             field.name,
         ))),
     }
@@ -602,7 +601,9 @@ mod tests {
     use super::*;
     use crate::expressions::ColumnName;
     use crate::schema::{DataType, MetadataValue, StructField, StructType};
-    use crate::utils::test_utils::{make_test_tc, test_deep_nested_schema_missing_leaf_cm};
+    use crate::utils::test_utils::{
+        assert_result_error_with_message, make_test_tc, test_deep_nested_schema_missing_leaf_cm,
+    };
 
     #[test]
     fn test_column_mapping_mode() {
@@ -866,7 +867,7 @@ mod tests {
     #[case::across_array(cm_schema_array_duplicates())]
     #[case::across_map(cm_schema_map_duplicates())]
     fn test_duplicate_column_mapping_ids_rejected(#[case] schema: StructType) {
-        crate::utils::test_utils::assert_result_error_with_message(
+        assert_result_error_with_message(
             validate_schema_column_mapping(&schema, ColumnMappingMode::Id),
             "Duplicate column mapping ID",
         );
@@ -874,7 +875,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_column_mapping_ids_rejected_in_name_mode() {
-        crate::utils::test_utils::assert_result_error_with_message(
+        assert_result_error_with_message(
             validate_schema_column_mapping(
                 &cm_schema_same_level_duplicates(),
                 ColumnMappingMode::Name,
@@ -1409,6 +1410,34 @@ mod tests {
             err.contains(expected_err),
             "Expected error containing '{expected_err}', got: {err}"
         );
+    }
+
+    #[rstest::rstest]
+    #[case::string_value(Some(MetadataValue::String("col-x".into())), Some("col-x"))]
+    #[case::missing(None /* annotation */, None /* expected(None means error) */)]
+    #[case::wrong_type_number(Some(MetadataValue::Number(7)), None /* expected(None means error) */)]
+    #[case::wrong_type_boolean(Some(MetadataValue::Boolean(true)), None /* expected(None means error) */)]
+    #[case::wrong_type_other(
+        Some(MetadataValue::Other(serde_json::Value::from("col-x"))),
+        None /* expected(None means error) */,
+    )]
+    fn test_expect_physical_name(
+        #[case] annotation: Option<MetadataValue>,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut field = StructField::new("a", DataType::INTEGER, true);
+        if let Some(value) = annotation {
+            field = field
+                .add_metadata([(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), value)]);
+        }
+        let result = expect_physical_name(&field);
+        match expected {
+            Some(expected) => assert_eq!(result.unwrap(), expected),
+            None => assert_result_error_with_message(
+                result,
+                "Expect field 'a' to have a physical name annotation",
+            ),
+        }
     }
 
     #[test]
