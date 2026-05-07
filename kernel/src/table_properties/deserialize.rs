@@ -227,6 +227,8 @@ fn parse_interval_impl(value: &str) -> Result<Duration, ParseIntervalError> {
 
 #[cfg(test)]
 mod tests {
+    use ParquetCompressionCodec::*;
+
     use super::*;
 
     #[test]
@@ -384,7 +386,6 @@ mod tests {
 
     #[test]
     fn test_parse_compression_codec_accepts_all_variants_case_insensitively() {
-        use ParquetCompressionCodec::*;
         for (input, expected) in [
             ("uncompressed", Uncompressed),
             ("UNCOMPRESSED", Uncompressed),
@@ -415,8 +416,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_compression_codec_unknown_falls_through_to_unknown_properties() {
+        let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, "brotli")]);
+        assert_eq!(props.parquet_compression_codec, None);
+        assert_eq!(
+            props.unknown_properties.get(PARQUET_COMPRESSION_CODEC),
+            Some(&"brotli".to_string())
+        );
+    }
+
+    #[test]
     fn test_compression_codec_round_trips_to_canonical_protocol_string() {
-        use ParquetCompressionCodec::*;
         // Each variant must Display-format to its Delta-protocol canonical name (lowercased,
         // snake_case). The `Uncompressed` variant has `none` as a parser-only alias; its
         // canonical output is `uncompressed`.
@@ -439,12 +449,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_compression_codec_unknown_falls_through_to_unknown_properties() {
-        let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, "brotli")]);
-        assert_eq!(props.parquet_compression_codec, None);
-        assert_eq!(
-            props.unknown_properties.get(PARQUET_COMPRESSION_CODEC),
-            Some(&"brotli".to_string())
-        );
+    fn test_compression_codec_or_default_falls_back_to_zstd_when_absent() {
+        // Absent: applies the spec-recommended Zstd fallback.
+        let props = TableProperties::default();
+        assert_eq!(props.compression_codec_or_default(), Zstd);
+
+        // Present: returns the parsed value as-is.
+        let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, "snappy")]);
+        assert_eq!(props.compression_codec_or_default(), Snappy);
     }
 }
