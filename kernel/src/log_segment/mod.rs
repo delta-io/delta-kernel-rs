@@ -114,7 +114,8 @@ pub(crate) struct LogSegment {
     ///
     /// Note: This is only populated if the hint file was read during creation of this
     /// log segment. The hint may describe a different checkpoint version than the one in this
-    /// segment.
+    /// segment. Callers should use explicit getters (such as [Self::checkpoint_schema]) rather
+    /// than reading this field directly.
     pub last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
 }
 
