@@ -50,7 +50,7 @@ The caller owns the returned builder handle and must call either `snapshot_build
 ## Write Flow
 
 ```
-get_default_engine() -> transaction() -> with_engine_info() -> add_files() -> commit()
+get_default_engine() -> transaction() -> with_engine_info() -> with_operation() -> add_files() -> commit()
 ```
 
 ## Building
