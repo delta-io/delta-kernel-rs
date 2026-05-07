@@ -744,8 +744,7 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_fails(
 async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn std::error::Error>> {
     let storage = Arc::new(InMemory::new());
     let table_root = "memory:///";
-    let engine =
-        Arc::new(DefaultEngineBuilder::<TokioBackgroundExecutor>::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     // Create table doesn't support IcebergCompatV3 yet, so this test hand-crafts a V0 commit.
     // The commit enables V3, column mapping, and row tracking. The schema contains one `id`
