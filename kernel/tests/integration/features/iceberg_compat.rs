@@ -29,13 +29,14 @@ use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::table_features::{
-    get_any_level_column_physical_name, ColumnMappingMode, TableFeature,
-};
+use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transforms::{transform_output_type, SchemaTransform};
-use test_utils::{add_commit, create_add_files_metadata, read_add_infos, test_table_setup_mt};
+use test_utils::{
+    add_commit, create_add_files_metadata, into_record_batch, read_add_infos, test_table_setup_mt,
+    write_batch_to_table,
+};
 use url::Url;
 
 use crate::common::write_utils::{collect_all_parquet_field_ids, read_parquet_root_schema};
@@ -46,7 +47,7 @@ const TABLE_ROOT: &str = "memory:///";
 /// to-be-deprecated `parquet.field.nested.ids` metadata. Loading the snapshot must fail.
 #[tokio::test]
 async fn snapshot_blocked_when_v3_schema_has_legacy_nested_ids() {
-    let (storage, engine) = make_engine();
+    let (storage, engine) = make_default_engine_and_store();
     // Create table doesn't support the legacy nested ids metadata, so we hand-craft a V0 commit.
     let nested_ids_legacy = serde_json::json!({
         "data.key": 100,
@@ -139,63 +140,6 @@ async fn snapshot_blocked_when_v3_schema_has_legacy_nested_ids() {
     );
 }
 
-/// Listing IcebergCompatV3 in writerFeatures (i.e. "supported") without setting
-/// `delta.enableIcebergCompatV3=true` must not activate V3: column mapping stays off and
-/// no nested-id metadata is stamped on the Map field.
-#[tokio::test]
-async fn v3_supported_but_not_enabled_skips_cm_and_nested_ids() {
-    let (_, engine) = make_engine();
-    let schema = Arc::new(
-        StructType::try_new(vec![StructField::nullable(
-            "data",
-            DataType::Map(Box::new(MapType::new(
-                DataType::INTEGER,
-                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
-                true,
-            ))),
-        )])
-        .unwrap(),
-    );
-
-    let _ = create_table(TABLE_ROOT, schema, "Test/1.0")
-        .with_table_properties([("delta.feature.icebergCompatV3", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
-        .unwrap()
-        .commit(engine.as_ref())
-        .unwrap();
-    let snapshot = Snapshot::builder_for(TABLE_ROOT)
-        .build(engine.as_ref())
-        .unwrap();
-
-    // 1. V3 is in writerFeatures (supported).
-    let writer_features = snapshot
-        .table_configuration()
-        .protocol()
-        .writer_features()
-        .expect("writerFeatures present");
-    assert!(
-        writer_features.contains(&TableFeature::IcebergCompatV3),
-        "expected icebergCompatV3 in writerFeatures, got: {writer_features:?}",
-    );
-
-    // 2. CM is not enabled (no auto-enable from V3 being merely supported).
-    assert_eq!(
-        snapshot.table_configuration().column_mapping_mode(),
-        ColumnMappingMode::None,
-    );
-
-    // 3. No nested-id metadata stamped on the Map field.
-    let loaded_schema = snapshot.schema();
-    let data_field = loaded_schema.field("data").expect("data field present");
-    assert!(
-        !data_field
-            .metadata
-            .contains_key(ColumnMetadataKey::ColumnMappingNestedIds.as_ref()),
-        "unexpected delta.columnMapping.nested.ids on data: {:?}",
-        data_field.metadata,
-    );
-}
-
 #[rstest::rstest]
 #[case::missing_num_records(None/* num_records */, Err("'stats.numRecords' is required"))]
 #[case::with_num_records(Some(3), Ok(1))]
@@ -204,7 +148,7 @@ async fn v3_commit_validates_num_records(
     #[case] num_records: Option<i64>,
     #[case] expected: Result<u64, &'static str>,
 ) {
-    let (_, engine) = make_engine();
+    let (_, engine) = make_default_engine_and_store();
 
     let _ = create_table(TABLE_ROOT, simple_schema(), "Test/1.0")
         .with_table_properties([("delta.enableIcebergCompatV3", "true")])
@@ -243,51 +187,6 @@ async fn v3_commit_validates_num_records(
     }
 }
 
-/// V3 create-table negative paths: enabling V3 alongside an incompatible property must fail at
-/// `.build(...)` with a clear error.
-///
-/// `cm_mode_none` and `row_tracking_disabled` are blocked by V3's dependency check
-/// (`maybe_enable_iceberg_compat_v3_dependencies`); the others are blocked earlier because
-/// the property is not in `ALLOWED_DELTA_PROPERTIES` for CREATE TABLE. Keep them here
-/// so that in the future when we support these properties for create table, we will remember to
-/// update this test.
-#[rstest::rstest]
-#[case::cm_mode_none(
-    &[("delta.columnMapping.mode", "none")],
-    "to be 'name' or 'id', got 'none'",
-)]
-#[case::row_tracking_disabled(
-    &[("delta.enableRowTracking", "false")],
-    "to be 'true', got 'false'",
-)]
-#[case::iceberg_compat_v1_active(
-    &[("delta.enableIcebergCompatV1", "true")],
-    "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
-)]
-#[case::iceberg_compat_v2_active(
-    &[("delta.enableIcebergCompatV2", "true")],
-    "Setting delta property 'delta.enableIcebergCompatV2' is not supported",
-)]
-#[tokio::test]
-async fn v3_create_table_rejects_incompatible_props(
-    #[case] extra_props: &[(&str, &str)],
-    #[case] err_substring: &str,
-) {
-    let (_, engine) = make_engine();
-    let mut props: Vec<(&str, &str)> = vec![("delta.enableIcebergCompatV3", "true")];
-    props.extend_from_slice(extra_props);
-
-    let err = create_table(TABLE_ROOT, simple_schema(), "Test/1.0")
-        .with_table_properties(props)
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains(err_substring),
-        "expected error containing {err_substring:?}, got: {err}",
-    );
-}
-
 /// V3 partitioned end-to-end: create + 4 commits with a checkpoint between, then validate
 /// protocol features, parquet field IDs (top-level + nested), partition materialization,
 /// timestamp physical type, and exact scan content.
@@ -301,25 +200,26 @@ async fn v3_create_table_rejects_incompatible_props(
 ///   implies it), `typeWidening` (kernel rejects writes against tables declaring it), and
 ///   `catalogManaged` (requires a catalog committer).
 #[rstest::rstest]
-#[case::min(&[], &[])]
+#[case::min(
+    /* extra_props */ &[],
+    /* enable_features */ &[],
+    /* expected_features */ &[V3_BASELINE_FEATURES],
+)]
 #[case::max(
-    // Features enabled through properties.
-    // Intentionally set `delta.columnMapping.mode=id`, as the `min` case tests 
-    // `name` mode(auto-enabled as a default by V3).
-    &[
-        ("delta.columnMapping.mode", "id"),
-        ("delta.enableDeletionVectors", "true"),
-        ("delta.enableInCommitTimestamps", "true"),
-        ("delta.enableChangeDataFeed", "true"),
-        ("delta.appendOnly", "true"),
+    // Intentionally set `delta.columnMapping.mode=id`, since the `min` case already covers the
+    // V3-default `name` mode.
+    /* extra_props */ &[("delta.columnMapping.mode", "id")],
+    /* enable_features */ &[
+        "deletionVectors", "inCommitTimestamp", "changeDataFeed", "appendOnly",
+        "v2Checkpoint", "vacuumProtocolCheck", "invariants",
     ],
-    // Enablement through feature signals(i.e. delta.feature.X=supported).
-    &["v2Checkpoint", "vacuumProtocolCheck", "invariants"],
+    /* expected_features */ &[READER_WRITER_FEATURES, WRITER_FEATURES],
 )]
 #[tokio::test(flavor = "multi_thread")]
 async fn v3_e2e_partitioned_writes_with_field_ids(
     #[case] extra_props: &[(&str, &str)],
-    #[case] extra_feature_signals: &[&str],
+    #[case] enable_features: &[&str],
+    #[case] expected_features: &[&[&str]],
 ) {
     // === Setup ===
     let (_tmp_dir, table_path, _) = test_table_setup_mt().unwrap();
@@ -335,12 +235,20 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
 
     // === Create partitioned V3 table ===
     let schema = nested_schema_with_all_delta_types();
-    let signal_props: Vec<(String, String)> = extra_feature_signals
+    // Features without an enable property are added via `delta.feature.X=supported`. Build
+    // the signal strings up front so the property tuples below can borrow them.
+    let signal_props: Vec<(String, String)> = enable_features
         .iter()
+        .filter(|f| enable_property_for(f).is_none())
         .map(|f| (format!("delta.feature.{f}"), "supported".to_string()))
         .collect();
     let mut props: Vec<(&str, &str)> = vec![("delta.enableIcebergCompatV3", "true")];
     props.extend(extra_props.iter().copied());
+    props.extend(
+        enable_features
+            .iter()
+            .filter_map(|f| enable_property_for(f).map(|p| (p, "true"))),
+    );
     props.extend(signal_props.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     let _ = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties(props)
@@ -350,7 +258,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
         .commit(engine.as_ref())
         .unwrap();
 
-    // === 2 commits, checkpoint, 2 more commits ===
+    // === 4 commits (2 outer iters x 2 partitions), checkpoint, 4 more commits ===
     for commit_idx in 0..2_i32 {
         write_partitioned_data(&table_url, engine.clone(), commit_idx).await;
     }
@@ -368,23 +276,11 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
         .unwrap();
 
     // === Verify protocol features and column mapping mode ===
-    let baseline_features = [
-        "icebergCompatV3",
-        "columnMapping",
-        "rowTracking",
-        "domainMetadata",
-        "timestampNtz",
-        "variantType",
-    ];
-    let auto_enabled_features: Vec<&str> = extra_props
+    let expected: Vec<&str> = expected_features
         .iter()
-        .filter(|(_, v)| *v == "true")
-        .map(|(k, _)| feature_for_enable_property(k))
+        .flat_map(|list| list.iter().copied())
         .collect();
-    let mut expected_features: Vec<&str> = baseline_features.to_vec();
-    expected_features.extend(auto_enabled_features);
-    expected_features.extend(extra_feature_signals.iter().copied());
-    verify_protocol(&final_snap, &expected_features);
+    verify_protocol(&final_snap, &expected);
     let cm_mode = final_snap
         .table_properties()
         .column_mapping_mode
@@ -405,7 +301,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
     assert_eq!(
         add_actions.len(),
         8,
-        "expected 4 commits x 2 partitions = 8 add files",
+        "expected 4 outer iters x 2 partitions = 8 add files",
     );
     let logical_schema = final_snap.schema();
     for add in &add_actions {
@@ -454,7 +350,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
 
 // === Helpers ===
 
-fn make_engine() -> (Arc<InMemory>, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
+fn make_default_engine_and_store() -> (Arc<InMemory>, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
     let storage = Arc::new(InMemory::new());
     let engine =
         Arc::new(DefaultEngineBuilder::<TokioBackgroundExecutor>::new(storage.clone()).build());
@@ -688,23 +584,22 @@ fn entries_field_arrays_empty(entries_field: &ArrowField) -> Vec<ArrayRef> {
     }
 }
 
-/// Open a transaction on `table_url`, write 2 partitions x 3 rows (regions "a" and "b") via the
-/// engine's parquet handler, and commit. Stats and `numRecords` are auto-collected by the
-/// default engine, so the numRecords invariant is satisfied.
-/// Assume the table schema is [`nested_schema_with_all_delta_types`].
+/// Write one commit per partition (regions "a" and "b"). Stats and
+/// `numRecords` are auto-collected by the default engine, so the numRecords invariant is
+/// satisfied. Assume the table schema is [`nested_schema_with_all_delta_types`].
 async fn write_partitioned_data(
     table_url: &Url,
     engine: Arc<DefaultEngine<TokioMultiThreadExecutor>>,
     random_seed: i32,
 ) {
-    let snapshot = Snapshot::builder_for(table_url.clone())
+    let mut snapshot = Snapshot::builder_for(table_url.clone())
         .build(engine.as_ref())
         .unwrap();
     // Defensive sanity check: confirm the table schema matches what `build_partition_batch`
     // produces. We compare top-level field names rather than full structs for simplicity.
     let actual_schema = snapshot.schema();
-    let expected_schema = nested_schema_with_all_delta_types();
     let actual_fields: Vec<&str> = actual_schema.fields().map(|f| f.name().as_str()).collect();
+    let expected_schema = nested_schema_with_all_delta_types();
     let expected_fields: Vec<&str> = expected_schema
         .fields()
         .map(|f| f.name().as_str())
@@ -713,42 +608,27 @@ async fn write_partitioned_data(
         actual_fields, expected_fields,
         "table schema does not match `nested_schema_with_all_delta_types`",
     );
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
-        .unwrap()
-        .with_engine_info(format!("Test/v3-commit-seed-{random_seed}"))
-        .with_data_change(true);
 
-    // Each partition gets its own write_parquet call with a partitioned WriteContext.
     for region in PARTITION_REGIONS {
         let batch = build_partition_batch(random_seed, region);
-        let write_context = txn
-            .partitioned_write_context(HashMap::from([(
-                "region".to_string(),
-                Scalar::String(region.to_string()),
-            )]))
-            .unwrap();
-        let add_files = engine
-            .write_parquet(&ArrowEngineData::new(batch), &write_context)
+        let partition_values =
+            HashMap::from([("region".to_string(), Scalar::String(region.to_string()))]);
+        snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, partition_values)
             .await
             .unwrap();
-        txn.add_files(add_files);
     }
-    let _ = txn.commit(engine.as_ref()).unwrap().unwrap_committed();
 }
 
-/// Map a `delta.enable*` (or `delta.appendOnly`) enablement-property key to the feature
-/// name. Panics on unknown keys to surface case-input typos.
-fn feature_for_enable_property(key: &str) -> &'static str {
-    match key {
-        "delta.enableDeletionVectors" => "deletionVectors",
-        "delta.enableInCommitTimestamps" => "inCommitTimestamp",
-        "delta.enableChangeDataFeed" => "changeDataFeed",
-        "delta.appendOnly" => "appendOnly",
-        "delta.enableRowTracking" => "rowTracking",
-        other => panic!("unknown enablement property '{other}'"),
-    }
-}
+/// Features that V3 auto-enables (plus TS_NTZ and variant types which are auto-enabled by our test
+/// schema).
+const V3_BASELINE_FEATURES: &[&str] = &[
+    "icebergCompatV3",
+    "columnMapping",
+    "rowTracking",
+    "domainMetadata",
+    "timestampNtz",
+    "variantType",
+];
 
 /// ReaderWriter features used in this test file.
 const READER_WRITER_FEATURES: &[&str] = &[
@@ -759,6 +639,37 @@ const READER_WRITER_FEATURES: &[&str] = &[
     "vacuumProtocolCheck",
     "variantType",
 ];
+
+/// Writer-only features used in this test file.
+const WRITER_FEATURES: &[&str] = &[
+    "appendOnly",
+    "changeDataFeed",
+    "domainMetadata",
+    "icebergCompatV3",
+    "inCommitTimestamp",
+    "invariants",
+    "rowTracking",
+];
+
+/// Maps each enablement-driven feature to its `delta.enable*` (or `delta.appendOnly`)
+/// property name.
+const FEATURE_ENABLE_PROPERTY: &[(&str, &str)] = &[
+    ("appendOnly", "delta.appendOnly"),
+    ("changeDataFeed", "delta.enableChangeDataFeed"),
+    ("deletionVectors", "delta.enableDeletionVectors"),
+    ("icebergCompatV3", "delta.enableIcebergCompatV3"),
+    ("inCommitTimestamp", "delta.enableInCommitTimestamps"),
+    ("rowTracking", "delta.enableRowTracking"),
+];
+
+/// Returns the `delta.enable*` property name for `feature` if one exists, or `None` if the
+/// feature must be added via the `delta.feature.X=supported` signal instead.
+fn enable_property_for(feature: &str) -> Option<&'static str> {
+    FEATURE_ENABLE_PROPERTY
+        .iter()
+        .find(|(name, _)| *name == feature)
+        .map(|(_, prop)| *prop)
+}
 
 /// Assert each name in `expected_features` appears in `writerFeatures`, plus that any
 /// reader+writer feature also appears in `readerFeatures`.
@@ -779,10 +690,23 @@ fn verify_protocol(snapshot: &Snapshot, expected_features: &[&str]) {
             writer_features.iter().any(|w| w == f),
             "writerFeatures missing {f}; got {writer_features:?}",
         );
-        if READER_WRITER_FEATURES.contains(f) {
+        let is_reader_writer = READER_WRITER_FEATURES.contains(f);
+        let is_writer_only = WRITER_FEATURES.contains(f);
+        assert!(
+            is_reader_writer || is_writer_only,
+            "feature '{f}' is not classified in READER_WRITER_FEATURES or WRITER_FEATURES; \
+             update one of those lists",
+        );
+        if is_reader_writer {
             assert!(
                 reader_features.iter().any(|r| r == f),
                 "readerFeatures missing {f} (reader+writer feature); got {reader_features:?}",
+            );
+        } else {
+            assert!(
+                !reader_features.iter().any(|r| r == f),
+                "readerFeatures unexpectedly contains writer-only feature {f}; \
+                 got {reader_features:?}",
             );
         }
     }
@@ -993,11 +917,7 @@ fn verify_scan_contents(
     let mut total_rows = 0_usize;
 
     for res in scan.execute(engine).unwrap() {
-        let raw = res.unwrap();
-        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(raw)
-            .unwrap()
-            .record_batch()
-            .clone();
+        let batch = into_record_batch(res.unwrap());
 
         let region_arr = batch
             .column_by_name("region")
