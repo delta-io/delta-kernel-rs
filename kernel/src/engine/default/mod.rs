@@ -169,10 +169,10 @@ pub struct DefaultEngine<E: TaskExecutor> {
 ///     .build();
 /// ```
 #[derive(Debug)]
-pub struct DefaultEngineBuilder<Executor> {
+pub struct DefaultEngineBuilder<E> {
     object_store: Arc<DynObjectStore>,
     /// The state is either [`DefaultTaskExecutor`] or `Arc<E>` with a custom task executor.
-    task_executor: Executor,
+    task_executor: E,
 }
 
 /// Represents the default [`TaskExecutor`]. The executor is created lazily to avoid unnecessary
@@ -195,7 +195,7 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
     }
 }
 
-impl<State> DefaultEngineBuilder<State> {
+impl<E> DefaultEngineBuilder<E> {
     /// Set a custom task executor for the engine.
     ///
     /// See [`executor::TaskExecutor`] for more details.
