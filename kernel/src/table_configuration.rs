@@ -866,7 +866,7 @@ impl TableConfiguration {
         // IcebergCompatV3 in this list, just be conservative here to check both.
         for feature in [TableFeature::RowTracking, TableFeature::IcebergCompatV3] {
             if self.is_feature_enabled(&feature) {
-                return Err(Error::generic(format!(
+                return Err(Error::unsupported(format!(
                     "Remove actions are not supported on tables with {} enabled yet",
                     feature.as_ref(),
                 )));
