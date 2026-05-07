@@ -123,10 +123,9 @@ impl ParquetHandler for SyncParquetHandler {
         }
         writer.close()?;
 
-        let (store, _, object_path) = resolve_scope(self.store.as_ref(), &location)?;
-
         // For local writes, ensure parent directories exist; `LocalFileSystem::put` does not
-        // create them. No-op for non-file:// URLs.
+        // create them. No-op for non-file:// URLs. Must happen before `resolve_scope` so that
+        // canonicalization of the parent succeeds.
         if location.scheme() == "file" {
             if let Ok(file_path) = location.to_file_path() {
                 if let Some(parent) = file_path.parent() {
@@ -137,6 +136,7 @@ impl ParquetHandler for SyncParquetHandler {
             }
         }
 
+        let (store, _, object_path) = resolve_scope(self.store.as_ref(), &location)?;
         futures::executor::block_on(store.put(&object_path, buf.into()))?;
         Ok(())
     }

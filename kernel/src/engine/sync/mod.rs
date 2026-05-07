@@ -116,11 +116,16 @@ pub(super) fn resolve_scope(
             "SyncEngine without an explicit store can only access file:// URLs, got: {url}"
         )));
     }
-    let file_path = url
+    let raw_path = url
         .to_file_path()
         .map_err(|()| Error::generic(format!("Invalid file URL: {url}")))?;
+    // On Windows the path may contain 8.3 short-name components such as `RUNNER~1`. The url
+    // crate URL-encodes `~` to `%7E` when round-tripping through `path_segments_mut`, but
+    // `to_file_path` does not decode it back, so `LocalFileSystem` ends up looking up the
+    // wrong path. Canonicalize so short names get resolved to their long form.
+    let file_path = canonicalize_for_localfs(&raw_path)?;
     // Every absolute path has at least one ancestor: itself. The last ancestor is the
-    // filesystem root (`/` on Unix, drive root like `D:\` on Windows).
+    // filesystem root (`/` on Unix, drive root like `C:\` on Windows).
     let root = file_path
         .ancestors()
         .last()
@@ -136,6 +141,22 @@ pub(super) fn resolve_scope(
         _ => None,
     }));
     Ok((store, base_url, path))
+}
+
+/// Canonicalize `path`, falling back to canonicalizing the parent (if `path` itself does not
+/// exist) so short-name components are still resolved without requiring the leaf to exist.
+fn canonicalize_for_localfs(path: &std::path::Path) -> DeltaResult<std::path::PathBuf> {
+    if path.exists() {
+        return Ok(path.canonicalize()?);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::generic(format!("Path has no parent: {path:?}")))?;
+    let canonical_parent = parent.canonicalize()?;
+    Ok(match path.file_name() {
+        Some(name) => canonical_parent.join(name),
+        None => canonical_parent,
+    })
 }
 
 /// Fetch the contents of a file via [`resolve_scope`] and return them as bytes.

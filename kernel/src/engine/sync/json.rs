@@ -74,10 +74,10 @@ impl JsonHandler for SyncJsonHandler {
         overwrite: bool,
     ) -> DeltaResult<()> {
         let buf = to_json_bytes(data)?;
-        let (store, _, object_path) = resolve_scope(self.store.as_ref(), path)?;
 
         // For local writes, ensure parent directories exist; `LocalFileSystem::put` does not
-        // create them. No-op for non-file:// URLs.
+        // create them. No-op for non-file:// URLs. Must happen before `resolve_scope` so that
+        // canonicalization of the parent succeeds.
         if path.scheme() == "file" {
             if let Ok(file_path) = path.to_file_path() {
                 if let Some(parent) = file_path.parent() {
@@ -87,6 +87,8 @@ impl JsonHandler for SyncJsonHandler {
                 }
             }
         }
+
+        let (store, _, object_path) = resolve_scope(self.store.as_ref(), path)?;
 
         let opts = if overwrite {
             crate::object_store::PutOptions::default()
