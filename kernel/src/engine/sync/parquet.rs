@@ -323,6 +323,48 @@ mod tests {
         assert!(file_path.exists());
     }
 
+    // === Contract tests (delegate to shared helpers in `engine::tests`) ===
+
+    #[test]
+    fn parquet_handler_reads_footer() {
+        crate::engine::tests::test_parquet_handler_reads_footer(&SyncParquetHandler::new(None));
+    }
+
+    #[test]
+    fn parquet_handler_footer_errors_on_missing_file() {
+        crate::engine::tests::test_parquet_handler_footer_errors_on_missing_file(
+            &SyncParquetHandler::new(None),
+        );
+    }
+
+    #[test]
+    fn parquet_handler_footer_preserves_field_ids() {
+        crate::engine::tests::test_parquet_handler_footer_preserves_field_ids(
+            &SyncParquetHandler::new(None),
+        );
+    }
+
+    #[test]
+    fn parquet_handler_write_always_overwrites() {
+        crate::engine::tests::test_parquet_handler_write_always_overwrites(
+            &SyncParquetHandler::new(None),
+        );
+    }
+
+    #[test]
+    fn parquet_handler_write_omits_arrow_schema() {
+        crate::engine::tests::test_parquet_handler_write_omits_arrow_schema(
+            &SyncParquetHandler::new(None),
+        );
+    }
+
+    #[test]
+    fn parquet_handler_reads_file_with_arrow_schema() {
+        crate::engine::tests::test_parquet_handler_reads_file_with_arrow_schema(
+            &SyncParquetHandler::new(None),
+        );
+    }
+
     /// Ensures `write_parquet_file` and `read_parquet_footer` work end-to-end with an
     /// `ObjectStore` backend. The local path is exercised by the other tests in this module.
     #[test]

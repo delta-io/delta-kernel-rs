@@ -190,4 +190,9 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn json_handler_file_path_contract() {
+        crate::engine::tests::test_json_handler_file_path_contract(&SyncJsonHandler::new(None));
+    }
 }

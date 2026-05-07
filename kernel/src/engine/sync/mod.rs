@@ -38,7 +38,6 @@ use crate::{
 
 pub(crate) mod json;
 mod parquet;
-pub(crate) use parquet::SyncParquetHandler;
 mod storage;
 
 /// A simple (test-only) implementation of [`Engine`]. See module docs for supported stores.
