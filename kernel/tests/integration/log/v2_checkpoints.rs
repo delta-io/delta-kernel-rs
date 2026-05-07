@@ -1429,9 +1429,7 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> Result<(), Box<dyn std::er
 }
 
 /// On a table with `deletionVectors` enabled, insert data, apply DV and write a V2 sidecar
-/// checkpoint. Scan back and make sure the DV columns survive. Row tracking is intentionally
-/// not enabled here -- kernel currently blocks Remove-emitting transactions (including
-/// `update_deletion_vectors`) on row-tracking tables.
+/// checkpoint. Scan back and make sure the DV columns survive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v2_sidecar_preserves_dv_on_add() -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
