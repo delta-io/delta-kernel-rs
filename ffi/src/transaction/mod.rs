@@ -727,7 +727,7 @@ mod tests {
             // Add engine info
             let engine_info = "default_engine";
             let engine_info_kernel_string = kernel_string_slice!(engine_info);
-            let txn_with_engine_info = unsafe {
+            let txn = unsafe {
                 ok_or_panic(with_engine_info(
                     txn,
                     engine_info_kernel_string,
@@ -738,19 +738,16 @@ mod tests {
             // Add the operation
             let operation = "WRITE";
             let operation_kernel_string = kernel_string_slice!(operation);
-            let txn_with_operation = unsafe {
+            let txn = unsafe {
                 ok_or_panic(with_operation(
-                    txn_with_engine_info,
+                    txn,
                     operation_kernel_string,
                     engine.shallow_copy(),
                 ))
             };
 
             let write_context = ok_or_panic(unsafe {
-                get_unpartitioned_write_context(
-                    txn_with_operation.shallow_copy(),
-                    engine.shallow_copy(),
-                )
+                get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
             });
 
             // Ensure we get the correct schema
@@ -792,12 +789,7 @@ mod tests {
                 ),
             ])
             .unwrap();
-            let parquet_schema = unsafe {
-                txn_with_operation
-                    .shallow_copy()
-                    .as_ref()
-                    .add_files_schema()
-            };
+            let parquet_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() };
             let file_info = write_parquet_file(
                 table_path_str,
                 "my_file.parquet",
@@ -809,9 +801,9 @@ mod tests {
                 get_engine_data(file_info.array, &file_info.schema, allocate_err)
             });
 
-            unsafe { add_files(txn_with_operation.shallow_copy(), file_info_engine_data) };
+            unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
 
-            ok_or_panic(unsafe { commit(txn_with_operation, engine.shallow_copy()) });
+            ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
 
             // Confirm that our commit is what we expect
             let commit1_url = table_url
