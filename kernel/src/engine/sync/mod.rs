@@ -143,20 +143,31 @@ pub(super) fn resolve_scope(
     Ok((store, base_url, path))
 }
 
-/// Canonicalize `path`, falling back to canonicalizing the parent (if `path` itself does not
-/// exist) so short-name components are still resolved without requiring the leaf to exist.
+/// On Windows, canonicalize `path` (or its parent if `path` itself does not exist) so 8.3
+/// short-name components such as `RUNNER~1` are resolved to their long form. The url crate
+/// URL-encodes `~` to `%7E` when round-tripping a path through `path_segments_mut`, but
+/// `to_file_path` does not decode it back, so `LocalFileSystem` would otherwise look up the
+/// wrong path. On non-Windows platforms canonicalization would resolve symlinks (e.g.
+/// `/var` -> `/private/var` on macOS) and break the URL round-trip, so it is a no-op.
 fn canonicalize_for_localfs(path: &std::path::Path) -> DeltaResult<std::path::PathBuf> {
-    if path.exists() {
-        return Ok(path.canonicalize()?);
+    #[cfg(not(windows))]
+    {
+        Ok(path.to_path_buf())
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::generic(format!("Path has no parent: {path:?}")))?;
-    let canonical_parent = parent.canonicalize()?;
-    Ok(match path.file_name() {
-        Some(name) => canonical_parent.join(name),
-        None => canonical_parent,
-    })
+    #[cfg(windows)]
+    {
+        if path.exists() {
+            return Ok(path.canonicalize()?);
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::generic(format!("Path has no parent: {path:?}")))?;
+        let canonical_parent = parent.canonicalize()?;
+        Ok(match path.file_name() {
+            Some(name) => canonical_parent.join(name),
+            None => canonical_parent,
+        })
+    }
 }
 
 /// Fetch the contents of a file via [`resolve_scope`] and return them as bytes.
