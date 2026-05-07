@@ -10,17 +10,21 @@ use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
     RowIndexBuilder,
 };
+use crate::engine::default::parquet::writer_options;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::engine::{reader_options, writer_options};
+use crate::engine::reader_options;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
+use crate::table_properties::ParquetWriterConfig;
 use crate::{
     DeltaResult, Error, FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler,
     PredicateRef,
 };
 
-pub(crate) struct SyncParquetHandler;
+pub(crate) struct SyncParquetHandler {
+    pub(crate) parquet_writer_config: ParquetWriterConfig,
+}
 
 fn try_create_from_parquet(
     file: File,
@@ -108,11 +112,9 @@ impl ParquetHandler for SyncParquetHandler {
         let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
-        let mut writer = ArrowWriter::try_new_with_options(
-            &mut file,
-            first_record_batch.schema(),
-            writer_options(),
-        )?;
+        let options = writer_options(&self.parquet_writer_config);
+        let mut writer =
+            ArrowWriter::try_new_with_options(&mut file, first_record_batch.schema(), options)?;
         writer.write(&first_record_batch)?;
 
         // Write remaining batches
@@ -173,7 +175,9 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file() {
-        let handler = SyncParquetHandler;
+        let handler = SyncParquetHandler {
+            parquet_writer_config: Default::default(),
+        };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -237,7 +241,9 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file_with_filter() {
-        let handler = SyncParquetHandler;
+        let handler = SyncParquetHandler {
+            parquet_writer_config: Default::default(),
+        };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_filtered.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -320,7 +326,9 @@ mod tests {
 
     #[test]
     fn test_sync_write_parquet_file_multiple_batches() {
-        let handler = SyncParquetHandler;
+        let handler = SyncParquetHandler {
+            parquet_writer_config: Default::default(),
+        };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_multi_batch.parquet");
         let url = Url::from_file_path(&file_path).unwrap();
@@ -399,7 +407,9 @@ mod tests {
 
     #[test]
     fn write_parquet_creates_parent_directories() {
-        let handler = SyncParquetHandler;
+        let handler = SyncParquetHandler {
+            parquet_writer_config: Default::default(),
+        };
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("a/b/c/test.parquet");
         let url = Url::from_file_path(&file_path).unwrap();

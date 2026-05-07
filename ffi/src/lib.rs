@@ -21,6 +21,7 @@ use url::Url;
 #[cfg(feature = "default-engine-base")]
 use {
     delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor,
+    delta_kernel::table_properties::{ParquetCompression, ParquetWriterConfig},
     std::collections::HashMap,
 };
 
@@ -482,6 +483,7 @@ pub struct EngineBuilder {
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
     /// If None, use the default single-threaded background executor.
     multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
+    parquet_writer_config: ParquetWriterConfig,
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -525,6 +527,7 @@ fn get_engine_builder_impl(
         allocate_fn,
         options: HashMap::default(),
         multithreaded_executor_config: None,
+        parquet_writer_config: Default::default(),
     });
     Ok(Box::into_raw(builder))
 }
@@ -582,6 +585,27 @@ pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
     });
 }
 
+/// Set the Parquet compression codec on the builder.
+///
+/// Accepted codec names (case-insensitive): `"snappy"`, `"zstd"`, `"uncompressed"`. Unrecognized
+/// names are silently ignored and the default codec (`zstd`) continues to apply.
+///
+/// # Safety
+///
+/// Caller must pass a valid `EngineBuilder` pointer and a valid string slice for `codec`.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn set_builder_parquet_compression(
+    builder: &mut EngineBuilder,
+    codec: KernelStringSlice,
+) {
+    if let Ok(s) = unsafe { String::try_from_slice(&codec) } {
+        if let Ok(compression) = ParquetCompression::try_from(s.as_str()) {
+            builder.parquet_writer_config = ParquetWriterConfig { compression };
+        }
+    }
+}
+
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
 /// longer valid_. Note that this _consumes_ and frees the builder, so there is no need to
 /// drop/free it afterwards.
@@ -600,6 +624,7 @@ pub unsafe extern "C" fn builder_build(
         builder_box.url,
         builder_box.options,
         builder_box.multithreaded_executor_config,
+        builder_box.parquet_writer_config,
         builder_box.allocate_fn,
     )
     .into_extern_result(&builder_box.allocate_fn)
@@ -624,7 +649,13 @@ fn get_default_default_engine_impl(
     url: DeltaResult<Url>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    get_default_engine_impl(url?, Default::default(), None, allocate_error)
+    get_default_engine_impl(
+        url?,
+        Default::default(),
+        None,
+        Default::default(),
+        allocate_error,
+    )
 }
 
 /// Safety
@@ -651,6 +682,7 @@ fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
     executor_config: Option<MultithreadedExecutorConfig>,
+    parquet_writer_config: ParquetWriterConfig,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel::engine::default::storage::store_from_url_opts;
@@ -666,10 +698,15 @@ fn get_default_engine_impl(
         Arc::new(
             DefaultEngineBuilder::new(store)
                 .with_task_executor(Arc::new(executor))
+                .with_parquet_writer_config(parquet_writer_config)
                 .build(),
         )
     } else {
-        Arc::new(DefaultEngineBuilder::new(store).build())
+        Arc::new(
+            DefaultEngineBuilder::new(store)
+                .with_parquet_writer_config(parquet_writer_config)
+                .build(),
+        )
     };
 
     Ok(engine_to_handle(engine, allocate_error))
@@ -1295,6 +1332,7 @@ mod tests {
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStoreExt as _;
     use delta_kernel::schema::StructType;
+    use delta_kernel::table_properties::{ParquetCompression, ParquetWriterConfig};
     use rstest::rstest;
     use serde_json::Value;
     use test_utils::{
@@ -1743,6 +1781,17 @@ mod tests {
             ))
         };
         unsafe { set_builder_with_multithreaded_executor(builder.as_mut().unwrap(), 2, 0) };
+        // Miri cannot execute the zstd-sys C library; use uncompressed so the test runs under Miri.
+        #[cfg(miri)]
+        {
+            let codec = "uncompressed";
+            unsafe {
+                set_builder_parquet_compression(
+                    builder.as_mut().unwrap(),
+                    kernel_string_slice!(codec),
+                )
+            };
+        }
         let engine = unsafe { ok_or_panic(builder_build(builder)) };
 
         let snapshot =
@@ -1759,6 +1808,60 @@ mod tests {
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
+    }
+
+    // Test that set_builder_parquet_compression applies valid codec strings.
+    #[cfg(feature = "default-engine-base")]
+    #[rstest]
+    #[case("snappy", ParquetCompression::Snappy)]
+    #[case("SNAPPY", ParquetCompression::Snappy)]
+    #[case("uncompressed", ParquetCompression::Uncompressed)]
+    #[case("UNCOMPRESSED", ParquetCompression::Uncompressed)]
+    #[case("zstd", ParquetCompression::Zstd)]
+    fn test_set_builder_parquet_valid_codec(
+        #[case] codec: &str,
+        #[case] expected: ParquetCompression,
+    ) {
+        let table_root = "memory:///test_table/";
+        let builder_ptr = unsafe {
+            ok_or_panic(get_engine_builder(
+                kernel_string_slice!(table_root),
+                allocate_err,
+            ))
+        };
+        let builder = unsafe { builder_ptr.as_mut().unwrap() };
+        unsafe { set_builder_parquet_compression(builder, kernel_string_slice!(codec)) };
+        assert_eq!(
+            builder.parquet_writer_config,
+            ParquetWriterConfig {
+                compression: expected
+            }
+        );
+        unsafe { drop(Box::from_raw(builder_ptr)) };
+    }
+
+    // Test that set_builder_parquet_compression silently ignores an unrecognized codec string.
+    #[cfg(feature = "default-engine-base")]
+    #[test]
+    fn test_set_builder_parquet_invalid_codec_ignored() {
+        let table_root = "memory:///test_table/";
+        let builder_ptr = unsafe {
+            ok_or_panic(get_engine_builder(
+                kernel_string_slice!(table_root),
+                allocate_err,
+            ))
+        };
+        let builder = unsafe { builder_ptr.as_mut().unwrap() };
+        let codec = "invalid_codec";
+        unsafe { set_builder_parquet_compression(builder, kernel_string_slice!(codec)) };
+        assert_eq!(
+            builder.parquet_writer_config,
+            ParquetWriterConfig {
+                compression: ParquetCompression::Zstd
+            },
+            "unrecognized codec should leave config unchanged"
+        );
+        unsafe { drop(Box::from_raw(builder_ptr)) };
     }
 
     #[tokio::test]
