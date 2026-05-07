@@ -65,7 +65,7 @@ These features are under active development. Their APIs may change between relea
 |---------|-------------|
 | `internal-api` | Exposes additional APIs not yet stabilized (marked with `#[cfg(feature = "internal-api")]`). Some examples in this guide use this feature. |
 | `prettyprint` | Enables Arrow pretty-print helpers. Useful for debugging and examples. Automatically enabled by `test-utils`. |
-| `test-utils` | Exposes test-only constructors for downstream crate tests. Enables `prettyprint`. Not intended for production use. |
+| `test-utils` | Exposes `delta_kernel::test_utils::*` helpers for downstream crate tests. Pulls in `default-engine-rustls`, `internal-api`, `prettyprint`, and tarball/temp-dir/rstest deps. Not intended for production use. |
 | `integration-test` | Enables heavy integration tests (e.g., HDFS via `hdfs-native-object-store`). |
 
 ## Common combinations

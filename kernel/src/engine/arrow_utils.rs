@@ -1593,7 +1593,7 @@ mod tests {
         StructField, StructType,
     };
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::test_utils::assert_result_error_with_message;
 
     fn column_mapping_cases() -> [ColumnMappingMode; 3] {
         [

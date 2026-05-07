@@ -1064,7 +1064,7 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::test_utils::assert_result_error_with_message;
     use crate::{
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };

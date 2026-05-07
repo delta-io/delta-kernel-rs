@@ -2175,10 +2175,8 @@ mod tests {
 
     use super::*;
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::{
-        assert_result_error_with_message, test_deep_nested_schema_missing_leaf_cm,
-    };
-
+    use crate::test_utils::assert_result_error_with_message;
+    use crate::utils::test_utils::test_deep_nested_schema_missing_leaf_cm;
     fn example_schema_metadata() -> &'static str {
         r#"
             {

@@ -1318,10 +1318,9 @@ mod tests {
     };
     use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
     use crate::test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
-    use crate::test_utils::{add_commit, delta_path_for_version};
+    use crate::test_utils::{add_commit, assert_result_error_with_message, delta_path_for_version};
     use crate::transaction::create_table::create_table;
-    use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
-
+    use crate::utils::test_utils::string_array_to_engine_data;
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
         let mut commit_info = json!({
@@ -2516,8 +2515,6 @@ mod tests {
         Ok(())
     }
 
-    // Verifies the test_context! macro works from kernel/src/ unit tests
-    // (crosses the crate type boundary via macro expansion).
     #[test]
     fn test_context_macro_works_in_unit_test() {
         let (_engine, snap, _table) = crate::test_utils::test_context!(

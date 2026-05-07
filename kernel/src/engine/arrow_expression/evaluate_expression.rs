@@ -938,7 +938,7 @@ mod tests {
         column_expr, column_expr_ref, BinaryExpressionOp, Expression as Expr, Transform,
     };
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::test_utils::assert_result_error_with_message;
 
     fn create_test_batch() -> RecordBatch {
         let schema = ArrowSchema::new(vec![

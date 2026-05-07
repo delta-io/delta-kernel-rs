@@ -1,12 +1,11 @@
-//! Test helpers shared across kernel and downstream crates. Gated by the
-//! `test-utils` feature.
+//! Test helpers, gated by the `test-utils` feature.
 
-// Test fixtures panic on contract violations by design; opt out of the
-// crate-wide unwrap/expect/panic deny within this module.
+// Test fixtures may panic; opt out of the crate-wide deny.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod counting_reporter;
 pub mod table_builder;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -46,8 +45,8 @@ use crate::parquet::file::properties::WriterProperties;
 use crate::scan::Scan;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::transaction::CommitResult;
-// Re-export the #[macro_export]ed macros from this module so callers can write
-// `use delta_kernel::test_utils::test_context` rather than digging at the crate root.
+// `#[macro_export]` puts these at the crate root; re-export here so callers can
+// import them alongside the rest of `test_utils`.
 pub use crate::{build_snapshot, test_context};
 use crate::{try_parse_uri, DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot};
 
@@ -896,9 +895,10 @@ pub fn assert_schema_has_field(schema: &crate::schema::StructType, path: &[Strin
     resolve_field(schema, path).unwrap();
 }
 
+#[track_caller]
 pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
     match res {
-        Ok(_) => panic!("Expected error, but got Ok result"),
+        Ok(_) => panic!("Expected error with message {message}, but got Ok result"),
         Err(error) => {
             let error_str = error.to_string();
             assert!(

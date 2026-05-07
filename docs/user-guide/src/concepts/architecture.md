@@ -275,7 +275,6 @@ The project is organized into several crates:
 | `unity_catalog_delta_client_api` | Trait definitions for Unity Catalog client implementations |
 | `unity_catalog_delta_rest_client` | REST-based Unity Catalog client built on the client API |
 | `acceptance` | Delta Acceptance Tests (DAT) validation suite |
-| `test_utils` | Shared test utilities |
 | `feature_tests` | Feature flag compatibility tests |
 
 ## What's next

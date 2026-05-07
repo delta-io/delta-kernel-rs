@@ -191,7 +191,9 @@ pub(crate) mod test_utils {
     use crate::object_store::ObjectStoreExt as _;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::table_features::ColumnMappingMode;
-    use crate::test_utils::{delta_path_for_version, load_test_data};
+    use crate::test_utils::{
+        assert_result_error_with_message, delta_path_for_version, load_test_data,
+    };
     use crate::transaction::create_table::create_table;
     use crate::transaction::{CreateTable, Transaction};
     use crate::{DeltaResult, Engine, EngineData, Error, Snapshot, SnapshotRef};
@@ -322,24 +324,6 @@ pub(crate) mod test_utils {
         ]
         .into();
         parse_json_batch(json_strings)
-    }
-
-    // TODO: allow tests to pass in context (issue#1133)
-    #[track_caller]
-    pub(crate) fn assert_result_error_with_message<T, E: ToString>(
-        res: Result<T, E>,
-        message: &str,
-    ) {
-        match res {
-            Ok(_) => panic!("Expected error with message {message}, but got Ok result"),
-            Err(error) => {
-                let error_str = error.to_string();
-                assert!(
-                    error_str.contains(message),
-                    "Error message does not contain the expected message.\nExpected message:\t{message}\nActual message:\t\t{error_str}"
-                );
-            }
-        }
     }
 
     /// Asserts the 2x2 matrix of (schema_has_feature, protocol_supports_feature) outcomes

@@ -925,7 +925,7 @@ mod tests {
     use crate::scan::PhysicalPredicate;
     use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::test_utils::assert_result_error_with_message;
     use crate::{DeltaResult, Expression as Expr, ExpressionRef};
 
     fn test_checkpoint_info() -> CheckpointReadInfo {

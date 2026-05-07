@@ -826,7 +826,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{column_expr, BinaryPredicateOp};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::test_utils::assert_result_error_with_message;
     use crate::{Expression as Expr, Predicate as Pred};
 
     #[test]

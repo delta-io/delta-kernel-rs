@@ -648,10 +648,10 @@ mod tests {
     use crate::schema::{
         ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
     };
+    use crate::test_utils::assert_result_error_with_message;
     use crate::transforms::{transform_output_type, SchemaTransform};
     use crate::utils::test_utils::{
-        array_in_map_kernel_schema, assert_result_error_with_message, collect_arrow_field_metadata,
-        complex_nested_with_field_ids,
+        array_in_map_kernel_schema, collect_arrow_field_metadata, complex_nested_with_field_ids,
     };
     use crate::DeltaResult;
 

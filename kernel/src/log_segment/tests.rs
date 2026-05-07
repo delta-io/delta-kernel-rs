@@ -33,11 +33,10 @@ use crate::scan::test_utils::{
 };
 use crate::schema::{DataType, StructField, StructType};
 use crate::test_utils::{
-    compacted_log_path_for_versions, delta_path_for_version, staged_commit_path_for_version,
+    assert_result_error_with_message, compacted_log_path_for_versions, delta_path_for_version,
+    staged_commit_path_for_version,
 };
-use crate::utils::test_utils::{
-    assert_batch_matches, assert_result_error_with_message, string_array_to_engine_data, Action,
-};
+use crate::utils::test_utils::{assert_batch_matches, string_array_to_engine_data, Action};
 use crate::{
     DeltaResult, EngineData, Expression, FileMeta, JsonHandler, ParquetHandler, Predicate,
     PredicateRef, RowVisitor, StorageHandler,

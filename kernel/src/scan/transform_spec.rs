@@ -215,7 +215,7 @@ mod tests {
 
     use super::*;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::test_utils::assert_result_error_with_message;
 
     // Tests for parse_partition_value function
     #[test]

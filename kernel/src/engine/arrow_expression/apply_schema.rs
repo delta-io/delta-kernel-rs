@@ -388,12 +388,11 @@ mod apply_schema_validation_tests {
     };
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
+    use crate::test_utils::assert_result_error_with_message;
     use crate::utils::test_utils::{
         array_in_map_arrow_data_without_field_ids, array_in_map_kernel_schema,
-        array_in_map_with_field_ids, assert_result_error_with_message,
-        collect_arrow_field_metadata, complex_nested_with_field_ids,
+        array_in_map_with_field_ids, collect_arrow_field_metadata, complex_nested_with_field_ids,
     };
-
     #[test]
     fn test_apply_schema_basic_functionality() {
         // Test that apply_schema works for basic field transformation

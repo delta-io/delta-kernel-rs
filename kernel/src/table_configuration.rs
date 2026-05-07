@@ -879,9 +879,10 @@ mod test {
         TableProperties, COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
         ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
     };
+    use crate::test_utils::assert_result_error_with_message;
     use crate::utils::test_utils::{
-        assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
-        test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
+        test_schema_flat, test_schema_flat_with_column_mapping, test_schema_nested,
+        test_schema_nested_with_column_mapping, test_schema_with_array,
         test_schema_with_array_and_column_mapping, test_schema_with_map,
         test_schema_with_map_and_column_mapping,
     };

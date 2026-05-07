@@ -405,7 +405,7 @@ pub(crate) mod tests {
     use crate::expressions::{column_expr, column_name, Expression as Expr};
     use crate::schema::{ColumnMetadataKey, MetadataValue};
     use crate::table_features::{FeatureType, TableFeature};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::test_utils::assert_result_error_with_message;
 
     // get a state info with no predicate or extra metadata
     pub(crate) fn get_simple_state_info(

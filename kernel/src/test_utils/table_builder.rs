@@ -40,9 +40,9 @@
 //! }
 //! ```
 //!
-//! Requires `Snapshot` and `DefaultEngineBuilder` to be in scope at the call site.
-//! The macros expand there, so types resolve to the caller's kernel crate -- avoiding
-//! the type mismatch between `test_utils`'s kernel and `kernel/src/` unit tests.
+//! Requires `Snapshot` and `DefaultEngineBuilder` to be in scope at the call site --
+//! the macros expand there and use unqualified type names, so the caller's `use`
+//! imports decide which types the expansion resolves to.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -1015,8 +1015,8 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
 /// A built test table backed by an in-memory object store.
 ///
 /// Exposes only the store and table root URL. Does NOT expose kernel types like
-/// `Snapshot` or `Engine` -- the test creates those from its own kernel imports.
-/// This avoids type mismatches between the test crate's kernel and test_utils's kernel.
+/// `Snapshot` or `Engine` -- the test creates those from its own kernel imports so
+/// the caller picks which `use`s drive the macro expansions below.
 pub struct TestTable {
     store: Arc<DynObjectStore>,
     table_root: String,
@@ -1041,11 +1041,7 @@ impl TestTable {
         &self.description
     }
 
-    /// Create a `DefaultEngine` backed by this table's store.
-    ///
-    /// Returns the engine from `test_utils`'s `delta_kernel`. For unit tests inside
-    /// `kernel/src/`, use `DefaultEngineBuilder::new(table.store().clone()).build()`
-    /// instead to get the correct crate-local engine type.
+    /// Create a `DefaultEngine` backed by this table's store using `TokioBackgroundExecutor`.
     pub fn engine(&self) -> DefaultEngine<TokioBackgroundExecutor> {
         DefaultEngineBuilder::new(self.store.clone()).build()
     }
@@ -1077,8 +1073,7 @@ pub fn test_table(log_state: LogState, feature_set: FeatureSet) -> TestTable {
 
 /// Load a snapshot from a [`TestTable`] according to a [`VersionTarget`].
 ///
-/// Expands at the call site so `Snapshot` resolves to the caller's crate. This avoids
-/// the type mismatch between `test_utils`'s kernel and `kernel/src/` unit tests' kernel.
+/// Expands at the call site so `Snapshot` resolves against the caller's `use` imports.
 /// Requires `Snapshot` to be in scope at the call site.
 #[macro_export]
 macro_rules! build_snapshot {

@@ -875,7 +875,7 @@ mod tests {
     use crate::table_properties::{
         ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3, PARQUET_FORMAT_VERSION,
     };
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::test_utils::assert_result_error_with_message;
 
     fn test_schema() -> SchemaRef {
         Arc::new(StructType::new_unchecked(vec![StructField::new(

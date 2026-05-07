@@ -599,8 +599,8 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use crate::schema::{ColumnMetadataKey, MetadataValue};
+    use crate::test_utils::assert_result_error_with_message;
     use crate::utils::current_time_ms;
-    use crate::utils::test_utils::assert_result_error_with_message;
     use crate::EngineData;
 
     fn into_record_batch(

@@ -691,7 +691,7 @@ mod tests {
     #[case::across_array(cm_schema_array_duplicates())]
     #[case::across_map(cm_schema_map_duplicates())]
     fn test_duplicate_column_mapping_ids_rejected(#[case] schema: StructType) {
-        crate::utils::test_utils::assert_result_error_with_message(
+        crate::test_utils::assert_result_error_with_message(
             validate_schema_column_mapping(&schema, ColumnMappingMode::Id),
             "Duplicate column mapping ID",
         );
@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_column_mapping_ids_rejected_in_name_mode() {
-        crate::utils::test_utils::assert_result_error_with_message(
+        crate::test_utils::assert_result_error_with_message(
             validate_schema_column_mapping(
                 &cm_schema_same_level_duplicates(),
                 ColumnMappingMode::Name,

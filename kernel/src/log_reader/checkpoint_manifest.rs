@@ -124,7 +124,8 @@ mod tests {
     use super::*;
     use crate::arrow::array::{Array, StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::utils::test_utils::{assert_result_error_with_message, load_test_table};
+    use crate::test_utils::assert_result_error_with_message;
+    use crate::utils::test_utils::load_test_table;
     use crate::SnapshotRef;
 
     /// Helper function to test manifest phase with expected add paths and sidecars

@@ -53,7 +53,6 @@ cargo +nightly fmt \
 | `delta_kernel_ffi`                       | `ffi/`                                     | C/C++ FFI bindings                                      |
 | `delta_kernel_derive`                    | `derive-macros/`                           | Proc macros                                             |
 | `acceptance`                             | `acceptance/`                              | Acceptance tests (DAT)                                  |
-| `test_utils`                             | `test-utils/`                              | Shared test utilities                                   |
 | `feature_tests`                          | `feature-tests/`                           | Feature flag tests                                      |
 | `delta-kernel-unity-catalog`             | `delta-kernel-unity-catalog/`              | Unity Catalog integration (UCKernelClient, UCCommitter) |
 | `unity-catalog-delta-client-api`         | `unity-catalog-delta-client-api/`          | Unity Catalog client traits and shared models           |
@@ -70,7 +69,9 @@ cargo +nightly fmt \
 - `clustered-table` -- clustered table write support (experimental)
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
-- `test-utils`, `integration-test` -- development only (`test-utils` enables `prettyprint`)
+- `test-utils` -- development only; exposes `delta_kernel::test_utils::*` helpers and
+  pulls in `default-engine-rustls`, `internal-api`, `prettyprint`, plus tarball/temp-dir/rstest deps
+- `integration-test` -- development only
 
 ## Architecture at a Glance
 
@@ -145,7 +146,7 @@ directly -- always use the visitor pattern (`visit_rows` with typed `GetData` ac
 
 Before writing a custom helper, check this curated list and the locations below.
 This list is non-exhaustive -- when in doubt, browse the source files directly
-(`test-utils/src/lib.rs`, `kernel/tests/integration/common/`,
+(`kernel/src/test_utils/`, `kernel/tests/integration/common/`,
 `kernel/tests/integration/<topic>/mod.rs`).
 
 **Arrow construction (from `delta_kernel::arrow`)**
@@ -156,7 +157,7 @@ This list is non-exhaustive -- when in doubt, browse the source files directly
   `(&kernel_data_type).try_into_arrow()` for `DataType`,
   `(&kernel_struct_type).try_into_arrow()` for `StructType` -> Arrow `Schema`.
 
-**Engine + table setup (from `test_utils`)**
+**Engine + table setup (from `delta_kernel::test_utils`)**
 
 - `test_table_setup()` / `test_table_setup_mt()` -- engine + temp table path. Use the `_mt`
   variant under `#[tokio::test(flavor = "multi_thread")]`.
@@ -169,18 +170,19 @@ This list is non-exhaustive -- when in doubt, browse the source files directly
 - Prefer the kernel `create_table` builder
   (`delta_kernel::transaction::create_table::create_table`). It exercises the same path
   connectors use and auto-derives the protocol from the schema and feature flags.
-- `test_utils::create_table` (a JSON helper that hand-rolls protocol + metadata) is older
-  but still needed when the kernel builder cannot enable a particular feature combination.
+- `delta_kernel::test_utils::create_table` (a JSON helper that hand-rolls protocol + metadata)
+  is older but still needed when the kernel builder cannot enable a particular feature
+  combination.
 
 **Schema fixtures**
 
-- `test_utils`: `nested_schema`, `schema_with_type`, `nested_schema_with_type`,
+- `delta_kernel::test_utils`: `nested_schema`, `schema_with_type`, `nested_schema_with_type`,
   `multi_schema_with_type`, `top_level_ntz_schema` / `nested_ntz_schema` /
   `multiple_ntz_schema`, `top_level_variant_schema` / `nested_variant_schema` /
   `multiple_variant_schema`.
 - `kernel/tests/integration/create_table/mod.rs`: `simple_schema`, `partition_test_schema`.
 
-**Commit + read helpers (from `test_utils`)**
+**Commit + read helpers (from `delta_kernel::test_utils`)**
 
 - `add_commit`, `add_staged_commit` -- write a JSON commit at a given version.
 - `read_actions_from_commit` -- read raw JSON actions from a specific commit. Use this
@@ -188,14 +190,14 @@ This list is non-exhaustive -- when in doubt, browse the source files directly
 - `test_read` -- full-scan read of a table; use for round-trip assertions.
 - `into_record_batch` -- convert `Box<dyn EngineData>` to Arrow `RecordBatch`.
 
-**Assertion helpers (from `test_utils`)**
+**Assertion helpers (from `delta_kernel::test_utils`)**
 
 - `assert_schema_has_field(schema, &["a", "b"])` -- assert a (possibly nested) field path.
 - `assert_result_error_with_message(result, "needle")` -- assert an error contains a
   substring.
 
 **If a name here doesn't match what's in code:** the list may have drifted from a rename.
-Run `rg '^pub (fn|async fn)' test-utils/src/lib.rs` to discover the current public surface,
+Run `rg '^pub (fn|async fn)' kernel/src/test_utils/` to discover the current public surface,
 and update this section in your PR. The same pattern works for
 `kernel/tests/integration/common/write_utils.rs`.
 

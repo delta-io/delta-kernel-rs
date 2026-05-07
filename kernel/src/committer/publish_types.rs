@@ -152,7 +152,7 @@ impl PublishMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::test_utils::assert_result_error_with_message;
 
     fn table_root() -> Url {
         Url::parse("memory:///").unwrap()

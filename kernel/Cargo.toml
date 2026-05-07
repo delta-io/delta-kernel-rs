@@ -69,9 +69,8 @@ tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
 # both arrow versions below are optional and require object_store
 object_store_12 = { package = "object_store", version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
 object_store_13 = { package = "object_store", version = "0.13.1", optional = true, features = ["aws", "azure", "gcp", "http"] }
-# test-utils-only deps (gated by the `test-utils` feature). rstest/rstest_reuse are needed
-# as regular (not dev-only) deps so rstest_reuse templates defined in
-# `test_utils::table_builder` can be exported to other crates' tests.
+# Pulled in by the `test-utils` feature. `rstest`/`rstest_reuse` are non-dev so the
+# templates in `delta_kernel::test_utils::table_builder` are visible to downstream tests.
 rstest = { version = "0.23", optional = true }
 rstest_reuse = { version = "0.7", optional = true }
 tar = { version = "0.4", optional = true }
@@ -109,9 +108,9 @@ default = []
 internal-api = []
 # prettyprint enables Arrow pretty-print helpers (test/example oriented).
 prettyprint = ["arrow_57?/prettyprint", "arrow_58?/prettyprint"]
-# test-utils exposes test-only constructors and helpers for downstream crate tests.
-# Pulls in the default engine (rustls) plus tarball/temp-dir/rstest deps needed by
-# the helpers; arrow version is determined by the consuming crate.
+# Helpers for downstream crate tests. Heavyweight: also pulls in `default-engine-rustls`
+# and `internal-api`. Arrow version is left to the consumer (pair with `arrow-57` or
+# `arrow-58`).
 test-utils = [
   "prettyprint",
   "internal-api",
@@ -155,8 +154,9 @@ default-engine-rustls = ["default-engine-base", "reqwest/rustls"]
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-# Pin an arrow version for kernel's own tests; downstream consumers pick their own. Uses
-# arrow-57 to match what the (now-folded) test_utils crate previously force-enabled.
+# Pin arrow-57 for kernel's own tests so `cargo test -p delta_kernel` exercises the
+# arrow-57 ObjectStoreExt compat-trait codepath. Downstream consumers pick their own
+# arrow version when enabling `test-utils`.
 delta_kernel = { path = ".", features = ["test-utils", "arrow-57"] }
 criterion = "0.5"
 # Used for testing parse_url_opts extensibility
