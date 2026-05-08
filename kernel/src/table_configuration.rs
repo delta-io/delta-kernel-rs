@@ -867,7 +867,7 @@ impl TableConfiguration {
         for feature in [TableFeature::RowTracking, TableFeature::IcebergCompatV3] {
             if self.is_feature_enabled(&feature) {
                 return Err(Error::unsupported(format!(
-                    "Remove actions are not supported on tables with {} enabled yet",
+                    "Remove actions are not yet supported on tables with {} enabled",
                     feature.as_ref(),
                 )));
             }

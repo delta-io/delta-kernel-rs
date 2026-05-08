@@ -347,8 +347,8 @@ impl<S> Transaction<S> {
             num_dv_updates = self.dv_matched_files.len(),
         );
 
-        // Some table features are not supported for remove actions yet, reject here.
-        if !self.remove_files_metadata.is_empty() || !self.dv_matched_files.is_empty() {
+        // Some table features don't yet support removeFiles. Reject here.
+        if !self.remove_files_metadata.is_empty() {
             self.effective_table_config
                 .validate_feature_support_for_remove()?;
         }

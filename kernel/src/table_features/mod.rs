@@ -346,6 +346,7 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
+// TODO(#2538): Support materializing stable row IDs on write.
 static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,

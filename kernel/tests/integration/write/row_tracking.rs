@@ -1,7 +1,5 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
@@ -16,7 +14,7 @@ use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-use test_utils::{create_table, engine_store_setup, read_add_infos};
+use test_utils::{create_table, engine_store_setup};
 use url::Url;
 
 /// Validates that kernel rejects remove actions on row-tracking tables.
@@ -139,79 +137,5 @@ async fn test_row_tracking_blocks_remove_files() -> Result<(), Box<dyn std::erro
         "expected remove-block error mentioning rowTracking, got: {msg}",
     );
 
-    Ok(())
-}
-
-/// Validates that kernel rejects DV updates on row-tracking tables.
-/// DV updates internally emit Remove+Add pairs, so the same gate fires.
-#[tokio::test]
-async fn test_row_tracking_blocks_dv_update() -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
-    let (store, engine, table_location) = engine_store_setup("test_rt_dv_block", None);
-    let engine = Arc::new(engine);
-    let table_url = create_table(
-        store.clone(),
-        table_location,
-        schema.clone(),
-        &[],
-        true,
-        vec!["deletionVectors"],
-        vec!["rowTracking", "domainMetadata", "deletionVectors"],
-    )
-    .await?;
-
-    // Blind-append one file.
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    test_utils::insert_data(
-        snapshot,
-        &engine,
-        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-    )
-    .await?
-    .unwrap_committed();
-
-    // Stage a DV update for the freshly-added file.
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let file_path = read_add_infos(&snapshot, engine.as_ref())
-        .map_err(|e| format!("read_add_infos: {e}"))?
-        .into_iter()
-        .next()
-        .expect("one add file")
-        .path;
-    let scan_files: Vec<FilteredEngineData> = snapshot
-        .clone()
-        .scan_builder()
-        .build()?
-        .scan_metadata(engine.as_ref())?
-        .map(|sm| sm.map(|x| x.scan_files))
-        .collect::<Result<_, _>>()?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_data_change(true);
-    txn.update_deletion_vectors(
-        HashMap::from([(
-            file_path,
-            DeletionVectorDescriptor {
-                storage_type: DeletionVectorStorageType::Inline,
-                path_or_inline_dv: "AAAA".to_string(),
-                offset: None,
-                size_in_bytes: 0,
-                cardinality: 0,
-            },
-        )]),
-        scan_files.into_iter().map(Ok),
-    )?;
-
-    let msg = txn
-        .commit(engine.as_ref())
-        .expect_err("DV update must be rejected on row-tracking tables")
-        .to_string();
-    assert!(
-        msg.contains("rowTracking"),
-        "expected rowTracking-block error, got: {msg}",
-    );
     Ok(())
 }
