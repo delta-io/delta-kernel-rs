@@ -2303,7 +2303,7 @@ mod test {
     }
 
     #[test]
-    fn test_iceberg_compat_v3_write_rejected_as_not_supported() {
+    fn test_iceberg_compat_v3_write_supported() {
         let config = create_mock_table_config_with_cm(
             &[
                 (ENABLE_ICEBERG_COMPAT_V3, "true"),
@@ -2318,10 +2318,9 @@ mod test {
                 TableFeature::DomainMetadata,
             ],
         );
-        assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
-            "Feature 'icebergCompatV3' is not supported",
-        );
+        config
+            .ensure_operation_supported(Operation::Write)
+            .expect("V3 write should be supported once kernel_support flips to Supported");
     }
 
     #[rstest]
