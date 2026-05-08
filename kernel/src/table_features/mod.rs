@@ -346,7 +346,9 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-// TODO(#2538): Support materializing stable row IDs on write.
+// TODO(#2538): Support materializing stable row IDs/CommitVersions on write and validate them
+// for removeFiles. Currently we block removeFiles on tables with RowTracking enabled for lack
+// of support and validations.
 static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
