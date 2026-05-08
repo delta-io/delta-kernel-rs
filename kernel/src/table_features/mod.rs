@@ -346,9 +346,11 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-// TODO(#2538): Support materializing stable row IDs/CommitVersions on write and validate them
-// for removeFiles. Currently we block removeFiles on tables with RowTracking enabled for lack
-// of support and validations.
+// TODO(#2538): Currently we block remove actions on RowTracking-enabled tables because
+//   1. kernel does not yet materialize stable row IDs / commit versions on write, which blocks COW
+//      rewrites,
+//   2. kernel does not yet validate if remove actions correctly reserved row IDs / commit versions.
+// Unblock after both 1 and 2 are supported.
 static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
