@@ -133,7 +133,7 @@ async fn test_row_tracking_blocks_remove_files() -> Result<(), Box<dyn std::erro
         .expect_err("commit must fail when remove_files is staged on a row-tracking table");
     let msg = err.to_string();
     assert!(
-        msg.contains("Remove actions are not supported") && msg.contains("rowTracking"),
+        msg.contains("Remove actions are not yet supported") && msg.contains("rowTracking"),
         "expected remove-block error mentioning rowTracking, got: {msg}",
     );
 
