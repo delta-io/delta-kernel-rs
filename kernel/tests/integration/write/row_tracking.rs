@@ -9,12 +9,13 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-use test_utils::{create_table, engine_store_setup};
+use test_utils::{create_table, engine_store_setup, test_table_setup_mt};
 use url::Url;
 
 /// Validates that kernel rejects remove actions on row-tracking tables.
@@ -137,5 +138,46 @@ async fn test_row_tracking_blocks_remove_files() -> Result<(), Box<dyn std::erro
         "expected remove-block error mentioning rowTracking, got: {msg}",
     );
 
+    Ok(())
+}
+
+/// `rowTracking` listed as supported (but not enabled) does NOT trigger the remove block.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_row_tracking_supported_but_not_enabled_allows_remove(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    // Row tracking is supported but not enabled.
+    let _ = kernel_create_table(&table_path, schema.clone(), "Test/1.0")
+        .with_table_properties([("delta.feature.rowTracking", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Append a file, then remove it -- commit must succeed.
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    test_utils::insert_data(
+        snapshot,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let scan = snapshot.clone().scan_builder().build()?;
+    let scan_files = scan
+        .scan_metadata(engine.as_ref())?
+        .next()
+        .unwrap()?
+        .scan_files;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_data_change(true);
+    txn.remove_files(scan_files);
+    txn.commit(engine.as_ref())?.unwrap_committed();
     Ok(())
 }
