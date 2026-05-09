@@ -54,6 +54,7 @@ pub mod expressions;
 pub mod ffi_tracing;
 pub mod log_path;
 pub mod scan;
+pub mod commit_range;
 pub mod schema;
 pub mod schema_visitor;
 

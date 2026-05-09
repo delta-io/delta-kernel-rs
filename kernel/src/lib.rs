@@ -88,6 +88,7 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
+pub mod commit_range;
 pub mod committer;
 // Public under test-utils so integration tests can inspect CRC state via
 // Snapshot::get_current_crc_if_loaded_for_testing.
