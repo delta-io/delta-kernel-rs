@@ -12,7 +12,7 @@ use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_features::{
-    find_max_column_id_in_schema, try_assign_field_column_mapping, ColumnMappingMode,
+    find_max_column_id_in_schema, try_assign_flat_column_mapping_info, ColumnMappingMode,
 };
 use crate::DeltaResult;
 
@@ -161,7 +161,10 @@ pub(crate) fn apply_schema_operations(
                              is not set in table properties",
                         )
                     })?;
-                    try_assign_field_column_mapping(&field, id)?
+                    // ALTER TABLE doesn't support icebergCompatV3 yet, so the new field never
+                    // gets `delta.columnMapping.nested.ids` here. Tracking issue:
+                    // <https://github.com/delta-io/delta-kernel-rs/issues/2492>
+                    try_assign_flat_column_mapping_info(&field, id)?
                 } else {
                     // No upfront reject for stray CM metadata: the recursive walk in
                     // `StructType::make_physical` (called from
