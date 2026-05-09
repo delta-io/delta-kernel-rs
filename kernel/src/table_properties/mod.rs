@@ -179,8 +179,8 @@ pub struct TableProperties {
     /// volumes of Amazon S3 calls to better partition across S3 servers.
     pub randomize_file_prefixes: Option<bool>,
 
-    /// When delta.randomizeFilePrefixes is set to true, the number of characters that Delta
-    /// generates for random prefixes.
+    /// The number of characters to use for random file path prefixes. Used when
+    /// `delta.randomizeFilePrefixes` is true or when column mapping is enabled.
     pub random_prefix_length: Option<NonZero<u64>>,
 
     /// The shortest duration within which new snapshots will retain transaction identifiers (for
@@ -252,17 +252,19 @@ impl TableProperties {
     }
 
     /// Returns whether to emit a random alphanumeric prefix in file paths regardless of column
-    /// mapping mode. Default: `false` per the Delta protocol.
+    /// mapping mode. Default: `false`.
     pub fn should_randomize_file_prefixes(&self) -> bool {
         self.randomize_file_prefixes.unwrap_or(false)
     }
 
     /// Returns the number of characters to use for random file path prefixes.
-    /// Default: `2`, matching Delta-Spark's `delta.randomPrefixLength` default.
-    pub fn random_prefix_length(&self) -> usize {
+    /// Default: `2`.
+    pub fn random_prefix_length(&self) -> NonZero<usize> {
+        const DEFAULT: NonZero<usize> = NonZero::<usize>::new(2).unwrap();
         self.random_prefix_length
-            .map(|n| n.get() as usize)
-            .unwrap_or(2)
+            .and_then(|n| usize::try_from(n.get()).ok())
+            .and_then(NonZero::new)
+            .unwrap_or(DEFAULT)
     }
 }
 

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::sync::Arc;
 
 use rand::Rng;
@@ -26,14 +27,14 @@ pub(super) struct SharedWriteState {
     pub(super) stats_columns: Vec<ColumnName>,
     /// Logical partition column names in metadata-defined order.
     pub(super) logical_partition_columns: Vec<String>,
-    /// Resolved value of the `delta.randomizeFilePrefixes` table property (default: false).
-    /// When true, [`WriteContext::write_dir`] emits a random alphanumeric prefix regardless
-    /// of column mapping mode.
+    /// Resolved value of the `delta.randomizeFilePrefixes` table property. When true,
+    /// [`WriteContext::write_dir`] emits a random alphanumeric prefix regardless of column
+    /// mapping mode.
     pub(super) randomize_file_prefixes: bool,
-    /// Resolved value of the `delta.randomPrefixLength` table property (default: 2). Drives
-    /// the length of the random prefix in [`WriteContext::write_dir`] for both the column
-    /// mapping and `randomizeFilePrefixes` paths.
-    pub(super) random_prefix_length: usize,
+    /// Resolved value of the `delta.randomPrefixLength` table property. Drives the length
+    /// of the random prefix in [`WriteContext::write_dir`] for both the column mapping and
+    /// `randomizeFilePrefixes` paths.
+    pub(super) random_prefix_length: NonZero<usize>,
 }
 
 /// A write context for a specific partition or an unpartitioned table. Created by
@@ -114,11 +115,11 @@ impl WriteContext {
     ///
     /// # Layout
     ///
-    /// A random alphanumeric prefix is emitted whenever column mapping is on **or** the
-    /// `delta.randomizeFilePrefixes` table property is true. The prefix length is controlled
-    /// by `delta.randomPrefixLength` (default 2, matching Delta-Spark). When a random prefix
-    /// is used on a partitioned table, Hive-style path components are suppressed; the
-    /// partition values are still recorded in `add.partitionValues`.
+    /// A random alphanumeric prefix is emitted whenever column mapping is on or the
+    /// `delta.randomizeFilePrefixes` table property is true. The prefix length is
+    /// controlled by `delta.randomPrefixLength`. When a random prefix is used on a
+    /// partitioned table, Hive-style path components are suppressed; the partition
+    /// values are still recorded in `add.partitionValues`.
     ///
     /// ```text
     ///                            | randomize=false                     | randomize=true
@@ -128,9 +129,8 @@ impl WriteContext {
     /// CM=Id/Name, any            | <table_root>/<prefix>/<uuid>.parquet| <table_root>/<prefix>/<uuid>.parquet
     /// ```
     ///
-    /// Each call generates a fresh prefix, matching Delta-Spark's per-file behavior
-    /// (`Utils.getRandomPrefix`). The alphanumeric charset is RFC 3986 unreserved, so
-    /// the prefix is URI-safe at any length.
+    /// Each call generates a fresh prefix. The alphanumeric charset is RFC 3986
+    /// unreserved, so the prefix is URI-safe at any length.
     ///
     /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
     /// [`build_add_file_metadata`]: crate::engine::default::build_add_file_metadata
@@ -141,7 +141,7 @@ impl WriteContext {
         // A random prefix is used when column mapping is on (to avoid leaking physical
         // UUID column names into paths) or when `delta.randomizeFilePrefixes` is set (to
         // avoid S3 hotspots). When a random prefix is used, the Hive-style partition path
-        // is suppressed -- partition values are recorded in `add.partitionValues` instead.
+        // is suppressed; partition values are recorded in `add.partitionValues` instead.
         let should_prefix = self.shared.column_mapping_mode != ColumnMappingMode::None
             || self.shared.randomize_file_prefixes;
         if should_prefix {
@@ -284,14 +284,13 @@ impl WriteContext {
     }
 }
 
-/// Generates a random alphanumeric prefix of the given length for data file directory paths,
-/// matching Delta-Spark's `Utils.getRandomPrefix` (`Random.alphanumeric.take(n)`). Used to avoid
-/// S3 hotspots and to prevent leaking physical UUID column names into paths when column mapping
-/// is enabled.
-fn random_alphanumeric_prefix(len: usize) -> String {
+/// Generates a random alphanumeric prefix of the given length for data file directory paths.
+/// Used to avoid S3 hotspots and to keep physical UUID column names out of paths when column
+/// mapping is enabled.
+fn random_alphanumeric_prefix(len: NonZero<usize>) -> String {
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::rng();
-    (0..len)
+    (0..len.get())
         .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
         .collect()
 }
@@ -307,7 +306,7 @@ mod tests {
     use crate::expressions::Expression;
     use crate::schema::{DataType, StructField, StructType};
 
-    fn make_write_context_with_randomize(
+    fn make_write_context(
         cm_mode: ColumnMappingMode,
         partition_columns: Vec<String>,
         partition_values: HashMap<String, Option<String>>,
@@ -327,7 +326,8 @@ mod tests {
             stats_columns: vec![],
             logical_partition_columns: partition_columns,
             randomize_file_prefixes,
-            random_prefix_length,
+            random_prefix_length: NonZero::new(random_prefix_length)
+                .expect("test prefix length must be > 0"),
         });
         WriteContext {
             shared,
@@ -357,7 +357,7 @@ mod tests {
         } else {
             (vec![], HashMap::new())
         };
-        let wc = make_write_context_with_randomize(cm_mode, cols, pvs, false, 2);
+        let wc = make_write_context(cm_mode, cols, pvs, false, 2);
         let path = wc.write_dir().path().to_string();
 
         match cm_mode {
@@ -399,13 +399,7 @@ mod tests {
 
     #[test]
     fn test_write_dir_cm_on_generates_different_prefixes_per_call() {
-        let wc = make_write_context_with_randomize(
-            ColumnMappingMode::Name,
-            vec![],
-            HashMap::new(),
-            false,
-            2,
-        );
+        let wc = make_write_context(ColumnMappingMode::Name, vec![], HashMap::new(), false, 2);
         let dirs: Vec<String> = (0..20).map(|_| wc.write_dir().path().to_string()).collect();
         let unique: HashSet<_> = dirs.iter().collect();
         assert!(
@@ -416,7 +410,7 @@ mod tests {
 
     #[test]
     fn test_write_dir_cm_off_partitioned_null_value_uses_hive_default() {
-        let wc = make_write_context_with_randomize(
+        let wc = make_write_context(
             ColumnMappingMode::None,
             vec!["region".into()],
             HashMap::from([("region".into(), None)]),
@@ -443,7 +437,7 @@ mod tests {
         #[case] value: &str,
         #[case] expected_path: &str,
     ) {
-        let wc = make_write_context_with_randomize(
+        let wc = make_write_context(
             ColumnMappingMode::None,
             vec![col.into()],
             HashMap::from([(col.into(), Some(value.into()))]),
@@ -460,8 +454,7 @@ mod tests {
     #[case::name_mode(ColumnMappingMode::Name)]
     #[case::id_mode(ColumnMappingMode::Id)]
     fn test_write_dir_cm_on_prefix_is_uri_safe(#[case] cm_mode: ColumnMappingMode) {
-        let wc =
-            make_write_context_with_randomize(cm_mode, vec!["p".into()], HashMap::new(), false, 2);
+        let wc = make_write_context(cm_mode, vec!["p".into()], HashMap::new(), false, 2);
         let path = wc.write_dir().path().to_string();
         assert!(
             !path.contains('%'),
@@ -484,8 +477,9 @@ mod tests {
     #[case(8)]
     #[case(32)]
     fn test_random_alphanumeric_prefix_format(#[case] len: usize) {
+        let nz_len = NonZero::new(len).unwrap();
         for _ in 0..100 {
-            let prefix = random_alphanumeric_prefix(len);
+            let prefix = random_alphanumeric_prefix(nz_len);
             assert_eq!(prefix.len(), len, "prefix should be exactly {len} chars");
             assert!(
                 prefix.chars().all(|c| c.is_ascii_alphanumeric()),
@@ -494,9 +488,9 @@ mod tests {
         }
     }
 
-    /// `randomizeFilePrefixes` triggers a random prefix even when CM is off, and suppresses
-    /// the Hive-style partition path. Combined with the existing CM-on behavior, this fully
-    /// pins the matrix described in the `write_dir` doc comment.
+    /// When CM is off and `randomizeFilePrefixes=true`, the random prefix replaces the
+    /// Hive-style path on disk for partitioned tables. Combined with the existing CM-on
+    /// behavior, this covers the full matrix described in the `write_dir` doc comment.
     #[rstest]
     fn test_write_dir_with_randomize_property(
         #[values(
@@ -516,7 +510,7 @@ mod tests {
         } else {
             (vec![], HashMap::new())
         };
-        let wc = make_write_context_with_randomize(cm_mode, cols, pvs, randomize, 2);
+        let wc = make_write_context(cm_mode, cols, pvs, randomize, 2);
         let path = wc.write_dir().path().to_string();
 
         let should_prefix = cm_mode != ColumnMappingMode::None || randomize;
@@ -556,13 +550,7 @@ mod tests {
         #[case] randomize: bool,
         #[case] prefix_len: usize,
     ) {
-        let wc = make_write_context_with_randomize(
-            cm_mode,
-            vec![],
-            HashMap::new(),
-            randomize,
-            prefix_len,
-        );
+        let wc = make_write_context(cm_mode, vec![], HashMap::new(), randomize, prefix_len);
         let path = wc.write_dir().path().to_string();
         let prefix = path
             .strip_prefix("/table/")
@@ -580,13 +568,12 @@ mod tests {
         );
     }
 
-    /// Pins the decision that for CM=None + partitioned + randomize=true, the random prefix
-    /// REPLACES the Hive path (matching Delta-Spark's `DelayedCommitProtocol.getFilename`).
-    /// Partition values are still recorded in `add.partitionValues`; this test only asserts
-    /// the on-disk layout.
+    /// When CM is off and a partitioned table has `randomizeFilePrefixes=true`, the random
+    /// prefix replaces the Hive-style path on disk. Partition values are still recorded in
+    /// `add.partitionValues`; this test only checks the on-disk layout.
     #[test]
     fn test_write_dir_cm_off_randomize_suppresses_hive() {
-        let wc = make_write_context_with_randomize(
+        let wc = make_write_context(
             ColumnMappingMode::None,
             vec!["year".into(), "month".into()],
             HashMap::from([
@@ -634,13 +621,7 @@ mod tests {
     #[case::error_outside_table_root("s3://bucket/other/abc.parquet", Err(()))]
     #[test]
     fn test_resolve_file_path(#[case] file_url: &str, #[case] expected: Result<&str, ()>) {
-        let wc = make_write_context_with_randomize(
-            ColumnMappingMode::None,
-            vec![],
-            HashMap::new(),
-            false,
-            2,
-        );
+        let wc = make_write_context(ColumnMappingMode::None, vec![], HashMap::new(), false, 2);
         let file = Url::parse(file_url).unwrap();
         match expected {
             Ok(exp) => assert_eq!(wc.resolve_file_path(&file).unwrap(), exp),
