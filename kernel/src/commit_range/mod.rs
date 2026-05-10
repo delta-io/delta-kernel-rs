@@ -19,7 +19,7 @@
 //!     .with_end_boundary(CommitBoundary::Version(4))
 //!     .build(engine)?;
 //!
-//! for commit in range.commits(engine, &[DeltaAction::Add, DeltaAction::Remove])? {
+//! for commit in range.commits(engine, start_snapshot, &[DeltaAction::Add, DeltaAction::Remove])? {
 //!     let commit = commit?;
 //!     println!("v={} ts={}", commit.version(), commit.timestamp());
 //!     for batch in commit.into_actions() {
@@ -32,7 +32,7 @@ mod actions;
 mod builder;
 
 use std::slice;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 pub use actions::{CommitActions, DeltaAction};
 pub use builder::{CommitOrdering, CommitRangeBuilder};
@@ -46,7 +46,8 @@ use crate::expressions::Expression;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{KernelSupport, MAX_VALID_READER_VERSION};
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::Operation;
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator, JsonHandler, Version};
 
 /// Output column name for the per-row commit version emitted by [`CommitRange::actions`].
@@ -171,22 +172,38 @@ impl CommitRange {
     pub fn commits(
         &self,
         engine: &dyn Engine,
+        start_snapshot: SnapshotRef,
         actions: &[DeltaAction],
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<CommitActions>> + Send> {
+        if start_snapshot.version() != self.start_version {
+            return Err(Error::generic(format!(
+                "start snapshot version {} does not match start_version {}",
+                start_snapshot.version(),
+                self.start_version,
+            )));
+        }
+
+        start_snapshot
+            .table_configuration()
+            .ensure_operation_supported(Operation::Scan)?;
+
         let action_kinds = actions.to_vec();
         let inject_protocol =
             self.validate_protocol && !action_kinds.contains(&DeltaAction::Protocol);
+        let inject_metadata =
+            self.validate_protocol && !action_kinds.contains(&DeltaAction::Metadata);
         let read_schema = build_read_schema(
             action_kinds
                 .iter()
                 .copied()
-                .chain(inject_protocol.then_some(DeltaAction::Protocol)),
+                .chain(inject_protocol.then_some(DeltaAction::Protocol))
+                .chain(inject_metadata.then_some(DeltaAction::Metadata)),
         );
         let json_handler = engine.json_handler();
         let validate = self.validate_protocol;
         let commit_files = self.commit_files.clone();
 
-        let drop_column_evaluator = if inject_protocol {
+        let drop_column_evaluator = if inject_protocol || inject_metadata {
             Some(build_drop_protocol_evaluator(
                 engine,
                 &action_kinds,
@@ -196,13 +213,17 @@ impl CommitRange {
             None
         };
 
+        let protocol_validator = Arc::new(ProtocolValidator::from(
+            start_snapshot,
+            drop_column_evaluator,
+        ));
         Ok(commit_files.into_iter().map(move |file| {
             open_commit_actions(
                 json_handler.as_ref(),
                 &file,
                 read_schema.clone(),
                 validate,
-                drop_column_evaluator.clone(),
+                protocol_validator.clone(),
             )
         }))
     }
@@ -221,13 +242,14 @@ impl CommitRange {
     pub fn actions(
         &self,
         engine: &dyn Engine,
+        start_snapshot: SnapshotRef,
         actions: &[DeltaAction],
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
         let action_kinds = actions.to_vec();
         let input_schema = build_read_schema(action_kinds.iter().copied());
         let output_schema = actions_output_schema(&action_kinds);
         let evaluation_handler = engine.evaluation_handler();
-        let commits_iter = self.commits(engine, actions)?;
+        let commits_iter = self.commits(engine, start_snapshot, actions)?;
 
         Ok(commits_iter.flat_map(
             move |commit_res| -> Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
@@ -259,6 +281,42 @@ impl CommitRange {
                 }))
             },
         ))
+    }
+}
+
+struct ProtocolValidator {
+    table_configuration: Arc<Mutex<TableConfiguration>>,
+    drop_evaluator: Option<Arc<dyn ExpressionEvaluator>>,
+}
+
+impl ProtocolValidator {
+    fn from(snapshot: SnapshotRef, drop_evaluator: Option<Arc<dyn ExpressionEvaluator>>) -> Self {
+        Self {
+            table_configuration: Arc::new(Mutex::new(snapshot.table_configuration().clone())),
+            drop_evaluator,
+        }
+    }
+
+    fn validate_protocol_and_drop_column(
+        &self,
+        batch: Box<dyn EngineData>,
+        version: Version,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let new_protocol = Protocol::try_new_from_data(batch.as_ref())?;
+        let new_metadata = Metadata::try_new_from_data(batch.as_ref())?;
+
+        let mut guard = self
+            .table_configuration
+            .lock()
+            .map_err(|_| Error::generic("table configuration mutex poisoned"))?;
+
+        *guard = TableConfiguration::try_new_from(&guard, new_metadata, new_protocol, version)?;
+        guard.ensure_operation_supported(Operation::Scan)?;
+
+        match &self.drop_evaluator {
+            Some(eval) => eval.evaluate(batch.as_ref()),
+            None => Ok(batch),
+        }
     }
 }
 
@@ -317,31 +375,6 @@ fn build_drop_protocol_evaluator(
     )
 }
 
-/// Validate that Kernel can read a table governed by `protocol`.
-///
-/// Lower-bound (`min_reader_version >= 1`) is enforced by [`Protocol::try_new`] during
-/// deserialization, so this helper only checks the upper bound and the `reader_features`
-/// list.
-fn validate_protocol_for_read(protocol: &Protocol) -> DeltaResult<()> {
-    let version = protocol.min_reader_version();
-    if version > MAX_VALID_READER_VERSION {
-        return Err(Error::unsupported(format!(
-            "Unsupported minimum reader version {version}; \
-             kernel supports up to {MAX_VALID_READER_VERSION}",
-        )));
-    }
-    if let Some(features) = protocol.reader_features() {
-        for feature in features {
-            if matches!(feature.info().kernel_support, KernelSupport::NotSupported) {
-                return Err(Error::unsupported(format!(
-                    "Reader feature '{feature}' is not supported by kernel",
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Output schema produced by [`CommitRange::actions`]:
 /// `struct<version: long, timestamp: long, ...input_fields>`.
 fn actions_output_schema(actions: &[DeltaAction]) -> SchemaRef {
@@ -387,23 +420,18 @@ fn open_commit_actions(
     file: &ParsedLogPath,
     read_schema: SchemaRef,
     validate_protocol: bool,
-    drop_evaluator: Option<Arc<dyn ExpressionEvaluator>>,
+    protocol_validator: Arc<ProtocolValidator>,
 ) -> DeltaResult<CommitActions> {
     let raw_iter =
         json_handler.read_json_files(slice::from_ref(&file.location), read_schema, None)?;
 
-    let mut seen_protocol = false;
+    let version = file.version;
     let actions = Box::new(raw_iter.map(move |batch_res| {
         let batch = batch_res?;
-        if validate_protocol && !seen_protocol {
-            if let Some(protocol) = Protocol::try_new_from_data(batch.as_ref())? {
-                validate_protocol_for_read(&protocol)?;
-                seen_protocol = true;
-            }
-        }
-        match &drop_evaluator {
-            Some(eval) => eval.evaluate(batch.as_ref()),
-            None => Ok(batch),
+        if validate_protocol {
+            protocol_validator.validate_protocol_and_drop_column(batch, version)
+        } else {
+            Ok(batch)
         }
     }));
 
@@ -430,27 +458,31 @@ mod tests {
     use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
     use crate::object_store::memory::InMemory;
     use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes};
+    use crate::Snapshot;
 
-    /// Open a `CommitRange` over the `table-with-dv-small` test table.
+    /// Open a `CommitRange` over `table-with-dv-small` with a matching start snapshot.
     ///
-    /// The table has two commits with mixed action kinds:
-    /// - v=0: protocol + metaData + add (initial file)
-    /// - v=1: commitInfo + remove (drops v=0 file) + add (rewrite with deletion vector)
-    fn open_test_range() -> (CommitRange, SyncEngine) {
+    /// `start_version` drives both the range's start boundary and the snapshot's version;
+    fn open_test_range_at(start_version: Version) -> (CommitRange, SyncEngine, SnapshotRef) {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let table_root = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
-        let range = CommitRange::builder_for(table_root.as_str(), CommitBoundary::Version(0))
-            .with_end_boundary(CommitBoundary::Version(1))
+        let range =
+            CommitRange::builder_for(table_root.as_str(), CommitBoundary::Version(start_version))
+                .with_end_boundary(CommitBoundary::Version(1))
+                .build(&engine)
+                .unwrap();
+        let start_snapshot = Snapshot::builder_for(table_root.as_str())
+            .at_version(start_version)
             .build(&engine)
             .unwrap();
-        (range, engine)
+        (range, engine, start_snapshot)
     }
 
     #[test]
     fn commits_yields_one_per_commit_in_range() {
-        let (range, engine) = open_test_range();
+        let (range, engine, start_snapshot) = open_test_range_at(0);
         let files = &range.commit_files;
         assert_eq!(
             files.len(),
@@ -460,7 +492,7 @@ mod tests {
 
         let actions = [DeltaAction::Add, DeltaAction::Remove];
         let collected = range
-            .commits(&engine, &actions)
+            .commits(&engine, start_snapshot, &actions)
             .unwrap()
             .collect::<DeltaResult<Vec<_>>>()
             .unwrap();
@@ -512,17 +544,10 @@ mod tests {
     fn commits_actions_project_to_requested_schema() {
         // v=1 of table-with-dv-small contains commitInfo + remove + add (DV rewrite).
         // The remove and add reference the same physical file path.
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
-        let table_root = url::Url::from_directory_path(path).unwrap();
-        let engine = SyncEngine::new();
-        let range = CommitRange::builder_for(table_root.as_str(), CommitBoundary::Version(1))
-            .with_end_boundary(CommitBoundary::Version(1))
-            .build(&engine)
-            .unwrap();
+        let (range, engine, start_snapshot) = open_test_range_at(1);
 
         let actions = [DeltaAction::Add, DeltaAction::Remove];
-        let mut iter = range.commits(&engine, &actions).unwrap();
+        let mut iter = range.commits(&engine, start_snapshot, &actions).unwrap();
         let commit = iter.next().expect("v=1 commit").unwrap();
         assert_eq!(commit.version(), 1);
         assert!(iter.next().is_none(), "single-commit range yields only v=1");
@@ -612,9 +637,10 @@ mod tests {
     fn drain_commits(
         range: &CommitRange,
         engine: &dyn Engine,
+        start_snapshot: SnapshotRef,
         actions: &[DeltaAction],
     ) -> DeltaResult<()> {
-        for commit_res in range.commits(engine, actions)? {
+        for commit_res in range.commits(engine, start_snapshot, actions)? {
             let commit = commit_res?;
             for batch_res in commit.into_actions() {
                 batch_res?;
@@ -628,10 +654,12 @@ mod tests {
     fn assert_unsupported_with_substring(
         range: &CommitRange,
         engine: &dyn Engine,
+        start_snapshot: SnapshotRef,
         actions: &[DeltaAction],
         expected_substring: &str,
     ) {
-        let err = drain_commits(range, engine, actions).expect_err("validation must reject");
+        let err = drain_commits(range, engine, start_snapshot, actions)
+            .expect_err("validation must reject");
         match &err {
             Error::Unsupported(msg) => assert!(
                 msg.contains(expected_substring),
@@ -641,45 +669,48 @@ mod tests {
         }
     }
 
+    const VALID_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}"#;
     const VALID_METADATA_LINE: &str = r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1000}}"#;
 
     #[tokio::test]
     async fn commits_errors_on_too_high_reader_version() {
-        let body = format!(
-            "{}\n{}",
-            r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#, VALID_METADATA_LINE,
-        );
-        let (engine, table_root) = engine_with_commits(&[(0, &body)]).await;
+        let v0 = format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE);
+        let v1 = r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#;
+        let (engine, table_root) = engine_with_commits(&[(0, &v0), (1, v1)]).await;
 
         let range = CommitRange::builder_for(table_root, CommitBoundary::Version(0))
-            .with_end_boundary(CommitBoundary::Version(0))
+            .with_end_boundary(CommitBoundary::Version(1))
             .build(engine.as_ref())
             .expect("build should succeed; validation runs during iteration");
 
+        let start_snapshot = Snapshot::builder_for(table_root)
+            .at_version(0)
+            .build(engine.as_ref())
+            .unwrap();
+
         let actions = [DeltaAction::Add, DeltaAction::Remove];
-        assert_unsupported_with_substring(&range, engine.as_ref(), &actions, "99");
+        assert_unsupported_with_substring(&range, engine.as_ref(), start_snapshot, &actions, "99");
     }
 
     #[tokio::test]
     async fn commits_errors_on_too_low_reader_version() {
-        // minReaderVersion=0 is rejected by `Protocol::try_new` before validate_protocol_for_read
-        // ever runs; the per-batch path surfaces the InvalidProtocol error. This pins the
-        // layered defense: malformed protocols are caught by deserialization, and well-formed
-        // but unsupported protocols (e.g. version=99) are caught by validate_protocol_for_read.
-        let body = format!(
-            "{}\n{}",
-            r#"{"protocol":{"minReaderVersion":0,"minWriterVersion":1}}"#, VALID_METADATA_LINE,
-        );
-        let (engine, table_root) = engine_with_commits(&[(0, &body)]).await;
+        let v0 = format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE);
+        let v1 = r#"{"protocol":{"minReaderVersion":0,"minWriterVersion":1}}"#;
+        let (engine, table_root) = engine_with_commits(&[(0, &v0), (1, v1)]).await;
 
         let range = CommitRange::builder_for(table_root, CommitBoundary::Version(0))
-            .with_end_boundary(CommitBoundary::Version(0))
+            .with_end_boundary(CommitBoundary::Version(1))
             .build(engine.as_ref())
             .expect("build should succeed");
 
+        let start_snapshot = Snapshot::builder_for(table_root)
+            .at_version(0)
+            .build(engine.as_ref())
+            .unwrap();
+
         let actions = [DeltaAction::Add, DeltaAction::Remove];
-        let err = drain_commits(&range, engine.as_ref(), &actions)
-            .expect_err("v=0 reader version must be rejected");
+        let err = drain_commits(&range, engine.as_ref(), start_snapshot, &actions)
+            .expect_err("v=1 reader version must be rejected");
         match &err {
             Error::InvalidProtocol(msg) => assert!(msg.contains('0'), "got: {msg}"),
             other => panic!("expected Error::InvalidProtocol, got: {other:?}"),
@@ -688,20 +719,28 @@ mod tests {
 
     #[tokio::test]
     async fn commits_errors_on_unsupported_reader_feature() {
-        let body = format!(
-            "{}\n{}",
-            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#,
-            VALID_METADATA_LINE,
-        );
-        let (engine, table_root) = engine_with_commits(&[(0, &body)]).await;
+        let v0 = format!("{}\n{}", VALID_PROTOCOL_LINE, VALID_METADATA_LINE);
+        let v1 = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#;
+        let (engine, table_root) = engine_with_commits(&[(0, &v0), (1, v1)]).await;
 
         let range = CommitRange::builder_for(table_root, CommitBoundary::Version(0))
-            .with_end_boundary(CommitBoundary::Version(0))
+            .with_end_boundary(CommitBoundary::Version(1))
             .build(engine.as_ref())
             .expect("build should succeed");
 
+        let start_snapshot = Snapshot::builder_for(table_root)
+            .at_version(0)
+            .build(engine.as_ref())
+            .unwrap();
+
         let actions = [DeltaAction::Add, DeltaAction::Remove];
-        assert_unsupported_with_substring(&range, engine.as_ref(), &actions, "futureFeature");
+        assert_unsupported_with_substring(
+            &range,
+            engine.as_ref(),
+            start_snapshot,
+            &actions,
+            "futureFeature",
+        );
     }
 
     #[rstest::rstest]
@@ -717,9 +756,9 @@ mod tests {
         #[case] actions: &[DeltaAction],
         #[case] expected_columns: &[&str],
     ) {
-        let (range, engine) = open_test_range();
+        let (range, engine, start_snapshot) = open_test_range_at(0);
         let mut saw_batch = false;
-        for commit in range.commits(&engine, actions).unwrap() {
+        for commit in range.commits(&engine, start_snapshot, actions).unwrap() {
             let commit = commit.unwrap();
             for batch in commit.into_actions() {
                 let batch = batch.unwrap();
@@ -747,8 +786,6 @@ mod tests {
 
     #[tokio::test]
     async fn commits_iter_yields_ok_then_err_on_downstream_bad_protocol() {
-        // v=0: valid (3,7) protocol + metadata. v=1: protocol upgrade to an unsupported
-        // version. The iterator must yield v=0 cleanly and surface the error on v=1.
         let v0 = format!(
             "{}\n{}",
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":[]}}"#,
@@ -762,8 +799,15 @@ mod tests {
             .build(engine.as_ref())
             .expect("build should succeed");
 
+        let start_snapshot = Snapshot::builder_for(table_root)
+            .at_version(0)
+            .build(engine.as_ref())
+            .unwrap();
+
         let actions = [DeltaAction::Add, DeltaAction::Remove];
-        let mut iter = range.commits(engine.as_ref(), &actions).unwrap();
+        let mut iter = range
+            .commits(engine.as_ref(), start_snapshot, &actions)
+            .unwrap();
 
         let v0_commit = iter.next().expect("v=0 commit").unwrap();
         let v0_batches: DeltaResult<Vec<_>> = v0_commit.into_actions().collect();
@@ -782,12 +826,12 @@ mod tests {
 
     #[test]
     fn actions_yields_metadata_columns_prepended() {
-        let (range, engine) = open_test_range();
+        let (range, engine, start_snapshot) = open_test_range_at(0);
         let files = range.commit_files.clone();
 
         let actions = [DeltaAction::Add, DeltaAction::Remove];
         let mut visitor = ActionsTaggedVisitor::default();
-        for batch_res in range.actions(&engine, &actions).unwrap() {
+        for batch_res in range.actions(&engine, start_snapshot, &actions).unwrap() {
             visitor.visit_rows_of(batch_res.unwrap().as_ref()).unwrap();
         }
 

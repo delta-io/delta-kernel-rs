@@ -326,13 +326,18 @@ mod tests {
             .build(&engine)
             .unwrap();
 
+        let start_snapshot = Snapshot::builder_for(table_root.as_str())
+            .at_version(0)
+            .build(&engine)
+            .unwrap();
+
         let asc_versions = asc_range
-            .commits(&engine, &actions)
+            .commits(&engine, start_snapshot.clone(), &actions)
             .unwrap()
             .map(|c| c.unwrap().version())
             .collect::<Vec<_>>();
         let desc_versions = desc_range
-            .commits(&engine, &actions)
+            .commits(&engine, start_snapshot, &actions)
             .unwrap()
             .map(|c| c.unwrap().version())
             .collect::<Vec<_>>();
