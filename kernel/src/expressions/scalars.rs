@@ -703,7 +703,13 @@ impl PrimitiveType {
 
         match self {
             String => Ok(Scalar::String(raw.to_string())),
-            Binary => Ok(Scalar::Binary(raw.to_string().into_bytes())),
+            // Binary partition values are serialized in the Delta log as a sequence of `\u00XX`
+            // escape groups, one per byte, per the partition-value serialization rules:
+            // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
+            // Decode the escape sequences back to raw bytes instead of returning the UTF-8 bytes
+            // of the literal escape string (which would double-encode the value for any downstream
+            // consumer that treats the result as real binary data).
+            Binary => parse_binary_partition_value(raw).map(Scalar::Binary),
             Byte => self.parse_str_as_scalar(raw, Scalar::Byte),
             Decimal(dtype) => Self::parse_decimal(raw, *dtype),
             Short => self.parse_str_as_scalar(raw, Scalar::Short),
@@ -818,6 +824,29 @@ impl PrimitiveType {
         };
         Ok(Scalar::Decimal(DecimalData::try_new(int, dtype)?))
     }
+}
+
+/// Decode a Binary partition value stored in the `\u00XX`-escaped format mandated by the Delta
+/// Lake protocol. Each byte is represented by exactly six ASCII characters: a backslash, the
+/// letter `u`, the literal `00`, and two hexadecimal digits (upper- or lower-case).
+///
+/// See [the protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization).
+fn parse_binary_partition_value(raw: &str) -> Result<Vec<u8>, Error> {
+    let parse_err = || Error::ParseError(raw.to_string(), DataType::BINARY);
+    let bytes = raw.as_bytes();
+    if !bytes.len().is_multiple_of(6) {
+        return Err(parse_err());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 6);
+    for chunk in bytes.chunks_exact(6) {
+        if &chunk[..4] != b"\\u00" {
+            return Err(parse_err());
+        }
+        let hex = std::str::from_utf8(&chunk[4..6]).map_err(|_| parse_err())?;
+        let byte = u8::from_str_radix(hex, 16).map_err(|_| parse_err())?;
+        out.push(byte);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1324,6 +1353,35 @@ mod tests {
             assert!(data.is_empty());
         } else {
             panic!("Expected Binary scalar");
+        }
+    }
+
+    #[test]
+    fn test_parse_binary_partition_value() {
+        // Per the Delta protocol a Binary partition value serializes each byte as `\u00XX`.
+        let round_trip = |bytes: &[u8]| {
+            let encoded: String = bytes.iter().map(|b| format!("\\u{b:04X}")).collect();
+            let scalar = PrimitiveType::Binary.parse_scalar(&encoded).unwrap();
+            assert_eq!(scalar, Scalar::Binary(bytes.to_vec()));
+        };
+
+        round_trip(b"\x00\x01\x7F\x80\xFF");
+        round_trip(&[0x23, 0xE8, 0x07, 0xDE, 0x56, 0x50, 0x9B, 0x48, 0xA1, 0x5F]);
+
+        // Lower-case hex digits are accepted too.
+        let scalar = PrimitiveType::Binary.parse_scalar("\\u00ab\\u00cd").unwrap();
+        assert_eq!(scalar, Scalar::Binary(vec![0xAB, 0xCD]));
+
+        // An empty input still maps to Null (shared behavior across all primitive types).
+        let empty = PrimitiveType::Binary.parse_scalar("").unwrap();
+        assert!(empty.is_null());
+
+        // Malformed inputs are rejected.
+        for bad in ["\\u0041X", "\\u00ZZ", "\\u0041\\", "\\u00\\u00ab", "partial"] {
+            assert!(
+                PrimitiveType::Binary.parse_scalar(bad).is_err(),
+                "expected parse error for {bad:?}"
+            );
         }
     }
 }
