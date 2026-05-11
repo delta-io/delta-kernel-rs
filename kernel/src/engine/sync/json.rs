@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use url::Url;
 
-use super::{read_files, resolve_scope};
+use super::{put_bytes, read_files};
 use crate::arrow::json::ReaderBuilder;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
@@ -74,39 +74,7 @@ impl JsonHandler for SyncJsonHandler {
         overwrite: bool,
     ) -> DeltaResult<()> {
         let buf = to_json_bytes(data)?;
-
-        // For local writes, ensure parent directories exist; `LocalFileSystem::put` does not
-        // create them. No-op for non-file:// URLs. Must happen before `resolve_scope` so that
-        // canonicalization of the parent succeeds.
-        if path.scheme() == "file" {
-            if let Ok(file_path) = path.to_file_path() {
-                if let Some(parent) = file_path.parent() {
-                    if !parent.exists() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                }
-            }
-        }
-
-        let (store, _, object_path) = resolve_scope(self.store.as_ref(), path)?;
-
-        let opts = if overwrite {
-            crate::object_store::PutOptions::default()
-        } else {
-            crate::object_store::PutOptions {
-                mode: crate::object_store::PutMode::Create,
-                ..Default::default()
-            }
-        };
-        futures::executor::block_on(store.put_opts(&object_path, buf.into(), opts)).map_err(
-            |e| match e {
-                crate::object_store::Error::AlreadyExists { .. } => {
-                    Error::FileAlreadyExists(path.to_string())
-                }
-                other => Error::generic(other.to_string()),
-            },
-        )?;
-        Ok(())
+        put_bytes(self.store.as_ref(), path, buf.into(), overwrite)
     }
 }
 

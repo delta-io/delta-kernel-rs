@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use url::Url;
 
-use super::{get_bytes, read_files, resolve_scope};
+use super::{get_bytes, put_bytes, read_files};
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
@@ -123,22 +123,7 @@ impl ParquetHandler for SyncParquetHandler {
         }
         writer.close()?;
 
-        // For local writes, ensure parent directories exist; `LocalFileSystem::put` does not
-        // create them. No-op for non-file:// URLs. Must happen before `resolve_scope` so that
-        // canonicalization of the parent succeeds.
-        if location.scheme() == "file" {
-            if let Ok(file_path) = location.to_file_path() {
-                if let Some(parent) = file_path.parent() {
-                    if !parent.exists() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                }
-            }
-        }
-
-        let (store, _, object_path) = resolve_scope(self.store.as_ref(), &location)?;
-        futures::executor::block_on(store.put(&object_path, buf.into()))?;
-        Ok(())
+        put_bytes(self.store.as_ref(), &location, buf.into(), true)
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {

@@ -164,6 +164,46 @@ pub(super) fn get_bytes(
     Ok(futures::executor::block_on(get_result.bytes())?)
 }
 
+/// Write `data` to `location` via [`resolve_scope`].
+///
+/// For `file://` URLs the parent directory is created if missing (matching the local FS
+/// behavior callers expect; `LocalFileSystem::put` itself does not create parents). When
+/// `overwrite` is false, an existing file at `location` produces [`Error::FileAlreadyExists`].
+pub(super) fn put_bytes(
+    default_store: Option<&Arc<DynObjectStore>>,
+    location: &Url,
+    data: Bytes,
+    overwrite: bool,
+) -> DeltaResult<()> {
+    if location.scheme() == "file" {
+        if let Ok(file_path) = location.to_file_path() {
+            if let Some(parent) = file_path.parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+        }
+    }
+    let (store, _, object_path) = resolve_scope(default_store, location)?;
+    let opts = if overwrite {
+        crate::object_store::PutOptions::default()
+    } else {
+        crate::object_store::PutOptions {
+            mode: crate::object_store::PutMode::Create,
+            ..Default::default()
+        }
+    };
+    futures::executor::block_on(store.put_opts(&object_path, data.into(), opts)).map_err(
+        |e| match e {
+            crate::object_store::Error::AlreadyExists { .. } => {
+                Error::FileAlreadyExists(location.to_string())
+            }
+            other => Error::generic(other.to_string()),
+        },
+    )?;
+    Ok(())
+}
+
 /// Read each file as bytes and feed it to `try_create_from_bytes` to produce data batches.
 fn read_files<F, I>(
     store: Option<&Arc<DynObjectStore>>,

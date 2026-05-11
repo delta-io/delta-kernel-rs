@@ -4,7 +4,7 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use url::Url;
 
-use super::resolve_scope;
+use super::{put_bytes, resolve_scope};
 use crate::object_store::path::Path;
 use crate::object_store::DynObjectStore;
 // `ObjectStoreExt` is needed for `store.get()` etc. in arrow-58 mode where these methods moved
@@ -83,24 +83,7 @@ impl StorageHandler for SyncStorageHandler {
     }
 
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
-        let (store, _, object_path) = resolve_scope(self.store.as_ref(), path)?;
-        let opts = if overwrite {
-            crate::object_store::PutOptions::default()
-        } else {
-            crate::object_store::PutOptions {
-                mode: crate::object_store::PutMode::Create,
-                ..Default::default()
-            }
-        };
-        futures::executor::block_on(store.put_opts(&object_path, data.into(), opts)).map_err(
-            |e| match e {
-                crate::object_store::Error::AlreadyExists { .. } => {
-                    Error::FileAlreadyExists(path.to_string())
-                }
-                other => Error::generic(other.to_string()),
-            },
-        )?;
-        Ok(())
+        put_bytes(self.store.as_ref(), path, data, overwrite)
     }
 
     fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
