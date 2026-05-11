@@ -57,16 +57,22 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowS
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
+use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
+use serde_json::json;
+
+use crate::delta_path_for_version;
 
 // ===========================================================================
 // LogState
@@ -78,6 +84,27 @@ pub enum LogState {
     /// Only JSON commit files: `num_commits` total versions (0 through `num_commits - 1`).
     /// Version 0 is always the create-table commit; versions 1+ contain data.
     CommitsOnly { num_commits: u64 },
+    /// Commits 0..`total_versions`, with a V1 parquet checkpoint at `checkpoint_at`.
+    /// Incompatible with the `v2Checkpoint` feature (build() will error).
+    CheckpointV1 {
+        checkpoint_at: u64,
+        total_versions: u64,
+    },
+    /// Commits 0..`total_versions`, with a V2 checkpoint at `checkpoint_at`.
+    /// Requires the `v2Checkpoint` feature (build() will error without it).
+    CheckpointV2 {
+        checkpoint_at: u64,
+        total_versions: u64,
+    },
+    /// V1 checkpoint at `checkpoint_at` followed by `commits_after` additional commits.
+    /// Total versions on disk = `checkpoint_at + commits_after + 1`.
+    /// Incompatible with the `v2Checkpoint` feature (build() will error).
+    CheckpointAndCommits {
+        checkpoint_at: u64,
+        commits_after: u64,
+    },
+    /// Commits 0..`total_versions`, with a CRC file at `crc_at`.
+    WithCrc { crc_at: u64, total_versions: u64 },
 }
 
 impl LogState {
@@ -94,10 +121,87 @@ impl LogState {
         LogState::CommitsOnly { num_commits: n }
     }
 
-    /// Number of commit files on disk (versions 0 through `num_versions - 1`).
+    /// V1 parquet checkpoint at `checkpoint_at`, with `total_versions` commits on disk.
+    pub fn checkpoint_v1(checkpoint_at: u64, total_versions: u64) -> Self {
+        assert!(
+            checkpoint_at < total_versions,
+            "checkpoint_at ({checkpoint_at}) must be < total_versions ({total_versions})"
+        );
+        LogState::CheckpointV1 {
+            checkpoint_at,
+            total_versions,
+        }
+    }
+
+    /// V2 checkpoint at `checkpoint_at`, with `total_versions` commits on disk.
+    pub fn checkpoint_v2(checkpoint_at: u64, total_versions: u64) -> Self {
+        assert!(
+            checkpoint_at < total_versions,
+            "checkpoint_at ({checkpoint_at}) must be < total_versions ({total_versions})"
+        );
+        LogState::CheckpointV2 {
+            checkpoint_at,
+            total_versions,
+        }
+    }
+
+    /// V1 checkpoint at `checkpoint_at`, followed by `commits_after` additional commits.
+    pub fn checkpoint_and_commits(checkpoint_at: u64, commits_after: u64) -> Self {
+        LogState::CheckpointAndCommits {
+            checkpoint_at,
+            commits_after,
+        }
+    }
+
+    /// CRC file at `crc_at`, with `total_versions` commits on disk.
+    pub fn with_crc(crc_at: u64, total_versions: u64) -> Self {
+        assert!(
+            crc_at < total_versions,
+            "crc_at ({crc_at}) must be < total_versions ({total_versions})"
+        );
+        LogState::WithCrc {
+            crc_at,
+            total_versions,
+        }
+    }
+
+    /// All standard log states for a table with `n` total versions.
+    ///
+    /// Useful for cross-product testing across all log configurations. Requires `n >= 3`
+    /// so that every returned variant is non-degenerate (`CheckpointAndCommits` needs at
+    /// least one commit after its checkpoint).
+    pub fn all(n: u64) -> Vec<Self> {
+        assert!(
+            n >= 3,
+            "need at least 3 versions for every LogState variant to be non-degenerate"
+        );
+        vec![
+            Self::with_commits(n),
+            Self::checkpoint_v1(n - 1, n),
+            Self::checkpoint_v2(n - 1, n),
+            Self::checkpoint_and_commits(1, n - 2),
+            Self::with_crc(0, n),
+        ]
+    }
+
+    /// Number of commit files on disk. A return value of `N` means versions 0 through
+    /// `N - 1` exist.
     pub(crate) fn num_versions(&self) -> u64 {
         match self {
-            LogState::CommitsOnly { num_commits } => *num_commits,
+            LogState::CommitsOnly { num_commits: n } => *n,
+            LogState::CheckpointV1 {
+                total_versions: n, ..
+            }
+            | LogState::CheckpointV2 {
+                total_versions: n, ..
+            }
+            | LogState::WithCrc {
+                total_versions: n, ..
+            } => *n,
+            LogState::CheckpointAndCommits {
+                checkpoint_at,
+                commits_after,
+            } => checkpoint_at + commits_after + 1,
         }
     }
 }
@@ -106,6 +210,31 @@ impl fmt::Display for LogState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LogState::CommitsOnly { num_commits } => write!(f, "commits({num_commits})"),
+            LogState::CheckpointV1 {
+                checkpoint_at,
+                total_versions,
+            } => write!(
+                f,
+                "checkpoint_v1(at={checkpoint_at}, total={total_versions})"
+            ),
+            LogState::CheckpointV2 {
+                checkpoint_at,
+                total_versions,
+            } => write!(
+                f,
+                "checkpoint_v2(at={checkpoint_at}, total={total_versions})"
+            ),
+            LogState::CheckpointAndCommits {
+                checkpoint_at,
+                commits_after,
+            } => write!(
+                f,
+                "checkpoint_and_commits(at={checkpoint_at}, after={commits_after})"
+            ),
+            LogState::WithCrc {
+                crc_at,
+                total_versions,
+            } => write!(f, "with_crc(at={crc_at}, total={total_versions})"),
         }
     }
 }
@@ -216,8 +345,12 @@ impl FeatureSet {
         self
     }
 
-    /// Common feature sets for cross-product testing: empty, one per feature, and one
-    /// with all features combined. Not the full power set -- add specific combos as needed.
+    /// Common feature sets for cross-product testing: empty, one per write-compatible
+    /// feature, and one with all write-compatible features combined. Not the full power
+    /// set -- add specific combos as needed.
+    ///
+    /// `type_widening` is intentionally excluded because kernel errors when writing
+    /// tables with that feature enabled (see `TableFeature::TypeWidening`).
     pub fn common() -> Vec<Self> {
         vec![
             Self::empty(),
@@ -227,11 +360,9 @@ impl FeatureSet {
             Self::new().deletion_vectors(),
             Self::new().append_only(),
             Self::new().change_data_feed(),
-            Self::new().type_widening(),
             Self::new().domain_metadata(),
             Self::new().vacuum_protocol_check(),
             Self::new().row_tracking(),
-            // All features combined
             Self::new()
                 .column_mapping("name")
                 .ict()
@@ -239,11 +370,26 @@ impl FeatureSet {
                 .deletion_vectors()
                 .append_only()
                 .change_data_feed()
-                .type_widening()
                 .domain_metadata()
                 .vacuum_protocol_check()
                 .row_tracking(),
         ]
+    }
+
+    /// Returns a new `FeatureSet` containing this set's properties plus those from `other`.
+    /// On key conflict, `other` wins (the rightmost value for each key is kept). Property
+    /// order is preserved: entries from `self` come first (with any key overrides applied
+    /// in place), followed by `other`'s novel keys in their original order.
+    pub fn merge(&self, other: &FeatureSet) -> Self {
+        let mut merged = self.clone();
+        for (k, v) in &other.table_properties {
+            if let Some(existing) = merged.table_properties.iter_mut().find(|(ek, _)| ek == k) {
+                existing.1 = v.clone();
+            } else {
+                merged.table_properties.push((k.clone(), v.clone()));
+            }
+        }
+        merged
     }
 
     /// Whether v2_checkpoint is enabled.
@@ -717,26 +863,97 @@ impl TestTableBuilder {
         }
     }
 
+    /// Build all valid (`LogState`, `FeatureSet`) combinations with the given required
+    /// features forced on every table.
+    ///
+    /// Cross-products [`LogState::all(3)`] with [`FeatureSet::common`], merging `required`
+    /// into each base feature set. Pass [`FeatureSet::empty`] for no required features.
+    /// Every returned table has 3 versions (0, 1, 2). Incompatible pairings are skipped:
+    /// - [`LogState::CheckpointV2`] without the `v2Checkpoint` feature.
+    /// - [`LogState::CheckpointV1`] / [`LogState::CheckpointAndCommits`] with the `v2Checkpoint`
+    ///   feature.
+    pub fn all_tables(required: FeatureSet) -> DeltaResult<Vec<TestTable>> {
+        let total_versions = 3;
+        let mut tables = Vec::new();
+        for log_state in LogState::all(total_versions) {
+            let needs_v2 = matches!(log_state, LogState::CheckpointV2 { .. });
+            let needs_v1 = matches!(
+                log_state,
+                LogState::CheckpointV1 { .. } | LogState::CheckpointAndCommits { .. }
+            );
+            for base_features in FeatureSet::common() {
+                let features = base_features.merge(&required);
+                if needs_v2 && !features.has_v2_checkpoint() {
+                    continue;
+                }
+                if needs_v1 && features.has_v2_checkpoint() {
+                    continue;
+                }
+                tables.push(
+                    Self::new()
+                        .with_log_state(log_state.clone())
+                        .with_features(features)
+                        .build()?,
+                );
+            }
+        }
+        Ok(tables)
+    }
+
     /// Build the table and return a [`TestTable`] handle to the store.
     ///
     /// Safe to call from both sync tests and `#[tokio::test]` -- uses a dedicated runtime
     /// on a background thread to avoid panicking on nested runtimes.
+    ///
+    /// Returns an error when log state and features are incompatible:
+    /// - [`LogState::CheckpointV2`] without the `v2Checkpoint` feature, or
+    /// - [`LogState::CheckpointV1`] / [`LogState::CheckpointAndCommits`] with the `v2Checkpoint`
+    ///   feature (kernel's checkpoint writer dispatches on the feature, so pairing V1 log state
+    ///   with the V2 feature would silently produce a V2 file).
     pub fn build(self) -> DeltaResult<TestTable> {
+        let has_v2 = self.features.has_v2_checkpoint();
+        match self.log_state {
+            LogState::CheckpointV2 { .. } if !has_v2 => {
+                return Err(delta_kernel::Error::generic(
+                    "LogState::CheckpointV2 requires FeatureSet::new().v2_checkpoint()",
+                ));
+            }
+            LogState::CheckpointV1 { .. } | LogState::CheckpointAndCommits { .. } if has_v2 => {
+                return Err(delta_kernel::Error::generic(
+                    "LogState::CheckpointV1 and LogState::CheckpointAndCommits are \
+                     incompatible with the v2Checkpoint feature; use LogState::CheckpointV2",
+                ));
+            }
+            _ => {}
+        }
         std::thread::scope(|s| {
             s.spawn(|| {
-                tokio::runtime::Runtime::new()
-                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?
-                    .block_on(self.build_async())
+                // Use a multi-threaded runtime so `Snapshot::checkpoint` (called below
+                // for checkpoint log states) can `block_in_place` without deadlocking.
+                // `TokioBackgroundExecutor` routes block_on through a single-threaded
+                // background runtime and deadlocks when combined with nested `block_on`
+                // calls from kernel's write path.
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+                let handle = runtime.handle().clone();
+                runtime.block_on(self.build_async(handle))
             })
             .join()
             .expect("builder thread panicked")
         })
     }
 
-    async fn build_async(self) -> DeltaResult<TestTable> {
+    async fn build_async(self, handle: tokio::runtime::Handle) -> DeltaResult<TestTable> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+        let executor = Arc::new(TokioMultiThreadExecutor::new(handle));
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(store.clone())
+                .with_task_executor(executor)
+                .build(),
+        );
         let schema = self.schema;
 
         // Version 0: CreateTable
@@ -786,6 +1003,20 @@ impl TestTableBuilder {
                 .clone();
         }
 
+        if let LogState::CheckpointV1 { checkpoint_at, .. }
+        | LogState::CheckpointV2 { checkpoint_at, .. }
+        | LogState::CheckpointAndCommits { checkpoint_at, .. } = &self.log_state
+        {
+            let snap = Snapshot::builder_for(table_root)
+                .at_version(*checkpoint_at)
+                .build(engine.as_ref())?;
+            snap.checkpoint(engine.as_ref())?;
+        }
+
+        if let LogState::WithCrc { crc_at, .. } = &self.log_state {
+            write_crc(*crc_at, &store, table_root).await?;
+        }
+
         Ok(TestTable {
             store,
             table_root: table_root.to_string(),
@@ -810,9 +1041,9 @@ impl TestTableBuilder {
 /// tables, all rows in a file share the same partition values; for unpartitioned or
 /// clustered tables, uses `unpartitioned_write_context`. Non-partition columns get
 /// varying data derived from version and file index.
-async fn write_data_commit(
+async fn write_data_commit<E: TaskExecutor>(
     snapshot: Arc<Snapshot>,
-    engine: &DefaultEngine<TokioBackgroundExecutor>,
+    engine: &DefaultEngine<E>,
     num_files: usize,
     rows_per_file: usize,
     partition_columns: &[String],
@@ -1009,6 +1240,102 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
 }
 
 // ===========================================================================
+// CRC file generation
+// ===========================================================================
+
+/// Write a CRC file at `version` for a table rooted at `table_root`.
+///
+/// Scans commits `0..=version` to pick up the latest protocol/metadata and to reconcile
+/// live Add files (subtracting any Remove actions). The resulting CRC's `protocol`,
+/// `metadata`, `numFiles`, and `tableSizeBytes` fields reflect the table's true state
+/// at `version`.
+///
+/// # Errors
+/// Returns an error if any commit file 0..=`version` cannot be read or parsed, or if
+/// writing the CRC file to the store fails. Also errors if the scanned commits do not
+/// contain any `protocol` or `metaData` action (which would violate protocol invariants
+/// for a well-formed table).
+pub async fn write_crc(
+    version: u64,
+    store: &Arc<DynObjectStore>,
+    table_root: &str,
+) -> DeltaResult<()> {
+    let mut protocol_json: Option<serde_json::Value> = None;
+    let mut metadata_json: Option<serde_json::Value> = None;
+    let mut live_adds: HashMap<String, i64> = HashMap::new();
+
+    for v in 0..=version {
+        let commit_path = delta_path_for_version(v, "json");
+        let resolved = crate::resolve_table_path(table_root, &commit_path)?;
+        let bytes = store.get(&resolved).await?.bytes().await?;
+        let text = std::str::from_utf8(bytes.as_ref())?;
+        for line in text.lines() {
+            let action: serde_json::Value = serde_json::from_str(line)?;
+            if let Some(p) = action.get("protocol") {
+                protocol_json = Some(p.clone());
+            }
+            if let Some(m) = action.get("metaData") {
+                metadata_json = Some(m.clone());
+            }
+            if let Some(add) = action.get("add") {
+                if let Some(path) = add.get("path").and_then(|p| p.as_str()) {
+                    let size = add.get("size").and_then(|s| s.as_i64()).unwrap_or(0);
+                    live_adds.insert(path.to_string(), size);
+                }
+            }
+            if let Some(remove) = action.get("remove") {
+                if let Some(path) = remove.get("path").and_then(|p| p.as_str()) {
+                    live_adds.remove(path);
+                }
+            }
+        }
+    }
+
+    let protocol_json = protocol_json.ok_or_else(|| {
+        delta_kernel::Error::generic(format!("no protocol action found in commits 0..={version}"))
+    })?;
+    let metadata_json = metadata_json.ok_or_else(|| {
+        delta_kernel::Error::generic(format!("no metaData action found in commits 0..={version}"))
+    })?;
+    let num_files = live_adds.len() as i64;
+    let table_size_bytes: i64 = live_adds.values().sum();
+
+    let crc = json!({
+        "tableSizeBytes": table_size_bytes,
+        "numFiles": num_files,
+        "numMetadata": 1,
+        "numProtocol": 1,
+        "metadata": metadata_json,
+        "protocol": protocol_json,
+    });
+
+    let crc_path = delta_path_for_version(version, "crc");
+    let resolved = crate::resolve_table_path(table_root, &crc_path)?;
+    store
+        .put(&resolved, serde_json::to_string(&crc)?.into())
+        .await?;
+    Ok(())
+}
+
+/// Sync wrapper around [`write_crc`]. Spawns a tokio runtime on a background thread so
+/// it is safe to call from both sync tests and `#[tokio::test]`.
+pub fn write_crc_sync(
+    version: u64,
+    store: &Arc<DynObjectStore>,
+    table_root: &str,
+) -> DeltaResult<()> {
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            tokio::runtime::Runtime::new()
+                .map_err(|e| delta_kernel::Error::generic(e.to_string()))?
+                .block_on(write_crc(version, store, table_root))
+        })
+        .join()
+        .expect("write_crc thread panicked")
+    })
+}
+
+// ===========================================================================
 // TestTable
 // ===========================================================================
 
@@ -1048,6 +1375,31 @@ impl TestTable {
     /// instead to get the correct crate-local engine type.
     pub fn engine(&self) -> DefaultEngine<TokioBackgroundExecutor> {
         DefaultEngineBuilder::new(self.store.clone()).build()
+    }
+
+    /// Delete the table's `_last_checkpoint` hint file if present. No-op if the file
+    /// does not exist. Use in tests that exercise the fallback path where the reader
+    /// must discover the latest checkpoint by listing rather than by hint.
+    pub fn delete_last_checkpoint(&self) -> DeltaResult<()> {
+        let path = delta_kernel::object_store::path::Path::from("_delta_log/_last_checkpoint");
+        let resolved = crate::resolve_table_path(&self.table_root, &path)?;
+        let store = Arc::clone(&self.store);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tokio::runtime::Runtime::new()
+                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?
+                    .block_on(async move {
+                        match store.delete(&resolved).await {
+                            Ok(()) | Err(delta_kernel::object_store::Error::NotFound { .. }) => {
+                                Ok(())
+                            }
+                            Err(e) => Err(delta_kernel::Error::from(e)),
+                        }
+                    })
+            })
+            .join()
+            .expect("delete_last_checkpoint thread panicked")
+        })
     }
 }
 
@@ -1306,6 +1658,204 @@ mod tests {
         TestTableBuilder::new()
             .with_table_config(table_config)
             .build()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_v1() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::checkpoint_v1(2, 4))
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_v2() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::checkpoint_v2(2, 4))
+            .with_features(FeatureSet::new().v2_checkpoint())
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_and_commits() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::checkpoint_and_commits(2, 2))
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_crc() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_crc(2, 4))
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_all_tables() -> DeltaResult<()> {
+        let tables = TestTableBuilder::all_tables(FeatureSet::empty())?;
+        // 5 log states x 11 feature sets = 55, minus 9 (CheckpointV2 log state x the 9
+        // feature sets that do not enable v2_checkpoint), minus 4 (V1/V1+commits log
+        // states x 2 feature sets that enable v2_checkpoint) = 42.
+        assert_eq!(tables.len(), 42);
+        for table in &tables {
+            let engine = table.engine();
+            let builder = Snapshot::builder_for(table.table_root());
+            let snap = builder.build(&engine)?;
+            assert_eq!(snap.version(), 2, "{}", table.description());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_all_tables_propagates_required_features() -> DeltaResult<()> {
+        let tables = TestTableBuilder::all_tables(FeatureSet::new().deletion_vectors())?;
+        assert!(!tables.is_empty());
+        for table in &tables {
+            let engine = table.engine();
+            let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+            let writer_features = snap
+                .table_configuration()
+                .protocol()
+                .writer_features()
+                .expect("writer features present");
+            assert!(
+                writer_features.contains(&TableFeature::DeletionVectors),
+                "missing DeletionVectors in table: {}",
+                table.description()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_v2_requires_v2_feature() {
+        let result = TestTableBuilder::new()
+            .with_log_state(LogState::checkpoint_v2(1, 3))
+            .build();
+        let msg = result.err().expect("expected error").to_string();
+        assert!(
+            msg.contains("CheckpointV2 requires"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_v1_rejects_v2_feature() {
+        let result = TestTableBuilder::new()
+            .with_log_state(LogState::checkpoint_v1(1, 3))
+            .with_features(FeatureSet::new().v2_checkpoint())
+            .build();
+        let msg = result.err().expect("expected error").to_string();
+        assert!(
+            msg.contains("incompatible with the v2Checkpoint feature"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_and_commits_rejects_v2_feature() {
+        let result = TestTableBuilder::new()
+            .with_log_state(LogState::checkpoint_and_commits(1, 1))
+            .with_features(FeatureSet::new().v2_checkpoint())
+            .build();
+        let msg = result.err().expect("expected error").to_string();
+        assert!(msg.contains("incompatible with the v2Checkpoint feature"));
+    }
+
+    #[test]
+    #[should_panic(expected = "need at least 3 versions")]
+    fn test_log_state_all_rejects_n_below_three() {
+        LogState::all(2);
+    }
+
+    #[rstest::rstest]
+    #[case::empty_into_empty(FeatureSet::empty(), FeatureSet::empty(), vec![])]
+    #[case::empty_into_nonempty(
+        FeatureSet::new().ict(),
+        FeatureSet::empty(),
+        vec![("delta.enableInCommitTimestamps".into(), "true".into())]
+    )]
+    #[case::nonempty_into_empty(
+        FeatureSet::empty(),
+        FeatureSet::new().ict(),
+        vec![("delta.enableInCommitTimestamps".into(), "true".into())]
+    )]
+    #[case::disjoint_preserves_order(
+        FeatureSet::new().ict(),
+        FeatureSet::new().v2_checkpoint(),
+        vec![
+            ("delta.enableInCommitTimestamps".into(), "true".into()),
+            ("delta.feature.v2Checkpoint".into(), "supported".into()),
+        ]
+    )]
+    #[case::duplicate_key_other_wins(
+        FeatureSet::new().column_mapping("name"),
+        FeatureSet::new().column_mapping("id"),
+        vec![("delta.columnMapping.mode".into(), "id".into())]
+    )]
+    #[case::same_key_same_value_deduped(
+        FeatureSet::new().v2_checkpoint(),
+        FeatureSet::new().v2_checkpoint(),
+        vec![("delta.feature.v2Checkpoint".into(), "supported".into())]
+    )]
+    fn test_feature_set_merge(
+        #[case] base: FeatureSet,
+        #[case] other: FeatureSet,
+        #[case] expected: Vec<(String, String)>,
+    ) {
+        let merged = base.merge(&other);
+        assert_eq!(merged.table_properties, expected);
+    }
+
+    #[test]
+    fn test_write_crc_content() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(LogState::with_commits(2))
+            .with_features(FeatureSet::new().column_mapping("name"))
+            .build()?;
+        write_crc_sync(1, table.store(), table.table_root())?;
+
+        let crc_path =
+            crate::resolve_table_path(table.table_root(), &delta_path_for_version(1, "crc"))?;
+        let bytes = std::thread::scope(|s| {
+            s.spawn(|| {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    let data = table.store().get(&crc_path).await.unwrap();
+                    data.bytes().await.unwrap()
+                })
+            })
+            .join()
+            .unwrap()
+        });
+        let crc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(crc["numMetadata"], 1);
+        assert_eq!(crc["numProtocol"], 1);
+        // Default builder writes 1 file per data commit; v1 has one Add.
+        assert_eq!(crc["numFiles"], 1);
+        assert!(crc["tableSizeBytes"].as_i64().unwrap() > 0);
+        assert!(crc["metadata"].is_object());
+        assert!(crc["protocol"].is_object());
+        assert_eq!(
+            crc["metadata"]["configuration"]["delta.columnMapping.mode"],
+            "name"
+        );
         Ok(())
     }
 
