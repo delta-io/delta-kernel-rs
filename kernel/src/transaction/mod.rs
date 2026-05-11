@@ -857,6 +857,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
     fn shared_write_state(&self) -> &Arc<SharedWriteState> {
         self.shared_write_state.get_or_init(|| {
             let table_config = &self.effective_table_config;
+            let props = table_config.table_properties();
+            let randomize_file_prefixes = props.should_randomize_file_prefixes();
+            let random_prefix_length = props.random_prefix_length();
             Arc::new(SharedWriteState {
                 table_root: table_config.table_root().clone(),
                 logical_schema: table_config.logical_schema(),
@@ -865,6 +868,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 column_mapping_mode: table_config.column_mapping_mode(),
                 stats_columns: self.stats_columns(),
                 logical_partition_columns: table_config.partition_columns().to_vec(),
+                randomize_file_prefixes,
+                random_prefix_length,
             })
         })
     }

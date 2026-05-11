@@ -767,7 +767,7 @@ pub(crate) mod test_utils {
     }
 
     /// Build the kernel schema described by [`complex_nested_with_field_ids`].
-    fn build_complex_nested_kernel_schema(nested_ids_meta_key: &str) -> StructType {
+    pub(crate) fn build_complex_nested_kernel_schema(nested_ids_meta_key: &str) -> StructType {
         let top_nested_ids = test_utils::nested_ids_json(&[
             ("top.key", 100),
             ("top.key.element", 101),

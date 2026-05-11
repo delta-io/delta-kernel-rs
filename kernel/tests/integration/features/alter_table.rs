@@ -7,9 +7,7 @@ use delta_kernel::arrow::array::{Array, Int32Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{column_name, ColumnName, Scalar};
-use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef, StructField,
     StructType,
@@ -20,8 +18,7 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
-    add_commit, create_table_and_load_snapshot, test_table_setup, test_table_setup_mt,
-    write_batch_to_table,
+    create_table_and_load_snapshot, test_table_setup, test_table_setup_mt, write_batch_to_table,
 };
 
 fn simple_schema() -> SchemaRef {
@@ -739,78 +736,15 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_fails(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn std::error::Error>> {
-    let storage = Arc::new(InMemory::new());
-    let table_root = "memory:///";
-    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
-
-    // Create table doesn't support IcebergCompatV3 yet, so this test hand-crafts a V0 commit.
-    // The commit enables V3, column mapping, and row tracking. The schema contains one `id`
-    // column with the column-mapping metadata required when CM mode is set.
-    let schema = StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)
-        .with_metadata([
-            (
-                ColumnMetadataKey::ColumnMappingId.as_ref(),
-                MetadataValue::from(1),
-            ),
-            (
-                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::from("col-1"),
-            ),
-        ])])?;
-    let schema_string = serde_json::to_string(&schema)?;
-    let commit = [
-        serde_json::json!({
-            "commitInfo": {
-                "timestamp": 1587968586154_i64,
-                "operation": "CREATE TABLE",
-                "operationParameters": {},
-                "isBlindAppend": true,
-            }
-        }),
-        serde_json::json!({
-            "protocol": {
-                "minReaderVersion": 3,
-                "minWriterVersion": 7,
-                "readerFeatures": ["columnMapping"],
-                "writerFeatures": [
-                    "icebergCompatV3",
-                    "columnMapping",
-                    "rowTracking",
-                    "domainMetadata",
-                ],
-            }
-        }),
-        serde_json::json!({
-            "metaData": {
-                "id": "deadbeef-1234-5678-abcd-000000000000",
-                "format": {
-                    "provider": "parquet",
-                    "options": {},
-                },
-                "schemaString": schema_string,
-                "partitionColumns": [],
-                "configuration": {
-                    "delta.enableIcebergCompatV3": "true",
-                    "delta.columnMapping.mode": "name",
-                    "delta.enableRowTracking": "true",
-                    "delta.rowTracking.materializedRowIdColumnName": "_row_id",
-                    "delta.rowTracking.materializedRowCommitVersionColumnName":
-                        "_row_commit_version",
-                    "delta.columnMapping.maxColumnId": "1",
-                },
-                "createdTime": 1234567890000_i64,
-            }
-        }),
-    ]
-    .into_iter()
-    .map(|action| serde_json::to_string(&action))
-    .collect::<Result<Vec<_>, _>>()?
-    .join("\n");
-    add_commit(table_root, storage.as_ref(), 0, commit.to_string()).await?;
-
-    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.enableIcebergCompatV3", "true")],
+    )?;
 
     let msg = snapshot
         .alter_table()
