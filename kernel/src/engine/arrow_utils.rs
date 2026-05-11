@@ -1375,7 +1375,7 @@ pub(crate) fn parse_json(
 /// Also used by ParseJson expression evaluation.
 ///
 /// Accepts any string array type (`StringArray`, `LargeStringArray`, `StringViewArray`) to avoid
-/// narrowing casts that could overflow (e.g. `LargeStringArray` → `StringArray`).
+/// narrowing casts that could overflow (e.g. `LargeStringArray` -> `StringArray`).
 pub(crate) fn parse_json_impl(
     json_strings: &dyn ArrowArray,
     schema: ArrowSchemaRef,
