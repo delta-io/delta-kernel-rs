@@ -13,6 +13,7 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
+    UnaryExpressionOp,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
 use crate::log_replay::{
@@ -632,6 +633,16 @@ fn get_add_transform_expr(
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
         Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
+    } else if has_stats_parsed {
+        // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
+        // serializing stats_parsed so ScanFile.stats is populated either way.
+        Arc::new(Expression::coalesce([
+            Expression::column(["add", "stats"]),
+            Expression::unary(
+                UnaryExpressionOp::ToJson,
+                Expression::column(["add", "stats_parsed"]),
+            ),
+        ]))
     } else {
         column_expr_ref!("add.stats")
     };
