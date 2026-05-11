@@ -235,7 +235,7 @@ int main(int argc, char* argv[])
 
     HandleExclusiveCommittedTransaction committed = commit_res.ok;
     printf("\nCommitted version: %lu\n",
-           (unsigned long)committed_transaction_version(committed));
+           (unsigned long)committed_transaction_version(&committed));
     free_committed_transaction(committed);
 
     // Cleanup

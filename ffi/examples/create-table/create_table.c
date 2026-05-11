@@ -179,7 +179,7 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   HandleExclusiveCommittedTransaction committed = commit_res.ok;
-  printf("Committed version: %" PRIu64 "\n", committed_transaction_version(committed));
+  printf("Committed version: %" PRIu64 "\n", committed_transaction_version(&committed));
   free_committed_transaction(committed);
 
   // === Open a snapshot on the new table to confirm it landed ===

@@ -18,7 +18,8 @@ use crate::scan::EngineSchema;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
     unwrap_and_parse_path_as_url, DeltaResult, ExclusiveEngineData, ExternEngine,
-    KernelStringSlice, SharedExternEngine, SharedSnapshot, Snapshot, TryFromStringSlice, Url,
+    KernelStringSlice, OptionalValue, SharedExternEngine, SharedSnapshot, Snapshot,
+    TryFromStringSlice, Url,
 };
 
 /// A handle for an existing-table transaction (`Transaction<ExistingTable>`).
@@ -36,7 +37,7 @@ pub struct ExclusiveTransaction;
 #[handle_descriptor(target=CreateTableTransaction, mutable=true, sized=true)]
 pub struct ExclusiveCreateTransaction;
 
-/// A handle for a successfully [`CommittedTransaction`].
+/// A handle for a [`CommittedTransaction`].
 ///
 /// Returned by [`commit`] and [`create_table_commit`]. Carries the committed version and,
 /// when available, the post-commit snapshot. Use [`committed_transaction_version`] and
@@ -288,7 +289,8 @@ pub unsafe extern "C" fn set_data_change(mut txn: Handle<ExclusiveTransaction>, 
 /// [`CommittedTransaction`] from which the caller can read the version and the optional
 /// post-commit snapshot. The returned handle must be freed with [`free_committed_transaction`].
 ///
-/// Returns an error if the commit fails (including conflicts and retryable IO errors).
+/// Returns an error if the commit fails. The FFI surfaces conflicted and retryable
+/// `CommitResult` variants as errors today (see TODO on `commit_result_to_committed_handle`).
 ///
 /// # Safety
 ///
@@ -402,6 +404,8 @@ pub unsafe extern "C" fn create_table_commit(
 // Committed transaction accessors
 // ============================================================================
 
+// TODO: expose CommittedTransaction::post_commit_stats through FFI.
+
 /// Free a [`CommittedTransaction`] handle.
 ///
 /// # Safety
@@ -422,46 +426,36 @@ pub unsafe extern "C" fn free_committed_transaction(txn: Handle<ExclusiveCommitt
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn committed_transaction_version(
-    txn: Handle<ExclusiveCommittedTransaction>,
+    txn: &Handle<ExclusiveCommittedTransaction>,
 ) -> u64 {
-    let committed = unsafe { txn.as_ref() };
-    committed.commit_version()
+    unsafe { txn.as_ref() }.commit_version()
 }
 
-/// Read the post-commit snapshot from a [`CommittedTransaction`] handle.
+/// Reads the post-commit snapshot, if available.
 ///
-/// Returns `true` if a post-commit snapshot is available (in which case `*out_snapshot` is
-/// written with a fresh [`SharedSnapshot`] handle that the caller must eventually free with
-/// [`free_snapshot`](crate::free_snapshot)). Returns `false` otherwise (in which case
-/// `*out_snapshot` is not modified). The kernel does not currently produce post-commit
-/// snapshots for transactions that experienced conflicts; in the FFI today, conflicts are
-/// reported as errors at commit time rather than as committed transactions, so a `false`
-/// return primarily indicates that this committed transaction was constructed without a
-/// post-commit snapshot.
+/// Returns `Some` with a fresh [`SharedSnapshot`] handle if the committed transaction has an
+/// associated post-commit snapshot. Returns `None` otherwise.
 ///
-/// Does not consume the handle; the caller still owns it and must eventually pass it to
-/// [`free_committed_transaction`]. Calling this function multiple times yields independent
-/// snapshot handles, each of which must be freed.
+/// Not every commit path produces a post-commit snapshot (see
+/// [`CommittedTransaction::post_commit_snapshot`] for the kernel-side rationale); callers
+/// can fall back to building a snapshot via [`get_snapshot_builder`](crate::get_snapshot_builder)
+/// in that case.
+///
+/// Each `Some` result contains an independent handle that the caller must eventually free with
+/// [`free_snapshot`](crate::free_snapshot). Does not consume the input handle; the caller must
+/// eventually pass it to [`free_committed_transaction`].
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid handle and a valid, writable `out_snapshot`
-/// pointer.
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn committed_transaction_post_commit_snapshot(
-    txn: Handle<ExclusiveCommittedTransaction>,
-    out_snapshot: *mut Handle<SharedSnapshot>,
-) -> bool {
-    let committed = unsafe { txn.as_ref() };
-    match committed.post_commit_snapshot() {
-        Some(snap) => {
-            // Arc::clone bumps the refcount; the resulting Handle owns its own strong reference,
-            // so freeing the CommittedTransaction handle later does not invalidate the snapshot.
-            unsafe { out_snapshot.write(Arc::clone(snap).into()) };
-            true
-        }
-        None => false,
-    }
+    txn: &Handle<ExclusiveCommittedTransaction>,
+) -> OptionalValue<Handle<SharedSnapshot>> {
+    unsafe { txn.as_ref() }
+        .post_commit_snapshot()
+        .map(|snap| Arc::clone(snap).into())
+        .into()
 }
 
 // ============================================================================
@@ -715,18 +709,18 @@ mod tests {
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
-    /// Read the version from a [`Handle<ExclusiveCommittedTransaction>`] and free the handle.
+    /// Reads the committed version from a [`Handle<ExclusiveCommittedTransaction>`] and
+    /// frees the handle.
     ///
-    /// Most existing tests only assert against the committed version, so this preserves the
-    /// pre-handle-API ergonomics (`let v = ok_or_panic(commit(...))`) while still exercising
-    /// the new accessor and explicit free.
+    /// Useful for tests that only need to assert on the version. Tests that also need
+    /// the post-commit snapshot should call the accessors directly.
     ///
     /// # Safety
     ///
-    /// Caller asserts the handle is valid (i.e. produced by [`commit`] / [`create_table_commit`]
-    /// and not previously freed).
+    /// Caller asserts the handle is valid (i.e. produced by [`commit`] /
+    /// [`create_table_commit`] and not previously freed).
     unsafe fn version_and_free(committed: Handle<ExclusiveCommittedTransaction>) -> u64 {
-        let version = unsafe { committed_transaction_version(committed.shallow_copy()) };
+        let version = unsafe { committed_transaction_version(&committed) };
         unsafe { free_committed_transaction(committed) };
         version
     }
@@ -1362,10 +1356,8 @@ mod tests {
             let commit_result = unsafe { commit(txn_with_engine_info, engine.shallow_copy()) };
 
             // UC committer returns success from our mock callback
-            assert!(commit_result.is_ok(), "Commit should succeed");
-            if let ExternResult::Ok(committed) = commit_result {
-                unsafe { free_committed_transaction(committed) };
-            }
+            let committed = ok_or_panic(commit_result);
+            unsafe { free_committed_transaction(committed) };
 
             let context = recover_test_context(context).unwrap();
 
@@ -1588,20 +1580,14 @@ mod tests {
             ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
         let committed = ok_or_panic(unsafe { create_table_commit(txn, engine.shallow_copy()) });
 
-        assert_eq!(
-            unsafe { committed_transaction_version(committed.shallow_copy()) },
-            0
-        );
+        assert_eq!(unsafe { committed_transaction_version(&committed) }, 0);
 
-        let mut slot = std::mem::MaybeUninit::<Handle<SharedSnapshot>>::uninit();
-        let has_snapshot = unsafe {
-            committed_transaction_post_commit_snapshot(committed.shallow_copy(), slot.as_mut_ptr())
+        let snap = match unsafe { committed_transaction_post_commit_snapshot(&committed) } {
+            OptionalValue::Some(snap) => snap,
+            OptionalValue::None => {
+                panic!("create_table commit should produce a post-commit snapshot")
+            }
         };
-        assert!(
-            has_snapshot,
-            "create_table commit should produce a post-commit snapshot"
-        );
-        let snap = unsafe { slot.assume_init() };
         assert_eq!(unsafe { version(snap.shallow_copy()) }, 0);
 
         unsafe { free_snapshot(snap) };
@@ -1635,31 +1621,34 @@ mod tests {
         });
 
         let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
-        let v = unsafe { committed_transaction_version(committed.shallow_copy()) };
+        let v = unsafe { committed_transaction_version(&committed) };
         assert_eq!(v, 2);
 
-        let mut slot = std::mem::MaybeUninit::<Handle<SharedSnapshot>>::uninit();
-        let has_snapshot = unsafe {
-            committed_transaction_post_commit_snapshot(committed.shallow_copy(), slot.as_mut_ptr())
+        let snap = match unsafe { committed_transaction_post_commit_snapshot(&committed) } {
+            OptionalValue::Some(snap) => snap,
+            OptionalValue::None => {
+                panic!("existing-table commit should produce a post-commit snapshot")
+            }
         };
-        assert!(
-            has_snapshot,
-            "existing-table commit should produce a post-commit snapshot"
-        );
-        let snap = unsafe { slot.assume_init() };
         assert_eq!(unsafe { version(snap.shallow_copy()) }, v);
 
         // Calling the accessor a second time must yield an independent handle (Arc clone).
-        let mut slot2 = std::mem::MaybeUninit::<Handle<SharedSnapshot>>::uninit();
-        assert!(unsafe {
-            committed_transaction_post_commit_snapshot(committed.shallow_copy(), slot2.as_mut_ptr())
-        });
-        let snap2 = unsafe { slot2.assume_init() };
+        let snap2 = match unsafe { committed_transaction_post_commit_snapshot(&committed) } {
+            OptionalValue::Some(snap) => snap,
+            OptionalValue::None => {
+                panic!("existing-table commit should produce a second post-commit snapshot")
+            }
+        };
         assert_eq!(unsafe { version(snap2.shallow_copy()) }, v);
 
+        // Free the CommittedTransaction handle first to verify the post-commit snapshot
+        // remains valid afterwards (per Arc::clone semantics in
+        // committed_transaction_post_commit_snapshot).
+        unsafe { free_committed_transaction(committed) };
+        assert_eq!(unsafe { version(snap.shallow_copy()) }, v);
+        assert_eq!(unsafe { version(snap2.shallow_copy()) }, v);
         unsafe { free_snapshot(snap2) };
         unsafe { free_snapshot(snap) };
-        unsafe { free_committed_transaction(committed) };
         unsafe { free_engine(engine) };
         Ok(())
     }

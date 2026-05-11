@@ -23,8 +23,8 @@
 //   - set_data_change(txn, false) because this empty commit does not add data
 //   - commit(txn, engine) to produce an empty commit, returning a CommittedTransaction handle
 //   - committed_transaction_version + committed_transaction_post_commit_snapshot to read the
-//     version and (when available) the post-commit snapshot directly from the result, avoiding
-//     a fresh snapshot load
+//     version and the post-commit snapshot directly from the result, avoiding a fresh
+//     snapshot load
 //   - free_committed_transaction to release the result handle
 //
 // NOTE: This example does NOT call add_files. Staging new files requires building an Arrow
@@ -126,16 +126,15 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   HandleExclusiveCommittedTransaction committed = commit_res.ok;
-  uint64_t committed_version = committed_transaction_version(committed);
-  printf("Committed version: %" PRIu64 "\n", committed_version);
+  printf("Committed version: %" PRIu64 "\n", committed_transaction_version(&committed));
 
   // === Read post-commit snapshot directly from the CommittedTransaction ===
-  // This avoids a fresh snapshot load: the kernel handed us an already-built snapshot for
-  // the post-commit version. If the handle does not carry one (e.g. some catalog-managed or
-  // retried-commit paths), fall back to loading via snapshot_builder_build.
-  HandleSharedSnapshot snap;
-  bool has_post_commit = committed_transaction_post_commit_snapshot(committed, &snap);
-  if (has_post_commit) {
+  // Avoids a fresh snapshot load: the kernel hands back the already-built snapshot
+  // for the post-commit version.
+  struct OptionalValueHandleSharedSnapshot post_commit =
+      committed_transaction_post_commit_snapshot(&committed);
+  if (post_commit.tag == SomeHandleSharedSnapshot) {
+    HandleSharedSnapshot snap = post_commit.some;
     printf("Post-commit snapshot version: %" PRIu64 "\n", version(snap));
     free_snapshot(snap);
   } else {
