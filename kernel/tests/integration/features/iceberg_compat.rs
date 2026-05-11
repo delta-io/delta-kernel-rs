@@ -351,8 +351,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
 
 fn make_default_engine_and_store() -> (Arc<InMemory>, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
     let storage = Arc::new(InMemory::new());
-    let engine =
-        Arc::new(DefaultEngineBuilder::<TokioBackgroundExecutor>::new(storage.clone()).build());
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
     (storage, engine)
 }
 

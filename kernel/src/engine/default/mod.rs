@@ -169,35 +169,48 @@ pub struct DefaultEngine<E: TaskExecutor> {
 ///     .build();
 /// ```
 #[derive(Debug)]
-pub struct DefaultEngineBuilder<E: TaskExecutor> {
+pub struct DefaultEngineBuilder<E> {
     object_store: Arc<DynObjectStore>,
-    task_executor: Arc<E>,
+    /// The state is either [`DefaultTaskExecutor`] or `Arc<E>` with a custom task executor.
+    task_executor: E,
 }
 
-impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
+/// Represents the default [`TaskExecutor`]. The executor is created lazily to avoid unnecessary
+/// instantiations.
+pub struct DefaultTaskExecutor;
+
+impl DefaultEngineBuilder<DefaultTaskExecutor> {
     /// Create a new [`DefaultEngineBuilder`] instance with the default executor.
     pub fn new(object_store: Arc<DynObjectStore>) -> Self {
         Self {
             object_store,
-            task_executor: Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
+            task_executor: DefaultTaskExecutor,
         }
+    }
+
+    /// Build the [`DefaultEngine`] instance.
+    pub fn build(self) -> DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
+        let task_executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
+        DefaultEngine::new_with_opts(self.object_store, task_executor)
     }
 }
 
-impl<E: TaskExecutor> DefaultEngineBuilder<E> {
+impl<E> DefaultEngineBuilder<E> {
     /// Set a custom task executor for the engine.
     ///
     /// See [`executor::TaskExecutor`] for more details.
     pub fn with_task_executor<F: TaskExecutor>(
         self,
         task_executor: Arc<F>,
-    ) -> DefaultEngineBuilder<F> {
+    ) -> DefaultEngineBuilder<Arc<F>> {
         DefaultEngineBuilder {
             object_store: self.object_store,
             task_executor,
         }
     }
+}
 
+impl<E: TaskExecutor> DefaultEngineBuilder<Arc<E>> {
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
         DefaultEngine::new_with_opts(self.object_store, self.task_executor)
@@ -210,9 +223,7 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
-    pub fn builder(
-        object_store: Arc<DynObjectStore>,
-    ) -> DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
+    pub fn builder(object_store: Arc<DynObjectStore>) -> DefaultEngineBuilder<DefaultTaskExecutor> {
         DefaultEngineBuilder::new(object_store)
     }
 }
