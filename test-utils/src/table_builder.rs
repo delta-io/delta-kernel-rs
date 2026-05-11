@@ -26,7 +26,7 @@
 //!
 //! #[rstest]
 //! fn test_scan(
-//!     #[values(LogState::with_commits(3))]
+//!     #[values(LogState::with_latest_version(2))]
 //!     log_state: LogState,
 //!     #[values(FeatureSet::empty())]
 //!     feature_set: FeatureSet,
@@ -44,7 +44,7 @@
 //! The macros expand there, so types resolve to the caller's kernel crate -- avoiding
 //! the type mismatch between `test_utils`'s kernel and `kernel/src/` unit tests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -54,10 +54,14 @@ use delta_kernel::arrow::array::{
     TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
+use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
+use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
@@ -69,44 +73,179 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
 
 // ===========================================================================
+// Sync/async bridge
+// ===========================================================================
+
+/// Run `make_fut` to completion on a dedicated multi-threaded tokio runtime in a
+/// scoped background thread. Safe to call from both sync tests and `#[tokio::test]`
+/// bodies -- the scoped thread avoids the nested-runtime panic that occurs when
+/// calling `Runtime::block_on` from a thread that already owns a tokio runtime.
+///
+/// A multi-threaded runtime is required so kernel operations that call
+/// `block_in_place` (e.g. `Snapshot::checkpoint`) do not deadlock, which is why
+/// the sync wrappers in this module all route through this helper.
+fn block_on_sync<F, Fut, T>(make_fut: F) -> DeltaResult<T>
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: std::future::Future<Output = DeltaResult<T>>,
+    T: Send,
+{
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+            runtime.block_on(make_fut())
+        })
+        .join()
+        .expect("block_on_sync thread panicked")
+    })
+}
+
+// ===========================================================================
 // LogState
 // ===========================================================================
 
-/// Describes the structure of a Delta table's log files on disk.
+/// Format kernel uses when writing each checkpoint in a [`LogState`]. Mirrors
+/// kernel's [`CheckpointSpec`], but with a soft-coupling fallback for
+/// cross-product tests: requesting V2 sidecars on a table that doesn't have the
+/// `v2Checkpoint` feature falls back to kernel's default rather than erroring.
+#[derive(Clone, Debug, Default)]
+pub enum CheckpointFormat {
+    /// Kernel picks V1 or V2-NoSidecar based on the `v2Checkpoint` feature flag.
+    #[default]
+    Default,
+    /// V2 with sidecar files. Honored only when `v2Checkpoint` is enabled;
+    /// silently falls back to [`CheckpointFormat::Default`] otherwise.
+    V2WithSidecarsIfEnabled {
+        /// Suggested file actions per sidecar; `None` uses the kernel default.
+        file_actions_per_sidecar_hint: Option<usize>,
+    },
+}
+
+/// Shape of a Delta table's `_delta_log/` directory.
 #[derive(Clone, Debug)]
-pub enum LogState {
-    /// Only JSON commit files: `num_commits` total versions (0 through `num_commits - 1`).
-    /// Version 0 is always the create-table commit; versions 1+ contain data.
-    CommitsOnly { num_commits: u64 },
+pub struct LogState {
+    /// Latest version on the table. Versions `0..=latest_version` exist as
+    /// commits on disk (v=0 is the create-table commit); `latest_version + 1`
+    /// total commits.
+    latest_version: u64,
+    /// Sorted ascending, distinct, all `<= latest_version`.
+    checkpoints_at: Vec<u64>,
+    /// Format applied to every checkpoint in `checkpoints_at`.
+    checkpoint_format: CheckpointFormat,
 }
 
 impl LogState {
-    /// Table with `n` total versions as JSON commit files.
-    ///
-    /// `n` must be >= 1. Version 0 is a metadata-only create-table commit (not CTAS).
-    /// For example, `with_commits(3)` produces versions 0, 1, 2 where version 0 has only
-    /// metadata and versions 1-2 contain data.
-    pub fn with_commits(n: u64) -> Self {
-        assert!(
-            n >= 1,
-            "with_commits() requires at least 1 version (the create-table commit)"
-        );
-        LogState::CommitsOnly { num_commits: n }
+    /// Build a table whose latest version is `n`. Produces `n + 1` commits
+    /// (v=0 create + v=1..=n data). No checkpoints by default.
+    pub fn with_latest_version(n: u64) -> Self {
+        Self {
+            latest_version: n,
+            checkpoints_at: Vec::new(),
+            checkpoint_format: CheckpointFormat::Default,
+        }
     }
 
-    /// Number of commit files on disk (versions 0 through `num_versions - 1`).
-    pub(crate) fn num_versions(&self) -> u64 {
-        match self {
-            LogState::CommitsOnly { num_commits } => *num_commits,
+    /// Add checkpoints at the given versions. Pass `[v]` for a single
+    /// checkpoint or `[v1, v2, ...]` for multiple. Each `v` must be
+    /// `<= latest_version` and not already present.
+    pub fn with_checkpoint_at(mut self, vs: impl IntoIterator<Item = u64>) -> Self {
+        for v in vs {
+            assert!(
+                v <= self.latest_version,
+                "checkpoint_at ({v}) must be <= latest_version ({})",
+                self.latest_version,
+            );
+            assert!(
+                !self.checkpoints_at.contains(&v),
+                "checkpoint_at ({v}) already present in {:?}",
+                self.checkpoints_at,
+            );
+            self.checkpoints_at.push(v);
         }
+        self.checkpoints_at.sort_unstable();
+        self
+    }
+
+    /// Optionally add a checkpoint at the given version. No-op when `None`.
+    /// Useful for cartesian-product rstest axes parameterized as
+    /// `#[values(None, Some(v))]`.
+    pub fn maybe_with_checkpoint_at(self, v: Option<u64>) -> Self {
+        match v {
+            Some(v) => self.with_checkpoint_at([v]),
+            None => self,
+        }
+    }
+
+    /// Switch every checkpoint to V2 with sidecars. Pass `None` for the kernel
+    /// default `file_actions_per_sidecar_hint`, or `Some(n)` to override.
+    /// Honored only when the paired [`FeatureSet`] enables `v2_checkpoint()`;
+    /// silently falls back to the default format otherwise so that
+    /// `#[values]` sweeps mixing both axes don't fail on invalid combinations.
+    pub fn with_sidecars_if_enabled(
+        mut self,
+        file_actions_per_sidecar_hint: Option<usize>,
+    ) -> Self {
+        self.checkpoint_format = CheckpointFormat::V2WithSidecarsIfEnabled {
+            file_actions_per_sidecar_hint,
+        };
+        self
+    }
+
+    /// Canonical log shapes for snapshot reader-path tests. Built against a
+    /// 10-version table; each shape exercises a distinct read path.
+    pub fn common() -> Vec<Self> {
+        const N: u64 = 10;
+        vec![
+            // commits-only: pure JSON replay
+            Self::with_latest_version(N),
+            // checkpoint at latest: no JSON tail (relevant for ICT, where the
+            // latest commit's timestamp lives in the checkpoint)
+            Self::with_latest_version(N).with_checkpoint_at([N]),
+            // checkpoint mid-stream: tail-replay over JSON commits after a checkpoint
+            Self::with_latest_version(N).with_checkpoint_at([N - 5]),
+            // multi-checkpoint: newer supersedes older
+            Self::with_latest_version(N).with_checkpoint_at([N - 5, N]),
+        ]
+    }
+
+    /// Latest version on the table. The total number of commits on disk is
+    /// `latest_version + 1`. (Does not yet account for log cleanup -- a
+    /// post-cleanup state where commits `0..K` have been removed is a
+    /// separate axis tracked in #2526.)
+    pub(crate) fn latest_version(&self) -> u64 {
+        self.latest_version
+    }
+
+    /// Versions at which checkpoints are written, in ascending order.
+    pub(crate) fn checkpoints_at(&self) -> &[u64] {
+        &self.checkpoints_at
+    }
+
+    /// Format applied to every checkpoint.
+    pub(crate) fn checkpoint_format(&self) -> &CheckpointFormat {
+        &self.checkpoint_format
     }
 }
 
 impl fmt::Display for LogState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LogState::CommitsOnly { num_commits } => write!(f, "commits({num_commits})"),
+        write!(f, "v={}", self.latest_version)?;
+        for v in &self.checkpoints_at {
+            write!(f, "+checkpoint_at({v})")?;
         }
+        match self.checkpoint_format {
+            CheckpointFormat::V2WithSidecarsIfEnabled {
+                file_actions_per_sidecar_hint: Some(n),
+            } => write!(f, "+sidecars({n})")?,
+            CheckpointFormat::V2WithSidecarsIfEnabled {
+                file_actions_per_sidecar_hint: None,
+            } => write!(f, "+sidecars")?,
+            CheckpointFormat::Default => {}
+        }
+        Ok(())
     }
 }
 
@@ -216,8 +355,12 @@ impl FeatureSet {
         self
     }
 
-    /// Common feature sets for cross-product testing: empty, one per feature, and one
-    /// with all features combined. Not the full power set -- add specific combos as needed.
+    /// Common feature sets for cross-product testing: empty, one per write-compatible
+    /// feature, and one with all write-compatible features combined. Not the full power
+    /// set -- add specific combos as needed.
+    ///
+    /// `type_widening` is intentionally excluded because kernel errors when writing
+    /// tables with that feature enabled (see `TableFeature::TypeWidening`).
     pub fn common() -> Vec<Self> {
         vec![
             Self::empty(),
@@ -227,11 +370,9 @@ impl FeatureSet {
             Self::new().deletion_vectors(),
             Self::new().append_only(),
             Self::new().change_data_feed(),
-            Self::new().type_widening(),
             Self::new().domain_metadata(),
             Self::new().vacuum_protocol_check(),
             Self::new().row_tracking(),
-            // All features combined
             Self::new()
                 .column_mapping("name")
                 .ict()
@@ -239,18 +380,10 @@ impl FeatureSet {
                 .deletion_vectors()
                 .append_only()
                 .change_data_feed()
-                .type_widening()
                 .domain_metadata()
                 .vacuum_protocol_check()
                 .row_tracking(),
         ]
-    }
-
-    /// Whether v2_checkpoint is enabled.
-    pub fn has_v2_checkpoint(&self) -> bool {
-        self.table_properties
-            .iter()
-            .any(|(k, v)| k == "delta.feature.v2Checkpoint" && v == "supported")
     }
 
     /// Returns the table features implied by the properties in this set. Used by tests
@@ -398,7 +531,10 @@ impl fmt::Display for TableConfig {
 // fn test_scan(feature_set: FeatureSet, table_config: TableConfig) { ... }
 // ```
 
-/// All common feature sets: empty, one per feature, and all combined.
+/// All common feature sets: empty, one per write-compatible feature, and all combined.
+///
+/// `type_widening` is intentionally excluded because kernel errors when writing tables
+/// with that feature enabled (see [`FeatureSet::common`]).
 #[rstest_reuse::template]
 #[rstest::rstest]
 pub fn feature_sets(
@@ -410,7 +546,6 @@ pub fn feature_sets(
         FeatureSet::new().deletion_vectors(),
         FeatureSet::new().append_only(),
         FeatureSet::new().change_data_feed(),
-        FeatureSet::new().type_widening(),
         FeatureSet::new().domain_metadata(),
         FeatureSet::new().vacuum_protocol_check(),
         FeatureSet::new().row_tracking(),
@@ -421,7 +556,6 @@ pub fn feature_sets(
             .deletion_vectors()
             .append_only()
             .change_data_feed()
-            .type_widening()
             .domain_metadata()
             .vacuum_protocol_check()
             .row_tracking()
@@ -622,7 +756,7 @@ impl TestTableBuilder {
     /// with 10 rows per commit.
     pub fn new() -> Self {
         Self {
-            log_state: LogState::with_commits(1),
+            log_state: LogState::with_latest_version(0),
             features: FeatureSet::empty(),
             table_config: TableConfig::new(),
             schema: default_schema(),
@@ -719,25 +853,44 @@ impl TestTableBuilder {
 
     /// Build the table and return a [`TestTable`] handle to the store.
     ///
-    /// Safe to call from both sync tests and `#[tokio::test]` -- uses a dedicated runtime
-    /// on a background thread to avoid panicking on nested runtimes.
+    /// Safe to call from both sync tests and `#[tokio::test]` -- uses a dedicated
+    /// runtime on a background thread to avoid panicking on nested runtimes.
+    /// Propagates I/O, create-table, commit, checkpoint, and CRC errors from the
+    /// underlying write path.
     pub fn build(self) -> DeltaResult<TestTable> {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                tokio::runtime::Runtime::new()
-                    .map_err(|e| delta_kernel::Error::generic(e.to_string()))?
-                    .block_on(self.build_async())
-            })
-            .join()
-            .expect("builder thread panicked")
-        })
+        block_on_sync(|| self.build_async())
     }
 
     async fn build_async(self) -> DeltaResult<TestTable> {
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         let table_root = "memory:///";
-        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = Arc::new(
+            DefaultEngineBuilder::new(store.clone())
+                .with_task_executor(executor)
+                .build(),
+        );
         let schema = self.schema;
+
+        // Resolve the checkpoint spec once. `V2WithSidecarsIfEnabled` falls back to
+        // `None` (kernel default: V1 or V2-NoSidecar based on the feature flag) when
+        // the table doesn't enable `v2Checkpoint`.
+        let v2_supported = self
+            .features
+            .expected_features()
+            .contains(&TableFeature::V2Checkpoint);
+        let spec = match self.log_state.checkpoint_format() {
+            CheckpointFormat::V2WithSidecarsIfEnabled {
+                file_actions_per_sidecar_hint,
+            } if v2_supported => Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+                file_actions_per_sidecar_hint: *file_actions_per_sidecar_hint,
+            })),
+            _ => None,
+        };
+        let checkpoints_at: HashSet<u64> =
+            self.log_state.checkpoints_at().iter().copied().collect();
 
         // Version 0: CreateTable
         let mut builder = create_table(table_root, schema, "TestTableBuilder/1.0");
@@ -761,16 +914,18 @@ impl TestTableBuilder {
                 self.clustering_columns.iter().map(|s| s.as_str()),
             ));
         }
-        let committed = builder
+        let mut snapshot = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?
-            .unwrap_committed();
-        let mut snapshot = committed.post_commit_snapshot().unwrap().clone();
+            .unwrap_post_commit_snapshot();
+        if checkpoints_at.contains(&0) {
+            snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
+        }
 
-        // Data commits (versions 1..N)
-        let total = self.log_state.num_versions();
-        for v in 1..total {
-            let result = write_data_commit(
+        // Data commits (versions 1..=latest). Checkpoint inline using the post-commit snapshot.
+        let latest = self.log_state.latest_version();
+        for v in 1..=latest {
+            snapshot = write_data_commit(
                 snapshot.clone(),
                 &engine,
                 self.num_data_files,
@@ -778,12 +933,11 @@ impl TestTableBuilder {
                 &self.partition_columns,
                 v,
             )
-            .await?;
-            snapshot = result
-                .unwrap_committed()
-                .post_commit_snapshot()
-                .unwrap()
-                .clone();
+            .await?
+            .unwrap_post_commit_snapshot();
+            if checkpoints_at.contains(&v) {
+                snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
+            }
         }
 
         Ok(TestTable {
@@ -810,9 +964,9 @@ impl TestTableBuilder {
 /// tables, all rows in a file share the same partition values; for unpartitioned or
 /// clustered tables, uses `unpartitioned_write_context`. Non-partition columns get
 /// varying data derived from version and file index.
-async fn write_data_commit(
+async fn write_data_commit<E: TaskExecutor>(
     snapshot: Arc<Snapshot>,
-    engine: &DefaultEngine<TokioBackgroundExecutor>,
+    engine: &DefaultEngine<E>,
     num_files: usize,
     rows_per_file: usize,
     partition_columns: &[String],
@@ -1035,7 +1189,7 @@ impl TestTable {
     }
 
     /// Human-readable description of this table's configuration (e.g.
-    /// `"commits(3) + columnMapping.mode=name, enableInCommitTimestamps=true"`).
+    /// `"v=3+checkpoint_at(2) + columnMapping.mode=name, enableInCommitTimestamps=true"`).
     /// Useful in assert messages to identify which config failed.
     pub fn description(&self) -> &str {
         &self.description
@@ -1209,6 +1363,8 @@ pub(crate) fn default_schema() -> SchemaRef {
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::ObjectStore;
     use rstest::rstest;
 
     use super::*;
@@ -1225,7 +1381,7 @@ mod tests {
     #[test]
     fn test_commits_only() -> DeltaResult<()> {
         let table = TestTableBuilder::new()
-            .with_log_state(LogState::with_commits(3))
+            .with_log_state(LogState::with_latest_version(2))
             .build()?;
         let engine = table.engine();
         let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
@@ -1236,7 +1392,7 @@ mod tests {
     /// Demonstrates the `test_context!` macro with rstest `#[values]`.
     #[rstest]
     fn test_version_targets(
-        #[values(LogState::with_commits(5))] log_state: LogState,
+        #[values(LogState::with_latest_version(4))] log_state: LogState,
         #[values(FeatureSet::empty())] feature_set: FeatureSet,
         #[values(
             VersionTarget::Latest,
@@ -1279,13 +1435,6 @@ mod tests {
     }
 
     #[test]
-    fn test_has_v2_checkpoint() {
-        assert!(!FeatureSet::empty().has_v2_checkpoint());
-        assert!(FeatureSet::new().v2_checkpoint().has_v2_checkpoint());
-        assert!(!FeatureSet::new().ict().has_v2_checkpoint());
-    }
-
-    #[test]
     fn test_table_config_properties_applied() -> DeltaResult<()> {
         let table = TestTableBuilder::new()
             .with_table_config(
@@ -1309,10 +1458,95 @@ mod tests {
         Ok(())
     }
 
+    /// V2 checkpoints with sidecars require both the `v2Checkpoint` feature
+    /// and `with_sidecars_if_enabled(...)` on the `LogState`. The checkpoint writer
+    /// emits sidecar parquet files into `_delta_log/_sidecars/`.
+    #[rstest::rstest]
+    #[case::default_hint(None)]
+    #[case::explicit_hint(Some(1))]
+    fn test_v2_sidecars_emit_sidecar_files(#[case] hint: Option<usize>) -> DeltaResult<()> {
+        let log_state = LogState::with_latest_version(2)
+            .with_checkpoint_at([1])
+            .with_sidecars_if_enabled(hint);
+        let table = TestTableBuilder::new()
+            .with_log_state(log_state)
+            .with_features(FeatureSet::new().v2_checkpoint())
+            .with_data(2, 5)
+            .build()?;
+        let sidecars = list_dir_filenames(table.store(), "_delta_log/_sidecars")?;
+        assert!(
+            sidecars.iter().any(|n| n.ends_with(".parquet")),
+            "expected sidecar files in _delta_log/_sidecars/, got {sidecars:?}",
+        );
+        Ok(())
+    }
+
+    /// `with_sidecars_if_enabled` without the `v2Checkpoint` feature is a no-op:
+    /// the table builds (no error) and no sidecar directory is produced.
+    #[test]
+    fn test_v2_sidecars_silently_ignored_without_v2_feature() -> DeltaResult<()> {
+        let log_state = LogState::with_latest_version(2)
+            .with_checkpoint_at([1])
+            .with_sidecars_if_enabled(None);
+        let table = TestTableBuilder::new()
+            .with_log_state(log_state)
+            .with_data(2, 5)
+            .build()?;
+        let sidecars = list_dir_filenames(table.store(), "_delta_log/_sidecars")?;
+        assert!(
+            sidecars.is_empty(),
+            "expected no sidecar files without v2_checkpoint, got {sidecars:?}",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_and_commits() -> DeltaResult<()> {
+        let log_state = LogState::with_latest_version(4).with_checkpoint_at([2]);
+        let table = TestTableBuilder::new()
+            .with_log_state(log_state.clone())
+            .build()?;
+        assert_log_state_files_on_disk(&table, &log_state)?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 4);
+        Ok(())
+    }
+
+    /// Cartesian-product check that every checkpoint configuration the builder
+    /// permits actually lands on disk and rebuilds correctly. Covers single
+    /// checkpoints at every legal version (None, 0, mid, latest) plus a
+    /// multi-checkpoint case (mid + latest).
+    #[rstest::rstest]
+    #[case::no_checkpoint(LogState::with_latest_version(2))]
+    #[case::checkpoint_at_v0(LogState::with_latest_version(2).with_checkpoint_at([0]))]
+    #[case::checkpoint_at_v1(LogState::with_latest_version(2).with_checkpoint_at([1]))]
+    #[case::checkpoint_at_latest(LogState::with_latest_version(2).with_checkpoint_at([2]))]
+    #[case::two_checkpoints(
+        LogState::with_latest_version(2).with_checkpoint_at([1, 2]),
+    )]
+    fn test_log_state_checkpoint_shapes_land_on_disk(
+        #[case] log_state: LogState,
+    ) -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .with_log_state(log_state.clone())
+            .build()?;
+        assert_log_state_files_on_disk(&table, &log_state)?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(
+            snap.version(),
+            2,
+            "rebuild lost commits for {}",
+            table.description(),
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_scan_with_column_mapping() -> DeltaResult<()> {
         let table = TestTableBuilder::new()
-            .with_log_state(LogState::with_commits(2))
+            .with_log_state(LogState::with_latest_version(1))
             .with_features(FeatureSet::new().column_mapping("name"))
             .with_data(1, 5)
             .build()?;
@@ -1329,7 +1563,7 @@ mod tests {
     #[test]
     fn test_scan_with_data() -> DeltaResult<()> {
         let table = TestTableBuilder::new()
-            .with_log_state(LogState::with_commits(2))
+            .with_log_state(LogState::with_latest_version(1))
             .with_data(2, 5)
             .build()?;
         let engine: Arc<dyn delta_kernel::Engine> =
@@ -1351,7 +1585,7 @@ mod tests {
     ) -> DeltaResult<()> {
         // 2 versions means v0 (create_table) + v1 (1 data commit with 10 rows)
         let table = TestTableBuilder::new()
-            .with_log_state(LogState::with_commits(2))
+            .with_log_state(LogState::with_latest_version(1))
             .with_data_layout(config)
             .build()?;
         let engine = table.engine();
@@ -1371,7 +1605,7 @@ mod tests {
     fn test_clustered_table_multiple_versions() -> DeltaResult<()> {
         // v0=create, v1-v3=data commits, 10 rows each
         let table = TestTableBuilder::new()
-            .with_log_state(LogState::with_commits(4))
+            .with_log_state(LogState::with_latest_version(3))
             .with_data_layout(DataLayoutConfig::ClusteredAllTypes)
             .build()?;
         let engine = table.engine();
@@ -1389,7 +1623,7 @@ mod tests {
     #[test]
     fn test_with_clustering_columns_directly() -> DeltaResult<()> {
         let table = TestTableBuilder::new()
-            .with_log_state(LogState::with_commits(2))
+            .with_log_state(LogState::with_latest_version(1))
             .with_schema(clustered_schema())
             .with_clustering_columns(["clust_int", "clust_string"])
             .build()?;
@@ -1416,8 +1650,60 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "at least 1 version")]
-    fn test_commits_zero_panics() {
-        LogState::with_commits(0);
+    #[should_panic(expected = "must be <=")]
+    fn test_with_checkpoint_at_rejects_above_latest_version() {
+        LogState::with_latest_version(2).with_checkpoint_at([3]);
+    }
+
+    #[rstest::rstest]
+    #[case(LogState::with_latest_version(3).with_checkpoint_at([2]), 3)]
+    #[case(LogState::with_latest_version(3).with_checkpoint_at([1]), 3)]
+    #[case(LogState::with_latest_version(4), 4)]
+    #[case(LogState::with_latest_version(2).with_checkpoint_at([1, 2]), 2)]
+    fn test_log_state_latest_version(#[case] log_state: LogState, #[case] expected: u64) {
+        assert_eq!(log_state.latest_version(), expected);
+    }
+
+    /// Asserts that every checkpoint version in `log_state.checkpoints_at()`
+    /// produced an on-disk checkpoint file. Snapshot rebuilds can silently
+    /// succeed via JSON-replay fallback even when a checkpoint is missing, so
+    /// any LogState-driven test should call this to verify the fixture's
+    /// contract before asserting anything else.
+    fn assert_log_state_files_on_disk(table: &TestTable, log_state: &LogState) -> DeltaResult<()> {
+        let entries = list_log_dir_filenames(table.store())?;
+        for &v in log_state.checkpoints_at() {
+            let prefix = format!("{v:020}.checkpoint");
+            assert!(
+                entries
+                    .iter()
+                    .any(|name| name.starts_with(&prefix) && name.ends_with(".parquet")),
+                "no checkpoint file at v={v} for {log_state}: {entries:?}",
+            );
+        }
+        Ok(())
+    }
+
+    /// Helper: list filenames (basenames only) directly under `_delta_log/` in
+    /// `store`. Returns just the leaf name so callers can match by suffix without
+    /// dealing with `memory:///`-style path quirks.
+    fn list_log_dir_filenames(store: &Arc<DynObjectStore>) -> DeltaResult<Vec<String>> {
+        list_dir_filenames(store, "_delta_log")
+    }
+
+    /// Helper: list filenames at an arbitrary prefix.
+    fn list_dir_filenames(store: &Arc<DynObjectStore>, prefix: &str) -> DeltaResult<Vec<String>> {
+        let store = store.clone();
+        let prefix = Path::from(prefix);
+        block_on_sync(move || async move {
+            let result = store
+                .list_with_delimiter(Some(&prefix))
+                .await
+                .map_err(delta_kernel::Error::from)?;
+            Ok(result
+                .objects
+                .into_iter()
+                .filter_map(|m| m.location.filename().map(|s| s.to_string()))
+                .collect())
+        })
     }
 }

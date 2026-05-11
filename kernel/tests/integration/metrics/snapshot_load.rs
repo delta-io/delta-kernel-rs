@@ -34,7 +34,7 @@ use super::{
 #[test]
 fn delta_only_snapshot_emits_expected_metrics() -> DeltaResult<()> {
     let table = TestTableBuilder::new()
-        .with_log_state(LogState::with_commits(2))
+        .with_log_state(LogState::with_latest_version(1))
         .with_data(1, 1)
         .build()?;
 
@@ -150,7 +150,7 @@ async fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> DeltaResult<()> 
 #[tokio::test]
 async fn snapshot_with_log_compaction_emits_expected_metrics() -> DeltaResult<()> {
     let table = TestTableBuilder::new()
-        .with_log_state(LogState::with_commits(3))
+        .with_log_state(LogState::with_latest_version(2))
         .with_schema(simple_schema())
         .with_data(1, 1)
         .build()?;
@@ -363,7 +363,7 @@ async fn checkpoint_with_multiple_tail_commits_emits_expected_metrics() -> Delta
 #[test]
 fn get_domain_metadata_when_no_latest_crc_incurs_additional_log_replay() -> DeltaResult<()> {
     let table = TestTableBuilder::new()
-        .with_log_state(LogState::with_commits(2))
+        .with_log_state(LogState::with_latest_version(1))
         .with_data(1, 1)
         .build()?;
 
