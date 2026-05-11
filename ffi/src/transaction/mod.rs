@@ -1623,13 +1623,15 @@ mod tests {
             )
         });
 
-        unsafe { free_expression_evaluator(evaluator) };
-        unsafe { free_kernel_expression(l2p) };
-        unsafe { free_schema(physical) };
-        unsafe { free_schema(logical) };
-        unsafe { free_write_context(write_context) };
-        unsafe { create_table_free_transaction(txn) };
-        unsafe { free_engine(engine) };
+        unsafe {
+            free_expression_evaluator(evaluator);
+            free_kernel_expression(l2p);
+            free_schema(physical);
+            free_schema(logical);
+            free_write_context(write_context);
+            create_table_free_transaction(txn);
+            free_engine(engine);
+        }
     }
 
     #[tokio::test]

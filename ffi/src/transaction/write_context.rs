@@ -84,7 +84,8 @@ pub unsafe extern "C" fn get_write_schema(
 /// written to parquet files. With column mapping enabled, field names are physical
 /// (e.g. `col-<uuid>`) and each field has a `parquet.field.id` metadata entry per the Delta
 /// column-mapping spec; otherwise it matches the logical schema. Partition columns are
-/// excluded unless the `materializePartitionColumns` writer feature is enabled.
+/// excluded unless the `materializePartitionColumns` writer feature or `IcebergCompatV3` is
+/// enabled.
 ///
 /// Use this as the parquet writer schema and as the output schema of the evaluator built
 /// from [`get_logical_to_physical`].
@@ -103,7 +104,7 @@ pub unsafe extern "C" fn get_physical_write_schema(
 
 /// Returns the logical-to-physical transform from a [`WriteContext`] handle. Engines apply
 /// it via an [`ExpressionEvaluator`] to each batch of logical data before writing parquet.
-/// It drops partition columns when `materializePartitionColumns` is not enabled. The column
+/// It drops partition columns when partition columns are not materialized. The column
 /// rename itself is encoded in the physical schema (the evaluator matches input columns to
 /// output fields by position), not in this expression.
 ///

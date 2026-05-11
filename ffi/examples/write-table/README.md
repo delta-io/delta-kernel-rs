@@ -2,7 +2,8 @@ write-table
 ===========
 
 C FFI example for the write transaction surface. Demonstrates `transaction`,
-`with_engine_info`, `get_unpartitioned_write_context`, `get_write_schema`, `get_write_path`,
+`with_engine_info`, `get_unpartitioned_write_context`, the four write-context accessors
+(`get_write_schema`, `get_physical_write_schema`, `get_logical_to_physical`, `get_write_path`),
 `set_data_change`, and `commit` against an existing table.
 
 # Building
