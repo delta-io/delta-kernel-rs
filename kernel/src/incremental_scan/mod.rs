@@ -243,6 +243,49 @@ impl IncrementalScanStream {
         let summary = self.into_summary()?;
         Ok(IncrementalListing { summary, add_files })
     }
+
+    /// Drain any unread batches, then intersect `base_keys` against the surviving-Add
+    /// file-key set to compute `duplicate_adds` (file keys in the consumer's base
+    /// listing that the range re-adds with new metadata, e.g. OPTIMIZE / liquid
+    /// clustering re-tag).
+    ///
+    /// Sugar over [`finish`] plus a single pass over `base_keys`. The iterator is
+    /// consumed exactly once; memory stays `O(surviving_adds)`.
+    ///
+    /// [`finish`]: Self::finish
+    pub fn finish_against_base(
+        self,
+        base_keys: impl IntoIterator<Item = FileActionKey>,
+    ) -> DeltaResult<IncrementalScanSummaryAgainstBase> {
+        let summary = self.finish()?;
+        let duplicate_adds: HashSet<FileActionKey> = base_keys
+            .into_iter()
+            .filter(|k| summary.surviving_adds.contains(k))
+            .collect();
+        Ok(IncrementalScanSummaryAgainstBase {
+            base_version: summary.base_version,
+            target_version: summary.target_version,
+            duplicate_adds,
+            removes: summary.removes,
+        })
+    }
+
+    /// Eager classified helper: collect every surviving Add batch and call
+    /// [`finish_against_base`] against `base_keys`. Returns an
+    /// [`IncrementalListingAgainstBase`] with the classified summary.
+    ///
+    /// [`finish_against_base`]: Self::finish_against_base
+    pub fn collect_listing_against_base(
+        mut self,
+        base_keys: impl IntoIterator<Item = FileActionKey>,
+    ) -> DeltaResult<IncrementalListingAgainstBase> {
+        let mut add_files: Vec<FilteredEngineData> = Vec::new();
+        for item in self.by_ref() {
+            add_files.push(item?);
+        }
+        let summary = self.finish_against_base(base_keys)?;
+        Ok(IncrementalListingAgainstBase { summary, add_files })
+    }
 }
 
 impl std::fmt::Debug for IncrementalScanStream {
@@ -293,6 +336,50 @@ pub struct IncrementalListing {
 impl std::fmt::Debug for IncrementalListing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IncrementalListing")
+            .field("summary", &self.summary)
+            .field("add_files_batch_count", &self.add_files.len())
+            .finish()
+    }
+}
+
+/// Cross-snapshot-classified file-key sets, returned by
+/// [`IncrementalScanStream::finish_against_base`].
+///
+/// To advance a delta-on-base file listing cache, append the streamed Add batches to
+/// the delta layer and use the union `removes U duplicate_adds` as the remove-mask
+/// against the base. Both sets are required: `removes` masks files that left the table;
+/// `duplicate_adds` masks the stale base entry of each file the range re-added with new
+/// metadata. Matching against the full `(path, dv_unique_id)` key (not path alone) keeps
+/// distinct DV-revision entries separate.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct IncrementalScanSummaryAgainstBase {
+    /// Exclusive lower bound of the scan range.
+    pub base_version: Version,
+    /// Inclusive upper bound; equals the source snapshot's version.
+    pub target_version: Version,
+    /// File keys from the surviving Add stream that also appear in the consumer's base
+    /// listing (metadata-only re-adds, e.g. OPTIMIZE / liquid clustering re-tag).
+    /// The corresponding rows are still in the streamed Adds.
+    pub duplicate_adds: HashSet<FileActionKey>,
+    /// File keys of surviving Remove actions. Consumers must union this with
+    /// `duplicate_adds` when masking the base.
+    pub removes: HashSet<FileActionKey>,
+}
+
+/// Eager output of [`IncrementalScanStream::collect_listing_against_base`]: the buffered
+/// Add batches plus the classified summary.
+#[non_exhaustive]
+pub struct IncrementalListingAgainstBase {
+    /// Classified file-key sets for the range; see [`IncrementalScanSummaryAgainstBase`].
+    pub summary: IncrementalScanSummaryAgainstBase,
+    /// All surviving Add batches in descending commit-version order.
+    pub add_files: Vec<FilteredEngineData>,
+}
+
+impl std::fmt::Debug for IncrementalListingAgainstBase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IncrementalListingAgainstBase")
             .field("summary", &self.summary)
             .field("add_files_batch_count", &self.add_files.len())
             .finish()

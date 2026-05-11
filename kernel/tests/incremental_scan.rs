@@ -11,7 +11,8 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::json::DefaultJsonHandler;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::incremental_scan::{
-    IncrementalListing, IncrementalScanStream, IncrementalScanSummary,
+    IncrementalListing, IncrementalListingAgainstBase, IncrementalScanStream,
+    IncrementalScanSummary,
 };
 use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::object_store::memory::InMemory;
@@ -908,6 +909,138 @@ async fn single_commit_split_across_batches_dedups_correctly(
         7,
         "selection-vector counts must not depend on batch_size (got batch_size={batch_size})"
     );
+
+    Ok(())
+}
+
+// === Classification ===
+//
+// `finish_against_base(base_keys)` and `collect_listing_against_base(base_keys)` intersect
+// the consumer's base file keys (`(path, dv_unique_id)`) against the surviving Adds to
+// surface metadata-only re-adds in `duplicate_adds`. The Add row itself stays in the
+// streamed Adds; the key is also surfaced separately so the consumer can mask the stale
+// base entry.
+
+fn unwrap_classified_listing(
+    result: Option<IncrementalScanStream>,
+    base_keys: impl IntoIterator<Item = FileActionKey>,
+) -> IncrementalListingAgainstBase {
+    result
+        .expect("expected Some(stream), got None (commits unavailable)")
+        .collect_listing_against_base(base_keys)
+        .expect("collect_listing_against_base succeeded")
+}
+
+fn classified_add_count(listing: &IncrementalListingAgainstBase) -> usize {
+    listing
+        .add_files
+        .iter()
+        .map(|f| f.selection_vector().iter().filter(|s| **s).count())
+        .sum()
+}
+
+#[rstest]
+#[case::all_re_adds(
+    vec!["re-added.parquet"],
+    vec!["re-added.parquet"],
+    1,
+    vec!["re-added.parquet"],
+)]
+#[case::mixed_new_and_re_added(
+    vec!["brand-new.parquet", "re-added.parquet"],
+    vec!["re-added.parquet"],
+    2,
+    vec!["re-added.parquet"],
+)]
+#[tokio::test]
+async fn classifies_metadata_only_re_adds(
+    #[case] range_adds: Vec<&'static str>,
+    #[case] base_paths: Vec<&'static str>,
+    #[case] expected_surviving: usize,
+    #[case] expected_duplicates: Vec<&'static str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    let actions: Vec<TestAction> = range_adds
+        .iter()
+        .map(|p| TestAction::Add(p.to_string()))
+        .collect();
+    add_commit(table_root, storage.as_ref(), 1, actions_to_string(actions)).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    let listing = unwrap_classified_listing(
+        target.incremental_scan_builder(0).build(engine.as_ref())?,
+        base_paths.iter().map(|p| key(p)),
+    );
+
+    assert_eq!(classified_add_count(&listing), expected_surviving);
+    let expected: HashSet<FileActionKey> = expected_duplicates.iter().map(|p| key(p)).collect();
+    assert_eq!(listing.summary.duplicate_adds, expected);
+    assert!(listing.summary.removes.is_empty());
+
+    Ok(())
+}
+
+// The pull-then-finalize flow: drive the iterator manually with `next()`, then call
+// `finish_against_base(base_keys)`. This is the documented streaming consumer pattern.
+#[tokio::test]
+async fn finish_after_manual_streaming_classifies_duplicates(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![
+            TestAction::Add("brand-new.parquet".to_string()),
+            TestAction::Add("re-added.parquet".to_string()),
+        ]),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let mut stream = target
+        .incremental_scan_builder(0)
+        .build(engine.as_ref())?
+        .expect("expected Some(stream)");
+
+    let mut yielded = 0;
+    for item in stream.by_ref() {
+        let _batch = item?;
+        yielded += 1;
+    }
+    assert_eq!(yielded, 1, "v1 produced one Add batch");
+
+    let summary =
+        stream.finish_against_base([key("re-added.parquet"), key("not-in-range.parquet")])?;
+    assert_eq!(
+        summary.duplicate_adds,
+        HashSet::from([key("re-added.parquet")]),
+        "non-matching base key is filtered out"
+    );
+    assert!(summary.removes.is_empty());
 
     Ok(())
 }
