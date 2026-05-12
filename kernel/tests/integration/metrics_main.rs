@@ -16,7 +16,7 @@ impl MetricsReporter for NoopReporter {
 
 fn main() {
     let table = TestTableBuilder::new()
-        .with_log_state(LogState::with_latest_version(1))
+        .with_log_state(LogState::with_commits(1))
         .with_data(1, 1)
         .build()
         .expect("build test table");
