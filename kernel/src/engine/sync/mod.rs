@@ -193,14 +193,14 @@ pub(super) fn put_bytes(
             ..Default::default()
         }
     };
-    futures::executor::block_on(store.put_opts(&object_path, data.into(), opts)).map_err(
-        |e| match e {
+    futures::executor::block_on(store.put_opts(&object_path, data.into(), opts)).map_err(|e| {
+        match e {
             crate::object_store::Error::AlreadyExists { .. } => {
                 Error::FileAlreadyExists(location.to_string())
             }
             other => Error::generic(other.to_string()),
-        },
-    )?;
+        }
+    })?;
     Ok(())
 }
 
