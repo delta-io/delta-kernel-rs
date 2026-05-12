@@ -13,7 +13,9 @@ use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Snapshot};
 use tempfile::tempdir;
-use test_utils::{create_default_engine, setup_test_tables, write_batch_to_table};
+use test_utils::{
+    begin_transaction, create_default_engine, setup_test_tables, write_batch_to_table,
+};
 use url::Url;
 
 use crate::common::write_utils::get_simple_int_schema;
@@ -54,10 +56,8 @@ async fn test_post_commit_snapshot_create_then_insert() -> DeltaResult<()> {
     for i in 1..11 {
         let base_version = current_snapshot.version();
 
-        let txn = current_snapshot
-            .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_engine_info("test");
+        let txn =
+            begin_transaction(current_snapshot.clone(), engine.as_ref())?.with_engine_info("test");
 
         match txn.commit(engine.as_ref())? {
             CommitResult::CommittedTransaction(committed) => {
@@ -131,10 +131,7 @@ async fn test_write_parquet_rejects_partitioned_write_context_on_unpartitioned_t
         setup_test_tables(schema.clone(), &[], None, "test_partition_reject").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot
-            .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-            .with_engine_info("test");
+        let txn = begin_transaction(snapshot.clone(), &engine)?.with_engine_info("test");
 
         let result = txn.partitioned_write_context(HashMap::from([(
             "nonexistent".to_string(),

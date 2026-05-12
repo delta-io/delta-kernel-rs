@@ -36,7 +36,7 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{try_parse_uri, DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot};
 use itertools::Itertools;
 use serde_json::{json, to_vec, Deserializer};
@@ -671,8 +671,7 @@ pub async fn insert_data<E: TaskExecutor>(
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?
         .with_operation("WRITE".to_string())
         .with_data_change(true);
 
@@ -683,6 +682,23 @@ pub async fn insert_data<E: TaskExecutor>(
     txn.add_files(add_files_metadata);
 
     txn.commit(engine.as_ref())
+}
+
+/// Starts a transaction using the passed snapshot using a [`FileSystemCommitter`].
+pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<Transaction> {
+    snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)
+}
+
+/// Load latest snapshot from `table_url` and start a transaction using a [`FileSystemCommitter`].
+///
+/// Convenience for the common test pattern of building a fresh snapshot just to start a
+/// transaction, when the snapshot itself is not needed afterward.
+pub fn load_and_begin_transaction(
+    table_url: impl AsRef<str>,
+    engine: &dyn Engine,
+) -> DeltaResult<Transaction> {
+    let snapshot = Snapshot::builder_for(table_url).build(engine)?;
+    begin_transaction(snapshot, engine)
 }
 
 // Helper function to set json values in a serde_json Values
