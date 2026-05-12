@@ -198,6 +198,8 @@ jobs:
       - name: trybuild tests
         if: steps.filter.outputs.ffi == 'true'
         run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
+      - name: metrics deadlock test
+        run: cargo run --locked --profile test --example metrics-tester
 
   ffi_test:
     runs-on: ${{ matrix.os }}
