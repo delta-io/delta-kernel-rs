@@ -145,6 +145,10 @@ impl IncrementalScanBuilder {
 /// [`Iterator::next`]; call [`finish`] or [`collect_listing`] to terminate and recover
 /// the surviving file-key sets.
 ///
+/// On error, `next()` yields `Some(Err(_))` once and returns `None` on every subsequent
+/// call; the stream's dedup state is incomplete, so terminal methods then return `Err`
+/// rather than producing a partial summary.
+///
 /// [`finish`]: Self::finish
 /// [`collect_listing`]: Self::collect_listing
 pub struct IncrementalScanStream {

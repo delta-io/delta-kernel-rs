@@ -177,10 +177,23 @@ async fn picks_up_staged_commits_from_log_tail() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-// A commit in the range that contains only Remove actions (no Adds) should not crash,
-// should produce no entries in `add_files`, and the Remove keys should land in `removes`.
+// A commit in the range that contains no Adds (removes-only or metadata-only) should
+// produce no entries in `add_files` and surface only the Remove paths (if any) in
+// `removes`.
+#[rstest]
+#[case::removes_only(
+    vec![
+        TestAction::Remove("gone-a.parquet".to_string()),
+        TestAction::Remove("gone-b.parquet".to_string()),
+    ],
+    vec!["gone-a.parquet", "gone-b.parquet"],
+)]
+#[case::metadata_only(vec![TestAction::Metadata], vec![])]
 #[tokio::test]
-async fn removes_only_commit_in_range() -> Result<(), Box<dyn std::error::Error>> {
+async fn commit_with_no_surviving_adds(
+    #[case] v1_actions: Vec<TestAction>,
+    #[case] expected_remove_paths: Vec<&'static str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
@@ -195,60 +208,20 @@ async fn removes_only_commit_in_range() -> Result<(), Box<dyn std::error::Error>
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![
-            TestAction::Remove("gone-a.parquet".to_string()),
-            TestAction::Remove("gone-b.parquet".to_string()),
-        ]),
+        actions_to_string(v1_actions),
     )
     .await?;
 
     let target = Snapshot::builder_for(table_url)
         .at_version(1)
         .build(engine.as_ref())?;
-
     let listing = unwrap_listing(target.incremental_scan_builder(0).build(engine.as_ref())?);
 
     assert_eq!(surviving_add_count(&listing), 0);
     assert!(listing.add_files.is_empty(), "no Adds means no add batches");
-    assert_eq!(listing.summary.removes.len(), 2);
-    assert!(listing.summary.removes.contains(&key("gone-a.parquet")));
-    assert!(listing.summary.removes.contains(&key("gone-b.parquet")));
-
-    Ok(())
-}
-
-// A commit in the range with only metadata actions (no Add or Remove) should be
-// silently skipped: no add batches, no removes.
-#[tokio::test]
-async fn metadata_only_commit_in_range() -> Result<(), Box<dyn std::error::Error>> {
-    let (storage, engine, table_url) = setup_test();
-    let table_root = table_url.as_str();
-
-    add_commit(
-        table_root,
-        storage.as_ref(),
-        0,
-        actions_to_string(vec![TestAction::Metadata]),
-    )
-    .await?;
-    // v1 contains only the standard Metadata; no Add or Remove.
-    add_commit(
-        table_root,
-        storage.as_ref(),
-        1,
-        actions_to_string(vec![TestAction::Metadata]),
-    )
-    .await?;
-
-    let target = Snapshot::builder_for(table_url)
-        .at_version(1)
-        .build(engine.as_ref())?;
-
-    let listing = unwrap_listing(target.incremental_scan_builder(0).build(engine.as_ref())?);
-
-    assert_eq!(surviving_add_count(&listing), 0);
-    assert!(listing.add_files.is_empty());
-    assert!(listing.summary.removes.is_empty());
+    let expected_removes: HashSet<FileActionKey> =
+        expected_remove_paths.iter().map(|p| key(p)).collect();
+    assert_eq!(listing.summary.removes, expected_removes);
 
     Ok(())
 }
@@ -315,94 +288,60 @@ fn add_no_dv(path: &str) -> String {
     )
 }
 
-// Same path with two different DVs across commits: both rows must survive. The dedup
-// key includes dv_unique_id, so `(X, dv1)` and `(X, dv2)` are distinct and neither
-// cancels the other. This is the protocol-correct outcome for DV-update flows where
-// the file's tombstone state changes between commits.
+// Same path with DV-bearing Adds across commits. Dedup keys on `(path, dv_unique_id)`:
+// different DV ids produce distinct keys (both survive), same DV ids collapse to one
+// surviving Add (newest-wins).
+#[rstest]
+#[case::different_dvs(
+    ("u", "abc", 1),
+    ("u", "xyz", 2),
+    2,
+    vec![("X.parquet", "uabc@1"), ("X.parquet", "uxyz@2")],
+)]
+#[case::same_dvs(
+    ("u", "abc", 1),
+    ("u", "abc", 1),
+    1,
+    vec![("X.parquet", "uabc@1")],
+)]
 #[tokio::test]
-async fn same_path_different_dvs_both_survive() -> Result<(), Box<dyn std::error::Error>> {
+async fn same_path_across_commits_dedups_by_dv(
+    #[case] v1_dv: (&'static str, &'static str, i32),
+    #[case] v2_dv: (&'static str, &'static str, i32),
+    #[case] expected_surviving: usize,
+    #[case] expected_keys: Vec<(&'static str, &'static str)>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
     add_commit(table_root, storage.as_ref(), 0, ACTION_METADATA.to_string()).await?;
-    // v1: Add(X, dv=u/abc/1)
     add_commit(
         table_root,
         storage.as_ref(),
         1,
-        add_with_dv("X.parquet", "u", "abc", 1),
+        add_with_dv("X.parquet", v1_dv.0, v1_dv.1, v1_dv.2),
     )
     .await?;
-    // v2: Add(X, dv=u/xyz/2) -- different DV id, distinct key.
     add_commit(
         table_root,
         storage.as_ref(),
         2,
-        add_with_dv("X.parquet", "u", "xyz", 2),
+        add_with_dv("X.parquet", v2_dv.0, v2_dv.1, v2_dv.2),
     )
     .await?;
 
     let target = Snapshot::builder_for(table_url)
         .at_version(2)
         .build(engine.as_ref())?;
-
     let listing = unwrap_listing(target.incremental_scan_builder(0).build(engine.as_ref())?);
 
-    assert_eq!(
-        surviving_add_count(&listing),
-        2,
-        "two Adds for the same path with different DVs must both survive (distinct keys)"
-    );
+    assert_eq!(surviving_add_count(&listing), expected_surviving);
     assert!(listing.summary.removes.is_empty());
-    let expected_adds: HashSet<FileActionKey> = [
-        key_with_dv("X.parquet", "uabc@1"),
-        key_with_dv("X.parquet", "uxyz@2"),
-    ]
-    .into_iter()
-    .collect();
-    assert_eq!(
-        listing.summary.surviving_adds, expected_adds,
-        "both `(X, dv1)` and `(X, dv2)` keys survive"
-    );
-
-    Ok(())
-}
-
-// Same path with the same DV across commits: only the newest Add survives. With dedup
-// walking newest-first, the first occurrence of `(X, dv)` wins and the older copy is
-// dropped. This is the standard "duplicate Add" case.
-#[tokio::test]
-async fn same_path_same_dv_only_newest_survives() -> Result<(), Box<dyn std::error::Error>> {
-    let (storage, engine, table_url) = setup_test();
-    let table_root = table_url.as_str();
-
-    add_commit(table_root, storage.as_ref(), 0, ACTION_METADATA.to_string()).await?;
-    add_commit(
-        table_root,
-        storage.as_ref(),
-        1,
-        add_with_dv("X.parquet", "u", "abc", 1),
-    )
-    .await?;
-    add_commit(
-        table_root,
-        storage.as_ref(),
-        2,
-        add_with_dv("X.parquet", "u", "abc", 1),
-    )
-    .await?;
-
-    let target = Snapshot::builder_for(table_url)
-        .at_version(2)
-        .build(engine.as_ref())?;
-
-    let listing = unwrap_listing(target.incremental_scan_builder(0).build(engine.as_ref())?);
-
-    assert_eq!(
-        surviving_add_count(&listing),
-        1,
-        "duplicate `(path, dv)` keys collapse to one surviving Add"
-    );
+    let expected_adds: HashSet<FileActionKey> = expected_keys
+        .iter()
+        .map(|(p, dv)| key_with_dv(p, dv))
+        .collect();
+    assert_eq!(listing.summary.surviving_adds, expected_adds);
 
     Ok(())
 }
