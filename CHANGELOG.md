@@ -1,3 +1,5 @@
+# Changelog
+
 ## [v0.22.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.22.1/) (2026-01-20)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.22.0...v0.22.1)
@@ -8,9 +10,6 @@
    reporter code could cause deadlocks. (#2550)
 
 [#2550]: https://github.com/delta-io/delta-kernel-rs/pull/2550
-
-
-# Changelog
 
 ## [v0.22.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.22.0/) (2026-04-29)
 
