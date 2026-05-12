@@ -509,7 +509,8 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     // The kernel can read DV-bearing tables and install connector-authored DV descriptors via
-    // `Transaction::update_deletion_vectors`.
+    // `Transaction::update_deletion_vectors`, including through the FFI
+    // `transaction_update_deletion_vectors` path.
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_deletion_vectors == Some(true)

@@ -5,7 +5,11 @@ mod write_context;
 
 use std::sync::Arc;
 
-pub use deletion_vector::*;
+pub use deletion_vector::{
+    dv_descriptor_map_insert, dv_descriptor_map_new, dv_descriptor_new, free_dv_descriptor,
+    free_dv_descriptor_map, transaction_update_deletion_vectors, ExclusiveDvDescriptor,
+    ExclusiveDvDescriptorMap, KernelDvStorageType,
+};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::{
@@ -2145,11 +2149,7 @@ mod tests {
         assert_eq!(filtered.data().len(), 3);
     }
 
-    /// End-to-end smoke test for the DV update FFI surface. Uses an on-disk DV-enabled
-    /// table; writes a connector-authored DV file, builds a descriptor with `dv_descriptor_new`,
-    /// inserts it into a map via `dv_descriptor_map_insert`, and applies it via
-    /// `transaction_update_deletion_vectors`. After commit, asserts the scan returns the
-    /// non-deleted rows.
+    /// End-to-end FFI round trip for connector-authored deletion vector updates.
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
     async fn test_dv_update_round_trip_via_ffi() -> Result<(), Box<dyn std::error::Error>> {
@@ -2169,8 +2169,8 @@ mod tests {
         let tmp_test_dir = tempdir()?;
         let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
 
-        // Build a DV-enabled table; test_utils::create_table now auto-sets
-        // delta.enableDeletionVectors when the writer feature is present.
+        // Build a DV-enabled table; create_table sets delta.enableDeletionVectors for the
+        // writer feature.
         let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
             "id",
             DataType::INTEGER,

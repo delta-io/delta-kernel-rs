@@ -31,6 +31,9 @@ pub struct SharedScan;
 #[handle_descriptor(target=ScanMetadata, mutable=false, sized=true)]
 pub struct SharedScanMetadata;
 
+/// Boxed scan metadata iterator stored behind [`ScanMetadataIterator`]'s mutex.
+type ScanMetadataIter = Box<dyn Iterator<Item = DeltaResult<ScanMetadata>> + Send>;
+
 /// An opaque, exclusive handle owning a [`ScanBuilder`].
 ///
 /// The caller must eventually either call [`scan_builder_build`] (which consumes the handle
@@ -340,9 +343,7 @@ pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handl
 // conceivable risk, if this interacts poorly with engine's mutual exclusion mechanism.
 pub struct ScanMetadataIterator {
     // Mutex -> Allow the iterator to be accessed safely by multiple threads.
-    // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
-    // Item = DeltaResult<ScanMetadata>
-    data: Mutex<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>> + Send>>,
+    data: Mutex<ScanMetadataIter>,
 
     // Also keep a reference to the external engine for its error allocator. The default Parquet
     // and Json handlers don't hold any reference to the tokio reactor they rely on, so the
@@ -353,12 +354,7 @@ pub struct ScanMetadataIterator {
 impl ScanMetadataIterator {
     /// Acquire the iterator's mutex, returning a guard the caller can drain. While the
     /// guard is alive, concurrent `scan_metadata_next` calls on the same handle block.
-    /// Used by [`crate::transaction::transaction_update_deletion_vectors`].
-    pub(crate) fn lock_iter(
-        &self,
-    ) -> DeltaResult<
-        std::sync::MutexGuard<'_, Box<dyn Iterator<Item = DeltaResult<ScanMetadata>> + Send>>,
-    > {
+    pub(crate) fn lock_iter(&self) -> DeltaResult<std::sync::MutexGuard<'_, ScanMetadataIter>> {
         self.data
             .lock()
             .map_err(|_| Error::generic("poisoned scan-metadata iterator mutex"))
@@ -436,10 +432,7 @@ fn scan_metadata_next_impl(
         scan_metadata: Handle<SharedScanMetadata>,
     ),
 ) -> DeltaResult<bool> {
-    let mut data = data
-        .data
-        .lock()
-        .map_err(|_| Error::generic("poisoned mutex"))?;
+    let mut data = data.lock_iter()?;
     if let Some(scan_metadata) = data.next().transpose()? {
         (engine_visitor)(engine_context, Arc::new(scan_metadata).into());
         Ok(true)

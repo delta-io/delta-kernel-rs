@@ -264,8 +264,8 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         &mut self,
         deletion_vector: impl DeletionVector,
     ) -> DeltaResult<DeletionVectorWriteResult> {
+        // Serialize first so a failure leaves the writer state and output untouched.
         let cardinality = deletion_vector.cardinality();
-        // Serialize the deletion vector to bytes
         let serialized = deletion_vector.serialize()?;
 
         // Write version byte on first write

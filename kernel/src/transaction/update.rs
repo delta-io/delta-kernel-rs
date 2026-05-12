@@ -215,11 +215,15 @@ impl Transaction {
     ///   new deletion vector descriptor for that file.
     /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata. The
     ///   selected elements of each FilteredEngineData must be a superset of the paths that key
-    ///   `new_dv_descriptors`.
+    ///   `new_dv_descriptors`. Per the Delta protocol, files with deletion vectors must have an
+    ///   accurate `numRecords` statistic, so matched scan metadata must preserve that stat.
     ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The transaction targets table creation instead of an existing table
+    /// - The table does not have deletion vectors enabled via protocol support and the
+    ///   `delta.enableDeletionVectors=true` table property
     /// - A file path in `new_dv_descriptors` is not found in `existing_data_files`
     ///
     /// # Examples
@@ -286,6 +290,8 @@ impl Transaction {
                     if visitor.matched_file_indexes[current_matched_index] != i {
                         *selected = false;
                     } else {
+                        // `matched_file_indexes` is populated from a FilteredRowVisitor, so every
+                        // matched row was selected in the original scan metadata.
                         current_matched_index += 1;
                         matched_dv_files += 1;
                     }
@@ -317,22 +323,22 @@ impl Transaction {
         Ok(())
     }
 
-    /// Verify the table has deletion vectors *enabled* (writer feature supported AND the
-    /// `delta.enableDeletionVectors` table property set to `true`). Per the Delta protocol
-    /// "Deletion Vectors" section, writers MUST only write new DVs when the property is
-    /// enabled, not merely when the feature is in the writer features list.
+    /// Verify the table has deletion vectors *enabled* (feature supported in both reader and
+    /// writer features AND the `delta.enableDeletionVectors` table property set to `true`). Per
+    /// the Delta protocol "Deletion Vectors" section, writers MUST only write new DVs when the
+    /// property is enabled, not merely when the feature is in the protocol.
     fn ensure_deletion_vectors_enabled(&self) -> DeltaResult<()> {
-        if self
+        if !self
             .effective_table_config
             .is_feature_enabled(&TableFeature::DeletionVectors)
         {
-            return Ok(());
+            return Err(Error::unsupported(
+                "Deletion vector writes require reader version 3, writer version 7, the \
+                 'deletionVectors' feature in both reader and writer features, and the \
+                 `delta.enableDeletionVectors` table property set to `true`",
+            ));
         }
-        Err(Error::unsupported(
-            "Deletion vector writes require reader version 3, writer version 7, the \
-             'deletionVectors' feature in both reader and writer features, and the \
-             `delta.enableDeletionVectors` table property set to `true`",
-        ))
+        Ok(())
     }
 }
 
@@ -440,7 +446,7 @@ fn new_dv_column_schema() -> &'static SchemaRef {
 // These methods are generic over the transaction state `S` because they are called from the
 // shared `commit()` path in `mod.rs` (`impl<S> Transaction<S>`). DV updates can only be
 // populated on `ExistingTableTransaction`, so the `is_create_table()` guard below is
-// defence-in-depth against future misuse.
+// defense-in-depth against future misuse.
 impl<S> Transaction<S> {
     /// Generate remove/add action pairs for files with DV updates.
     ///

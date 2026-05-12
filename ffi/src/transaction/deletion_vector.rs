@@ -1,10 +1,7 @@
 //! FFI surface for deletion-vector update transactions.
 //!
-//! Two pieces:
-//! 1. An opaque [`DvDescriptorMap`] (path -> [`DeletionVectorDescriptor`]) that the engine
-//!    populates with descriptors it constructed via [`dv_descriptor_new`].
-//! 2. [`transaction_update_deletion_vectors`] consumes the map, drains the supplied scan-metadata
-//!    iterator, and stages remove/add action pairs on the transaction.
+//! Engines build a descriptor map from connector-authored DVs, then pass it with scan metadata to
+//! [`transaction_update_deletion_vectors`] to stage the remove/add action pairs.
 
 use std::collections::HashMap;
 use std::os::raw::c_int;
@@ -32,7 +29,7 @@ pub struct DvDescriptorMap {
     inner: HashMap<String, DeletionVectorDescriptor>,
 }
 
-/// Mutable handle for an [`DvDescriptorMap`].
+/// Mutable handle for a [`DvDescriptorMap`].
 #[handle_descriptor(target=DvDescriptorMap, mutable=true, sized=true)]
 pub struct ExclusiveDvDescriptorMap;
 
@@ -79,10 +76,10 @@ pub unsafe extern "C" fn free_dv_descriptor(descriptor: Handle<ExclusiveDvDescri
 /// Storage type for a [`DeletionVectorDescriptor`], mirroring the protocol-level
 /// `storageType` field. Values match the protocol's single-character codes:
 /// - `PersistedRelative` (`'u'`): the DV is stored on disk; path is reconstructed from the prefix +
-///   base85-encoded UUID held in `path_or_inline_dv`
+///   z85-encoded UUID held in `path_or_inline_dv`
 /// - `Inline` (`'i'`): the deletion vector is stored inline in the log
 /// - `PersistedAbsolute` (`'p'`): the DV is stored at the absolute URL given by `path_or_inline_dv`
-#[repr(i32)]
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelDvStorageType {
     /// `'u'` -- persisted DV with a relative `<prefix><z85-uuid>` reference.
@@ -123,15 +120,17 @@ impl TryFrom<c_int> for KernelDvStorageType {
 ///
 /// Per the Delta protocol "Deletion Vector Descriptor Schema":
 /// - `Inline` descriptors MUST NOT carry an offset; pass `has_offset = false`.
-/// - `PersistedRelative` descriptors carry the random prefix followed by a 20-character
-///   base85-encoded UUID, so `path_or_inline_dv` MUST be at least 20 characters long.
+/// - `PersistedRelative` descriptors carry the optional random prefix followed by a 20-character
+///   z85-encoded UUID, so `path_or_inline_dv` MUST be at least 20 characters long.
 /// - `PersistedAbsolute` descriptors MUST contain a parseable URL.
+/// - If `has_offset` is true, `offset` MUST be non-negative.
 /// - `size_in_bytes` MUST be non-negative.
 /// - `cardinality` MUST be non-negative.
 ///
 /// For persisted DVs, `offset` is the byte offset within the DV file at which the DV's
 /// 4-byte big-endian size prefix begins. For a single-DV file, this is usually `1`
-/// (skipping the version byte).
+/// (skipping the version byte). Omitting the offset is only appropriate for single-DV files
+/// where the size prefix begins immediately after the version byte.
 ///
 /// # Safety
 ///
@@ -179,6 +178,11 @@ fn dv_descriptor_new_impl(
             "deletion vector cardinality must be non-negative",
         ));
     }
+    if has_offset && offset < 0 {
+        return Err(Error::generic(
+            "deletion vector offset must be non-negative",
+        ));
+    }
     let path = path?.to_string();
     match storage_type {
         KernelDvStorageType::Inline => {
@@ -191,7 +195,7 @@ fn dv_descriptor_new_impl(
         KernelDvStorageType::PersistedRelative => {
             if path.len() < 20 {
                 return Err(Error::generic(
-                    "persisted-relative DV path must be at least 20 chars (z85-encoded uuid)",
+                    "persisted-relative DV path must be at least 20 chars (z85-encoded UUID)",
                 ));
             }
         }
@@ -222,6 +226,7 @@ fn dv_descriptor_new_impl(
 /// metadata produced by the kernel (the Add file action's `path` field). The kernel
 /// matches against this string when applying the DV update; a typo causes
 /// [`transaction_update_deletion_vectors`] to return an error.
+/// Re-inserting a descriptor for an existing path replaces the previous descriptor.
 ///
 /// # Safety
 ///
@@ -239,15 +244,20 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
     // descriptor must remain valid so the caller can free it (otherwise we get a UAF
     // when they retry or clean up).
     let path_result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
-    let result: DeltaResult<()> = (|| {
-        let path: &str = path_result?;
-        let owned_path = path.to_string();
-        // Now take ownership of the descriptor.
-        let descriptor = unsafe { descriptor.into_inner() };
-        map_ref.inner.insert(owned_path, *descriptor);
-        Ok(())
-    })();
+    let result = dv_descriptor_map_insert_impl(map_ref, path_result, descriptor);
     result.into_extern_result(&engine_ref)
+}
+
+fn dv_descriptor_map_insert_impl(
+    map: &mut DvDescriptorMap,
+    data_file_path: DeltaResult<&str>,
+    descriptor: Handle<ExclusiveDvDescriptor>,
+) -> DeltaResult<()> {
+    let path = data_file_path?;
+    let owned_path = path.to_string();
+    let descriptor = unsafe { descriptor.into_inner() };
+    map.inner.insert(owned_path, *descriptor);
+    Ok(())
 }
 
 // =============================================================================
@@ -257,12 +267,18 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
 /// Stage deletion-vector update actions on the transaction. For every entry in `dv_map`
 /// the kernel emits a Remove + Add action pair on commit (the Add carries the new DV
 /// descriptor; row-level statistics from the original Add are preserved).
+/// Matched scan metadata must include an accurate `numRecords` statistic because the Delta
+/// protocol requires it for files with deletion vectors.
 ///
-/// Consumes `dv_map`. Drains `scan_iter`: after this call the iterator handle yields
-/// `false` from `scan_metadata_next`. The engine should pass an iterator that covers
-/// at least every file path mentioned in the map; extra files are ignored. If the map
-/// references a path that does not appear in the iterator, the call returns an error
-/// and leaves the transaction unchanged.
+/// Consumes `dv_map`. On success, drains `scan_iter` so subsequent calls to
+/// `scan_metadata_next` return `false`; on error, the iterator may be partially consumed.
+/// The engine should pass an iterator that covers at least every file path mentioned in the
+/// map; extra files are ignored. If the map references a path that does not appear in the
+/// iterator, the call returns an error and leaves the transaction unchanged.
+///
+/// This stages data-changing DV updates by default. Call
+/// [`crate::transaction::set_data_change`] first for maintenance operations that should commit
+/// with `dataChange = false`.
 ///
 /// # Safety
 ///
@@ -270,8 +286,8 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
 /// remains valid after this call; the caller is expected to follow with `commit` (or
 /// `free_transaction`) on the same handle. The DV map handle is consumed and must not
 /// be used or freed after this call. The scan iterator handle is borrowed but drained
-/// (the iterator's mutex is held for the duration of this call), and afterwards may
-/// only be passed to `free_scan_metadata_iter`.
+/// or partially drained (the iterator's mutex is held for the duration of this call),
+/// and afterwards may only be passed to `free_scan_metadata_iter`.
 #[no_mangle]
 pub unsafe extern "C" fn transaction_update_deletion_vectors(
     mut txn: Handle<ExclusiveTransaction>,
@@ -293,12 +309,7 @@ fn transaction_update_deletion_vectors_impl(
     scan_iter: &crate::scan::ScanMetadataIterator,
 ) -> DeltaResult<()> {
     let mut guard = scan_iter.lock_iter()?;
-    // Adapt &mut Box<dyn Iterator<ScanMetadata>> -> &mut dyn Iterator ->
-    // Iterator<FilteredEngineData>. The &mut adapter borrows from `guard`, which we keep alive
-    // for the call.
-    let scan_meta_iter: &mut (dyn Iterator<Item = DeltaResult<delta_kernel::scan::ScanMetadata>>
-              + Send) = &mut **guard;
-    let files_iter = Transaction::scan_metadata_to_engine_data(scan_meta_iter);
+    let files_iter = Transaction::scan_metadata_to_engine_data(&mut **guard);
     txn.update_deletion_vectors(dv_map.inner, files_iter)
 }
 
@@ -306,7 +317,6 @@ fn transaction_update_deletion_vectors_impl(
 mod tests {
     use super::*;
 
-    /// Verify every `KernelDvStorageType` variant maps to the matching kernel storage type.
     #[test]
     fn kernel_dv_storage_type_maps_to_kernel_storage_type() {
         let cases = [
@@ -338,7 +348,6 @@ mod tests {
         );
     }
 
-    /// `dv_descriptor_new_impl` rejects an inline descriptor with `has_offset = true`.
     #[test]
     fn dv_descriptor_new_rejects_inline_with_offset() {
         let err = dv_descriptor_new_impl(KernelDvStorageType::Inline, Ok("ABC"), true, 0, 4, 1)
@@ -347,7 +356,6 @@ mod tests {
         assert!(err.to_string().contains("inline"), "unexpected: {err}");
     }
 
-    /// `dv_descriptor_new_impl` rejects a persisted-relative descriptor with too short a path.
     #[test]
     fn dv_descriptor_new_rejects_short_relative_path() {
         let err = dv_descriptor_new_impl(
@@ -363,7 +371,6 @@ mod tests {
         assert!(err.to_string().contains("20 chars"), "unexpected: {err}");
     }
 
-    /// `dv_descriptor_new_impl` rejects a persisted-absolute descriptor with a non-URL path.
     #[test]
     fn dv_descriptor_new_rejects_non_url_absolute_path() {
         let err = dv_descriptor_new_impl(
@@ -379,9 +386,8 @@ mod tests {
         assert!(err.to_string().contains("URL"), "unexpected: {err}");
     }
 
-    /// `dv_descriptor_new_impl` rejects negative size and cardinality.
     #[test]
-    fn dv_descriptor_new_rejects_negative_size_and_cardinality() {
+    fn dv_descriptor_new_rejects_negative_size_offset_and_cardinality() {
         let err = dv_descriptor_new_impl(KernelDvStorageType::Inline, Ok("ABC"), false, 0, -1, 0)
             .err()
             .expect("expected error");
@@ -394,5 +400,63 @@ mod tests {
             .err()
             .expect("expected error");
         assert!(err.to_string().contains("cardinality"), "unexpected: {err}");
+
+        let err = dv_descriptor_new_impl(
+            KernelDvStorageType::PersistedAbsolute,
+            Ok("file:///tmp/dv.bin"),
+            true,
+            -1,
+            4,
+            1,
+        )
+        .err()
+        .expect("expected error");
+        assert!(err.to_string().contains("offset"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn dv_descriptor_new_round_trips_fields() {
+        let handle = dv_descriptor_new_impl(
+            KernelDvStorageType::PersistedAbsolute,
+            Ok("file:///tmp/dv.bin"),
+            true,
+            7,
+            42,
+            9,
+        )
+        .expect("descriptor should be valid");
+        let descriptor = unsafe { handle.into_inner() };
+
+        assert_eq!(
+            descriptor.storage_type,
+            DeletionVectorStorageType::PersistedAbsolute
+        );
+        assert_eq!(descriptor.path_or_inline_dv, "file:///tmp/dv.bin");
+        assert_eq!(descriptor.offset, Some(7));
+        assert_eq!(descriptor.size_in_bytes, 42);
+        assert_eq!(descriptor.cardinality, 9);
+    }
+
+    #[test]
+    fn dv_descriptor_map_insert_error_leaves_descriptor_freeable() {
+        let mut map = DvDescriptorMap {
+            inner: HashMap::new(),
+        };
+        let descriptor =
+            dv_descriptor_new_impl(KernelDvStorageType::Inline, Ok("ABC"), false, 0, 4, 1)
+                .expect("descriptor should be valid");
+
+        let result = dv_descriptor_map_insert_impl(
+            &mut map,
+            Err(Error::generic("bad data file path")),
+            descriptor.shallow_copy(),
+        );
+
+        assert!(
+            result.is_err(),
+            "insert should fail before consuming descriptor"
+        );
+        assert!(map.inner.is_empty());
+        unsafe { free_dv_descriptor(descriptor) };
     }
 }
