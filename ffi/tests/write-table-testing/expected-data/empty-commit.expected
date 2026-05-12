@@ -1,6 +1,8 @@
 Writing empty commit to <TABLE>
 Write context:
-  schema_handle: <obtained>
-  write_path:    file://<TABLE>/
+  logical_schema:      <obtained>
+  physical_schema:     <obtained>
+  logical_to_physical: <obtained>
+  write_path:          file://<TABLE>/
 Committed version: 1
 Post-commit snapshot version: 1
