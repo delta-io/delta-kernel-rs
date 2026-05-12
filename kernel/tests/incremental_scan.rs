@@ -39,17 +39,11 @@ fn setup_test() -> (
 }
 
 fn key(path: &str) -> FileActionKey {
-    FileActionKey {
-        path: path.to_string(),
-        dv_unique_id: None,
-    }
+    FileActionKey::new(path, None)
 }
 
 fn key_with_dv(path: &str, dv_unique_id: &str) -> FileActionKey {
-    FileActionKey {
-        path: path.to_string(),
-        dv_unique_id: Some(dv_unique_id.to_string()),
-    }
+    FileActionKey::new(path, Some(dv_unique_id.to_string()))
 }
 
 fn surviving_add_count(listing: &IncrementalListing) -> usize {
@@ -255,6 +249,49 @@ async fn metadata_only_commit_in_range() -> Result<(), Box<dyn std::error::Error
     assert_eq!(surviving_add_count(&listing), 0);
     assert!(listing.add_files.is_empty());
     assert!(listing.summary.removes.is_empty());
+
+    Ok(())
+}
+
+// Locks the iterator contract: `next()` returns `None` once every in-range commit has been
+// processed, even when no commit produced a surviving Add. Polling past exhaustion stays
+// `None` and never panics.
+#[tokio::test]
+async fn next_returns_none_after_exhaustion() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    let mut stream = target
+        .incremental_scan_builder(0)
+        .build(engine.as_ref())?
+        .expect("expected Some(stream)");
+
+    for item in stream.by_ref() {
+        item?;
+    }
+    assert!(
+        stream.next().is_none(),
+        "polling past exhaustion stays None"
+    );
+    assert!(stream.next().is_none(), "still None on repeat poll");
 
     Ok(())
 }

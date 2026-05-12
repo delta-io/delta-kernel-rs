@@ -17,11 +17,23 @@ use crate::{
     DeltaResult, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta, Version,
 };
 
-/// Schema projected from each commit JSON: `add` and `remove` only. Protocol and metadata
-/// updates between base and target are validated against the target snapshot's protocol via
-/// [`Operation::Scan`]. By the protocol's feature-immutability rule (features cannot be removed
-/// once added), any reader feature present in an intermediate commit is also present in the
-/// target snapshot's protocol; checking the target alone is sufficient.
+/// Schema projected from each commit JSON: `add` and `remove` only. Kernel itself decodes only
+/// `path` and `deletionVector.{storageType, pathOrInlineDv, offset}` from these rows (for dedup
+/// keying); every other field is passed through to the caller verbatim inside
+/// [`FilteredEngineData`].
+///
+/// Target-only protocol validation via [`Operation::Scan`] is sufficient because:
+///   - The protocol's feature-immutability rule (features cannot be removed once added) makes the
+///     target snapshot's `readerFeatures` an upper bound on every reader feature in use in any
+///     commit in `(base_version, target_version]`.
+///   - Of the fields kernel itself decodes, only `deletionVector.*` is feature-gated, and
+///     pre-`deletionVectors`-enable commits cannot populate it.
+///
+/// Consumers that decode pass-through fields (e.g. `stats`, `partitionValues`, `baseRowId`)
+/// must interpret each row against the protocol active at that row's commit version, not
+/// naively against the target snapshot. The most common pitfall is column mapping enabled
+/// mid-range: pre-enable rows key `stats`/`partitionValues` by logical names, post-enable
+/// rows key them by physical names.
 static INCREMENTAL_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),
@@ -29,37 +41,53 @@ static INCREMENTAL_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-/// Builder for an incremental scan over `(base_version, target_version]`. The target version
-/// is taken from the supplied snapshot; the base version is supplied at construction.
+/// Builder for an incremental scan over `(base_version, target_version]`.
+///
+/// The upper bound (`target_version`) is taken from the supplied target snapshot; the lower
+/// bound (`base_version`, exclusive) is supplied at construction. Use this to advance a
+/// cached file listing from `base_version` to the target snapshot without re-scanning the
+/// whole table.
+///
+/// Construct via [`crate::Snapshot::incremental_scan_builder`] (preferred) and drive with
+/// [`IncrementalScanBuilder::build`].
 #[derive(Debug)]
 pub struct IncrementalScanBuilder {
-    snapshot: SnapshotRef,
+    /// The target snapshot; supplies `target_version`, the snapshot's commit list, and the
+    /// effective protocol used for the reader-feature check.
+    target_snapshot: SnapshotRef,
+    /// Exclusive lower bound of the scan range. Must be strictly less than the target
+    /// snapshot's version.
     base_version: Version,
 }
 
 impl IncrementalScanBuilder {
-    /// Create a new builder for the range `(base_version, snapshot.version()]`. Listing,
-    /// dedup, and the protocol check happen in [`IncrementalScanBuilder::build`].
+    /// Create a new builder for the range `(base_version, target_snapshot.version()]`.
     ///
-    /// Most consumers should call [`crate::Snapshot::incremental_scan_builder`] instead
-    /// of constructing directly.
-    pub(crate) fn new(snapshot: impl Into<SnapshotRef>, base_version: Version) -> Self {
+    /// Connectors should call [`crate::Snapshot::incremental_scan_builder`] rather than
+    /// constructing directly.
+    ///
+    /// Listing, dedup, and the protocol check happen in [`IncrementalScanBuilder::build`].
+    pub(crate) fn new(target_snapshot: impl Into<SnapshotRef>, base_version: Version) -> Self {
         Self {
-            snapshot: snapshot.into(),
+            target_snapshot: target_snapshot.into(),
             base_version,
         }
     }
 
     /// Build the incremental scan stream.
     ///
-    /// Runs version validation, the protocol-feature check, and the snapshot-covers-the-range
-    /// check upfront. If the range can be served, returns `Some(stream)` for the consumer to
-    /// drive batch-by-batch. Returns `None` when the target snapshot's commit list cannot serve
-    /// `(base_version, target_version]`; consumers should fall back to a full scan via
-    /// [`crate::Snapshot::scan_builder`].
+    /// Does not re-list `_delta_log/`: the target snapshot already validated its commit
+    /// list during construction, so this method walks that pre-existing list and clips it
+    /// to `(base_version, target_version]`. For catalog-managed tables that's important,
+    /// the snapshot's `log_tail` carries staged commits that a fresh storage listing would
+    /// miss. Runs version validation, the reader-feature check on the target protocol, and
+    /// the snapshot-covers-the-range check upfront. If the range can be served, returns
+    /// `Some(stream)` for the consumer to drive batch-by-batch. Returns `None` when the
+    /// target snapshot's commit list cannot serve `(base_version, target_version]`;
+    /// consumers should fall back to a full scan via [`crate::Snapshot::scan_builder`].
     ///
     /// # Errors
-    /// - `Err` if `base_version >= snapshot.version()` (caller error).
+    /// - `Err` if `base_version >= target_snapshot.version()` (caller error).
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
     /// - `Err` if the engine fails to open the commit stream.
     ///
@@ -70,7 +98,7 @@ impl IncrementalScanBuilder {
         // clipping below, and the "snapshot covers the range" check should all be replaced
         // by a single `CommitRangeBuilder::from_snapshot(...).build(engine)` call once
         // that primitive lands. https://github.com/delta-io/delta-kernel-rs/issues/2493
-        let target_version = self.snapshot.version();
+        let target_version = self.target_snapshot.version();
         require!(
             self.base_version < target_version,
             Error::generic(format!(
@@ -78,12 +106,17 @@ impl IncrementalScanBuilder {
                 self.base_version, target_version
             ))
         );
+        // `base_version < target_version` above guarantees `base_version < u64::MAX`, but use
+        // `checked_add` to make the dependency explicit and panic-free.
+        let start_version = self.base_version.checked_add(1).ok_or_else(|| {
+            Error::generic("IncrementalScanBuilder: base_version + 1 overflowed u64")
+        })?;
 
         // Confirm kernel supports the target's reader features. Mirrors `Scan::new`. The
         // intermediate commits in `(base_version, target_version]` are read for their `add`
         // and `remove` actions only -- their schemas/stats are passed through opaquely to
         // the caller, who is expected to interpret them against the target snapshot.
-        self.snapshot
+        self.target_snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
@@ -93,13 +126,16 @@ impl IncrementalScanBuilder {
         // includes any staged/ratified-but-unpublished commits passed in via `with_log_tail`,
         // which a fresh storage listing would silently miss. `CommitRange` will own this
         // listing-and-validation responsibility centrally.
-        let snapshot_commits = &self.snapshot.log_segment().listed.ascending_commit_files;
+        let snapshot_commits = &self
+            .target_snapshot
+            .log_segment()
+            .listed
+            .ascending_commit_files;
         let snapshot_first_version = snapshot_commits.first().map(|c| c.version);
 
         // TODO(#2493): this "snapshot covers range" check becomes a typed error from
         // `CommitRange::build` (e.g. `Error::CommitsUnavailable { missing: Range<Version> }`),
         // pattern-matched here to return `None`.
-        let start_version = self.base_version + 1;
         if snapshot_first_version.is_none_or(|v| v > start_version) {
             return Ok(None);
         }
@@ -109,7 +145,7 @@ impl IncrementalScanBuilder {
         // `DefaultEngine`'s `buffered(buffer_size)`) overlap object-store GETs across
         // commits, instead of paying first-byte latency once per commit serially.
         // Newest-first order gives `FileActionDeduplicator` newest-wins semantics across
-        // the range.
+        // the range. `read_json_files` takes `&[FileMeta]` so materializing here is required.
         let commit_locations: Vec<FileMeta> = snapshot_commits
             .iter()
             .filter(|c| c.version >= start_version && c.version <= target_version)
@@ -135,15 +171,42 @@ impl IncrementalScanBuilder {
     }
 }
 
-/// Streaming output of an incremental scan: surviving Add batches in newest-first order,
-/// followed by a terminal method that returns the surviving file-key sets.
+/// Streaming output of an incremental scan over `(base_version, target_version]`.
 ///
-/// Driving the iterator is what advances dedup state, so any of the terminal methods
-/// drains anything the consumer hasn't pulled before computing the final state.
+/// # Iteration contract
 ///
-/// If the iterator surfaces an error, the dedup state becomes inconsistent. Calling a
-/// terminal method on an errored stream returns `Err` rather than producing a stale
-/// summary. The terminal methods consume `self`, so the type system prevents reuse.
+/// As an [`Iterator`], yields surviving Add batches as [`FilteredEngineData`] in
+/// newest-first order (descending commit version): commits closer to `target_version`
+/// produce items before commits closer to `base_version`. Within a commit, the engine may
+/// split its rows across multiple [`ActionsBatch`] yields and may interleave batches across
+/// commits during prefetch; the surviving-Add filtering is per-batch and order-independent.
+///
+/// A commit whose Adds were all cancelled by later Removes produces no item but still
+/// updates dedup state for older commits. The iterator returns `None` once every in-range
+/// commit has been processed.
+///
+/// # Dedup state
+///
+/// Dedup is keyed on `(path, dv_unique_id)` and only advances when [`Iterator::next`] is
+/// polled. A consumer who polls until exhaustion has fully populated `surviving_adds` /
+/// `removes`. A consumer who calls a terminal method ([`finish`] / [`collect_listing`])
+/// before exhausting drains the remaining batches internally before computing the final
+/// state.
+///
+/// # Error semantics
+///
+/// On any underlying I/O or visitor error, the yielding `next()` call returns
+/// `Some(Err(_))` and the stream transitions to an errored state. All subsequent `next()`
+/// calls return `None` (no double-reporting), and calling any terminal method on an
+/// errored stream returns `Err` rather than producing a partial summary. The terminal
+/// methods consume `self`, so the type system also prevents accidental reuse.
+///
+/// On any error the consumer should fall back to a full scan via
+/// [`crate::Snapshot::scan_builder`]: kernel cannot guarantee the diff is complete.
+///
+/// [`finish`]: Self::finish
+/// [`collect_listing`]: Self::collect_listing
+/// [`ActionsBatch`]: crate::log_replay::ActionsBatch
 pub struct IncrementalScanStream {
     base_version: Version,
     target_version: Version,
@@ -222,7 +285,13 @@ impl IncrementalScanStream {
     /// [`finish`] to recover the file-key sets. Use this when the diff fits in memory and
     /// the consumer prefers the simpler eager shape over the iterator pattern.
     ///
+    /// The returned `Vec` may contain multiple batches per source commit: the engine is
+    /// free to split a commit's rows across [`ActionsBatch`] yields (e.g. by JSON-reader
+    /// batch-size limits). One yielded batch produces at most one `Vec` entry, and a
+    /// commit whose Adds were all cancelled by later Removes produces no entry at all.
+    ///
     /// [`finish`]: Self::finish
+    /// [`ActionsBatch`]: crate::log_replay::ActionsBatch
     pub fn collect_listing(mut self) -> DeltaResult<IncrementalListing> {
         let mut add_files: Vec<FilteredEngineData> = Vec::new();
         for item in self.by_ref() {
@@ -312,6 +381,9 @@ fn process_batch(
     };
     visitor.visit_rows_of(batch.as_ref())?;
 
+    // No Adds in the batch survived dedup, e.g. a Removes-only commit or a commit whose
+    // Adds were all cancelled by later commits in the range. Skip yielding an empty
+    // batch; dedup state has still been advanced by the visit above.
     if !adds_sel.iter().any(|s| *s) {
         return Ok(None);
     }
@@ -323,6 +395,7 @@ const ADD_PATH_INDEX: usize = 0;
 const ADD_DV_START_INDEX: usize = 1; // .storageType, .pathOrInlineDv, .offset
 const REMOVE_PATH_INDEX: usize = 4;
 const REMOVE_DV_START_INDEX: usize = 5; // .storageType, .pathOrInlineDv, .offset
+const NUM_GETTERS: usize = 8; // 4 add + 4 remove columns
 
 // We share `FileActionDeduplicator` with the scan path but not `AddRemoveDedupVisitor`:
 // that visitor is wired to scan-only state (`StateInfo`, `ScanMetrics`, per-row transform
@@ -366,9 +439,9 @@ impl RowVisitor for IncrementalDedupVisitor<'_, '_> {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 8,
+            getters.len() == NUM_GETTERS,
             Error::InternalError(format!(
-                "IncrementalDedupVisitor expected 8 getters, got {}",
+                "IncrementalDedupVisitor expected {NUM_GETTERS} getters, got {}",
                 getters.len()
             ))
         );

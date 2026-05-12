@@ -30,12 +30,8 @@ pub(crate) mod deduplicator;
 /// of adds and removes during log replay.
 #[derive(Debug, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize, Clone)]
 pub struct FileActionKey {
-    /// The data file path, as stored on the action.
-    pub path: String,
-    /// Deletion-vector unique id, or `None` if the action carries no deletion vector. Same
-    /// `path` with different `dv_unique_id` (e.g. an `add(P, dv=new) + remove(P, dv=old)`
-    /// DV-replacement pair) refers to distinct logical file identities.
-    pub dv_unique_id: Option<String>,
+    path: String,
+    dv_unique_id: Option<String>,
 }
 
 impl FileActionKey {
@@ -43,6 +39,18 @@ impl FileActionKey {
     pub fn new(path: impl Into<String>, dv_unique_id: Option<String>) -> Self {
         let path = path.into();
         Self { path, dv_unique_id }
+    }
+
+    /// The data file path, as stored on the action.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Deletion-vector unique id, or `None` if the action carries no deletion vector. Same
+    /// `path` with different `dv_unique_id` (e.g. an `add(P, dv=new) + remove(P, dv=old)`
+    /// DV-replacement pair) refers to distinct logical file identities.
+    pub fn dv_unique_id(&self) -> Option<&str> {
+        self.dv_unique_id.as_deref()
     }
 }
 
