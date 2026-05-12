@@ -1550,7 +1550,6 @@ mod tests {
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{MapData, Scalar, StructData};
-    use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -2089,8 +2088,7 @@ mod tests {
             "id",
             DataType::INTEGER,
         )])?);
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
+        let engine = Arc::new(crate::engine::sync::SyncEngine::new());
         let mut txn = create_table(
             tempdir.path().to_str().expect("valid temp path"),
             schema,
@@ -2528,7 +2526,7 @@ mod tests {
     fn disallow_catalog_committer_for_non_catalog_managed_table() {
         let storage = Arc::new(InMemory::new());
         let table_root = url::Url::parse("memory:///").unwrap();
-        let engine = crate::engine::default::DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = crate::engine::sync::SyncEngine::new_with_store(storage.clone());
 
         // Create a non-catalog-managed table (no catalogManaged feature)
         let actions = [
@@ -2560,7 +2558,7 @@ mod tests {
     #[test]
     fn disallow_catalog_committer_for_non_catalog_managed_create_table() {
         let storage = Arc::new(InMemory::new());
-        let engine = crate::engine::default::DefaultEngineBuilder::new(storage).build();
+        let engine = crate::engine::sync::SyncEngine::new_with_store(storage);
 
         // Create a non-catalog-managed table using a catalog committer
         let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![
