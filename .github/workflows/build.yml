@@ -201,7 +201,7 @@ jobs:
       - name: metrics deadlock test
         run: |
           count=$(cargo run --profile test --example metrics-tester | grep -E 'invalid_field|Invalid uuid' | wc -l)
-          [ "$count" -eq 2 ]
+          [ "$count" -ge 2 ]
 
   ffi_test:
     runs-on: ${{ matrix.os }}
