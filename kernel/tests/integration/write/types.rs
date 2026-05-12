@@ -22,7 +22,9 @@ use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-use test_utils::{create_table, engine_store_setup, test_read, test_table_setup};
+use test_utils::{
+    begin_transaction, create_table, engine_store_setup, test_read, test_table_setup,
+};
 use url::Url;
 
 #[tokio::test]
@@ -48,9 +50,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    let mut txn = test_utils::load_and_begin_transaction(table_url.clone(), &engine)?
         .with_engine_info("default engine");
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
@@ -167,10 +167,8 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-        .with_data_change(true);
+    let mut txn =
+        test_utils::load_and_begin_transaction(table_url.clone(), &engine)?.with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -374,10 +372,8 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-        .with_data_change(true);
+    let mut txn =
+        test_utils::load_and_begin_transaction(table_url.clone(), &engine)?.with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -519,8 +515,7 @@ async fn test_not_null_data_column_rejects_null_in_batch(
         "non-null schema must auto-enable the `invariants` writer feature",
     );
 
-    let write_context = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let write_context = begin_transaction(snapshot, engine.as_ref())?
         .with_engine_info("default engine")
         .unpartitioned_write_context()?;
 

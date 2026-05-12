@@ -3,7 +3,6 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{Array, AsArray, Int32Array, Int64Array, StringArray};
 use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -18,7 +17,8 @@ use itertools::Itertools;
 use serde_json::{Deserializer, Value};
 use tempfile::{tempdir, TempDir};
 use test_utils::{
-    create_default_engine_mt_executor, create_table, engine_store_setup, read_scan, test_read,
+    begin_transaction, create_default_engine_mt_executor, create_table, engine_store_setup,
+    load_and_begin_transaction, read_scan, test_read,
 };
 use url::Url;
 
@@ -58,11 +58,8 @@ async fn write_data_to_table(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     data: Vec<ArrowEngineData>,
 ) -> DeltaResult<CommitResult> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let committer = Box::new(FileSystemCommitter::new());
-    let mut txn = snapshot
-        .transaction(committer, engine.as_ref())?
-        .with_data_change(true);
+    let mut txn =
+        load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
 
     // Write data out by spawning async tasks to simulate executors
     let write_context = Arc::new(txn.unpartitioned_write_context()?);
@@ -579,8 +576,7 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
     let tmp_test_dir = tempdir()?;
     let (_schema, table_url, engine, store) =
         setup_number_table(&tmp_test_dir, "test_consecutive_commits").await?;
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?;
 
     // Commit without adding any add files
     assert!(txn.commit(engine.as_ref())?.is_committed());
@@ -618,12 +614,10 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine2.as_ref())?;
 
     // Create two transactions from the same snapshot (simulating parallel transactions)
-    let mut txn1 = snapshot1
-        .transaction(Box::new(FileSystemCommitter::new()), engine1.as_ref())?
+    let mut txn1 = begin_transaction(snapshot1, engine1.as_ref())?
         .with_engine_info("transaction 1")
         .with_data_change(true);
-    let mut txn2 = snapshot2
-        .transaction(Box::new(FileSystemCommitter::new()), engine2.as_ref())?
+    let mut txn2 = begin_transaction(snapshot2, engine2.as_ref())?
         .with_engine_info("transaction 2")
         .with_data_change(true);
 
