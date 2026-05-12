@@ -319,9 +319,18 @@ void log_line_callback(KernelStringSlice line) {
 int main(int argc, char* argv[])
 {
   char* requested_cols = NULL;
+  bool use_arrow_metadata = false;
   int c;
-  while ((c = getopt (argc, argv, "c:")) != -1) {
+  while ((c = getopt (argc, argv, "ac:")) != -1) {
     switch (c) {
+    case 'a':
+      // Use the Arrow batch-mode scan metadata path (scan_metadata_next_arrow) instead of
+      // the callback-based path (scan_metadata_next + visit_scan_metadata). This path
+      // returns scan-file metadata as Arrow C Data Interface batches; engines that already
+      // process Arrow natively can extract path/size/stats/DV/partition-values directly
+      // from the batch columns rather than via per-row callbacks.
+      use_arrow_metadata = true;
+      break;
     case 'c':
       requested_cols = optarg;
       break;
@@ -344,9 +353,16 @@ int main(int argc, char* argv[])
   }
 
   if (optind != (argc - 1)) {
-    printf("Usage: %s [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
+    printf("Usage: %s [-a] [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
     return -1;
   }
+
+#ifndef PRINT_ARROW_DATA
+  if (use_arrow_metadata) {
+    fprintf(stderr, "-a (arrow-batch metadata) requires building with PRINT_DATA=ON\n");
+    return -1;
+  }
+#endif
 
   char* table_path = argv[optind];
   printf("Reading table at %s\n", table_path);
@@ -369,7 +385,10 @@ int main(int argc, char* argv[])
     return -1;
   }
 
-  // an example of using a builder to set options when building an engine
+  // Example of using the builder to set object-store options before building the engine. The
+  // keys accepted here come from object_store's configuration vocabulary (e.g. "aws_region",
+  // "aws_access_key_id"). They are object-store-specific and only meaningful when the table URL
+  // points at that backend -- for a local file:// table the setters have no effect.
   EngineBuilder* engine_builder = engine_builder_res.ok;
   if (!set_builder_opt(engine_builder, "aws_region", "us-west-2")) {
     return -1;
@@ -384,8 +403,8 @@ int main(int argc, char* argv[])
   //   get_default_engine(table_path_slice, NULL);
 
   if (engine_res.tag != OkHandleSharedExternEngine) {
-    print_error("File to get engine", (Error*)engine_builder_res.err);
-    free_error((Error*)engine_builder_res.err);
+    print_error("Failed to get engine", (Error*)engine_res.err);
+    free_error((Error*)engine_res.err);
     return -1;
   }
 
@@ -395,12 +414,16 @@ int main(int argc, char* argv[])
   if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
     print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
     free_error((Error*)snapshot_builder_res.err);
+    free_engine(engine);
     return -1;
   }
+  // snapshot_builder_build consumes the builder handle whether it succeeds or fails, so there
+  // is nothing to free for the builder here.
   ExternResultHandleSharedSnapshot snapshot_res = snapshot_builder_build(snapshot_builder_res.ok);
   if (snapshot_res.tag != OkHandleSharedSnapshot) {
     print_error("Failed to create snapshot.", (Error*)snapshot_res.err);
     free_error((Error*)snapshot_res.err);
+    free_engine(engine);
     return -1;
   }
 
@@ -477,6 +500,14 @@ int main(int argc, char* argv[])
   if (data_iter_res.tag != OkHandleSharedScanMetadataIterator) {
     print_error("Failed to construct scan metadata iterator.", (Error*)data_iter_res.err);
     free_error((Error*)data_iter_res.err);
+    free_scan(scan);
+    free_schema(logical_schema);
+    free_schema(physical_schema);
+    free_snapshot(snapshot);
+    free_engine(engine);
+    free(context.table_root);
+    free(scan_table_path);
+    free_partition_list(context.partition_cols);
     return -1;
   }
 
@@ -484,17 +515,30 @@ int main(int argc, char* argv[])
 
   print_diag("\nIterating scan metadata\n");
 
-  // iterate scan files
-  for (;;) {
-    ExternResultbool ok_res =
-      scan_metadata_next(data_iter, &context, do_visit_scan_metadata);
-    if (ok_res.tag != Okbool) {
-      print_error("Failed to iterate scan metadata.", (Error*)ok_res.err);
-      free_error((Error*)ok_res.err);
-      return -1;
-    } else if (!ok_res.ok) {
-      print_diag("Scan metadata iterator done\n");
-      break;
+  int exit_code = 0;
+#ifdef PRINT_ARROW_DATA
+  if (use_arrow_metadata) {
+    // Arrow batch-mode: hand each metadata batch to iterate_scan_metadata_arrow, which
+    // imports it via arrow-glib for inspection. This path does NOT call read_parquet_file;
+    // a real engine would walk the batch columns and read parquet itself.
+    iterate_scan_metadata_arrow(&context, data_iter);
+  } else
+#endif
+  {
+    // Callback-mode: kernel calls back into do_visit_scan_metadata for each metadata batch,
+    // which then walks each scan file via visit_scan_metadata + scan_row_callback.
+    for (;;) {
+      ExternResultbool ok_res =
+        scan_metadata_next(data_iter, &context, do_visit_scan_metadata);
+      if (ok_res.tag != Okbool) {
+        print_error("Failed to iterate scan metadata.", (Error*)ok_res.err);
+        free_error((Error*)ok_res.err);
+        exit_code = -1;
+        break;
+      } else if (!ok_res.ok) {
+        print_diag("Scan metadata iterator done\n");
+        break;
+      }
     }
   }
 
@@ -516,5 +560,5 @@ int main(int argc, char* argv[])
   free(scan_table_path);
   free_partition_list(context.partition_cols);
 
-  return 0;
+  return exit_code;
 }

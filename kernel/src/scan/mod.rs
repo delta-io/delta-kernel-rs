@@ -24,6 +24,7 @@ use crate::kernel_predicates::{
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
+use crate::metrics::reporter::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
 use crate::scan::log_replay::{
@@ -37,7 +38,7 @@ use crate::schema::{
     ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
-use crate::transforms::{ExpressionTransform, SchemaTransform};
+use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::IteratorExt;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
@@ -361,6 +362,8 @@ struct GetReferencedFields<'a> {
     column_mapping_mode: ColumnMappingMode,
 }
 impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     // Capture the path mapping for this leaf field
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
         // Record the physical name mappings for all referenced leaf columns. Delta column names
@@ -408,8 +411,10 @@ struct PrefixColumns {
 }
 
 impl<'a> ExpressionTransform<'a> for PrefixColumns {
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        Some(Cow::Owned(self.prefix.join(name)))
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Cow<'a, ColumnName> {
+        Cow::Owned(self.prefix.join(name))
     }
 }
 
@@ -417,6 +422,8 @@ struct ApplyColumnMappings {
     column_mappings: HashMap<ColumnName, ColumnName>,
 }
 impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     // NOTE: We already verified all column references. But if the map probe ever did fail, the
     // transform would just delete any expression(s) that reference the invalid column.
     fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
@@ -764,7 +771,6 @@ impl Scan {
         >,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         let start = Instant::now();
-        let reporter = engine.get_metrics_reporter();
         let operation_id = MetricId::new();
 
         let (iter, metrics) = match self.state_info.physical_predicate {
@@ -787,9 +793,7 @@ impl Scan {
         let on_complete = move || {
             let event = metrics.to_event(operation_id, ScanType::Full, start.elapsed());
             info!(%event);
-            if let Some(r) = reporter {
-                r.report(event);
-            }
+            emit_scan_metadata_completed(&event);
         };
         Ok(iter.into_iter().flatten().on_complete(on_complete))
     }
@@ -859,7 +863,7 @@ impl Scan {
         let mut prefixer = PrefixColumns {
             prefix: ColumnName::new(["add", "stats_parsed"]),
         };
-        let prefixed = prefixer.transform_pred(&skipping_pred)?;
+        let prefixed = prefixer.transform_pred(&skipping_pred);
         Some(Arc::new(prefixed.into_owned()))
     }
 

@@ -151,6 +151,32 @@ fn with_engine_info_impl(
     Ok(Box::new(txn.with_engine_info(info)).into())
 }
 
+/// Set the operation that this transaction is performing. This string will be persisted in the
+/// commit and visible to anyone who describes the table history. This CONSUMES the transaction
+/// handle and returns a new handle for the updated transaction.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. CONSUMES the transaction handle.
+#[no_mangle]
+pub unsafe extern "C" fn with_operation(
+    txn: Handle<ExclusiveTransaction>,
+    operation: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    with_operation_impl(*txn, operation).into_extern_result(&engine)
+}
+
+fn with_operation_impl(
+    txn: Transaction,
+    operation: KernelStringSlice,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let operation: String = unsafe { TryFromStringSlice::try_from_slice(&operation) }?;
+    Ok(Box::new(txn.with_operation(operation)).into())
+}
+
 /// Add domain metadata to the transaction. The domain metadata will be written to the Delta log
 /// as a `domainMetadata` action when the transaction is committed.
 ///
@@ -701,7 +727,7 @@ mod tests {
             // Add engine info
             let engine_info = "default_engine";
             let engine_info_kernel_string = kernel_string_slice!(engine_info);
-            let txn_with_engine_info = unsafe {
+            let txn = unsafe {
                 ok_or_panic(with_engine_info(
                     txn,
                     engine_info_kernel_string,
@@ -709,11 +735,19 @@ mod tests {
                 ))
             };
 
-            let write_context = ok_or_panic(unsafe {
-                get_unpartitioned_write_context(
-                    txn_with_engine_info.shallow_copy(),
+            // Add the operation
+            let operation = "WRITE";
+            let operation_kernel_string = kernel_string_slice!(operation);
+            let txn = unsafe {
+                ok_or_panic(with_operation(
+                    txn,
+                    operation_kernel_string,
                     engine.shallow_copy(),
-                )
+                ))
+            };
+
+            let write_context = ok_or_panic(unsafe {
+                get_unpartitioned_write_context(txn.shallow_copy(), engine.shallow_copy())
             });
 
             // Ensure we get the correct schema
@@ -755,12 +789,7 @@ mod tests {
                 ),
             ])
             .unwrap();
-            let parquet_schema = unsafe {
-                txn_with_engine_info
-                    .shallow_copy()
-                    .as_ref()
-                    .add_files_schema()
-            };
+            let parquet_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() };
             let file_info = write_parquet_file(
                 table_path_str,
                 "my_file.parquet",
@@ -772,9 +801,9 @@ mod tests {
                 get_engine_data(file_info.array, &file_info.schema, allocate_err)
             });
 
-            unsafe { add_files(txn_with_engine_info.shallow_copy(), file_info_engine_data) };
+            unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
 
-            ok_or_panic(unsafe { commit(txn_with_engine_info, engine.shallow_copy()) });
+            ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
 
             // Confirm that our commit is what we expect
             let commit1_url = table_url
@@ -801,7 +830,7 @@ mod tests {
                     "commitInfo": {
                         "timestamp": 0,
                         "engineInfo": "default_engine",
-                        "operation": "UNKNOWN",
+                        "operation": "WRITE",
                         "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                         "operationParameters": {},
                         "txnId": ZERO_UUID

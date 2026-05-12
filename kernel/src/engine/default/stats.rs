@@ -343,13 +343,22 @@ struct ColumnStats {
 ///
 /// Returns `ColumnStats` containing null_count, min, and max for this column.
 /// For struct columns, these are nested StructArrays. For leaf columns, these are scalar arrays.
-/// Map, List, and other complex types are skipped (returns default empty stats).
+/// Complex types (Map, List, Variant) get nullCount only because they have no meaningful
+/// ordering for min/max data skipping, but null counts are still useful for tracking nullability.
 fn compute_column_stats(
     column: &ArrayRef,
     path: &mut Vec<String>,
     filter: &ColumnTrie<'_>,
 ) -> DeltaResult<ColumnStats> {
     match column.data_type() {
+        // A struct column that the filter marks as a terminal leaf (e.g. Variant, which is a
+        // struct at the Arrow level but a leaf for stats purposes) gets nullCount only, no
+        // recursion into sub-fields and no min/max.
+        DataType::Struct(_) if filter.is_terminal(path) => Ok(ColumnStats {
+            null_count: Some(Arc::new(Int64Array::from(vec![column.null_count() as i64]))),
+            min_value: None,
+            max_value: None,
+        }),
         DataType::Struct(fields) => {
             let struct_array = column
                 .as_struct_opt()
@@ -430,7 +439,7 @@ fn compute_column_stats(
 
             // When min/max is None (all nulls or unsupported type), emit a null-valued
             // single-element array to keep the field present in the stats struct. This
-            // allows downstream consumers (like StatsVerifier) to find the column and
+            // allows downstream consumers (like StatsColumnVerifier) to find the column and
             // check nullCount == numRecords. The JSON serializer omits null fields, so
             // the on-disk format still matches Spark's ignoreNullFields behavior.
             let null_fallback = || -> ArrayRef { Arc::new(new_null_array(column.data_type(), 1)) };
@@ -547,8 +556,10 @@ pub(crate) fn collect_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{Array, AsArray, Int32Array, Int64Array, StringArray};
-    use crate::arrow::buffer::NullBuffer;
+    use crate::arrow::array::{
+        Array, AsArray, BinaryArray, Int32Array, Int64Array, ListArray, MapArray, StringArray,
+    };
+    use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::{Fields, Int32Type, Int64Type, Schema};
     use crate::engine::arrow_expression::evaluate_expression::to_json;
@@ -767,7 +778,7 @@ mod tests {
         assert_eq!(value_null_count.value(0), 3);
 
         // All-null columns are present in minValues/maxValues but with null values.
-        // The field must exist so that StatsVerifier can find it via visit_rows and
+        // The field must exist so that StatsColumnVerifier can find it via visit_rows and
         // check nullCount == numRecords. The JSON serializer omits null fields, so
         // the on-disk format still matches Spark's ignoreNullFields behavior.
         let min_values = stats
@@ -1025,7 +1036,11 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(nested_struct) as ArrayRef]).unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("nested")]).unwrap();
+        let stats = collect_stats(
+            &batch,
+            &[column_name!("nested.a"), column_name!("nested.b")],
+        )
+        .unwrap();
 
         // Check nullCount.nested.a = 0, nullCount.nested.b = 1
         let null_count = stats
@@ -1123,9 +1138,6 @@ mod tests {
 
     #[test]
     fn test_collect_stats_complex_types_null_count_only() {
-        use crate::arrow::array::ListArray;
-        use crate::arrow::buffer::OffsetBuffer;
-
         // Schema with list column - should have nullCount but no min/max
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -1205,6 +1217,128 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_stats_map_null_count_only() {
+        // === GIVEN: a batch with an id column and a map column (1 null out of 3 rows) ===
+        let map_field = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, true),
+            ])),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "map_col",
+                DataType::Map(Arc::new(map_field.clone()), false),
+                true,
+            ),
+        ]));
+        let keys = StringArray::from(vec!["a", "b"]);
+        let values = Int64Array::from(vec![1, 2]);
+        let entries = StructArray::new(
+            Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, true),
+            ]),
+            vec![Arc::new(keys) as ArrayRef, Arc::new(values) as ArrayRef],
+            None,
+        );
+        let map_array = MapArray::new(
+            Arc::new(map_field),
+            OffsetBuffer::new(vec![0, 1, 1, 2].into()),
+            entries,
+            Some(vec![true, false, true].into()), // second element is null
+            false,
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(map_array),
+            ],
+        )
+        .unwrap();
+
+        // === WHEN: collecting stats for both columns ===
+        let stats = collect_stats(&batch, &[column_name!("id"), column_name!("map_col")]).unwrap();
+
+        // === THEN: map_col has nullCount=1 but no min/max ===
+        let null_count = child_struct(&stats, "nullCount");
+        let map_nulls = null_count
+            .column_by_name("map_col")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+        assert_eq!(map_nulls.value(0), 1);
+
+        let min_values = child_struct(&stats, "minValues");
+        assert!(min_values.column_by_name("id").is_some());
+        assert!(min_values.column_by_name("map_col").is_none());
+    }
+
+    #[test]
+    fn test_collect_stats_variant_terminal_struct_null_count_only() {
+        // Variant is Struct { metadata: Binary, value: Binary } at the Arrow level, but
+        // stats_column_names lists it as a terminal leaf ["v"]. The is_terminal guard in
+        // compute_column_stats must produce nullCount at the struct level without recursing
+        // into metadata/value sub-fields.
+
+        // === GIVEN: a batch with an id column and a Variant column (1 null out of 3 rows) ===
+        let variant_fields = Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, false),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Struct(variant_fields.clone()), true),
+        ]));
+        let variant_array = StructArray::new(
+            variant_fields,
+            vec![
+                Arc::new(BinaryArray::from(vec![
+                    Some([0x01, 0x00, 0x00].as_slice()),
+                    None,
+                    Some([0x01, 0x00, 0x00].as_slice()),
+                ])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![
+                    Some([0x0C].as_slice()),
+                    None,
+                    Some([0x0C].as_slice()),
+                ])) as ArrayRef,
+            ],
+            Some(NullBuffer::from_iter([true, false, true])), // row 1 is null
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(variant_array),
+            ],
+        )
+        .unwrap();
+
+        // === WHEN: collecting stats with "v" as a terminal column ===
+        let stats = collect_stats(&batch, &[column_name!("id"), column_name!("v")]).unwrap();
+
+        // === THEN: v has nullCount=1 at the struct level, no recursion, no min/max ===
+        let null_count = child_struct(&stats, "nullCount");
+        let v_nulls = null_count
+            .column_by_name("v")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+        assert_eq!(v_nulls.value(0), 1);
+
+        // v must NOT be recursed into, no nested metadata/value in nullCount
+        assert!(null_count.column_by_name("metadata").is_none());
+        assert!(null_count.column_by_name("value").is_none());
+
+        let min_values = child_struct(&stats, "minValues");
+        assert!(min_values.column_by_name("id").is_some());
+        assert!(min_values.column_by_name("v").is_none());
+    }
+
+    #[test]
     fn test_collect_stats_struct_with_nulls_at_struct_level() {
         // Schema: { my_struct: { a: int32, b: int32 (nullable) } }
         // Test both struct-level nulls and field-level nulls
@@ -1236,7 +1370,11 @@ mod tests {
 
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(struct_array)]).unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("my_struct")]).unwrap();
+        let stats = collect_stats(
+            &batch,
+            &[column_name!("my_struct.a"), column_name!("my_struct.b")],
+        )
+        .unwrap();
 
         // Visualizing the data:
         // Row 0: struct=NULL,  (a=1, b=None are "invisible")
@@ -1280,6 +1418,16 @@ mod tests {
             get_stat::<Int32Type>(&stats, "maxValues", "my_struct", "b"),
             20
         );
+    }
+
+    /// Extracts a named child column from a StructArray, downcasting it to StructArray.
+    fn child_struct<'a>(parent: &'a StructArray, name: &str) -> &'a StructArray {
+        parent
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
     }
 
     // Generic helper to extract and downcast nested columns from stats

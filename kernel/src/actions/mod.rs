@@ -214,6 +214,11 @@ impl TryFrom<Format> for Scalar {
 }
 
 // Serde derives are needed for CRC file deserialization (see `crc::reader`).
+//
+// TODO(#2446): `Metadata` stores the schema only as a JSON string. Callers that already hold
+// a parsed `SchemaRef` (e.g. CREATE TABLE) serialize into `schema_string` and then re-parse
+// downstream in `TableConfiguration::try_new` via `parse_schema()`. Caching the parsed schema
+// on `Metadata` would eliminate the round-trip.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
@@ -242,9 +247,7 @@ impl Metadata {
     /// # Errors
     ///
     /// Returns an error if there are any metadata columns in the schema.
-    // TODO: remove allow(dead_code) after we use this API in CREATE TABLE, etc.
     #[internal_api]
-    #[allow(dead_code)]
     pub(crate) fn try_new(
         name: Option<String>,
         description: Option<String>,
@@ -343,6 +346,29 @@ impl Metadata {
     #[internal_api]
     pub(crate) fn parse_table_properties(&self) -> TableProperties {
         TableProperties::from(self.configuration.iter())
+    }
+
+    /// Returns a new Metadata with the schema replaced, preserving all other fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if schema serialization fails.
+    pub(crate) fn with_schema(self, schema: SchemaRef) -> DeltaResult<Self> {
+        Ok(Self {
+            schema_string: serde_json::to_string(&schema)?,
+            ..self
+        })
+    }
+
+    /// Returns a new Metadata with a single configuration entry inserted (or replaced),
+    /// preserving all other configuration entries and metadata fields.
+    pub(crate) fn with_configuration_entry(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.configuration.insert(key.into(), value.into());
+        self
     }
 
     #[cfg(test)]

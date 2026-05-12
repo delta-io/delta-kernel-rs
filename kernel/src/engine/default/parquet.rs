@@ -24,7 +24,7 @@ use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::{reader_options, writer_options};
 use crate::expressions::ColumnName;
-use crate::metrics::{MetricEvent, MetricsReporter};
+use crate::metrics::emit_parquet_read_completed;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
@@ -43,8 +43,6 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
     readahead: usize,
-    /// Optional reporter for emitting [`MetricEvent::ParquetReadCompleted`] events.
-    reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 /// Metadata of a data file (typically a parquet file).
@@ -149,7 +147,6 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             store,
             task_executor,
             readahead: 10,
-            reporter: None,
         }
     }
 
@@ -158,12 +155,6 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// Defaults to 10.
     pub fn with_readahead(mut self, readahead: usize) -> Self {
         self.readahead = readahead;
-        self
-    }
-
-    /// Set a metrics reporter to receive [`MetricEvent::ParquetReadCompleted`] events.
-    pub fn with_reporter(mut self, reporter: Option<Arc<dyn MetricsReporter>>) -> Self {
-        self.reporter = reporter;
         self
     }
 
@@ -315,6 +306,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        let num_files = files.len() as u64;
+        let bytes_read = files.iter().map(|f| f.size).sum();
         let future = read_parquet_files_impl(
             self.store.clone(),
             files.to_vec(),
@@ -322,22 +315,12 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             predicate,
         );
         let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
-        if let Some(reporter) = &self.reporter {
-            let num_files = files.len() as u64;
-            let bytes_read = files.iter().map(|f| f.size).sum();
-            Ok(Box::new(super::ReadMetricsIterator::new(
-                inner,
-                reporter.clone(),
-                num_files,
-                bytes_read,
-                |num_files, bytes_read| MetricEvent::ParquetReadCompleted {
-                    num_files,
-                    bytes_read,
-                },
-            )))
-        } else {
-            Ok(inner)
-        }
+        Ok(Box::new(super::ReadMetricsIterator::new(
+            inner,
+            num_files,
+            bytes_read,
+            emit_parquet_read_completed,
+        )))
     }
 
     /// Writes engine data to a Parquet file at the specified location.
@@ -615,7 +598,7 @@ mod tests {
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
-    use crate::schema::ColumnMetadataKey;
+    use crate::schema::{ColumnMetadataKey, MetadataValue};
     use crate::utils::current_time_ms;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::EngineData;
@@ -1303,12 +1286,13 @@ mod tests {
             .find(|f| f.name() == "value")
             .unwrap();
 
-        // Field ID is transformed to kernel key when reading
+        // Field ID is transformed to kernel key when reading. arrow->kernel parses the
+        // `PARQUET:field_id` string back into kernel's canonical `MetadataValue::Number(i64)`.
         assert_eq!(
             field
                 .metadata()
                 .get(ColumnMetadataKey::ParquetFieldId.as_ref()),
-            Some(&"42".into())
+            Some(&MetadataValue::Number(42))
         );
 
         // Field ID should be accessible via documented API

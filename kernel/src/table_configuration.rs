@@ -21,6 +21,7 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
+use crate::schema::validation::validate_iceberg_compat_v3_no_legacy_nested_id;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
@@ -64,7 +65,7 @@ pub(crate) enum InCommitTimestampEnablement {
 /// stats from a checkpoint written before logical metadata was added.
 fn strip_metadata(schema: SchemaRef) -> SchemaRef {
     match StripFieldMetadataTransform.transform_struct(&schema) {
-        Some(Cow::Owned(s)) => Arc::new(s),
+        Cow::Owned(s) => Arc::new(s),
         _ => schema,
     }
 }
@@ -150,6 +151,32 @@ impl TableConfiguration {
         version: Version,
     ) -> DeltaResult<Self> {
         let logical_schema = Arc::new(metadata.parse_schema()?);
+        Self::try_new_inner(metadata, protocol, table_root, version, logical_schema)
+    }
+
+    /// Like [`try_new`](Self::try_new), but reuses `base`'s protocol, table root, and version
+    /// and takes a pre-parsed `logical_schema`.
+    pub(crate) fn try_new_with_schema(
+        base: &Self,
+        metadata: Metadata,
+        logical_schema: SchemaRef,
+    ) -> DeltaResult<Self> {
+        Self::try_new_inner(
+            metadata,
+            base.protocol.clone(),
+            base.table_root.clone(),
+            base.version,
+            logical_schema,
+        )
+    }
+
+    fn try_new_inner(
+        metadata: Metadata,
+        protocol: Protocol,
+        table_root: Url,
+        version: Version,
+        logical_schema: SchemaRef,
+    ) -> DeltaResult<Self> {
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
@@ -170,6 +197,7 @@ impl TableConfiguration {
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
+        validate_iceberg_compat_v3_no_legacy_nested_id(&table_config)?;
 
         Ok(table_config)
     }
@@ -202,17 +230,25 @@ impl TableConfiguration {
     /// Creates a new [`TableConfiguration`] representing the table configuration immediately
     /// after a commit.
     ///
-    /// This method takes a pre-commit table configuration and produces a post-commit
-    /// configuration at the committed version. This allows immediate use of the new table
-    /// configuration without re-reading metadata from storage.
+    /// This method takes the current table configuration and produces a post-commit
+    /// configuration at the committed version. If the commit included new Protocol or Metadata
+    /// actions (e.g. ALTER TABLE), those are passed in and the configuration is rebuilt with
+    /// full validation. Otherwise the existing configuration is cloned with only the version
+    /// updated.
     ///
-    /// TODO: Take in Protocol (when Kernel-RS supports protocol changes)
-    /// TODO: Take in Metadata (when Kernel-RS supports metadata changes)
-    pub(crate) fn new_post_commit(table_configuration: &Self, new_version: Version) -> Self {
-        Self {
-            version: new_version,
-            ..table_configuration.clone()
-        }
+    /// Returns the new [`TableConfiguration`] at `new_version`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the new metadata/protocol combination fails
+    /// [`TableConfiguration::try_new`] validation (e.g., unsupported features, invalid schema).
+    pub(crate) fn new_post_commit(
+        table_configuration: &Self,
+        new_version: Version,
+        new_metadata: Option<Metadata>,
+        new_protocol: Option<Protocol>,
+    ) -> DeltaResult<Self> {
+        Self::try_new_from(table_configuration, new_metadata, new_protocol, new_version)
     }
 
     /// Generates the expected schema for file statistics.
@@ -421,15 +457,28 @@ impl TableConfiguration {
         self.physical_schemas.full.clone()
     }
 
+    /// Whether partition column values must be materialized into data files.
+    /// Returns true when either:
+    ///   * The [`MaterializePartitionColumns`] writer feature is enabled, or
+    ///   * [`IcebergCompatV3`] is enabled
+    ///
+    /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
+    /// [`IcebergCompatV3`]: crate::table_features::TableFeature::IcebergCompatV3
+    pub(crate) fn should_materialize_partition_columns(&self) -> bool {
+        // TODO(#1125): add IcebergcompatV1/V2 here when they are supported.
+        self.is_feature_enabled(&TableFeature::MaterializePartitionColumns)
+            || self.is_feature_enabled(&TableFeature::IcebergCompatV3)
+    }
+
     /// The physical schema for writing data files.
     ///
-    /// When [`MaterializePartitionColumns`] is enabled, returns the full physical schema
+    /// When [`should_materialize_partition_columns`] is true, returns the full physical schema
     /// (partition columns are materialized in data files). Otherwise, returns the physical
     /// schema with partition columns excluded.
     ///
-    /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
+    /// [`should_materialize_partition_columns`]: Self::should_materialize_partition_columns
     pub(crate) fn physical_write_schema(&self) -> SchemaRef {
-        if self.is_feature_enabled(&TableFeature::MaterializePartitionColumns) {
+        if self.should_materialize_partition_columns() {
             self.physical_schema()
         } else {
             self.physical_data_schema_without_partition_columns()
@@ -801,6 +850,13 @@ impl TableConfiguration {
             EnablementCheck::EnabledIf(check_fn) => check_fn(&self.table_properties),
         }
     }
+
+    /// Returns true when the table requires every AddFile to carry a non-null
+    /// `stats.numRecords`.
+    pub(crate) fn requires_stats_num_records(&self) -> bool {
+        // TODO(#1125): Add icebergCompatV2 to the list when it is supported.
+        self.is_feature_enabled(&TableFeature::IcebergCompatV3)
+    }
 }
 
 #[cfg(test)]
@@ -820,7 +876,8 @@ mod test {
         TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::{
-        TableProperties, COLUMN_MAPPING_MODE, ENABLE_IN_COMMIT_TIMESTAMPS,
+        TableProperties, COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
+        ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
     };
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
@@ -2088,7 +2145,7 @@ mod test {
         "id",
         vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
     )]
-    // --- nested schema ---
+    // --- nested schema (includes map/array inside struct as leaf columns) ---
     #[case::nested_none(
         test_schema_nested(),
         "none",
@@ -2096,6 +2153,8 @@ mod test {
             ColumnName::new(["id"]),
             ColumnName::new(["info", "name"]),
             ColumnName::new(["info", "age"]),
+            ColumnName::new(["info", "tags"]),
+            ColumnName::new(["info", "scores"]),
         ],
     )]
     #[case::nested_name(
@@ -2105,6 +2164,8 @@ mod test {
             ColumnName::new(["phys_id"]),
             ColumnName::new(["phys_info", "phys_name"]),
             ColumnName::new(["phys_info", "phys_age"]),
+            ColumnName::new(["phys_info", "phys_tags"]),
+            ColumnName::new(["phys_info", "phys_scores"]),
         ],
     )]
     #[case::nested_id(
@@ -2114,39 +2175,41 @@ mod test {
             ColumnName::new(["phys_id"]),
             ColumnName::new(["phys_info", "phys_name"]),
             ColumnName::new(["phys_info", "phys_age"]),
+            ColumnName::new(["phys_info", "phys_tags"]),
+            ColumnName::new(["phys_info", "phys_scores"]),
         ],
     )]
-    // --- schema with map (map fields excluded from stats) ---
+    // --- schema with map (included as leaf for nullCount stats) ---
     #[case::map_none(
         test_schema_with_map(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+        vec![ColumnName::new(["id"]), ColumnName::new(["entries"]), ColumnName::new(["name"])],
     )]
     #[case::map_name(
         test_schema_with_map_and_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_entries"]), ColumnName::new(["phys_name"])],
     )]
     #[case::map_id(
         test_schema_with_map_and_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_entries"]), ColumnName::new(["phys_name"])],
     )]
-    // --- schema with array (array fields excluded from stats) ---
+    // --- schema with array (included as leaf for nullCount stats) ---
     #[case::array_none(
         test_schema_with_array(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+        vec![ColumnName::new(["id"]), ColumnName::new(["items"]), ColumnName::new(["name"])],
     )]
     #[case::array_name(
         test_schema_with_array_and_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_items"]), ColumnName::new(["phys_name"])],
     )]
     #[case::array_id(
         test_schema_with_array_and_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_items"]), ColumnName::new(["phys_name"])],
     )]
     fn test_physical_stats_column_names_all_schemas(
         #[case] schema: SchemaRef,
@@ -2172,5 +2235,339 @@ mod test {
             config.ensure_operation_supported(Operation::Write).is_ok(),
             "ClusteredTable with DomainMetadata should be supported for writes"
         );
+    }
+
+    // V3 supported + property set -> partition column materialized into the write schema;
+    // V3 supported but property unset -> partition column stripped from the write schema.
+    #[rstest]
+    #[case::v3_enabled(
+        &[(ENABLE_ICEBERG_COMPAT_V3, "true"), (ENABLE_ROW_TRACKING, "true")],
+        // pcol is included, meaning we expect the partition col to be materialized to disk.
+        vec!["value", "pcol"],
+    )]
+    #[case::v3_supported_but_property_unset(&[], vec!["value"])]
+    fn test_physical_write_schema_materializes_pv_when_iceberg_compat_v3_enabled(
+        #[case] extra_props: &[(&str, &str)],
+        #[case] expected_field_names: Vec<&str>,
+    ) {
+        // Partitioned schema: one data col + one partition col. No column mapping, so physical
+        // names equal logical names.
+        // IcebergCompatV3 requires column mapping. This test bypasses that requirement for
+        // convenience.
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("value", DataType::INTEGER),
+            StructField::nullable("pcol", DataType::STRING),
+        ]));
+        let props: HashMap<String, String> = extra_props
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let metadata =
+            Metadata::try_new(None, None, schema, vec!["pcol".to_string()], 0, props).unwrap();
+        let protocol = Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(Vec::<TableFeature>::new()),
+            Some(vec![
+                TableFeature::IcebergCompatV3,
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+            ]),
+        )
+        .unwrap();
+        let config =
+            TableConfiguration::try_new(metadata, protocol, Url::try_from("file:///").unwrap(), 0)
+                .unwrap();
+
+        let write_schema = config.physical_write_schema();
+        // This is the final check: whether the partition column `pcol` is present in the
+        // physical schema as expected.
+        let field_names: Vec<&str> = write_schema.fields().map(|f| f.name.as_str()).collect();
+        assert_eq!(field_names, expected_field_names);
+    }
+
+    #[test]
+    fn test_iceberg_compat_v3_write_supported() {
+        let config = create_mock_table_config_with_cm(
+            &[
+                (ENABLE_ICEBERG_COMPAT_V3, "true"),
+                (ENABLE_ROW_TRACKING, "true"),
+            ],
+            Some(ColumnMappingMode::Name),
+            &[TableFeature::ColumnMapping],
+            &[
+                TableFeature::IcebergCompatV3,
+                TableFeature::ColumnMapping,
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+            ],
+        );
+        config
+            .ensure_operation_supported(Operation::Write)
+            .expect("V3 write should be supported once kernel_support flips to Supported");
+    }
+
+    #[rstest]
+    #[case::unset(None, false)]
+    #[case::true_(Some("true"), true)]
+    #[case::false_(Some("false"), false)]
+    fn test_iceberg_compat_v3_enablement_follows_table_property(
+        #[case] property_value: Option<&str>,
+        #[case] expected_enabled: bool,
+    ) {
+        let extra = property_value
+            .map(|v| vec![(ENABLE_ICEBERG_COMPAT_V3, v)])
+            .unwrap_or_default();
+        let config = create_mock_table_config_with_cm(
+            &extra,
+            Some(ColumnMappingMode::Name),
+            &[TableFeature::ColumnMapping],
+            &[
+                TableFeature::IcebergCompatV3,
+                TableFeature::ColumnMapping,
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+            ],
+        );
+        assert_eq!(
+            config.is_feature_enabled(&TableFeature::IcebergCompatV3),
+            expected_enabled,
+        );
+    }
+
+    #[rstest]
+    #[case::column_mapping_not_supported(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        None,
+        vec![],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'columnMapping' to be enabled"),
+    )]
+    #[case::column_mapping_mode_none(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some(ColumnMappingMode::None),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        // column mapping mode = none is considered as not enabled.
+        Some("requires 'columnMapping' to be enabled"),
+    )]
+    // RowTracking feature supported but `delta.enableRowTracking` is unset, so it's not enabled.
+    #[case::row_tracking_not_enabled(
+        &[(ENABLE_ICEBERG_COMPAT_V3, "true")],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'rowTracking' to be enabled"),
+    )]
+    #[case::with_iceberg_compat_v1_enabled(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ICEBERG_COMPAT_V1, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::IcebergCompatV1,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'icebergCompatV1' to not be enabled"),
+    )]
+    #[case::with_iceberg_compat_v2_enabled(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ICEBERG_COMPAT_V2, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::IcebergCompatV2,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        Some("requires 'icebergCompatV2' to not be enabled"),
+    )]
+    // Positive paths for both supported column-mapping modes (`name` and `id`).
+    #[case::all_satisfied_cm_name_mode(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some(ColumnMappingMode::Name),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        None,
+    )]
+    #[case::all_satisfied_cm_id_mode(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        Some(ColumnMappingMode::Id),
+        vec![TableFeature::ColumnMapping],
+        vec![
+            TableFeature::IcebergCompatV3,
+            TableFeature::ColumnMapping,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        None,
+    )]
+    fn test_iceberg_compat_v3_feature_requirements(
+        #[case] props: &[(&str, &str)],
+        #[case] cm_mode: Option<ColumnMappingMode>,
+        #[case] reader_features: Vec<TableFeature>,
+        #[case] writer_features: Vec<TableFeature>,
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        let config =
+            create_mock_table_config_with_cm(props, cm_mode, &reader_features, &writer_features);
+        let result = config.validate_feature_requirements(&TableFeature::IcebergCompatV3);
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
+    }
+
+    // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.
+    #[rstest]
+    #[case::v1_rejects_v2(
+        TableFeature::IcebergCompatV1,
+        TableFeature::IcebergCompatV2,
+        "requires 'icebergCompatV2' to not be enabled"
+    )]
+    #[case::v1_rejects_v3(
+        TableFeature::IcebergCompatV1,
+        TableFeature::IcebergCompatV3,
+        "requires 'icebergCompatV3' to not be enabled"
+    )]
+    #[case::v2_rejects_v1(
+        TableFeature::IcebergCompatV2,
+        TableFeature::IcebergCompatV1,
+        "requires 'icebergCompatV1' to not be enabled"
+    )]
+    #[case::v2_rejects_v3(
+        TableFeature::IcebergCompatV2,
+        TableFeature::IcebergCompatV3,
+        "requires 'icebergCompatV3' to not be enabled"
+    )]
+    #[case::v3_rejects_v1(
+        TableFeature::IcebergCompatV3,
+        TableFeature::IcebergCompatV1,
+        "requires 'icebergCompatV1' to not be enabled"
+    )]
+    #[case::v3_rejects_v2(
+        TableFeature::IcebergCompatV3,
+        TableFeature::IcebergCompatV2,
+        "requires 'icebergCompatV2' to not be enabled"
+    )]
+    fn test_iceberg_compat_mutual_exclusion(
+        #[case] feature_to_enable: TableFeature,
+        #[case] conflicting_feature: TableFeature,
+        #[case] expected_error_substring: &str,
+    ) {
+        // Map each IcebergCompat feature to the table property that enables it.
+        let conflicting_enable_property = match conflicting_feature {
+            TableFeature::IcebergCompatV1 => ENABLE_ICEBERG_COMPAT_V1,
+            TableFeature::IcebergCompatV2 => ENABLE_ICEBERG_COMPAT_V2,
+            TableFeature::IcebergCompatV3 => ENABLE_ICEBERG_COMPAT_V3,
+            ref other => panic!("unexpected feature in iceberg-compat exclusion test: {other:?}"),
+        };
+        // V3 also requires Column mapping and RowTracking enabled; enable them unconditionally so
+        // V3 cases reach the mutual-exclusion check.
+        let config = create_mock_table_config_with_cm(
+            &[
+                (conflicting_enable_property, "true"),
+                (ENABLE_ROW_TRACKING, "true"),
+            ],
+            Some(ColumnMappingMode::Name),
+            &[TableFeature::ColumnMapping],
+            &[
+                feature_to_enable.clone(),
+                conflicting_feature,
+                TableFeature::ColumnMapping,
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+            ],
+        );
+        assert_result_error_with_message(
+            config.validate_feature_requirements(&feature_to_enable),
+            expected_error_substring,
+        );
+    }
+
+    /// Test helper: variant of `create_mock_table_config` that also takes an optional
+    /// column-mapping mode and requires the caller to provide reader and writer feature lists
+    /// explicitly. `name`/`id` modes need a column-mapping-annotated schema (otherwise
+    /// `TableConfiguration::try_new` rejects the metadata for missing per-field annotations);
+    /// this helper swaps the schema accordingly.
+    // TODO(#2491): Consolidate the `create_*_table_config*` helpers.
+    fn create_mock_table_config_with_cm(
+        extra_props: &[(&str, &str)],
+        cm_mode: Option<ColumnMappingMode>,
+        reader_features: &[TableFeature],
+        writer_features: &[TableFeature],
+    ) -> TableConfiguration {
+        let schema: SchemaRef = match cm_mode {
+            Some(ColumnMappingMode::Name | ColumnMappingMode::Id) => schema_with_column_mapping(),
+            _ => Arc::new(StructType::new_unchecked([StructField::nullable(
+                "value",
+                DataType::INTEGER,
+            )])),
+        };
+        let mut props: HashMap<String, String> = extra_props
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        if let Some(mode) = cm_mode {
+            let mode_str = match mode {
+                ColumnMappingMode::Name => "name",
+                ColumnMappingMode::Id => "id",
+                ColumnMappingMode::None => "none",
+            };
+            props.insert(COLUMN_MAPPING_MODE.to_string(), mode_str.to_string());
+        }
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, props).unwrap();
+
+        let protocol = Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(reader_features.to_vec()),
+            Some(writer_features.to_vec()),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
     }
 }

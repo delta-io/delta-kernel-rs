@@ -164,10 +164,7 @@ pub(crate) mod last_checkpoint_hint;
 
 pub(crate) mod log_segment_files;
 
-#[cfg(feature = "internal-api")]
 pub mod history_manager;
-#[cfg(not(feature = "internal-api"))]
-pub(crate) mod history_manager;
 
 #[cfg(feature = "internal-api")]
 pub mod parallel;
@@ -184,7 +181,6 @@ pub use error::{DeltaResult, Error};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
-pub use metrics::MetricsReporter;
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 
@@ -197,10 +193,6 @@ pub mod engine;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
-
-/// Sentinel version indicating a pre-commit state (table does not exist yet).
-/// Used for create-table transactions before the first commit.
-pub const PRE_COMMIT_VERSION: Version = u64::MAX;
 
 pub type FileSize = u64;
 pub type FileIndex = u64;
@@ -271,6 +263,12 @@ impl FileMeta {
             last_modified,
             size,
         }
+    }
+
+    /// Casts `size` to `i64`. Errors if `size` exceeds `i64::MAX`.
+    pub(crate) fn size_as_i64(&self) -> DeltaResult<i64> {
+        i64::try_from(self.size)
+            .map_err(|_| Error::generic(format!("file size {} exceeds i64::MAX", self.size)))
     }
 }
 
@@ -858,6 +856,20 @@ pub trait ParquetHandler: AsAny {
     /// This will overwrite the file if it already exists. For filesystem-backed
     /// implementations, the parent directories must be created if they do not exist.
     ///
+    /// # Parquet field IDs
+    ///
+    /// The engine must write a Parquet `field_id` correctly when the kernel
+    /// [`StructField`] carries a field-id related annotation, including:
+    /// - [`ColumnMetadataKey::ColumnMappingId`] / [`ColumnMetadataKey::ParquetFieldId`]
+    /// - [`ColumnMetadataKey::ColumnMappingNestedIds`]
+    ///
+    /// For how to use these keys, refer to the Delta protocol's [Column Mapping] and
+    /// [IcebergCompatV2] sections.
+    ///
+    /// **Non-compliance produces files with incorrect `field_id`s**, which may lead to
+    /// read failures when column mapping mode is `id` and to failures when converting
+    /// the table to Iceberg.   
+    ///
     /// # Parameters
     ///
     /// - `url` - The full URL path where the Parquet file should be written (e.g.,
@@ -867,6 +879,13 @@ pub trait ParquetHandler: AsAny {
     /// # Returns
     ///
     /// A [`DeltaResult`] indicating success or failure.
+    ///
+    /// [`StructField`]: crate::schema::StructField
+    /// [`ColumnMetadataKey::ColumnMappingId`]: crate::schema::ColumnMetadataKey::ColumnMappingId
+    /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
+    /// [`ColumnMetadataKey::ColumnMappingNestedIds`]: crate::schema::ColumnMetadataKey::ColumnMappingNestedIds
+    /// [Column Mapping]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
+    /// [IcebergCompatV2]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#iceberg-compatibility-v2
     fn write_parquet_file(
         &self,
         location: url::Url,
@@ -927,14 +946,6 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
-
-    /// Get the connector provided [`MetricsReporter`] for metrics collection.
-    ///
-    /// Returns an optional reporter that will receive metric events from Delta operations.
-    /// The default implementation returns None (no metrics reporting).
-    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
-        None
-    }
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared
@@ -959,3 +970,30 @@ compile_error!(
 // also be added. https://doc.rust-lang.org/rustdoc/write-documentation/documentation-tests.html#include-items-only-when-collecting-doctests
 #[cfg(doctest)]
 mod doctests;
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case::zero(0, Some(0))]
+    #[case::one(1, Some(1))]
+    #[case::i64_max(i64::MAX as u64, Some(i64::MAX))]
+    #[case::just_over_i64_max(i64::MAX as u64 + 1, None)]
+    #[case::u64_max(u64::MAX, None)]
+    /// Tests `FileMeta::size_as_i64` for both success (size fits in i64) and error (size exceeds
+    /// i64::MAX) paths.
+    fn test_file_meta_size_as_i64(#[case] size: u64, #[case] expected: Option<i64>) {
+        let meta = FileMeta::new(Url::parse("file:///x").unwrap(), 0, size);
+        match expected {
+            Some(v) => assert_eq!(meta.size_as_i64().unwrap(), v),
+            None => assert!(meta
+                .size_as_i64()
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds i64::MAX")),
+        }
+    }
+}

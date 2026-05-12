@@ -2,7 +2,6 @@
 //! files.
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -21,7 +20,7 @@ use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
+use crate::metrics::MetricId;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::compare::SchemaComparison;
@@ -29,7 +28,7 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _}
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
-    StorageHandler, Version, PRE_COMMIT_VERSION,
+    StorageHandler, Version,
 };
 
 mod domain_metadata_replay;
@@ -153,20 +152,45 @@ fn schema_to_is_not_null_predicate(schema: &StructType) -> Option<PredicateRef> 
 }
 
 impl LogSegment {
-    /// Creates a synthetic LogSegment for pre-commit transactions (e.g., create-table).
-    /// The sentinel version PRE_COMMIT_VERSION indicates no version exists yet on disk.
-    /// This is used to construct a pre-commit snapshot that provides table configuration
-    /// (protocol, metadata, schema) for operations like CTAS.
-    #[allow(dead_code)] // Used by create_table module
-    pub(crate) fn for_pre_commit(log_root: Url) -> Self {
-        use crate::PRE_COMMIT_VERSION;
-        Self {
-            end_version: PRE_COMMIT_VERSION,
+    /// Creates a LogSegment for a newly created table at version 0 from a single commit file.
+    ///
+    /// Normal log segments are built by listing files from storage and replaying them. For CREATE
+    /// TABLE, the table has no prior log. We construct the segment directly from the just created
+    /// commit file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `internal_error` if `commit_file` is not version 0 or not a commit file type.
+    pub(crate) fn new_for_version_zero(
+        log_root: Url,
+        commit_file: ParsedLogPath,
+    ) -> DeltaResult<Self> {
+        require!(
+            commit_file.version == 0,
+            crate::Error::internal_error(format!(
+                "new_for_version_zero called with version {}",
+                commit_file.version
+            ))
+        );
+        require!(
+            commit_file.is_commit(),
+            crate::Error::internal_error(format!(
+                "new_for_version_zero called with non-commit file type: {:?}",
+                commit_file.file_type
+            ))
+        );
+        Ok(Self {
+            end_version: commit_file.version,
             checkpoint_version: None,
             log_root,
             last_checkpoint_metadata: None,
-            listed: LogSegmentFiles::default(),
-        }
+            listed: LogSegmentFiles {
+                max_published_version: Some(commit_file.version),
+                latest_commit_file: Some(commit_file.clone()),
+                ascending_commit_files: vec![commit_file],
+                ..Default::default()
+            },
+        })
     }
 
     #[internal_api]
@@ -199,6 +223,7 @@ impl LogSegment {
             &listed_files.checkpoint_parts,
             end_version,
         )?;
+        validate_latest_commit_file(&listed_files, effective_version)?;
 
         let log_segment = LogSegment {
             end_version: effective_version,
@@ -274,19 +299,21 @@ impl LogSegment {
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
     /// Reports metrics: `LogSegmentLoaded`.
-    #[instrument(name = "log_seg.for_snap", skip_all, err)]
+    // Span name must match `SEGMENT_FOR_SNAPSHOT_SPAN` in `metrics::reporter`.
+    #[instrument(
+        name = "segment.for_snapshot",
+        err,
+        skip(storage, time_travel_version),
+        fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files)
+    )]
     #[internal_api]
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
-        reporter: Option<&Arc<dyn MetricsReporter>>,
-        operation_id: Option<MetricId>,
+        operation_id: MetricId,
     ) -> DeltaResult<Self> {
-        let operation_id = operation_id.unwrap_or_default();
-        let start = Instant::now();
-
         let time_travel_version = time_travel_version.into();
         let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
         let result = Self::for_snapshot_impl(
@@ -296,20 +323,21 @@ impl LogSegment {
             checkpoint_hint,
             time_travel_version,
         );
-        let log_segment_loading_duration = start.elapsed();
 
         match result {
             Ok(log_segment) => {
-                reporter.inspect(|r| {
-                    r.report(MetricEvent::LogSegmentLoaded {
-                        operation_id,
-                        duration: log_segment_loading_duration,
-                        num_commit_files: log_segment.listed.ascending_commit_files.len() as u64,
-                        num_checkpoint_files: log_segment.listed.checkpoint_parts.len() as u64,
-                        num_compaction_files: log_segment.listed.ascending_compaction_files.len()
-                            as u64,
-                    });
-                });
+                tracing::Span::current().record(
+                    "num_commit_files",
+                    log_segment.listed.ascending_commit_files.len() as u64,
+                );
+                tracing::Span::current().record(
+                    "num_checkpoint_files",
+                    log_segment.listed.checkpoint_parts.len() as u64,
+                );
+                tracing::Span::current().record(
+                    "num_compaction_files",
+                    log_segment.listed.ascending_compaction_files.len() as u64,
+                );
                 Ok(log_segment)
             }
             Err(e) => Err(e),
@@ -506,6 +534,10 @@ impl LogSegment {
     /// Creates a new LogSegment reflecting a checkpoint written at this segment's version.
     /// The checkpoint must be at `end_version`. Kernel does not write multi-part checkpoints,
     /// so the checkpoint must be a single file (classic parquet or V2 UUID).
+    ///
+    /// If the existing `latest_crc_file` is older than the new checkpoint version, it is
+    /// cleared to preserve the `LogSegmentFiles` invariant that `latest_crc_file.version >=
+    /// checkpoint version`.
     pub(crate) fn try_new_with_checkpoint(&self, checkpoint: ParsedLogPath) -> DeltaResult<Self> {
         require!(
             matches!(
@@ -529,11 +561,19 @@ impl LogSegment {
 
         let mut new_log_segment = self.clone();
         new_log_segment.checkpoint_version = Some(checkpoint.version);
+        let checkpoint_version = checkpoint.version;
         new_log_segment.listed.checkpoint_parts = vec![checkpoint];
         // A snapshot at version N only contains commits and compactions at versions <= N,
         // so a checkpoint at N covers everything and we can clear them entirely.
         new_log_segment.listed.ascending_commit_files.clear();
         new_log_segment.listed.ascending_compaction_files.clear();
+        // Preserve the LogSegmentFiles invariant that `latest_crc_file.version >= checkpoint
+        // version`. A stale CRC is worse than missing: downstream P&M fallbacks (see
+        // `read_protocol_metadata_opt`) would load an older P&M and overwrite the current one.
+        new_log_segment
+            .listed
+            .latest_crc_file
+            .take_if(|crc| crc.version < checkpoint_version);
         // TODO(#839): Once CheckpointWriter exposes the output schema, build a
         // LastCheckpointHintSummary and thread it through here instead of None. Today the
         // schema is computed inside checkpoint_data() but not returned. With None, the next
@@ -1104,11 +1144,7 @@ impl LogSegment {
     }
 
     /// How many commits since a checkpoint, according to this log segment.
-    /// Returns 0 for pre-commit snapshots (where end_version is PRE_COMMIT_VERSION).
     pub(crate) fn commits_since_checkpoint(&self) -> u64 {
-        if self.end_version == PRE_COMMIT_VERSION {
-            return 0;
-        }
         // we can use 0 as the checkpoint version if there is no checkpoint since `end_version - 0`
         // is the correct number of commits since a checkpoint if there are no checkpoints
         let checkpoint_version = self.checkpoint_version.unwrap_or(0);
@@ -1117,11 +1153,7 @@ impl LogSegment {
     }
 
     /// How many commits since a log-compaction or checkpoint, according to this log segment.
-    /// Returns 0 for pre-commit snapshots (where end_version is PRE_COMMIT_VERSION).
     pub(crate) fn commits_since_log_compaction_or_checkpoint(&self) -> u64 {
-        if self.end_version == PRE_COMMIT_VERSION {
-            return 0;
-        }
         // Annoyingly we have to search all the compaction files to determine this, because we only
         // sort by start version, so technically the max end version could be anywhere in the vec.
         // We can return 0 in the case there is no compaction since end_version - 0 is the correct
@@ -1485,4 +1517,30 @@ fn validate_end_version(
         );
     }
     Ok(effective_version)
+}
+
+/// Validates the `latest_commit_file` field of a [`LogSegmentFiles`]. Enforces:
+///
+/// 1. If `ascending_commit_files` is non-empty, `latest_commit_file` must be `Some`.
+/// 2. If `latest_commit_file` is `Some`, its version must equal `effective_version`.
+fn validate_latest_commit_file(
+    listed: &LogSegmentFiles,
+    effective_version: Version,
+) -> DeltaResult<()> {
+    require!(
+        listed.ascending_commit_files.is_empty() || listed.latest_commit_file.is_some(),
+        Error::internal_error(
+            "latest_commit_file must be Some when ascending_commit_files is non-empty"
+        )
+    );
+    if let Some(commit) = &listed.latest_commit_file {
+        require!(
+            commit.version == effective_version,
+            Error::internal_error(format!(
+                "latest_commit_file version {} does not match end_version {effective_version}",
+                commit.version,
+            ))
+        );
+    }
+    Ok(())
 }

@@ -5,7 +5,10 @@ pub mod table_builder;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-pub use counting_reporter::{CountingReporter, RelaxedCounter};
+pub use counting_reporter::{
+    ensure_metrics_compatible_global_subscriber, install_thread_local_metrics_reporter,
+    CountingReporter, RelaxedCounter,
+};
 use delta_kernel::actions::get_log_add_schema;
 use delta_kernel::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray, RecordBatch,
@@ -900,10 +903,12 @@ pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, messa
 }
 
 /// Creates add file metadata for one or more files without partition values.
-/// Each tuple contains: (file_path, file_size, mod_time, num_records)
+///
+/// Each tuple contains `(file_path, file_size, mod_time, num_records)`. `num_records` is
+/// `Option<i64>` so callers can produce a NULL `stats.numRecords` cell.
 pub fn create_add_files_metadata(
     add_files_schema: &SchemaRef,
-    files: Vec<(&str, i64, i64, i64)>,
+    files: Vec<(&str, i64, i64, Option<i64>)>,
 ) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
     let num_files = files.len();
 
@@ -1260,6 +1265,21 @@ pub fn remove_all_and_get_remove_actions(
         _ => panic!("Transaction should be committed"),
     };
     read_actions_from_commit(table_url, committed.commit_version(), "remove")
+}
+
+/// Build a `serde_json::Value` mapping nested dot-paths to ids.
+///
+/// For example, `nested_ids_json(&[("array_in_map.key", 100)])` builds:
+///
+/// ```json
+/// { "array_in_map.key": 100 }
+/// ```
+pub fn nested_ids_json(entries: &[(&str, i64)]) -> serde_json::Value {
+    let obj: serde_json::Map<String, serde_json::Value> = entries
+        .iter()
+        .map(|(k, v)| (k.to_string(), serde_json::Value::from(*v)))
+        .collect();
+    serde_json::Value::Object(obj)
 }
 
 /// Asserts that `action["partitionValues"]` contains the given key with the expected value.

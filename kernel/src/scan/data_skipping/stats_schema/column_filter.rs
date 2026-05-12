@@ -227,8 +227,9 @@ impl<'col> StatsColumnFilter<'col> {
                     self.collect_field(child, result);
                 }
             }
-            // Map, Array, and Variant types are not eligible for statistics collection.
-            DataType::Map(_) | DataType::Array(_) | DataType::Variant(_) => {}
+            // All non-struct types are leaf columns for stats purposes: they count against
+            // the column limit and are included in nullCount. Array, Map, and Variant are
+            // excluded from min/max by MinMaxStatsTransform.
             _ => {
                 if self.should_include_for_table() {
                     result.push(ColumnName::new(&self.path));

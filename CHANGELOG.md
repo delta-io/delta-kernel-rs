@@ -1,5 +1,198 @@
 # Changelog
 
+## [v0.22.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.22.0/) (2026-04-29)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.21.0...v0.22.0)
+
+
+### 🏗️ Breaking changes
+
+1. Add delta.parquet.format.version table property ([#2369])
+   - Adds `parquet_format_version: Option<String>` field to `TableProperties`. Callers using
+     exhaustive struct construction must add `parquet_format_version: None`.
+2. Robust partitioned-write APIs ([#2356])
+   - Replaces the old `WriteContext` API with partition-aware variants: use
+     `txn.partitioned_write_context(partition_values)` or `txn.unpartitioned_write_context()`.
+     Partition values are now passed as `Map<String, Scalar>` (kernel handles serialization per
+     the Delta spec) instead of `Map<String, String>`.
+     `DefaultParquetHandler::write_parquet_file` signature changed from
+     `(path, data, partition_values, stats_columns)` to `(data, &WriteContext)`. See
+     `kernel/tests/integration/write/partitioned.rs` and the updated
+     `kernel/examples/write-table` for migration examples.
+3. Add typed null literal support to FFI expression visitors ([#2375])
+   - FFI `visit_expression_literal_null` and `visit_literal_null` now accept `type_tag` (plus
+     `precision`/`scale` for decimal). FFI engines must provide type information when emitting
+     null literals; see the new `NullTypeTag` enum for the contract.
+4. Change get_create_table_builder to accept EngineSchema visitor ([#2378])
+   - FFI `get_create_table_builder` now takes `&EngineSchema` instead of `Handle<SharedSchema>`.
+     Engines must implement the visitor pattern (`visit_field_*` callbacks) to populate the
+     schema, matching the existing `scan_builder_with_schema` pattern. See the
+     `ffi/examples/create-table` example for a reference implementation.
+5. Transform stats parsed for remove actions ([#2061])
+   - Adds `fn has_field(&self, name: &ColumnName) -> bool` to the `EngineData` trait. Custom
+     `EngineData` implementors must add this method.
+6. Default to writing relative paths in `add.path` ([#2410])
+   - Kernel now writes **relative** paths in `add.path` (e.g. `abc.parquet`) instead of absolute
+     URLs (e.g. `s3://bucket/table/abc.parquet`), matching Delta Spark.
+7. Add tests for histograms and expose stats and histogram ([#2373])
+   - New public types `FileStats` and `FileSizeHistogram`, plus `Snapshot::get_or_load_file_stats`
+     and `Snapshot::get_file_stats_if_loaded` accessors. Connectors can read CRC file-stats
+     histogram data through these public APIs.
+8. Separate read state from effective state in Transaction ([#2385])
+   - Internal `Transaction` refactor: splits the held snapshot into
+     `read_snapshot_opt: Option<SnapshotRef>` (pre-commit state) and
+     `effective_table_config: TableConfiguration` (state this commit will produce).
+9. Make scan_table_changes_next return *mut ArrowFFIData ([#2430])
+   - The Ok variant of FFI `scan_table_changes_next`'s `ExternResult` is now a heap-allocated
+     `*mut ArrowFFIData` instead of an inline `ArrowFFIData` value. FFI consumers must switch
+     from value-style access (`res.ok`) to pointer-style and call the new `free_arrow_ffi_data`
+     on non-null results.
+10. Update `CheckpointWriter::finalize` to accept `LastCheckpointHintStats` ([#2400])
+    - `CheckpointWriter::finalize` now takes a `LastCheckpointHintStats` struct instead of
+      `(FileMeta, ActionReconciliationIteratorState)`. Construct the new struct to correctly
+      populate `_last_checkpoint` (including `sizeInBytes` and `size`) for V2 checkpoints with
+      sidecars.
+11. Replace existing metrics reporting with tracing ([#1822])
+    - `MetricsReporter` is no longer part of the `Engine` APIs. Instead you can register a
+      reporter as a tracing layer. See `kernel/examples/inspect-table` for an example of how
+      to migrate.
+12. Add CheckpointRowGroupFilter for checkpoint data skipping ([#1893])
+    - `ParquetStatsProvider::get_parquet_rowcount_stat` return type changed from `i64` to
+      `Option<i64>`. Engines implementing `ParquetStatsProvider` must wrap their existing return
+      in `Some(num_rows)`.
+
+### 🚀 Features / new APIs
+
+1. Add infrastructures for sidecar splitting support ([#2271])
+2. Add `extract_primitive_scalar` utility for Arrow-to-Scalar conversion ([#2368])
+3. `ParquetHandler` auto-creates the target directory if it does not exist ([#2287])
+4. Add schema validation for CREATE TABLE ([#2309])
+5. Add row tracking support for create table ([#2317])
+6. *(tests)* Add read-path integration tests for row tracking ([#2316])
+7. Add Arrow batch-mode scan metadata FFI ([#2395])
+8. Reject non-null columns in CREATE TABLE unconditionally ([#2404])
+9. Auto-enable invariants writer feature for non-null columns in CREATE TABLE ([#2418])
+10. Add ffi examples for cdf, create-table, write-table ([#2431])
+11. Add high level api for timestamp conversion ([#900])
+12. Collect nullCount statistics for array, map, and variant columns ([#2442])
+13. Add AlterTable framework with add_column support ([#2387])
+14. Add set_nullable support for ALTER TABLE ([#2388])
+15. Allow materializePartitionColumns feature signal in CREATE TABLE ([#2481])
+
+### 🐛 Bug Fixes
+
+1. Acceptance test framework should reject negative snapshot version ([#2364])
+2. Exclude partition columns from write-path stats collection ([#2362])
+3. Add BYTE/SHORT support to stats verifier and GetData trait ([#2382])
+4. Support presigned DB URLs ([#2398])
+5. Ensure doctests are run in GitHub Actions ([#2412])
+6. Missing PR link in the v0.21.0 CHANGELOG ([#2428])
+7. Drop partitionValues_parsed in build_remove_transform ([#2429])
+8. URI-encode Hive partition path for partitioned writes ([#2424])
+9. Propagate null bitmap in evaluate_map_to_struct ([#2419])
+10. Correct inaccuracies in ffi examples ([#2432])
+11. Restore the Snapshot::new internal API ([#2425])
+12. Clear stale CRC file in LogSegment::try_new_with_checkpoint ([#2457])
+13. Keep name-based validation for column expressions with struct ([#2440])
+14. Reuse LazyCrc in checkpoint early-return during incremental update ([#2329])
+15. Add deserialization alias for file histogram ([#2489])
+
+### 📚 Documentation
+
+1. Remove references to default-engine feature ([#2417])
+
+### 🚜 Refactor
+
+1. Extract prerequisite schema constructions for `CheckpointWriter` ([#2313])
+2. Change inconsistent kernel modules to use mod convention ([#2408])
+3. Enforce line width and import ordering with nightly rustfmt ([#2383])
+4. Add more test setup utils for partitioned write tests ([#2422])
+5. Move data file methods behind SupportsDataFiles trait ([#2386])
+
+### 🧪 Testing
+
+1. Add CountingReporter integration tests across different scenarios ([#2194])
+2. Predicate parser on acceptance workload harness ([#2215])
+3. Add partition support for TestTableBuilder ([#2321])
+4. Add FeatureSet methods for table builder ([#2283])
+5. Split write.rs into topic-focused files ([#2460])
+6. Consolidate write tests into single [[test]] binary ([#2472])
+7. Collapse integration tests into a single binary ([#2477])
+8. Migrate a test to use the create table builder ([#2482])
+
+### ⚙️ Chores/CI
+
+1. Don't generate unused Arrow schema. ([#2107])
+2. Validate ascii only in PR body via CI job ([#2405])
+3. Skip invalid handle code tests for coverage ([#2414])
+4. PathMode ([#2360], [#2410]) and `WriteContext::partition_group_key` ([#2392], [#2403]) were
+   added and reverted within this release. No net user-visible change.
+
+
+[#2369]: https://github.com/delta-io/delta-kernel-rs/pull/2369
+[#2364]: https://github.com/delta-io/delta-kernel-rs/pull/2364
+[#2271]: https://github.com/delta-io/delta-kernel-rs/pull/2271
+[#2194]: https://github.com/delta-io/delta-kernel-rs/pull/2194
+[#2368]: https://github.com/delta-io/delta-kernel-rs/pull/2368
+[#2362]: https://github.com/delta-io/delta-kernel-rs/pull/2362
+[#2356]: https://github.com/delta-io/delta-kernel-rs/pull/2356
+[#2287]: https://github.com/delta-io/delta-kernel-rs/pull/2287
+[#2215]: https://github.com/delta-io/delta-kernel-rs/pull/2215
+[#2382]: https://github.com/delta-io/delta-kernel-rs/pull/2382
+[#2375]: https://github.com/delta-io/delta-kernel-rs/pull/2375
+[#2309]: https://github.com/delta-io/delta-kernel-rs/pull/2309
+[#2392]: https://github.com/delta-io/delta-kernel-rs/pull/2392
+[#2317]: https://github.com/delta-io/delta-kernel-rs/pull/2317
+[#2378]: https://github.com/delta-io/delta-kernel-rs/pull/2378
+[#2398]: https://github.com/delta-io/delta-kernel-rs/pull/2398
+[#2316]: https://github.com/delta-io/delta-kernel-rs/pull/2316
+[#2403]: https://github.com/delta-io/delta-kernel-rs/pull/2403
+[#2107]: https://github.com/delta-io/delta-kernel-rs/pull/2107
+[#2061]: https://github.com/delta-io/delta-kernel-rs/pull/2061
+[#2395]: https://github.com/delta-io/delta-kernel-rs/pull/2395
+[#2360]: https://github.com/delta-io/delta-kernel-rs/pull/2360
+[#2373]: https://github.com/delta-io/delta-kernel-rs/pull/2373
+[#2313]: https://github.com/delta-io/delta-kernel-rs/pull/2313
+[#2408]: https://github.com/delta-io/delta-kernel-rs/pull/2408
+[#2410]: https://github.com/delta-io/delta-kernel-rs/pull/2410
+[#2383]: https://github.com/delta-io/delta-kernel-rs/pull/2383
+[#2412]: https://github.com/delta-io/delta-kernel-rs/pull/2412
+[#2405]: https://github.com/delta-io/delta-kernel-rs/pull/2405
+[#2404]: https://github.com/delta-io/delta-kernel-rs/pull/2404
+[#2414]: https://github.com/delta-io/delta-kernel-rs/pull/2414
+[#2385]: https://github.com/delta-io/delta-kernel-rs/pull/2385
+[#2422]: https://github.com/delta-io/delta-kernel-rs/pull/2422
+[#2417]: https://github.com/delta-io/delta-kernel-rs/pull/2417
+[#2428]: https://github.com/delta-io/delta-kernel-rs/pull/2428
+[#2429]: https://github.com/delta-io/delta-kernel-rs/pull/2429
+[#2321]: https://github.com/delta-io/delta-kernel-rs/pull/2321
+[#2424]: https://github.com/delta-io/delta-kernel-rs/pull/2424
+[#2418]: https://github.com/delta-io/delta-kernel-rs/pull/2418
+[#2419]: https://github.com/delta-io/delta-kernel-rs/pull/2419
+[#2432]: https://github.com/delta-io/delta-kernel-rs/pull/2432
+[#2430]: https://github.com/delta-io/delta-kernel-rs/pull/2430
+[#2400]: https://github.com/delta-io/delta-kernel-rs/pull/2400
+[#2425]: https://github.com/delta-io/delta-kernel-rs/pull/2425
+[#2431]: https://github.com/delta-io/delta-kernel-rs/pull/2431
+[#1822]: https://github.com/delta-io/delta-kernel-rs/pull/1822
+[#900]: https://github.com/delta-io/delta-kernel-rs/pull/900
+[#2442]: https://github.com/delta-io/delta-kernel-rs/pull/2442
+[#2386]: https://github.com/delta-io/delta-kernel-rs/pull/2386
+[#2283]: https://github.com/delta-io/delta-kernel-rs/pull/2283
+[#2457]: https://github.com/delta-io/delta-kernel-rs/pull/2457
+[#1893]: https://github.com/delta-io/delta-kernel-rs/pull/1893
+[#2440]: https://github.com/delta-io/delta-kernel-rs/pull/2440
+[#2460]: https://github.com/delta-io/delta-kernel-rs/pull/2460
+[#2387]: https://github.com/delta-io/delta-kernel-rs/pull/2387
+[#2472]: https://github.com/delta-io/delta-kernel-rs/pull/2472
+[#2388]: https://github.com/delta-io/delta-kernel-rs/pull/2388
+[#2481]: https://github.com/delta-io/delta-kernel-rs/pull/2481
+[#2477]: https://github.com/delta-io/delta-kernel-rs/pull/2477
+[#2329]: https://github.com/delta-io/delta-kernel-rs/pull/2329
+[#2482]: https://github.com/delta-io/delta-kernel-rs/pull/2482
+[#2489]: https://github.com/delta-io/delta-kernel-rs/pull/2489
+
+
 ## [v0.21.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.21.0/) (2026-04-10)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.20.0...v0.21.0)
@@ -258,7 +451,13 @@
 [#2116]: https://github.com/delta-io/delta-kernel-rs/pull/2116
 [#2349]: https://github.com/delta-io/delta-kernel-rs/pull/2349
 [#2336]: https://github.com/delta-io/delta-kernel-rs/pull/2336
-
+[#2077]: https://github.com/delta-io/delta-kernel-rs/pull/2077                                                                                               
+[#2111]: https://github.com/delta-io/delta-kernel-rs/pull/2111                                                                                                 
+[#2065]: https://github.com/delta-io/delta-kernel-rs/pull/2065                                                                                               
+[#2025]: https://github.com/delta-io/delta-kernel-rs/pull/2025                                                                                               
+[#1996]: https://github.com/delta-io/delta-kernel-rs/pull/1996
+[#1717]: https://github.com/delta-io/delta-kernel-rs/pull/1717
+[#1922]: https://github.com/delta-io/delta-kernel-rs/pull/1922
 
 ## [v0.20.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.20.0/) (2026-02-26)
 

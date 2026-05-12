@@ -39,20 +39,21 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.21.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.22.0" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
 indexmap = "2.10.0"
 itertools = "0.14"
+percent-encoding = "2"
 rand = "0.9"
 roaring = "0.11.2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 strum = { version = "0.27", features = ["derive"] }
 thiserror = "2"
-# only for structured logging
 tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = "0.3"
 url = "2"
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
@@ -117,8 +118,8 @@ arrow-expression = ["need-arrow"]
 # Schema diffing functionality (experimental)
 schema-diff = []
 
-# this is an 'internal' feature flag which has all the shared bits from default-engine and
-# default-engine-rustls
+# this is an 'internal' feature flag which has all the shared bits from default-engine-native-tls
+# and default-engine-rustls
 default-engine-base = [
   "arrow-conversion",
   "arrow-expression",
@@ -160,3 +161,11 @@ harness = false
 [[bench]]
 name = "expression_bench"
 harness = false
+
+# Single integration test binary. Linking each integration test as a separate
+# binary is expensive (every binary re-links Arrow, Parquet, and the default
+# engine), so all integration tests share one binary whose entry point is
+# `tests/integration/main.rs` and whose topics live as submodules.
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"

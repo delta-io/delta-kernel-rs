@@ -272,6 +272,33 @@ jobs:
           cmake ..
           make
           make test
+      - name: build and run create-table test
+        run: |
+          pushd ffi/examples/create-table
+          mkdir build
+          pushd build
+          cmake ..
+          make
+          make test
+      # NOTE: write-table's ctest seeds its target table by invoking the create-table
+      # binary, so create-table must be built first (its build/ dir is preserved by the
+      # preceding step and write-table's CMakeLists references it via a relative path).
+      - name: build and run write-table test
+        run: |
+          pushd ffi/examples/write-table
+          mkdir build
+          pushd build
+          cmake ..
+          make
+          make test
+      - name: build and run read-table-changes test
+        run: |
+          pushd ffi/examples/read-table-changes
+          mkdir build
+          pushd build
+          cmake ..
+          make
+          make test
   miri:
     name: "Miri (shard ${{ matrix.partition }}/3)"
     runs-on: ubuntu-latest
@@ -310,7 +337,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@2d15d02e710b40b6332201aba6af30d595b5cd96 # cargo-llvm-cov
       - name: Generate code coverage
-        run: cargo llvm-cov --locked --all-features --workspace --codecov --output-path codecov.json -- --skip read_table_version_hdfs
+        run: cargo llvm-cov --locked --all-features --workspace --codecov --output-path codecov.json -- --skip read_table_version_hdfs --skip handle::tests::invalid_handle_code
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5.5.3
         with:

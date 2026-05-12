@@ -174,21 +174,25 @@ pub(crate) mod test_utils {
     use serde::Serialize;
     use tempfile::TempDir;
     use test_utils::{delta_path_for_version, load_test_data};
+    use tracing::subscriber::DefaultGuard;
+    use tracing_subscriber::util::SubscriberInitExt as _;
     use url::Url;
 
     use crate::actions::{
         get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove,
     };
-    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::array::{RecordBatch, StringArray, StructArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::committer::FileSystemCommitter;
+    use crate::engine::arrow_conversion::{parquet_field_id_metadata, TryIntoArrow as _};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
-    use crate::metrics::{MetricEvent, MetricsReporter};
+    use crate::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
+    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::transaction::{CreateTable, Transaction};
@@ -211,11 +215,22 @@ pub(crate) mod test_utils {
         pub(crate) fn events(&self) -> Vec<MetricEvent> {
             self.events.lock().unwrap().clone()
         }
+    }
 
-        /// Clears all captured events.
-        pub(crate) fn clear(&self) {
-            self.events.lock().unwrap().clear();
-        }
+    /// Kernel-internal twin of [`test_utils::install_thread_local_metrics_reporter`].
+    ///
+    /// Internal tests need their own helper because the trait identity of `MetricsReporter`
+    /// differs across the test_utils <-> kernel path-dep boundary. Both helpers wrap
+    /// [`test_utils::ensure_metrics_compatible_global_subscriber`] + a thread-local
+    /// `set_default` and serve the same purpose: install a metrics-collecting subscriber
+    /// in a way that is robust against tracing callsite-cache poisoning.
+    pub(crate) fn install_thread_local_metrics_reporter(
+        reporter: Arc<dyn MetricsReporter>,
+    ) -> DefaultGuard {
+        test_utils::ensure_metrics_compatible_global_subscriber();
+        tracing_subscriber::registry()
+            .with_metrics_reporter_layer(reporter)
+            .set_default()
     }
 
     #[derive(Serialize)]
@@ -487,6 +502,351 @@ pub(crate) mod test_utils {
                 MetadataValue::String(physical_name.into()),
             ),
         ])
+    }
+
+    /// Shared fixture for nested field-id propagation tests.
+    pub(crate) struct NestedFieldIdFixture {
+        pub(crate) kernel_schema: StructType,
+        pub(crate) input_arrow_data: StructArray,
+        pub(crate) expected_arrow_schema: ArrowSchema,
+    }
+
+    /// Recursively collect `(field_name, metadata_value)` pairs for the given metadata key
+    /// across all (nested) Arrow fields in `schema`.
+    pub(crate) fn collect_arrow_field_metadata(
+        schema: &ArrowSchema,
+        metadata_key: &str,
+    ) -> Vec<(String, String)> {
+        fn collect_from_fields(
+            fields: &[Arc<Field>],
+            metadata_key: &str,
+            out: &mut Vec<(String, String)>,
+        ) {
+            for field in fields {
+                collect_from_field(field, metadata_key, out);
+            }
+        }
+
+        fn collect_from_field(field: &Field, metadata_key: &str, out: &mut Vec<(String, String)>) {
+            if let Some(value) = field.metadata().get(metadata_key) {
+                out.push((field.name().clone(), value.clone()));
+            }
+
+            match field.data_type() {
+                DataType::Struct(fields) => collect_from_fields(fields, metadata_key, out),
+                DataType::List(entry) | DataType::Map(entry, _) => {
+                    collect_from_field(entry, metadata_key, out)
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        collect_from_fields(schema.fields(), metadata_key, &mut out);
+        out
+    }
+
+    /// Build the kernel schema for `array_in_map: map<int, array<int>>` with caller-provided
+    /// top-level field metadata.
+    pub(crate) fn array_in_map_kernel_schema(
+        metadata: impl IntoIterator<Item = (String, MetadataValue)>,
+    ) -> StructType {
+        let array_in_map = StructField::nullable(
+            "array_in_map",
+            KernelDataType::Map(Box::new(MapType::new(
+                KernelDataType::INTEGER,
+                KernelDataType::Array(Box::new(ArrayType::new(KernelDataType::INTEGER, true))),
+                true,
+            ))),
+        )
+        .with_metadata(metadata);
+        StructType::try_new(vec![array_in_map]).unwrap()
+    }
+
+    /// Build an [`array_in_map_kernel_schema`] with `parquet.field.id` on the top-level field
+    /// and a nested-ids JSON map (key/value/element) under `nested_ids_meta_key`.
+    pub(crate) fn array_in_map_with_field_ids(nested_ids_meta_key: &str) -> StructType {
+        let nested_ids = MetadataValue::Other(test_utils::nested_ids_json(&[
+            ("array_in_map.key", 100),
+            ("array_in_map.value", 101),
+            ("array_in_map.value.element", 102),
+        ]));
+        array_in_map_kernel_schema([
+            (
+                ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                MetadataValue::from(1i64),
+            ),
+            (nested_ids_meta_key.to_string(), nested_ids),
+        ])
+    }
+
+    /// Build an empty Arrow `StructArray` matching [`array_in_map_kernel_schema`] with no field-id
+    /// metadata.
+    pub(crate) fn array_in_map_arrow_data_without_field_ids() -> StructArray {
+        let kernel_schema =
+            array_in_map_kernel_schema(std::iter::empty::<(String, MetadataValue)>());
+        let arrow_schema: ArrowSchema = (&kernel_schema).try_into_arrow().unwrap();
+        let batch = RecordBatch::new_empty(Arc::new(arrow_schema));
+        StructArray::try_new(
+            batch.schema().fields.clone(),
+            batch.columns().to_vec(),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Build a [`NestedFieldIdFixture`] covering Array+Map nested-id propagation through a
+    /// Struct boundary.
+    ///
+    /// ## 1. Kernel schema
+    ///
+    /// Two [`StructField`]s `top` and `inner` carry `parquet.field.id` (rewritten to
+    /// `PARQUET:field_id` in the Arrow output) plus a `<nested_ids_meta_key>` JSON map rooted
+    /// at each field's name. Each carries an array inside a map.
+    ///
+    /// ```json
+    /// {
+    ///   "type": "struct",
+    ///   "fields": [{
+    ///     "name": "top",
+    ///     "type": {
+    ///       "type": "map",
+    ///       "keyType":   {"type": "array", "elementType": "integer"},
+    ///       "valueType": {"type": "struct", "fields": [{
+    ///         "name": "inner",
+    ///         "type": {"type": "map", "keyType": "integer",
+    ///                  "valueType": {"type": "array", "elementType": "integer"}},
+    ///         "metadata": {
+    ///           "parquet.field.id": 2,
+    ///           "<nested_ids_meta_key>": {
+    ///             "inner.key": 200, "inner.value": 201, "inner.value.element": 202
+    ///           }
+    ///         }
+    ///       }]}
+    ///     },
+    ///     "metadata": {
+    ///       "parquet.field.id": 1,
+    ///       "<nested_ids_meta_key>": {
+    ///         "top.key": 100, "top.key.element": 101, "top.value": 102
+    ///       }
+    ///     }
+    ///   }]
+    /// }
+    /// ```
+    ///
+    /// ## 2. Input Arrow schema
+    ///
+    /// Same shape as kernel schema with no metadata anywhere, except a *stale*
+    /// `PARQUET:field_id=999` on the synthesized `top.key.element` field.
+    ///
+    /// ## 3. Expected output Arrow schema
+    ///
+    /// What `try_into_arrow(kernel schema)` and
+    /// `apply_schema(input arrow schema, kernel schema)` should both produce:
+    /// - `top` and `inner` carry `PARQUET:field_id` (rewritten from `parquet.field.id`).
+    /// - Synthesized list/map `key`/`value`/`element` fields each carry `PARQUET:field_id` pulled
+    ///   from the corresponding nested-ids JSON entry. `top.key.element` has `101` (kernel's), not
+    ///   the stale `999` from the input.
+    ///
+    /// ```json
+    /// {
+    ///   "fields": [{
+    ///     "name": "top", "type": "map",
+    ///     "metadata": {"PARQUET:field_id": "1"},
+    ///     "entries": { "name": "key_value", "type": "struct", "fields": [
+    ///       {
+    ///         "name": "key", "type": "list",
+    ///         "metadata": {"PARQUET:field_id": "100"},
+    ///         "element": {
+    ///           "name": "element", "type": "int32",
+    ///           "metadata": {"PARQUET:field_id": "101"}
+    ///         }
+    ///       },
+    ///       {
+    ///         "name": "value", "type": "struct",
+    ///         "metadata": {"PARQUET:field_id": "102"},
+    ///         "fields": [{
+    ///           "name": "inner", "type": "map",
+    ///           "metadata": {"PARQUET:field_id": "2"},
+    ///           "entries": { "name": "key_value", "type": "struct", "fields": [
+    ///             {
+    ///               "name": "key", "type": "int32",
+    ///               "metadata": {"PARQUET:field_id": "200"}
+    ///             },
+    ///             {
+    ///               "name": "value", "type": "list",
+    ///               "metadata": {"PARQUET:field_id": "201"},
+    ///               "element": {
+    ///                 "name": "element", "type": "int32",
+    ///                 "metadata": {"PARQUET:field_id": "202"}
+    ///               }
+    ///             }
+    ///           ]}
+    ///         }]
+    ///       }
+    ///     ]}
+    ///   }]
+    /// }
+    /// ```
+    pub(crate) fn complex_nested_with_field_ids(nested_ids_meta_key: &str) -> NestedFieldIdFixture {
+        NestedFieldIdFixture {
+            kernel_schema: build_complex_nested_kernel_schema(nested_ids_meta_key),
+            input_arrow_data: build_arrow_input_with_stale_element_id(),
+            expected_arrow_schema: expected_complex_nested_arrow_schema(),
+        }
+    }
+
+    /// Build the input Arrow data for [`complex_nested_with_field_ids`] by
+    /// striping the metadata from [`build_complex_nested_kernel_schema`], and
+    /// add one stale `PARQUET:field_id` to the `top.key.element` field.
+    fn build_arrow_input_with_stale_element_id() -> StructArray {
+        // Get the no-meta Arrow shape from the kernel schema.
+        let plain_inner = StructField::nullable("inner", complex_nested_inner_map_type());
+        let plain_top = StructField::nullable(
+            "top",
+            complex_nested_outer_map_type(StructType::try_new(vec![plain_inner]).unwrap()),
+        );
+        let plain_kernel_schema = StructType::try_new(vec![plain_top]).unwrap();
+        let plain_arrow_schema: ArrowSchema = (&plain_kernel_schema).try_into_arrow().unwrap();
+
+        // Add stale `PARQUET:field_id` to the `top.key.element` field.
+        let top = plain_arrow_schema.field(0);
+        let DataType::Map(entries, sorted) = top.data_type() else {
+            unreachable!("top is a Map by construction");
+        };
+        let DataType::Struct(entries_fields) = entries.data_type() else {
+            unreachable!("map entries is a Struct by construction");
+        };
+        let outer_key = &entries_fields[0];
+        let DataType::List(outer_element) = outer_key.data_type() else {
+            unreachable!("outer map key is a List by construction");
+        };
+        let stale_element = outer_element
+            .as_ref()
+            .clone()
+            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "999".to_string())].into());
+        let new_outer_key = Field::new(
+            outer_key.name(),
+            DataType::List(Arc::new(stale_element)),
+            outer_key.is_nullable(),
+        );
+        let new_entries = Field::new(
+            entries.name(),
+            DataType::Struct(vec![new_outer_key, entries_fields[1].as_ref().clone()].into()),
+            entries.is_nullable(),
+        );
+        let new_top = Field::new(
+            top.name(),
+            DataType::Map(Arc::new(new_entries), *sorted),
+            top.is_nullable(),
+        );
+        let arrow_input_schema = ArrowSchema::new(vec![new_top]);
+        let batch = RecordBatch::new_empty(Arc::new(arrow_input_schema));
+        StructArray::try_new(
+            batch.schema().fields.clone(),
+            batch.columns().to_vec(),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn complex_nested_inner_map_type() -> KernelDataType {
+        KernelDataType::Map(Box::new(MapType::new(
+            KernelDataType::INTEGER,
+            KernelDataType::Array(Box::new(ArrayType::new(KernelDataType::INTEGER, true))),
+            true,
+        )))
+    }
+
+    fn complex_nested_outer_map_type(struct_value: StructType) -> KernelDataType {
+        KernelDataType::Map(Box::new(MapType::new(
+            KernelDataType::Array(Box::new(ArrayType::new(KernelDataType::INTEGER, true))),
+            KernelDataType::Struct(Box::new(struct_value)),
+            true,
+        )))
+    }
+
+    /// Build the kernel schema described by [`complex_nested_with_field_ids`].
+    pub(crate) fn build_complex_nested_kernel_schema(nested_ids_meta_key: &str) -> StructType {
+        let top_nested_ids = test_utils::nested_ids_json(&[
+            ("top.key", 100),
+            ("top.key.element", 101),
+            ("top.value", 102),
+        ]);
+        let inner_nested_ids = test_utils::nested_ids_json(&[
+            ("inner.key", 200),
+            ("inner.value", 201),
+            ("inner.value.element", 202),
+        ]);
+        // Each `StructField` carries `parquet.field.id` plus the nested-ids JSON.
+        let inner_field = StructField::nullable("inner", complex_nested_inner_map_type())
+            .with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                    MetadataValue::from(2i64),
+                ),
+                (
+                    nested_ids_meta_key.to_string(),
+                    MetadataValue::Other(inner_nested_ids),
+                ),
+            ]);
+        let top_field = StructField::nullable(
+            "top",
+            complex_nested_outer_map_type(StructType::try_new(vec![inner_field]).unwrap()),
+        )
+        .with_metadata([
+            (
+                ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                MetadataValue::from(1i64),
+            ),
+            (
+                nested_ids_meta_key.to_string(),
+                MetadataValue::Other(top_nested_ids),
+            ),
+        ]);
+        StructType::try_new(vec![top_field]).unwrap()
+    }
+
+    /// Build the expected output Arrow schema for [`complex_nested_with_field_ids`].
+    fn expected_complex_nested_arrow_schema() -> ArrowSchema {
+        // top.value.inner.value.element: int (PARQUET:field_id=202).
+        let inner_list_element = Field::new("element", DataType::Int32, true)
+            .with_metadata(parquet_field_id_metadata(Some(202)));
+        // top.value.inner.value: list<int> (PARQUET:field_id=201).
+        let inner_value = Field::new("value", DataType::List(Arc::new(inner_list_element)), true)
+            .with_metadata(parquet_field_id_metadata(Some(201)));
+        // top.value.inner.key: int (PARQUET:field_id=200).
+        let inner_key = Field::new("key", DataType::Int32, false)
+            .with_metadata(parquet_field_id_metadata(Some(200)));
+        // top.value.inner.key_value: synthesized map-entries struct (no field id).
+        let inner_entries = Field::new(
+            "key_value",
+            DataType::Struct(vec![inner_key, inner_value].into()),
+            false,
+        );
+        // top.value.inner: map<int, list<int>> (PARQUET:field_id=2).
+        let inner_field = Field::new("inner", DataType::Map(Arc::new(inner_entries), false), true)
+            .with_metadata(parquet_field_id_metadata(Some(2)));
+        // top.value: struct<inner: ...> (PARQUET:field_id=102).
+        let struct_value_field =
+            Field::new("value", DataType::Struct(vec![inner_field].into()), true)
+                .with_metadata(parquet_field_id_metadata(Some(102)));
+        // top.key.element: int (PARQUET:field_id=101).
+        let outer_key_element = Field::new("element", DataType::Int32, true)
+            .with_metadata(parquet_field_id_metadata(Some(101)));
+        // top.key: list<int> (PARQUET:field_id=100).
+        let outer_key = Field::new("key", DataType::List(Arc::new(outer_key_element)), false)
+            .with_metadata(parquet_field_id_metadata(Some(100)));
+        // top.key_value: synthesized map-entries struct (no field id).
+        let outer_entries = Field::new(
+            "key_value",
+            DataType::Struct(vec![outer_key, struct_value_field].into()),
+            false,
+        );
+        // top: map<list<int>, struct<...>> (PARQUET:field_id=1).
+        let top_field = Field::new("top", DataType::Map(Arc::new(outer_entries), false), true)
+            .with_metadata(parquet_field_id_metadata(Some(1)));
+        ArrowSchema::new(vec![top_field])
     }
 
     /// Flat schema: `[id: long, name: string]`

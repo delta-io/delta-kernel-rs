@@ -4,8 +4,9 @@ pub(crate) use column_mapping::get_any_level_column_physical_name;
 pub use column_mapping::validate_schema_column_mapping;
 pub use column_mapping::ColumnMappingMode;
 pub(crate) use column_mapping::{
-    assign_column_mapping_metadata, column_mapping_mode, get_column_mapping_mode_from_properties,
-    get_field_column_mapping_info, physical_to_logical_column_name,
+    assign_column_mapping_metadata, column_mapping_mode, find_max_column_id_in_schema,
+    get_column_mapping_mode_from_properties, get_field_column_mapping_info,
+    physical_to_logical_column_name, try_assign_flat_column_mapping_info,
 };
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -21,6 +22,7 @@ use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
+
 mod column_mapping;
 mod timestamp_ntz;
 
@@ -106,10 +108,12 @@ pub(crate) enum TableFeature {
     RowTracking,
     /// domain specific metadata
     DomainMetadata,
-    /// Iceberg compatibility support
+    /// Iceberg V1 compatibility support
     IcebergCompatV1,
-    /// Iceberg compatibility support
+    /// Iceberg V2 compatibility support
     IcebergCompatV2,
+    /// Iceberg V3 compatibility support
+    IcebergCompatV3,
     /// The Clustered Table feature facilitates the physical clustering of rows
     /// that share similar values on a predefined set of clustering columns.
     #[strum(serialize = "clustering")]
@@ -233,7 +237,10 @@ pub(crate) enum FeatureRequirement {
     NotSupported(TableFeature),
     /// Feature must NOT be enabled (may be supported but property must not activate it)
     NotEnabled(TableFeature),
-    /// Custom validation logic
+    /// Custom validation logic. Currently unused, but already integrated into the
+    /// validation pipeline(`TableConfiguration::validate_feature_requirements`), so kept for
+    /// future use.
+    #[allow(dead_code)]
     Custom(fn(&Protocol, &TableProperties) -> DeltaResult<()>),
 }
 
@@ -339,6 +346,9 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
+/// TODO: When kernel writes the materialized `row_id` / `row_commit_version`
+/// columns, they must use the reserved parquet field IDs defined by the
+/// protocol on IcebergCompatV3 tables, not auto-assigned IDs.
 static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
@@ -369,19 +379,9 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
-        FeatureRequirement::Custom(|_protocol, properties| {
-            let mode = properties.column_mapping_mode;
-            if !matches!(
-                mode,
-                Some(ColumnMappingMode::Name) | Some(ColumnMappingMode::Id)
-            ) {
-                return Err(Error::generic(
-                    "IcebergCompatV1 requires Column Mapping in 'name' or 'id' mode",
-                ));
-            }
-            Ok(())
-        }),
         FeatureRequirement::NotSupported(TableFeature::DeletionVectors),
+        FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV2),
+        FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV3),
     ],
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
@@ -402,24 +402,52 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
-        FeatureRequirement::Custom(|_protocol, properties| {
-            let mode = properties.column_mapping_mode;
-            if !matches!(
-                mode,
-                Some(ColumnMappingMode::Name) | Some(ColumnMappingMode::Id)
-            ) {
-                return Err(Error::generic(
-                    "IcebergCompatV2 requires Column Mapping in 'name' or 'id' mode",
-                ));
-            }
-            Ok(())
-        }),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
         FeatureRequirement::NotEnabled(TableFeature::DeletionVectors),
+        FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV3),
     ],
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v2 == Some(true)
+    }),
+};
+
+/// IcebergCompatV3 ensures tables can be converted to Apache Iceberg V3.
+///
+/// Spec: <https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-compat-v3.md>
+///
+/// TODO: Implement the write-side requirements for IcebergCompatV3.
+/// TODO: Support ALTER TABLE on tables with IcebergCompatV3 enabled.
+///
+/// Attention in the future:
+/// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3
+///   tables.
+/// - Column defaults: when supported, only literal expressions are allowed.
+/// - REPLACE TABLE: when supported, partition columns must not change across the replace.
+/// - Timestamp parquet encoding: when kernel can write INT96 or INT64, IcebergCompatV3 tables must
+///   always use INT64; INT96 is forbidden.
+/// - ALTER TABLE SET/UNSET TBLPROPERTIES: when supported, reject any property change that would
+///   disable IcebergCompatV3 on an existing table.
+/// - Void type: when supported, it must not appear inside map or array types.
+///
+/// Tracking issue: <https://github.com/delta-io/delta-kernel-rs/issues/2492>
+static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[
+        FeatureRequirement::Enabled(TableFeature::ColumnMapping),
+        FeatureRequirement::Enabled(TableFeature::RowTracking),
+        // Unlike V1/V2, V3 intentionally permits DeletionVectors per the RFC. No
+        // `NotEnabled(DeletionVectors)` requirement is needed.
+        //
+        // V1/V2 may remain in `writerFeatures` (supported) as long as they are not active,
+        // hence `NotEnabled` rather than `NotSupported`.
+        FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
+        FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV2),
+    ],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::EnabledIf(|props| {
+        props.enable_iceberg_compat_v3 == Some(true)
     }),
 };
 
@@ -496,6 +524,9 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+/// TODO: When type widening is supported on writes, restrict the allowed
+/// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg v3
+/// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
 static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -509,6 +540,9 @@ static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 
+/// TODO: When type widening is supported on writes, restrict the allowed
+/// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg
+/// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
 static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -604,6 +638,7 @@ impl TableFeature {
             | TableFeature::InCommitTimestamp
             | TableFeature::IcebergCompatV1
             | TableFeature::IcebergCompatV2
+            | TableFeature::IcebergCompatV3
             | TableFeature::ClusteredTable
             | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
             TableFeature::Unknown(_) => FeatureType::Unknown,
@@ -638,6 +673,7 @@ impl TableFeature {
             TableFeature::DomainMetadata => &DOMAIN_METADATA_INFO,
             TableFeature::IcebergCompatV1 => &ICEBERG_COMPAT_V1_INFO,
             TableFeature::IcebergCompatV2 => &ICEBERG_COMPAT_V2_INFO,
+            TableFeature::IcebergCompatV3 => &ICEBERG_COMPAT_V3_INFO,
             TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
             TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
 
@@ -776,6 +812,7 @@ mod tests {
                 TableFeature::DomainMetadata => "domainMetadata",
                 TableFeature::IcebergCompatV1 => "icebergCompatV1",
                 TableFeature::IcebergCompatV2 => "icebergCompatV2",
+                TableFeature::IcebergCompatV3 => "icebergCompatV3",
                 TableFeature::ClusteredTable => "clustering",
                 TableFeature::MaterializePartitionColumns => "materializePartitionColumns",
                 TableFeature::CatalogManaged => "catalogManaged",
