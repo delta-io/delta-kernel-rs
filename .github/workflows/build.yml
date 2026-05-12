@@ -199,6 +199,7 @@ jobs:
         if: steps.filter.outputs.ffi == 'true'
         run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
       - name: metrics deadlock test
+        shell: bash
         run: |
           output=$(cargo run --profile test --example metrics-tester)
           echo "$output" | grep -q 'invalid_field'
