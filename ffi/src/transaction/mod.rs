@@ -2216,7 +2216,7 @@ mod tests {
         let add_files_schema = add_txn.add_files_schema();
         let add_metadata = test_utils::create_add_files_metadata(
             add_files_schema,
-            vec![(&data_file_path, parquet_len as i64, 1_000_000, 4)],
+            vec![(&data_file_path, parquet_len as i64, 1_000_000, Some(4))],
         )?;
         add_txn.add_files(add_metadata);
         let _ = add_txn.commit(kernel_engine.as_ref())?.unwrap_committed();
@@ -2302,7 +2302,8 @@ mod tests {
         });
 
         let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
-        assert_eq!(committed, 2);
+        let committed_version = unsafe { version_and_free(committed) };
+        assert_eq!(committed_version, 2);
 
         // Verify: scan now returns 2 rows (10 and 40).
         let snapshot = delta_kernel::snapshot::Snapshot::builder_for(table_url.clone())

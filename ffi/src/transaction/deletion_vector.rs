@@ -237,14 +237,14 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
     data_file_path: KernelStringSlice,
     descriptor: Handle<ExclusiveDvDescriptor>,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<()> {
+) -> ExternResult<bool> {
     let map_ref = unsafe { map.as_mut() };
     let engine_ref = unsafe { engine.as_ref() };
     // Parse the path BEFORE taking ownership of the descriptor: if parsing fails the
     // descriptor must remain valid so the caller can free it (otherwise we get a UAF
     // when they retry or clean up).
     let path_result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
-    let result = dv_descriptor_map_insert_impl(map_ref, path_result, descriptor);
+    let result = dv_descriptor_map_insert_impl(map_ref, path_result, descriptor).map(|_| true);
     result.into_extern_result(&engine_ref)
 }
 
@@ -294,12 +294,13 @@ pub unsafe extern "C" fn transaction_update_deletion_vectors(
     dv_map: Handle<ExclusiveDvDescriptorMap>,
     scan_iter: Handle<SharedScanMetadataIterator>,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<()> {
+) -> ExternResult<bool> {
     let txn_ref = unsafe { txn.as_mut() };
     let dv_map = unsafe { dv_map.into_inner() };
     let scan_iter_ref = unsafe { scan_iter.as_ref() };
     let engine_ref = unsafe { engine.as_ref() };
     transaction_update_deletion_vectors_impl(txn_ref, *dv_map, scan_iter_ref)
+        .map(|_| true)
         .into_extern_result(&engine_ref)
 }
 
