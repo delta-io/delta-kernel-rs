@@ -69,6 +69,23 @@ impl ReportGeneratorLayer {
     pub fn new(reporter: Arc<dyn MetricsReporter>) -> Self {
         ReportGeneratorLayer { reporter }
     }
+
+    fn drain_into_visitor<S>(
+        span: Option<tracing_subscriber::registry::SpanRef<'_, S>>,
+        record: impl FnOnce(&mut EventVisitor),
+    ) where
+        S: Subscriber + for<'l> tracing_subscriber::registry::LookupSpan<'l>,
+    {
+        let warnings = span.and_then(|span| {
+            let mut extensions = span.extensions_mut();
+            let visitor = extensions.get_mut::<EventVisitor>()?;
+            record(visitor);
+            Some(std::mem::take(&mut visitor.pending_warnings))
+        });
+        for warn in warnings.unwrap_or_default() {
+            warn!("{warn}");
+        }
+    }
 }
 
 struct EventVisitor {
@@ -476,32 +493,11 @@ where
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
-        let mut warnings = vec![];
-        if let Some(span) = ctx.event_span(event) {
-            let mut extensions = span.extensions_mut();
-            if let Some(visitor) = extensions.get_mut::<EventVisitor>() {
-                event.record(visitor);
-                warnings.append(&mut visitor.pending_warnings);
-            }
-        }
-
-        for warn in warnings {
-            warn!("{warn}");
-        }
+        Self::drain_into_visitor(ctx.event_span(event), |v| event.record(v));
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
-        let mut warnings = vec![];
-        if let Some(span) = ctx.span(id) {
-            let mut extensions = span.extensions_mut();
-            if let Some(visitor) = extensions.get_mut::<EventVisitor>() {
-                values.record(visitor);
-                warnings.append(&mut visitor.pending_warnings);
-            }
-        }
-        for warn in warnings {
-            warn!("{warn}");
-        }
+        Self::drain_into_visitor(ctx.span(id), |v| values.record(v));
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
@@ -522,15 +518,19 @@ where
         };
         if metadata.fields().field("report").is_some() {
             let Some(span) = ctx.span(&id) else { return };
-            let mut extensions = span.extensions_mut();
-            let duration = extensions.get_mut::<Instant>().map(|start| start.elapsed());
-            if let Some(event_visitor) = extensions.get_mut::<EventVisitor>() {
-                if let Some(duration) = duration {
-                    event_visitor.set_duration(duration);
+            let event = {
+                let mut extensions = span.extensions_mut();
+                let duration = extensions.get_mut::<Instant>().map(|start| start.elapsed());
+                let Some(event_visitor) = extensions.get_mut::<EventVisitor>() else {
+                    return;
+                };
+                if let Some(d) = duration {
+                    event_visitor.set_duration(d);
                 }
-                if let Some(event) = event_visitor.event.take() {
-                    self.reporter.report(event);
-                }
+                event_visitor.event.take()
+            }; // unlock the extensions before reporting so the reporter itself is safe to warn! etc
+            if let Some(event) = event {
+                self.reporter.report(event);
             }
         }
     }

@@ -199,7 +199,9 @@ jobs:
         if: steps.filter.outputs.ffi == 'true'
         run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
       - name: metrics deadlock test
-        run: cargo run --locked --profile test --example metrics-tester
+        run: |
+          count=$(cargo run --profile test --example metrics-tester | grep -E 'invalid_field|Invalid uuid' | wc -l)
+          [ "$count" -eq 2 ]
 
   ffi_test:
     runs-on: ${{ matrix.os }}
