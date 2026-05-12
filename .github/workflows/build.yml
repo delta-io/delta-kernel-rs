@@ -200,8 +200,9 @@ jobs:
         run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
       - name: metrics deadlock test
         run: |
-          count=$(cargo run --profile test --example metrics-tester | grep -E 'invalid_field|Invalid uuid' | wc -l)
-          [ "$count" -ge 2 ]
+          output=$(cargo run --profile test --example metrics-tester)
+          echo "$output" | grep -q 'invalid_field'
+          echo "$output" | grep -q 'Invalid uuid'
 
   ffi_test:
     runs-on: ${{ matrix.os }}
