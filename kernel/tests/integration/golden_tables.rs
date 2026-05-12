@@ -12,8 +12,6 @@ use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::parquet::arrow::async_reader::{
@@ -24,6 +22,8 @@ use futures::stream::TryStreamExt;
 use futures::StreamExt;
 use itertools::Itertools;
 use paste::paste;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::load_test_data;
 use url::Url;
 

@@ -20,7 +20,7 @@ use tracing::debug;
 use url::Url;
 #[cfg(feature = "default-engine-base")]
 use {
-    delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor,
+    delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor,
     std::collections::HashMap,
 };
 
@@ -653,8 +653,8 @@ fn get_default_engine_impl(
     executor_config: Option<MultithreadedExecutorConfig>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    use delta_kernel::engine::default::storage::store_from_url_opts;
-    use delta_kernel::engine::default::DefaultEngineBuilder;
+    use delta_kernel_default_engine::storage::store_from_url_opts;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
 
     let store = store_from_url_opts(&url, options)?;
 
@@ -1289,12 +1289,12 @@ impl<T> Default for ReferenceSet<T> {
 mod tests {
     use std::collections::HashMap;
 
-    use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::ObjectStoreExt as _;
     use delta_kernel::schema::StructType;
+    use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
     use rstest::rstest;
     use serde_json::Value;
     use test_utils::{

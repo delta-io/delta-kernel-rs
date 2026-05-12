@@ -4,13 +4,12 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
+use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use delta_kernel::{DeltaResult, FileMeta};
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use futures::FutureExt;
-
-use crate::arrow::array::RecordBatch;
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use crate::{DeltaResult, FileMeta};
 
 /// A fallible future that resolves to a stream of [`RecordBatch`]
 /// cbindgen:ignore
@@ -20,7 +19,7 @@ pub type FileOpenFuture =
 /// Generic API for opening a file using an [`ObjectStore`] and resolving to a
 /// stream of [`RecordBatch`]
 ///
-/// [`ObjectStore`]: crate::object_store::ObjectStore
+/// [`ObjectStore`]: delta_kernel::object_store::ObjectStore
 pub trait FileOpener: Send + Unpin {
     /// Asynchronously open the specified file and return a stream
     /// of [`RecordBatch`]

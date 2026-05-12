@@ -120,13 +120,13 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
-    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::snapshot::Snapshot;
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
     use delta_kernel::{DeltaResult, Engine, FileMeta, FilteredEngineData};
+    use delta_kernel_default_engine::DefaultEngineBuilder;
 
     use super::*;
 

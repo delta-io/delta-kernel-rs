@@ -13,12 +13,12 @@ use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_delta_table;
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
+use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use itertools::Itertools;
 use url::Url;
 
@@ -76,7 +76,7 @@ async fn try_main() -> DeltaResult<()> {
     println!("Using Delta table at: {url}");
 
     // Get the engine for local filesystem
-    use delta_kernel::engine::default::storage::store_from_url;
+    use delta_kernel_default_engine::storage::store_from_url;
     let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 
     // Create or get the table

@@ -133,6 +133,9 @@ pub mod column_trie;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod column_trie;
 pub mod kernel_predicates;
+#[cfg(feature = "internal-api")]
+pub mod utils;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod utils;
 
 #[cfg(feature = "internal-api")]
@@ -947,21 +950,6 @@ pub trait Engine: AsAny {
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
 }
-
-// we have an 'internal' feature flag: default-engine-base, which is actually just the shared
-// pieces of default-engine-native-tls and default-engine-rustls. the crate can't compile with
-// _only_ default-engine-base, so we give a friendly error here.
-#[cfg(all(
-    feature = "default-engine-base",
-    not(any(
-        feature = "default-engine-native-tls",
-        feature = "default-engine-rustls",
-    ))
-))]
-compile_error!(
-    "The default-engine-base feature flag is not meant to be used directly. \
-    Please use either default-engine-native-tls or default-engine-rustls."
-);
 
 // Rustdoc's documentation tests can do some things that regular unit tests can't. Here we are
 // using doctests to test macros. Specifically, we are testing for failed macro invocations due

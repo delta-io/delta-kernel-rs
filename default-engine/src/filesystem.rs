@@ -4,19 +4,18 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use bytes::Bytes;
-use delta_kernel_derive::internal_api;
+use delta_kernel::metrics::reporter::{
+    COPY_COMPLETED_NAME, LIST_COMPLETED_NAME, READ_COMPLETED_NAME, STORAGE_SPAN,
+};
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
+use delta_kernel::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 use futures::stream::{self, BoxStream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
 
-use super::UrlExt;
-use crate::engine::default::executor::TaskExecutor;
-use crate::metrics::reporter::{
-    COPY_COMPLETED_NAME, LIST_COMPLETED_NAME, READ_COMPLETED_NAME, STORAGE_SPAN,
-};
-use crate::object_store::path::Path;
-use crate::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use crate::executor::TaskExecutor;
+use crate::UrlExt;
 
 /// Stream wrapper that emits a storage metric span when dropped.
 ///
@@ -110,7 +109,6 @@ pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
 }
 
 impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
-    #[internal_api]
     pub(crate) fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             inner: store,
@@ -172,7 +170,7 @@ async fn list_from_impl(
         // Wrap in MetricsIterator so the metric fires in Drop on the caller's thread
         // (not here on the background thread where no tracing subscriber is installed).
         let stream = MetricsIterator::new(
-            stream::iter(items.into_iter().map(Ok::<FileMeta, crate::Error>)),
+            stream::iter(items.into_iter().map(Ok::<FileMeta, delta_kernel::Error>)),
             LIST_COMPLETED_NAME,
             start,
         );
@@ -294,7 +292,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
         let future = list_from_impl(self.inner.clone(), path.clone());
-        let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        let iter = crate::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
 
@@ -309,7 +307,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
         let future = read_files_impl(self.inner.clone(), files, self.readahead);
-        let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        let iter = crate::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
 
@@ -366,16 +364,18 @@ mod tests {
     use std::ops::Range;
     use std::time::Duration;
 
+    use bytes::Bytes;
+    use delta_kernel::object_store::local::LocalFileSystem;
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::ObjectStoreExt as _;
+    use delta_kernel::utils::current_time_duration;
     use itertools::Itertools;
     use test_utils::delta_path_for_version;
 
-    use super::*;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::DefaultEngineBuilder;
-    use crate::object_store::local::LocalFileSystem;
-    use crate::object_store::memory::InMemory;
-    use crate::utils::current_time_duration;
-    use crate::Engine as _;
+    use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::filesystem::supports_ordered_listing;
+    use crate::{DefaultEngineBuilder, *};
 
     fn setup_test() -> (
         tempfile::TempDir,

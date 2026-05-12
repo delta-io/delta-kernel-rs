@@ -14,6 +14,7 @@ release = false
 
 [dependencies]
 delta_kernel = { path = "../kernel" }
+delta_kernel_default_engine = { path = "../default-engine", optional = true }
 # Direct deps for TLS crypto provider regression tests (see lib.rs).
 reqwest = { version = "0.13", default-features = false, optional = true }
 rustls = { version = "0.23", default-features = false, optional = true }
@@ -23,5 +24,5 @@ default = ["arrow"]
 arrow = ["arrow-58"]
 arrow-58 = ["delta_kernel/arrow-58"]
 arrow-57 = ["delta_kernel/arrow-57"]
-default-engine-native-tls = ["delta_kernel/default-engine-native-tls", "dep:rustls", "reqwest/native-tls"]
-default-engine-rustls = ["delta_kernel/default-engine-rustls", "dep:rustls", "reqwest/rustls"]
+default-engine-native-tls = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine", "delta_kernel_default_engine/native-tls", "dep:rustls", "reqwest/native-tls"]
+default-engine-rustls = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine", "delta_kernel_default_engine/rustls", "dep:rustls", "reqwest/rustls"]

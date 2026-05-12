@@ -9,6 +9,17 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
+use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::schema::Schema;
+use delta_kernel::transaction::WriteContext;
+// Re-export delta_kernel types commonly used by engine implementations and their tests.
+pub use delta_kernel::{
+    DeltaResult, Engine, EngineData, Error, EvaluationHandler, FileDataReadResultIterator,
+    FileMeta, FileSlice, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, StorageHandler,
+};
 use futures::stream::{BoxStream, StreamExt as _};
 use url::Url;
 
@@ -16,15 +27,6 @@ use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
-use super::arrow_conversion::TryFromArrow as _;
-use super::arrow_data::ArrowEngineData;
-use super::arrow_expression::ArrowEvaluationHandler;
-use crate::object_store::DynObjectStore;
-use crate::schema::Schema;
-use crate::transaction::WriteContext;
-use crate::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
-};
 
 pub mod executor;
 pub mod file_stream;
@@ -83,15 +85,15 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
 
-/// Wraps a [`crate::FileDataReadResultIterator`] to emit a metrics event exactly once when the
-/// iterator is either exhausted or dropped.
+/// Wraps a [`delta_kernel::FileDataReadResultIterator`] to emit a metrics event exactly once when
+/// the iterator is either exhausted or dropped.
 ///
 /// Used by the JSON and Parquet handlers to report the number of files and bytes requested per
 /// `read_*_files` call. The `emit_fn` is called with `(num_files, bytes_read)` and is expected
 /// to create and immediately drop a tracing span, which triggers the `ReportGeneratorLayer` to
-/// fire the appropriate [`crate::metrics::MetricEvent`] to any registered reporter.
-pub(super) struct ReadMetricsIterator {
-    inner: crate::FileDataReadResultIterator,
+/// fire the appropriate [`delta_kernel::metrics::MetricEvent`] to any registered reporter.
+pub(crate) struct ReadMetricsIterator {
+    inner: delta_kernel::FileDataReadResultIterator,
     num_files: u64,
     bytes_read: u64,
     emitted: bool,
@@ -99,8 +101,8 @@ pub(super) struct ReadMetricsIterator {
 }
 
 impl ReadMetricsIterator {
-    pub(super) fn new(
-        inner: crate::FileDataReadResultIterator,
+    pub(crate) fn new(
+        inner: delta_kernel::FileDataReadResultIterator,
         num_files: u64,
         bytes_read: u64,
         emit_fn: fn(u64, u64),
@@ -123,7 +125,7 @@ impl ReadMetricsIterator {
 }
 
 impl Iterator for ReadMetricsIterator {
-    type Item = crate::DeltaResult<Box<dyn crate::EngineData>>;
+    type Item = delta_kernel::DeltaResult<Box<dyn delta_kernel::EngineData>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let item = self.inner.next();
@@ -270,8 +272,8 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// [`Transaction::unpartitioned_write_context`], which handle partition value validation,
     /// serialization, and logical-to-physical key translation.
     ///
-    /// [`Transaction::partitioned_write_context`]: crate::transaction::Transaction::partitioned_write_context
-    /// [`Transaction::unpartitioned_write_context`]: crate::transaction::Transaction::unpartitioned_write_context
+    /// [`Transaction::partitioned_write_context`]: delta_kernel::transaction::Transaction::partitioned_write_context
+    /// [`Transaction::unpartitioned_write_context`]: delta_kernel::transaction::Transaction::unpartitioned_write_context
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,
@@ -303,7 +305,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 /// [`Transaction::add_files`].
 ///
 /// [`DataFileMetadata`]: parquet::DataFileMetadata
-/// [`Transaction::add_files`]: crate::transaction::Transaction::add_files
+/// [`Transaction::add_files`]: delta_kernel::transaction::Transaction::add_files
 pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
     write_context: &WriteContext,
@@ -362,9 +364,10 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::engine::tests::test_arrow_engine;
-    use crate::object_store::local::LocalFileSystem;
+    use delta_kernel::engine::tests::test_arrow_engine;
+    use delta_kernel::object_store::local::LocalFileSystem;
+
+    use crate::*;
 
     #[test]
     fn test_default_engine() {

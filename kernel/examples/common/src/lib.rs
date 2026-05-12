@@ -5,9 +5,6 @@ use std::sync::Arc;
 
 use clap::{Args, CommandFactory, FromArgMatches};
 use delta_kernel::arrow::array::RecordBatch;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::storage::store_from_url_opts;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::aws::AmazonS3Builder;
 use delta_kernel::object_store::azure::MicrosoftAzureBuilder;
 use delta_kernel::object_store::gcp::GoogleCloudStorageBuilder;
@@ -15,6 +12,9 @@ use delta_kernel::object_store::{DynObjectStore, ObjectStoreScheme};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::MetadataColumnSpec;
 use delta_kernel::{DeltaResult, SnapshotRef};
+use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_default_engine::storage::store_from_url_opts;
+use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use url::Url;
 
 #[derive(Args)]

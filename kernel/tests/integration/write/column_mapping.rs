@@ -8,8 +8,6 @@ use delta_kernel::arrow::array::{
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{ColumnName, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
@@ -17,6 +15,8 @@ use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::{Engine, FileMeta, Snapshot};
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
     assert_partition_values, assert_schema_has_field, copy_directory,
     create_table_and_load_snapshot, nested_batches, nested_schema, read_actions_from_commit,

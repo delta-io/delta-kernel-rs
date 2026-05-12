@@ -13,7 +13,7 @@ pub fn test_default_engine_feature_flags() {
     ))]
     {
         #[allow(unused_imports)]
-        use delta_kernel::engine::default::DefaultEngine;
+        use delta_kernel_default_engine::DefaultEngine;
     }
 }
 
