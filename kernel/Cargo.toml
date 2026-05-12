@@ -39,7 +39,7 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.22.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.22.1" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
@@ -169,3 +169,8 @@ harness = false
 [[test]]
 name = "integration"
 path = "tests/integration/main.rs"
+
+# Declare as an example for access to test_utils
+[[example]]
+name = "metrics-tester"
+path = "tests/integration/metrics_main.rs"
