@@ -304,7 +304,7 @@ impl LogSegment {
         name = "segment.for_snapshot",
         err,
         skip(storage, time_travel_version),
-        fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files)
+        fields(report, operation_id = %operation_id, num_commit_files, num_checkpoint_files, num_compaction_files, has_latest_crc_file)
     )]
     #[internal_api]
     pub(crate) fn for_snapshot(
@@ -337,6 +337,10 @@ impl LogSegment {
                 tracing::Span::current().record(
                     "num_compaction_files",
                     log_segment.listed.ascending_compaction_files.len() as u64,
+                );
+                tracing::Span::current().record(
+                    "has_latest_crc_file",
+                    log_segment.listed.latest_crc_file.is_some(),
                 );
                 Ok(log_segment)
             }
