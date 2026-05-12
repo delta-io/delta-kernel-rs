@@ -7,7 +7,7 @@ use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
 use crate::transforms::SchemaTransform;
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{transform_output_type, DeltaResult, Error};
 
 /// Validates that if a table schema contains TIMESTAMP_NANOS columns, the table must have the
 /// TimestampNanos feature in both reader and writer features.
@@ -36,6 +36,8 @@ pub(crate) fn schema_contains_timestamp_nanos(schema: &Schema) -> bool {
 struct UsesTimestampNanos(bool);
 
 impl<'a> SchemaTransform<'a> for UsesTimestampNanos {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
         if *ptype == PrimitiveType::TimestampNanos {
             self.0 = true;

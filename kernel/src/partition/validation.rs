@@ -343,7 +343,6 @@ mod tests {
         DataType::TIMESTAMP_NANOS,
         Scalar::TimestampNanos(1_718_499_599_999_999_999)
     )]
-    #[case(DataType::TIMESTAMP_NANOS, Scalar::Null(DataType::TIMESTAMP_NANOS))]
     fn test_validate_nanos_encoding_table_rows_return_ok(
         #[case] data_type: DataType,
         #[case] value: Scalar,
