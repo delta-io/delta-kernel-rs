@@ -1,25 +1,34 @@
 use std::ops::Range;
 
 use crate::arrow::array::cast::AsArray;
+use crate::arrow::array::types::{
+    Date32Type, Decimal128Type, Float32Type, Float64Type, GenericBinaryType, GenericStringType,
+    Int16Type, Int32Type, Int64Type, Int8Type, TimestampMicrosecondType,
+};
 use crate::arrow::array::{
-    types::{
-        Date32Type, Decimal128Type, Float32Type, Float64Type, GenericBinaryType, GenericStringType,
-        Int32Type, Int64Type, TimestampMicrosecondType,
-    },
     Array, BinaryViewArray, BooleanArray, GenericByteArray, GenericListArray, GenericListViewArray,
     MapArray, OffsetSizeTrait, PrimitiveArray, RunArray, StringViewArray,
 };
-
 use crate::engine::arrow_data::as_string_accessor;
-use crate::{
-    engine_data::{GetData, ListItem, MapItem},
-    DeltaResult, Error,
-};
+use crate::engine_data::{GetData, ListItem, MapItem};
+use crate::{DeltaResult, Error};
 
 // actual impls (todo: could macro these)
 
 impl GetData<'_> for BooleanArray {
     fn get_bool(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<bool>> {
+        Ok(self.is_valid(row_index).then(|| self.value(row_index)))
+    }
+}
+
+impl GetData<'_> for PrimitiveArray<Int8Type> {
+    fn get_byte(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<i8>> {
+        Ok(self.is_valid(row_index).then(|| self.value(row_index)))
+    }
+}
+
+impl GetData<'_> for PrimitiveArray<Int16Type> {
+    fn get_short(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<i16>> {
         Ok(self.is_valid(row_index).then(|| self.value(row_index)))
     }
 }
@@ -282,14 +291,30 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
 mod tests {
     use super::*;
     use crate::arrow::array::{
-        BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
-        LargeStringArray, PrimitiveArray,
+        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+        LargeBinaryArray, LargeStringArray, PrimitiveArray,
     };
     use crate::engine_data::GetData;
 
     // =========================================================================
-    // Existing type tests (bool, int, long, str)
+    // Scalar type tests
     // =========================================================================
+
+    #[test]
+    fn test_get_byte() {
+        let array = Int8Array::from(vec![Some(i8::MAX), Some(i8::MIN), None]);
+        assert_eq!(array.get_byte(0, "f").unwrap(), Some(i8::MAX));
+        assert_eq!(array.get_byte(1, "f").unwrap(), Some(i8::MIN));
+        assert_eq!(array.get_byte(2, "f").unwrap(), None);
+    }
+
+    #[test]
+    fn test_get_short() {
+        let array = Int16Array::from(vec![Some(i16::MAX), Some(i16::MIN), None]);
+        assert_eq!(array.get_short(0, "f").unwrap(), Some(i16::MAX));
+        assert_eq!(array.get_short(1, "f").unwrap(), Some(i16::MIN));
+        assert_eq!(array.get_short(2, "f").unwrap(), None);
+    }
 
     #[test]
     fn test_get_bool() {
@@ -314,10 +339,6 @@ mod tests {
         assert_eq!(array.get_long(1, "f").unwrap(), Some(i64::MIN));
         assert_eq!(array.get_long(2, "f").unwrap(), None);
     }
-
-    // =========================================================================
-    // New type tests (float, double, date, timestamp, decimal)
-    // =========================================================================
 
     #[test]
     fn test_get_float() {
@@ -437,7 +458,9 @@ mod tests {
     fn test_wrong_type_returns_error() {
         let int_array = Int32Array::from(vec![Some(42)]);
 
-        // Calling get_float on an Int32Array should error
+        // Calling the wrong getter on an Int32Array should error
+        assert!(int_array.get_byte(0, "f").is_err());
+        assert!(int_array.get_short(0, "f").is_err());
         assert!(int_array.get_float(0, "f").is_err());
         assert!(int_array.get_double(0, "f").is_err());
         assert!(int_array.get_long(0, "f").is_err());

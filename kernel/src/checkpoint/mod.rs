@@ -1,14 +1,16 @@
-//! This module implements the API for writing single-file checkpoints.
+//! This module implements the API for **customized** Delta checkpoint writes, where the
+//! caller drives the write themselves. The entry point is [`Snapshot::create_checkpoint_writer`].
 //!
-//! The entry point for this API is [`Snapshot::create_checkpoint_writer`].
+//! If you want an all-in-one API that handles writing the checkpoint, use
+//! [`Snapshot::checkpoint`] instead.
 //!
 //! ## Checkpoint Types and Selection Logic
 //! This API supports two checkpoint types, selected based on table features:
 //!
-//! | Table Feature    | Resulting Checkpoint Type    | Description                                                                 |
-//! |------------------|-------------------------------|-----------------------------------------------------------------------------|
-//! | No v2Checkpoints | Single-file Classic-named V1 | Follows V1 specification without [`CheckpointMetadata`] action             |
-//! | v2Checkpoints    | Single-file Classic-named V2 | Follows V2 specification with [`CheckpointMetadata`] action while maintaining backward compatibility via classic naming |
+//! | Table Feature    | Resulting Checkpoint Type                   | Description                                                                                                             |
+//! |------------------|---------------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
+//! | No v2Checkpoints | Single-file Classic-named V1                | Follows V1 specification without [`CheckpointMetadata`] action                                                          |
+//! | v2Checkpoints    | Classic-named V2 (with or without sidecars) | Follows V2 specification with [`CheckpointMetadata`] action while maintaining backward compatibility via classic naming |
 //!
 //! For more information on the V1/V2 specifications, see the following protocol section:
 //! <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-specs>
@@ -24,10 +26,11 @@
 //!
 //! 1. Create a [`CheckpointWriter`] using [`Snapshot::create_checkpoint_writer`]
 //! 2. Get the checkpoint path from [`CheckpointWriter::checkpoint_path`]
-//! 2. Get the checkpoint data from [`CheckpointWriter::checkpoint_data`]
-//! 3. Write the data to the path in object storage (engine-specific)
-//! 4. Collect metadata ([`FileMeta`]) from the write operation
-//! 5. Pass the metadata and exhausted data iterator to [`CheckpointWriter::finalize`]
+//! 3. Get the checkpoint data from [`CheckpointWriter::checkpoint_data`]
+//! 4. Write the data to the path in object storage (engine-specific)
+//! 5. Collect metadata ([`FileMeta`]) from the write operation
+//! 6. Build a [`LastCheckpointHintStats`] from the exhausted iterator state
+//! 7. Pass the [`LastCheckpointHintStats`] to [`CheckpointWriter::finalize`]
 //!
 //! ```no_run
 //! # use std::sync::Arc;
@@ -40,7 +43,7 @@
 //! # use delta_kernel::Error;
 //! # use delta_kernel::FileMeta;
 //! # use url::Url;
-//! fn write_checkpoint_file(path: Url, data: &mut ActionReconciliationIterator) -> DeltaResult<FileMeta> {
+//! fn write_checkpoint_file(path: Url, data: ActionReconciliationIterator) -> DeltaResult<FileMeta> {
 //!     todo!() /* engine-specific logic to write data to object storage*/
 //! }
 //!
@@ -51,22 +54,32 @@
 //! let snapshot = Snapshot::builder_for(url).build(engine)?;
 //!
 //! // Create a checkpoint writer from the snapshot
-//! let mut writer = snapshot.create_checkpoint_writer()?;
+//! let writer = snapshot.create_checkpoint_writer()?;
 //!
 //! // Get the checkpoint path and data
 //! let checkpoint_path = writer.checkpoint_path()?;
 //! let checkpoint_data = writer.checkpoint_data(engine)?;
 //!
-//! // Get the iterator state
+//! // Get the iterator state before consuming the data
 //! let state = checkpoint_data.state();
 //!
 //! // Write the checkpoint data to the object store and collect metadata
-//! let metadata: FileMeta = write_checkpoint_file(checkpoint_path, &mut checkpoint_data)?;
-//!
+//! // The write function consumes the iterator, dropping its Arc reference to the state.
+//! let metadata: FileMeta = write_checkpoint_file(checkpoint_path, checkpoint_data)?;
 //! /* IMPORTANT: All data must be written before finalizing the checkpoint */
 //!
-//! // Finalize the checkpoint by passing the metadata and state handle
-//! writer.finalize(engine, &metadata, &state)?;
+//! // Build the [`LastCheckpointHintStats`] from the exhausted iterator state
+//! let state = std::sync::Arc::into_inner(state)
+//!     .ok_or(Error::internal_error("checkpoint state Arc still has other references"))?;
+//! let last_checkpoint_stats =
+//!     delta_kernel::checkpoint::LastCheckpointHintStats::from_reconciliation_state(
+//!         state,
+//!         metadata.size,
+//!         0, /* num_sidecars */
+//!     )?;
+//!
+//! // Finalize the checkpoint by passing the stats
+//! writer.finalize(engine, &last_checkpoint_stats)?;
 //!
 //! # Ok::<_, Error>(())
 //! ```
@@ -82,12 +95,14 @@
 //! in the future, we can revisit this decision.
 //!
 //! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
+//! [`FileMeta`]: crate::FileMeta
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
+//! [`Snapshot::checkpoint`]: crate::Snapshot::checkpoint
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
-// Future extensions:
-// - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
-//   multi-file support, but the current implementation only supports single-file checkpoints.
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+
+use tracing::info;
+use url::Url;
 
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
@@ -104,24 +119,179 @@ use crate::engine_data::FilteredEngineData;
 use crate::expressions::{Expression, Scalar, StructData, Transform};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
-use crate::path::ParsedLogPath;
+use crate::path::{self, ParsedLogPath};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
-
-use url::Url;
+use crate::{
+    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta, Version,
+};
 
 mod checkpoint_transform;
+mod sidecar;
 
 use checkpoint_transform::{
     build_checkpoint_output_schema, build_checkpoint_read_schema, build_checkpoint_transform,
     StatsTransformConfig,
 };
-
+use sidecar::{create_sidecar_action_batch, SidecarSplitter, SingleSidecarDataIterator};
 #[cfg(test)]
 mod tests;
+
+/// Information about a freshly-written checkpoint. Pass it to
+/// [`CheckpointWriter::finalize`] to produce the `_last_checkpoint` hint file.
+///
+/// Unlike [`LastCheckpointHint`], which is used on the read path and has many optional
+/// fields, this struct focuses on the write path and all fields are required. Note this
+/// is a kernel requirement; the Delta protocol itself marks some of these fields as
+/// optional in the `_last_checkpoint` hint. See the [Last Checkpoint File Schema] for
+/// more details.
+///
+/// Construct via [`LastCheckpointHintStats::from_reconciliation_state`].
+///
+/// # Note
+/// This is intended for sophisticated connectors that customize how checkpoints are
+/// written. If you are not deeply familiar with the Delta protocol, you may use
+/// [`Snapshot::checkpoint`](crate::snapshot::Snapshot::checkpoint), which handles
+/// checkpoint writing end-to-end.
+///
+/// [Last Checkpoint File Schema]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#last-checkpoint-file-schema
+#[derive(Debug)]
+pub struct LastCheckpointHintStats {
+    /// The total number of actions stored in the checkpoint (including actions created
+    /// outside the reconciliation iterator, e.g. sidecar actions).
+    num_actions: i64,
+    /// The total size in bytes of the checkpoint. For V2 checkpoint with sidecars,
+    /// this is the sum of the main checkpoint file size and all sidecar file sizes.
+    size_in_bytes: i64,
+    /// The number of Add-file actions in the checkpoint.
+    num_of_add_files: i64,
+}
+
+impl LastCheckpointHintStats {
+    /// Constructs a `LastCheckpointHintStats` from the fully-exhausted reconciliation state.
+    ///
+    /// # Parameters
+    /// - `state`: fully-exhausted reconciliation iterator state. All data must have been written to
+    ///   storage before calling this.
+    /// - `size_in_bytes`: total byte size of the checkpoint. For V2 checkpoints with sidecars, the
+    ///   caller should include the main checkpoint file size plus all sidecar file sizes.
+    /// - `num_sidecars`: number of sidecar actions. Use `0` for V1 checkpoints or V2 checkpoints
+    ///   without sidecars.
+    ///
+    /// # Errors
+    /// - If the reconciliation iterator has not been fully exhausted.
+    /// - If `size_in_bytes` exceeds `i64::MAX`.
+    /// - If `num_sidecars` exceeds `i64::MAX`.
+    /// - If `state.actions_count() + num_sidecars` overflows `i64`.
+    pub fn from_reconciliation_state(
+        state: ActionReconciliationIteratorState,
+        size_in_bytes: u64,
+        num_sidecars: u64,
+    ) -> DeltaResult<Self> {
+        if !state.is_exhausted() {
+            return Err(Error::checkpoint_write(
+                "Cannot build LastCheckpointHintStats: the reconciliation iterator must be fully \
+                 consumed and all data written to storage before finalizing",
+            ));
+        }
+        let size_in_bytes = i64::try_from(size_in_bytes).map_err(|e| {
+            Error::checkpoint_write(format!("size_in_bytes {size_in_bytes} exceeds i64: {e}"))
+        })?;
+        let num_sidecars_i64 = i64::try_from(num_sidecars).map_err(|e| {
+            Error::checkpoint_write(format!("num_sidecars {num_sidecars} exceeds i64: {e}"))
+        })?;
+        let num_actions = state
+            .actions_count()
+            .checked_add(num_sidecars_i64)
+            .ok_or_else(|| {
+                Error::checkpoint_write(format!(
+                    "checkpoint action count overflowed i64: {} + {num_sidecars}",
+                    state.actions_count()
+                ))
+            })?;
+        Ok(Self {
+            num_actions,
+            size_in_bytes,
+            num_of_add_files: state.add_actions_count(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct WrittenCheckpointInfo {
+    /// Metadata of the main checkpoint file.
+    pub(crate) file_meta: FileMeta,
+    /// Stats for the `_last_checkpoint` hint.
+    pub(crate) last_checkpoint_stats: LastCheckpointHintStats,
+}
+
+/// Schemas and configs needed for building the checkpoint read/output schemas.
+struct CheckpointSchemaContext {
+    stats_config: StatsTransformConfig,
+    /// The checkpoint schema before table-specific fields like
+    /// `stats_parsed` and `partitionValues_parsed` are injected.
+    checkpoint_base_schema: SchemaRef,
+    stats_schema: SchemaRef,
+    partition_schema: Option<SchemaRef>,
+    is_v2: bool,
+}
+
+/// Default value for [`V2CheckpointConfig::WithSidecar::file_actions_per_sidecar_hint`].
+/// It's the suggested upper bound of file actions (`add` and `remove`) per sidecar file when
+/// the caller does not provide an explicit hint.
+pub const DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT: usize = 50_000;
+
+/// Specifies the checkpoint format and behavior.
+#[derive(Debug)]
+pub enum CheckpointSpec {
+    /// Write a checkpoint following the V1 spec, the original checkpoint format, without
+    /// sidecar files or checkpoint metadata. See [V1 spec] for more details.
+    ///
+    /// [V1 spec]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#v1-spec
+    V1,
+    /// Write a checkpoint following the V2 spec, which allows putting file actions (`add`
+    /// and `remove`) in sidecar files. Requires the `v2Checkpoint` reader/writer feature.
+    /// See [V2 spec] and [`V2CheckpointConfig::WithSidecar`] for more details.
+    ///
+    /// [V2 spec]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#v2-spec
+    V2(V2CheckpointConfig),
+}
+
+/// Configuration for V2 checkpoints.
+///
+/// Note: "File actions" here means `add` and `remove` actions. "Non-file actions" means
+/// the rest (`protocol`, `metaData`, `txn`, etc.).
+#[derive(Debug)]
+pub enum V2CheckpointConfig {
+    /// Write a V2 checkpoint without sidecar files.
+    NoSidecar,
+    /// Write a V2 checkpoint with file actions split into [Sidecar Files]. A main
+    /// checkpoint file is written, with one `sidecar` action pointing to each sidecar file.
+    ///
+    /// # Benefits of Sidecars
+    /// - **Read parallelism**: readers can fetch sidecars in parallel.
+    /// - **Smaller main checkpoint**: callers that only need non-file actions (e.g. `protocol`,
+    ///   `metaData`) can skip the sidecars entirely.
+    ///
+    /// # Note
+    /// Sidecars add extra write cost (one parquet file per sidecar).
+    ///
+    /// [Sidecar Files]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-files
+    WithSidecar {
+        /// Suggested number of file actions per sidecar file. When there are X file actions,
+        /// the number of sidecars will roughly be `X / file_actions_per_sidecar_hint`.
+        ///
+        /// This is a hint, not a strict limit, because file actions are stored in `EngineData`
+        /// batches that cannot be split. For example, if the hint is 99 but a single
+        /// `EngineData` batch contains 100 file actions, all 100 will be written to one sidecar.
+        ///
+        /// When `None`, kernel uses [`DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT`] (50,000) as the
+        /// default.
+        file_actions_per_sidecar_hint: Option<usize>,
+    },
+}
 
 /// Schema of the `_last_checkpoint` file
 /// We cannot use `LastCheckpointInfo::to_schema()` as it would include the 'checkpoint_schema'
@@ -178,8 +348,8 @@ static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// supports the `v2Checkpoints` reader/writer feature.
 ///
 /// # Warning
-/// The checkpoint data must be fully written to storage before calling [`CheckpointWriter::finalize`].
-/// Failing to do so may result in data loss or corruption.
+/// The checkpoint data must be fully written to storage before calling
+/// [`CheckpointWriter::finalize`]. Failing to do so may result in data loss or corruption.
 ///
 /// # See Also
 /// See the [module-level documentation](self) for the complete checkpoint workflow
@@ -260,6 +430,7 @@ impl CheckpointWriter {
         )
         .map(|parsed| parsed.location)
     }
+
     /// Returns the checkpoint data to be written to the checkpoint file.
     ///
     /// This method reads actions from the log segment, processes them for checkpoint creation,
@@ -269,7 +440,7 @@ impl CheckpointWriter {
     ///
     /// The returned [`ActionReconciliationIterator`] yields [`FilteredEngineData`] batches with
     /// stats transforms already applied. Use [`ActionReconciliationIterator::state`] to get the
-    /// shared state for passing to [`CheckpointWriter::finalize`].
+    /// shared state for building a [`LastCheckpointHintStats`] after the iterator is exhausted.
     ///
     /// # Engine Usage
     ///
@@ -280,7 +451,12 @@ impl CheckpointWriter {
     ///     let data = batch?.apply_selection_vector()?;
     ///     parquet_writer.write(&data).await?;
     /// }
-    /// writer.finalize(&engine, &metadata, &state)?;
+    /// drop(checkpoint_data);
+    /// let state = Arc::into_inner(state)
+    ///     .ok_or(Error::internal_error("checkpoint state Arc still has other references"))?;
+    /// let last_checkpoint_stats =
+    ///     LastCheckpointHintStats::from_reconciliation_state(state, size_in_bytes, 0)?;
+    /// writer.finalize(&engine, &last_checkpoint_stats)?;
     /// ```
     // Implementation overview:
     // 1. Determines whether to write a V1 or V2 checkpoint based on `v2Checkpoints` feature
@@ -292,35 +468,7 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
-        let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
-
-        // Get clustering columns so they are always included in stats per the Delta protocol.
-        let tc = self.snapshot.table_configuration();
-        let physical_clustering_columns = self.snapshot.get_physical_clustering_columns(engine)?;
-
-        // Get stats schema from table configuration.
-        // This already excludes partition columns and applies column mapping.
-        let stats_schema = tc
-            .build_expected_stats_schemas(physical_clustering_columns.as_deref(), None)?
-            .physical;
-
-        // Select schema based on V2 checkpoint support
-        let is_v2_checkpoints_supported = self
-            .snapshot
-            .table_configuration()
-            .is_feature_supported(&TableFeature::V2Checkpoint);
-
-        let base_schema = if is_v2_checkpoints_supported {
-            &CHECKPOINT_ACTIONS_SCHEMA_V2
-        } else {
-            &CHECKPOINT_ACTIONS_SCHEMA_V1
-        };
-
-        // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
-        let partition_schema = self
-            .snapshot
-            .table_configuration()
-            .build_partition_values_parsed_schema();
+        let schema_context = self.checkpoint_schema_context(engine)?;
 
         // The read schema and output schema differ because the transform needs access to
         // both stats formats as input, but may only write one format as output.
@@ -332,8 +480,11 @@ impl CheckpointWriter {
         //
         // output_schema: Only includes the stats fields that the table config requests
         // (e.g., only `stats` if writeStatsAsJson=true and writeStatsAsStruct=false).
-        let read_schema =
-            build_checkpoint_read_schema(base_schema, &stats_schema, partition_schema.as_deref())?;
+        let read_schema = build_checkpoint_read_schema(
+            &schema_context.checkpoint_base_schema,
+            &schema_context.stats_schema,
+            schema_context.partition_schema.as_deref(),
+        )?;
 
         // Read actions from log segment
         let actions = self
@@ -350,17 +501,20 @@ impl CheckpointWriter {
 
         let output_schema = self.get_or_init_output_schema(|| {
             build_checkpoint_output_schema(
-                &config,
-                base_schema,
-                &stats_schema,
-                partition_schema.as_deref(),
+                &schema_context.stats_config,
+                &schema_context.checkpoint_base_schema,
+                &schema_context.stats_schema,
+                schema_context.partition_schema.as_deref(),
             )
         })?;
 
         // Build transform expression and create expression evaluator.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
-        let transform_expr =
-            build_checkpoint_transform(&config, &stats_schema, partition_schema.as_ref());
+        let transform_expr = build_checkpoint_transform(
+            &schema_context.stats_config,
+            &schema_context.stats_schema,
+            schema_context.partition_schema.as_ref(),
+        );
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             read_schema,
             transform_expr,
@@ -382,7 +536,8 @@ impl CheckpointWriter {
         // For V2 checkpoints, chain the checkpoint metadata batch after the transformed
         // action stream. The metadata batch is created with the output schema directly,
         // bypassing the stats transform (it has no add actions to transform).
-        let checkpoint_metadata = is_v2_checkpoints_supported
+        let checkpoint_metadata = schema_context
+            .is_v2
             .then(|| self.create_checkpoint_metadata_batch(engine, &output_schema));
 
         Ok(ActionReconciliationIterator::new(Box::new(
@@ -398,41 +553,39 @@ impl CheckpointWriter {
     /// 2. All data has been successfully written to object storage
     ///
     /// # Parameters
-    /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `metadata`: The metadata of the written checkpoint file
-    /// - `checkpoint_iter_state`: The state of the checkpoint data iterator
+    /// - `engine`: Implementation of [`Engine`] APIs.
+    /// - `last_checkpoint_stats`: The [`LastCheckpointHintStats`] containing fields needed to write
+    ///   the `_last_checkpoint` file.
     ///
     /// # Returns: `Ok` if the checkpoint was successfully finalized
     // Internally, this method:
-    // 1. Validates that the checkpoint data iterator is fully exhausted
-    // 2. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
-    // 3. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the delta log
+    // 1. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
+    // 2. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the delta log
     pub fn finalize(
         self,
         engine: &dyn Engine,
-        metadata: &FileMeta,
-        checkpoint_iter_state: &ActionReconciliationIteratorState,
+        last_checkpoint_stats: &LastCheckpointHintStats,
     ) -> DeltaResult<()> {
-        // Ensure the checkpoint data iterator is fully exhausted
-        if !checkpoint_iter_state.is_exhausted() {
-            return Err(Error::checkpoint_write(
-                "The checkpoint data iterator must be fully consumed and written to storage before calling finalize"
-            ));
+        // Skip writing `_last_checkpoint` if the existing hint already points to a newer
+        // checkpoint, to avoid regressing the hint.
+        let checkpoint_version = self.snapshot.version();
+        if let Some(hint_version) = self.snapshot.log_segment().last_checkpoint_version() {
+            if hint_version > checkpoint_version {
+                info!(
+                    hint_version,
+                    checkpoint_version,
+                    "Skipping _last_checkpoint write: existing hint is newer than checkpoint"
+                );
+                return Ok(());
+            }
         }
-
-        let size_in_bytes = i64::try_from(metadata.size).map_err(|e| {
-            Error::CheckpointWrite(format!(
-                "Failed to convert checkpoint size in bytes from u64 {} to i64: {}, when writing _last_checkpoint",
-                metadata.size, e
-            ))
-        })?;
 
         let data = create_last_checkpoint_data(
             engine,
             self.version,
-            checkpoint_iter_state.actions_count(),
-            checkpoint_iter_state.add_actions_count(),
-            size_in_bytes,
+            last_checkpoint_stats.num_actions,
+            last_checkpoint_stats.num_of_add_files,
+            last_checkpoint_stats.size_in_bytes,
         );
 
         let last_checkpoint_path = LastCheckpointHint::path(&self.snapshot.log_segment().log_root)?;
@@ -446,6 +599,111 @@ impl CheckpointWriter {
         )?;
 
         Ok(())
+    }
+
+    pub(crate) fn write_v2_checkpoint_with_sidecars(
+        &self,
+        engine: &dyn Engine,
+        file_actions_per_sidecar_hint: usize,
+    ) -> DeltaResult<WrittenCheckpointInfo> {
+        let output_schema = self.get_or_init_output_schema(|| {
+            let ctx = self.checkpoint_schema_context(engine)?;
+            build_checkpoint_output_schema(
+                &ctx.stats_config,
+                &ctx.checkpoint_base_schema,
+                &ctx.stats_schema,
+                ctx.partition_schema.as_deref(),
+            )
+        })?;
+        let data_iter = self.checkpoint_data(engine)?;
+        let iter_state = data_iter.state();
+
+        let splitter = SidecarSplitter::new_mut_shared(
+            data_iter,
+            engine.evaluation_handler().as_ref(),
+            output_schema.clone(),
+        )?;
+
+        // Write sidecar files
+        let mut sidecar_metas: Vec<(String, FileMeta)> = Vec::new();
+        loop {
+            if let Some(entry) = write_single_sidecar(
+                engine,
+                &splitter,
+                file_actions_per_sidecar_hint,
+                self.snapshot.table_root(),
+                self.snapshot.version(),
+            )? {
+                sidecar_metas.push(entry);
+            }
+            let is_exhausted = splitter
+                .lock()
+                .map_err(|e| Error::internal_error(format!("sidecar splitter lock poisoned: {e}")))?
+                .is_exhausted();
+            if is_exhausted {
+                break;
+            }
+        }
+
+        // Collect non-file action batches(e.g., `protocol`, `metaData`, `txn`, etc.)
+        let non_file_batches = Arc::into_inner(splitter)
+            .ok_or_else(|| {
+                Error::internal_error("sidecar splitter Arc should have no other references")
+            })?
+            .into_inner()
+            .map_err(|e| Error::internal_error(format!("sidecar splitter lock poisoned: {e}")))?
+            .into_non_file_batches();
+
+        // Create sidecar action rows for the main checkpoint file. Each row populates only
+        // the `sidecar` column, e.g. `sidecar: { path: "<sidecar_filename>.parquet", sizeInBytes:
+        // <size>, modificationTime: <time>, tags: null }`, with all other action columns
+        // left null.
+        let sidecar_batch = create_sidecar_action_batch(engine, &output_schema, &sidecar_metas)?;
+
+        // Write main checkpoint file: non-file actions + sidecar references
+        let checkpoint_path = self.checkpoint_path()?;
+        let main_data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
+        engine
+            .parquet_handler()
+            .write_parquet_file(checkpoint_path.clone(), main_data)?;
+
+        // size_in_bytes covers the main checkpoint file plus all sidecar files.
+        let sidecar_sizes_sum = sidecar_metas
+            .iter()
+            .try_fold(0u64, |acc, (_, m)| acc.checked_add(m.size))
+            .ok_or_else(|| Error::internal_error("sidecar sizes sum overflowed u64"))?;
+        let sidecar_count = sidecar_metas.len() as u64;
+        build_written_checkpoint_info(
+            engine,
+            &checkpoint_path,
+            iter_state,
+            sidecar_sizes_sum,
+            sidecar_count,
+        )
+    }
+
+    /// Writes a checkpoint without sidecars, will automatically choose V1 or V2
+    /// based on the table features.
+    pub(crate) fn write_checkpoint_without_sidecars(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<WrittenCheckpointInfo> {
+        let checkpoint_path = self.checkpoint_path()?;
+        let data_iter = self.checkpoint_data(engine)?;
+        let state = data_iter.state();
+        let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
+        engine
+            .parquet_handler()
+            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
+
+        build_written_checkpoint_info(
+            engine,
+            &checkpoint_path,
+            state,
+            0, /* sidecar_sizes_sum */
+            0, /* sidecar_count */
+        )
     }
 
     /// Creates the checkpoint metadata action for V2 checkpoints.
@@ -504,6 +762,42 @@ impl CheckpointWriter {
             add_actions_count: 0,
         })
     }
+
+    /// Helper for computing the checkpoint schema context from the snapshot and engine.
+    fn checkpoint_schema_context(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<CheckpointSchemaContext> {
+        let tc = self.snapshot.table_configuration();
+        let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
+
+        // Select schema based on V2 checkpoint support
+        let is_v2 = tc.is_feature_supported(&TableFeature::V2Checkpoint);
+        let base_schema = if is_v2 {
+            CHECKPOINT_ACTIONS_SCHEMA_V2.clone()
+        } else {
+            CHECKPOINT_ACTIONS_SCHEMA_V1.clone()
+        };
+
+        // Get clustering columns so they are always included in stats per the Delta protocol.
+        let physical_clustering_columns = self.snapshot.get_physical_clustering_columns(engine)?;
+
+        // Get stats schema from table configuration.
+        // This already excludes partition columns and applies column mapping.
+        let stats_schema = tc
+            .build_expected_stats_schemas(physical_clustering_columns.as_deref(), None)?
+            .physical;
+
+        // Build partition schema for partitionValues_parsed (None for non-partitioned tables)
+        let partition_schema = tc.build_partition_values_parsed_schema();
+        Ok(CheckpointSchemaContext {
+            stats_config: config,
+            checkpoint_base_schema: base_schema,
+            stats_schema,
+            partition_schema,
+            is_v2,
+        })
+    }
 }
 
 /// Creates the data for the _last_checkpoint file containing checkpoint
@@ -545,4 +839,51 @@ pub(crate) fn create_last_checkpoint_data(
             add_actions_counter.into(),
         ],
     )
+}
+
+/// Writes one sidecar file. Returns `None` if the splitter yielded no rows for this sidecar.
+fn write_single_sidecar(
+    engine: &dyn Engine,
+    splitter: &Arc<Mutex<SidecarSplitter>>,
+    file_actions_per_sidecar_hint: usize,
+    table_root: &Url,
+    version: Version,
+) -> DeltaResult<Option<(String, FileMeta)>> {
+    let mut iter =
+        SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?.peekable();
+    if iter.peek().is_none() {
+        return Ok(None);
+    }
+    let (filename, sidecar_url) = path::new_sidecar(table_root, version)?;
+    engine
+        .parquet_handler()
+        .write_parquet_file(sidecar_url.clone(), Box::new(iter))?;
+    let meta = engine.storage_handler().head(&sidecar_url)?;
+    Ok(Some((filename, meta)))
+}
+
+fn build_written_checkpoint_info(
+    engine: &dyn Engine,
+    checkpoint_path: &Url,
+    state: Arc<ActionReconciliationIteratorState>,
+    sidecar_sizes_sum: u64,
+    sidecar_count: u64,
+) -> DeltaResult<WrittenCheckpointInfo> {
+    let file_meta = engine.storage_handler().head(checkpoint_path)?;
+    let total_size_in_bytes = file_meta
+        .size
+        .checked_add(sidecar_sizes_sum)
+        .ok_or_else(|| Error::internal_error("checkpoint total size_in_bytes overflowed u64"))?;
+    let state = Arc::into_inner(state).ok_or_else(|| {
+        Error::internal_error("ActionReconciliationIteratorState Arc has other references")
+    })?;
+    let last_checkpoint_stats = LastCheckpointHintStats::from_reconciliation_state(
+        state,
+        total_size_in_bytes,
+        sidecar_count,
+    )?;
+    Ok(WrittenCheckpointInfo {
+        file_meta,
+        last_checkpoint_stats,
+    })
 }

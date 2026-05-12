@@ -1,13 +1,12 @@
-use std::borrow::Cow;
+use std::borrow::{Cow, ToOwned};
 
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
-use crate::transforms::{map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else};
+use crate::transforms::{
+    map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
+    Carrier,
+};
 
-/// Generic framework for describing recursive bottom-up schema transforms. Transformations return
-/// `Option<Cow>` with the following semantics:
-/// * `Some(Cow::Owned)` -- The schema element was transformed and should propagate to its parent.
-/// * `Some(Cow::Borrowed)` -- The schema element was not transformed.
-/// * `None` -- The schema element was filtered out and the parent should no longer reference it.
+/// Generic framework for describing recursive bottom-up schema transforms.
 ///
 /// The transform can start from whatever schema element is available
 /// (e.g. [`Self::transform_struct`] to start with [`StructType`]), or it can start from the generic
@@ -32,68 +31,103 @@ use crate::transforms::{map_owned_children_or_else, map_owned_or_else, map_owned
 /// * Binary (two children) - If either child was filtered out, filter out the parent. If at least
 ///   one child changed, build a new parent around them. Otherwise, return the parent unchanged.
 ///
-/// * Variadic (0+ children) - If no children remain (all filtered out), filter out the
-///   parent. Otherwise, if at least one child changed or was filtered out, build a new parent around
-///   the children. Otherwise, return the parent unchanged.
+/// * Variadic (0+ children) - If no children remain (all filtered out), filter out the parent.
+///   Otherwise, if at least one child changed or was filtered out, build a new parent around the
+///   children. Otherwise, return the parent unchanged.
 ///
 /// Implementations can call these as needed, but will generally not need to override them.
+///
+/// # Transform carrier selection
+///
+/// Implementations choose an output [`Carrier`] instance based on the operation to be
+/// performed. That carrier determines the return type of each transform method.
+///
+/// For example, a simple read-only visitor would use `()` as a carrier, while a validity checker
+/// could use `DeltaResult<()>` instead. A mutating transform uses `Cow<_>`, returning `Cow::Owned`
+/// for changed/replaced nodes, and a filtering transform uses `Option<Cow<_>>`, where `None`
+/// indicates the node should be dropped rather than replaced. `DeltaResult<Cow<_>>` and
+/// `Result<Option<Cow<_>>, E>` round out the set as fallible mutating and fitering transforms that
+/// short circuit immediately upon `Err`.
 pub trait SchemaTransform<'a> {
+    /// [`Carrier`] output type for transformed nodes.
+    ///
+    /// Implementations can use [`crate::transforms::transform_output_type`] to define `Output`
+    /// and `Residual` together.
+    type Output<T: ToOwned + ?Sized + 'a>: Carrier<'a, T, Residual = Self::Residual>;
+
+    /// Residual type propagated by this transform's output [`Carrier`]. This type is statically
+    /// derivable, but still required due to limitations in rust type system expressiveness.
+    ///
+    /// Implementations can use [`crate::transforms::transform_output_type`] to define `Output`
+    /// and `Residual` together. Or, define it manually like this:
+    /// ```rust,no_run
+    /// # use std::borrow::Cow;
+    /// # use delta_kernel::transforms::SchemaTransform;
+    /// # use delta_kernel::transforms::Carrier;
+    /// # struct X;
+    /// # impl<'a> SchemaTransform<'a> for X {
+    /// #     type Output<T: std::borrow::ToOwned + ?Sized + 'a> = Cow<'a, T>;
+    /// type Residual = <Self::Output<()> as Carrier<'a, ()>>::Residual;
+    /// # }
+    /// ```
+    type Residual;
+
     /// Called for each primitive encountered during the traversal (leaf).
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        Some(Cow::Borrowed(ptype))
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Self::Output<PrimitiveType> {
+        Carrier::from_inner(Cow::Borrowed(ptype))
     }
 
     /// Called for each struct encountered during the traversal. The provided implementation just
     /// forwards to [`Self::recurse_into_struct`].
-    fn transform_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+    fn transform_struct(&mut self, stype: &'a StructType) -> Self::Output<StructType> {
         self.recurse_into_struct(stype)
     }
 
     /// Called for each struct field encountered during the traversal. The provided implementation
     /// forwards to [`Self::recurse_into_struct_field`].
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Self::Output<StructField> {
         self.recurse_into_struct_field(field)
     }
 
     /// Called for each array encountered during the traversal. The provided implementation just
     /// forwards to [`Self::recurse_into_array`].
-    fn transform_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+    fn transform_array(&mut self, atype: &'a ArrayType) -> Self::Output<ArrayType> {
         self.recurse_into_array(atype)
     }
 
     /// Called for each array element type encountered during the traversal. The provided
     /// implementation forwards to [`Self::transform`].
-    fn transform_array_element(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
+    fn transform_array_element(&mut self, etype: &'a DataType) -> Self::Output<DataType> {
         self.transform(etype)
     }
 
     /// Called for each map encountered during the traversal. The provided implementation just
     /// forwards to [`Self::recurse_into_map`].
-    fn transform_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
+    fn transform_map(&mut self, mtype: &'a MapType) -> Self::Output<MapType> {
         self.recurse_into_map(mtype)
     }
 
     /// Called for each map key encountered during the traversal. The provided implementation
     /// forwards to [`Self::transform`].
-    fn transform_map_key(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
+    fn transform_map_key(&mut self, etype: &'a DataType) -> Self::Output<DataType> {
         self.transform(etype)
     }
 
     /// Called for each map value encountered during the traversal. The provided implementation
     /// forwards to [`Self::transform`].
-    fn transform_map_value(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
+    fn transform_map_value(&mut self, etype: &'a DataType) -> Self::Output<DataType> {
         self.transform(etype)
     }
 
     /// Called for each variant value encountered. The provided implementation just
     /// forwards to [`Self::recurse_into_struct`].
-    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+    fn transform_variant(&mut self, stype: &'a StructType) -> Self::Output<StructType> {
         self.recurse_into_struct(stype)
     }
 
     /// General entry point for a recursive traversal over any data type. Also invoked internally to
     /// dispatch on nested data types encountered during the traversal.
-    fn transform(&mut self, data_type: &'a DataType) -> Option<Cow<'a, DataType>> {
+    fn transform(&mut self, data_type: &'a DataType) -> Self::Output<DataType> {
         match data_type {
             DataType::Primitive(ptype) => {
                 let child = self.transform_primitive(ptype);
@@ -119,10 +153,7 @@ pub trait SchemaTransform<'a> {
     }
 
     /// Recursively transforms a struct field's data type (unary).
-    fn recurse_into_struct_field(
-        &mut self,
-        field: &'a StructField,
-    ) -> Option<Cow<'a, StructField>> {
+    fn recurse_into_struct_field(&mut self, field: &'a StructField) -> Self::Output<StructField> {
         let child = self.transform(&field.data_type);
         map_owned_or_else(field, child, |new_data_type| StructField {
             name: field.name.clone(),
@@ -133,13 +164,13 @@ pub trait SchemaTransform<'a> {
     }
 
     /// Recursively transforms a struct's fields (variadic).
-    fn recurse_into_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+    fn recurse_into_struct(&mut self, stype: &'a StructType) -> Self::Output<StructType> {
         let children = stype.fields().map(|f| self.transform_struct_field(f));
         map_owned_children_or_else(stype, children, StructType::new_unchecked)
     }
 
     /// Recursively transforms an array's element type (unary).
-    fn recurse_into_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+    fn recurse_into_array(&mut self, atype: &'a ArrayType) -> Self::Output<ArrayType> {
         let child = self.transform_array_element(&atype.element_type);
         map_owned_or_else(atype, child, |element_type| ArrayType {
             type_name: atype.type_name.clone(),
@@ -149,7 +180,7 @@ pub trait SchemaTransform<'a> {
     }
 
     /// Recursively transforms a map's key and value types (binary).
-    fn recurse_into_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
+    fn recurse_into_map(&mut self, mtype: &'a MapType) -> Self::Output<MapType> {
         let key_type = self.transform_map_key(&mtype.key_type);
         let value_type = self.transform_map_value(&mtype.value_type);
         let f = |(key_type, value_type)| MapType {
@@ -191,38 +222,38 @@ impl SchemaDepthChecker {
         (checker.max_depth_seen, checker.call_count)
     }
 
-    // Triggers the requested recursion only doing so would not exceed the depth limit.
-    fn depth_limited<'a, T: Clone + std::fmt::Debug>(
+    // Triggers the requested recursion only if doing so would not exceed the depth limit.
+    // If the next step would exceed the limit, short-circuit the traversal.
+    fn depth_limited<'a, T: ToOwned + std::fmt::Debug + ?Sized>(
         &mut self,
-        recurse: impl FnOnce(&mut Self, &'a T) -> Option<Cow<'a, T>>,
+        recurse: impl FnOnce(&mut Self, &'a T) -> Result<(), ()>,
         arg: &'a T,
-    ) -> Option<Cow<'a, T>> {
+    ) -> Result<(), ()> {
         self.call_count += 1;
-        if self.max_depth_seen < self.current_depth {
-            self.max_depth_seen = self.current_depth;
-            if self.depth_limit < self.current_depth {
-                tracing::warn!("Max schema depth {} exceeded by {arg:?}", self.depth_limit);
-            }
+        self.max_depth_seen = self.max_depth_seen.max(self.current_depth);
+        if self.current_depth > self.depth_limit {
+            tracing::warn!("Max schema depth {} exceeded by {arg:?}", self.depth_limit);
+            return Err(());
         }
-        if self.max_depth_seen <= self.depth_limit {
-            self.current_depth += 1;
-            let _ = recurse(self, arg);
-            self.current_depth -= 1;
-        }
-        None
+        self.current_depth += 1;
+        let result = recurse(self, arg);
+        self.current_depth -= 1;
+        result
     }
 }
 impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
-    fn transform_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+    transform_output_type!(|'a, T| Result<(), ()>);
+
+    fn transform_struct(&mut self, stype: &'a StructType) -> Result<(), ()> {
         self.depth_limited(Self::recurse_into_struct, stype)
     }
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), ()> {
         self.depth_limited(Self::recurse_into_struct_field, field)
     }
-    fn transform_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+    fn transform_array(&mut self, atype: &'a ArrayType) -> Result<(), ()> {
         self.depth_limited(Self::recurse_into_array, atype)
     }
-    fn transform_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
+    fn transform_map(&mut self, mtype: &'a MapType) -> Result<(), ()> {
         self.depth_limited(Self::recurse_into_map, mtype)
     }
 }
@@ -304,19 +335,16 @@ mod tests {
         let check_with_call_count =
             |depth_limit| SchemaDepthChecker::check_with_call_count(&schema, depth_limit);
 
-        // Hit depth limit at "a" but still have to look at "b" "c" "d"
-        assert_eq!(check_with_call_count(1), (2, 5));
-        assert_eq!(check_with_call_count(2), (3, 6));
+        // Short-circuit when the first over-limit node is encountered.
+        assert_eq!(check_with_call_count(1), (2, 3));
+        assert_eq!(check_with_call_count(2), (3, 4));
 
-        // Hit depth limit at "w" but still have to look at "x" "y" "z"
-        assert_eq!(check_with_call_count(3), (4, 10));
-        assert_eq!(check_with_call_count(4), (5, 11));
+        assert_eq!(check_with_call_count(3), (4, 5));
+        assert_eq!(check_with_call_count(4), (5, 7));
 
-        // Depth limit hit at "n" but still have to look at "m"
-        assert_eq!(check_with_call_count(5), (6, 15));
+        assert_eq!(check_with_call_count(5), (6, 12));
 
-        // Depth limit not hit until "u"
-        assert_eq!(check_with_call_count(6), (7, 28));
+        assert_eq!(check_with_call_count(6), (7, 24));
 
         // Depth limit not hit (full traversal required)
         assert_eq!(check_with_call_count(7), (7, 32));

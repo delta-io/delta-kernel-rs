@@ -117,8 +117,6 @@ pub fn get_final_required_properties_for_uc(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::sync::Arc;
 
     use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
@@ -129,6 +127,8 @@ mod tests {
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
     use delta_kernel::{DeltaResult, Engine, FileMeta, FilteredEngineData};
+
+    use super::*;
 
     /// A mock catalog committer that writes directly to the published path.
     struct MockCatalogCommitter;
@@ -171,7 +171,7 @@ mod tests {
         let table_path = "memory:///test_table/";
         let schema = Arc::new(
             StructType::try_new(vec![
-                StructField::new("id", DataType::INTEGER, false),
+                StructField::new("id", DataType::INTEGER, true),
                 StructField::new("region", DataType::STRING, true),
             ])
             .unwrap(),
@@ -187,7 +187,10 @@ mod tests {
             .commit(&engine)
             .unwrap();
 
-        let snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(table_path)
+            .with_max_catalog_version(0)
+            .build(&engine)
+            .unwrap();
         assert_eq!(snapshot.version(), 0);
         let uc_props = get_final_required_properties_for_uc(&snapshot, &engine).unwrap();
 
@@ -229,7 +232,7 @@ mod tests {
         ]);
         let schema = Arc::new(
             StructType::try_new(vec![
-                StructField::new("id", DataType::INTEGER, false),
+                StructField::new("id", DataType::INTEGER, true),
                 StructField::new("region", DataType::STRING, true),
                 StructField::new("address", DataType::Struct(Box::new(address_struct)), true),
             ])
@@ -252,7 +255,10 @@ mod tests {
             .commit(&engine)
             .unwrap();
 
-        let snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(table_path)
+            .with_max_catalog_version(0)
+            .build(&engine)
+            .unwrap();
         let uc_props = get_final_required_properties_for_uc(&snapshot, &engine).unwrap();
 
         // Clustering columns serialized as array of path arrays:
@@ -272,7 +278,7 @@ mod tests {
         let engine = DefaultEngineBuilder::new(storage).build();
         let table_path = "memory:///test_version_check/";
         let schema = Arc::new(
-            StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)]).unwrap(),
+            StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap(),
         );
 
         // Create a table (version 0) and append (version 1)
@@ -283,7 +289,10 @@ mod tests {
             .unwrap()
             .commit(&engine)
             .unwrap();
-        let v0_snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
+        let v0_snapshot = Snapshot::builder_for(table_path)
+            .with_max_catalog_version(0)
+            .build(&engine)
+            .unwrap();
         let result = v0_snapshot
             .transaction(Box::new(MockCatalogCommitter), &engine)
             .unwrap()
@@ -292,7 +301,10 @@ mod tests {
         assert!(result.is_committed());
 
         // Load snapshot at version 1
-        let snapshot = Snapshot::builder_for(table_path).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(table_path)
+            .with_max_catalog_version(1)
+            .build(&engine)
+            .unwrap();
         assert_eq!(snapshot.version(), 1);
 
         // Should fail because version != 0

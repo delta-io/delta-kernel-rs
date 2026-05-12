@@ -13,8 +13,8 @@ use crate::{KernelStringSlice, TryFromStringSlice};
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct LogPathArray {
-    /// Pointer to the first element of the FfiLogPath array. If len is 0, this pointer may be null,
-    /// otherwise it must be non-null.
+    /// Pointer to the first element of the FfiLogPath array. If len is 0, this pointer may be
+    /// null, otherwise it must be non-null.
     pub ptr: *const FfiLogPath,
     /// Number of elements in the array
     pub len: usize,

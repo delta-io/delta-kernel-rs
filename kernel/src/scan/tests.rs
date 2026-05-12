@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-
 use rstest::rstest;
 
+use super::*;
 use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
@@ -21,12 +21,9 @@ use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
 use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{
-    Engine, EvaluationHandler, FileDataReadResultIterator, FileMeta, JsonHandler, ParquetFooter,
-    ParquetHandler, PredicateRef, StorageHandler,
+    Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, JsonHandler,
+    ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
 };
-use crate::{EngineData, Snapshot};
-
-use super::*;
 
 /// Helper macro to extract a typed column from a RecordBatch or StructArray.
 macro_rules! get_column {
@@ -846,7 +843,7 @@ fn test_prefix_columns_simple() {
     };
     // A simple binary predicate: x > 100
     let pred = Pred::gt(column_expr!("x"), Expr::literal(100i64));
-    let result = prefixer.transform_pred(&pred).unwrap().into_owned();
+    let result = prefixer.transform_pred(&pred).into_owned();
 
     // The column reference should now be add.stats_parsed.x
     let refs: Vec<_> = result.references().into_iter().collect();
@@ -1044,12 +1041,7 @@ fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
     let mut prefixer = PrefixColumns {
         prefix: ColumnName::new(["add", "stats_parsed"]),
     };
-    Some(
-        prefixer
-            .transform_pred(&skipping_pred)
-            .unwrap()
-            .into_owned(),
-    )
+    Some(prefixer.transform_pred(&skipping_pred).into_owned())
 }
 
 /// Applies a meta predicate as a row group filter and returns the total rows read.
@@ -1381,7 +1373,8 @@ fn test_scan_metadata_with_multiple_stats_columns() {
     }
 }
 
-/// Test that `with_stats_columns` with a nonexistent column name produces empty stats for that column.
+/// Test that `with_stats_columns` with a nonexistent column name produces empty stats for that
+/// column.
 #[test]
 fn test_scan_metadata_with_nonexistent_stats_columns() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
@@ -1515,30 +1508,37 @@ fn execute_does_not_error_when_parquet_returns_empty_and_stats_absent() {
     );
 }
 
-/// Tests for ScanMetadataCompleted event emission
+/// Tests for `ScanMetadataCompleted` event emission via the tracing-based metrics system.
 mod scan_metadata_completed_tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
 
     use rstest::rstest;
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
     use crate::engine::default::DefaultEngineBuilder;
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
-    use crate::metrics::MetricEvent;
+    use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
     use crate::object_store::local::LocalFileSystem;
     use crate::utils::test_utils::CapturingReporter;
     use crate::Snapshot;
 
-    fn run_scan(table: &str, predicate: Option<Arc<Pred>>) -> (Arc<CapturingReporter>, usize) {
+    fn run_scan(
+        table: &str,
+        predicate: Option<Arc<Pred>>,
+    ) -> (
+        Arc<CapturingReporter>,
+        tracing::subscriber::DefaultGuard,
+        usize,
+    ) {
         let path = std::fs::canonicalize(PathBuf::from(table)).unwrap();
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
-        let engine = Arc::new(
-            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
-                .with_metrics_reporter(reporter.clone())
-                .build(),
-        );
+        let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
+        let guard = tracing_subscriber::registry()
+            .with_metrics_reporter_layer(reporter.clone())
+            .set_default();
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let mut builder = snapshot.scan_builder();
         if let Some(pred) = predicate {
@@ -1550,7 +1550,7 @@ mod scan_metadata_completed_tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        (reporter, results.len())
+        (reporter, guard, results.len())
     }
 
     fn get_scan_event(reporter: &CapturingReporter) -> MetricEvent {
@@ -1572,7 +1572,7 @@ mod scan_metadata_completed_tests {
         0
     )]
     #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 2, 0)]
-    #[case::with_removes("./tests/data/with_checkpoint_no_last_checkpoint/", None, 2, 1, 1, 0)]
+    #[case::with_checkpoint("./tests/data/with_checkpoint_no_last_checkpoint/", None, 2, 1, 1, 0)]
     #[case::partition_filter(
         "./tests/data/basic_partitioned/",
         Some(Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))),
@@ -1586,7 +1586,7 @@ mod scan_metadata_completed_tests {
         #[case] expected_removes: u64,
         #[case] expected_filtered: u64,
     ) {
-        let (reporter, _) = run_scan(table, predicate);
+        let (reporter, _guard, _) = run_scan(table, predicate);
         let MetricEvent::ScanMetadataCompleted {
             total_duration,
             num_add_files_seen,
@@ -1606,20 +1606,20 @@ mod scan_metadata_completed_tests {
     }
 
     #[test]
-    fn test_no_metrics_on_early_drop() {
+    fn scan_metadata_completed_not_emitted_on_early_drop() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
-        let engine = Arc::new(
-            DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
-                .with_metrics_reporter(reporter.clone())
-                .build(),
-        );
+        let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
+        let _guard = tracing_subscriber::registry()
+            .with_metrics_reporter_layer(reporter.clone())
+            .set_default();
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
         {
             let mut iter = scan.scan_metadata(engine.as_ref()).unwrap();
             let _ = iter.next();
+            // Drop without exhausting -- callback must not fire
         }
         assert!(reporter
             .events()

@@ -28,8 +28,7 @@ use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
-use crate::engine::arrow_utils::parse_json_impl;
-use crate::engine::arrow_utils::prim_array_cmp;
+use crate::engine::arrow_utils::{parse_json_impl, prim_array_cmp};
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
@@ -129,7 +128,8 @@ fn evaluate_struct_expression(
             ArrowField::new(
                 output_field.name(),
                 output_col.data_type().clone(),
-                output_field.nullable, // Use schema's nullability; Arrow will validate any mismatch
+                output_field.nullable, /* Use schema's nullability; Arrow will validate any
+                                        * mismatch */
             )
         })
         .collect();
@@ -265,15 +265,7 @@ pub fn evaluate_expression(
         (Literal(scalar), _) => {
             validate_array_type(scalar.to_array(batch.num_rows())?, result_type)
         }
-        (Column(name), _) => {
-            // Column extraction uses ordinal-based struct validation because column mapping
-            // can cause physical/logical name mismatches. apply_schema handles renaming.
-            let arr = extract_column(batch, name)?;
-            if let Some(expected) = result_type {
-                ensure_data_types(expected, arr.data_type(), ValidationMode::TypesOnly)?;
-            }
-            Ok(arr)
-        }
+        (Column(name), _) => validate_array_type(extract_column(batch, name)?, result_type),
         (Struct(fields, nullability), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_expression(fields, batch, output_schema, nullability.as_ref())
         }
@@ -456,8 +448,9 @@ fn cast_list_elements(
     Ok(cast(vals, &container)?)
 }
 
-/// This function converts ArrowView types to their non-view type equivalents. This is used for [`evaluate_predicate`] conversion,  
-/// currently does not support nested conversion. This only supports limited conversions (see code for exactly which).
+/// This function converts ArrowView types to their non-view type equivalents. This is used for
+/// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
+/// supports limited conversions (see code for exactly which).
 fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToNonView),
@@ -472,8 +465,9 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn A
     }
 }
 
-/// This function converts  Arrow types to their Arrow view type equivalents. This is used for [`evaluate_predicate`] conversion,  
-/// currently does not support nested conversion. This only supports limited conversions (see code for exactly which).  
+/// This function converts  Arrow types to their Arrow view type equivalents. This is used for
+/// [`evaluate_predicate`] conversion, currently does not support nested conversion. This only
+/// supports limited conversions (see code for exactly which).
 fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> DeltaResult<Arc<dyn Array>> {
     match vals.data_type() {
         ArrowDataType::List(field) => cast_list_elements(&vals, field, ViewCast::ToView),
@@ -607,8 +601,9 @@ pub fn evaluate_predicate(
             let right = evaluate_expression(right, batch, None)?;
 
             // If the types differ (e.g. one side is a view type and the other is not),
-            // normalize both to view types since benchamrking results show that casting from non-view to view type is faster
-            // than casting from view type to non-view type.
+            // normalize both to view types since benchamrking results show that casting from
+            // non-view to view type is faster than casting from view type to non-view
+            // type.
             let (left, right) = if left.data_type() == right.data_type() {
                 (left, right)
             } else {
@@ -720,7 +715,8 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
 /// are null for a given row, the result will be null for that row.
 ///
 /// # Parameters
-/// - `arrays`: Slice of Arrow arrays to coalesce. Must not be empty and all arrays must have the same data type.
+/// - `arrays`: Slice of Arrow arrays to coalesce. Must not be empty and all arrays must have the
+///   same data type.
 /// - `result_type`: Optional expected result type. If provided, must match the arrays' data type.
 ///
 /// # Returns
@@ -898,10 +894,22 @@ fn evaluate_map_to_struct(
         .map(|f| ArrowField::try_from_kernel(*f))
         .try_collect()?;
 
+    // Propagate the input map's null bitmap to the output struct. This is critical:
+    // when a map row is null, the loop above appends null to every child builder
+    // (since no keys match). Without this null bitmap, the output struct row appears
+    // valid (non-null) to Arrow, but its children contain nulls. If any child field
+    // is non-nullable, Arrow rejects this as "Found unmasked nulls for non-nullable
+    // StructArray field". With the bitmap, the struct row is marked null, which masks
+    // the child nulls and satisfies Arrow's validation.
+    //
+    // This matters during checkpoint creation: the COALESCE expression evaluates
+    // MAP_TO_STRUCT for all rows including non-add actions (remove, metadata, protocol)
+    // where the partition values map is null. Partition columns declared NOT NULL would
+    // cause the checkpoint to fail without this propagation.
     Ok(StructArray::try_new(
         arrow_fields.into(),
         output_columns,
-        None,
+        map_array.nulls().cloned(),
     )?)
 }
 
@@ -914,19 +922,23 @@ fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaRes
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use rstest::rstest;
+
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray, StructArray,
+        ArrayRef, BooleanArray, Int32Array, Int64Array, MapBuilder, StringArray, StringBuilder,
+        StructArray,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
-    use crate::expressions::column_expr;
-    use crate::expressions::{column_expr_ref, BinaryExpressionOp, Expression as Expr, Transform};
+    use crate::expressions::{
+        column_expr, column_expr_ref, BinaryExpressionOp, Expression as Expr, Transform,
+    };
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
-    use rstest::rstest;
-    use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {
         let schema = ArrowSchema::new(vec![
@@ -1964,8 +1976,6 @@ mod tests {
 
     /// Helper: creates a RecordBatch with a `pv` column of type Map<String, String>.
     fn create_partition_map_batch() -> RecordBatch {
-        use crate::arrow::array::{MapBuilder, StringBuilder};
-
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
 
         // Row 0: {"date": "2024-01-15", "region": "us", "id": "42"}
@@ -2066,8 +2076,6 @@ mod tests {
 
     #[test]
     fn test_map_to_struct_parse_error() {
-        use crate::arrow::array::{MapBuilder, StringBuilder};
-
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("count");
         builder.values().append_value("not_a_number");
@@ -2091,8 +2099,6 @@ mod tests {
 
     #[test]
     fn test_map_to_struct_duplicate_keys() {
-        use crate::arrow::array::{MapBuilder, StringBuilder};
-
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("x");
         builder.values().append_value("first");
@@ -2121,6 +2127,98 @@ mod tests {
             .unwrap();
         // Rightmost entry wins
         assert_eq!(col.value(0), "last");
+    }
+
+    #[rstest]
+    #[case::mixed_nulls(
+        vec![
+            Some(vec![("region", "us"), ("id", "42")]),
+            None,
+            Some(vec![("region", "eu"), ("id", "7")]),
+        ],
+        vec![true, false, true],
+    )]
+    #[case::all_nulls(vec![None, None], vec![false, false])]
+    fn test_map_to_struct_null_propagation_with_non_nullable_fields(
+        #[case] rows: Vec<Option<Vec<(&str, &str)>>>,
+        #[case] expected_validity: Vec<bool>,
+    ) {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for row in &rows {
+            match row {
+                Some(entries) => {
+                    for (k, v) in entries {
+                        builder.keys().append_value(k);
+                        builder.values().append_value(v);
+                    }
+                    builder.append(true).unwrap();
+                }
+                None => {
+                    builder.append(false).unwrap();
+                }
+            }
+        }
+        let map_array = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "pv",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::new("region", DataType::STRING, false),
+            StructField::new("id", DataType::INTEGER, false),
+        ]);
+        let result_type = DataType::Struct(Box::new(output_schema));
+        let expr = Expr::map_to_struct(column_expr!("pv"));
+        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+
+        assert_eq!(structs.len(), expected_validity.len());
+        for (i, &valid) in expected_validity.iter().enumerate() {
+            assert_eq!(structs.is_valid(i), valid, "row {i} validity mismatch");
+        }
+    }
+
+    #[test]
+    fn test_coalesce_map_to_struct_with_null_map_non_nullable_fields() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("date");
+        builder.values().append_value("2024-01-15");
+        builder.append(true).unwrap();
+        builder.append(false).unwrap();
+
+        let map_array = builder.finish();
+        let map_type = map_array.data_type().clone();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "pv_parsed",
+                ArrowDataType::Struct(
+                    vec![ArrowField::new("date", ArrowDataType::Date32, false)].into(),
+                ),
+                true,
+            ),
+            ArrowField::new("pv", map_type, true),
+        ]));
+
+        let pv_parsed = new_null_array(schema.field(0).data_type(), 2);
+        let batch = RecordBatch::try_new(schema, vec![pv_parsed, Arc::new(map_array)]).unwrap();
+
+        let output_schema =
+            StructType::new_unchecked(vec![StructField::new("date", DataType::DATE, false)]);
+        let result_type = DataType::Struct(Box::new(output_schema));
+        let expr = Expr::coalesce([
+            Expr::column(["pv_parsed"]),
+            Expr::map_to_struct(column_expr!("pv")),
+        ]);
+        let result = evaluate_expression(&expr, &batch, Some(&result_type)).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+
+        // Row 0: pv_parsed null, MAP_TO_STRUCT succeeds
+        assert!(structs.is_valid(0));
+        // Row 1: pv_parsed null, map null → null struct
+        assert!(structs.is_null(1));
     }
 
     #[test]
@@ -2290,7 +2388,7 @@ mod tests {
     }
 
     #[test]
-    fn column_extract_struct_with_mismatched_field_names() {
+    fn column_extract_struct_rejects_mismatched_field_names() {
         let batch = make_struct_batch(
             vec![
                 ArrowField::new("col-abc-001", ArrowDataType::Int64, true),
@@ -2302,7 +2400,6 @@ mod tests {
             ],
         );
 
-        // Logical names differ from physical names due to column mapping
         let logical_type = DataType::try_struct_type([
             StructField::nullable("my_column", DataType::LONG),
             StructField::nullable("other_column", DataType::LONG),
@@ -2311,39 +2408,15 @@ mod tests {
 
         let expr = column_expr!("stats");
         let result = evaluate_expression(&expr, &batch, Some(&logical_type));
-
-        // Ordinal-based validation passes: same field count and types by position.
-        // The downstream apply_schema transformation handles renaming.
-        let arr = result.expect("should succeed with mismatched names but matching types");
-        let struct_arr = arr.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_arr.num_columns(), 2);
-        assert_eq!(struct_arr.len(), 2);
-    }
-
-    #[test]
-    fn column_extract_struct_rejects_mismatched_field_count() {
-        let batch = make_struct_batch(
-            vec![ArrowField::new("col-abc-001", ArrowDataType::Int64, true)],
-            vec![Arc::new(Int64Array::from(vec![Some(1), Some(2)]))],
-        );
-
-        let logical_type = DataType::try_struct_type([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-        ])
-        .unwrap();
-
-        let expr = column_expr!("stats");
-        let result = evaluate_expression(&expr, &batch, Some(&logical_type));
-        assert_result_error_with_message(result, "Struct field count mismatch");
+        assert_result_error_with_message(result, "Missing Struct fields");
     }
 
     #[test]
     fn column_extract_struct_rejects_mismatched_child_types() {
         let batch = make_struct_batch(
             vec![
-                ArrowField::new("col-abc-001", ArrowDataType::Int64, true),
-                ArrowField::new("col-abc-002", ArrowDataType::Utf8, true),
+                ArrowField::new("a", ArrowDataType::Int64, true),
+                ArrowField::new("b", ArrowDataType::Utf8, true),
             ],
             vec![
                 Arc::new(Int64Array::from(vec![Some(1)])),
@@ -2351,7 +2424,6 @@ mod tests {
             ],
         );
 
-        // Expect two LONG columns, but the second arrow field is Utf8
         let logical_type = DataType::try_struct_type([
             StructField::nullable("a", DataType::LONG),
             StructField::nullable("b", DataType::LONG),
@@ -2364,7 +2436,7 @@ mod tests {
     }
 
     #[test]
-    fn column_extract_struct_with_matching_names_still_works() {
+    fn column_extract_struct_with_matching_names_works() {
         let batch = make_struct_batch(
             vec![
                 ArrowField::new("a", ArrowDataType::Int64, true),
@@ -2387,15 +2459,11 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// Exercises the exact code path from `get_add_transform_expr` where a `struct_from`
-    /// expression wraps `column_expr!("add.stats_parsed")`. When the checkpoint parquet has
-    /// stats_parsed with physical column names (e.g. `col-abc-001`) but the output schema
-    /// uses logical names (e.g. `id`), `evaluate_struct_expression` calls
-    /// `evaluate_expression(Column, struct_result_type)` with mismatched field names.
-    /// Without ordinal-based validation this fails with a name mismatch error.
+    /// When a `struct_from` expression wraps a `Column` referencing stats_parsed, and the
+    /// checkpoint parquet has physical column names (e.g. `col-abc-001`) but the output schema
+    /// uses logical names (e.g. `id`), name-based validation correctly rejects the mismatch.
     #[test]
-    fn struct_from_with_column_tolerates_nested_name_mismatch() {
-        // Build a batch mimicking checkpoint data: add.stats_parsed uses physical names
+    fn struct_from_with_column_rejects_nested_name_mismatch() {
         let stats_fields: Vec<ArrowField> = vec![
             ArrowField::new("col-abc-001", ArrowDataType::Int64, true),
             ArrowField::new("col-abc-002", ArrowDataType::Int64, true),
@@ -2435,7 +2503,6 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(add_struct)]).unwrap();
 
-        // struct_from mimicking get_add_transform_expr: wraps a Column referencing stats_parsed
         let expr = Expr::struct_from([
             column_expr_ref!("add.path"),
             column_expr_ref!("add.stats_parsed"),
@@ -2455,36 +2522,6 @@ mod tests {
         .unwrap();
 
         let result = evaluate_expression(&expr, &batch, Some(&output_type));
-        result.expect("struct_from with Column sub-expression should tolerate field name mismatch");
-    }
-
-    #[test]
-    fn column_extract_nested_struct_with_mismatched_names() {
-        let inner_fields = vec![ArrowField::new("phys-inner", ArrowDataType::Int64, true)];
-        let inner_struct = ArrowDataType::Struct(inner_fields.clone().into());
-        let batch = make_struct_batch(
-            vec![ArrowField::new("phys-outer", inner_struct, true)],
-            vec![Arc::new(
-                StructArray::try_new(
-                    inner_fields.into(),
-                    vec![Arc::new(Int64Array::from(vec![Some(42)]))],
-                    None,
-                )
-                .unwrap(),
-            )],
-        );
-
-        let logical_type = DataType::try_struct_type([StructField::nullable(
-            "logical_outer",
-            DataType::struct_type_unchecked([StructField::nullable(
-                "logical_inner",
-                DataType::LONG,
-            )]),
-        )])
-        .unwrap();
-
-        let expr = column_expr!("stats");
-        let result = evaluate_expression(&expr, &batch, Some(&logical_type));
-        assert!(result.is_ok());
+        assert_result_error_with_message(result, "Missing Struct fields");
     }
 }

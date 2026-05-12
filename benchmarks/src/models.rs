@@ -1,15 +1,16 @@
 //! Data models for workload specifications
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use delta_kernel::actions::{Metadata, Protocol};
 use delta_kernel::schema::Schema;
 use serde::Deserialize;
 use url::Url;
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-
 /// ReadConfig represents a specific configuration for a read operation
-/// A config represents configurations for a specific benchmark that aren't specified in the spec JSON file
+/// A config represents configurations for a specific benchmark that aren't specified in the spec
+/// JSON file
 #[derive(Clone, Debug)]
 pub struct ReadConfig {
     pub name: String,
@@ -43,11 +44,12 @@ pub struct CatalogInfo {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableInfo {
-    /// Table name is a short identifier for the table (part of the final benchmark name), e.g. 100Adds0Chkpts
+    /// Table name is a short identifier for the table (part of the final benchmark name), e.g.
+    /// 100Adds0Chkpts
     pub name: String,
     /// Human-readable description of the table. Use this to capture context that the name alone
-    /// doesn't convey (e.g. "A table with 1 commit with 1M add actions. This includes a commit file
-    /// in the delta log, but no actual Parquet data files and no CRC files").
+    /// doesn't convey (e.g. "A table with 1 commit with 1M add actions. This includes a commit
+    /// file in the delta log, but no actual Parquet data files and no CRC files").
     /// The description is a free-form more verbose description for human readers.
     pub description: String,
     /// URL to the table. Used for remote tables (e.g. `s3://my-bucket/my-table`) or (rarely)
@@ -59,13 +61,15 @@ pub struct TableInfo {
     /// Whether to use `UCKernelClient` (catalog-managed) or standard snapshot builder is
     /// determined by the `delta.feature.catalogManaged` property.
     /// Mutually exclusive with `table_path`.
-    /// TODO(#2303): Create an enum type that ensures table_path and catalog_info are mutually exclusive
+    /// TODO(#2303): Create an enum type that ensures table_path and catalog_info are mutually
+    /// exclusive
     pub catalog_info: Option<CatalogInfo>,
     /// Schema at the latest version of the table, in Delta protocol JSON format
     /// e.g. `{"type": "struct", "fields": [...]}`
     pub schema: Schema,
     /// Delta protocol requirements at the latest version of the table
-    /// e.g. `{"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": [], "writerFeatures": []}`
+    /// e.g. `{"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": [],
+    /// "writerFeatures": []}`
     pub protocol: Protocol,
     /// Log-level statistics giving a quick overview of the table without requiring a full log
     /// replay. See [`LogInfo`] for field details.
@@ -94,7 +98,8 @@ impl TableInfo {
 
     pub fn resolved_table_root(&self) -> Url {
         self.table_path.clone().unwrap_or_else(|| {
-            // If table path is not provided, assume that the Delta table is in a delta/ subdirectory at the same level as tableInfo.json
+            // If table path is not provided, assume that the Delta table is in a delta/
+            // subdirectory at the same level as tableInfo.json
             Url::from_file_path(self.table_info_dir.join("delta"))
                 .expect("table_info_dir must be an absolute path")
         })
@@ -136,8 +141,9 @@ pub struct LogInfo {
     /// Version of the most recent CRC file, if any
     pub last_crc_version: Option<u64>,
     /// Number of part files in the most recent multi-part checkpoint, if any.
-    /// For classic multi-part checkpoints this is the number of parquet parts; for V2 checkpoints this is the number of sidecar files
-    /// For workloads that don't have multi-part checkpoints/sidecars, this is `None`
+    /// For classic multi-part checkpoints this is the number of parquet parts; for V2 checkpoints
+    /// this is the number of sidecar files For workloads that don't have multi-part
+    /// checkpoints/sidecars, this is `None`
     pub num_checkpoint_files: Option<u32>,
 }
 
@@ -170,24 +176,31 @@ pub enum DataLayout {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum TimeTravel {
-    Version { version: u64 },
+    /// Timetravel to a specific snapshot/read version specified by the workload JSON.
+    /// It is i64 so that negative values from the test spec can be deserialized correctly.
+    /// [`TimeTravel::as_version`] will reject values below zero.
+    Version { version: i64 },
+    /// Timetravel to a specific timestamp specified by the workload JSON.
+    /// (not yet supported)
     Timestamp { timestamp: String },
 }
 
 impl TimeTravel {
-    /// Returns the version if this is version-based time travel.
+    /// Returns the version if this is version-based time travel and the version is non-negative.
     ///
-    /// Returns an error message for timestamp-based time travel, which is not yet supported.
+    /// Returns an error for negative versions or for timestamp-based time travel (which is not
+    /// yet supported).
     pub fn as_version(&self) -> Result<u64, &'static str> {
         match self {
-            TimeTravel::Version { version } => Ok(*version),
+            TimeTravel::Version { version } => u64::try_from(*version)
+                .map_err(|_| "Only non-negative snapshot versions are supported"),
             TimeTravel::Timestamp { .. } => Err("Timestamp-based time travel is not yet supported"),
         }
     }
 }
 
-/// Spec defines the operation performed on a table - defines what operation at what version (e.g. read at version 0)
-/// There will be multiple specs for a given table
+/// Spec defines the operation performed on a table - defines what operation at what version (e.g.
+/// read at version 0) There will be multiple specs for a given table
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Spec {
@@ -322,8 +335,9 @@ pub struct Workload {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rstest::rstest;
+
+    use super::*;
 
     fn make_table_info(tags: &[&str]) -> TableInfo {
         let tags_json = serde_json::to_string(tags).unwrap();
@@ -490,10 +504,16 @@ mod tests {
         "snapshotConstruction",
         Some(7)
     )]
+    #[case(
+        r#"{"type": "snapshotConstruction", "version": -1}"#,
+        "snapshotConstruction",
+        Some(-1)
+    )]
+    #[case(r#"{"type": "read", "version": -1}"#, "read", Some(-1))]
     fn test_deserialize_spec(
         #[case] json: &str,
         #[case] expected_type: &str,
-        #[case] expected_version: Option<u64>,
+        #[case] expected_version: Option<i64>,
     ) {
         let spec: Spec = serde_json::from_str(json).expect("Failed to deserialize spec");
         assert_eq!(spec.as_str(), expected_type);
@@ -511,6 +531,15 @@ mod tests {
         };
 
         assert_eq!(version, expected_version);
+    }
+
+    #[test]
+    fn test_time_travel_as_version_rejects_negative() {
+        let tt = TimeTravel::Version { version: -1 };
+        assert_eq!(
+            tt.as_version(),
+            Err("Only non-negative snapshot versions are supported")
+        );
     }
 
     #[rstest]

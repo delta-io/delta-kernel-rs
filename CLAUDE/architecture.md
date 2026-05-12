@@ -28,7 +28,8 @@ properties, and version number.
 
 Built via `Snapshot::builder_for(url).build(engine)` (latest version) or
 `.at_version(v).build(engine)` (specific version). For catalog-managed tables,
-`.with_log_tail(commits)` supplies recent unpublished commits from the catalog.
+`.with_log_tail(commits)` supplies recent unpublished commits from the catalog and
+`.with_max_catalog_version(v)` caps the snapshot at the latest catalog-ratified version.
 
 **Snapshot loading internals:**
 1. **LogSegment** (`kernel/src/log_segment/`) -- discovers commits + checkpoints for the
@@ -63,14 +64,14 @@ set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and
 
 `Snapshot` -> `Transaction` -> commit
 
-The kernel coordinates the write transaction: it provides the write context (target directory,
-physical schema, stats columns), assembles commit actions (CommitInfo, Add files), enforces
-protocol compliance (table features, schema validation), and delegates the atomic commit to a
-`Committer`.
+The kernel coordinates the write transaction: it provides the write context (validated partition
+values, recommended write directory, physical schema, stats columns), assembles commit
+actions (CommitInfo, Add files), enforces protocol compliance (table features, schema validation),
+and delegates the atomic commit to a `Committer`.
 
 **Steps:**
 1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)
-2. Get `WriteContext` for target dir, physical schema, and stats columns
+2. Get `WriteContext` via `partitioned_write_context(values)` or `unpartitioned_write_context()`
 3. Write Parquet files (via engine), collect file metadata
 4. Register files via `txn.add_files(metadata)`
 5. Commit: returns `CommittedTransaction`, `ConflictedTransaction`, or `RetryableTransaction`
@@ -118,6 +119,8 @@ all returned batches -- the engine may split a single file across multiple batch
 - `kernel/src/snapshot/` -- `Snapshot`, `SnapshotBuilder`, entry point for reads/writes
 - `kernel/src/scan/` -- `Scan`, `ScanBuilder`, log replay, data skipping
 - `kernel/src/transaction/` -- `Transaction`, `WriteContext`, `create_table` builder
+- `kernel/src/partition/` -- partition value validation, serialization, Hive-style path
+   encoding, URI encoding for `add.path`
 - `kernel/src/committer/` -- `Committer` trait, `FileSystemCommitter`
 - `kernel/src/log_segment/` -- log file discovery, Protocol/Metadata replay
 - `kernel/src/log_replay.rs` -- file-action deduplication, `LogReplayProcessor` trait
@@ -129,7 +132,7 @@ all returned batches -- the engine may split a single file across multiple batch
   `column_expr!` macro
 - `kernel/src/transforms/` -- generic recursive transforms (`ExpressionTransform`,
   `SchemaTransform`)
-- `kernel/src/checkpoint/` -- checkpoint writing (V1 and V2 single-file classic-named)
+- `kernel/src/checkpoint/` -- classic-named checkpoint writing (V1; V2 with or without sidecars)
 - `kernel/src/table_configuration.rs` -- table metadata, properties, feature management
 - `kernel/src/table_features/` -- protocol feature definitions, `TableFeature` enum
 - `kernel/src/table_properties.rs` -- table property parsing (delta.appendOnly, etc.)
@@ -140,8 +143,8 @@ all returned batches -- the engine may split a single file across multiple batch
 
 Tables whose commits go through a catalog (e.g. Unity Catalog) instead of direct filesystem
 writes. Kernel doesn't know about catalogs -- the catalog client provides a log tail via
-`SnapshotBuilder::with_log_tail()` and a custom `Committer` for staging/ratifying/publishing
-commits.
+`SnapshotBuilder::with_log_tail()`, caps the version via `with_max_catalog_version()`, and
+uses a custom `Committer` for staging/ratifying/publishing commits.
 
 The `UCCommitter` (in the `delta-kernel-unity-catalog` crate) is the reference implementation of a catalog
 committer for Unity Catalog. It stages commits to `_staged_commits/`, calls the UC commit API to

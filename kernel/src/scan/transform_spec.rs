@@ -18,7 +18,8 @@ use crate::{DeltaResult, Error};
 /// A list of field transforms that describes a transform expression to be created at scan time.
 pub(crate) type TransformSpec = Vec<FieldTransformSpec>;
 
-/// Describes a single field transformation to apply when converting physical data to logical schema.
+/// Describes a single field transformation to apply when converting physical data to logical
+/// schema.
 ///
 /// These transformations are "sparse" - they only specify what changes, while unchanged fields
 /// pass through implicitly in their original order.
@@ -210,10 +211,11 @@ pub(crate) fn parse_partition_value_raw(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
-    use std::collections::HashMap;
 
     // Tests for parse_partition_value function
     #[test]
@@ -479,7 +481,8 @@ mod tests {
             panic!("Expected Transform expression");
         };
 
-        // Should not drop _change_type (doesn't exist physically) and insert metadata value after id
+        // Should not drop _change_type (doesn't exist physically) and insert metadata value after
+        // id
         assert!(!transform.field_transforms.contains_key("_change_type"));
 
         assert!(transform.field_transforms.contains_key("id"));

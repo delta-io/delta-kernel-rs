@@ -1,11 +1,11 @@
 //! File system committer for non-catalog-managed tables.
 
-use crate::{DeltaResult, Engine, Error, FileMeta, FilteredEngineData};
 use tracing::{info, instrument};
 
 use super::commit_types::{CommitMetadata, CommitResponse};
 use super::publish_types::PublishMetadata;
 use super::Committer;
+use crate::{DeltaResult, Engine, Error, FileMeta, FilteredEngineData};
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
 /// commits to a file system directly via `Engine::json_handler().write_json_file` for
@@ -85,11 +85,12 @@ impl Committer for FileSystemCommitter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use url::Url;
+
+    use super::*;
     use crate::actions::{Metadata, Protocol};
     use crate::committer::{CommitProtocolMetadata, CommitType};
     use crate::engine::default::DefaultEngineBuilder;
@@ -97,7 +98,6 @@ mod tests {
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
-    use url::Url;
 
     #[tokio::test]
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
@@ -115,6 +115,7 @@ mod tests {
         storage.put(&commit_path, actions.into()).await.unwrap();
 
         let snapshot = crate::snapshot::SnapshotBuilder::new_for(table_root)
+            .with_max_catalog_version(0)
             .build(&engine)
             .unwrap();
         // Try to commit a transaction with FileSystemCommitter

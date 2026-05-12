@@ -3,14 +3,14 @@
 use std::slice;
 use std::str::FromStr;
 
+use delta_kernel_derive::internal_api;
+use url::Url;
+use uuid::Uuid;
+
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, Version};
-use delta_kernel_derive::internal_api;
-
-use url::Url;
-use uuid::Uuid;
 
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;
@@ -26,6 +26,8 @@ const DELTA_LOG_DIR: &str = "_delta_log";
 const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
 /// The subdirectory name within the delta log where staged commits reside
 const STAGED_COMMITS_DIR: &str = "_staged_commits/";
+/// The subdirectory name within the delta log where checkpoint sidecars reside
+const SIDECAR_DIR_WITH_SLASH: &str = "_sidecars/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
@@ -107,7 +109,8 @@ fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> 
 }
 
 impl<Location: AsUrl> ParsedLogPath<Location> {
-    // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is local.
+    // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is
+    // local.
     #[internal_api]
     pub(crate) fn try_from(location: Location) -> DeltaResult<Option<ParsedLogPath<Location>>> {
         let url = location.as_url();
@@ -146,7 +149,8 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             None => return Ok(None),
         };
 
-        // this check determines if we're in the delta log dir, or in the staged commits dir. The check is:
+        // this check determines if we're in the delta log dir, or in the staged commits dir. The
+        // check is:
         // 1. If the dir is named _staged_commits, check if the parent dir is _delta_log, and ensure
         //    no higher level directories are _also_ named _delta_log. If those checks pass we're in
         //    the staged_commits dir
@@ -283,6 +287,7 @@ impl ParsedLogPath<FileMeta> {
     ///
     /// Returns the inCommitTimestamp value, or an error if ICT is not found or cannot be read.
     /// Callers should handle enablement version checks before calling this method.
+    #[tracing::instrument(skip(engine), ret, fields(version = self.version, path = %self.location.as_url()))]
     pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         // Only works on commit files
         if !self.is_commit() {
@@ -383,6 +388,8 @@ impl ParsedLogPath<Url> {
     }
 
     /// Create a new ParsedLogPath<Url> for a log compaction file
+    // TODO(#2337): remove allow(dead_code) when log compaction is re-enabled
+    #[allow(dead_code)]
     pub(crate) fn new_log_compaction(
         table_root: &Url,
         start_version: Version,
@@ -397,6 +404,20 @@ impl ParsedLogPath<Url> {
         }
         Ok(path)
     }
+}
+
+/// A checkpoint sidecar is a uniquely-named parquet file: `{unique}.parquet` where `unique` is
+/// some unique string such as a UUID. We use `<version>.checkpoint.<uuid>.parquet` here.
+///
+/// Sidecar paths should be URI-encoded. All characters in the filename here are Unreserved
+/// Characters, so we can just retain them. Ref: <https://www.ietf.org/rfc/rfc2396.txt>
+pub(crate) fn new_sidecar(table_root: &Url, version: Version) -> DeltaResult<(String, Url)> {
+    let filename = format!("{version:020}.checkpoint.{}.parquet", Uuid::new_v4());
+    let url = table_root
+        .join(DELTA_LOG_DIR_WITH_SLASH)?
+        .join(SIDECAR_DIR_WITH_SLASH)?
+        .join(&filename)?;
+    Ok((filename, url))
 }
 
 /// A wrapper around parsed log path to provide more structure/safety when handling
@@ -460,12 +481,13 @@ pub(crate) mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use test_utils::add_commit;
+
     use super::*;
     use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::utils::test_utils::assert_result_error_with_message;
-    use test_utils::add_commit;
 
     impl ParsedLogPath<FileMeta> {
         pub(crate) fn create_parsed_published_commit(table_root: &Url, version: Version) -> Self {
@@ -1116,5 +1138,37 @@ pub(crate) mod tests {
             result,
             "read_in_commit_timestamp can only be called on commit files",
         );
+    }
+
+    /// Verifies `new_sidecar` builds a `<version:020>.checkpoint.<uuid>.parquet` filename
+    /// under `<table_root>/_delta_log/_sidecars/`.
+    #[rstest::rstest]
+    #[case::version_zero(0)]
+    #[case::small_version(7)]
+    #[case::large_version(1_234_567_890)]
+    fn test_new_sidecar_path(#[case] version: Version) {
+        let table_root = Url::parse("memory:///table/").unwrap();
+        let (filename, url) = new_sidecar(&table_root, version).unwrap();
+
+        // Filename: `<version:020>.checkpoint.<uuid>.parquet`
+        let prefix = format!("{version:020}.checkpoint.");
+        assert!(
+            filename.starts_with(&prefix) && filename.ends_with(".parquet"),
+            "unexpected filename: {filename}"
+        );
+        // The middle segment must be a valid UUID.
+        let uuid_part = filename
+            .strip_prefix(&prefix)
+            .and_then(|s| s.strip_suffix(".parquet"))
+            .unwrap();
+        Uuid::parse_str(uuid_part).expect("middle segment must be a valid UUID");
+
+        // URL: `<table_root>/_delta_log/_sidecars/<filename>`
+        let expected = table_root
+            .join("_delta_log/_sidecars/")
+            .unwrap()
+            .join(&filename)
+            .unwrap();
+        assert_eq!(url, expected);
     }
 }

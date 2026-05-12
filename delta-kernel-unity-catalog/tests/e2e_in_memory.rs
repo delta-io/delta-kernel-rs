@@ -187,10 +187,12 @@ async fn test_checkpoint_after_publish() -> Result<(), TestError> {
 
     commit(&snapshot, &commits_client, &engine)?
         .publish(&engine, &committer)?
-        .checkpoint(&engine)?;
+        .checkpoint(&engine, None)?;
 
     // Load a fresh snapshot and verify checkpoint was written
-    let snapshot = Snapshot::builder_for(table_uri).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_uri)
+        .with_max_catalog_version(3)
+        .build(&engine)?;
     assert_eq!(snapshot.log_segment().checkpoint_version, Some(3));
 
     Ok(())
@@ -208,7 +210,7 @@ async fn test_cannot_checkpoint_unpublished_snapshot() -> Result<(), TestError> 
 
     let snapshot = commit(&snapshot, &commits_client, &engine)?;
 
-    let err = snapshot.checkpoint(&engine).unwrap_err();
+    let err = snapshot.checkpoint(&engine, None).unwrap_err();
     assert!(matches!(err, delta_kernel::Error::Generic(msg) if msg.contains("not published")));
     Ok(())
 }

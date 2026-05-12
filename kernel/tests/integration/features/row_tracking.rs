@@ -1,0 +1,1147 @@
+use std::sync::Arc;
+
+use delta_kernel::arrow::array::{Array, AsArray, Int32Array, Int64Array, StringArray};
+use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
+use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::to_json_bytes;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
+use delta_kernel::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
+use delta_kernel::transaction::CommitResult;
+use delta_kernel::{DeltaResult, Error, Snapshot};
+use itertools::Itertools;
+use serde_json::{Deserializer, Value};
+use tempfile::{tempdir, TempDir};
+use test_utils::{
+    begin_transaction, create_default_engine_mt_executor, create_table, engine_store_setup,
+    load_and_begin_transaction, read_scan, test_read,
+};
+use url::Url;
+
+/// Helper function to create a simple table with row tracking enabled.
+async fn create_row_tracking_table(
+    tmp_dir: &TempDir,
+    table_name: &str,
+    schema: SchemaRef,
+) -> DeltaResult<(
+    Url,
+    Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    Arc<DynObjectStore>,
+)> {
+    let tmp_test_dir_url = Url::from_directory_path(tmp_dir.path())
+        .map_err(|_| Error::generic("Failed to convert directory path to URL"))?;
+    let (store, engine, table_location) = engine_store_setup(table_name, Some(&tmp_test_dir_url));
+
+    // Create table with row tracking feature enabled
+    let table_url = create_table(
+        store.clone(),
+        table_location,
+        schema,
+        &[],    // no partition columns
+        true,   // use 37 protocol
+        vec![], // no reader features
+        vec!["domainMetadata", "rowTracking"],
+    )
+    .await
+    .map_err(|e| Error::generic(format!("Failed to create table: {e}")))?;
+
+    Ok((table_url, Arc::new(engine), store))
+}
+
+/// Helper function to write data and return the number of records written.
+async fn write_data_to_table(
+    table_url: &Url,
+    engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    data: Vec<ArrowEngineData>,
+) -> DeltaResult<CommitResult> {
+    let mut txn =
+        load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
+
+    // Write data out by spawning async tasks to simulate executors
+    let write_context = Arc::new(txn.unpartitioned_write_context()?);
+    let tasks = data.into_iter().map(|data| {
+        let engine = engine.clone();
+        let write_context = write_context.clone();
+        tokio::task::spawn(async move { engine.write_parquet(&data, write_context.as_ref()).await })
+    });
+
+    let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+
+    for meta in add_files_metadata {
+        let metadata = meta?;
+        txn.add_files(metadata);
+    }
+
+    // Commit the transaction
+    txn.commit(engine.as_ref())
+}
+
+/// Helper function to create a row-tracking table with a single `number: INTEGER` column.
+async fn setup_number_table(
+    tmp_dir: &TempDir,
+    name: &str,
+) -> DeltaResult<(
+    SchemaRef,
+    Url,
+    Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    Arc<DynObjectStore>,
+)> {
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+    let (table_url, engine, store) =
+        create_row_tracking_table(tmp_dir, name, schema.clone()).await?;
+    Ok((schema, table_url, engine, store))
+}
+
+/// Helper function to create an Arc<dyn Array> from an i32 vector.
+fn int32_array(data: Vec<i32>) -> Arc<dyn Array> {
+    Arc::new(Int32Array::from(data))
+}
+
+/// Helper function to create an Arc<dyn Array> from an i64 vector.
+fn int64_array(data: Vec<i64>) -> Arc<dyn Array> {
+    Arc::new(Int64Array::from(data))
+}
+
+/// Helper function to create an Arc<dyn Array> from a String vector.
+fn string_array(data: Vec<String>) -> Arc<dyn Array> {
+    Arc::new(StringArray::from(data))
+}
+
+/// Helper function to generate ArrowEngineData from batches of Arrow arrays.
+fn generate_data<I>(schema: SchemaRef, batches: I) -> DeltaResult<Vec<ArrowEngineData>>
+where
+    I: IntoIterator<Item = Vec<Arc<dyn Array>>>,
+{
+    let arrow_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
+    batches
+        .into_iter()
+        .map(|batch_columns| -> DeltaResult<ArrowEngineData> {
+            let record_batch = RecordBatch::try_new(arrow_schema.clone(), batch_columns)?;
+            Ok(ArrowEngineData::new(record_batch))
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+/// Helper function to verify row tracking-related information in a commit.
+async fn verify_row_tracking_in_commit(
+    store: &Arc<DynObjectStore>,
+    table_url: &Url,
+    commit_version: u64,
+    expected_base_row_ids: Vec<i64>,
+    expected_row_id_high_water_mark: i64,
+) -> DeltaResult<()> {
+    let commit_url = table_url.join(&format!("_delta_log/{commit_version:020}.json"))?;
+    let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
+
+    let parsed_actions: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)
+        .into_iter::<Value>()
+        .try_collect()?;
+
+    // Extract base row IDs and default commit versions
+    let (mut base_row_ids, default_commit_versions): (Vec<_>, Vec<_>) = parsed_actions
+        .iter()
+        .filter_map(|action| {
+            action.get("add").map(|add| {
+                let base_row_id = add
+                    .get("baseRowId")
+                    .cloned()
+                    .expect("Add action should have baseRowId field")
+                    .as_i64()
+                    .expect("baseRowId should be an i64");
+                let default_commit_version = add
+                    .get("defaultRowCommitVersion")
+                    .cloned()
+                    .expect("Add action should have defaultRowCommitVersion field")
+                    .as_i64()
+                    .expect("defaultRowCommitVersion should be an i64");
+                (base_row_id, default_commit_version)
+            })
+        })
+        .unzip();
+    base_row_ids.sort();
+
+    assert_eq!(base_row_ids, expected_base_row_ids);
+    assert_eq!(
+        default_commit_versions,
+        vec![commit_version as i64; default_commit_versions.len()]
+    );
+
+    // Extract the row ID high water mark
+    let row_tracking_domain_config = parsed_actions
+        .iter()
+        .filter_map(|action| {
+            action.get("domainMetadata").and_then(|meta| {
+                let domain = meta
+                    .get("domain")
+                    .expect("Domain metadata must have a domain");
+                match domain.as_str() {
+                    Some("delta.rowTracking") => Some(
+                        meta.get("configuration")
+                            .expect("Domain metadata must have a configuration")
+                            .as_str()
+                            .expect("Configuration should be a string"),
+                    ),
+                    _ => None,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        row_tracking_domain_config.len(),
+        1,
+        "There must be exactly one row tracking domain metadata action"
+    );
+
+    let row_id_high_water_mark = serde_json::from_str::<Value>(row_tracking_domain_config[0])?
+        .get("rowIdHighWaterMark")
+        .expect("rowIdHighWaterMark should be present")
+        .as_i64()
+        .expect("rowIdHighWaterMark should be an i64");
+    assert_eq!(
+        row_id_high_water_mark, expected_row_id_high_water_mark,
+        "rowIdHighWaterMark should match expected value"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_row_tracking_append() -> DeltaResult<()> {
+    // Setup
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_test_dir = tempdir()?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_append").await?;
+
+    // Create two new arrow record batches to append
+    let data = generate_data(
+        schema.clone(),
+        [
+            vec![int32_array(vec![1, 2, 3])],
+            vec![int32_array(vec![4, 5, 6])],
+        ],
+    )?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
+
+    // Verify the commit was written correctly
+    verify_row_tracking_in_commit(
+        &store,
+        &table_url,
+        1,          // commit to verify
+        vec![0, 3], // expected base row IDs
+        5,          // expected high watermark
+    )
+    .await?;
+
+    // Verify the data can still be read correctly
+    test_read(
+        &ArrowEngineData::new(RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+        )?),
+        &table_url,
+        engine,
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_row_tracking_single_record_batches() -> DeltaResult<()> {
+    // Setup
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_test_dir = tempdir()?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_single_records").await?;
+
+    // Write individual records in separate batches
+    let data = generate_data(
+        schema.clone(),
+        [
+            vec![int32_array(vec![1])],
+            vec![int32_array(vec![2])],
+            vec![int32_array(vec![3])],
+        ],
+    )?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
+
+    // Verify the commit was written correctly
+    verify_row_tracking_in_commit(
+        &store,
+        &table_url,
+        1,             // commit to verify
+        vec![0, 1, 2], // expected base row IDs
+        2,             // expected high watermark
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_row_tracking_large_batch() -> DeltaResult<()> {
+    // Setup
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_test_dir = tempdir()?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_large_batch").await?;
+
+    // Write a large batch with 1000 records
+    let large_batch: Vec<i32> = (1..=1000).collect();
+    let data = generate_data(schema.clone(), [vec![int32_array(large_batch.clone())]])?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
+
+    // Verify the commit was written correctly
+    verify_row_tracking_in_commit(
+        &store,
+        &table_url,
+        1,       // commit to verify
+        vec![0], // expected base row IDs
+        999,     // expected high watermark
+    )
+    .await?;
+
+    // Verify the data can still be read correctly
+    test_read(
+        &ArrowEngineData::new(RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(large_batch))],
+        )?),
+        &table_url,
+        engine,
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
+    // Setup
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_test_dir = tempdir()?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_consecutive_commits").await?;
+
+    // First transaction: write two batches with 3 records each
+    let data_1 = generate_data(
+        schema.clone(),
+        [
+            vec![int32_array(vec![1, 2, 3])],
+            vec![int32_array(vec![4, 5, 6])],
+        ],
+    )?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_1)
+        .await?
+        .is_committed());
+
+    // Verify first commit
+    verify_row_tracking_in_commit(
+        &store,
+        &table_url,
+        1,          // commit to verify
+        vec![0, 3], // expected base row IDs
+        5,          // expected high watermark
+    )
+    .await?;
+
+    // Second transaction: write one batch with 2 records
+    // This should read the existing row tracking domain metadata and assign base row IDs starting
+    // from 6
+    let data_2 = generate_data(schema.clone(), [vec![int32_array(vec![7, 8])]])?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_2)
+        .await?
+        .is_committed());
+
+    // Verify second commit
+    verify_row_tracking_in_commit(
+        &store,
+        &table_url,
+        2,       // commit to verify
+        vec![6], // expected base row IDs
+        7,       // expected high watermark
+    )
+    .await?;
+
+    // Verify the data can still be read correctly
+    test_read(
+        &ArrowEngineData::new(RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![7, 8, 1, 2, 3, 4, 5, 6]))],
+        )?),
+        &table_url,
+        engine,
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
+    // Setup
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_test_dir = tempdir()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("name", DataType::STRING),
+    ])?);
+
+    let (table_url, engine, store) =
+        create_row_tracking_table(&tmp_test_dir, "test_three_transactions", schema.clone()).await?;
+
+    // First transaction
+    let data_1 = generate_data(
+        schema.clone(),
+        [
+            vec![int64_array(vec![1]), string_array(vec!["a".to_string()])],
+            vec![
+                int64_array(vec![2, 3, 4]),
+                string_array(vec!["b".to_string(), "c".to_string(), "d".to_string()]),
+            ],
+            vec![
+                int64_array(vec![5, 6]),
+                string_array(vec!["e".to_string(), "f".to_string()]),
+            ],
+        ],
+    )?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_1)
+        .await?
+        .is_committed());
+
+    verify_row_tracking_in_commit(
+        &store,
+        &table_url,
+        1,             // commit to verify
+        vec![0, 1, 4], // expected base row IDs
+        5,             // expected high watermark
+    )
+    .await?;
+
+    // Second transaction
+    let data_2 = generate_data(
+        schema.clone(),
+        [vec![
+            int64_array(vec![7, 8]),
+            string_array(vec!["g".to_string(), "h".to_string()]),
+        ]],
+    )?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_2)
+        .await?
+        .is_committed());
+
+    verify_row_tracking_in_commit(
+        &store,
+        &table_url,
+        2,       // commit to verify
+        vec![6], // expected base row IDs
+        7,       // expected high watermark
+    )
+    .await?;
+
+    // Third transaction
+    let data_3 = generate_data(
+        schema.clone(),
+        [
+            vec![
+                int64_array(vec![9, 10]),
+                string_array(vec!["i".to_string(), "j".to_string()]),
+            ],
+            vec![
+                int64_array(vec![11, 12]),
+                string_array(vec!["k".to_string(), "l".to_string()]),
+            ],
+        ],
+    )?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_3)
+        .await?
+        .is_committed());
+
+    verify_row_tracking_in_commit(
+        &store,
+        &table_url,
+        3,           // commit to verify
+        vec![8, 10], // expected base row IDs
+        11,          // expected high watermark
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
+    // Setup
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_test_dir = tempdir()?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_append").await?;
+
+    // Create two regular and one empty arrow record batches to append
+    let data = generate_data(
+        schema.clone(),
+        [
+            vec![int32_array(vec![1, 2, 3])],
+            vec![int32_array(Vec::<i32>::new())],
+            vec![int32_array(vec![4, 5, 6])],
+        ],
+    )?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
+
+    // Verify the commit was written correctly
+    verify_row_tracking_in_commit(
+        &store,
+        &table_url,
+        1,             // commit to verify
+        vec![0, 3, 3], // expected base row IDs
+        5,             // expected high watermark
+    )
+    .await?;
+
+    // Verify the data can still be read correctly
+    test_read(
+        &ArrowEngineData::new(RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+        )?),
+        &table_url,
+        engine,
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
+    // Setup
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_test_dir = tempdir()?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_append").await?;
+
+    // Create two new _empty_ arrow record batches to append
+    let data = generate_data(
+        schema.clone(),
+        [
+            vec![int32_array(Vec::<i32>::new())],
+            vec![int32_array(Vec::<i32>::new())],
+        ],
+    )?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
+
+    // Verify the commit was written correctly
+    // NB: The expected high water mark is a bit unintuitive here, as we are appending empty
+    // batches. Appending empty batches means that we assign the same base row ID multiple times
+    // and that the high water mark is lower than the last assigned base row ID (because that
+    // base row ID has no actual row attached to it).
+    verify_row_tracking_in_commit(
+        &store,
+        &table_url,
+        1,          // commit to verify
+        vec![0, 0], // expected base row IDs
+        -1,         // expected high watermark
+    )
+    .await?;
+
+    // Verify that the table is empty
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+    let batches = read_scan(&scan, engine)?;
+
+    assert!(batches.is_empty(), "Table should be empty");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_row_tracking_without_adds() -> DeltaResult<()> {
+    // Setup
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_test_dir = tempdir()?;
+    let (_schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_consecutive_commits").await?;
+    let txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?;
+
+    // Commit without adding any add files
+    assert!(txn.commit(engine.as_ref())?.is_committed());
+
+    // Fetch and parse the commit
+    let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;
+    let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
+
+    let parsed_actions: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)
+        .into_iter::<Value>()
+        .try_collect()?;
+
+    // Verify that there only is a commit info action
+    // NOTE: We specifically test that we don't write domain metadata for commits without actual
+    // data
+    assert_eq!(parsed_actions.len(), 1, "Expected only one action");
+    assert!(parsed_actions[0].get("commitInfo").is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
+    // Setup
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_test_dir = tempdir()?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_test_dir, "test_parallel_row_tracking").await?;
+
+    let engine1 = engine.clone();
+    let engine2 = engine;
+
+    // Create two snapshots from the same initial state
+    let snapshot1 = Snapshot::builder_for(table_url.clone()).build(engine1.as_ref())?;
+    let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine2.as_ref())?;
+
+    // Create two transactions from the same snapshot (simulating parallel transactions)
+    let mut txn1 = begin_transaction(snapshot1, engine1.as_ref())?
+        .with_engine_info("transaction 1")
+        .with_data_change(true);
+    let mut txn2 = begin_transaction(snapshot2, engine2.as_ref())?
+        .with_engine_info("transaction 2")
+        .with_data_change(true);
+
+    // Prepare data for both transactions
+    let data1 = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )?;
+    let data2 = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![4, 5]))],
+    )?;
+
+    // Write data for both transactions
+    let write_context1 = Arc::new(txn1.unpartitioned_write_context()?);
+    let write_context2 = Arc::new(txn2.unpartitioned_write_context()?);
+
+    let metadata1 = engine1
+        .write_parquet(&ArrowEngineData::new(data1), write_context1.as_ref())
+        .await?;
+
+    let metadata2 = engine2
+        .write_parquet(&ArrowEngineData::new(data2), write_context2.as_ref())
+        .await?;
+
+    txn1.add_files(metadata1);
+    txn2.add_files(metadata2);
+
+    // Commit the first transaction - this should succeed
+    let result1 = txn1.commit(engine1.as_ref())?;
+    match result1 {
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(
+                committed.commit_version(),
+                1,
+                "First transaction should commit at version 1"
+            );
+        }
+        CommitResult::ConflictedTransaction(conflicted) => {
+            panic!(
+                "First transaction should not conflict, got conflict at version {}",
+                conflicted.conflict_version()
+            );
+        }
+        CommitResult::RetryableTransaction(_) => {
+            panic!("First transaction should not be retryable error");
+        }
+    }
+
+    // Commit the second transaction - this should result in a conflict
+    let result2 = txn2.commit(engine2.as_ref())?;
+    match result2 {
+        CommitResult::CommittedTransaction(committed) => {
+            panic!(
+                "Second transaction should conflict, but got committed at version {}",
+                committed.commit_version()
+            );
+        }
+        CommitResult::ConflictedTransaction(conflicted) => {
+            assert_eq!(
+                conflicted.conflict_version(),
+                1,
+                "Conflict should be at version 1"
+            );
+
+            // TODO: In the future, we need to resolve conflicts and retry the commit
+            // For now, we just verify that we got the conflict as expected
+        }
+        CommitResult::RetryableTransaction(_) => {
+            panic!("Second transaction should not be retryable error");
+        }
+    }
+
+    // Verify that the winning transaction is in the log and that it has the correct metadata
+    verify_row_tracking_in_commit(
+        &store,
+        &table_url,
+        1,       // commit to verify
+        vec![0], // expected base row IDs
+        2,       // expected high watermark
+    )
+    .await?;
+
+    // Verify the data matches the winning transaction
+    test_read(
+        &ArrowEngineData::new(RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))], // Only data from winning transaction
+        )?),
+        &table_url,
+        engine1,
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
+    // Setup
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_test_dir = tempdir()?;
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    // Create a table without row tracking
+    let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path())
+        .map_err(|_| Error::generic("Failed to convert directory path to URL"))?;
+    let (store, engine, table_location) =
+        engine_store_setup("test_no_row_tracking", Some(&tmp_test_dir_url));
+
+    let table_url = create_table(
+        store.clone(),
+        table_location,
+        schema.clone(),
+        &[],
+        true,
+        vec![], // no reader features
+        vec![], // no writer features
+    )
+    .await
+    .map_err(|e| Error::generic(format!("Failed to create table: {e}")))?;
+
+    let engine = Arc::new(engine);
+
+    // Create data to append
+    let data = generate_data(
+        schema.clone(),
+        [
+            vec![int32_array(vec![1, 2, 3])],
+            vec![int32_array(vec![4, 5, 6])],
+        ],
+    )?;
+
+    // Write data to the table
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
+
+    // Verify that the commit does NOT contain row tracking fields
+    let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;
+    let commit = store.get(&Path::from_url_path(commit_url.path())?).await?;
+
+    let parsed_actions: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)
+        .into_iter::<Value>()
+        .try_collect()?;
+
+    // Find all add actions and verify they don't have row tracking fields
+    let add_actions: Vec<_> = parsed_actions
+        .iter()
+        .filter_map(|action| action.get("add"))
+        .collect();
+
+    // Ensure we have at least one add action to verify
+    assert!(!add_actions.is_empty(), "Expected at least one add action");
+
+    for add_action in add_actions {
+        // Verify that row tracking fields are NOT present
+        assert!(
+            add_action.get("baseRowId").is_none(),
+            "Add action should not have baseRowId field when row tracking is disabled"
+        );
+        assert!(
+            add_action.get("defaultRowCommitVersion").is_none(),
+            "Add action should not have defaultRowCommitVersion field when row tracking is disabled"
+        );
+    }
+
+    // Verify that no domain metadata actions exist for row tracking
+    let row_tracking_domain_metadata: Vec<_> = parsed_actions
+        .iter()
+        .filter_map(|action| {
+            action.get("domainMetadata").and_then(|meta| {
+                let domain = meta.get("domain")?;
+                match domain.as_str() {
+                    Some("delta.rowTracking") => Some(meta),
+                    _ => None,
+                }
+            })
+        })
+        .collect();
+
+    assert!(
+        row_tracking_domain_metadata.is_empty(),
+        "Should not have any row tracking domain metadata when row tracking is disabled"
+    );
+
+    Ok(())
+}
+
+/// Build a scan with `MetadataColumnSpec::RowId` appended to the snapshot schema and execute it.
+fn read_row_id_scan(
+    snapshot: Arc<Snapshot>,
+    engine: Arc<dyn delta_kernel::Engine>,
+) -> DeltaResult<Vec<RecordBatch>> {
+    let scan_schema = Arc::new(
+        snapshot
+            .schema()
+            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?,
+    );
+    let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
+    read_scan(&scan, engine)
+}
+
+/// Collect all `row_id` values from scan results across all batches by column name.
+fn collect_row_ids(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name("row_id")
+                .expect("row_id column not found in batch")
+                .as_primitive::<Int64Type>()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// Basic read: write one file with 3 rows, verify row IDs are sequential starting from 0.
+#[tokio::test]
+async fn test_read_row_ids_basic() -> DeltaResult<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_dir = tempdir()?;
+    let (schema, table_url, engine, _store) =
+        setup_number_table(&tmp_dir, "test_read_row_ids_basic").await?;
+
+    let data = generate_data(schema.clone(), [vec![int32_array(vec![10, 20, 30])]])?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let batches = read_row_id_scan(snapshot, engine)?;
+
+    let mut row_ids = collect_row_ids(&batches);
+    row_ids.sort_unstable();
+    assert_eq!(row_ids, vec![0, 1, 2], "Row IDs must be sequential from 0");
+
+    Ok(())
+}
+
+/// Multiple files in one commit: each file's row IDs start at its baseRowId with no overlap.
+#[tokio::test]
+async fn test_read_row_ids_multiple_files_one_commit() -> DeltaResult<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_dir = tempdir()?;
+    let (schema, table_url, engine, _store) =
+        setup_number_table(&tmp_dir, "test_read_row_ids_multiple_files").await?;
+
+    // Two files: 3 rows (baseRowId=0) and 4 rows (baseRowId=3).
+    let data = generate_data(
+        schema.clone(),
+        [
+            vec![int32_array(vec![1, 2, 3])],
+            vec![int32_array(vec![4, 5, 6, 7])],
+        ],
+    )?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let batches = read_row_id_scan(snapshot, engine)?;
+
+    let mut all_ids = collect_row_ids(&batches);
+    all_ids.sort_unstable();
+
+    // 7 rows total, IDs must be 0..=6 with no duplicates.
+    assert_eq!(
+        all_ids,
+        (0i64..7).collect::<Vec<_>>(),
+        "Row IDs must be non-overlapping across files"
+    );
+
+    // Each batch's IDs must form a contiguous block starting at its baseRowId.
+    for batch in &batches {
+        let ids: Vec<i64> = batch
+            .column_by_name("row_id")
+            .expect("row_id column not found")
+            .as_primitive::<Int64Type>()
+            .values()
+            .to_vec();
+        let min = *ids.iter().min().unwrap();
+        let expected = (min..min + ids.len() as i64).collect::<Vec<_>>();
+        assert_eq!(ids, expected, "IDs within a file must be contiguous");
+    }
+
+    Ok(())
+}
+
+/// Multiple commits: row IDs are globally unique and monotonically increasing across commits.
+#[tokio::test]
+async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_dir = tempdir()?;
+    let (schema, table_url, engine, _store) =
+        setup_number_table(&tmp_dir, "test_read_row_ids_multiple_commits").await?;
+
+    // Commit 1: 3 rows -> IDs 0, 1, 2.
+    let data1 = generate_data(schema.clone(), [vec![int32_array(vec![1, 2, 3])]])?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data1)
+        .await?
+        .is_committed());
+
+    // Commit 2: 2 rows -> IDs 3, 4.
+    let data2 = generate_data(schema.clone(), [vec![int32_array(vec![4, 5])]])?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data2)
+        .await?
+        .is_committed());
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let batches = read_row_id_scan(snapshot, engine)?;
+
+    let mut all_ids = collect_row_ids(&batches);
+    all_ids.sort_unstable();
+
+    // 5 rows total, IDs must be 0..=4 with no duplicates or gaps.
+    assert_eq!(
+        all_ids,
+        vec![0, 1, 2, 3, 4],
+        "Row IDs must be globally unique and monotonically increasing across commits"
+    );
+
+    Ok(())
+}
+
+/// After checkpoint: row IDs survive a checkpoint and new writes continue from the high watermark.
+///
+/// Uses a multi-threaded runtime and `TokioMultiThreadExecutor` for checkpoint because
+/// `checkpoint()` consumes a lazy iterator inside a `block_on()` future where each item read
+/// triggers another `block_on()`. With `TokioBackgroundExecutor` this causes nested blocking on
+/// the same background thread (deadlock). `TokioMultiThreadExecutor` uses `block_in_place()`
+/// instead, which requires a multi-threaded runtime to delegate work to other workers.
+/// Writes use the standard `TokioBackgroundExecutor` engine, matching all other tests in this file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_dir = tempdir()?;
+    let (schema, table_url, engine, _store) =
+        setup_number_table(&tmp_dir, "test_read_row_ids_after_checkpoint").await?;
+
+    // Write 3 rows -> IDs 0, 1, 2.
+    let data = generate_data(schema.clone(), [vec![int32_array(vec![1, 2, 3])]])?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
+
+    // Checkpoint at version 1. Uses TokioMultiThreadExecutor to avoid the nested block_on
+    // deadlock that occurs with TokioBackgroundExecutor during checkpoint's lazy I/O.
+    let mt_engine = create_default_engine_mt_executor(&table_url)?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(mt_engine.as_ref())?;
+    snapshot.checkpoint(mt_engine.as_ref(), None)?;
+
+    // Fresh snapshot loaded from the checkpoint must return the same row IDs.
+    let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(mt_engine.as_ref())?;
+    let batches = read_row_id_scan(fresh_snapshot, mt_engine.clone())?;
+
+    let mut ids_after_ckpt = collect_row_ids(&batches);
+    ids_after_ckpt.sort_unstable();
+    assert_eq!(
+        ids_after_ckpt,
+        vec![0, 1, 2],
+        "Row IDs must be unchanged after loading from checkpoint"
+    );
+
+    // Write 2 more rows -> must continue from watermark, no resets or duplicates.
+    let data2 = generate_data(schema.clone(), [vec![int32_array(vec![4, 5])]])?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data2)
+        .await?
+        .is_committed());
+
+    let snapshot2 = Snapshot::builder_for(table_url.clone()).build(mt_engine.as_ref())?;
+    let batches2 = read_row_id_scan(snapshot2, mt_engine)?;
+
+    let mut all_ids = collect_row_ids(&batches2);
+    all_ids.sort_unstable();
+    assert_eq!(
+        all_ids,
+        vec![0, 1, 2, 3, 4],
+        "Row IDs must continue from the high watermark after checkpoint with no resets or duplicates"
+    );
+
+    Ok(())
+}
+
+/// Row IDs coexist with row index: both columns are correct when requested together.
+///
+/// Row index is file-local (resets to 0 per file); row ID is global (baseRowId + row_index).
+#[tokio::test]
+async fn test_read_row_ids_coexist_with_row_index() -> DeltaResult<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_dir = tempdir()?;
+    let (schema, table_url, engine, _store) =
+        setup_number_table(&tmp_dir, "test_read_row_ids_coexist_with_row_index").await?;
+
+    // Two files: 3 rows (baseRowId=0) and 2 rows (baseRowId=3).
+    let data = generate_data(
+        schema.clone(),
+        [
+            vec![int32_array(vec![1, 2, 3])],
+            vec![int32_array(vec![4, 5])],
+        ],
+    )?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let scan_schema = Arc::new(
+        snapshot
+            .schema()
+            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?
+            .add_metadata_column("row_index", MetadataColumnSpec::RowIndex)?,
+    );
+    let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
+    let batches = read_scan(&scan, engine)?;
+
+    for batch in &batches {
+        assert_eq!(
+            batch.num_columns(),
+            3,
+            "Expected number | row_id | row_index"
+        );
+
+        let row_ids: Vec<i64> = batch
+            .column_by_name("row_id")
+            .expect("row_id column not found")
+            .as_primitive::<Int64Type>()
+            .values()
+            .to_vec();
+        let row_indexes: Vec<i64> = batch
+            .column_by_name("row_index")
+            .expect("row_index column not found")
+            .as_primitive::<Int64Type>()
+            .values()
+            .to_vec();
+
+        let n = batch.num_rows() as i64;
+
+        // Row index is file-local: always 0..n.
+        assert_eq!(
+            row_indexes,
+            (0..n).collect::<Vec<_>>(),
+            "Row index must reset to 0 for each file"
+        );
+
+        // Row ID = baseRowId + row_index. Since row_index starts at 0, the minimum row ID in
+        // this batch is the baseRowId, and IDs within the batch must be contiguous.
+        let base = *row_ids.iter().min().unwrap();
+        assert_eq!(
+            row_ids,
+            (base..base + n).collect::<Vec<_>>(),
+            "Row IDs within a file must equal baseRowId + row_index"
+        );
+    }
+
+    // All row IDs across both files must cover 0..=4 with no duplicates.
+    let mut all_ids = collect_row_ids(&batches);
+    all_ids.sort_unstable();
+    assert_eq!(
+        all_ids,
+        vec![0, 1, 2, 3, 4],
+        "Row IDs must be globally unique when coexisting with row index"
+    );
+
+    Ok(())
+}
+
+/// After log compaction: row IDs are preserved in the compacted log and scan correctly.
+///
+/// Writes data across two commits, creates a log compaction file covering all commits
+/// (versions 0..=2), loads a fresh snapshot, and verifies that row IDs still read back
+/// correctly through the scan path. This ensures that `baseRowId` and row-tracking domain
+/// metadata survive compaction without being dropped or corrupted.
+#[tokio::test]
+#[ignore = "log compaction is not yet supported, tracked in #2337"]
+async fn test_read_row_ids_after_log_compaction() -> DeltaResult<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp_dir = tempdir()?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_dir, "test_read_row_ids_after_log_compaction").await?;
+
+    // Commit 1: 3 rows -> IDs 0, 1, 2.
+    let data1 = generate_data(schema.clone(), [vec![int32_array(vec![1, 2, 3])]])?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data1)
+        .await?
+        .is_committed());
+
+    // Commit 2: 2 rows -> IDs 3, 4.
+    let data2 = generate_data(schema.clone(), [vec![int32_array(vec![4, 5])]])?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data2)
+        .await?
+        .is_committed());
+
+    // Create a log compaction file spanning all commits so far (versions 0..=2).
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut writer = snapshot.log_compaction_writer(0, 2)?;
+    let compaction_path = writer.compaction_path().clone();
+    let batches = writer
+        .compaction_data(engine.as_ref())?
+        .collect::<DeltaResult<Vec<_>>>()?;
+
+    let json_bytes = to_json_bytes(batches.into_iter().map(Ok))?;
+    store
+        .put(
+            &Path::from_url_path(compaction_path.path())?,
+            json_bytes.into(),
+        )
+        .await
+        .map_err(|e| Error::generic(e.to_string()))?;
+
+    // Load a fresh snapshot -- it should read Protocol and Metadata and file list from the
+    // compaction file.
+    let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let scan_batches = read_row_id_scan(fresh_snapshot, engine)?;
+
+    let mut all_ids = collect_row_ids(&scan_batches);
+    all_ids.sort_unstable();
+    assert_eq!(
+        all_ids,
+        vec![0, 1, 2, 3, 4],
+        "Row IDs must be preserved and correct after log compaction"
+    );
+
+    Ok(())
+}

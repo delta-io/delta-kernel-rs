@@ -1,8 +1,7 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use crate::engine::default::parquet::{reader_options, writer_options};
-use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+use url::Url;
 
 use super::read_files;
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
@@ -12,14 +11,14 @@ use crate::engine::arrow_utils::{
     RowIndexBuilder,
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::engine::{reader_options, writer_options};
+use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
     DeltaResult, Error, FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler,
     PredicateRef,
 };
-
-use url::Url;
 
 pub(crate) struct SyncParquetHandler;
 
@@ -78,8 +77,7 @@ impl ParquetHandler for SyncParquetHandler {
     ///
     /// # Parameters
     ///
-    /// - `location` - The full URL path where the Parquet file should be written
-    ///   (e.g., `file:///path/to/file.parquet`).
+    /// - `location` - The full URL path where the Parquet file should be written (e.g., `file:///path/to/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
     ///
     /// # Returns
@@ -94,6 +92,12 @@ impl ParquetHandler for SyncParquetHandler {
         let path = location
             .to_file_path()
             .map_err(|_| crate::Error::generic(format!("Invalid file URL: {location}")))?;
+
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
 
         let mut file = File::create(&path)?;
 
@@ -140,22 +144,18 @@ impl ParquetHandler for SyncParquetHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
-    use crate::engine::arrow_conversion::TryIntoKernel as _;
     use std::sync::Arc;
+
     use tempfile::tempdir;
     use url::Url;
 
-    #[test]
-    fn test_sync_write_parquet_file() {
-        let handler = SyncParquetHandler;
-        let temp_dir = tempdir().unwrap();
-        let file_path = temp_dir.path().join("test.parquet");
-        let url = Url::from_file_path(&file_path).unwrap();
+    use super::*;
+    use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+    use crate::engine::arrow_conversion::TryIntoKernel as _;
+    use crate::{DeltaResult, EngineData};
 
-        // Create test data
-        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(
+    fn test_data_iter() -> Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![
                 (
                     "id",
@@ -168,14 +168,19 @@ mod tests {
             ])
             .unwrap(),
         ));
+        Box::new(std::iter::once(Ok(engine_data)))
+    }
 
-        // Create iterator with single batch
-        let data_iter: Box<
-            dyn Iterator<Item = crate::DeltaResult<Box<dyn crate::EngineData>>> + Send,
-        > = Box::new(std::iter::once(Ok(engine_data)));
+    #[test]
+    fn test_sync_write_parquet_file() {
+        let handler = SyncParquetHandler;
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
 
-        // Write the file
-        handler.write_parquet_file(url.clone(), data_iter).unwrap();
+        handler
+            .write_parquet_file(url.clone(), test_data_iter())
+            .unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());
@@ -390,5 +395,16 @@ mod tests {
         assert_eq!(value_col.values(), &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
         assert!(result.next().is_none());
+    }
+
+    #[test]
+    fn write_parquet_creates_parent_directories() {
+        let handler = SyncParquetHandler;
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("a/b/c/test.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        handler.write_parquet_file(url, test_data_iter()).unwrap();
+        assert!(file_path.exists());
     }
 }
