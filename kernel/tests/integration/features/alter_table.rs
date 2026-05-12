@@ -35,13 +35,16 @@ fn committer() -> Box<FileSystemCommitter> {
     Box::new(FileSystemCommitter::new())
 }
 
-fn max_column_id(snap: &Snapshot) -> i64 {
+/// Reads `delta.columnMapping.maxColumnId` from the snapshot's metadata. Returns
+/// `None` when the property is absent (e.g. non-CM tables) so callers can compare it
+/// directly against `cm_mode.map(...)`-style expectations. CM-only callers should
+/// `.expect(...)` at the use site to surface the protocol violation explicitly.
+fn max_column_id(snap: &Snapshot) -> Option<i64> {
     snap.table_configuration()
         .metadata()
         .configuration()
         .get("delta.columnMapping.maxColumnId")
         .and_then(|v| v.parse().ok())
-        .expect("maxColumnId should be set and parseable on a CM table")
 }
 
 // ============================================================================
@@ -64,7 +67,8 @@ async fn add_columns_lifecycle(
         .unwrap_or_default();
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &properties)?;
-    let original_max_id = cm_mode.map(|_| max_column_id(&snapshot));
+    let original_max_id =
+        cm_mode.map(|_| max_column_id(&snapshot).expect("CM table must have maxColumnId"));
 
     // Write two rows with only the original columns populated.
     let batch = RecordBatch::try_new(
@@ -127,7 +131,7 @@ async fn add_columns_lifecycle(
                 other => panic!("expected String, got {other:?}"),
             }
         }
-        assert!(max_column_id(&reloaded) > orig);
+        assert!(max_column_id(&reloaded).expect("CM table must have maxColumnId") > orig);
     } else {
         assert!(reloaded
             .table_configuration()
@@ -265,7 +269,8 @@ async fn add_complex_type_column(
         .unwrap_or_default();
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &properties)?;
-    let original_max_id = cm_mode.map(|_| max_column_id(&snapshot));
+    let original_max_id =
+        cm_mode.map(|_| max_column_id(&snapshot).expect("CM table must have maxColumnId"));
 
     let field_name = field.name().to_string();
     let expected_type = field.data_type().clone();
@@ -294,7 +299,7 @@ async fn add_complex_type_column(
             "all assigned IDs must exceed original max"
         );
         assert_eq!(
-            max_column_id(&reloaded),
+            max_column_id(&reloaded).expect("CM table must have maxColumnId"),
             ids.iter().copied().max().unwrap(),
             "table maxColumnId must equal the largest assigned ID",
         );
@@ -422,6 +427,86 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
         .downcast_ref::<Int32Array>()
         .expect("b is int");
     assert_eq!(b_col.value(0), 100);
+
+    Ok(())
+}
+
+/// Empty-schema tables are valid intermediate state, so they need to behave normally
+/// once a column is added. This test runs the full lifecycle (create empty, ALTER ADD
+/// COLUMN, write rows, scan them back, time-travel to v0) across all column-mapping
+/// modes so the CM bookkeeping (maxColumnId, column-mapping id, physical name) is
+/// exercised on a schema that started empty rather than being created with columns
+/// up front.
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_create_then_add_column(
+    #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let properties: Vec<(&str, &str)> = cm_mode
+        .map(|m| vec![("delta.columnMapping.mode", m)])
+        .unwrap_or_default();
+
+    let empty_schema = Arc::new(StructType::try_new(vec![])?);
+    let v0 =
+        create_table_and_load_snapshot(&table_path, empty_schema, engine.as_ref(), &properties)?;
+    assert_eq!(v0.version(), 0);
+    assert_eq!(v0.schema().num_fields(), 0);
+    assert_eq!(max_column_id(&v0), cm_mode.map(|_| 0));
+
+    v0.alter_table()
+        .add_column(StructField::nullable("id", DataType::INTEGER))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let v1 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(v1.version(), 1);
+    let schema = v1.schema();
+    assert_eq!(schema.num_fields(), 1);
+    let id_field = schema.field("id").expect("added field should exist");
+    assert_eq!(id_field.data_type(), &DataType::INTEGER);
+    assert!(id_field.is_nullable());
+    assert_eq!(max_column_id(&v1), cm_mode.map(|_| 1));
+    assert_eq!(id_field.column_mapping_id(), cm_mode.map(|_| 1i64));
+    assert_eq!(
+        id_field
+            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+            .is_some(),
+        cm_mode.is_some(),
+        "physical name presence must track column-mapping enablement",
+    );
+
+    // Write rows through the freshly-added column and confirm the read path round-trips
+    // them. Under CM this also exercises the physical-name plumbing for a column whose
+    // schema started empty.
+    let arrow_schema = v1.schema().as_ref().try_into_arrow().unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(arrow_schema),
+        vec![Arc::new(Int32Array::from(vec![Some(1), None, Some(99)]))],
+    )
+    .unwrap();
+    let v2 = write_batch_to_table(&v1, engine.as_ref(), batch, HashMap::new())
+        .await
+        .map_err(|e| delta_kernel::Error::generic(format!("write_batch_to_table failed: {e}")))?;
+    assert_eq!(v2.version(), 2);
+
+    let scan = v2.scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 3,
+        "post-ALTER write should yield 3 rows on read"
+    );
+
+    // The empty-schema snapshot must still be loadable via time-travel after later
+    // commits introduce a column and data files; pins the contract that the v0 history
+    // survives schema evolution.
+    let v0_after = Snapshot::builder_for(&table_path)
+        .at_version(0)
+        .build(engine.as_ref())?;
+    assert_eq!(v0_after.version(), 0);
+    assert_eq!(v0_after.schema().num_fields(), 0);
 
     Ok(())
 }
@@ -641,7 +726,8 @@ async fn chain_add_column_and_set_nullable(
             .column_mapping_id()
             .expect("existing field should already have a column mapping ID")
     });
-    let original_max_id = cm_mode.map(|_| max_column_id(&snapshot));
+    let original_max_id =
+        cm_mode.map(|_| max_column_id(&snapshot).expect("CM table must have maxColumnId"));
 
     // Two alter+checkpoint cycles: (add email + nullable id), (add age + nullable name).
     let v1 = snapshot
@@ -689,7 +775,7 @@ async fn chain_add_column_and_set_nullable(
             .expect("existing id column mapping");
         assert_eq!(id_after, orig_id, "existing id CM id must not change");
         assert!(
-            max_column_id(&reloaded) > orig_max,
+            max_column_id(&reloaded).expect("CM table must have maxColumnId") > orig_max,
             "chained add_column must bump maxColumnId"
         );
     }
