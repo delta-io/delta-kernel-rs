@@ -29,7 +29,7 @@ pub struct DvDescriptorMap {
     inner: HashMap<String, DeletionVectorDescriptor>,
 }
 
-/// Mutable handle for a [`DvDescriptorMap`].
+/// Mutable handle for a deletion vector descriptor map.
 #[handle_descriptor(target=DvDescriptorMap, mutable=true, sized=true)]
 pub struct ExclusiveDvDescriptorMap;
 

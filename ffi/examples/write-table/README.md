@@ -27,3 +27,8 @@ follow-up; once it lands, this example should grow an `add_files` flow alongside
 `with_domain_metadata` / `with_domain_metadata_removed` demo (the `domainMetadata` writer
 feature can be enabled today via the existing `create_table_builder_with_table_property`
 API by setting `delta.feature.domainMetadata=supported`).
+
+Deletion vector updates are exposed through `dv_descriptor_new`, `dv_descriptor_map_insert`,
+and `transaction_update_deletion_vectors`, but are not demonstrated here yet. A useful C
+example needs a connector-authored DV file and scan metadata for the files being updated; that
+fits better once the example has a shared Arrow/write helper.
