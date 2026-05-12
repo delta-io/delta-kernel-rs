@@ -194,28 +194,11 @@ impl LogState {
         self
     }
 
-    /// Canonical log shapes for snapshot reader-path tests. Built against a
-    /// 10-version table; each shape exercises a distinct read path.
-    pub fn common() -> Vec<Self> {
-        const N: u64 = 10;
-        vec![
-            // commits-only: pure JSON replay
-            Self::with_latest_version(N),
-            // checkpoint at latest: no JSON tail (relevant for ICT, where the
-            // latest commit's timestamp lives in the checkpoint)
-            Self::with_latest_version(N).with_checkpoint_at([N]),
-            // checkpoint mid-stream: tail-replay over JSON commits after a checkpoint
-            Self::with_latest_version(N).with_checkpoint_at([N - 5]),
-            // multi-checkpoint: newer supersedes older
-            Self::with_latest_version(N).with_checkpoint_at([N - 5, N]),
-        ]
-    }
-
     /// Latest version on the table. The total number of commits on disk is
     /// `latest_version + 1`. (Does not yet account for log cleanup -- a
     /// post-cleanup state where commits `0..K` have been removed is a
     /// separate axis tracked in #2526.)
-    pub(crate) fn latest_version(&self) -> u64 {
+    pub fn latest_version(&self) -> u64 {
         self.latest_version
     }
 
@@ -355,37 +338,6 @@ impl FeatureSet {
         self
     }
 
-    /// Common feature sets for cross-product testing: empty, one per write-compatible
-    /// feature, and one with all write-compatible features combined. Not the full power
-    /// set -- add specific combos as needed.
-    ///
-    /// `type_widening` is intentionally excluded because kernel errors when writing
-    /// tables with that feature enabled (see `TableFeature::TypeWidening`).
-    pub fn common() -> Vec<Self> {
-        vec![
-            Self::empty(),
-            Self::new().column_mapping("name"),
-            Self::new().ict(),
-            Self::new().v2_checkpoint(),
-            Self::new().deletion_vectors(),
-            Self::new().append_only(),
-            Self::new().change_data_feed(),
-            Self::new().domain_metadata(),
-            Self::new().vacuum_protocol_check(),
-            Self::new().row_tracking(),
-            Self::new()
-                .column_mapping("name")
-                .ict()
-                .v2_checkpoint()
-                .deletion_vectors()
-                .append_only()
-                .change_data_feed()
-                .domain_metadata()
-                .vacuum_protocol_check()
-                .row_tracking(),
-        ]
-    }
-
     /// Returns the table features implied by the properties in this set. Used by tests
     /// to check that each builder method actually enables the right feature.
     pub fn expected_features(&self) -> Vec<TableFeature> {
@@ -470,26 +422,6 @@ impl TableConfig {
         ));
         self
     }
-
-    /// Common table configs for cross-product testing: default plus all four stats
-    /// property combos.
-    pub fn common() -> Vec<Self> {
-        vec![
-            Self::new(),
-            Self::new()
-                .write_stats_as_json(true)
-                .write_stats_as_struct(false),
-            Self::new()
-                .write_stats_as_json(false)
-                .write_stats_as_struct(true),
-            Self::new()
-                .write_stats_as_json(true)
-                .write_stats_as_struct(true),
-            Self::new()
-                .write_stats_as_json(false)
-                .write_stats_as_struct(false),
-        ]
-    }
 }
 
 impl fmt::Display for TableConfig {
@@ -531,10 +463,8 @@ impl fmt::Display for TableConfig {
 // fn test_scan(feature_set: FeatureSet, table_config: TableConfig) { ... }
 // ```
 
-/// All common feature sets: empty, one per write-compatible feature, and all combined.
-///
-/// `type_widening` is intentionally excluded because kernel errors when writing tables
-/// with that feature enabled (see [`FeatureSet::common`]).
+/// Empty + one per write-compatible feature + all combined. `type_widening` is
+/// excluded because kernel errors when writing tables with that feature enabled.
 #[rstest_reuse::template]
 #[rstest::rstest]
 pub fn feature_sets(
@@ -1224,6 +1154,11 @@ pub fn test_table(log_state: LogState, feature_set: FeatureSet) -> TestTable {
         .build()
         .expect("failed to build test table")
 }
+
+/// Mid version used by the [`default_sweep`] template for `AtVersion` and
+/// `IncrementalToLatest` targets. Must satisfy `mid <= latest_version` for every
+/// log state in the sweep.
+pub const DEFAULT_SWEEP_MID_VERSION: u64 = 5;
 
 // ===========================================================================
 // Macros
