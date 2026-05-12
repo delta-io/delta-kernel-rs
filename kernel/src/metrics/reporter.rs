@@ -4,6 +4,7 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Instant;
 
+use delta_kernel_derive::internal_api;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{event, warn, Level, Span, Subscriber};
@@ -185,8 +186,11 @@ struct StorageEventTypeVisitor {
     duration: u64,
 }
 
+#[internal_api]
 pub(crate) const COPY_COMPLETED_NAME: &str = "copy_completed";
+#[internal_api]
 pub(crate) const LIST_COMPLETED_NAME: &str = "list_completed";
+#[internal_api]
 pub(crate) const READ_COMPLETED_NAME: &str = "read_completed";
 
 // Span names for metric-bearing spans. Each constant is used both at the span creation site
@@ -196,6 +200,7 @@ pub(crate) const READ_COMPLETED_NAME: &str = "read_completed";
 pub(crate) const SEGMENT_FOR_SNAPSHOT_SPAN: &str = "segment.for_snapshot";
 pub(crate) const SEGMENT_READ_METADATA_SPAN: &str = "segment.read_metadata";
 pub(crate) const SNAP_BUILD_SPAN: &str = "snap.build";
+#[internal_api]
 pub(crate) const STORAGE_SPAN: &str = "storage";
 const JSON_READ_COMPLETED_SPAN: &str = "json_read_completed";
 const PARQUET_READ_COMPLETED_SPAN: &str = "parquet_read_completed";

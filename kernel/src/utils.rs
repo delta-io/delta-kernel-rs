@@ -96,6 +96,7 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
 }
 
 /// Returns the current time as a Duration since Unix epoch.
+#[internal_api]
 pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -103,6 +104,7 @@ pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
 }
 
 /// Returns the current time in milliseconds since Unix epoch.
+#[internal_api]
 pub(crate) fn current_time_ms() -> DeltaResult<i64> {
     let duration = current_time_duration()?;
     i64::try_from(duration.as_millis())
@@ -251,7 +253,7 @@ pub(crate) mod test_utils {
 
     use crate::schema::{
         ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType, MetadataValue,
-        PrimitiveType, SchemaRef, StructField, StructType,
+        SchemaRef, StructField, StructType,
     };
 
     /// A mock table that writes commits to a local temporary delta log. This can be used to
@@ -406,82 +408,6 @@ pub(crate) mod test_utils {
             Metadata::try_new(None, None, schema, vec![], 0, props.into_iter().collect()).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         crate::table_configuration::TableConfiguration::try_new(metadata, protocol, table_root, 0)
-    }
-
-    /// Helper to get a field from a StructType by name, panicking if not found.
-    pub(crate) fn get_schema_field(struct_type: &StructType, name: &str) -> StructField {
-        struct_type
-            .fields()
-            .find(|f| f.name() == name)
-            .unwrap_or_else(|| panic!("Field '{name}' not found"))
-            .clone()
-    }
-
-    /// Validates that a schema has the expected checkpoint structure with top-level action fields
-    /// and proper nested types for add, metaData, and protocol actions.
-    pub(crate) fn validate_checkpoint_schema(schema: &SchemaRef) {
-        // Verify top-level action fields exist and are structs
-        let top_level_fields = ["txn", "add", "remove", "metaData", "protocol"];
-        for field_name in top_level_fields {
-            let field = get_schema_field(schema, field_name);
-            assert!(
-                matches!(field.data_type(), KernelDataType::Struct(_)),
-                "Field '{field_name}' should be a struct type"
-            );
-        }
-
-        // Verify 'add' struct has expected fields with correct types
-        let add_field = get_schema_field(schema, "add");
-        let add_struct = match add_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'add' should be a struct"),
-        };
-        assert_eq!(
-            get_schema_field(add_struct, "path").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::String)
-        );
-        assert_eq!(
-            get_schema_field(add_struct, "size").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::Long)
-        );
-        assert!(
-            matches!(
-                get_schema_field(add_struct, "partitionValues").data_type(),
-                KernelDataType::Map(_)
-            ),
-            "'partitionValues' should be a map type"
-        );
-
-        // Verify 'metaData' struct has nested 'format' struct
-        let metadata_field = get_schema_field(schema, "metaData");
-        let metadata_struct = match metadata_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'metaData' should be a struct"),
-        };
-        let format_field = get_schema_field(metadata_struct, "format");
-        let format_struct = match format_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'format' should be a struct"),
-        };
-        assert_eq!(
-            get_schema_field(format_struct, "provider").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::String)
-        );
-
-        // Verify 'protocol' struct has version fields
-        let protocol_field = get_schema_field(schema, "protocol");
-        let protocol_struct = match protocol_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'protocol' should be a struct"),
-        };
-        assert_eq!(
-            get_schema_field(protocol_struct, "minReaderVersion").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::Integer)
-        );
-        assert_eq!(
-            get_schema_field(protocol_struct, "minWriterVersion").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::Integer)
-        );
     }
 
     // ==================== Test schema helpers ====================

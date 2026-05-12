@@ -11,8 +11,6 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
@@ -22,6 +20,8 @@ use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::parquet::DefaultParquetHandler;
 use test_utils::{
     begin_transaction, create_table, engine_store_setup, test_read, test_table_setup,
 };

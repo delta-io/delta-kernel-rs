@@ -68,6 +68,9 @@
 //! correlating to specific Snapshot/Transaction operations.
 
 mod events;
+#[cfg(feature = "internal-api")]
+pub mod reporter;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod reporter;
 
 use std::sync::Arc;

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::Snapshot;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
     actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
     create_log_path, delta_path_for_version, TestAction,

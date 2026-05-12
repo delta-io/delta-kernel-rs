@@ -403,7 +403,7 @@ pub(crate) fn timestamp_to_version(
 /// # Examples
 /// ```ignore
 /// use delta_kernel::snapshot::Snapshot;
-/// use delta_kernel::engine::default::DefaultEngine;
+/// use test_utils::delta_kernel_default_engine::DefaultEngine;
 /// use delta_kernel::history_manager::latest_version_as_of;
 ///
 /// let engine = DefaultEngine::try_new(...)?;
@@ -430,7 +430,7 @@ pub fn latest_version_as_of(
 /// # Examples
 /// ```ignore
 /// use delta_kernel::snapshot::Snapshot;
-/// use delta_kernel::engine::default::DefaultEngine;
+/// use test_utils::delta_kernel_default_engine::DefaultEngine;
 /// use delta_kernel::history_manager::first_version_after;
 ///
 /// let engine = DefaultEngine::try_new(...)?;
@@ -479,7 +479,7 @@ pub fn first_version_after(
 /// # Examples
 /// ```ignore
 /// use delta_kernel::snapshot::Snapshot;
-/// use delta_kernel::engine::default::DefaultEngine;
+/// use test_utils::delta_kernel_default_engine::DefaultEngine;
 /// use delta_kernel::history_manager::timestamp_range_to_versions;
 ///
 /// let engine = DefaultEngine::try_new(...)?;

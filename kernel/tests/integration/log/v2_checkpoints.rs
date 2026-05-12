@@ -13,7 +13,6 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
-use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::schema::{DataType, StructField, StructType};
@@ -22,6 +21,7 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use itertools::Itertools;
+use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::{
     begin_transaction, create_add_files_metadata, create_table_and_load_snapshot, insert_data,
     load_test_data, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
@@ -883,7 +883,7 @@ fn read_last_checkpoint(table_path: &str) -> serde_json::Value {
 async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
-    engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
+    engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
 ) -> DeltaResult<Arc<Snapshot>> {
     fn make_info_array(names: &[&str]) -> ArrayRef {
         let name_array: ArrayRef = Arc::new(StringArray::from(
@@ -1140,7 +1140,7 @@ fn assert_sidecars_contain_only_file_actions(
 async fn create_partitioned_stats_table<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
-    engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
+    engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::LONG),
@@ -1604,7 +1604,7 @@ fn cross_feature_schema() -> Arc<StructType> {
 async fn build_v2_table_with_feature<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
-    engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
+    engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
     features: &[CrossFeature],
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let schema = cross_feature_schema();

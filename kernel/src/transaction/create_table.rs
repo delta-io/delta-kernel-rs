@@ -101,8 +101,8 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// use delta_kernel::transaction::create_table::create_table;
 /// use delta_kernel::schema::{DataType, StructField, StructType};
 /// use delta_kernel::committer::FileSystemCommitter;
-/// use delta_kernel::engine::default::DefaultEngineBuilder;
-/// use delta_kernel::engine::default::storage::store_from_url;
+/// use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
+/// use test_utils::delta_kernel_default_engine::storage::store_from_url;
 ///
 /// # fn main() -> delta_kernel::DeltaResult<()> {
 /// let schema = Arc::new(StructType::new_unchecked(vec![

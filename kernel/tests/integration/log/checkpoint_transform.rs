@@ -15,8 +15,6 @@ use delta_kernel::arrow::compute::{concat_batches, sort_to_indices, take};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema, TimestampMicrosecondType,
 };
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{column_expr, Scalar};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
@@ -24,6 +22,8 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::{DeltaResult, Expression, Snapshot};
 use serde_json::json;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{insert_data, read_scan, write_batch_to_table};
 use url::Url;
 

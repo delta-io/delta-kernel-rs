@@ -58,11 +58,6 @@ use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::{
-    TokioBackgroundExecutor, TokioMultiThreadExecutor,
-};
-use delta_kernel::engine::default::executor::TaskExecutor;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::DynObjectStore;
@@ -71,6 +66,11 @@ use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel_default_engine::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
+use delta_kernel_default_engine::executor::TaskExecutor;
+use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 
 // ===========================================================================
 // Sync/async bridge

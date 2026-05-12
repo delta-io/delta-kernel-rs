@@ -4,39 +4,43 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+use delta_kernel::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
+use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
+use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_utils::{
+    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
+    RowIndexBuilder,
+};
+use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use delta_kernel::engine::{reader_options, writer_options};
+use delta_kernel::expressions::ColumnName;
+use delta_kernel::metrics::emit_parquet_read_completed;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
+use delta_kernel::parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ParquetRecordBatchReaderBuilder,
+};
+use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
+use delta_kernel::parquet::arrow::async_reader::{
+    ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+};
+use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
+use delta_kernel::schema::{SchemaRef, StructType};
+use delta_kernel::transaction::WriteContext;
+use delta_kernel::{
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
+    ParquetHandler, PredicateRef,
+};
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 
-use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
-use super::stats::collect_stats;
-use super::UrlExt;
-use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
-use crate::arrow::datatypes::{DataType, Field, Schema};
-use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
-use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::{
-    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
-    RowIndexBuilder,
-};
-use crate::engine::default::executor::TaskExecutor;
-use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::engine::{reader_options, writer_options};
-use crate::expressions::ColumnName;
-use crate::metrics::emit_parquet_read_completed;
-use crate::object_store::path::Path;
-use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use crate::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
-use crate::schema::{SchemaRef, StructType};
-use crate::transaction::WriteContext;
-use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
-    ParquetHandler, PredicateRef,
-};
+use crate::executor::TaskExecutor;
+use crate::file_stream::{FileOpenFuture, FileOpener, FileStream};
+use crate::stats::collect_stats;
+use crate::UrlExt;
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -73,7 +77,7 @@ impl DataFileMetadata {
     ///
     /// The `log_path` is the path string written to the Delta log's `add.path` field.
     ///
-    /// [`Transaction::add_files_schema`]: crate::transaction::Transaction::add_files_schema
+    /// [`Transaction::add_files_schema`]: delta_kernel::transaction::Transaction::add_files_schema
     pub(crate) fn as_record_batch(
         &self,
         partition_values: &HashMap<String, Option<String>>,
@@ -218,10 +222,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// Add action metadata ready for [`Transaction::add_files`].
     ///
     /// Note that the schema does not contain the dataChange column. In order to set `data_change`
-    /// flag, use [`crate::transaction::Transaction::with_data_change`].
+    /// flag, use [`delta_kernel::transaction::Transaction::with_data_change`].
     ///
-    /// [`WriteContext::write_dir`]: crate::transaction::WriteContext::write_dir
-    /// [`Transaction::add_files`]: crate::transaction::Transaction::add_files
+    /// [`WriteContext::write_dir`]: delta_kernel::transaction::WriteContext::write_dir
+    /// [`Transaction::add_files`]: delta_kernel::transaction::Transaction::add_files
     pub async fn write_parquet_file(
         &self,
         data: Box<dyn EngineData>,
@@ -234,7 +238,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
                 write_context.stats_columns(),
             )
             .await?;
-        super::build_add_file_metadata(file_metadata, write_context)
+        crate::build_add_file_metadata(file_metadata, write_context)
     }
 }
 
@@ -282,7 +286,7 @@ async fn read_parquet_files_impl(
                 schema,
                 predicate,
                 None,
-                super::DEFAULT_BATCH_SIZE,
+                crate::DEFAULT_BATCH_SIZE,
                 file,
             )
             .await
@@ -290,7 +294,7 @@ async fn read_parquet_files_impl(
     });
     // create a stream from that iterator which buffers up to `buffer_size` futures at a time
     let result_stream = stream::iter(file_futures)
-        .buffered(super::DEFAULT_BUFFER_SIZE)
+        .buffered(crate::DEFAULT_BUFFER_SIZE)
         .try_flatten()
         .map_ok(|record_batch| -> Box<dyn EngineData> {
             Box::new(ArrowEngineData::new(record_batch))
@@ -314,8 +318,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             physical_schema,
             predicate,
         );
-        let inner = super::stream_future_to_iter(self.task_executor.clone(), future)?;
-        Ok(Box::new(super::ReadMetricsIterator::new(
+        let inner = crate::stream_future_to_iter(self.task_executor.clone(), future)?;
+        Ok(Box::new(crate::ReadMetricsIterator::new(
             inner,
             num_files,
             bytes_read,
@@ -420,7 +424,7 @@ async fn open_parquet_file(
     let path = Path::from_url_path(file_meta.location.path())?;
 
     let mut reader = {
-        use crate::object_store::ObjectStoreScheme;
+        use delta_kernel::object_store::ObjectStoreScheme;
         // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
         // request which isn't supported by Azure. For now we just detect if the URL is
         // pointing to azure and if so, do a HEAD request so we can pass in file size to the
@@ -581,27 +585,48 @@ mod tests {
     use std::path::PathBuf;
     use std::slice;
 
+    use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+    use delta_kernel::arrow::array::{
+        Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+        Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, StructArray,
+        TimestampMicrosecondArray,
+    };
+    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::object_store::local::LocalFileSystem;
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::object_store::ObjectStoreExt as _;
+    use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
+    use delta_kernel::parquet::arrow::async_reader::{
+        ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+    };
+    use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
+    use delta_kernel::schema::{ColumnMetadataKey, MetadataValue};
+    use delta_kernel::utils::current_time_ms;
+    use delta_kernel::EngineData;
+    use futures::TryStreamExt as _;
     use itertools::Itertools;
     use url::Url;
 
-    use super::*;
-    use crate::arrow::array::{
-        Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-        Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
-        TimestampMicrosecondArray,
-    };
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use crate::engine::arrow_conversion::TryIntoKernel as _;
-    use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::DEFAULT_BATCH_SIZE;
-    use crate::object_store::local::LocalFileSystem;
-    use crate::object_store::memory::InMemory;
-    use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
-    use crate::schema::{ColumnMetadataKey, MetadataValue};
-    use crate::utils::current_time_ms;
-    use crate::utils::test_utils::assert_result_error_with_message;
-    use crate::EngineData;
+    use super::{open_parquet_file, DataFileMetadata};
+    use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::{DEFAULT_BATCH_SIZE, *};
+
+    #[track_caller]
+    fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
+        match res {
+            Ok(_) => panic!("Expected error with message {message}, but got Ok result"),
+            Err(error) => {
+                let error_str = error.to_string();
+                assert!(
+                    error_str.contains(message),
+                    "Error message does not contain the expected message.\nExpected message:\t{message}\nActual message:\t\t{error_str}"
+                );
+            }
+        }
+    }
 
     fn into_record_batch(
         engine_data: DeltaResult<Box<dyn EngineData>>,
@@ -638,7 +663,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_parquet_file_with_size() {
         let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+            "../kernel/tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
         )).unwrap();
         let file_size = std::fs::metadata(&path).unwrap().len();
         let url = Url::from_file_path(path).unwrap();
@@ -656,7 +681,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_parquet_file_without_size() {
         let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+            "../kernel/tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
         )).unwrap();
         let url = Url::from_file_path(path).unwrap();
         let file_meta = FileMeta {
@@ -675,7 +700,7 @@ mod tests {
         let store = Arc::new(LocalFileSystem::new());
 
         let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+            "../kernel/tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
         )).unwrap();
         let url = url::Url::from_file_path(path).unwrap();
         let location = Path::from_url_path(url.path()).unwrap();
@@ -759,7 +784,7 @@ mod tests {
 
         // Build expected schema dynamically based on stats
         let stats_field = Field::new("stats", stats.data_type().clone(), true);
-        let schema = Arc::new(crate::arrow::datatypes::Schema::new(vec![
+        let schema = Arc::new(delta_kernel::arrow::datatypes::Schema::new(vec![
             Field::new("path", ArrowDataType::Utf8, false),
             Field::new(
                 "partitionValues",
@@ -1300,8 +1325,8 @@ mod tests {
             .expect("Field ID should be accessible via ColumnMetadataKey::ParquetFieldId per lib.rs:836-837");
 
         match field_id {
-            crate::schema::MetadataValue::String(id) => assert_eq!(id, "42"),
-            crate::schema::MetadataValue::Number(id) => assert_eq!(*id, 42),
+            delta_kernel::schema::MetadataValue::String(id) => assert_eq!(id, "42"),
+            delta_kernel::schema::MetadataValue::Number(id) => assert_eq!(*id, 42),
             other => panic!("Expected String or Number, got {other:?}"),
         }
     }
@@ -1311,10 +1336,10 @@ mod tests {
     /// Per lib.rs:676-680, field IDs (via [`ColumnMetadataKey::ParquetFieldId`]) should take
     /// precedence over field names for column matching.
     ///
-    /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
+    /// [`ColumnMetadataKey::ParquetFieldId`]: delta_kernel::schema::ColumnMetadataKey::ParquetFieldId
     #[test]
     fn test_read_parquet_with_field_id_matching() {
-        use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
+        use delta_kernel::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
 
         // Write parquet with field IDs using PARQUET_FIELD_ID_META_KEY (Parquet's native key)
         // The kernel will transform these to parquet.field.id when reading
@@ -1349,13 +1374,12 @@ mod tests {
         // Create kernel schema with DIFFERENT names but SAME field IDs
         let kernel_schema = Arc::new(
             StructType::try_new(vec![
-                StructField::new("user_id", crate::schema::DataType::LONG, false).with_metadata([
-                    (
+                StructField::new("user_id", delta_kernel::schema::DataType::LONG, false)
+                    .with_metadata([(
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(1),
-                    ),
-                ]),
-                StructField::new("user_name", crate::schema::DataType::STRING, false)
+                    )]),
+                StructField::new("user_name", delta_kernel::schema::DataType::STRING, false)
                     .with_metadata([(
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(2),
@@ -1500,40 +1524,45 @@ mod tests {
 
     #[test]
     fn parquet_handler_reads_footer() {
-        crate::engine::tests::test_parquet_handler_reads_footer(&default_parquet_handler());
+        delta_kernel::engine::tests::test_parquet_handler_reads_footer(
+            &default_parquet_handler(),
+            std::path::Path::new(
+                "../kernel/tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
+            ),
+        );
     }
 
     #[test]
     fn parquet_handler_footer_errors_on_missing_file() {
-        crate::engine::tests::test_parquet_handler_footer_errors_on_missing_file(
+        delta_kernel::engine::tests::test_parquet_handler_footer_errors_on_missing_file(
             &default_parquet_handler(),
         );
     }
 
     #[test]
     fn parquet_handler_footer_preserves_field_ids() {
-        crate::engine::tests::test_parquet_handler_footer_preserves_field_ids(
+        delta_kernel::engine::tests::test_parquet_handler_footer_preserves_field_ids(
             &default_parquet_handler(),
         );
     }
 
     #[test]
     fn parquet_handler_write_always_overwrites() {
-        crate::engine::tests::test_parquet_handler_write_always_overwrites(
+        delta_kernel::engine::tests::test_parquet_handler_write_always_overwrites(
             &default_parquet_handler(),
         );
     }
 
     #[test]
     fn parquet_handler_write_omits_arrow_schema() {
-        crate::engine::tests::test_parquet_handler_write_omits_arrow_schema(
+        delta_kernel::engine::tests::test_parquet_handler_write_omits_arrow_schema(
             &default_parquet_handler(),
         );
     }
 
     #[test]
     fn parquet_handler_reads_file_with_arrow_schema() {
-        crate::engine::tests::test_parquet_handler_reads_file_with_arrow_schema(
+        delta_kernel::engine::tests::test_parquet_handler_reads_file_with_arrow_schema(
             &default_parquet_handler(),
         );
     }

@@ -10,10 +10,9 @@
 //! A generic trait [TaskExecutor] can be implemented with your preferred async
 //! runtime. Behind the `tokio` feature flag, we provide a both a single-threaded
 //! and multi-threaded executor based on Tokio.
+use delta_kernel::DeltaResult;
 use futures::future::BoxFuture;
 use futures::Future;
-
-use crate::DeltaResult;
 
 /// An executor that can be used to run async tasks. This is used by IO functions
 /// within the `DefaultEngine`.
@@ -50,7 +49,6 @@ pub trait TaskExecutor: Send + Sync + 'static {
     fn enter(&self) -> Self::Guard<'_>;
 }
 
-#[cfg(any(feature = "tokio", test))]
 pub mod tokio {
     use std::mem::ManuallyDrop;
     use std::sync::mpsc::channel;
@@ -59,8 +57,7 @@ pub mod tokio {
     use futures::{Future, TryFutureExt};
     use tokio::runtime::{EnterGuard, Handle, RuntimeFlavor};
 
-    use super::TaskExecutor;
-    use crate::{DeltaResult, Error};
+    use crate::{DeltaResult, Error, TaskExecutor};
 
     /// A [`TaskExecutor`] that uses the tokio single-threaded runtime in a
     /// background thread to service tasks.
@@ -323,7 +320,10 @@ pub mod tokio {
 
     #[cfg(test)]
     mod test {
-        use super::*;
+        use std::sync::mpsc::channel;
+
+        use super::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
+        use crate::*;
 
         async fn test_executor(executor: impl TaskExecutor) {
             // Can run a task

@@ -6,23 +6,21 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use delta_kernel_derive::internal_api;
-
-use crate::arrow::array::{
+use delta_kernel::arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array,
     LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StringViewArray, StructArray,
 };
-use crate::arrow::compute::kernels::aggregate::{max, max_string, min, min_string};
-use crate::arrow::datatypes::{
+use delta_kernel::arrow::compute::kernels::aggregate::{max, max_string, min, min_string};
+use delta_kernel::arrow::datatypes::{
     ArrowPrimitiveType, DataType, Date32Type, Date64Type, Decimal128Type, Field, Float32Type,
     Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, TimeUnit, TimestampMicrosecondType,
     TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type,
     UInt64Type, UInt8Type,
 };
-use crate::column_trie::ColumnTrie;
-use crate::engine::arrow_utils::fix_nested_null_masks;
-use crate::expressions::ColumnName;
-use crate::{DeltaResult, Error};
+use delta_kernel::column_trie::ColumnTrie;
+use delta_kernel::engine::arrow_utils::fix_nested_null_masks;
+use delta_kernel::expressions::ColumnName;
+use delta_kernel::{DeltaResult, Error};
 
 /// Maximum prefix length for string statistics (Delta protocol requirement).
 const STRING_PREFIX_LENGTH: usize = 32;
@@ -164,7 +162,7 @@ fn agg_timestamp<T>(
     agg: Agg,
 ) -> DeltaResult<Option<ArrayRef>>
 where
-    T: crate::arrow::datatypes::ArrowTimestampType,
+    T: delta_kernel::arrow::datatypes::ArrowTimestampType,
     PrimitiveArray<T>: From<Vec<Option<i64>>>,
 {
     let array = column.as_primitive_opt::<T>().ok_or_else(|| {
@@ -502,7 +500,6 @@ impl StatsAccumulator {
 /// * `batch` - The RecordBatch to collect statistics from
 /// * `stats_columns` - Column names that should have statistics collected (allowlist). Only these
 ///   columns will appear in nullCount/minValues/maxValues.
-#[internal_api]
 pub(crate) fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
@@ -555,16 +552,19 @@ pub(crate) fn collect_stats(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::arrow::array::{
-        Array, AsArray, BinaryArray, Int32Array, Int64Array, ListArray, MapArray, StringArray,
+    use delta_kernel::arrow::array::{
+        Array, ArrayRef, AsArray, BinaryArray, Int32Array, Int64Array, ListArray, MapArray,
+        RecordBatch, StringArray, StructArray,
     };
-    use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
-    use crate::arrow::compute::concat_batches;
-    use crate::arrow::datatypes::{Fields, Int32Type, Int64Type, Schema};
-    use crate::engine::arrow_expression::evaluate_expression::to_json;
-    use crate::expressions::column_name;
-    use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
+    use delta_kernel::arrow::compute::concat_batches;
+    use delta_kernel::arrow::datatypes::{DataType, Field, Fields, Int32Type, Int64Type, Schema};
+    use delta_kernel::engine::arrow_expression::evaluate_expression::to_json;
+    use delta_kernel::expressions::{column_name, ColumnName};
+    use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    use super::{collect_stats, truncate_max_string, truncate_min_string};
+    use crate::*;
 
     #[test]
     fn test_collect_stats_single_batch() {
@@ -1438,7 +1438,7 @@ mod tests {
         field_name: &str,
     ) -> T::Native
     where
-        T: crate::arrow::datatypes::ArrowPrimitiveType,
+        T: delta_kernel::arrow::datatypes::ArrowPrimitiveType,
     {
         stats
             .column_by_name(stat_name)
@@ -1609,7 +1609,7 @@ mod tests {
         // Load a PySpark-generated Delta table containing all supported stat types
         // and extract Spark's reference stats from the commit log.
         let test_path =
-            std::fs::canonicalize("./tests/data/stats-writing-all-types/delta").unwrap();
+            std::fs::canonicalize("../kernel/tests/data/stats-writing-all-types/delta").unwrap();
 
         let commit_path = test_path
             .join("_delta_log")

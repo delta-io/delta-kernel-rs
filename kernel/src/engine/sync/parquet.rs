@@ -312,7 +312,12 @@ mod tests {
 
     #[test]
     fn parquet_handler_reads_footer() {
-        crate::engine::tests::test_parquet_handler_reads_footer(&SyncParquetHandler::new(None));
+        crate::engine::tests::test_parquet_handler_reads_footer(
+            &SyncParquetHandler::new(None),
+            std::path::Path::new(
+                "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
+            ),
+        );
     }
 
     #[test]

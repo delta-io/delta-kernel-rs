@@ -7,12 +7,11 @@
 //! details) in their own tests.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use tempfile::{tempdir, NamedTempFile};
-use test_utils::delta_path_for_version;
 use url::Url;
 
 use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
@@ -26,9 +25,16 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
 use crate::schema::{
     column_name, ColumnMetadataKey, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
-    StructField, StructType,
+    PrimitiveType, SchemaRef, StructField, StructType,
 };
 use crate::{DeltaResult, Engine, EngineData, FileMeta, JsonHandler, ParquetHandler};
+
+/// Inlined equivalent of `test_utils::delta_path_for_version`, used by [`test_arrow_engine`].
+/// Kept local so `engine::tests` does not pull `test_utils` (a dev-dependency) when
+/// `internal-api` is enabled in non-test builds.
+fn delta_path_for_version(version: u64, suffix: &str) -> Path {
+    Path::from(format!("_delta_log/{version:020}.{suffix}"))
+}
 
 // ---------------------------------------------------------------------------
 // Shared file-setup helpers
@@ -37,6 +43,7 @@ use crate::{DeltaResult, Engine, EngineData, FileMeta, JsonHandler, ParquetHandl
 /// Writes `lines` as newline-delimited JSON to a [`NamedTempFile`] and returns the file
 /// together with a [`FileMeta`] pointing at it. The temp file must be kept alive for as
 /// long as the `FileMeta` is in use.
+#[internal_api]
 pub(crate) fn make_temp_json_file(lines: &[&str]) -> (NamedTempFile, FileMeta) {
     let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
     for line in lines {
@@ -57,6 +64,7 @@ pub(crate) fn make_temp_json_file(lines: &[&str]) -> (NamedTempFile, FileMeta) {
 }
 
 /// Builds a [`FileMeta`] for a local file path, reading the actual size from the filesystem.
+#[internal_api]
 pub(crate) fn file_meta_for(path: &std::path::Path) -> FileMeta {
     let url = Url::from_file_path(path).unwrap();
     let size = std::fs::metadata(path).unwrap().len();
@@ -74,6 +82,7 @@ pub(crate) fn file_meta_for(path: &std::path::Path) -> FileMeta {
 /// Contract: any [`JsonHandler`] that receives a schema with a [`MetadataColumnSpec::FilePath`]
 /// column must populate it with the file URL for every row, readable via [`GetData`] without
 /// any Arrow downcasting.
+#[internal_api]
 pub(crate) fn test_json_handler_file_path_contract(handler: &dyn JsonHandler) {
     let (_temp, file_meta) = make_temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#]);
     let expected_url = file_meta.location.to_string();
@@ -128,20 +137,93 @@ pub(crate) fn test_json_handler_file_path_contract(handler: &dyn JsonHandler) {
 // ParquetHandler contract tests
 // ---------------------------------------------------------------------------
 
-/// Contract: [`ParquetHandler::read_parquet_footer`] must correctly parse the schema
-/// from a real Delta checkpoint file.
-pub(crate) fn test_parquet_handler_reads_footer(handler: &dyn ParquetHandler) {
-    let path = std::fs::canonicalize(PathBuf::from(
-        "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
-    ))
-    .unwrap();
+/// Contract: [`ParquetHandler::read_parquet_footer`] must correctly parse the schema from a
+/// real Delta checkpoint file. `checkpoint_path` should point at a V1 checkpoint parquet file
+/// (kernel ships a fixture under `kernel/tests/data/`).
+#[internal_api]
+pub(crate) fn test_parquet_handler_reads_footer(
+    handler: &dyn ParquetHandler,
+    checkpoint_path: &std::path::Path,
+) {
+    let path = std::fs::canonicalize(checkpoint_path).unwrap();
     let file_meta = file_meta_for(&path);
     let footer = handler.read_parquet_footer(&file_meta).unwrap();
-    crate::utils::test_utils::validate_checkpoint_schema(&footer.schema);
+    validate_checkpoint_schema(&footer.schema);
+}
+
+/// Validates that a schema has the expected checkpoint structure with top-level action fields
+/// and proper nested types for add, metaData, and protocol actions.
+fn validate_checkpoint_schema(schema: &SchemaRef) {
+    fn get_field(struct_type: &StructType, name: &str) -> StructField {
+        struct_type
+            .fields()
+            .find(|f| f.name() == name)
+            .unwrap_or_else(|| panic!("Field '{name}' not found"))
+            .clone()
+    }
+
+    for field_name in ["txn", "add", "remove", "metaData", "protocol"] {
+        let field = get_field(schema, field_name);
+        assert!(
+            matches!(field.data_type(), DataType::Struct(_)),
+            "Field '{field_name}' should be a struct type"
+        );
+    }
+
+    let add_field = get_field(schema, "add");
+    let add_struct = match add_field.data_type() {
+        DataType::Struct(s) => s,
+        _ => panic!("'add' should be a struct"),
+    };
+    assert_eq!(
+        get_field(add_struct, "path").data_type(),
+        &DataType::Primitive(PrimitiveType::String)
+    );
+    assert_eq!(
+        get_field(add_struct, "size").data_type(),
+        &DataType::Primitive(PrimitiveType::Long)
+    );
+    assert!(
+        matches!(
+            get_field(add_struct, "partitionValues").data_type(),
+            DataType::Map(_)
+        ),
+        "'partitionValues' should be a map type"
+    );
+
+    let metadata_field = get_field(schema, "metaData");
+    let metadata_struct = match metadata_field.data_type() {
+        DataType::Struct(s) => s,
+        _ => panic!("'metaData' should be a struct"),
+    };
+    let format_field = get_field(metadata_struct, "format");
+    let format_struct = match format_field.data_type() {
+        DataType::Struct(s) => s,
+        _ => panic!("'format' should be a struct"),
+    };
+    assert_eq!(
+        get_field(format_struct, "provider").data_type(),
+        &DataType::Primitive(PrimitiveType::String)
+    );
+
+    let protocol_field = get_field(schema, "protocol");
+    let protocol_struct = match protocol_field.data_type() {
+        DataType::Struct(s) => s,
+        _ => panic!("'protocol' should be a struct"),
+    };
+    assert_eq!(
+        get_field(protocol_struct, "minReaderVersion").data_type(),
+        &DataType::Primitive(PrimitiveType::Integer)
+    );
+    assert_eq!(
+        get_field(protocol_struct, "minWriterVersion").data_type(),
+        &DataType::Primitive(PrimitiveType::Integer)
+    );
 }
 
 /// Contract: [`ParquetHandler::read_parquet_footer`] must return an error for a
 /// non-existent file.
+#[internal_api]
 pub(crate) fn test_parquet_handler_footer_errors_on_missing_file(handler: &dyn ParquetHandler) {
     let mut temp_path = std::env::temp_dir();
     temp_path.push("non_existent_kernel_test_file.parquet");
@@ -158,6 +240,7 @@ pub(crate) fn test_parquet_handler_footer_errors_on_missing_file(handler: &dyn P
 
 /// Contract: [`ParquetHandler::read_parquet_footer`] must preserve Arrow field IDs,
 /// accessible via [`ColumnMetadataKey::ParquetFieldId`].
+#[internal_api]
 pub(crate) fn test_parquet_handler_footer_preserves_field_ids(handler: &dyn ParquetHandler) {
     let make_field_with_id = |name: &str, ty: ArrowDataType, nullable: bool, id: &str| {
         Field::new(name, ty, nullable).with_metadata(HashMap::from([(
@@ -205,6 +288,7 @@ pub(crate) fn test_parquet_handler_footer_preserves_field_ids(handler: &dyn Parq
 /// Contract: [`ParquetHandler::write_parquet_file`] always overwrites an existing file.
 /// Writes `[1, 2, 3]`, then overwrites with `[10, 20]`, and verifies only `[10, 20]`
 /// is present.
+#[internal_api]
 pub(crate) fn test_parquet_handler_write_always_overwrites(handler: &dyn ParquetHandler) {
     let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("overwrite_test.parquet");
@@ -267,6 +351,7 @@ pub(crate) fn test_parquet_handler_write_always_overwrites(handler: &dyn Parquet
 
 /// Contract: [`ParquetHandler::write_parquet_file`] must not embed the Arrow IPC schema
 /// (`ARROW:schema`) in the file's key/value metadata.
+#[internal_api]
 pub(crate) fn test_parquet_handler_write_omits_arrow_schema(handler: &dyn ParquetHandler) {
     let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("no_arrow_schema.parquet");
@@ -298,6 +383,7 @@ pub(crate) fn test_parquet_handler_write_omits_arrow_schema(handler: &dyn Parque
 /// Contract: [`ParquetHandler::read_parquet_files`] must successfully read a file whose
 /// metadata contains an embedded Arrow IPC schema (e.g. one produced by [`ArrowWriter`]
 /// without explicit options to skip it).
+#[internal_api]
 pub(crate) fn test_parquet_handler_reads_file_with_arrow_schema(handler: &dyn ParquetHandler) {
     let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("with_arrow_schema.parquet");
@@ -345,6 +431,7 @@ pub(crate) fn test_parquet_handler_reads_file_with_arrow_schema(handler: &dyn Pa
 // Storage / Engine helpers (used by the engine-level tests)
 // ---------------------------------------------------------------------------
 
+#[internal_api]
 pub(crate) fn test_arrow_engine(engine: &dyn Engine, base_url: &Url) {
     test_list_from_should_sort_and_filter(engine, base_url, get_arrow_data);
 }

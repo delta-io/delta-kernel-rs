@@ -6,10 +6,10 @@ use std::sync::Arc;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::Snapshot;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
     begin_transaction, create_table_and_load_snapshot, read_add_infos, test_table_setup,
     write_batch_to_table,

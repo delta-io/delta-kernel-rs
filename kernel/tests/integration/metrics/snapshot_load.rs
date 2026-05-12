@@ -9,13 +9,13 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
+use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{insert_data, test_table_setup_mt};
 use url::Url;
 

@@ -95,7 +95,7 @@ impl ArrowFFIData {
 ///
 /// # Safety
 /// data_handle must be a valid ExclusiveEngineData as read by the
-/// [`delta_kernel::engine::default::DefaultEngine`] obtained from `get_default_engine`.
+/// [`delta_kernel_default_engine::DefaultEngine`] obtained from `get_default_engine`.
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn get_raw_arrow_data(

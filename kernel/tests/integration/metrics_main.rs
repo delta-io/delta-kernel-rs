@@ -2,9 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
 use delta_kernel::Snapshot;
+use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use tracing_subscriber::layer::SubscriberExt as _;
 

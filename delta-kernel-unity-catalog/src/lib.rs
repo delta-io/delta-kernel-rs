@@ -125,13 +125,13 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::committer::{Committer, FileSystemCommitter};
-    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::table_features::{
         SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
     };
     use delta_kernel::transaction::CommitResult;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
     use tracing::info;
     use unity_catalog_delta_client_api::{Commit, InMemoryCommitsClient, Operation, TableData};
     use unity_catalog_delta_rest_client::models::TablesResponse;
