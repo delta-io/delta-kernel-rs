@@ -1107,7 +1107,7 @@ mod tests {
 
     use rstest::rstest;
     use serde_json::json;
-    use test_utils::table_builder::{FeatureSet, LogState, VersionTarget};
+    use test_utils::table_builder::{DataLayoutConfig, FeatureSet, LogState, VersionTarget};
     use test_utils::{add_commit, delta_path_for_version};
 
     use super::{commit, *};
@@ -1982,6 +1982,7 @@ mod tests {
         let (_engine, snap, _table) = test_utils::test_context!(
             LogState::with_latest_version(2),
             FeatureSet::empty(),
+            DataLayoutConfig::Unpartitioned,
             VersionTarget::Latest,
             SyncEngine::new_with_store
         );
