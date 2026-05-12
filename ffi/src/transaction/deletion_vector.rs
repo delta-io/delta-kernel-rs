@@ -1,15 +1,13 @@
 //! FFI surface for deletion-vector update transactions.
 //!
-//! Three pieces:
+//! Two pieces:
 //! 1. An opaque [`DvDescriptorMap`] (path -> [`DeletionVectorDescriptor`]) that the engine
-//!    populates with the DVs it wants to install.
-//! 2. Helpers to build [`DeletionVectorDescriptor`] handles -- either by writing fresh DV files via
-//!    the kernel ([`transaction_write_deletion_vector`]) or by constructing them manually from
-//!    engine-authored DV file metadata ([`dv_descriptor_new`]).
-//! 3. [`transaction_update_deletion_vectors`] consumes the map, drains the supplied scan-metadata
+//!    populates with descriptors it constructed via [`dv_descriptor_new`].
+//! 2. [`transaction_update_deletion_vectors`] consumes the map, drains the supplied scan-metadata
 //!    iterator, and stages remove/add action pairs on the transaction.
 
 use std::collections::HashMap;
+use std::os::raw::c_int;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::transaction::Transaction;
@@ -105,10 +103,23 @@ impl From<KernelDvStorageType> for DeletionVectorStorageType {
     }
 }
 
+impl TryFrom<c_int> for KernelDvStorageType {
+    type Error = Error;
+
+    fn try_from(value: c_int) -> DeltaResult<Self> {
+        match value {
+            0 => Ok(Self::PersistedRelative),
+            1 => Ok(Self::Inline),
+            2 => Ok(Self::PersistedAbsolute),
+            _ => Err(Error::generic(format!(
+                "invalid deletion vector storage type: {value}"
+            ))),
+        }
+    }
+}
+
 /// Construct a [`DeletionVectorDescriptor`] from raw fields, for engines that author DV
 /// files themselves and want to install them via [`transaction_update_deletion_vectors`].
-/// Engines that delegate the file format to kernel should call
-/// [`transaction_write_deletion_vector`] instead.
 ///
 /// Per the Delta protocol "Deletion Vector Descriptor Schema":
 /// - `Inline` descriptors MUST NOT carry an offset; pass `has_offset = false`.
@@ -119,15 +130,15 @@ impl From<KernelDvStorageType> for DeletionVectorStorageType {
 /// - `cardinality` MUST be non-negative.
 ///
 /// For persisted DVs, `offset` is the byte offset within the DV file at which the DV's
-/// 4-byte big-endian size prefix begins. A single-DV file produced by
-/// [`transaction_write_deletion_vector`] uses offset `1` (skipping the version byte).
+/// 4-byte big-endian size prefix begins. For a single-DV file, this is usually `1`
+/// (skipping the version byte).
 ///
 /// # Safety
 ///
 /// Caller must pass valid string slice and engine handle.
 #[no_mangle]
 pub unsafe extern "C" fn dv_descriptor_new(
-    storage_type: KernelDvStorageType,
+    storage_type: c_int,
     path_or_inline_dv: KernelStringSlice,
     has_offset: bool,
     offset: i32,
@@ -137,15 +148,17 @@ pub unsafe extern "C" fn dv_descriptor_new(
 ) -> ExternResult<Handle<ExclusiveDvDescriptor>> {
     let engine = unsafe { engine.as_ref() };
     let path = unsafe { TryFromStringSlice::try_from_slice(&path_or_inline_dv) };
-    dv_descriptor_new_impl(
-        storage_type,
-        path,
-        has_offset,
-        offset,
-        size_in_bytes,
-        cardinality,
-    )
-    .into_extern_result(&engine)
+    let result = KernelDvStorageType::try_from(storage_type).and_then(|storage_type| {
+        dv_descriptor_new_impl(
+            storage_type,
+            path,
+            has_offset,
+            offset,
+            size_in_bytes,
+            cardinality,
+        )
+    });
+    result.into_extern_result(&engine)
 }
 
 fn dv_descriptor_new_impl(
@@ -200,71 +213,6 @@ fn dv_descriptor_new_impl(
     .into())
 }
 
-/// Frame raw RoaringTreemap bytes into a Delta deletion-vector file, write it via the
-/// engine's storage handler, and return an owned [`DeletionVectorDescriptor`] handle.
-///
-/// `roaring_bytes` is a portable 64-bit RoaringTreemap (the format produced by
-/// `RoaringTreemap::serialize_into` in the Rust crate, or `RoaringBitmap.serialize` with
-/// the portable variant in other languages). Native (non-portable) roaring serialization
-/// is reserved by the spec and will round-trip-fail when read back. The kernel adds the
-/// Delta DV framing (version byte, big-endian size prefix, magic number, big-endian
-/// CRC32) and chooses the file path.
-///
-/// `random_prefix` is treated as a single path component (no leading or trailing
-/// slashes). Pass an empty slice to write at the table root. A short non-empty prefix
-/// can help spread load across object-store partitions.
-///
-/// The kernel does not verify `cardinality` against the bitmap; passing a wrong value
-/// produces a descriptor with incorrect cardinality.
-///
-/// The returned descriptor has [`KernelDvStorageType::PersistedRelative`] storage type
-/// and must be released either by [`free_dv_descriptor`] or by inserting it into a map
-/// via [`dv_descriptor_map_insert`].
-///
-/// # Safety
-///
-/// Caller must pass valid handles. `roaring_bytes` must point to at least
-/// `roaring_bytes_len` initialized bytes (or be null when `roaring_bytes_len == 0`).
-/// `random_prefix` must be a valid (possibly empty) string slice. The transaction
-/// handle is borrowed and remains valid after this call; the caller must follow up
-/// with `commit` or `free_transaction`.
-#[no_mangle]
-pub unsafe extern "C" fn transaction_write_deletion_vector(
-    txn: Handle<ExclusiveTransaction>,
-    engine: Handle<SharedExternEngine>,
-    roaring_bytes: *const u8,
-    roaring_bytes_len: usize,
-    cardinality: i64,
-    random_prefix: KernelStringSlice,
-) -> ExternResult<Handle<ExclusiveDvDescriptor>> {
-    let extern_engine = unsafe { engine.as_ref() };
-    // The kernel helper takes &self, so we only need shared access to the transaction.
-    let txn_ref: &Transaction = unsafe { txn.as_ref() };
-    let prefix = unsafe { TryFromStringSlice::try_from_slice(&random_prefix) };
-    // SAFETY: caller's contract requires `roaring_bytes` to point to at least
-    // `roaring_bytes_len` initialized bytes when not null; null is treated as empty.
-    let bytes_slice: &[u8] = if roaring_bytes.is_null() || roaring_bytes_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(roaring_bytes, roaring_bytes_len) }
-    };
-    transaction_write_deletion_vector_impl(txn_ref, extern_engine, bytes_slice, cardinality, prefix)
-        .into_extern_result(&extern_engine)
-}
-
-fn transaction_write_deletion_vector_impl(
-    txn: &Transaction,
-    extern_engine: &dyn crate::ExternEngine,
-    roaring_bytes: &[u8],
-    cardinality: i64,
-    random_prefix: DeltaResult<&str>,
-) -> DeltaResult<Handle<ExclusiveDvDescriptor>> {
-    let engine = extern_engine.engine();
-    let descriptor =
-        txn.write_deletion_vector(engine.as_ref(), roaring_bytes, cardinality, random_prefix?)?;
-    Ok(Box::new(descriptor).into())
-}
-
 /// Insert a deletion vector descriptor into the map under the given data file path.
 /// Consumes the descriptor handle on success. On error (e.g. invalid `data_file_path`),
 /// the descriptor handle is left untouched and must still be released by the caller via
@@ -314,7 +262,7 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
 /// `false` from `scan_metadata_next`. The engine should pass an iterator that covers
 /// at least every file path mentioned in the map; extra files are ignored. If the map
 /// references a path that does not appear in the iterator, the call returns an error
-/// and the transaction is left unchanged.
+/// and leaves the transaction unchanged.
 ///
 /// # Safety
 ///
@@ -378,6 +326,16 @@ mod tests {
         for (ffi, kernel) in cases {
             assert_eq!(DeletionVectorStorageType::from(ffi), kernel);
         }
+    }
+
+    #[test]
+    fn kernel_dv_storage_type_rejects_invalid_discriminant() {
+        let err = KernelDvStorageType::try_from(42).expect_err("expected error");
+        assert!(
+            err.to_string()
+                .contains("invalid deletion vector storage type"),
+            "unexpected: {err}"
+        );
     }
 
     /// `dv_descriptor_new_impl` rejects an inline descriptor with `has_offset = true`.

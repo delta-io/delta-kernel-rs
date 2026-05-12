@@ -2146,21 +2146,23 @@ mod tests {
     }
 
     /// End-to-end smoke test for the DV update FFI surface. Uses an on-disk DV-enabled
-    /// table; pushes a serialized roaring bitmap through `transaction_write_deletion_vector`,
-    /// inserts the resulting descriptor into a map via `dv_descriptor_map_insert`, and
-    /// applies it via `transaction_update_deletion_vectors`. After commit, asserts the
-    /// scan returns the non-deleted rows.
+    /// table; writes a connector-authored DV file, builds a descriptor with `dv_descriptor_new`,
+    /// inserts it into a map via `dv_descriptor_map_insert`, and applies it via
+    /// `transaction_update_deletion_vectors`. After commit, asserts the scan returns the
+    /// non-deleted rows.
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
     async fn test_dv_update_round_trip_via_ffi() -> Result<(), Box<dyn std::error::Error>> {
-        use delta_kernel::actions::deletion_vector_writer::{DeletionVector, KernelDeletionVector};
+        use delta_kernel::actions::deletion_vector_writer::{
+            KernelDeletionVector, StreamingDeletionVectorWriter,
+        };
         use delta_kernel::object_store::path::Path as ObjectStorePath;
         use delta_kernel_ffi::scan::{
             free_scan, free_scan_metadata_iter, scan, scan_metadata_iter_init,
         };
         use delta_kernel_ffi::transaction::{
-            dv_descriptor_map_insert, dv_descriptor_map_new, transaction_update_deletion_vectors,
-            transaction_write_deletion_vector,
+            dv_descriptor_map_insert, dv_descriptor_map_new, dv_descriptor_new,
+            transaction_update_deletion_vectors, KernelDvStorageType,
         };
         use test_utils::{create_default_engine, record_batch_to_bytes};
 
@@ -2219,11 +2221,20 @@ mod tests {
         add_txn.add_files(add_metadata);
         let _ = add_txn.commit(kernel_engine.as_ref())?.unwrap_committed();
 
-        // Build a serialized roaring bitmap deleting rows 1 and 2 (ids 20, 30) via the
-        // kernel-provided helper to avoid pulling in the roaring crate directly.
+        // Build and write a connector-authored DV file deleting rows 1 and 2 (ids 20, 30).
         let mut dv = KernelDeletionVector::new();
         dv.add_deleted_row_indexes([1u64, 2]);
-        let roaring_bytes: Vec<u8> = dv.serialize()?.to_vec();
+        let mut dv_bytes = Vec::new();
+        let mut dv_writer = StreamingDeletionVectorWriter::new(&mut dv_bytes);
+        let dv_write_result = dv_writer.write_deletion_vector(dv)?;
+        dv_writer.finalize()?;
+        let dv_url = table_url.join("connector_dv.bin")?;
+        store
+            .put(
+                &ObjectStorePath::from_url_path(dv_url.path())?,
+                dv_bytes.into(),
+            )
+            .await?;
 
         // === FFI surface under test ===
         let table_path = table_url.to_file_path().unwrap();
@@ -2241,16 +2252,17 @@ mod tests {
             )
         });
 
-        // Frame the bitmap into a DV file via the kernel.
-        let prefix = "p1";
+        // Build a descriptor from the connector-authored DV file metadata.
+        let dv_url_string = dv_url.to_string();
         let descriptor = ok_or_panic(unsafe {
-            transaction_write_deletion_vector(
-                txn.shallow_copy(),
+            dv_descriptor_new(
+                KernelDvStorageType::PersistedAbsolute as i32,
+                kernel_string_slice!(dv_url_string),
+                true,
+                dv_write_result.offset,
+                dv_write_result.size_in_bytes,
+                dv_write_result.cardinality,
                 engine.shallow_copy(),
-                roaring_bytes.as_ptr(),
-                roaring_bytes.len(),
-                2,
-                kernel_string_slice!(prefix),
             )
         });
 

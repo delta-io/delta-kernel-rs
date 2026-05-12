@@ -1991,6 +1991,55 @@ mod tests {
         Ok(())
     }
 
+    /// Tests that a mismatch after scanning some files does not leave staged DV updates behind.
+    #[test]
+    fn test_update_deletion_vectors_mismatch_does_not_mutate_transaction(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        fn collect_path(paths: &mut Vec<String>, scan_file: crate::scan::state::ScanFile) {
+            paths.push(scan_file.path);
+        }
+
+        let (engine, snapshot) = setup_dv_enabled_table();
+        let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
+        let scan = snapshot.scan_builder().build()?;
+        let scan_metadata = scan
+            .scan_metadata(&engine)?
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        let mut paths = Vec::new();
+        for metadata in &scan_metadata {
+            paths = metadata.visit_scan_files(paths, collect_path)?;
+        }
+        let existing_path = paths
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::generic("expected at least one scan file"))?;
+
+        let mut dv_map = HashMap::new();
+        dv_map.insert(existing_path, create_test_dv_descriptor("matched"));
+        dv_map.insert(
+            "non_existent_file.parquet".to_string(),
+            create_test_dv_descriptor("missing"),
+        );
+
+        let result = txn.update_deletion_vectors(
+            dv_map,
+            scan_metadata
+                .into_iter()
+                .map(|metadata| Ok(metadata.scan_files)),
+        );
+
+        assert!(
+            result.is_err(),
+            "Should fail when only some DV descriptors match scan files"
+        );
+        assert!(
+            txn.dv_matched_files.is_empty(),
+            "Failed DV update should not leave staged file updates"
+        );
+        Ok(())
+    }
+
     /// Tests that update_deletion_vectors handles empty DV updates correctly as a no-op.
     /// This edge case occurs when a DELETE operation matches no rows.
     #[test]
