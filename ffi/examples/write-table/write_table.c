@@ -21,8 +21,11 @@
 //   - get_unpartitioned_write_context(txn, engine) + get_write_schema/get_write_path
 //     (the values an engine needs when writing parquet files itself)
 //   - set_data_change(txn, false) because this empty commit does not add data
-//   - commit(txn, engine) to produce an empty commit
-//   - Reading the committed version back via a new snapshot to confirm
+//   - commit(txn, engine) to produce an empty commit, returning a CommittedTransaction handle
+//   - committed_transaction_version + committed_transaction_post_commit_snapshot to read the
+//     version and the post-commit snapshot directly from the result, avoiding a fresh
+//     snapshot load
+//   - free_committed_transaction to release the result handle
 //
 // NOTE: This example does NOT call add_files. Staging new files requires building an Arrow
 // RecordBatch that matches Transaction::add_files_schema (path, partitionValues, size,
@@ -115,36 +118,51 @@ int main(int argc, char* argv[]) {
   free_write_context(write_context);
 
   // === Commit ===
-  ExternResultu64 commit_res = commit(txn, engine);
-  if (commit_res.tag != Oku64) {
+  ExternResultHandleExclusiveCommittedTransaction commit_res = commit(txn, engine);
+  if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
     print_error("commit failed.", (Error*)commit_res.err);
     free_error((Error*)commit_res.err);
     free_engine(engine);
     return 1;
   }
-  printf("Committed version: %" PRIu64 "\n", commit_res.ok);
+  HandleExclusiveCommittedTransaction committed = commit_res.ok;
+  printf("Committed version: %" PRIu64 "\n", committed_transaction_version(&committed));
 
-  // === Read back via snapshot to confirm ===
-  ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res =
-      get_snapshot_builder(table_path_slice, engine);
-  if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
-    print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
-    free_error((Error*)snapshot_builder_res.err);
-    free_engine(engine);
-    return 1;
+  // === Read post-commit snapshot directly from the CommittedTransaction ===
+  // Avoids a fresh snapshot load: the kernel hands back the already-built snapshot
+  // for the post-commit version.
+  struct OptionalValueHandleSharedSnapshot post_commit =
+      committed_transaction_post_commit_snapshot(&committed);
+  if (post_commit.tag == SomeHandleSharedSnapshot) {
+    HandleSharedSnapshot snap = post_commit.some;
+    printf("Post-commit snapshot version: %" PRIu64 "\n", version(snap));
+    free_snapshot(snap);
+  } else {
+    printf("No post-commit snapshot available; loading via snapshot builder.\n");
+    ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res =
+        get_snapshot_builder(table_path_slice, engine);
+    if (snapshot_builder_res.tag != OkHandleMutableFfiSnapshotBuilder) {
+      print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
+      free_error((Error*)snapshot_builder_res.err);
+      free_committed_transaction(committed);
+      free_engine(engine);
+      return 1;
+    }
+    ExternResultHandleSharedSnapshot snap_res =
+        snapshot_builder_build(snapshot_builder_res.ok);
+    if (snap_res.tag != OkHandleSharedSnapshot) {
+      print_error("Failed to load snapshot after commit.", (Error*)snap_res.err);
+      free_error((Error*)snap_res.err);
+      free_committed_transaction(committed);
+      free_engine(engine);
+      return 1;
+    }
+    HandleSharedSnapshot loaded = snap_res.ok;
+    printf("Snapshot version after commit: %" PRIu64 "\n", version(loaded));
+    free_snapshot(loaded);
   }
-  ExternResultHandleSharedSnapshot snap_res =
-      snapshot_builder_build(snapshot_builder_res.ok);
-  if (snap_res.tag != OkHandleSharedSnapshot) {
-    print_error("Failed to load snapshot after commit.", (Error*)snap_res.err);
-    free_error((Error*)snap_res.err);
-    free_engine(engine);
-    return 1;
-  }
-  SharedSnapshot* snap = snap_res.ok;
-  printf("Snapshot version after commit: %" PRIu64 "\n", version(snap));
 
-  free_snapshot(snap);
+  free_committed_transaction(committed);
   free_engine(engine);
   return 0;
 }

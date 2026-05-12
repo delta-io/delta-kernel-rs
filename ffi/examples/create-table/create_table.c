@@ -171,14 +171,16 @@ int main(int argc, char* argv[]) {
   ExclusiveCreateTransaction* txn = txn_res.ok;
 
   // === Commit ===
-  ExternResultu64 commit_res = create_table_commit(txn, engine);
-  if (commit_res.tag != Oku64) {
+  ExternResultHandleExclusiveCommittedTransaction commit_res = create_table_commit(txn, engine);
+  if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
     print_error("create_table_commit failed.", (Error*)commit_res.err);
     free_error((Error*)commit_res.err);
     free_engine(engine);
     return 1;
   }
-  printf("Committed version: %" PRIu64 "\n", commit_res.ok);
+  HandleExclusiveCommittedTransaction committed = commit_res.ok;
+  printf("Committed version: %" PRIu64 "\n", committed_transaction_version(&committed));
+  free_committed_transaction(committed);
 
   // === Open a snapshot on the new table to confirm it landed ===
   ExternResultHandleMutableFfiSnapshotBuilder snapshot_builder_res =

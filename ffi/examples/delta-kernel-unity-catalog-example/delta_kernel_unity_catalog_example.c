@@ -223,9 +223,9 @@ int main(int argc, char* argv[])
 
     HandleExclusiveTransaction txn_with_info = txn_with_info_res.ok;
     // calling commit here will end up calling our callback
-    ExternResultu64 commit_res = commit(txn_with_info, engine);
+    ExternResultHandleExclusiveCommittedTransaction commit_res = commit(txn_with_info, engine);
 
-    if (commit_res.tag != Oku64) {
+    if (commit_res.tag != OkHandleExclusiveCommittedTransaction) {
         print_error("Commit failed", (Error*)commit_res.err);
         free_error((Error*)commit_res.err);
         free_engine(engine);
@@ -233,7 +233,10 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    printf("\nCommitted version: %lu\n", (unsigned long)commit_res.ok);
+    HandleExclusiveCommittedTransaction committed = commit_res.ok;
+    printf("\nCommitted version: %lu\n",
+           (unsigned long)committed_transaction_version(&committed));
+    free_committed_transaction(committed);
 
     // Cleanup
     // Note: txn_with_info was consumed by commit(), so we don't free it

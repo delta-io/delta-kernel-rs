@@ -51,7 +51,15 @@ The caller owns the returned builder handle and must call either `snapshot_build
 
 ```
 get_default_engine() -> transaction() -> with_engine_info() -> with_operation() -> add_files() -> commit()
+                                                                                  |
+                                                                                  v
+              committed_transaction_version / committed_transaction_post_commit_snapshot
+                                                                                  |
+                                                                                  v
+                                                                  free_committed_transaction
 ```
+
+`commit()` and `create_table_commit()` return a `Handle<ExclusiveCommittedTransaction>` that the caller can read via `committed_transaction_version` and `committed_transaction_post_commit_snapshot`, then must release with `free_committed_transaction`. The post-commit snapshot, when present, is a separate `SharedSnapshot` handle that must be freed with `free_snapshot`.
 
 ## Building
 
