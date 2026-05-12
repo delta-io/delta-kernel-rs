@@ -13,7 +13,7 @@ serve:
 
 # Test that code examples compile
 test:
-	cargo clean --manifest-path $(KERNEL_PATH)/kernel/Cargo.toml -p delta_kernel
+	cargo clean --manifest-path $(KERNEL_PATH)/kernel/Cargo.toml
 	cargo build --locked --manifest-path $(KERNEL_PATH)/kernel/Cargo.toml --features "$(KERNEL_FEATURES)"
 	mdbook test -L $(KERNEL_PATH)/target/debug/deps
 
