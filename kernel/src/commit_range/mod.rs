@@ -16,21 +16,26 @@
 //!
 //! # Example
 //! ```no_run
+//! use std::sync::Arc;
 //! use delta_kernel::commit_range::{CommitRange, DeltaAction};
-//! use delta_kernel::Snapshot;
+//! use delta_kernel::{Error, Snapshot};
+//! use delta_kernel::engine::default::DefaultEngineBuilder;
+//! use delta_kernel::object_store::local::LocalFileSystem;
 //!
-//! let anchor_snapshot = Snapshot::builder_for("file:///data/T").at_version(0).build(engine)?;
+//! let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build();
+//! let anchor_snapshot = Snapshot::builder_for("file:///data/T").at_version(0).build(&engine)?;
 //! let range = CommitRange::builder_for("file:///data/T", 0)
 //!     .with_end_version(4)
-//!     .build(engine)?;
+//!     .build(&engine)?;
 //!
-//! for commit in range.commits(engine, anchor_snapshot, &[DeltaAction::Add, DeltaAction::Remove])? {
+//! for commit in range.commits(&engine, anchor_snapshot, &[DeltaAction::Add, DeltaAction::Remove])? {
 //!     let commit = commit?;
 //!     println!("v={} ts={}", commit.version(), commit.timestamp());
 //!     for batch in commit.into_actions() {
 //!         let _batch = batch?;
 //!     }
 //! }
+//! # Ok::<(), Error>(())
 //! ```
 
 mod actions;
