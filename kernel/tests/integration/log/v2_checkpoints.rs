@@ -1470,8 +1470,7 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
         .scan_metadata(engine.as_ref())?
         .map_ok(|sm| sm.scan_files)
         .try_collect()?;
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?
-        .with_data_change(true);
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
     txn.update_deletion_vectors(
         HashMap::from([(path, dv.clone())]),
         scan_files.into_iter().map(Ok),
@@ -1538,8 +1537,7 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> Result<(), Box<dyn std:
     // === Step 2: Run 60 commits of 1_000 synthetic adds each (60_000 total). ===
     let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     for c in 0..COMMITS {
-        let mut txn = begin_transaction(snapshot, engine.as_ref())?
-            .with_data_change(true);
+        let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
         let add_files_schema = txn.add_files_schema().clone();
         let paths: Vec<String> = (0..PER_COMMIT)
             .map(|i| format!("part-{c:03}-{i:04}.parquet"))

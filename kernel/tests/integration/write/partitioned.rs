@@ -985,8 +985,7 @@ async fn test_partition_null_validation_in_batch_materialized(
     // being filtered out), so the NOT NULL enforcement seam moves into the engine: a null
     // in a `nullable: false` field is rejected at batch construction below, independent of
     // whatever value the mock map carries here.
-    let txn = begin_transaction(snapshot, engine.as_ref())?
-        .with_engine_info("default engine");
+    let txn = begin_transaction(snapshot, engine.as_ref())?.with_engine_info("default engine");
     let _write_context = txn.partitioned_write_context(HashMap::from([(
         "p".to_string(),
         Scalar::String("a".into()),

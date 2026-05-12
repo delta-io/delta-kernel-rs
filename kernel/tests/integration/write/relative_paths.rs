@@ -24,8 +24,7 @@ async fn write_batch_to_table_simple(
     engine: &DefaultEngine<TokioBackgroundExecutor>,
     data: RecordBatch,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
-    let mut txn = begin_transaction(snapshot.clone(), engine)?
-        .with_engine_info("test");
+    let mut txn = begin_transaction(snapshot.clone(), engine)?.with_engine_info("test");
     let write_context = txn.unpartitioned_write_context()?;
     let add_meta = engine
         .write_parquet(&ArrowEngineData::new(data), &write_context)
@@ -75,8 +74,7 @@ async fn test_multiple_files_in_commit_all_use_relative_paths(
     let snapshot =
         create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
 
-    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
-        .with_engine_info("test");
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?.with_engine_info("test");
     let write_context = txn.unpartitioned_write_context().unwrap();
     for values in [vec![1, 2], vec![3, 4]] {
         let add_meta = engine

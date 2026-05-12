@@ -22,7 +22,9 @@ use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-use test_utils::{begin_transaction, create_table, engine_store_setup, test_read, test_table_setup};
+use test_utils::{
+    begin_transaction, create_table, engine_store_setup, test_read, test_table_setup,
+};
 use url::Url;
 
 #[tokio::test]
@@ -165,8 +167,8 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let mut txn = test_utils::load_and_begin_transaction(table_url.clone(), &engine)?
-        .with_data_change(true);
+    let mut txn =
+        test_utils::load_and_begin_transaction(table_url.clone(), &engine)?.with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -370,8 +372,8 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     )
     .await?;
 
-    let mut txn = test_utils::load_and_begin_transaction(table_url.clone(), &engine)?
-        .with_data_change(true);
+    let mut txn =
+        test_utils::load_and_begin_transaction(table_url.clone(), &engine)?.with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.

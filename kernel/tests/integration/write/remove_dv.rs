@@ -950,8 +950,7 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
         }
         let scan = scan_builder.build()?;
 
-        let mut txn = begin_transaction(snapshot, engine.as_ref())?
-            .with_data_change(true);
+        let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
 
         // Pass scan metadata (which contains stats_parsed) directly to remove_files.
         // This previously failed with "Too few fields in output schema".
@@ -1049,8 +1048,8 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         let engine = Arc::new(engine);
 
         // Write two partitions: country="usa" and country="japan".
-        let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
-            .with_data_change(true);
+        let mut txn =
+            load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
         let append_data = [[1, 2, 3], [10, 20, 30]].map(|data| -> delta_kernel::DeltaResult<_> {
             let data = RecordBatch::try_new(
                 Arc::new(data_schema.as_ref().try_into_arrow()?),
@@ -1075,8 +1074,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         }
         let scan = scan_builder.build()?;
 
-        let mut txn = begin_transaction(snapshot, engine.as_ref())?
-            .with_data_change(true);
+        let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
         for scan_metadata in scan.scan_metadata(engine.as_ref())? {
             txn.remove_files(scan_metadata?.scan_files);
         }

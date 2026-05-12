@@ -53,8 +53,8 @@ async fn write_data_to_table(
     schema: SchemaRef,
     values: Vec<i32>,
 ) -> Result<Version, Box<dyn std::error::Error>> {
-    let mut txn = load_and_begin_transaction(table_url.clone(), engine.as_ref())?
-        .with_engine_info("test");
+    let mut txn =
+        load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_engine_info("test");
 
     add_files_to_transaction(&mut txn, engine, schema, values).await?;
 
