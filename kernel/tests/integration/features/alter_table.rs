@@ -454,6 +454,30 @@ async fn empty_create_then_add_column(
     assert_eq!(v0.schema().num_fields(), 0);
     assert_eq!(max_column_id(&v0), cm_mode.map(|_| 0));
 
+    // Scans and blind appends against the empty-schema snapshot are blocked with
+    // friendly errors that point users at ALTER TABLE ADD COLUMN.
+    let scan_err = v0
+        .clone()
+        .scan_builder()
+        .build()
+        .expect_err("scan_builder().build() must reject empty-schema snapshots");
+    assert!(
+        scan_err.to_string().contains("empty schema")
+            && scan_err.to_string().contains("ALTER TABLE ADD COLUMN"),
+        "scan error must point at ALTER TABLE ADD COLUMN, got: {scan_err}"
+    );
+    let write_err = v0
+        .clone()
+        .transaction(committer(), engine.as_ref())?
+        .with_engine_info("EmptySchemaApp/0.1.0")
+        .unpartitioned_write_context()
+        .expect_err("unpartitioned_write_context() must reject empty-schema snapshots");
+    assert!(
+        write_err.to_string().contains("empty schema")
+            && write_err.to_string().contains("alter_table"),
+        "write_context error must point at alter_table, got: {write_err}"
+    );
+
     v0.alter_table()
         .add_column(StructField::nullable("id", DataType::INTEGER))
         .build(engine.as_ref(), committer())?

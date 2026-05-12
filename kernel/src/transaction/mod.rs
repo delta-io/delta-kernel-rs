@@ -364,6 +364,7 @@ impl<S> Transaction<S> {
         }
 
         self.validate_blind_append_semantics()?;
+        self.ensure_schema_non_empty_for_data_writes()?;
 
         // CDF check only applies to existing tables (not create table)
         // If there are add and remove files with data change in the same transaction, we block it.
@@ -695,6 +696,45 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
+    /// Reject data file writes against an empty-schema table.
+    ///
+    /// Empty-schema tables are valid intermediate state, but a transaction that adds,
+    /// removes, or updates data files has nothing to write into. The caller must
+    /// populate the schema with ALTER TABLE ADD COLUMN first. Metadata-only commits
+    /// are still allowed; CREATE TABLE is exempt because the empty schema is what is
+    /// being created.
+    fn ensure_schema_non_empty_for_data_writes(&self) -> DeltaResult<()> {
+        if self.is_create_table() {
+            return Ok(());
+        }
+        let has_data_changes = !self.add_files_metadata.is_empty()
+            || !self.remove_files_metadata.is_empty()
+            || !self.dv_matched_files.is_empty();
+        if has_data_changes {
+            self.ensure_schema_non_empty_for_write_context()?;
+        }
+        Ok(())
+    }
+
+    /// Reject WriteContext handouts on empty-schema tables.
+    ///
+    /// Fires earlier than [`ensure_schema_non_empty_for_data_writes`], when the engine
+    /// first asks for a [`WriteContext`], so the user sees a clear error before staging
+    /// any parquet. CREATE TABLE transactions are exempt.
+    fn ensure_schema_non_empty_for_write_context(&self) -> DeltaResult<()> {
+        if self.is_create_table() {
+            return Ok(());
+        }
+        if self.effective_table_config.logical_schema().num_fields() == 0 {
+            return Err(Error::generic(
+                "Cannot write data files to a Delta table with empty schema; \
+                 use `snapshot.alter_table().add_column(...)` to add at least one \
+                 column before writing data",
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns true if this is a create-table transaction.
     /// A create-table transaction has no read snapshot (no pre-existing table).
     fn is_create_table(&self) -> bool {
@@ -914,6 +954,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         &self,
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
+        self.ensure_schema_non_empty_for_write_context()?;
         let shared = self.shared_write_state();
         require!(
             !shared.logical_partition_columns.is_empty(),
@@ -961,6 +1002,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// Returns an error if the table has partition columns (use
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
+        self.ensure_schema_non_empty_for_write_context()?;
         let shared = self.shared_write_state();
         require!(
             shared.logical_partition_columns.is_empty(),
