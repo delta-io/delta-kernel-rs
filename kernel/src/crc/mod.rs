@@ -98,10 +98,6 @@ pub struct Crc {
     /// Number of live [`Add`] actions in this table version after action reconciliation.
     /// Private -- use [`Crc::file_stats()`] to access safely.
     num_files: i64,
-    /// Number of [`Metadata`] actions. Must be 1.
-    pub num_metadata: i64,
-    /// Number of [`Protocol`] actions. Must be 1.
-    pub num_protocol: i64,
     /// The table [`Metadata`] at this version.
     pub metadata: Metadata,
     /// The table [`Protocol`] at this version.
@@ -139,15 +135,15 @@ pub struct Crc {
 
     // ===== Not yet supported fields =====
     /// A unique identifier for the transaction that produced this commit.
-    pub txn_id: Option<String>,
+    pub(crate) txn_id: Option<String>,
     /// All live [`Add`] file actions at this version.
-    pub all_files: Option<Vec<Add>>,
+    pub(crate) all_files: Option<Vec<Add>>,
     /// Number of records deleted through Deletion Vectors in this table version.
-    pub num_deleted_records_opt: Option<i64>,
+    pub(crate) num_deleted_records_opt: Option<i64>,
     /// Number of Deletion Vectors active in this table version.
-    pub num_deletion_vectors_opt: Option<i64>,
+    pub(crate) num_deletion_vectors_opt: Option<i64>,
     /// Distribution of deleted record counts across files.
-    pub deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
+    pub(crate) deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
 }
 
 impl Crc {
@@ -209,40 +205,30 @@ impl TryFrom<CrcRaw> for Crc {
     fn try_from(raw: CrcRaw) -> Result<Self, Self::Error> {
         // Per the Delta protocol spec, numMetadata and numProtocol MUST be 1 in any CRC file.
         // Reject malformed files at the deserialization boundary so callers can trust the value.
-        if raw.num_metadata != 1 {
-            return Err(Error::generic(format!(
-                "CRC file has invalid numMetadata: expected 1, got {}",
-                raw.num_metadata
-            )));
+        for (name, value) in [
+            ("numMetadata", raw.num_metadata),
+            ("numProtocol", raw.num_protocol),
+        ] {
+            if value != 1 {
+                return Err(Error::generic(format!(
+                    "CRC file has invalid {name}: expected 1, got {value}"
+                )));
+            }
         }
-        if raw.num_protocol != 1 {
-            return Err(Error::generic(format!(
-                "CRC file has invalid numProtocol: expected 1, got {}",
-                raw.num_protocol
-            )));
-        }
-        let domain_metadata = raw.domain_metadata.map(|vec| {
-            vec.into_iter()
-                .map(|dm| (dm.domain().to_string(), dm))
-                .collect()
-        });
-        let set_transactions = raw.set_transactions.map(|vec| {
-            vec.into_iter()
-                .map(|txn| (txn.app_id.clone(), txn))
-                .collect()
-        });
         Ok(Crc {
             table_size_bytes: raw.table_size_bytes,
             num_files: raw.num_files,
-            num_metadata: raw.num_metadata,
-            num_protocol: raw.num_protocol,
             metadata: raw.metadata,
             protocol: raw.protocol,
             // A CRC file on disk is by definition valid; we never deserialize a degraded state.
             file_stats_validity: FileStatsValidity::Valid,
             in_commit_timestamp_opt: raw.in_commit_timestamp_opt,
-            set_transactions,
-            domain_metadata,
+            set_transactions: raw
+                .set_transactions
+                .map(|v| v.into_iter().map(|t| (t.app_id.clone(), t)).collect()),
+            domain_metadata: raw
+                .domain_metadata
+                .map(|v| v.into_iter().map(|d| (d.domain().to_string(), d)).collect()),
             file_size_histogram: raw.file_size_histogram,
             // Not yet round-tripped through CrcRaw; see the "not yet supported" fields on Crc.
             txn_id: None,
@@ -264,12 +250,8 @@ impl From<Crc> for CrcRaw {
             metadata: crc.metadata,
             protocol: crc.protocol,
             in_commit_timestamp_opt: crc.in_commit_timestamp_opt,
-            set_transactions: crc
-                .set_transactions
-                .map(|map| map.into_values().collect::<Vec<_>>()),
-            domain_metadata: crc
-                .domain_metadata
-                .map(|map| map.into_values().collect::<Vec<_>>()),
+            set_transactions: crc.set_transactions.map(|m| m.into_values().collect()),
+            domain_metadata: crc.domain_metadata.map(|m| m.into_values().collect()),
             file_size_histogram: crc.file_size_histogram,
         }
     }
@@ -327,6 +309,8 @@ pub struct DeletedRecordCountsHistogram {
 mod tests {
     use std::collections::HashMap;
 
+    use rstest::rstest;
+
     use super::Crc;
     use crate::actions::{DomainMetadata, SetTransaction};
 
@@ -336,8 +320,6 @@ mod tests {
         domains: Option<HashMap<String, DomainMetadata>>,
     ) -> Crc {
         Crc {
-            num_metadata: 1,
-            num_protocol: 1,
             set_transactions: txns,
             domain_metadata: domains,
             ..Default::default()
@@ -522,8 +504,6 @@ mod tests {
         let crc = Crc {
             table_size_bytes: 1024 * 1024,
             num_files: 10,
-            num_metadata: 1,
-            num_protocol: 1,
             set_transactions: Some(txns),
             domain_metadata: Some(domains),
             ..Default::default()
@@ -563,7 +543,8 @@ mod tests {
 
     // ===== numMetadata / numProtocol rejection =====
 
-    /// Minimal CRC JSON with a given numMetadata / numProtocol pair. Both fields are required.
+    /// Minimal CRC JSON with the supplied numMetadata / numProtocol values; used to construct
+    /// invalid CRCs and verify rejection.
     fn crc_json_with_counts(num_metadata: i64, num_protocol: i64) -> String {
         format!(
             r#"{{
@@ -584,30 +565,23 @@ mod tests {
         )
     }
 
-    /// Per the Delta protocol spec, `numMetadata` MUST be 1.
-    #[test]
-    fn de_invalid_num_metadata_is_rejected() {
-        for bad in [0i64, 2, 3, -1] {
-            let json = crc_json_with_counts(bad, 1);
-            let err = serde_json::from_str::<Crc>(&json).unwrap_err().to_string();
-            assert!(
-                err.contains("numMetadata"),
-                "expected error to mention numMetadata for value {bad}, got: {err}"
-            );
-        }
-    }
-
-    /// Per the Delta protocol spec, `numProtocol` MUST be 1.
-    #[test]
-    fn de_invalid_num_protocol_is_rejected() {
-        for bad in [0i64, 2, 3, -1] {
-            let json = crc_json_with_counts(1, bad);
-            let err = serde_json::from_str::<Crc>(&json).unwrap_err().to_string();
-            assert!(
-                err.contains("numProtocol"),
-                "expected error to mention numProtocol for value {bad}, got: {err}"
-            );
-        }
+    /// Per the Delta protocol spec, both `numMetadata` and `numProtocol` MUST be 1; any other
+    /// value (zero, two, negative) is rejected, and the error names the offending field.
+    #[rstest]
+    #[case::num_metadata("numMetadata", |b| (b, 1))]
+    #[case::num_protocol("numProtocol", |b| (1, b))]
+    fn de_invalid_count_is_rejected(
+        #[case] field: &str,
+        #[case] counts: fn(i64) -> (i64, i64),
+        #[values(0i64, 2, 3, -1)] bad: i64,
+    ) {
+        let (m, p) = counts(bad);
+        let json = crc_json_with_counts(m, p);
+        let err = serde_json::from_str::<Crc>(&json).unwrap_err().to_string();
+        assert!(
+            err.contains(field),
+            "expected error to mention {field} for value {bad}, got: {err}"
+        );
     }
 
     // ===== File size histogram validation =====
@@ -635,8 +609,6 @@ mod tests {
             }}"#
         )
     }
-
-    use rstest::rstest;
 
     /// Both the Delta spec field name and the legacy Delta-Spark name must deserialize.
     #[rstest]

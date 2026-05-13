@@ -163,8 +163,6 @@ mod tests {
         let crc = Crc {
             table_size_bytes: 100,
             num_files: 10,
-            num_metadata: 1,
-            num_protocol: 1,
             ..Default::default()
         };
         let loaded = CrcLoadResult::Loaded(Arc::new(crc));
@@ -251,8 +249,6 @@ mod tests {
         Crc {
             table_size_bytes,
             num_files: 1,
-            num_metadata: 1,
-            num_protocol: 1,
             ..Default::default()
         }
     }

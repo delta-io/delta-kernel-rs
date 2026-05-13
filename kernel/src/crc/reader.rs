@@ -52,8 +52,6 @@ mod tests {
         // Verify basic fields
         assert_eq!(crc.table_size_bytes, 5259);
         assert_eq!(crc.num_files, 10);
-        assert_eq!(crc.num_metadata, 1);
-        assert_eq!(crc.num_protocol, 1);
         assert_eq!(crc.in_commit_timestamp_opt, Some(1694758257000));
 
         // Verify protocol

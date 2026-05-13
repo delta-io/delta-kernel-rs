@@ -75,8 +75,6 @@ mod tests {
         Crc {
             table_size_bytes: 1024,
             num_files: 5,
-            num_metadata: 1,
-            num_protocol: 1,
             protocol,
             txn_id: None,
             in_commit_timestamp_opt: Some(ict),
