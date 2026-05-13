@@ -840,6 +840,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         // Drop every partition colum from logical data, if we need to materilize them, re-insert
         // them after the data columns, following the order in the table's
         // `partitionColumns` metadata field.
+        // This is to align with delta-spark's behavior.
         let mut transform = Transform::new_top_level();
         for col in &logical_partition_cols {
             transform = transform.with_dropped_field_if_exists(col);

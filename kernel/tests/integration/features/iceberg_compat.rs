@@ -978,3 +978,29 @@ fn verify_scan_contents(
         "all complex (map) values must be null",
     );
 }
+
+// E2E: icebergCompatV3 must drive the same partition-column materialization as the
+// standalone `materializePartitionColumns` feature. Asserts parquet field order (data cols
+// first, then partition cols) and verifies the checkpoint + scan roundtrip survives.
+// `cm_none` is omitted since V3 requires column mapping.
+#[rstest::rstest]
+#[case::cm_name(ColumnMappingMode::Name)]
+#[case::cm_id(ColumnMappingMode::Id)]
+#[tokio::test(flavor = "multi_thread")]
+async fn v3_partition_in_middle_roundtrip(
+    #[case] cm_mode: ColumnMappingMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let trigger = test_utils::table_builder::FeatureSet::new()
+        .with_property("delta.enableIcebergCompatV3", "true");
+    super::materialize_partition_columns::assert_partition_in_middle_roundtrip(trigger, cm_mode)
+        .await
+}
+
+/// V3 enables materialization; when the connector hands kernel a data batch that omits a
+/// partition column, kernel should produce an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn v3_missing_partition_columns_errors() -> Result<(), Box<dyn std::error::Error>> {
+    let features = test_utils::table_builder::FeatureSet::new()
+        .with_property("delta.enableIcebergCompatV3", "true");
+    super::materialize_partition_columns::assert_missing_partition_cols_errors(features).await
+}
