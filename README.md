@@ -1,4 +1,4 @@
-# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] ![Crates.io MSRV](https://img.shields.io/crates/msrv/:crate)
+# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] ![Crates.io MSRV](https://img.shields.io/crates/msrv/delta_kernel)
 
 [build-status]: https://img.shields.io/github/actions/workflow/status/delta-io/delta-kernel-rs/build.yml?branch=main
 [actions]: https://github.com/delta-io/delta-kernel-rs/actions/workflows/build.yml?query=branch%3Amain
