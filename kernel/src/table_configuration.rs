@@ -497,7 +497,7 @@ impl TableConfiguration {
         // Resolve each logical partition column to its physical field.
         let mut physical_partition_fields = Vec::with_capacity(logical_partition_columns.len());
         for logical_name in logical_partition_columns {
-            // SAFETY: logical partition columns are a subset of the logical schema, we should never
+            // Logical partition columns are a subset of the logical schema, we should never
             // get `None` here. Log a warning just as a safety net.
             let Some(logical_field) = logical_schema.field(logical_name.as_str()) else {
                 warn!(
@@ -507,7 +507,7 @@ impl TableConfiguration {
                 continue;
             };
             let physical_name = logical_field.physical_name(mode);
-            // SAFETY: physical partition columns are a subset of the full physical schema, we
+            // Physical partition columns are a subset of the full physical schema, we
             // should never get `None` here. Log a warning just as a safety net.
             let Some(physical_field) = full_physical_schema.field(physical_name) else {
                 warn!(

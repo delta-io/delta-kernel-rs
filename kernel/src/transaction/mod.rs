@@ -837,10 +837,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
             .effective_table_config
             .should_materialize_partition_columns();
 
-        // Drop every partition colum from logical data, if we need to materilize them, re-insert
+        // Drop every partition colum from logical data, if we need to materialize them, re-insert
         // them after the data columns, following the order in the table's
-        // `partitionColumns` metadata field.
-        // This is to align with delta-spark's behavior.
+        // `partitionColumns` metadata field. This is to align with delta-spark's behavior.
         let mut transform = Transform::new_top_level();
         for col in &logical_partition_cols {
             transform = transform.with_dropped_field_if_exists(col);
@@ -851,8 +850,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
         }
 
         // Materialize: re-insert partition columns after the data columns, following the order in
-        // the table's `partitionColumns` metadata field. Get the set of logical partition
-        // columns first.
+        // the table's `partitionColumns` metadata field.
+
+        // Get the set of logical partition columns first.
         let logical_partition_set: HashSet<&str> =
             logical_partition_cols.iter().map(|s| s.as_str()).collect();
 
@@ -1890,8 +1890,7 @@ mod tests {
         );
 
         // With materializePartitionColumns, the partition column is dropped from its
-        // logical position AND re-inserted after the last data column, so the output
-        // matches physical_write_schema().
+        // logical position AND re-inserted after the last data column.
         let (snap_with, wc_with) = snapshot_and_partitioned_write_context(
             "./tests/data/partitioned_with_materialize_feature/",
         )?;
