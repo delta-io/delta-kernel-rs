@@ -1802,9 +1802,10 @@ mod tests {
         assert_eq!(log_state.latest_version(), expected);
     }
 
-    /// Asserts the on-disk log directory matches `log_state`: checkpoints exist where
-    /// declared, commits below `cleanup_before` are deleted. Snapshot rebuilds can
-    /// silently succeed via JSON replay even when these files are wrong.
+    /// Asserts the on-disk log directory matches `log_state`: declared checkpoints
+    /// survive iff their version is >= `cleanup_before`, and no versioned log file
+    /// remains below `cleanup_before`. Snapshot rebuilds can silently succeed via
+    /// JSON replay even when these files are wrong.
     fn assert_log_state_files_on_disk(table: &TestTable, log_state: &LogState) -> DeltaResult<()> {
         let entries = list_log_dir_filenames(table.store())?;
         let cleanup = log_state.cleanup_before().unwrap_or(0);
@@ -1821,12 +1822,11 @@ mod tests {
                 if surviving { "present" } else { "cleaned up" },
             );
         }
-        if cleanup > 0 {
-            for v in 0..cleanup {
-                let json = format!("{v:020}.json");
+        for entry in &entries {
+            if let Some(v) = log_file_version(&Path::from(entry.as_str())) {
                 assert!(
-                    !entries.iter().any(|name| name == &json),
-                    "expected v={v} JSON to be cleaned up, found in {entries:?}",
+                    v >= cleanup,
+                    "expected v={v} ({entry}) to be cleaned up (cleanup_before={cleanup}): {entries:?}",
                 );
             }
         }
