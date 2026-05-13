@@ -860,9 +860,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
             .effective_table_config
             .logical_schema()
             .fields()
-            .map(|f| f.name().to_string())
-            .filter(|name| !logical_partition_set.contains(name.as_str()))
-            .next_back();
+            .rfind(|f| !logical_partition_set.contains(f.name().as_str()))
+            .map(|f| f.name().to_string());
 
         // `Transform::with_inserted_field(None, expr)` is equivalent to prepend.
         // When anchor is None, all columns in the table are data columns, so prepend works as
