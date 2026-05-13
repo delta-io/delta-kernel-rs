@@ -12,8 +12,8 @@ use uuid::Uuid;
 use super::TableFeature;
 use crate::actions::Protocol;
 use crate::schema::{
-    ArrayType, ColumnMetadataKey, ColumnName, DataType, MapType, MetadataValue, Schema,
-    StructField, StructType,
+    ArrayType, ColumnMetadataKey, ColumnName, DataType, ExistingColumnMappingAnnotations, MapType,
+    MetadataValue, Schema, StructField, StructType,
 };
 use crate::table_properties::{TableProperties, COLUMN_MAPPING_MODE};
 use crate::transforms::{transform_output_type, SchemaTransform};
@@ -30,6 +30,30 @@ pub enum ColumnMappingMode {
     Id,
     /// Columns are mapped to a physical name
     Name,
+}
+
+/// Maximum legal `delta.columnMapping.id` value per the Delta protocol, which restricts the id
+/// to a 32-bit non-negative integer
+/// (see <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping>). Kernel
+/// stores the id in `i64` end-to-end (`MetadataValue::Number` is `i64`) but enforces this bound
+/// at the validation and allocation entry points so writers cannot persist out-of-range ids.
+pub(crate) const MAX_COLUMN_MAPPING_ID: i64 = i32::MAX as i64;
+
+/// Validates that a `delta.columnMapping.id` value lies in the protocol-permitted range
+/// `0..=`[`MAX_COLUMN_MAPPING_ID`]. Out-of-range ids (negative or above `i32::MAX`) are rejected
+/// with a single canonical message naming the offending value and the protocol bound. Callers
+/// that want to add context (e.g. the offending field name or table-property name) wrap with
+/// `.map_err(|e| Error::schema(format!("Field '{name}': {e}")))?` -- matching the kernel
+/// convention used by sibling validators in `schema/validation.rs`.
+pub(crate) fn validate_column_mapping_id(id: i64) -> DeltaResult<()> {
+    if (0..=MAX_COLUMN_MAPPING_ID).contains(&id) {
+        return Ok(());
+    }
+    let key = ColumnMetadataKey::ColumnMappingId.as_ref();
+    Err(Error::schema(format!(
+        "Invalid column mapping id {id}: the Delta protocol restricts \
+         `{key}` to a 32-bit non-negative integer (max {MAX_COLUMN_MAPPING_ID}).",
+    )))
 }
 
 /// Determine the column mapping mode for a table based on the [`Protocol`] and [`TableProperties`]
@@ -57,13 +81,32 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
     let mut validator = ValidateColumnMappings {
         mode,
         path: vec![],
-        seen: HashMap::new(),
+        seen: SeenColumnMappingAnnotations::default(),
     };
     validator.transform_struct(schema)
 }
 
+/// Tracks `delta.columnMapping.id` and `delta.columnMapping.physicalName` values that have
+/// already been claimed during a single schema walk, so duplicates can be rejected at the
+/// first collision (with both offending field names in the error) rather than letting the
+/// duplicate slip through to a downstream parquet read where field ids resolve ambiguously.
+///
+/// Both maps key the duplicate value to the first field name that claimed it, so the error
+/// can name *both* fields. Tracking physical names addresses delta-spark parity (their
+/// `checkColumnIdAndPhysicalNameAssignments` rejects both kinds of collision) and matches the
+/// PROTOCOL.md "globally unique identifier" requirement for `physicalName` -- duplicate
+/// physical names would break parquet column resolution under `ColumnMappingMode::Name`.
+#[derive(Default, Debug)]
+pub(crate) struct SeenColumnMappingAnnotations<'a> {
+    /// `delta.columnMapping.id` -> first field name that claimed it.
+    pub ids: HashMap<i64, &'a str>,
+    /// `delta.columnMapping.physicalName` -> first field name that claimed it.
+    pub physical_names: HashMap<&'a str, &'a str>,
+}
+
 /// Validates a field's column mapping annotations and extracts the physical name and column
-/// mapping id. If `seen` is provided, also checks for duplicate column mapping IDs.
+/// mapping id. If `seen` is provided, also checks for duplicate column mapping IDs and
+/// duplicate `physicalName` values across the schema walk.
 ///
 /// Metadata columns are not subject to column mapping and must not carry column mapping
 /// annotations. Returns the logical field name and `None` for such fields.
@@ -73,14 +116,15 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
 /// Returns the physical name and `Some(id)`.
 ///
 /// When disabled (`None`), neither annotation should be present. Returns the logical field name
-/// and `None`.
+/// and `None`. In `None` mode no dedup is performed (the returned "physical name" is just the
+/// logical field name and is only schema-unique within its parent struct, not globally).
 ///
 /// `path` identifies the field in error messages (e.g. `&["a", "b"]` renders as `a.b`).
-pub(crate) fn get_field_column_mapping_info<'a>(
+pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
     field: &'a StructField,
     mode: ColumnMappingMode,
     path: &[&str],
-    seen: Option<&mut HashMap<i64, &'a str>>,
+    seen: Option<&mut SeenColumnMappingAnnotations<'a>>,
 ) -> DeltaResult<(&'a str, Option<i64>)> {
     let field_path = || ColumnName::new(path.iter().copied());
     let physical_name_meta = field
@@ -150,13 +194,29 @@ pub(crate) fn get_field_column_mapping_info<'a>(
         }
     };
 
-    if let (Some(id), Some(seen)) = (id, seen) {
-        seen.insert(id, field.name()).map_or(Ok(()), |prev| {
-            Err(Error::schema(format!(
-                "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
-                field.name()
-            )))
-        })?;
+    // CM-disabled mode synthesizes `physical_name = field.name()`, which only has to be unique
+    // within its parent struct, not globally -- so dedup is gated on CM being enabled. ID dedup
+    // additionally requires `Some(id)` because `id` is `None` outside CM-enabled mode.
+    if mode != ColumnMappingMode::None {
+        if let Some(seen) = seen {
+            if let Some(id) = id {
+                seen.ids.insert(id, field.name()).map_or(Ok(()), |prev| {
+                    Err(Error::schema(format!(
+                        "Duplicate column mapping ID {id} assigned to both '{prev}' and '{}'",
+                        field.name()
+                    )))
+                })?;
+            }
+            seen.physical_names
+                .insert(physical_name, field.name())
+                .map_or(Ok(()), |prev| {
+                    Err(Error::schema(format!(
+                        "Duplicate `delta.columnMapping.physicalName` '{physical_name}' \
+                         assigned to both '{prev}' and '{}'",
+                        field.name(),
+                    )))
+                })?;
+        }
     }
 
     Ok((physical_name, id))
@@ -165,7 +225,8 @@ pub(crate) fn get_field_column_mapping_info<'a>(
 struct ValidateColumnMappings<'a> {
     mode: ColumnMappingMode,
     path: Vec<&'a str>,
-    seen: HashMap<i64, &'a str>, // column mapping id -> first field name that claimed it
+    /// CM ids and physical names already claimed during the walk, with the first claimer.
+    seen: SeenColumnMappingAnnotations<'a>,
 }
 
 impl<'a> ValidateColumnMappings<'a> {
@@ -195,7 +256,12 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
     }
     fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
         self.transform_inner(field.name(), |this| {
-            get_field_column_mapping_info(field, this.mode, &this.path, Some(&mut this.seen))?;
+            validate_and_extract_column_mapping_annotations(
+                field,
+                this.mode,
+                &this.path,
+                Some(&mut this.seen),
+            )?;
             this.recurse_into_struct_field(field)
         })
     }
@@ -230,24 +296,44 @@ pub(crate) fn get_column_mapping_mode_from_properties(
     }
 }
 
-/// Assigns column mapping metadata (id and physicalName) to all fields in `schema`, and also
-/// assigns `delta.columnMapping.nested.ids` on Array/Map fields when
-/// `assign_nested_field_ids` is `true`.
+/// Assigns column mapping metadata (id and physicalName) to all fields in a schema,
+/// matching delta-spark's `DeltaColumnMapping.assignColumnIdAndPhysicalName` semantics.
 ///
 /// This function recursively processes all fields in the schema, including nested structs,
-/// arrays, and maps. Each field is assigned a new unique ID and physical name. When
-/// `assign_nested_field_ids` is true, each element/key/value in Array/Map is assigned a new
-/// unique parquet field id and stored in the `delta.columnMapping.nested.ids` metadata of the
-/// nearest ancestor `StructField`.
+/// arrays, and maps. For each field:
+/// - If both `delta.columnMapping.id` and `delta.columnMapping.physicalName` are present, they are
+///   preserved verbatim and `max_id` is advanced past the preserved id.
+/// - If only `id` is present, `physicalName` is filled in as `col-<uuid>` and the id is preserved.
+/// - If only `physicalName` is present, a new `id` is allocated as `*max_id + 1`.
+/// - If neither is present, both are assigned.
 ///
-/// Fields with pre-existing column mapping metadata (id or physicalName) are rejected to avoid
-/// conflicts.
+/// Wrong-typed annotations (`id` not a number, `physicalName` not a string), an empty
+/// `physicalName`, and a negative `id` error out. The latter two are stricter than
+/// delta-spark: an empty physical name fails PROTOCOL.md's "globally unique identifier"
+/// requirement and would break Parquet column resolution, and a negative id is rejected so
+/// `(*max_id).max(n)` cannot silently no-op below the allocator's seed.
+///
+/// Pre-populated `delta.columnMapping.nested.ids` and `parquet.field.nested.ids` annotations
+/// are always rejected: those payloads are kernel-managed and only emitted by the nested-ids
+/// assignment pass below.
+///
+/// When `assign_nested_field_ids` is `true`, after the per-field flat assignment this function
+/// also allocates fresh parquet field ids for the synthetic `Array.element`,
+/// `Map.key`, and `Map.value` slots and stores them under
+/// `delta.columnMapping.nested.ids` on the nearest ancestor `StructField`. Allocating these
+/// nested ids is a hard requirement for IcebergCompatV2/3.
+///
+/// Callers should seed `max_id` from [`find_max_column_id_in_schema`] so newly assigned
+/// IDs do not collide with preserved ones. Duplicate preserved IDs are detected by
+/// [`crate::schema::StructType::make_physical`], which runs from
+/// `TableConfiguration::try_new[_with_schema]` after assignment.
 ///
 /// # Arguments
 ///
 /// * `schema` - The schema to transform.
-/// * `max_id` - Tracks the highest column ID assigned. Updated in place. Should be initialized to
-///   `0` for a new table.
+/// * `max_id` - Tracks the highest column ID. Read and updated in place. Should be seeded from
+///   [`find_max_column_id_in_schema`] (or `0` for a brand-new table with no preserved IDs anywhere)
+///   so newly assigned IDs cannot collide with preserved ones.
 /// * `assign_nested_field_ids` - When `true`, also allocates IDs for synthetic `Array.element` and
 ///   `Map.key`/`Map.value` fields, stores them in `delta.columnMapping.nested.ids`, and includes
 ///   them in `max_id`. Assigning IDs to these nested fields is a hard requirement for
@@ -255,13 +341,13 @@ pub(crate) fn get_column_mapping_mode_from_properties(
 ///
 /// # Returns
 ///
-/// A new schema with column mapping metadata on all fields.
+/// A new schema with column mapping metadata present on every field.
 ///
 /// # Example
 ///
-/// Given a top-level field `m: map<list<int>, int>`, after calling with
-/// `assign_nested_field_ids = true` the field gets (`<pname>` is the assigned UUID-based
-/// physical name):
+/// Given a top-level field `m: map<list<int>, int>` with no pre-existing annotations, after
+/// calling with `assign_nested_field_ids = true` the field gets (`<pname>` is the assigned
+/// UUID-based physical name):
 ///
 /// ```json
 /// {
@@ -276,7 +362,7 @@ pub(crate) fn get_column_mapping_mode_from_properties(
 /// ```
 ///
 /// `max_id` ends at `4`. With `assign_nested_field_ids = false` the same field gets only the
-/// CM metadata and `max_id` ends at `1`:
+/// flat CM metadata and `max_id` ends at `1`:
 ///
 /// ```json
 /// {
@@ -308,52 +394,125 @@ pub(crate) fn assign_column_mapping_metadata(
 /// field.
 type NestedFieldIds = serde_json::Map<String, serde_json::Value>;
 
-/// Assigns flat column mapping metadata(id and physical name) to a single field, recursively
-/// processing nested types. Returns a new field with a fresh unique ID and a UUID-based physical
-/// name, and increments `max_id` to reflect the assignment.
+/// Advances `max_id` by one and returns the new value, surfacing `i64` overflow as an error.
 ///
-/// `delta.columnMapping.nested.ids` is not assigned here.
+/// `assign_column_mapping_metadata` allocates fresh column-mapping IDs as `max_id + 1`. A
+/// connector that preserves an `id` near `i64::MAX` and then asks kernel to allocate a fresh
+/// sibling would silently wrap to `i64::MIN` without this guard, producing a negative id that
+/// would then trip the negative-id check on the next round-trip.
+///
+/// In practice this should be unreachable: the Delta protocol restricts `columnMapping.id` to a
+/// 32-bit non-negative integer (`i32::MAX` ~ 2.1B), so anything near `i64::MAX` (~ 9.2
+/// quintillion) is over four billion times the protocol-permitted maximum and points at a bug
+/// in the connector's id allocator rather than legitimate id exhaustion. The error message
+/// reflects that diagnosis.
+fn next_column_mapping_id(max_id: &mut i64) -> DeltaResult<i64> {
+    let next = max_id.checked_add(1).ok_or_else(|| {
+        Error::generic(format!(
+            "Cannot allocate column mapping id: `max_id + 1` overflows `i64` \
+             (max_id={current}). The Delta protocol caps `delta.columnMapping.id` at a \
+             32-bit non-negative integer; fix the upstream id allocator producing \
+             out-of-range preserved ids.",
+            current = *max_id,
+        ))
+    })?;
+    if next > MAX_COLUMN_MAPPING_ID {
+        return Err(Error::generic(format!(
+            "Cannot allocate column mapping id {next}: exceeds the Delta protocol's 32-bit \
+             non-negative maximum ({MAX_COLUMN_MAPPING_ID}). A preserved \
+             `delta.columnMapping.id` is at the protocol cap; lower the largest preserved \
+             id so kernel can allocate a sibling within range.",
+        )));
+    }
+    *max_id = next;
+    Ok(next)
+}
+
+/// Assigns flat column mapping metadata (id and physical name) to a single field, recursively
+/// processing nested types. Implements the 3-way preserve/fill/assign behavior described on
+/// [`assign_column_mapping_metadata`], matching delta-spark. The returned field always has both
+/// `delta.columnMapping.id` and `delta.columnMapping.physicalName` present.
+///
+/// `delta.columnMapping.nested.ids` is not assigned here; the separate nested-ids pass run by
+/// [`assign_column_mapping_metadata`] handles that.
+///
+/// `max_id` is advanced as follows:
+/// - When a `delta.columnMapping.id` is preserved, `*max_id = max(*max_id, preserved_id)`.
+/// - When a new id is allocated, `*max_id` is incremented via [`next_column_mapping_id`] (which
+///   uses `checked_add`) and the new id is the post-increment value.
 ///
 /// # Errors
 ///
-/// - Field carries a pre-existing `delta.columnMapping.id`, `delta.columnMapping.physicalName`,
-///   `delta.columnMapping.nested.ids`, or `parquet.field.nested.ids` annotation.
+/// - Field carries a pre-existing `delta.columnMapping.nested.ids` or `parquet.field.nested.ids`
+///   annotation (those payloads are kernel-managed).
+/// - A pre-existing `delta.columnMapping.id` annotation is wrong-typed or negative.
+/// - A pre-existing `delta.columnMapping.physicalName` annotation is wrong-typed or empty.
+/// - Allocating a fresh id would overflow `i64`.
 pub(crate) fn try_assign_flat_column_mapping_info(
     field: &StructField,
     max_id: &mut i64,
 ) -> DeltaResult<StructField> {
     for key in [
-        ColumnMetadataKey::ColumnMappingId,
-        ColumnMetadataKey::ColumnMappingPhysicalName,
         ColumnMetadataKey::ColumnMappingNestedIds,
         ColumnMetadataKey::ParquetFieldNestedIds,
     ] {
         if field.get_config_value(&key).is_some() {
             return Err(Error::generic(format!(
-                "Field '{}' has pre-populated `{}` metadata; the caller must not provide \
-                 column-mapping annotations on input fields.",
+                "Field '{}' has pre-populated `{}` metadata; this annotation is \
+                 kernel-managed and must not be supplied on input fields.",
                 field.name,
                 key.as_ref(),
             )));
         }
     }
-    // Start with the existing field and assign new ID
+
+    let ExistingColumnMappingAnnotations { id, physical_name } =
+        field.validate_and_extract_existing_column_mapping_annotations()?;
+
     let mut new_field = field.clone();
-    *max_id += 1;
-    new_field.metadata.insert(
-        ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-        MetadataValue::Number(*max_id),
-    );
-    // Assign physical name
-    let physical_name = format!("col-{}", Uuid::new_v4());
-    new_field.metadata.insert(
-        ColumnMetadataKey::ColumnMappingPhysicalName
-            .as_ref()
-            .to_string(),
-        MetadataValue::String(physical_name),
-    );
-    // Recursively process nested types
+
+    match (id, physical_name) {
+        // Both present: preserve verbatim and advance `max_id` past the preserved id.
+        (Some(preserved_id), Some(_)) => {
+            *max_id = (*max_id).max(preserved_id);
+        }
+        // Only `id` present: preserve id, fill in physical name.
+        (Some(preserved_id), None) => {
+            *max_id = (*max_id).max(preserved_id);
+            new_field.metadata.insert(
+                ColumnMetadataKey::ColumnMappingPhysicalName
+                    .as_ref()
+                    .to_string(),
+                MetadataValue::String(format!("col-{}", Uuid::new_v4())),
+            );
+        }
+        // Only `physicalName` present: preserve name, allocate id.
+        (None, Some(_)) => {
+            let new_id = next_column_mapping_id(max_id)?;
+            new_field.metadata.insert(
+                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                MetadataValue::Number(new_id),
+            );
+        }
+        // Neither present: assign both.
+        (None, None) => {
+            let new_id = next_column_mapping_id(max_id)?;
+            new_field.metadata.insert(
+                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                MetadataValue::Number(new_id),
+            );
+            new_field.metadata.insert(
+                ColumnMetadataKey::ColumnMappingPhysicalName
+                    .as_ref()
+                    .to_string(),
+                MetadataValue::String(format!("col-{}", Uuid::new_v4())),
+            );
+        }
+    }
+
+    // Recursively process nested types (struct/array/map descend; primitive/variant pass through).
     new_field.data_type = flat_cm_info_for_nested_data_type(&field.data_type, max_id)?;
+
     Ok(new_field)
 }
 
@@ -911,68 +1070,389 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_assign_column_mapping_metadata_simple() {
-        let schema = StructType::new_unchecked([
-            StructField::new("a", DataType::INTEGER, false),
-            StructField::new("b", DataType::STRING, true),
-        ]);
+    /// Schema shapes used to dimensionalize tests over field nesting depth.
+    #[derive(Clone, Copy, Debug)]
+    enum SchemaShape {
+        /// Field under test is a top-level sibling of an unannotated field.
+        Flat,
+        /// Field under test lives inside a 1-level nested struct, with a top-level unannotated
+        /// sibling.
+        NestedStruct,
+        /// Field under test lives 2 levels deep inside nested structs, with a top-level
+        /// unannotated sibling.
+        DeeplyNestedStruct,
+    }
 
-        let mut max_id = 0;
-        let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
+    const FIELD_UNDER_TEST: &str = "field_under_test";
 
-        // Should have assigned IDs 1 and 2
-        assert_eq!(max_id, 2);
-        assert_eq!(result.fields().count(), 2);
+    /// Builds the field whose pre-existing column-mapping annotations vary by test case.
+    fn make_field_under_test(pre_id: Option<i64>, pre_name: Option<&str>) -> StructField {
+        let mut metadata: Vec<(&str, MetadataValue)> = Vec::new();
+        if let Some(id) = pre_id {
+            metadata.push((
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(id),
+            ));
+        }
+        if let Some(name) = pre_name {
+            metadata.push((
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(name.to_string()),
+            ));
+        }
+        let field = StructField::not_null(FIELD_UNDER_TEST, DataType::INTEGER);
+        if metadata.is_empty() {
+            field
+        } else {
+            field.add_metadata(metadata)
+        }
+    }
 
-        // Check both fields have metadata
-        for (i, field) in result.fields().enumerate() {
-            let expected_id = (i + 1) as i64;
-            assert_eq!(
-                field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
-                Some(&MetadataValue::Number(expected_id))
-            );
-            assert!(field
-                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-                .is_some());
-
-            // Verify physical name format (col-{uuid})
-            if let Some(MetadataValue::String(name)) =
-                field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-            {
-                assert!(
-                    name.starts_with("col-"),
-                    "Physical name should start with 'col-'"
-                );
+    /// Wraps the field under test according to `shape`, alongside a top-level unannotated
+    /// sibling. Returns the schema and path that resolves back to the field under test.
+    fn build_schema_with_field_under_test(
+        shape: SchemaShape,
+        field_under_test: StructField,
+    ) -> (StructType, Vec<String>) {
+        let path = |segments: &[&str]| segments.iter().map(|s| s.to_string()).collect();
+        match shape {
+            SchemaShape::Flat => {
+                let schema = StructType::new_unchecked([
+                    StructField::nullable("unannotated_sibling", DataType::STRING),
+                    field_under_test,
+                ]);
+                (schema, path(&[FIELD_UNDER_TEST]))
+            }
+            SchemaShape::NestedStruct => {
+                let inner = StructType::new_unchecked([field_under_test]);
+                let schema = StructType::new_unchecked([
+                    StructField::nullable("unannotated_sibling", DataType::STRING),
+                    StructField::nullable("outer", DataType::Struct(Box::new(inner))),
+                ]);
+                (schema, path(&["outer", FIELD_UNDER_TEST]))
+            }
+            SchemaShape::DeeplyNestedStruct => {
+                let innermost = StructType::new_unchecked([field_under_test]);
+                let middle = StructType::new_unchecked([StructField::nullable(
+                    "middle",
+                    DataType::Struct(Box::new(innermost)),
+                )]);
+                let schema = StructType::new_unchecked([
+                    StructField::nullable("unannotated_sibling", DataType::STRING),
+                    StructField::nullable("outer", DataType::Struct(Box::new(middle))),
+                ]);
+                (schema, path(&["outer", "middle", FIELD_UNDER_TEST]))
             }
         }
     }
 
-    #[test]
-    fn test_assign_column_mapping_metadata_rejects_existing_id() {
-        // Schema with pre-existing column mapping metadata should be rejected
-        let schema = StructType::new_unchecked([
-            StructField::new("a", DataType::INTEGER, false).add_metadata([
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref(),
-                    MetadataValue::Number(100),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("existing-physical".to_string()),
-                ),
-            ]),
-            StructField::new("b", DataType::STRING, true),
-        ]);
+    /// Happy-path dispatch coverage for [`assign_column_mapping_metadata`]. Each `#[case]`
+    /// exercises one of the 4 dispatch arms (preserve-both / preserve-id-fill-name /
+    /// preserve-name-allocate-id / assign-both), including `id = 0` to verify that 0 is
+    /// accepted as a preserved id (matches delta-spark; symmetric with `maxColumnId = 0`
+    /// table property). The schema-shape `#[values]` axis confirms the same dispatch behavior
+    /// at every nesting depth.
+    #[rstest::rstest]
+    #[case::preserve_both(Some(100), Some("preserved-name"))]
+    #[case::preserve_id_only(Some(7), None)]
+    #[case::preserve_name_only(None, Some("user-supplied"))]
+    #[case::preserve_id_zero(Some(0), Some("zero-name"))]
+    #[case::neither_preserved(None, None)]
+    fn test_assign_column_mapping_metadata_dispatch(
+        #[case] pre_id: Option<i64>,
+        #[case] pre_name: Option<&str>,
+        #[values(
+            SchemaShape::Flat,
+            SchemaShape::NestedStruct,
+            SchemaShape::DeeplyNestedStruct
+        )]
+        shape: SchemaShape,
+    ) {
+        let field_under_test = make_field_under_test(pre_id, pre_name);
+        let (schema, field_under_test_path) =
+            build_schema_with_field_under_test(shape, field_under_test);
+
+        let seed = find_max_column_id_in_schema(&schema).unwrap_or(0);
+        let mut max_id = seed;
+        let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
+
+        let result_field = result.field_at_path(&field_under_test_path);
+        let result_id = result_field
+            .column_mapping_id()
+            .expect("expected numeric column mapping id");
+        let result_name = expect_physical_name(result_field).unwrap();
+
+        match pre_id {
+            Some(id) => assert_eq!(result_id, id, "preserved id must round-trip"),
+            None => assert!(
+                result_id > seed,
+                "allocated id {result_id} must exceed seed {seed}",
+            ),
+        }
+        match pre_name {
+            Some(expected) => {
+                assert_eq!(result_name, expected, "preserved name must round-trip")
+            }
+            None => assert!(
+                result_name.starts_with("col-"),
+                "generated name should start with `col-`, got {result_name:?}",
+            ),
+        }
+    }
+
+    /// Validates delta-spark's seeding rule for [`assign_column_mapping_metadata`].
+    ///
+    /// delta-spark's `DeltaColumnMapping.assignColumnIdAndPhysicalName` seeds:
+    ///     maxColumnId = max(currentMaxColumnId, findMaxColumnId(schema))
+    /// then assigns each new id as `maxColumnId += 1`. Consequence: every newly assigned
+    /// id is strictly greater than `findMaxColumnId(schema)`, and preserved ids round-trip
+    /// unchanged.
+    ///
+    /// Each `#[case]` supplies a different set of preserved ids to confirm the seed advances
+    /// correctly regardless of value sparsity (sparse positives, sequential, with `0`,
+    /// single-max).
+    #[rstest::rstest]
+    #[case::sparse_positives(vec![1, 5, 100])]
+    #[case::with_zero(vec![0, 5, 100])]
+    #[case::single_max(vec![100])]
+    #[case::sequential(vec![1, 2, 3])]
+    #[case::single_zero(vec![0])]
+    fn test_assign_column_mapping_metadata_seed_avoids_collisions(#[case] preserved_ids: Vec<i64>) {
+        let preserved_max = *preserved_ids.iter().max().unwrap();
+        const UNANNOTATED_FIELD_NAMES: [&str; 3] =
+            ["unannotated_1", "unannotated_2", "unannotated_3"];
+
+        // Build schema: unannotated_1, [preserved_0..N], unannotated_2, unannotated_3.
+        let mut fields = vec![StructField::nullable(
+            UNANNOTATED_FIELD_NAMES[0],
+            DataType::STRING,
+        )];
+        for (i, id) in preserved_ids.iter().enumerate() {
+            let name = format!("preserved_{i}");
+            fields.push(
+                StructField::not_null(&name, DataType::INTEGER).add_metadata([
+                    (
+                        ColumnMetadataKey::ColumnMappingId.as_ref(),
+                        MetadataValue::Number(*id),
+                    ),
+                    (
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                        MetadataValue::String(format!("p-{name}")),
+                    ),
+                ]),
+            );
+        }
+        fields.extend(
+            UNANNOTATED_FIELD_NAMES[1..]
+                .iter()
+                .map(|n| StructField::nullable(*n, DataType::STRING)),
+        );
+        let schema = StructType::new_unchecked(fields);
+
+        let mut max_id = find_max_column_id_in_schema(&schema).unwrap_or(0);
+        assert_eq!(max_id, preserved_max, "seed should equal the preserved max");
+
+        let result = assign_column_mapping_metadata(&schema, &mut max_id, false).unwrap();
+        // Three unannotated fields -> +3 ids above the seed.
+        assert_eq!(max_id, preserved_max + UNANNOTATED_FIELD_NAMES.len() as i64);
+
+        // Every assigned id on an unannotated field exceeds the preserved max.
+        for name in UNANNOTATED_FIELD_NAMES {
+            let field = result.field(name).unwrap();
+            let id = field
+                .column_mapping_id()
+                .expect("expected numeric column mapping id");
+            assert!(
+                id > preserved_max,
+                "newly assigned id {id} for '{name}' must exceed preserved max {preserved_max}",
+            );
+        }
+
+        // Preserved ids round-trip.
+        for (i, expected_id) in preserved_ids.iter().enumerate() {
+            let name = format!("preserved_{i}");
+            assert_eq!(
+                result
+                    .field(&name)
+                    .unwrap()
+                    .column_mapping_id()
+                    .expect("expected numeric column mapping id"),
+                *expected_id,
+                "preserved id at '{name}' must round-trip",
+            );
+        }
+    }
+
+    /// Each case supplies a (possibly partial, possibly malformed) annotation pair and asserts
+    /// the error names both the offending key and the kind of violation.
+    #[rstest::rstest]
+    #[case::id_wrong_type_string(
+        Some(MetadataValue::String("not-a-number".to_string())),
+        Some(MetadataValue::String("p".to_string())),
+        "non-numeric",
+        ColumnMetadataKey::ColumnMappingId,
+    )]
+    #[case::name_wrong_type_number(
+        None,
+        Some(MetadataValue::Number(7)),
+        "non-string",
+        ColumnMetadataKey::ColumnMappingPhysicalName
+    )]
+    #[case::name_empty_no_id(
+        None,
+        Some(MetadataValue::String(String::new())),
+        "empty",
+        ColumnMetadataKey::ColumnMappingPhysicalName
+    )]
+    #[case::name_empty_with_id(
+        Some(MetadataValue::Number(5)),
+        Some(MetadataValue::String(String::new())),
+        "empty",
+        ColumnMetadataKey::ColumnMappingPhysicalName
+    )]
+    #[case::id_negative_with_name(
+        Some(MetadataValue::Number(-7)),
+        Some(MetadataValue::String("p".to_string())),
+        "Invalid column mapping id",
+        ColumnMetadataKey::ColumnMappingId,
+    )]
+    #[case::id_i64_min_no_name(
+        Some(MetadataValue::Number(i64::MIN)),
+        None,
+        "Invalid column mapping id",
+        ColumnMetadataKey::ColumnMappingId
+    )]
+    fn test_assign_column_mapping_metadata_rejects_invalid_annotations(
+        #[case] id: Option<MetadataValue>,
+        #[case] name: Option<MetadataValue>,
+        #[case] violation_kind: &str,
+        #[case] offending_key: ColumnMetadataKey,
+        #[values(
+            SchemaShape::Flat,
+            SchemaShape::NestedStruct,
+            SchemaShape::DeeplyNestedStruct
+        )]
+        shape: SchemaShape,
+    ) {
+        let mut metadata = Vec::new();
+        if let Some(id) = id {
+            metadata.push((ColumnMetadataKey::ColumnMappingId.as_ref(), id));
+        }
+        if let Some(name) = name {
+            metadata.push((ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), name));
+        }
+        let bad = StructField::not_null(FIELD_UNDER_TEST, DataType::INTEGER).add_metadata(metadata);
+        let (schema, _) = build_schema_with_field_under_test(shape, bad);
+
+        let mut max_id = 0;
+        let err = assign_column_mapping_metadata(&schema, &mut max_id, false)
+            .unwrap_err()
+            .to_string();
+        let key = offending_key.as_ref();
+        assert!(
+            err.contains(violation_kind) && err.contains(key),
+            "Expected '{violation_kind}' and '{key}' in error, got: {err}",
+        );
+    }
+
+    /// `next_column_mapping_id` must reject `i64` overflow rather than wrapping to a negative
+    /// id. Both fresh-allocation arms (`physicalName`-only and neither-preserved) flow through
+    /// it, so each is exercised here. Without `checked_add` a connector that preserved an id
+    /// near `i64::MAX` and asked kernel to allocate a sibling would wrap silently and produce
+    /// a negative id that would then trip the negative-id validator on the next round-trip.
+    #[rstest::rstest]
+    #[case::physical_name_only(Some("preserved-name"))]
+    #[case::neither_annotation(None)]
+    fn test_assign_column_mapping_metadata_errors_when_id_allocation_overflows(
+        #[case] preserved_physical_name: Option<&str>,
+    ) {
+        let field = make_field_under_test(None, preserved_physical_name);
+        let schema = StructType::new_unchecked([field]);
+
+        let mut max_id = i64::MAX;
+        let err = assign_column_mapping_metadata(&schema, &mut max_id, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Cannot allocate column mapping id")
+                && err.contains("overflows `i64`")
+                && err.contains("32-bit non-negative integer")
+                && err.contains(&i64::MAX.to_string()),
+            "Expected overflow error citing the i64 ceiling, the protocol's 32-bit bound, \
+             and the offending `max_id`; got: {err}",
+        );
+        // `max_id` must not be advanced past `i64::MAX` on failure.
+        assert_eq!(max_id, i64::MAX);
+    }
+
+    /// `i32::MAX` is the protocol's largest legal `delta.columnMapping.id`. A connector that
+    /// preserves it must round-trip; a fresh sibling allocated above it must be rejected with
+    /// the protocol-bound message (not the `i64` overflow message). This pins both halves of
+    /// the bound to one rstest so the negative space is contiguous.
+    #[rstest::rstest]
+    #[case::preserved_at_protocol_max_round_trips(i32::MAX as i64, true)]
+    #[case::preserved_above_protocol_max_rejected(i32::MAX as i64 + 1, false)]
+    fn test_assign_column_mapping_metadata_enforces_protocol_32bit_bound(
+        #[case] preserved_id: i64,
+        #[case] expect_ok: bool,
+    ) {
+        let field_under_test = make_field_under_test(Some(preserved_id), Some("preserved-name"));
+        let (schema, _) = build_schema_with_field_under_test(SchemaShape::Flat, field_under_test);
 
         let mut max_id = 0;
         let result = assign_column_mapping_metadata(&schema, &mut max_id, false);
+        if expect_ok {
+            let schema = result.expect("preserved id at protocol max must round-trip");
+            assert_eq!(
+                schema
+                    .field(FIELD_UNDER_TEST)
+                    .unwrap()
+                    .column_mapping_id()
+                    .expect("expected numeric column mapping id"),
+                i32::MAX as i64,
+            );
+            assert_eq!(max_id, i32::MAX as i64);
+        } else {
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("Invalid column mapping id")
+                    && err.contains(&MAX_COLUMN_MAPPING_ID.to_string()),
+                "Expected canonical out-of-range error citing the 32-bit max, got: {err}",
+            );
+        }
+    }
 
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+    /// Allocating a sibling next to a preserved id at the protocol cap must error with the
+    /// allocator-flavored bound message (distinct from the `i64::MAX` overflow message; the
+    /// `checked_add` succeeds, then the bound check trips).
+    #[test]
+    fn test_assign_column_mapping_metadata_errors_when_allocation_would_exceed_protocol_max() {
+        // Field 1 preserves id = i32::MAX; field 2 has only physicalName so allocation fires.
+        let preserved = StructField::not_null("preserved", DataType::INTEGER).add_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(i32::MAX as i64),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("preserved-name".to_string()),
+            ),
+        ]);
+        let needs_allocation = StructField::not_null("needs_alloc", DataType::INTEGER)
+            .add_metadata([(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("user-supplied".to_string()),
+            )]);
+        let schema = StructType::new_unchecked([preserved, needs_allocation]);
+
+        let mut max_id = find_max_column_id_in_schema(&schema).unwrap_or(0);
+        let err = assign_column_mapping_metadata(&schema, &mut max_id, false)
+            .unwrap_err()
+            .to_string();
         assert!(
-            err_msg.contains("pre-populated") && err_msg.contains("delta.columnMapping.id"),
-            "Expected error naming the pre-populated CM annotation, got: {err_msg}"
+            err.contains("Cannot allocate column mapping id")
+                && err.contains("exceeds the Delta protocol's 32-bit non-negative maximum"),
+            "Expected allocator-flavored protocol-bound error, got: {err}",
         );
     }
 
@@ -1029,32 +1509,23 @@ mod tests {
         seen_ids: &mut HashSet<i64>,
         seen_physical_names: &mut HashSet<String>,
     ) {
-        let id = field
-            .get_config_value(&ColumnMetadataKey::ColumnMappingId)
-            .unwrap_or_else(|| panic!("Field '{}' should have column mapping ID", field.name));
-        let MetadataValue::Number(id_val) = id else {
+        let id_val = field.column_mapping_id().unwrap_or_else(|| {
             panic!(
-                "Field '{}' column mapping ID should be a number",
+                "Field '{}' should have a numeric column mapping ID",
                 field.name
-            );
-        };
+            )
+        });
         assert!(
-            seen_ids.insert(*id_val),
-            "Duplicate column mapping ID {} on field '{}'",
-            id_val,
+            seen_ids.insert(id_val),
+            "Duplicate column mapping ID {id_val} on field '{}'",
             field.name
         );
 
-        let physical = field
-            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-            .unwrap_or_else(|| panic!("Field '{}' should have physical name", field.name));
-        let MetadataValue::String(physical_name) = physical else {
-            panic!("Field '{}' physical name should be a string", field.name);
-        };
+        let physical_name = expect_physical_name(field)
+            .unwrap_or_else(|e| panic!("Field '{}' should have physical name: {e}", field.name));
         assert!(
             seen_physical_names.insert(physical_name.clone()),
-            "Duplicate physical name '{}' on field '{}'",
-            physical_name,
+            "Duplicate physical name '{physical_name}' on field '{}'",
             field.name
         );
     }
