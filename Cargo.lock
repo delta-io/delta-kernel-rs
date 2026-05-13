@@ -1289,6 +1289,7 @@ dependencies = [
  "reqwest 0.13.2",
  "roaring",
  "rstest",
+ "rstest_reuse",
  "rustc_version",
  "serde",
  "serde_json",

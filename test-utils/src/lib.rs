@@ -2,6 +2,68 @@
 
 pub mod counting_reporter;
 pub mod table_builder;
+
+// Required so rstest_reuse templates exported with `#[export]` can resolve
+// `rstest_reuse::*` when expanded in a downstream crate.
+// rstest_reuse's `#[template]` looks for a bare `#[rstest]` (single-segment path)
+// to locate the attribute split point, so we import `rstest` here as a bare name.
+// The `#[values(...)]` and type idents live inside the template macro body and
+// are only resolved at expansion time in consumer crates.
+#[allow(unused_imports)]
+use rstest::rstest;
+pub use rstest_reuse;
+use rstest_reuse::template;
+#[allow(unused_imports)]
+use table_builder::{FeatureSet, LogState, VersionTarget, DEFAULT_SWEEP_MID_VERSION};
+
+/// Canonical `(LogState x FeatureSet x VersionTarget)` cross-product and the single
+/// source of truth for sweep cardinality. Apply with
+/// `#[rstest_reuse::apply(default_sweep)]` on a test taking those three params;
+/// each combination expands to its own test runner case. Lives at crate root
+/// (not in `table_builder`) so the `#[macro_export]`-generated macro is reachable
+/// cross-crate as `test_utils::default_sweep`.
+#[template]
+#[export]
+#[rstest]
+pub fn default_sweep(
+    #[values(
+        LogState::with_latest_version(10),
+        LogState::with_latest_version(10).with_checkpoint_at([10]),
+        LogState::with_latest_version(10).with_checkpoint_at([5]),
+        LogState::with_latest_version(10).with_checkpoint_at([5, 10])
+    )]
+    log_state: LogState,
+    #[values(
+        FeatureSet::empty(),
+        FeatureSet::new().column_mapping("name"),
+        FeatureSet::new().ict(),
+        FeatureSet::new().v2_checkpoint(),
+        FeatureSet::new().deletion_vectors(),
+        FeatureSet::new().append_only(),
+        FeatureSet::new().change_data_feed(),
+        FeatureSet::new().domain_metadata(),
+        FeatureSet::new().vacuum_protocol_check(),
+        FeatureSet::new().row_tracking(),
+        FeatureSet::new()
+            .column_mapping("name")
+            .ict()
+            .v2_checkpoint()
+            .deletion_vectors()
+            .append_only()
+            .change_data_feed()
+            .domain_metadata()
+            .vacuum_protocol_check()
+            .row_tracking()
+    )]
+    feature_set: FeatureSet,
+    #[values(
+        VersionTarget::Latest,
+        VersionTarget::AtVersion(DEFAULT_SWEEP_MID_VERSION),
+        VersionTarget::IncrementalToLatest { from: DEFAULT_SWEEP_MID_VERSION }
+    )]
+    version_target: VersionTarget,
+) {
+}
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
