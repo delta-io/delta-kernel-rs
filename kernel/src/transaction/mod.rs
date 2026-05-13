@@ -832,19 +832,46 @@ impl<S: SupportsDataFiles> Transaction<S> {
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
-        let partition_cols = self.effective_table_config.partition_columns().to_vec();
-        // Check if partition columns should be materialized into data files.
-        let should_materialize_partition_columns = self
+        let logical_partition_cols = self.effective_table_config.partition_columns().to_vec();
+        let should_materialize_partition = self
             .effective_table_config
             .should_materialize_partition_columns();
-        // Build a Transform expression that drops partition columns from the input
-        // (unless they should be materialized).
+
+        // Drop every partition colum from logical data, if we need to materilize them, re-insert
+        // them after the data columns, following the order in the table's
+        // `partitionColumns` metadata field.
         let mut transform = Transform::new_top_level();
-        if !should_materialize_partition_columns {
-            for col in &partition_cols {
-                transform = transform.with_dropped_field_if_exists(col);
-            }
+        for col in &logical_partition_cols {
+            transform = transform.with_dropped_field_if_exists(col);
         }
+
+        if !should_materialize_partition {
+            return Expression::transform(transform);
+        }
+
+        // Materialize: re-insert partition columns after the data columns, following the order in
+        // the table's `partitionColumns` metadata field. Get the set of logical partition
+        // columns first.
+        let logical_partition_set: HashSet<&str> =
+            logical_partition_cols.iter().map(|s| s.as_str()).collect();
+
+        // Anchor on the last data column.
+        let anchor: Option<String> = self
+            .effective_table_config
+            .logical_schema()
+            .fields()
+            .map(|f| f.name().to_string())
+            .filter(|name| !logical_partition_set.contains(name.as_str()))
+            .next_back();
+
+        // `Transform::with_inserted_field(None, expr)` is equivalent to prepend.
+        // When anchor is None, all columns in the table are data columns, so prepend works as
+        // expected.
+        for col in &logical_partition_cols {
+            transform = transform
+                .with_inserted_field(anchor.clone(), Expression::column([col.as_str()]).into());
+        }
+
         Expression::transform(transform)
     }
 
@@ -1555,8 +1582,10 @@ mod tests {
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
     use crate::schema::MapType;
-    use crate::table_features::ColumnMappingMode;
-    use crate::transaction::create_table::create_table;
+    use crate::table_features::{
+        ColumnMappingMode, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    };
+    use crate::transaction::create_table::{create_table, CreateTableTransaction};
     use crate::utils::test_utils::{
         load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
         test_schema_with_array, test_schema_with_map,
@@ -1860,7 +1889,9 @@ mod tests {
             "Partition column 'letter' should be dropped. Expression: {expr_str}"
         );
 
-        // With materializePartitionColumns, no columns should be dropped (identity transform)
+        // With materializePartitionColumns, the partition column is dropped from its
+        // logical position AND re-inserted after the last data column, so the output
+        // matches physical_write_schema().
         let (snap_with, wc_with) = snapshot_and_partitioned_write_context(
             "./tests/data/partitioned_with_materialize_feature/",
         )?;
@@ -1876,8 +1907,14 @@ mod tests {
         );
         let expr_str = format!("{}", wc_with.logical_to_physical());
         assert!(
-            !expr_str.contains("drop"),
-            "No columns should be dropped with materializePartitionColumns. Expression: {expr_str}"
+            expr_str.contains("drop letter"),
+            "Partition column 'letter' should be dropped from its original position. \
+             Expression: {expr_str}"
+        );
+        assert!(
+            expr_str.contains("insert [Column(letter)]"),
+            "Partition column 'letter' should be re-inserted after the last data column. \
+             Expression: {expr_str}"
         );
 
         Ok(())
@@ -1911,6 +1948,73 @@ mod tests {
             "Non-partition column 'number' should be in physical schema"
         );
         Ok(())
+    }
+
+    // When `should_materialize_partition_columns` returns true, `generate_logical_to_physical`
+    // should produce a Transform that drops every partition column from its logical position
+    // and re-inserts it after the last data column (or prepends when the table is
+    // all-partition). Metadata partition order is intentionally reversed from the logical
+    // schema order to prove the metadata order wins.
+    #[rstest]
+    #[case::partition_in_middle(
+        vec![
+            StructField::nullable("a", DataType::INTEGER),
+            StructField::nullable("p1", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+            StructField::nullable("p2", DataType::STRING),
+            StructField::nullable("c", DataType::INTEGER),
+        ],
+        vec!["p2", "p1"],
+        Transform::new_top_level()
+            .with_dropped_field_if_exists("p2")
+            .with_dropped_field_if_exists("p1")
+            .with_inserted_field(Some("c"), Expression::column(["p2"]).into())
+            .with_inserted_field(Some("c"), Expression::column(["p1"]).into()),
+    )]
+    #[case::all_partition_columns(
+        vec![
+            StructField::nullable("p1", DataType::STRING),
+            StructField::nullable("p2", DataType::STRING),
+        ],
+        vec!["p2", "p1"],
+        Transform::new_top_level()
+            .with_dropped_field_if_exists("p2")
+            .with_dropped_field_if_exists("p1")
+            .with_inserted_field(None::<String>, Expression::column(["p2"]).into())
+            .with_inserted_field(None::<String>, Expression::column(["p1"]).into()),
+    )]
+    fn test_generate_logical_to_physical_partition_layouts(
+        #[case] schema_fields: Vec<StructField>,
+        #[case] partition_cols: Vec<&str>,
+        #[case] expected_transform: Transform,
+    ) {
+        let schema = Arc::new(StructType::new_unchecked(schema_fields));
+        let partition_columns: Vec<String> = partition_cols.iter().map(|s| s.to_string()).collect();
+        let metadata =
+            Metadata::try_new(None, None, schema, partition_columns, 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(Vec::<TableFeature>::new()),
+            Some(vec![TableFeature::MaterializePartitionColumns]),
+        )
+        .unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, Url::try_from("file:///").unwrap(), 0)
+                .unwrap();
+        let txn = CreateTableTransaction::try_new_create_table(
+            table_config,
+            "test".to_string(),
+            Box::new(FileSystemCommitter::new()),
+            vec![], /* system_domain_metadata */
+            None,   /* clustering_columns */
+        )
+        .unwrap();
+
+        let Expression::Transform(actual) = txn.generate_logical_to_physical() else {
+            panic!("expected Expression::Transform");
+        };
+        assert_eq!(actual, expected_transform);
     }
 
     /// Using the wrong write context method for the table's partitioning returns an error.

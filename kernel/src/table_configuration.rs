@@ -478,11 +478,55 @@ impl TableConfiguration {
     ///
     /// [`should_materialize_partition_columns`]: Self::should_materialize_partition_columns
     pub(crate) fn physical_write_schema(&self) -> SchemaRef {
-        if self.should_materialize_partition_columns() {
-            self.physical_schema()
-        } else {
-            self.physical_data_schema_without_partition_columns()
+        if !self.should_materialize_partition_columns() {
+            return self.physical_data_schema_without_partition_columns();
         }
+
+        // Data columns first, then partition columns in the order from the table's
+        // `partitionColumns` metadata field. This is to align with delta-spark's behavior.
+        let physical_data_schema = self.physical_data_schema_without_partition_columns();
+        let logical_partition_columns = self.partition_columns();
+        if logical_partition_columns.is_empty() {
+            return physical_data_schema;
+        }
+
+        let mode = self.column_mapping_mode();
+        let logical_schema = self.logical_schema();
+        let full_physical_schema = &self.physical_schemas.full;
+
+        // Resolve each logical partition column to its physical field.
+        let mut physical_partition_fields = Vec::with_capacity(logical_partition_columns.len());
+        for logical_name in logical_partition_columns {
+            // SAFETY: logical partition columns are a subset of the logical schema, we should never
+            // get `None` here. Log a warning just as a safety net.
+            let Some(logical_field) = logical_schema.field(logical_name.as_str()) else {
+                warn!(
+                    partition_column = %logical_name,
+                    "partition column missing from logical schema; ",
+                );
+                continue;
+            };
+            let physical_name = logical_field.physical_name(mode);
+            // SAFETY: physical partition columns are a subset of the full physical schema, we
+            // should never get `None` here. Log a warning just as a safety net.
+            let Some(physical_field) = full_physical_schema.field(physical_name) else {
+                warn!(
+                    "partition column '{logical_name}' (physical name '{physical_name}') \
+                     missing from full physical schema",
+                );
+                continue;
+            };
+            physical_partition_fields.push(physical_field.clone());
+        }
+
+        // Safety: physical_data_schema + physical_partition_fields are both subsets
+        // of an already-valid schema.
+        Arc::new(StructType::new_unchecked(
+            physical_data_schema
+                .fields()
+                .cloned()
+                .chain(physical_partition_fields),
+        ))
     }
 
     /// The [`TableProperties`] of this table at this version.
@@ -2282,6 +2326,56 @@ mod test {
         let write_schema = config.physical_write_schema();
         // This is the final check: whether the partition column `pcol` is present in the
         // physical schema as expected.
+        let field_names: Vec<&str> = write_schema.fields().map(|f| f.name.as_str()).collect();
+        assert_eq!(field_names, expected_field_names);
+    }
+
+    // With `should_materialize_partition_columns` returns true, `physical_write_schema` should have
+    // data columns first then partition columns in the the order of the table's metadata's
+    // `partitionColumns`, regardless of their original position in the logical schema. Metadata
+    // partition order is intentionally reversed from the logical schema order to prove the
+    // metadata order wins.
+    #[rstest]
+    #[case::partition_in_middle(
+        vec![
+            StructField::nullable("a", DataType::INTEGER),
+            StructField::nullable("p1", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+            StructField::nullable("p2", DataType::STRING),
+            StructField::nullable("c", DataType::INTEGER),
+        ],
+        vec!["p2", "p1"],
+        vec!["a", "b", "c", "p2", "p1"],
+    )]
+    #[case::all_partition_columns(
+        vec![
+            StructField::nullable("p1", DataType::STRING),
+            StructField::nullable("p2", DataType::STRING),
+        ],
+        vec!["p2", "p1"],
+        vec!["p2", "p1"],
+    )]
+    fn test_physical_write_schema_partition_layouts(
+        #[case] schema_fields: Vec<StructField>,
+        #[case] partition_cols: Vec<&str>,
+        #[case] expected_field_names: Vec<&str>,
+    ) {
+        let schema = Arc::new(StructType::new_unchecked(schema_fields));
+        let partition_columns: Vec<String> = partition_cols.iter().map(|s| s.to_string()).collect();
+        let metadata =
+            Metadata::try_new(None, None, schema, partition_columns, 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(Vec::<TableFeature>::new()),
+            Some(vec![TableFeature::MaterializePartitionColumns]),
+        )
+        .unwrap();
+        let config =
+            TableConfiguration::try_new(metadata, protocol, Url::try_from("file:///").unwrap(), 0)
+                .unwrap();
+
+        let write_schema = config.physical_write_schema();
         let field_names: Vec<&str> = write_schema.fields().map(|f| f.name.as_str()).collect();
         assert_eq!(field_names, expected_field_names);
     }
