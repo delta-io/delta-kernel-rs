@@ -5,7 +5,7 @@
 //!
 //! [`Crc`] holds the in-memory state using shapes that make kernel queries easy: typed
 //! validity enums and `HashMap`s keyed by id, instead of the flat scalars and arrays of the
-//! on-disk format. It (de)serializes to/from JSON via the private [`CrcRaw`] serde
+//! on-disk format. It (de)serializes to/from JSON via the private `CrcRaw` serde
 //! intermediate, which mirrors the wire format exactly.
 //!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
@@ -77,13 +77,13 @@ pub enum FileStatsValidity {
 /// Parsed content of a CRC (version checksum) file.
 ///
 /// A `Crc` is either (a) loaded from disk (deserialized from a `.crc` JSON file via
-/// the private [`CrcRaw`] intermediate) or (b) computed in memory (built incrementally via
-/// [`Crc::apply`]).
+/// the private `CrcRaw` intermediate) or (b) computed in memory (built incrementally via
+/// `Crc::apply`).
 ///
 /// A CRC file must:
 /// 1. Be named `{version}.crc` with version zero-padded to 20 digits: `00000000000000000001.crc`
 /// 2. Be stored directly in the _delta_log directory alongside Delta log files
-/// 3. Contain exactly one JSON object with the schema mirrored by [`CrcRaw`].
+/// 3. Contain exactly one JSON object with the schema mirrored by `CrcRaw`.
 ///
 /// This struct and its fields are marked `pub`, but the `crc` module is only re-exported as `pub`
 /// when the `test-utils` feature is enabled (otherwise `pub(crate)`). See `kernel/src/lib.rs`.
@@ -115,20 +115,20 @@ pub struct Crc {
     //       observations" from "fully tracked but empty".
     /// Live transaction identifier ([`SetTransaction`]) actions at this version. `None` = not
     /// tracked (field absent in CRC JSON or not computed). `Some(empty_map)` = tracked, no
-    /// active set transactions. [`Crc::apply`] skips updates when `None`.
+    /// active set transactions. `Crc::apply` skips updates when `None`.
     ///
     /// Stored as a HashMap keyed by `app_id` for efficient lookup. The CRC JSON format uses
-    /// a Vec, which is converted via the [`CrcRaw`] serde intermediate.
+    /// a Vec, which is converted via the `CrcRaw` serde intermediate.
     pub set_transactions: Option<HashMap<String, SetTransaction>>,
     // TODO: introduce `DomainMetadataState` (Complete / Partial) to disambiguate "no
     //       observations" from "fully tracked but empty".
     /// Active (non-removed) [`DomainMetadata`] actions at this version. Tombstones
     /// (`removed=true`) are never stored. `None` = not tracked (field absent in CRC JSON or not
-    /// computed). `Some(empty_map)` = tracked, no active domain metadata. [`Crc::apply`]
+    /// computed). `Some(empty_map)` = tracked, no active domain metadata. `Crc::apply`
     /// skips updates when `None`.
     ///
     /// Stored as a HashMap keyed by domain name for efficient lookup. The CRC JSON format uses
-    /// a Vec, which is converted via the [`CrcRaw`] serde intermediate.
+    /// a Vec, which is converted via the `CrcRaw` serde intermediate.
     pub domain_metadata: Option<HashMap<String, DomainMetadata>>,
     /// Size distribution information of files remaining after action reconciliation.
     pub file_size_histogram: Option<FileSizeHistogram>,
