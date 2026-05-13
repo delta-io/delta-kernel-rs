@@ -28,5 +28,3 @@ follow-up; once it lands, this example should grow an `add_files` flow alongside
 feature can be enabled today via the existing `create_table_builder_with_table_property`
 API by setting `delta.feature.domainMetadata=supported`).
 
-Deletion vector updates are demonstrated separately in `ffi/examples/update-dv`. That example
-assumes the connector has already authored the DV file and knows the descriptor fields to install.
