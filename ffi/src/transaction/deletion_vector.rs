@@ -199,8 +199,6 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
     // descriptor must remain valid so the caller can free it (otherwise we get a UAF
     // when they retry or clean up).
     let path_result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
-    // Returns `bool` instead of `()`: cbindgen erases `ExternResult<()>` to a tag/payload-
-    // less type that C can't use. Same convention as `visit_domain_metadata`.
     dv_descriptor_map_insert_impl(map_ref, path_result, descriptor)
         .map(|_| true)
         .into_extern_result(&engine_ref)
@@ -257,7 +255,6 @@ pub unsafe extern "C" fn transaction_update_deletion_vectors(
     let dv_map = unsafe { dv_map.into_inner() };
     let scan_iter_ref = unsafe { scan_iter.as_ref() };
     let engine_ref = unsafe { engine.as_ref() };
-    // See `dv_descriptor_map_insert` for the `bool` return convention.
     transaction_update_deletion_vectors_impl(txn_ref, *dv_map, scan_iter_ref)
         .map(|_| true)
         .into_extern_result(&engine_ref)
