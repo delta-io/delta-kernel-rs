@@ -201,25 +201,23 @@ impl DeletionVectorDescriptor {
                 Error::deletion_vector("inline deletion vectors must not carry an offset")
             ),
             DeletionVectorStorageType::PersistedRelative => {
-                let path_len = path_or_inline_dv.len();
+                // Byte-slice rather than char-slice: z85 is ASCII-only, and string slicing
+                // would panic if a non-ASCII byte boundary fell inside the trailing 20-byte
+                // window. `z85::decode` accepts `&[u8]` and rejects non-z85 bytes.
+                let bytes = path_or_inline_dv.as_bytes();
                 require!(
-                    path_len >= 20,
+                    bytes.len() >= 20,
                     Error::deletion_vector(format!(
-                        "persisted-relative DV path must be at least 20 chars, got {path_len}"
+                        "persisted-relative DV path must be at least 20 bytes, got {}",
+                        bytes.len()
                     ))
                 );
-                let suffix = &path_or_inline_dv[path_len - 20..];
-                let decoded = z85::decode(suffix).map_err(|_| {
+                let suffix = &bytes[bytes.len() - 20..];
+                z85::decode(suffix).map_err(|_| {
                     Error::deletion_vector(
                         "persisted-relative DV path must end with a z85-encoded UUID",
                     )
                 })?;
-                require!(
-                    decoded.len() == 16,
-                    Error::deletion_vector(
-                        "persisted-relative DV z85 suffix must decode to a 16-byte UUID"
-                    )
-                );
             }
             DeletionVectorStorageType::PersistedAbsolute => {
                 Url::parse(&path_or_inline_dv).map_err(|e| {
@@ -900,12 +898,23 @@ mod tests {
         Some(1),
         4,
         1,
-        "20 chars"
+        "20 bytes"
     )]
     #[case::persisted_relative_invalid_z85(
         DeletionVectorStorageType::PersistedRelative,
-        // 20 chars but `_` is outside the z85 alphabet, so z85::decode fails.
+        // 20 bytes but `_` is outside the z85 alphabet, so z85::decode fails.
         "____________________",
+        Some(1),
+        4,
+        1,
+        "z85"
+    )]
+    #[case::persisted_relative_non_ascii(
+        DeletionVectorStorageType::PersistedRelative,
+        // 22 bytes (`euro` U+20AC is 3 bytes) with `len - 20 = 2` landing inside the
+        // multi-byte codepoint; byte-slicing keeps this from panicking and z85 rejects
+        // the non-ASCII payload.
+        "a\u{20ac}aaaaaaaaaaaaaaaaaa",
         Some(1),
         4,
         1,
