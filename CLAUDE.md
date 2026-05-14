@@ -9,7 +9,8 @@ internals. Kernel never does I/O directly -- it defines _what_ to do via its API
 
 Current capabilities: table reads with predicates, data skipping, deletion vectors, change
 data feed, checkpoints (V1 & V2), log compaction (disabled, #2337), blind append writes, table creation
-(including clustered tables), and catalog-managed table support.
+(including clustered tables), catalog-managed table support, and incremental scan over a
+version range (`incremental_scan`).
 
 ## Build & Test Commands
 

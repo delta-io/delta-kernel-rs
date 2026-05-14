@@ -20,6 +20,7 @@ use crate::committer::{Committer, PublishMetadata};
 use crate::crc::Crc;
 use crate::crc::{try_write_crc_file, CrcDelta, FileStats, LazyCrc};
 use crate::expressions::ColumnName;
+use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::MetricId;
@@ -853,6 +854,17 @@ impl Snapshot {
     /// Create a [`ScanBuilder`] for an `SnapshotRef`.
     pub fn scan_builder(self: Arc<Self>) -> ScanBuilder {
         ScanBuilder::new(self)
+    }
+
+    /// Create an [`IncrementalScanBuilder`] for the range `(base_version, self.version()]`.
+    ///
+    /// Use this to advance a cached file listing from `base_version` to this snapshot's
+    /// version without doing a full scan. See [`IncrementalScanBuilder`] for details.
+    pub fn incremental_scan_builder(
+        self: Arc<Self>,
+        base_version: Version,
+    ) -> IncrementalScanBuilder {
+        IncrementalScanBuilder::new(self, base_version)
     }
 
     /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
