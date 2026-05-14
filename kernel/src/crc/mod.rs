@@ -3,10 +3,10 @@
 //! A [CRC file] contains a snapshot of table state at a specific version, which can be used to
 //! optimize log replay operations like reading Protocol/Metadata, domain metadata, and ICT.
 //!
-//! [`Crc`] holds the in-memory state using shapes that make kernel queries easy: typed
-//! validity enums and `HashMap`s keyed by id, instead of the flat scalars and arrays of the
-//! on-disk format. It (de)serializes to/from JSON via the private `CrcRaw` serde
-//! intermediate, which mirrors the wire format exactly.
+//! [`Crc`] holds the in-memory state using shapes that make kernel queries easy: a typed
+//! state enum (`FileStatsState`) and `HashMap`s keyed by id, instead of the flat scalars and
+//! arrays of the on-disk format. It (de)serializes to/from JSON via the private `CrcRaw`
+//! serde intermediate, which mirrors the wire format exactly.
 //!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 
@@ -19,6 +19,7 @@ mod file_size_histogram;
 mod file_stats;
 mod lazy;
 mod reader;
+mod state;
 mod writer;
 
 use std::collections::HashMap;
@@ -33,42 +34,12 @@ pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
+pub use state::FileStatsState;
 #[allow(unused)]
 pub(crate) use writer::try_write_crc_file;
 
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::Error;
-
-/// Tracks whether file stats (`num_files`, `table_size_bytes`) are trustworthy.
-///
-/// Defaults to [`Valid`](Self::Valid), which is the correct state when deserializing a CRC file
-/// from disk (a CRC file's stats are correct by definition).
-// TODO: replace `FileStatsValidity` with a typed `FileStatsState` enum that carries the
-//       data per variant so reads from a degraded state are a compile error.
-#[allow(dead_code)] // Variants used in follow-up PRs (forward replay, transaction delta).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum FileStatsValidity {
-    /// File stats are known-correct absolute totals. This is the case when seeded from a CRC
-    /// file (which contains `num_files` and `table_size_bytes`) or when replay starts from
-    /// version zero (where the initial state is trivially zero). Safe to write to disk.
-    #[default]
-    Valid,
-    /// File stats are relative deltas, not absolute totals. This happens when seeding from a
-    /// checkpoint: we extract metadata fields but not file counts (reading all add actions from
-    /// a checkpoint just for counts is too expensive). The accumulated deltas are correct, but
-    /// without a baseline they cannot produce final totals. Not safe to write to disk.
-    RequiresCheckpointRead,
-    /// A non-incremental operation was seen: file stats cannot be determined incrementally.
-    /// For example, ANALYZE STATS re-adds existing files with updated statistics but no
-    /// corresponding removes, so naively counting adds would double-count.
-    /// A full log replay from scratch could recover correct file stats. Not safe to write to disk.
-    Indeterminate,
-    /// A file action had a missing size field: correct file stats are impossible to compute.
-    /// For example, the Delta protocol allows `remove.size` to be null -- when encountered,
-    /// we can no longer track byte totals. Unlike [`Indeterminate`](Self::Indeterminate), no
-    /// amount of replay can recover the missing data. Not safe to write to disk.
-    Untrackable,
-}
 
 // ============================================================================
 // Crc: in-memory representation
@@ -88,25 +59,16 @@ pub enum FileStatsValidity {
 /// This struct and its fields are marked `pub`, but the `crc` module is only re-exported as `pub`
 /// when the `test-utils` feature is enabled (otherwise `pub(crate)`). See `kernel/src/lib.rs`.
 // TODO: rename `Crc` to `CrcState` to align with `FileStatsState`, `SetTransactionState`, etc.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(try_from = "CrcRaw", into = "CrcRaw")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "CrcRaw")]
 pub struct Crc {
     // ===== Required fields =====
-    /// Total size of the table in bytes, calculated as the sum of the `size` field of all live
-    /// [`Add`] actions. Private -- use [`Crc::file_stats()`] to access safely.
-    table_size_bytes: i64,
-    /// Number of live [`Add`] actions in this table version after action reconciliation.
-    /// Private -- use [`Crc::file_stats()`] to access safely.
-    num_files: i64,
     /// The table [`Metadata`] at this version.
     pub metadata: Metadata,
     /// The table [`Protocol`] at this version.
     pub protocol: Protocol,
-    /// Whether the file stats (`num_files`, `table_size_bytes`) in this CRC are trustworthy.
-    /// Not serialized -- this is an in-memory replay concern only. When deserialized from a CRC
-    /// file on disk, defaults to [`FileStatsValidity::Valid`] (a CRC file's stats are correct
-    /// by definition). A CRC is only safe to write to disk when validity is `Valid`.
-    pub file_stats_validity: FileStatsValidity,
+    /// File-level statistics as a typed state. See [`FileStatsState`].
+    pub(crate) file_stats_state: FileStatsState,
 
     // ===== Optional fields =====
     /// The in-commit timestamp of this version. Present iff In-Commit Timestamps are enabled.
@@ -130,8 +92,6 @@ pub struct Crc {
     /// Stored as a HashMap keyed by domain name for efficient lookup. The CRC JSON format uses
     /// a Vec, which is converted via the `CrcRaw` serde intermediate.
     pub domain_metadata: Option<HashMap<String, DomainMetadata>>,
-    /// Size distribution information of files remaining after action reconciliation.
-    pub file_size_histogram: Option<FileSizeHistogram>,
 
     // ===== Not yet supported fields =====
     /// A unique identifier for the transaction that produced this commit.
@@ -147,20 +107,30 @@ pub struct Crc {
 }
 
 impl Crc {
-    /// Returns file-level statistics only if they are known to be valid.
+    /// Returns absolute file-level statistics only if `file_stats_state` is `Complete`.
     ///
     /// Returns `None` when file stats cannot be trusted -- for example, when the CRC was
     /// built from incremental replay that encountered a non-incremental operation or a
     /// missing file size.
-    pub fn file_stats(&self) -> Option<FileStats> {
-        match self.file_stats_validity {
-            FileStatsValidity::Valid => Some(FileStats {
-                num_files: self.num_files,
-                table_size_bytes: self.table_size_bytes,
-                file_size_histogram: self.file_size_histogram.clone(),
-            }),
-            _ => None,
-        }
+    pub fn file_stats(&self) -> Option<&FileStats> {
+        self.file_stats_state.file_stats()
+    }
+
+    /// Returns the typed file-stats state. Useful for callers that want to inspect the
+    /// variant directly (via `matches!` or the `is_*` predicates).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn file_stats_state(&self) -> &FileStatsState {
+        &self.file_stats_state
+    }
+}
+
+/// Refuses to serialize a degraded (non-`Complete`) CRC, so an invalid state can never
+/// round-trip through disk.
+impl Serialize for Crc {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        CrcRaw::try_from(self)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
     }
 }
 
@@ -215,13 +185,16 @@ impl TryFrom<CrcRaw> for Crc {
                 )));
             }
         }
-        Ok(Crc {
-            table_size_bytes: raw.table_size_bytes,
+        // A CRC file on disk is by definition complete; we never deserialize a degraded state.
+        let file_stats_state = FileStatsState::Complete(FileStats {
             num_files: raw.num_files,
+            table_size_bytes: raw.table_size_bytes,
+            file_size_histogram: raw.file_size_histogram,
+        });
+        Ok(Crc {
             metadata: raw.metadata,
             protocol: raw.protocol,
-            // A CRC file on disk is by definition valid; we never deserialize a degraded state.
-            file_stats_validity: FileStatsValidity::Valid,
+            file_stats_state,
             in_commit_timestamp_opt: raw.in_commit_timestamp_opt,
             set_transactions: raw
                 .set_transactions
@@ -229,7 +202,6 @@ impl TryFrom<CrcRaw> for Crc {
             domain_metadata: raw
                 .domain_metadata
                 .map(|v| v.into_iter().map(|d| (d.domain().to_string(), d)).collect()),
-            file_size_histogram: raw.file_size_histogram,
             // Not yet round-tripped through CrcRaw; see the "not yet supported" fields on Crc.
             txn_id: None,
             all_files: None,
@@ -240,20 +212,34 @@ impl TryFrom<CrcRaw> for Crc {
     }
 }
 
-impl From<Crc> for CrcRaw {
-    fn from(crc: Crc) -> Self {
-        CrcRaw {
-            table_size_bytes: crc.table_size_bytes,
-            num_files: crc.num_files,
+/// Fails for non-`Complete` file stats: a degraded CRC has no well-defined on-disk shape.
+impl TryFrom<&Crc> for CrcRaw {
+    type Error = Error;
+    fn try_from(crc: &Crc) -> Result<Self, Self::Error> {
+        let FileStatsState::Complete(stats) = &crc.file_stats_state else {
+            return Err(Error::ChecksumWriteUnsupported(format!(
+                "Cannot serialize CRC with {:?} file stats",
+                crc.file_stats_state
+            )));
+        };
+        Ok(CrcRaw {
+            table_size_bytes: stats.table_size_bytes,
+            num_files: stats.num_files,
             num_metadata: 1,
             num_protocol: 1,
-            metadata: crc.metadata,
-            protocol: crc.protocol,
+            metadata: crc.metadata.clone(),
+            protocol: crc.protocol.clone(),
             in_commit_timestamp_opt: crc.in_commit_timestamp_opt,
-            set_transactions: crc.set_transactions.map(|m| m.into_values().collect()),
-            domain_metadata: crc.domain_metadata.map(|m| m.into_values().collect()),
-            file_size_histogram: crc.file_size_histogram,
-        }
+            set_transactions: crc
+                .set_transactions
+                .as_ref()
+                .map(|m| m.values().cloned().collect()),
+            domain_metadata: crc
+                .domain_metadata
+                .as_ref()
+                .map(|m| m.values().cloned().collect()),
+            file_size_histogram: stats.file_size_histogram.clone(),
+        })
     }
 }
 
@@ -311,7 +297,7 @@ mod tests {
 
     use rstest::rstest;
 
-    use super::Crc;
+    use super::{Crc, CrcRaw, FileStats, FileStatsState};
     use crate::actions::{DomainMetadata, SetTransaction};
 
     /// Helper to create a minimal `Crc` with only set_transactions and domain_metadata populated.
@@ -502,8 +488,11 @@ mod tests {
         );
 
         let crc = Crc {
-            table_size_bytes: 1024 * 1024,
-            num_files: 10,
+            file_stats_state: FileStatsState::Complete(FileStats {
+                num_files: 10,
+                table_size_bytes: 1024 * 1024,
+                file_size_histogram: None,
+            }),
             set_transactions: Some(txns),
             domain_metadata: Some(domains),
             ..Default::default()
@@ -514,8 +503,9 @@ mod tests {
         let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
 
         // Verify scalar fields survive the round-trip
-        assert_eq!(deserialized.table_size_bytes, 1024 * 1024);
-        assert_eq!(deserialized.num_files, 10);
+        let stats = deserialized.file_stats().unwrap();
+        assert_eq!(stats.table_size_bytes(), 1024 * 1024);
+        assert_eq!(stats.num_files(), 10);
 
         // Verify all set transactions
         let txns = deserialized.set_transactions.as_ref().unwrap();
@@ -584,6 +574,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ser_indeterminate_file_stats_returns_error() {
+        let crc = Crc {
+            file_stats_state: FileStatsState::Indeterminate,
+            ..Default::default()
+        };
+        let err = serde_json::to_string(&crc).unwrap_err().to_string();
+        assert!(
+            err.contains("Cannot serialize CRC"),
+            "expected serialize-rejection error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn try_from_ref_indeterminate_returns_checksum_write_unsupported() {
+        let crc = Crc {
+            file_stats_state: FileStatsState::Indeterminate,
+            ..Default::default()
+        };
+        let err = CrcRaw::try_from(&crc).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ChecksumWriteUnsupported(_)),
+            "expected ChecksumWriteUnsupported, got: {err:?}"
+        );
+    }
+
     // ===== File size histogram validation =====
 
     /// Minimal CRC JSON with a file size histogram field spliced in under the given field name
@@ -620,7 +636,7 @@ mod tests {
             r#"{"sortedBinBoundaries": [0, 100, 200], "fileCounts": [1, 2, 3], "totalBytes": [10, 200, 300]}"#,
         );
         let crc: Crc = serde_json::from_str(&json).unwrap();
-        assert!(crc.file_size_histogram.is_some());
+        assert!(crc.file_stats().unwrap().file_size_histogram().is_some());
     }
 
     #[rstest]
@@ -629,7 +645,7 @@ mod tests {
     fn de_null_file_size_histogram_deserializes_to_none(#[case] field_name: &str) {
         let json = crc_json_with_histogram(field_name, "null");
         let crc: Crc = serde_json::from_str(&json).unwrap();
-        assert!(crc.file_size_histogram.is_none());
+        assert!(crc.file_stats().unwrap().file_size_histogram().is_none());
     }
 
     /// Validation must reject malformed histograms regardless of which field name they arrived

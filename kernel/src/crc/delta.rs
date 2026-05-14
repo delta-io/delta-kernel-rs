@@ -8,15 +8,15 @@
 //! - **Metadata fields** (protocol, metadata, domain metadata, set transactions, in-commit
 //!   timestamp): always kept up-to-date -- every `apply` unconditionally merges these from the
 //!   delta.
-//! - **File stats** (`num_files`, `table_size_bytes`): only updated when the current
-//!   [`FileStatsValidity`] is not terminal and the commit's operation is incremental-safe. Once
-//!   validity degrades (e.g. a non-incremental operation like ANALYZE STATS, or a missing file
-//!   size), file stats stop updating for the lifetime of that CRC.
+//! - **File stats** ([`FileStatsState`]): only updated when the state is `Complete` and the
+//!   commit's operation is incremental-safe. Once the state degrades (e.g. a non-incremental
+//!   operation like ANALYZE STATS, or a missing file size), file stats stop updating for the
+//!   lifetime of that CRC.
 
 use tracing::warn;
 
 use super::file_stats::FileStatsDelta;
-use super::{Crc, FileStatsValidity};
+use super::{Crc, FileSizeHistogram, FileStats, FileStatsState};
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 
 /// The CRC-relevant changes ("delta") from a single commit. Produced either by reading a
@@ -38,7 +38,7 @@ pub(crate) struct CrcDelta {
     /// In-commit timestamp, if present in this commit.
     pub(crate) in_commit_timestamp: Option<i64>,
     /// Must be `Some` with an incremental-safe value for file stats to update. `None` or
-    /// unrecognized values transition validity to `Indeterminate`.
+    /// unrecognized values transition the [`FileStatsState`] to `Indeterminate`.
     pub(crate) operation: Option<String>,
     /// A file action in this commit had a missing `size` field, making byte-level file stats
     /// impossible to compute.
@@ -83,14 +83,16 @@ impl CrcDelta {
                 .ok()
         });
         Some(Crc {
-            table_size_bytes: self.file_stats.net_bytes,
-            num_files: self.file_stats.net_files,
+            file_stats_state: FileStatsState::Complete(FileStats {
+                num_files: self.file_stats.net_files,
+                table_size_bytes: self.file_stats.net_bytes,
+                file_size_histogram: initial_histogram,
+            }),
             protocol,
             metadata,
             domain_metadata,
             set_transactions,
             in_commit_timestamp_opt: self.in_commit_timestamp,
-            file_size_histogram: initial_histogram,
             ..Default::default()
         })
     }
@@ -98,13 +100,9 @@ impl CrcDelta {
 
 /// Commit delta application for [`Crc`]. See the [module-level docs](self) for details.
 impl Crc {
-    /// Apply a commit delta, updating all CRC fields and adjusting file stats validity.
-    ///
-    /// Metadata fields are always updated. File stats are only updated when:
-    /// - Validity is not already terminal ([`Untrackable`](FileStatsValidity::Untrackable) or
-    ///   [`Indeterminate`](FileStatsValidity::Indeterminate))
-    /// - The delta has no missing file sizes
-    /// - The operation is incremental-safe
+    /// Apply a commit delta. Protocol, metadata, and ICT update unconditionally; domain
+    /// metadata and set transactions update only when already tracked (`Some`); file stats
+    /// follow the [`FileStatsState`] state machine.
     pub(crate) fn apply(&mut self, delta: CrcDelta) {
         // Protocol and metadata: replace if present.
         if let Some(p) = delta.protocol {
@@ -146,56 +144,64 @@ impl Crc {
         // clears the previous value.
         self.in_commit_timestamp_opt = delta.in_commit_timestamp;
 
-        // Bail if already Untrackable -- nothing can recover missing file stats or histograms.
-        if self.file_stats_validity == FileStatsValidity::Untrackable {
-            return;
-        }
-
-        // Missing file size poisons stats permanently. Checked after the Untrackable bail-out
-        // so that Untrackable can never transition to Indeterminate below.
-        if delta.has_missing_file_size {
-            self.file_stats_validity = FileStatsValidity::Untrackable;
-            self.file_size_histogram = None;
-            return;
-        }
-
-        // Bail if already Indeterminate (theoretically recoverable via full replay).
-        if self.file_stats_validity == FileStatsValidity::Indeterminate {
-            return;
-        }
-
         let is_incremental_safe = delta
             .operation
             .as_deref()
             .is_some_and(FileStatsDelta::is_incremental_safe);
-        if !is_incremental_safe {
-            self.file_stats_validity = FileStatsValidity::Indeterminate;
-            self.file_size_histogram = None;
-            return;
-        }
-        self.num_files += delta.file_stats.net_files;
-        self.table_size_bytes += delta.file_stats.net_bytes;
+        self.file_stats_state = transition_file_stats(
+            &self.file_stats_state,
+            &delta.file_stats,
+            is_incremental_safe,
+            delta.has_missing_file_size,
+        );
+    }
+}
 
-        // Histogram: merge base and delta.
-        // Only update if the base CRC has a histogram AND the delta provides one.
-        // If the merge fails (e.g. negative counts from corrupted data) or the delta is
-        // missing a histogram, drop it rather than leaving stale data.
-        if let (Some(base_hist), Some(delta_hist)) = (
-            self.file_size_histogram.as_ref(),
-            &delta.file_stats.net_histogram,
-        ) {
-            match base_hist.try_apply_delta(delta_hist) {
-                Ok(merged) => self.file_size_histogram = Some(merged),
-                Err(e) => {
-                    warn!("Histogram merge failed, dropping file size histogram: {e}");
-                    self.file_size_histogram = None;
-                }
+/// Compute the next [`FileStatsState`] given the current state and an incoming delta.
+///
+/// See [`FileStatsState`] for the full transition table.
+fn transition_file_stats(
+    current: &FileStatsState,
+    delta: &FileStatsDelta,
+    is_incremental_safe: bool,
+    has_missing_file_size: bool,
+) -> FileStatsState {
+    match current {
+        // Indeterminate is terminal in incremental replay. A future full add/remove dedup
+        // pass could recover Complete.
+        FileStatsState::Indeterminate => FileStatsState::Indeterminate,
+        // Either a non-incremental op (e.g. ANALYZE STATS) or a missing remove.size makes
+        // incremental tracking impossible: a full add/remove reconciliation can recover.
+        _ if !is_incremental_safe || has_missing_file_size => FileStatsState::Indeterminate,
+        FileStatsState::Complete(stats) => FileStatsState::Complete(FileStats {
+            // Counts and bytes have no non-negative check.
+            num_files: stats.num_files + delta.net_files,
+            table_size_bytes: stats.table_size_bytes + delta.net_bytes,
+            // Histogram: per-bin merge; drop on failure. See `merge_histogram`.
+            file_size_histogram: merge_histogram(
+                stats.file_size_histogram.as_ref(),
+                delta.net_histogram.as_ref(),
+            ),
+        }),
+    }
+}
+
+/// Merge a base histogram with a delta histogram. Returns `Some(merged)` only when both are
+/// present and [`FileSizeHistogram::try_apply_delta`] succeeds; otherwise returns `None`.
+/// `try_apply_delta` fails on boundary mismatch or negative per-bin sums.
+fn merge_histogram(
+    base: Option<&FileSizeHistogram>,
+    delta: Option<&FileSizeHistogram>,
+) -> Option<FileSizeHistogram> {
+    match (base, delta) {
+        (Some(base_hist), Some(delta_hist)) => match base_hist.try_apply_delta(delta_hist) {
+            Ok(merged) => Some(merged),
+            Err(e) => {
+                warn!("Histogram merge failed, dropping file size histogram: {e}");
+                None
             }
-        } else if self.file_size_histogram.is_some() {
-            // The base had a histogram but the delta couldn't provide one. Drop it rather than
-            // leaving a stale value.
-            self.file_size_histogram = None;
-        }
+        },
+        _ => None,
     }
 }
 
@@ -211,8 +217,11 @@ mod tests {
 
     fn base_crc() -> Crc {
         Crc {
-            table_size_bytes: 1000,
-            num_files: 10,
+            file_stats_state: FileStatsState::Complete(FileStats {
+                num_files: 10,
+                table_size_bytes: 1000,
+                file_size_histogram: None,
+            }),
             ..Default::default()
         }
     }
@@ -258,14 +267,15 @@ mod tests {
         assert!(!FileStatsDelta::is_incremental_safe("UNKNOWN"));
     }
 
-    // ===== Crc deserialized from CRC file (default validity) =====
+    // ===== Crc deserialized from CRC file (default state) =====
 
     #[test]
-    fn test_deserialized_crc_has_valid_stats() {
+    fn test_deserialized_crc_has_complete_stats() {
         let crc = base_crc();
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
-        assert_eq!(crc.num_files, 10);
-        assert_eq!(crc.table_size_bytes, 1000);
+        let stats = crc.file_stats().unwrap();
+        assert!(crc.file_stats_state.is_complete());
+        assert_eq!(stats.num_files(), 10);
+        assert_eq!(stats.table_size_bytes(), 1000);
     }
 
     // ===== Crc::apply tests =====
@@ -274,9 +284,10 @@ mod tests {
     fn test_apply_updates_file_stats() {
         let mut crc = base_crc();
         crc.apply(write_delta(3, 600));
-        assert_eq!(crc.num_files, 13); // 10 + 3
-        assert_eq!(crc.table_size_bytes, 1600); // 1000 + 600
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
+        let stats = crc.file_stats().unwrap();
+        assert_eq!(stats.num_files(), 13); // 10 + 3
+        assert_eq!(stats.table_size_bytes(), 1600); // 1000 + 600
+        assert!(crc.file_stats_state.is_complete());
     }
 
     /// Applies multiple commit deltas sequentially.
@@ -285,9 +296,10 @@ mod tests {
         let mut crc = base_crc();
         crc.apply(write_delta(3, 600));
         crc.apply(write_delta(-2, -400));
-        assert_eq!(crc.num_files, 11); // 10 + 3 - 2
-        assert_eq!(crc.table_size_bytes, 1200); // 1000 + 600 - 400
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
+        let stats = crc.file_stats().unwrap();
+        assert_eq!(stats.num_files(), 11); // 10 + 3 - 2
+        assert_eq!(stats.table_size_bytes(), 1200); // 1000 + 600 - 400
+        assert!(crc.file_stats_state.is_complete());
     }
 
     #[test]
@@ -298,7 +310,7 @@ mod tests {
             ..write_delta(1, 100)
         };
         crc.apply(unsafe_change);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
+        assert!(crc.file_stats_state.is_indeterminate());
     }
 
     #[test]
@@ -309,7 +321,7 @@ mod tests {
             ..write_delta(1, 100)
         };
         crc.apply(unknown_delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
+        assert!(crc.file_stats_state.is_indeterminate());
     }
 
     #[test]
@@ -320,65 +332,24 @@ mod tests {
             ..write_delta(1, 100)
         };
         crc.apply(unsafe_change);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
+        assert!(crc.file_stats_state.is_indeterminate());
 
-        // Subsequent safe op doesn't recover validity.
+        // Subsequent safe op doesn't recover the state.
         crc.apply(write_delta(5, 500));
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
+        assert!(crc.file_stats_state.is_indeterminate());
     }
 
-    // ===== apply: Untrackable (missing file size) tests =====
+    // ===== apply: missing-file-size tests =====
 
     #[test]
-    fn test_missing_file_size_transitions_to_untrackable() {
+    fn test_missing_file_size_transitions_to_indeterminate() {
         let mut crc = base_crc();
         let delta = CrcDelta {
             has_missing_file_size: true,
             ..write_delta(1, 100)
         };
         crc.apply(delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
-    }
-
-    #[test]
-    fn test_untrackable_stays_untrackable() {
-        let mut crc = base_crc();
-        let delta = CrcDelta {
-            has_missing_file_size: true,
-            ..write_delta(1, 100)
-        };
-        crc.apply(delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
-
-        // Applying a safe delta does not recover from Untrackable.
-        crc.apply(write_delta(5, 500));
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
-
-        // Applying an unsafe delta also stays Untrackable (does not downgrade to Indeterminate).
-        crc.apply(CrcDelta {
-            operation: None,
-            ..write_delta(1, 100)
-        });
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
-    }
-
-    #[test]
-    fn test_indeterminate_transitions_to_untrackable_on_missing_size() {
-        let mut crc = base_crc();
-        let unsafe_change = CrcDelta {
-            operation: Some("ANALYZE STATS".to_string()),
-            ..write_delta(1, 100)
-        };
-        crc.apply(unsafe_change);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
-
-        // Missing size escalates Indeterminate to Untrackable.
-        let delta = CrcDelta {
-            has_missing_file_size: true,
-            ..write_delta(1, 100)
-        };
-        crc.apply(delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
+        assert!(crc.file_stats_state.is_indeterminate());
     }
 
     // ===== apply: non-file-stats field updates =====
@@ -519,11 +490,12 @@ mod tests {
             ..write_delta(5, 1000)
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
+        let stats = crc.file_stats().unwrap();
         assert_eq!(crc.protocol, protocol);
         assert_eq!(crc.metadata, metadata);
-        assert_eq!(crc.num_files, 5);
-        assert_eq!(crc.table_size_bytes, 1000);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
+        assert_eq!(stats.num_files(), 5);
+        assert_eq!(stats.table_size_bytes(), 1000);
+        assert!(crc.file_stats_state.is_complete());
         assert_eq!(crc.domain_metadata, Some(HashMap::new()));
         assert_eq!(crc.in_commit_timestamp_opt, None);
     }
@@ -673,9 +645,11 @@ mod tests {
     fn base_crc_with_histogram(file_sizes: &[i64]) -> Crc {
         let hist = histogram_from_sizes(file_sizes);
         Crc {
-            table_size_bytes: file_sizes.iter().sum(),
-            num_files: file_sizes.len() as i64,
-            file_size_histogram: Some(hist),
+            file_stats_state: FileStatsState::Complete(FileStats {
+                num_files: file_sizes.len() as i64,
+                table_size_bytes: file_sizes.iter().sum(),
+                file_size_histogram: Some(hist),
+            }),
             ..Default::default()
         }
     }
@@ -734,7 +708,8 @@ mod tests {
         let delta = write_delta_with_histograms(add, remove);
         crc.apply(delta);
 
-        let hist = crc.file_size_histogram.as_ref().unwrap();
+        let stats = crc.file_stats().unwrap();
+        let hist = stats.file_size_histogram().unwrap();
         for &(bin, count, bytes) in expected_bins {
             assert_eq!(hist.file_counts[bin], count, "file_counts[{bin}]");
             assert_eq!(hist.total_bytes[bin], bytes, "total_bytes[{bin}]");
@@ -759,8 +734,9 @@ mod tests {
             ..Default::default()
         };
         crc.apply(delta);
+        let stats = crc.file_stats().unwrap();
         assert!(
-            crc.file_size_histogram.is_none(),
+            stats.file_size_histogram().is_none(),
             "histogram should be None when delta doesn't provide a histogram"
         );
     }
@@ -773,21 +749,21 @@ mod tests {
             ..write_delta(1, 100)
         };
         crc.apply(unsafe_delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Indeterminate);
-        assert!(crc.file_size_histogram.is_none());
+        // Indeterminate has no histogram field; the histogram data is gone.
+        assert!(crc.file_stats_state.is_indeterminate());
+        assert!(crc.file_stats().is_none());
     }
 
     #[test]
-    fn apply_drops_histogram_on_untrackable() {
+    fn apply_drops_histogram_on_missing_file_size() {
         let mut crc = base_crc_with_histogram(&[100, 200]);
-        // A missing file size makes byte-level stats impossible, so the histogram is dropped.
         let delta = CrcDelta {
             has_missing_file_size: true,
             ..write_delta(1, 100)
         };
         crc.apply(delta);
-        assert_eq!(crc.file_stats_validity, FileStatsValidity::Untrackable);
-        assert!(crc.file_size_histogram.is_none());
+        assert!(crc.file_stats_state.is_indeterminate());
+        assert!(crc.file_stats().is_none());
     }
 
     #[test]
@@ -805,7 +781,8 @@ mod tests {
             ..Default::default()
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
-        let hist = crc.file_size_histogram.as_ref().unwrap();
+        let stats = crc.file_stats().unwrap();
+        let hist = stats.file_size_histogram().unwrap();
         assert_eq!(hist.file_counts[0], 2);
         assert_eq!(hist.total_bytes[0], 1500);
     }
@@ -820,7 +797,8 @@ mod tests {
             ..write_delta(0, 0)
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
-        assert!(crc.file_size_histogram.is_none());
+        let stats = crc.file_stats().unwrap();
+        assert!(stats.file_size_histogram().is_none());
     }
 
     #[test]
@@ -834,9 +812,11 @@ mod tests {
         )
         .unwrap();
         let mut crc = Crc {
-            table_size_bytes: 800,
-            num_files: 3,
-            file_size_histogram: Some(base_hist),
+            file_stats_state: FileStatsState::Complete(FileStats {
+                num_files: 3,
+                table_size_bytes: 800,
+                file_size_histogram: Some(base_hist),
+            }),
             ..Default::default()
         };
 
@@ -859,11 +839,12 @@ mod tests {
         crc.apply(delta);
 
         // Histogram should be preserved (boundaries match)
-        let hist = crc.file_size_histogram.as_ref().unwrap();
+        let stats = crc.file_stats().unwrap();
+        let hist = stats.file_size_histogram().unwrap();
         assert_eq!(hist.sorted_bin_boundaries, vec![0, 200, 1000]);
         assert_eq!(hist.file_counts, vec![2, 1, 1]); // (2+1-1), (1+0-0), (0+1-0)
         assert_eq!(hist.total_bytes, vec![250, 500, 1500]); // (300+100-150), (500+0-0), (0+1500-0)
-        assert_eq!(crc.num_files, 4);
-        assert_eq!(crc.table_size_bytes, 2250);
+        assert_eq!(stats.num_files(), 4);
+        assert_eq!(stats.table_size_bytes(), 2250);
     }
 }
