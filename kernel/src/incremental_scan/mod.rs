@@ -266,7 +266,7 @@ impl IncrementalScanStream {
     /// when your cache holds keys in a streamable shape and you don't have a faster
     /// `contains` lookup.
     ///
-    /// Prefer [`into_summary_against_base_with`] when your cache supports
+    /// Prefer [`into_summary_against_base_closure`] when your cache supports
     /// `contains`-style lookup (HashMap, HashSet, BTreeMap, custom index). That form
     /// iterates the (typically much smaller) live-Add set and probes your base via the
     /// supplied closure, dropping work from `O(|base|)` to `O(|live_adds|)`.
@@ -275,8 +275,8 @@ impl IncrementalScanStream {
     /// See [`into_summary`].
     ///
     /// [`into_summary`]: Self::into_summary
-    /// [`into_summary_against_base_with`]: Self::into_summary_against_base_with
-    pub fn into_summary_against_base<'a>(
+    /// [`into_summary_against_base_closure`]: Self::into_summary_against_base_closure
+    pub fn into_summary_against_base_iter<'a>(
         self,
         base_keys: impl IntoIterator<Item = &'a FileActionKey>,
     ) -> DeltaResult<IncrementalScanSummaryAgainstBase> {
@@ -294,7 +294,7 @@ impl IncrementalScanStream {
         })
     }
 
-    /// Predicate form of [`into_summary_against_base`]: pass a closure that answers
+    /// Predicate form of [`into_summary_against_base_iter`]: pass a closure that answers
     /// "is this key in your base?" Iterates the live-Add set (typically much smaller than
     /// the base) and calls `base_contains` once per live-Add key.
     ///
@@ -308,8 +308,8 @@ impl IncrementalScanStream {
     /// See [`into_summary`].
     ///
     /// [`into_summary`]: Self::into_summary
-    /// [`into_summary_against_base`]: Self::into_summary_against_base
-    pub fn into_summary_against_base_with(
+    /// [`into_summary_against_base_iter`]: Self::into_summary_against_base_iter
+    pub fn into_summary_against_base_closure(
         self,
         base_contains: impl Fn(&FileActionKey) -> bool,
     ) -> DeltaResult<IncrementalScanSummaryAgainstBase> {
@@ -329,20 +329,20 @@ impl IncrementalScanStream {
     }
 
     /// Eager classified helper: collect every live Add batch and call
-    /// [`into_summary_against_base`] against `base_keys`. Returns an
+    /// [`into_summary_against_base_iter`] against `base_keys`. Returns an
     /// [`IncrementalListingAgainstBase`] with the classified summary.
     ///
-    /// Prefer [`into_listing_against_base_with`] when your base supports `contains`-style
-    /// lookup — see [`into_summary_against_base_with`] for the rationale.
+    /// Prefer [`into_listing_against_base_closure`] when your base supports `contains`-style
+    /// lookup — see [`into_summary_against_base_closure`] for the rationale.
     ///
     /// # Errors
     /// See [`into_summary`].
     ///
     /// [`into_summary`]: Self::into_summary
-    /// [`into_summary_against_base`]: Self::into_summary_against_base
-    /// [`into_summary_against_base_with`]: Self::into_summary_against_base_with
-    /// [`into_listing_against_base_with`]: Self::into_listing_against_base_with
-    pub fn into_listing_against_base<'a>(
+    /// [`into_summary_against_base_iter`]: Self::into_summary_against_base_iter
+    /// [`into_summary_against_base_closure`]: Self::into_summary_against_base_closure
+    /// [`into_listing_against_base_closure`]: Self::into_listing_against_base_closure
+    pub fn into_listing_against_base_iter<'a>(
         mut self,
         base_keys: impl IntoIterator<Item = &'a FileActionKey>,
     ) -> DeltaResult<IncrementalListingAgainstBase> {
@@ -350,20 +350,20 @@ impl IncrementalScanStream {
         for item in self.by_ref() {
             add_files.push(item?);
         }
-        let summary = self.into_summary_against_base(base_keys)?;
+        let summary = self.into_summary_against_base_iter(base_keys)?;
         Ok(IncrementalListingAgainstBase { summary, add_files })
     }
 
-    /// Predicate form of [`into_listing_against_base`]; see
-    /// [`into_summary_against_base_with`] for the rationale.
+    /// Predicate form of [`into_listing_against_base_iter`]; see
+    /// [`into_summary_against_base_closure`] for the rationale.
     ///
     /// # Errors
     /// See [`into_summary`].
     ///
     /// [`into_summary`]: Self::into_summary
-    /// [`into_listing_against_base`]: Self::into_listing_against_base
-    /// [`into_summary_against_base_with`]: Self::into_summary_against_base_with
-    pub fn into_listing_against_base_with(
+    /// [`into_listing_against_base_iter`]: Self::into_listing_against_base_iter
+    /// [`into_summary_against_base_closure`]: Self::into_summary_against_base_closure
+    pub fn into_listing_against_base_closure(
         mut self,
         base_contains: impl Fn(&FileActionKey) -> bool,
     ) -> DeltaResult<IncrementalListingAgainstBase> {
@@ -371,7 +371,7 @@ impl IncrementalScanStream {
         for item in self.by_ref() {
             add_files.push(item?);
         }
-        let summary = self.into_summary_against_base_with(base_contains)?;
+        let summary = self.into_summary_against_base_closure(base_contains)?;
         Ok(IncrementalListingAgainstBase { summary, add_files })
     }
 }
@@ -431,7 +431,7 @@ impl std::fmt::Debug for IncrementalListing {
 }
 
 /// Cross-snapshot-classified file-key sets, returned by
-/// [`IncrementalScanStream::into_summary_against_base`].
+/// [`IncrementalScanStream::into_summary_against_base_iter`] (or its closure variant).
 ///
 /// To advance a delta-on-base file listing cache, append the streamed Add batches to
 /// the delta layer and use the union `removes U duplicate_adds` as the remove-mask
@@ -455,7 +455,8 @@ pub struct IncrementalScanSummaryAgainstBase {
     pub removes: HashSet<FileActionKey>,
 }
 
-/// Eager output of [`IncrementalScanStream::into_listing_against_base`]: the buffered
+/// Eager output of [`IncrementalScanStream::into_listing_against_base_iter`] (or its
+/// closure variant): the buffered
 /// Add batches plus the classified summary.
 #[non_exhaustive]
 pub struct IncrementalListingAgainstBase {

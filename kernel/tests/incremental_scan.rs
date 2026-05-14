@@ -915,7 +915,7 @@ async fn single_commit_split_across_batches_dedups_correctly(
 
 // === Classification ===
 //
-// `into_summary_against_base(base_keys)` and `into_listing_against_base(base_keys)`
+// `into_summary_against_base_iter(base_keys)` / `into_listing_against_base_iter(base_keys)`
 // intersect the consumer's base file keys (`(path, dv_unique_id)`) against the live
 // Adds to surface metadata-only re-adds in `duplicate_adds`. The Add row itself stays in
 // the streamed Adds; the key is also surfaced separately so the consumer can mask the
@@ -927,8 +927,8 @@ fn unwrap_classified_listing<'a>(
 ) -> IncrementalListingAgainstBase {
     result
         .expect("expected Some(stream), got None (commits unavailable)")
-        .into_listing_against_base(base_keys)
-        .expect("into_listing_against_base succeeded")
+        .into_listing_against_base_iter(base_keys)
+        .expect("into_listing_against_base_iter succeeded")
 }
 
 fn classified_add_count(listing: &IncrementalListingAgainstBase) -> usize {
@@ -993,7 +993,7 @@ async fn classifies_metadata_only_re_adds(
 }
 
 // The pull-then-finalize flow: drive the iterator manually with `next()`, then call
-// `into_summary_against_base(base_keys)`. This is the documented streaming consumer
+// `into_summary_against_base_iter(base_keys)`. This is the documented streaming consumer
 // pattern.
 #[tokio::test]
 async fn into_summary_after_manual_streaming_classifies_duplicates(
@@ -1036,7 +1036,7 @@ async fn into_summary_after_manual_streaming_classifies_duplicates(
     assert_eq!(yielded, 1, "v1 produced one Add batch");
 
     let base_keys = [key("re-added.parquet"), key("not-in-range.parquet")];
-    let summary = stream.into_summary_against_base(&base_keys)?;
+    let summary = stream.into_summary_against_base_iter(&base_keys)?;
     assert_eq!(
         summary.duplicate_adds,
         HashSet::from([key("re-added.parquet")]),
@@ -1091,7 +1091,7 @@ async fn predicate_variants_match_iterator_variants() -> Result<(), Box<dyn std:
         .incremental_scan_builder(0)
         .build(engine.as_ref())?
         .expect("expected Some(stream)");
-    let summary_with = stream.into_summary_against_base_with(|k| base_index.contains_key(k))?;
+    let summary_with = stream.into_summary_against_base_closure(|k| base_index.contains_key(k))?;
     assert_eq!(
         summary_with.duplicate_adds,
         HashSet::from([key("re-added.parquet")]),
@@ -1102,7 +1102,7 @@ async fn predicate_variants_match_iterator_variants() -> Result<(), Box<dyn std:
         .incremental_scan_builder(0)
         .build(engine.as_ref())?
         .expect("expected Some(stream)");
-    let listing_with = stream.into_listing_against_base_with(|k| base_index.contains_key(k))?;
+    let listing_with = stream.into_listing_against_base_closure(|k| base_index.contains_key(k))?;
     assert_eq!(
         listing_with.summary.duplicate_adds,
         summary_with.duplicate_adds
@@ -1149,7 +1149,7 @@ async fn empty_base_keys_produces_no_duplicates() -> Result<(), Box<dyn std::err
         .build(engine.as_ref())?
         .expect("expected Some(stream)");
     let empty: [FileActionKey; 0] = [];
-    let summary_iter = stream.into_summary_against_base(&empty)?;
+    let summary_iter = stream.into_summary_against_base_iter(&empty)?;
     assert!(summary_iter.duplicate_adds.is_empty());
     assert_eq!(summary_iter.removes, HashSet::from([key("gone.parquet")]));
 
@@ -1158,7 +1158,7 @@ async fn empty_base_keys_produces_no_duplicates() -> Result<(), Box<dyn std::err
         .incremental_scan_builder(0)
         .build(engine.as_ref())?
         .expect("expected Some(stream)");
-    let summary_with = stream.into_summary_against_base_with(|_| false)?;
+    let summary_with = stream.into_summary_against_base_closure(|_| false)?;
     assert!(summary_with.duplicate_adds.is_empty());
     assert_eq!(summary_with.removes, HashSet::from([key("gone.parquet")]));
 
