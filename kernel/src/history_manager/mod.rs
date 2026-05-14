@@ -192,6 +192,7 @@ fn linear_search_file_mod_timestamps(
         return Err(LogHistoryError::TimestampOutOfRange {
             timestamp,
             reason: bound.out_of_range_reason(),
+            nearest_timestamp: None,
         });
     }
 
@@ -227,9 +228,19 @@ fn linear_search_file_mod_timestamps(
         prev_monotonic_ts = monotonic_ts;
     }
 
-    result.ok_or(LogHistoryError::TimestampOutOfRange {
-        timestamp,
-        reason: bound.out_of_range_reason(),
+    result.ok_or_else(|| {
+        // Exiting with `result == None` means either (GreatestLower) every commit
+        // is after `timestamp`, so the earliest commit is the nearest, or
+        // (LeastUpper) every commit is before `timestamp`, so the latest is.
+        let nearest = match bound {
+            Bound::GreatestLower => commits[0].location.last_modified,
+            Bound::LeastUpper => commits[commits.len() - 1].location.last_modified,
+        };
+        LogHistoryError::TimestampOutOfRange {
+            timestamp,
+            reason: bound.out_of_range_reason(),
+            nearest_timestamp: Some(nearest),
+        }
     })
 }
 
@@ -246,6 +257,7 @@ fn binary_search_ict_timestamps(
         return Err(LogHistoryError::TimestampOutOfRange {
             timestamp,
             reason: bound.out_of_range_reason(),
+            nearest_timestamp: None,
         });
     }
 
@@ -265,10 +277,22 @@ fn binary_search_ict_timestamps(
     match binary_search_by_key_with_bounds(commits, timestamp, commit_to_ict, bound) {
         Ok(idx) => Ok(commits[idx].version),
         Err(SearchError::KeyFunctionError(error)) => Err(error),
-        Err(SearchError::OutOfRange) => Err(LogHistoryError::TimestampOutOfRange {
-            timestamp,
-            reason: bound.out_of_range_reason(),
-        }),
+        Err(SearchError::OutOfRange) => {
+            // OutOfRange under `GreatestLower` means timestamp < commits[0]'s
+            // ICT; under `LeastUpper` it means timestamp > commits.last()'s
+            // ICT. Either side is read via `commit_to_ict`; on engine failure
+            // we degrade to `None` rather than mask the original error.
+            let boundary = match bound {
+                Bound::GreatestLower => &commits[0],
+                Bound::LeastUpper => &commits[commits.len() - 1],
+            };
+            let nearest_timestamp = commit_to_ict(boundary).ok();
+            Err(LogHistoryError::TimestampOutOfRange {
+                timestamp,
+                reason: bound.out_of_range_reason(),
+                nearest_timestamp,
+            })
+        }
     }
 }
 
@@ -323,6 +347,7 @@ pub(crate) fn timestamp_to_version(
             return Err(LogHistoryError::TimestampOutOfRange {
                 timestamp,
                 reason: bound.out_of_range_reason(),
+                nearest_timestamp: Some(snap_ts),
             });
         }
         // Timestamp before snapshot: need to search the log
