@@ -3,10 +3,10 @@
 //! A [CRC file] contains a snapshot of table state at a specific version, which can be used to
 //! optimize log replay operations like reading Protocol/Metadata, domain metadata, and ICT.
 //!
-//! [`Crc`] holds the in-memory state using shapes that make kernel queries easy: a typed
-//! state enum (`FileStatsState`) and `HashMap`s keyed by id, instead of the flat scalars and
-//! arrays of the on-disk format. It (de)serializes to/from JSON via the private `CrcRaw`
-//! serde intermediate, which mirrors the wire format exactly.
+//! [`Crc`] holds the in-memory state using shapes that make kernel queries easy: typed
+//! state enums (`FileStatsState`, `DomainMetadataState`) and `HashMap`s keyed by id, instead
+//! of the flat scalars and arrays of the on-disk format. It (de)serializes to/from JSON via
+//! the private `CrcRaw` serde intermediate, which mirrors the wire format exactly.
 //!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 
@@ -85,7 +85,11 @@ pub struct Crc {
     /// Active (non-removed) [`DomainMetadata`] actions at this version, as a typed
     /// [`DomainMetadataState`]. Tombstones (`removed=true`) are never stored. `Complete(map)`
     /// is authoritative for misses; `Partial(map)` carries known-correct entries but requires
-    /// log replay for misses. Only the `Complete` variant is materialized to the file.
+    /// log replay for misses. Only the `Complete` variant is persisted to the CRC file.
+    ///
+    /// TODO: when the table protocol does not enable the `domainMetadata` feature, no DM
+    /// action can exist, so `Partial(_)` is semantically equivalent to `Complete(empty)` and
+    /// both serde paths could collapse the distinction.
     pub domain_metadata_state: DomainMetadataState,
 
     // ===== Not yet supported fields =====
@@ -196,9 +200,6 @@ impl TryFrom<CrcRaw> for Crc {
                 .map(|v| v.into_iter().map(|t| (t.app_id.clone(), t)).collect()),
             // Present array (including empty `[]`) deserializes as Complete; absent or null
             // deserializes as Partial(empty).
-            // TODO: if the table protocol does not support the domainMetadata feature, an
-            //       absent field is equivalent to `Complete(empty)` (no domains can exist),
-            //       so we could deserialize to Complete here too.
             domain_metadata_state: match raw.domain_metadata {
                 Some(v) => DomainMetadataState::Complete(
                     v.into_iter().map(|d| (d.domain().to_string(), d)).collect(),
@@ -239,9 +240,6 @@ impl TryFrom<&Crc> for CrcRaw {
                 .map(|m| m.values().cloned().collect()),
             // Only Complete survives the round-trip; Partial drops to absent so the next
             // read does not mistake it for an authoritative Complete cache.
-            // TODO: if the table protocol does not support the domainMetadata feature,
-            //       `Partial(_)` is equivalent to `Complete(empty)` (no domains can exist),
-            //       so we could serialize an empty `[]` here too.
             domain_metadata: match &crc.domain_metadata_state {
                 DomainMetadataState::Complete(m) => Some(m.values().cloned().collect()),
                 DomainMetadataState::Partial(_) => None,
@@ -308,7 +306,8 @@ mod tests {
     use super::{Crc, CrcRaw, DomainMetadataState, FileStats, FileStatsState};
     use crate::actions::{DomainMetadata, SetTransaction};
 
-    /// Helper to create a minimal `Crc` with only set_transactions and domain_metadata populated.
+    /// Helper to create a minimal `Crc` with only set_transactions and domain_metadata_state
+    /// populated.
     fn crc_with(
         txns: Option<HashMap<String, SetTransaction>>,
         domains: DomainMetadataState,
@@ -362,8 +361,9 @@ mod tests {
         assert_eq!(txn2.last_updated, None);
 
         // A present `domainMetadata` array deserializes as `Complete` (authoritative).
-        assert!(crc.domain_metadata_state.is_complete());
-        let domains = crc.domain_metadata_state.data();
+        let DomainMetadataState::Complete(domains) = &crc.domain_metadata_state else {
+            panic!("expected Complete, got {:?}", crc.domain_metadata_state);
+        };
         assert_eq!(domains.len(), 2);
         assert!(domains.contains_key("delta.rowTracking"));
         assert!(domains.contains_key("delta.clustering"));
@@ -572,8 +572,12 @@ mod tests {
         assert_eq!(txns["etl-pipeline"].version, 7);
 
         // Verify all domain metadatas
-        assert!(deserialized.domain_metadata_state.is_complete());
-        let domains = deserialized.domain_metadata_state.data();
+        let DomainMetadataState::Complete(domains) = &deserialized.domain_metadata_state else {
+            panic!(
+                "expected Complete, got {:?}",
+                deserialized.domain_metadata_state
+            );
+        };
         assert_eq!(domains.len(), 3);
         assert!(domains.contains_key("delta.rowTracking"));
         assert!(domains.contains_key("delta.clustering"));

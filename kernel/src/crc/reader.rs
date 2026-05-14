@@ -31,6 +31,7 @@ mod tests {
 
     use super::*;
     use crate::actions::{Format, Metadata, Protocol};
+    use crate::crc::DomainMetadataState;
     use crate::engine::sync::SyncEngine;
     use crate::path::ParsedLogPath;
     use crate::table_features::TableFeature;
@@ -105,8 +106,9 @@ mod tests {
         assert_eq!(crc.metadata, expected_metadata);
 
         // Verify domain metadatas
-        assert!(crc.domain_metadata_state.is_complete());
-        let dms = crc.domain_metadata_state.data();
+        let DomainMetadataState::Complete(dms) = &crc.domain_metadata_state else {
+            panic!("expected Complete, got {:?}", crc.domain_metadata_state);
+        };
         assert_eq!(dms.len(), 3);
 
         assert!(dms["delta.clustering"]

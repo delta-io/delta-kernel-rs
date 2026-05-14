@@ -6,8 +6,7 @@
 //! degraded state because the field does not exist there.
 //!
 //! - [`FileStatsState`] tracks file-stat validity (Complete / Indeterminate / Untrackable).
-//! - [`DomainMetadataState`] tracks domain-metadata completeness (Complete / Partial). A
-//!   follow-up PR adds `SetTransactionState` with the same shape.
+//! - [`DomainMetadataState`] tracks domain-metadata completeness (Complete / Partial).
 
 use std::collections::HashMap;
 
@@ -93,19 +92,6 @@ impl Default for DomainMetadataState {
     }
 }
 
-impl DomainMetadataState {
-    /// Returns the underlying map. Both variants own one.
-    pub fn data(&self) -> &HashMap<String, DomainMetadata> {
-        match self {
-            Self::Complete(map) | Self::Partial(map) => map,
-        }
-    }
-
-    pub fn is_complete(&self) -> bool {
-        matches!(self, Self::Complete(_))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,24 +152,6 @@ mod tests {
     }
 
     // ===== DomainMetadataState =====
-
-    #[test]
-    fn dm_state_data_accessor_returns_underlying_map_for_both_variants() {
-        let map = HashMap::from([(
-            "d".to_string(),
-            DomainMetadata::new("d".to_string(), "{}".to_string()),
-        )]);
-        assert_eq!(DomainMetadataState::Complete(map.clone()).data().len(), 1);
-        assert_eq!(DomainMetadataState::Partial(map).data().len(), 1);
-        assert_eq!(DomainMetadataState::default().data().len(), 0);
-    }
-
-    #[test]
-    fn dm_state_is_complete_only_for_complete_variant() {
-        assert!(DomainMetadataState::Complete(HashMap::new()).is_complete());
-        assert!(!DomainMetadataState::Partial(HashMap::new()).is_complete());
-        assert!(!DomainMetadataState::default().is_complete());
-    }
 
     #[test]
     fn dm_state_default_is_empty_partial() {

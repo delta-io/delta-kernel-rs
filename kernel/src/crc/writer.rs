@@ -213,4 +213,30 @@ mod tests {
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
         assert!(matches!(result, Err(Error::ChecksumWriteUnsupported(_))));
     }
+
+    /// Pins the current writer contract: a `Partial` DM does NOT block the write. The CRC
+    /// lands on disk with `domainMetadata` absent (Partial is non-authoritative, so the
+    /// serializer drops it), and the next read deserializes back to `Partial(empty)`.
+    /// Any future change that gates writes on DM completeness must update this test.
+    #[test]
+    fn test_write_with_partial_dm_succeeds_and_persists_no_dm_field() {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let table_root = url::Url::parse("memory:///test_table/").unwrap();
+        let path = ParsedLogPath::create_parsed_crc(&table_root, 0);
+
+        let mut crc = test_crc();
+        crc.domain_metadata_state = DomainMetadataState::Partial(HashMap::from([(
+            "k".to_string(),
+            DomainMetadata::new("k".to_string(), "v".to_string()),
+        )]));
+
+        try_write_crc_file(&engine, path.location.as_url(), &crc).unwrap();
+
+        let read_back = try_read_crc_file(&engine, &path).unwrap();
+        assert_eq!(
+            read_back.domain_metadata_state,
+            DomainMetadataState::Partial(HashMap::new())
+        );
+    }
 }
