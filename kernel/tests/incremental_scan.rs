@@ -1045,3 +1045,65 @@ async fn into_summary_after_manual_streaming_classifies_duplicates(
 
     Ok(())
 }
+
+// HashSet variants (`*_set`) take `&HashSet<FileActionKey>` and produce the same
+// `duplicate_adds` as the streaming-iterator variants. Asserts that for a fixed
+// (range, base) pair both forms agree on the classified output.
+#[tokio::test]
+async fn hashset_variants_match_iterator_variants() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![
+            TestAction::Add("brand-new.parquet".to_string()),
+            TestAction::Add("re-added.parquet".to_string()),
+        ]),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let base_keys: HashSet<FileActionKey> =
+        [key("re-added.parquet"), key("not-in-range.parquet")].into();
+
+    // HashSet form of into_summary_against_base.
+    let stream = target
+        .clone()
+        .incremental_scan_builder(0)
+        .build(engine.as_ref())?
+        .expect("expected Some(stream)");
+    let summary_set = stream.into_summary_against_base_set(&base_keys)?;
+    assert_eq!(
+        summary_set.duplicate_adds,
+        HashSet::from([key("re-added.parquet")]),
+    );
+    assert!(summary_set.removes.is_empty());
+
+    // HashSet form of into_listing_against_base produces the same classification.
+    let stream = target
+        .incremental_scan_builder(0)
+        .build(engine.as_ref())?
+        .expect("expected Some(stream)");
+    let listing_set = stream.into_listing_against_base_set(&base_keys)?;
+    assert_eq!(
+        listing_set.summary.duplicate_adds,
+        summary_set.duplicate_adds
+    );
+    assert_eq!(listing_set.summary.removes, summary_set.removes);
+    assert_eq!(classified_add_count(&listing_set), 2);
+
+    Ok(())
+}
