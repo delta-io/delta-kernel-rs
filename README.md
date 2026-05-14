@@ -22,6 +22,8 @@ is the Rust/C equivalent of [Java Delta Kernel][java-kernel].
 Delta-kernel-rs is split into a few different crates:
 
 - kernel: The actual core kernel crate
+- default-engine: The default Arrow/Tokio-based `Engine` implementation, published as
+  `delta_kernel_default_engine`
 - acceptance: Acceptance tests that validate correctness  via the [Delta Acceptance Tests][dat]
 - derive-macros: A crate for our [derive-macros] to live in
 - ffi: Functionality that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
@@ -45,27 +47,34 @@ In general, you will want to depend on `delta-kernel-rs` by adding it as a depen
 module. The core kernel includes facilities for reading and writing delta tables, and allows the
 consumer to implement their own `Engine` trait in order to build engine-specific implementations of
 the various `Engine` APIs that the kernel relies on (e.g. implement an engine-specific
-`read_json_files()` using the native engine JSON reader). If there is no need to implement the
-consumer's own `Engine` trait, the kernel has a feature flag to enable a default, asynchronous
-`Engine` implementation built with [Arrow] and [Tokio].
+`read_json_files()` using the native engine JSON reader). If you do not need a custom `Engine`,
+add the `delta_kernel_default_engine` crate to get the default asynchronous `Engine` implementation
+built with [Arrow] and [Tokio].
 
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
 delta_kernel = "0.22.0"
 
-# or turn on the default engine, based on latest arrow
-delta_kernel = { version = "0.22.0", features = ["default-engine-rustls", "arrow"] }
+# or pull in the default Arrow/Tokio engine alongside the kernel
+delta_kernel = "0.22.0"
+delta_kernel_default_engine = { version = "0.22.0", features = ["rustls"] }
 ```
 
 ### Feature flags
-There are more feature flags in addition to the `default-engine-rustls` flag shown above. Relevant
-flags include:
+`delta_kernel_default_engine` exposes the following feature flags:
 
 | Feature flag  | Description   |
 | ------------- | ------------- |
-| `default-engine-rustls`    | Turn on the 'default' engine with rustls TLS backend  |
-| `default-engine-native-tls`| Turn on the 'default' engine with native-tls TLS backend  |
+| `rustls`      | Use the rustls TLS backend for HTTPS object stores  |
+| `native-tls`  | Use the native-tls TLS backend for HTTPS object stores  |
+| `arrow-57`    | Build against arrow 57 (see Arrow versioning below) |
+| `arrow-58`    | Build against arrow 58 (see Arrow versioning below) |
+
+The `delta_kernel` crate itself exposes a few additional flags:
+
+| Feature flag  | Description   |
+| ------------- | ------------- |
 | `arrow-conversion`  | Conversion utilities for arrow/kernel schema interoperation |
 | `arrow-expression`  | Expression system implementation for arrow |
 
@@ -75,7 +84,7 @@ are still unstable. We therefore may break APIs within minor releases (that is, 
 we will not break APIs in patch releases (`0.1.0` -> `0.1.1`).
 
 ## Arrow versioning
-If you enable a default engine feature (`default-engine-rustls` or `default-engine-native-tls`),
+If you depend on `delta_kernel_default_engine` (with either the `rustls` or `native-tls` feature),
 you get an implementation of the `Engine` trait that uses [Arrow] as its data format.
 
 The [`arrow crate`](https://docs.rs/arrow/latest/arrow/) tends to release new major versions rather
