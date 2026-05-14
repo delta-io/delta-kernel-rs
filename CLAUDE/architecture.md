@@ -61,8 +61,8 @@ set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and
   requires `internal-api` feature)
 
 **Incremental read:** `Snapshot::incremental_scan_builder(base_version)` streams the file-action
-diff over `(base_version, target_version]` -- surviving Adds as a `FilteredEngineData` iterator
-plus a terminal summary of surviving Add and Remove file keys. Use this to advance a cached
+diff over `(base_version, target_version]` -- live Adds as a `FilteredEngineData` iterator
+plus a terminal summary of live Add and Remove file keys. Use this to advance a cached
 file listing without re-scanning the table.
 
 ## Write Path

@@ -133,7 +133,7 @@ impl IncrementalScanBuilder {
             target_version,
             actions,
             seen_file_keys: HashSet::new(),
-            surviving_adds: HashSet::new(),
+            live_adds: HashSet::new(),
             removes: HashSet::new(),
             errored: false,
         }))
@@ -141,14 +141,14 @@ impl IncrementalScanBuilder {
 }
 
 /// Streaming output of an incremental scan over `(base_version, target_version]`.
-/// Yields surviving Add batches as [`FilteredEngineData`] in newest-first order via
+/// Yields live Add batches as [`FilteredEngineData`] in newest-first order via
 /// [`Iterator::next`]; call [`into_summary`] or [`into_listing`] to terminate and recover
-/// the surviving file-key sets.
+/// the live file-key sets.
 ///
-/// A row "survives" the scan over `(base_version, target_version]` if, walking commits
-/// newest-first and keying by `(path, dv_unique_id)`, it is the first occurrence of that
-/// key (first-seen-wins dedup) and no later commit in the range contains a Remove for the
-/// same key.
+/// An Add is "live" at the target if, walking commits newest-first and keying by
+/// `(path, dv_unique_id)`, it is the first occurrence of that key (first-seen-wins dedup)
+/// and no later commit in the range contains a Remove for the same key — i.e. the file is
+/// still in the table at `target_version`.
 ///
 /// On error, `next()` yields `Some(Err(_))` once and returns `None` on every subsequent
 /// call; the stream's dedup state is incomplete, so terminal methods then return `Err`
@@ -161,7 +161,7 @@ pub struct IncrementalScanStream {
     target_version: Version,
     actions: FileDataReadResultIterator,
     seen_file_keys: HashSet<FileActionKey>,
-    surviving_adds: HashSet<FileActionKey>,
+    live_adds: HashSet<FileActionKey>,
     removes: HashSet<FileActionKey>,
     errored: bool,
 }
@@ -182,7 +182,7 @@ impl Iterator for IncrementalScanStream {
                 Ok(batch) => match process_batch(
                     batch,
                     &mut self.seen_file_keys,
-                    &mut self.surviving_adds,
+                    &mut self.live_adds,
                     &mut self.removes,
                 ) {
                     Ok(Some(filtered)) => return Some(Ok(filtered)),
@@ -198,7 +198,7 @@ impl Iterator for IncrementalScanStream {
 }
 
 impl IncrementalScanStream {
-    /// Drain any unread batches, then return the surviving file-key sets without applying
+    /// Drain any unread batches, then return the live file-key sets without applying
     /// cross-snapshot dedup. Consumers can intersect these against whatever base
     /// data structure they prefer.
     ///
@@ -219,12 +219,12 @@ impl IncrementalScanStream {
         Ok(IncrementalScanSummary {
             base_version: self.base_version,
             target_version: self.target_version,
-            surviving_adds: self.surviving_adds,
+            live_adds: self.live_adds,
             removes: self.removes,
         })
     }
 
-    /// Eager helper: collect every surviving Add batch into a [`Vec`], then call
+    /// Eager helper: collect every live Add batch into a [`Vec`], then call
     /// [`into_summary`] to recover the file-key sets. Use this when the diff fits in memory
     /// and the consumer prefers the simpler eager shape over the iterator pattern.
     ///
@@ -250,14 +250,14 @@ impl std::fmt::Debug for IncrementalScanStream {
         f.debug_struct("IncrementalScanStream")
             .field("base_version", &self.base_version)
             .field("target_version", &self.target_version)
-            .field("surviving_adds", &self.surviving_adds.len())
+            .field("live_adds", &self.live_adds.len())
             .field("removes", &self.removes.len())
             .field("errored", &self.errored)
             .finish()
     }
 }
 
-/// Surviving file-key sets without cross-snapshot classification, returned by
+/// Live file-key sets without cross-snapshot classification, returned by
 /// [`IncrementalScanStream::into_summary`].
 ///
 /// Each set element is a [`FileActionKey`] of `(path, dv_unique_id)`. Consumers should match
@@ -271,9 +271,11 @@ pub struct IncrementalScanSummary {
     pub base_version: Version,
     /// Inclusive upper bound; equals the source snapshot's version.
     pub target_version: Version,
-    /// File keys of surviving Add actions in `(base_version, target_version]`.
-    pub surviving_adds: HashSet<FileActionKey>,
-    /// File keys of surviving Remove actions in `(base_version, target_version]`.
+    /// File keys of live Add actions in `(base_version, target_version]` (i.e. Adds whose
+    /// `(path, dv_unique_id)` is still present at `target_version`).
+    pub live_adds: HashSet<FileActionKey>,
+    /// File keys of Remove actions in `(base_version, target_version]`, deduped
+    /// first-seen-wins by `(path, dv_unique_id)`.
     pub removes: HashSet<FileActionKey>,
 }
 
@@ -281,10 +283,10 @@ pub struct IncrementalScanSummary {
 /// batches plus the summary (no cross-snapshot classification).
 #[non_exhaustive]
 pub struct IncrementalListing {
-    /// Surviving Add and Remove file-key sets for the range.
+    /// Live Add and Remove file-key sets for the range.
     pub summary: IncrementalScanSummary,
-    /// All surviving Add batches in descending commit-version order. One entry per source
-    /// commit batch that produced any surviving Adds.
+    /// All live Add batches in descending commit-version order. One entry per source
+    /// commit batch that produced any live Adds.
     pub add_files: Vec<FilteredEngineData>,
 }
 
@@ -302,7 +304,7 @@ impl std::fmt::Debug for IncrementalListing {
 fn process_batch(
     batch: Box<dyn EngineData>,
     seen_file_keys: &mut HashSet<FileActionKey>,
-    surviving_adds: &mut HashSet<FileActionKey>,
+    live_adds: &mut HashSet<FileActionKey>,
     removes: &mut HashSet<FileActionKey>,
 ) -> DeltaResult<Option<FilteredEngineData>> {
     let row_count = batch.len();
@@ -319,7 +321,7 @@ fn process_batch(
     let mut visitor = IncrementalDedupVisitor {
         deduplicator,
         adds_sel: &mut adds_sel,
-        surviving_adds,
+        live_adds,
         removes,
     };
     visitor.visit_rows_of(batch.as_ref())?;
@@ -344,13 +346,13 @@ const NUM_GETTERS: usize = 8; // 4 add + 4 remove columns
 // that visitor is wired to scan-only state (`StateInfo`, `ScanMetrics`, per-row transform
 // expressions, partition value parsing, base row id) and only outputs Adds. Removes are
 // folded into `seen_file_keys` as a side effect and never surfaced to the caller. The
-// incremental scan needs both surviving Adds and surviving Removes exposed (keyed by
+// incremental scan needs both live Adds and Removes exposed (keyed by
 // `(path, dv_unique_id)`), and it deliberately skips the scan-only per-row work, so a
 // slimmer visitor is the right shape here.
 struct IncrementalDedupVisitor<'a, 'seen> {
     deduplicator: FileActionDeduplicator<'seen>,
     adds_sel: &'a mut [bool],
-    surviving_adds: &'a mut HashSet<FileActionKey>,
+    live_adds: &'a mut HashSet<FileActionKey>,
     removes: &'a mut HashSet<FileActionKey>,
 }
 
@@ -404,7 +406,7 @@ impl RowVisitor for IncrementalDedupVisitor<'_, '_> {
 
             if is_add {
                 self.adds_sel[i] = true;
-                self.surviving_adds.insert(key);
+                self.live_adds.insert(key);
             } else {
                 self.removes.insert(key);
             }

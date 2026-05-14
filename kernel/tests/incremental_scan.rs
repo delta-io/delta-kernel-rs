@@ -46,7 +46,7 @@ fn key_with_dv(path: &str, dv_unique_id: &str) -> FileActionKey {
     FileActionKey::new(path, Some(dv_unique_id.to_string()))
 }
 
-fn surviving_add_count(listing: &IncrementalListing) -> usize {
+fn live_add_count(listing: &IncrementalListing) -> usize {
     listing
         .add_files
         .iter()
@@ -86,7 +86,7 @@ fn unwrap_listing(result: Option<IncrementalScanStream>) -> IncrementalListing {
 #[tokio::test]
 async fn within_range_cancellation(
     #[case] commits: Vec<Vec<TestAction>>,
-    #[case] expected_surviving: usize,
+    #[case] expected_live: usize,
     #[case] expected_removes: Vec<&'static str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
@@ -115,7 +115,7 @@ async fn within_range_cancellation(
         .build(engine.as_ref())?;
     let listing = unwrap_listing(target.incremental_scan_builder(0).build(engine.as_ref())?);
 
-    assert_eq!(surviving_add_count(&listing), expected_surviving);
+    assert_eq!(live_add_count(&listing), expected_live);
     let expected: HashSet<FileActionKey> = expected_removes.iter().map(|p| key(p)).collect();
     assert_eq!(listing.summary.removes, expected);
 
@@ -168,9 +168,9 @@ async fn picks_up_staged_commits_from_log_tail() -> Result<(), Box<dyn std::erro
 
     // Both staged Adds must survive -- they're only reachable via log_tail.
     assert_eq!(
-        surviving_add_count(&listing),
+        live_add_count(&listing),
         2,
-        "expected 2 surviving Adds from staged commits in log_tail"
+        "expected 2 live Adds from staged commits in log_tail"
     );
     assert_eq!(listing.summary.target_version, 2);
 
@@ -190,7 +190,7 @@ async fn picks_up_staged_commits_from_log_tail() -> Result<(), Box<dyn std::erro
 )]
 #[case::metadata_only(vec![TestAction::Metadata], vec![])]
 #[tokio::test]
-async fn commit_with_no_surviving_adds(
+async fn commit_with_no_live_adds(
     #[case] v1_actions: Vec<TestAction>,
     #[case] expected_remove_paths: Vec<&'static str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -217,7 +217,7 @@ async fn commit_with_no_surviving_adds(
         .build(engine.as_ref())?;
     let listing = unwrap_listing(target.incremental_scan_builder(0).build(engine.as_ref())?);
 
-    assert_eq!(surviving_add_count(&listing), 0);
+    assert_eq!(live_add_count(&listing), 0);
     assert!(listing.add_files.is_empty(), "no Adds means no add batches");
     let expected_removes: HashSet<FileActionKey> =
         expected_remove_paths.iter().map(|p| key(p)).collect();
@@ -227,7 +227,7 @@ async fn commit_with_no_surviving_adds(
 }
 
 // Locks the iterator contract: `next()` returns `None` once every in-range commit has been
-// processed, even when no commit produced a surviving Add. Polling past exhaustion stays
+// processed, even when no commit produced a live Add. Polling past exhaustion stays
 // `None` and never panics.
 #[tokio::test]
 async fn next_returns_none_after_exhaustion() -> Result<(), Box<dyn std::error::Error>> {
@@ -290,7 +290,7 @@ fn add_no_dv(path: &str) -> String {
 
 // Same path with DV-bearing Adds across commits. Dedup keys on `(path, dv_unique_id)`:
 // different DV ids produce distinct keys (both survive), same DV ids collapse to one
-// surviving Add (newest-wins).
+// live Add (newest-wins).
 #[rstest]
 #[case::different_dvs(
     ("u", "abc", 1),
@@ -308,7 +308,7 @@ fn add_no_dv(path: &str) -> String {
 async fn same_path_across_commits_dedups_by_dv(
     #[case] v1_dv: (&'static str, &'static str, i32),
     #[case] v2_dv: (&'static str, &'static str, i32),
-    #[case] expected_surviving: usize,
+    #[case] expected_live: usize,
     #[case] expected_keys: Vec<(&'static str, &'static str)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
@@ -335,21 +335,21 @@ async fn same_path_across_commits_dedups_by_dv(
         .build(engine.as_ref())?;
     let listing = unwrap_listing(target.incremental_scan_builder(0).build(engine.as_ref())?);
 
-    assert_eq!(surviving_add_count(&listing), expected_surviving);
+    assert_eq!(live_add_count(&listing), expected_live);
     assert!(listing.summary.removes.is_empty());
     let expected_adds: HashSet<FileActionKey> = expected_keys
         .iter()
         .map(|(p, dv)| key_with_dv(p, dv))
         .collect();
-    assert_eq!(listing.summary.surviving_adds, expected_adds);
+    assert_eq!(listing.summary.live_adds, expected_adds);
 
     Ok(())
 }
 
 // DV-update pattern: v1 introduces the file with no DV; v2 emits Remove(X, no_dv) +
 // Add(X, dv1). The Remove has key `(X, NULL)` and cancels the v1 Add. The new Add has
-// key `(X, dv1)` -- distinct -- and survives. The consumer sees one surviving Add
-// with the new DV and one surviving Remove for the old (no-DV) version.
+// key `(X, dv1)` -- distinct -- and stays live. The consumer sees one live Add
+// with the new DV and one Remove for the old (no-DV) version.
 #[tokio::test]
 async fn dv_update_remove_no_dv_add_with_dv() -> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
@@ -376,7 +376,7 @@ async fn dv_update_remove_no_dv_add_with_dv() -> Result<(), Box<dyn std::error::
     // The new DV-bearing Add (key `(X, dv1)`) survives. The v1 no-DV Add (key `(X, NULL)`)
     // is cancelled by the v2 no-DV Remove (same key).
     assert_eq!(
-        surviving_add_count(&listing),
+        live_add_count(&listing),
         1,
         "the new DV-bearing Add survives; the old no-DV Add is cancelled"
     );
@@ -552,7 +552,7 @@ async fn compaction_file_in_range_is_ignored() -> Result<(), Box<dyn std::error:
     let listing = unwrap_listing(target.incremental_scan_builder(0).build(engine.as_ref())?);
 
     assert_eq!(
-        surviving_add_count(&listing),
+        live_add_count(&listing),
         2,
         "B (live) and C (live) survive; A is cancelled by the v2 Remove"
     );
@@ -565,11 +565,11 @@ async fn compaction_file_in_range_is_ignored() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-// `into_summary` returns the surviving Add and Remove file-key sets directly (without going
+// `into_summary` returns the live Add and Remove file-key sets directly (without going
 // through the iterator first). Connectors that don't need per-batch streaming can drain
-// via `into_summary` and apply their own logic over the surviving keys.
+// via `into_summary` and apply their own logic over the keys.
 #[tokio::test]
-async fn into_summary_returns_surviving_keys() -> Result<(), Box<dyn std::error::Error>> {
+async fn into_summary_returns_live_keys() -> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
@@ -613,13 +613,13 @@ async fn into_summary_returns_surviving_keys() -> Result<(), Box<dyn std::error:
     let footer: IncrementalScanSummary = stream.into_summary()?;
     assert_eq!(footer.base_version, 0);
     assert_eq!(footer.target_version, 2);
-    assert_eq!(footer.surviving_adds, HashSet::from([key("B"), key("C")]),);
+    assert_eq!(footer.live_adds, HashSet::from([key("B"), key("C")]),);
     assert_eq!(footer.removes, HashSet::from([key("A")]));
 
     Ok(())
 }
 
-// The iterator yields one batch per source commit that produced surviving Adds, in
+// The iterator yields one batch per source commit that produced live Adds, in
 // descending commit-version order. Commits whose Adds were all cancelled by later
 // Removes do not produce an item, but they still update dedup state for older commits.
 #[tokio::test]
@@ -682,15 +682,15 @@ async fn streaming_yields_batches_newest_first_skipping_cancelled_commits(
         batches.push(item?);
     }
 
-    // v4 produced the surviving add(C); v3 had only Removes (no add item);
+    // v4 produced the live add(C); v3 had only Removes (no add item);
     // v2 and v1 had their adds cancelled by v3 (no add items). So exactly one batch.
     assert_eq!(
         batches.len(),
         1,
         "expected one yielded batch (v4 only); v3 has no Adds, v1/v2 cancelled"
     );
-    let surviving: usize = batches[0].selection_vector().iter().filter(|s| **s).count();
-    assert_eq!(surviving, 1, "the single yielded batch contains add(C)");
+    let live: usize = batches[0].selection_vector().iter().filter(|s| **s).count();
+    assert_eq!(live, 1, "the single yielded batch contains add(C)");
 
     let footer = stream.into_summary()?;
     assert_eq!(footer.removes, HashSet::from([key("A"), key("B")]),);
@@ -752,7 +752,7 @@ async fn mixed_intra_batch_selection_vector() -> Result<(), Box<dyn std::error::
     // Two yielded batches: v2 (with mixed selection [false,true,false]) and v1 (with [true]).
     assert_eq!(listing.add_files.len(), 2);
     assert_eq!(
-        surviving_add_count(&listing),
+        live_add_count(&listing),
         2,
         "C and A survive; B and D cancelled"
     );
@@ -822,7 +822,7 @@ impl Engine for CustomBatchSizeEngine {
 // stresses path-only state machines: plain Adds, two DV-replacement pairs (same path, Add
 // with new DV plus Remove with old/null DV), and a standalone Remove. Forcing the JSON
 // reader to split this commit into many `ActionsBatch` yields (batch_size = 1, 2, 3)
-// must produce the exact same surviving Add and Remove path sets as the unsplit case
+// must produce the exact same live Add and Remove path sets as the unsplit case
 // (batch_size large enough to hold every row). If our dedup state ever becomes
 // per-batch instead of global, this test fails.
 #[rstest]
@@ -876,7 +876,7 @@ async fn single_commit_split_across_batches_dedups_correctly(
         .build(&engine)?;
     let listing = unwrap_listing(target.incremental_scan_builder(0).build(&engine)?);
 
-    // 7 surviving Adds: a, b, c, e, g (plain) plus d and f (the new DV-bearing copies).
+    // 7 live Adds: a, b, c, e, g (plain) plus d and f (the new DV-bearing copies).
     // The no-DV Removes for d and f have key `(path, NULL)`, distinct from the new
     // DV-bearing Adds, so they survive too.
     let expected_adds: HashSet<FileActionKey> = [
@@ -896,15 +896,15 @@ async fn single_commit_split_across_batches_dedups_correctly(
             .collect();
 
     assert_eq!(
-        listing.summary.surviving_adds, expected_adds,
-        "surviving_adds must not depend on batch_size (got batch_size={batch_size})"
+        listing.summary.live_adds, expected_adds,
+        "live_adds must not depend on batch_size (got batch_size={batch_size})"
     );
     assert_eq!(
         listing.summary.removes, expected_removes,
         "removes must not depend on batch_size (got batch_size={batch_size})"
     );
     assert_eq!(
-        surviving_add_count(&listing),
+        live_add_count(&listing),
         7,
         "selection-vector counts must not depend on batch_size (got batch_size={batch_size})"
     );
