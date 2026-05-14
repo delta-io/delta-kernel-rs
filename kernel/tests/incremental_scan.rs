@@ -1112,3 +1112,55 @@ async fn predicate_variants_match_iterator_variants() -> Result<(), Box<dyn std:
 
     Ok(())
 }
+
+// Empty base: `duplicate_adds` is empty (nothing in the range overlaps the empty base),
+// but `removes` still surfaces every range remove. Exercises both against-base forms.
+#[tokio::test]
+async fn empty_base_keys_produces_no_duplicates() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![
+            TestAction::Add("a.parquet".to_string()),
+            TestAction::Remove("gone.parquet".to_string()),
+        ]),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    // By-ref iterator with empty input.
+    let stream = target
+        .clone()
+        .incremental_scan_builder(0)
+        .build(engine.as_ref())?
+        .expect("expected Some(stream)");
+    let empty: [FileActionKey; 0] = [];
+    let summary_iter = stream.into_summary_against_base(&empty)?;
+    assert!(summary_iter.duplicate_adds.is_empty());
+    assert_eq!(summary_iter.removes, HashSet::from([key("gone.parquet")]));
+
+    // Predicate closure that always returns false.
+    let stream = target
+        .incremental_scan_builder(0)
+        .build(engine.as_ref())?
+        .expect("expected Some(stream)");
+    let summary_with = stream.into_summary_against_base_with(|_| false)?;
+    assert!(summary_with.duplicate_adds.is_empty());
+    assert_eq!(summary_with.removes, HashSet::from([key("gone.parquet")]));
+
+    Ok(())
+}
