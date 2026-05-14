@@ -268,8 +268,6 @@ impl IncrementalScanStream {
     ///   underlying engine error determines retryability; typically retryable by rebuilding the
     ///   stream.
     ///
-    /// This method itself adds no new error conditions over [`into_summary`].
-    ///
     /// [`into_summary`]: Self::into_summary
     /// [`into_summary_against_base_set`]: Self::into_summary_against_base_set
     pub fn into_summary_against_base(
