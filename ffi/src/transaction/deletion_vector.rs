@@ -10,7 +10,6 @@ use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionV
 use delta_kernel::transaction::Transaction;
 use delta_kernel::{DeltaResult, Error};
 use delta_kernel_ffi_macros::handle_descriptor;
-use url::Url;
 
 use super::ExclusiveTransaction;
 use crate::error::{ExternResult, IntoExternResult};
@@ -118,14 +117,9 @@ impl TryFrom<c_int> for KernelDvStorageType {
 /// Construct a [`DeletionVectorDescriptor`] from raw fields, for engines that author DV
 /// files themselves and want to install them via [`transaction_update_deletion_vectors`].
 ///
-/// Per the Delta protocol "Deletion Vector Descriptor Schema":
-/// - `Inline` descriptors MUST NOT carry an offset; pass `has_offset = false`.
-/// - `PersistedRelative` descriptors carry the optional random prefix followed by a 20-character
-///   z85-encoded UUID, so `path_or_inline_dv` MUST be at least 20 characters long.
-/// - `PersistedAbsolute` descriptors MUST contain a parseable URL.
-/// - If `has_offset` is true, `offset` MUST be non-negative.
-/// - `size_in_bytes` MUST be non-negative.
-/// - `cardinality` MUST be non-negative.
+/// Field validation (storage-type rules, non-negative size/cardinality/offset, etc.) is
+/// performed by [`DeletionVectorDescriptor::try_new`]; see its docs for the full contract.
+/// Pass `has_offset = false` to omit the offset.
 ///
 /// For persisted DVs, `offset` is the byte offset within the DV file at which the DV's
 /// 4-byte big-endian size prefix begins. For a single-DV file, this is usually `1`
@@ -168,53 +162,14 @@ fn dv_descriptor_new_impl(
     size_in_bytes: i32,
     cardinality: i64,
 ) -> DeltaResult<Handle<ExclusiveDvDescriptor>> {
-    if size_in_bytes < 0 {
-        return Err(Error::generic(
-            "deletion vector size_in_bytes must be non-negative",
-        ));
-    }
-    if cardinality < 0 {
-        return Err(Error::generic(
-            "deletion vector cardinality must be non-negative",
-        ));
-    }
-    if has_offset && offset < 0 {
-        return Err(Error::generic(
-            "deletion vector offset must be non-negative",
-        ));
-    }
-    let path = path?.to_string();
-    match storage_type {
-        KernelDvStorageType::Inline => {
-            if has_offset {
-                return Err(Error::generic(
-                    "inline deletion vectors must not carry an offset",
-                ));
-            }
-        }
-        KernelDvStorageType::PersistedRelative => {
-            if path.len() < 20 {
-                return Err(Error::generic(
-                    "persisted-relative DV path must be at least 20 chars (z85-encoded UUID)",
-                ));
-            }
-        }
-        KernelDvStorageType::PersistedAbsolute => {
-            Url::parse(&path).map_err(|e| {
-                Error::generic(format!(
-                    "persisted-absolute DV path must parse as a URL: {e}"
-                ))
-            })?;
-        }
-    }
-    Ok(Box::new(DeletionVectorDescriptor {
-        storage_type: storage_type.into(),
-        path_or_inline_dv: path,
-        offset: has_offset.then_some(offset),
+    let descriptor = DeletionVectorDescriptor::try_new(
+        storage_type.into(),
+        path?,
+        has_offset.then_some(offset),
         size_in_bytes,
         cardinality,
-    })
-    .into())
+    )?;
+    Ok(Box::new(descriptor).into())
 }
 
 /// Insert a deletion vector descriptor into the map under the given data file path.
@@ -244,8 +199,12 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
     // descriptor must remain valid so the caller can free it (otherwise we get a UAF
     // when they retry or clean up).
     let path_result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
-    let result = dv_descriptor_map_insert_impl(map_ref, path_result, descriptor).map(|_| true);
-    result.into_extern_result(&engine_ref)
+    // Return value is a meaningless placeholder; cbindgen drops `ExternResult<()>` to a
+    // bare `ExternResult` with no tag/payload, which is unusable from C. `bool` is the
+    // existing convention for void-like fallible FFI functions (e.g. `visit_domain_metadata`).
+    dv_descriptor_map_insert_impl(map_ref, path_result, descriptor)
+        .map(|_| true)
+        .into_extern_result(&engine_ref)
 }
 
 fn dv_descriptor_map_insert_impl(
@@ -299,6 +258,7 @@ pub unsafe extern "C" fn transaction_update_deletion_vectors(
     let dv_map = unsafe { dv_map.into_inner() };
     let scan_iter_ref = unsafe { scan_iter.as_ref() };
     let engine_ref = unsafe { engine.as_ref() };
+    // See `dv_descriptor_map_insert` for why this returns `bool` instead of `()`.
     transaction_update_deletion_vectors_impl(txn_ref, *dv_map, scan_iter_ref)
         .map(|_| true)
         .into_extern_result(&engine_ref)
@@ -350,73 +310,10 @@ mod tests {
     }
 
     #[test]
-    fn dv_descriptor_new_rejects_inline_with_offset() {
-        let err = dv_descriptor_new_impl(KernelDvStorageType::Inline, Ok("ABC"), true, 0, 4, 1)
-            .err()
-            .expect("expected error");
-        assert!(err.to_string().contains("inline"), "unexpected: {err}");
-    }
-
-    #[test]
-    fn dv_descriptor_new_rejects_short_relative_path() {
-        let err = dv_descriptor_new_impl(
-            KernelDvStorageType::PersistedRelative,
-            Ok("short"),
-            true,
-            1,
-            4,
-            1,
-        )
-        .err()
-        .expect("expected error");
-        assert!(err.to_string().contains("20 chars"), "unexpected: {err}");
-    }
-
-    #[test]
-    fn dv_descriptor_new_rejects_non_url_absolute_path() {
-        let err = dv_descriptor_new_impl(
-            KernelDvStorageType::PersistedAbsolute,
-            Ok("not a url"),
-            true,
-            1,
-            4,
-            1,
-        )
-        .err()
-        .expect("expected error");
-        assert!(err.to_string().contains("URL"), "unexpected: {err}");
-    }
-
-    #[test]
-    fn dv_descriptor_new_rejects_negative_size_offset_and_cardinality() {
-        let err = dv_descriptor_new_impl(KernelDvStorageType::Inline, Ok("ABC"), false, 0, -1, 0)
-            .err()
-            .expect("expected error");
-        assert!(
-            err.to_string().contains("size_in_bytes"),
-            "unexpected: {err}"
-        );
-
-        let err = dv_descriptor_new_impl(KernelDvStorageType::Inline, Ok("ABC"), false, 0, 4, -1)
-            .err()
-            .expect("expected error");
-        assert!(err.to_string().contains("cardinality"), "unexpected: {err}");
-
-        let err = dv_descriptor_new_impl(
-            KernelDvStorageType::PersistedAbsolute,
-            Ok("file:///tmp/dv.bin"),
-            true,
-            -1,
-            4,
-            1,
-        )
-        .err()
-        .expect("expected error");
-        assert!(err.to_string().contains("offset"), "unexpected: {err}");
-    }
-
-    #[test]
     fn dv_descriptor_new_round_trips_fields() {
+        // Smoke test that the FFI wrapper forwards fields to the kernel constructor
+        // without dropping or reordering anything. Validation cases live with
+        // `DeletionVectorDescriptor::try_new` in the kernel.
         let handle = dv_descriptor_new_impl(
             KernelDvStorageType::PersistedAbsolute,
             Ok("file:///tmp/dv.bin"),
@@ -436,6 +333,16 @@ mod tests {
         assert_eq!(descriptor.offset, Some(7));
         assert_eq!(descriptor.size_in_bytes, 42);
         assert_eq!(descriptor.cardinality, 9);
+    }
+
+    #[test]
+    fn dv_descriptor_new_surfaces_kernel_validation_error() {
+        // Verify the FFI wrapper propagates errors raised by
+        // `DeletionVectorDescriptor::try_new` instead of producing a handle.
+        let err = dv_descriptor_new_impl(KernelDvStorageType::Inline, Ok("ABC"), true, 0, 4, 1)
+            .err()
+            .expect("expected validation error");
+        assert!(err.to_string().contains("inline"), "unexpected: {err}");
     }
 
     #[test]
