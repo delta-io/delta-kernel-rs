@@ -921,9 +921,9 @@ async fn single_commit_split_across_batches_dedups_correctly(
 // the streamed Adds; the key is also surfaced separately so the consumer can mask the
 // stale base entry.
 
-fn unwrap_classified_listing(
+fn unwrap_classified_listing<'a>(
     result: Option<IncrementalScanStream>,
-    base_keys: impl IntoIterator<Item = FileActionKey>,
+    base_keys: impl IntoIterator<Item = &'a FileActionKey>,
 ) -> IncrementalListingAgainstBase {
     result
         .expect("expected Some(stream), got None (commits unavailable)")
@@ -978,9 +978,10 @@ async fn classifies_metadata_only_re_adds(
     let target = Snapshot::builder_for(table_url)
         .at_version(1)
         .build(engine.as_ref())?;
+    let base_keys: Vec<FileActionKey> = base_paths.iter().map(|p| key(p)).collect();
     let listing = unwrap_classified_listing(
         target.incremental_scan_builder(0).build(engine.as_ref())?,
-        base_paths.iter().map(|p| key(p)),
+        &base_keys,
     );
 
     assert_eq!(classified_add_count(&listing), expected_live);
@@ -1034,8 +1035,8 @@ async fn into_summary_after_manual_streaming_classifies_duplicates(
     }
     assert_eq!(yielded, 1, "v1 produced one Add batch");
 
-    let summary =
-        stream.into_summary_against_base([key("re-added.parquet"), key("not-in-range.parquet")])?;
+    let base_keys = [key("re-added.parquet"), key("not-in-range.parquet")];
+    let summary = stream.into_summary_against_base(&base_keys)?;
     assert_eq!(
         summary.duplicate_adds,
         HashSet::from([key("re-added.parquet")]),
@@ -1046,11 +1047,13 @@ async fn into_summary_after_manual_streaming_classifies_duplicates(
     Ok(())
 }
 
-// HashSet variants (`*_set`) take `&HashSet<FileActionKey>` and produce the same
-// `duplicate_adds` as the streaming-iterator variants. Asserts that for a fixed
-// (range, base) pair both forms agree on the classified output.
+// Predicate variants (`*_with`) take a closure and produce the same `duplicate_adds`
+// as the iterator variants. Asserts that for a fixed (range, base) pair both forms
+// agree on the classified output. Demonstrates HashMap-backed base via closure.
 #[tokio::test]
-async fn hashset_variants_match_iterator_variants() -> Result<(), Box<dyn std::error::Error>> {
+async fn predicate_variants_match_iterator_variants() -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::HashMap;
+
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
@@ -1076,34 +1079,36 @@ async fn hashset_variants_match_iterator_variants() -> Result<(), Box<dyn std::e
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let base_keys: HashSet<FileActionKey> =
-        [key("re-added.parquet"), key("not-in-range.parquet")].into();
+    // Base lives in a HashMap (key -> metadata). Closure does the contains-check.
+    let base_index: HashMap<FileActionKey, i64> = [
+        (key("re-added.parquet"), 100),
+        (key("not-in-range.parquet"), 200),
+    ]
+    .into();
 
-    // HashSet form of into_summary_against_base.
     let stream = target
         .clone()
         .incremental_scan_builder(0)
         .build(engine.as_ref())?
         .expect("expected Some(stream)");
-    let summary_set = stream.into_summary_against_base_set(&base_keys)?;
+    let summary_with = stream.into_summary_against_base_with(|k| base_index.contains_key(k))?;
     assert_eq!(
-        summary_set.duplicate_adds,
+        summary_with.duplicate_adds,
         HashSet::from([key("re-added.parquet")]),
     );
-    assert!(summary_set.removes.is_empty());
+    assert!(summary_with.removes.is_empty());
 
-    // HashSet form of into_listing_against_base produces the same classification.
     let stream = target
         .incremental_scan_builder(0)
         .build(engine.as_ref())?
         .expect("expected Some(stream)");
-    let listing_set = stream.into_listing_against_base_set(&base_keys)?;
+    let listing_with = stream.into_listing_against_base_with(|k| base_index.contains_key(k))?;
     assert_eq!(
-        listing_set.summary.duplicate_adds,
-        summary_set.duplicate_adds
+        listing_with.summary.duplicate_adds,
+        summary_with.duplicate_adds
     );
-    assert_eq!(listing_set.summary.removes, summary_set.removes);
-    assert_eq!(classified_add_count(&listing_set), 2);
+    assert_eq!(listing_with.summary.removes, summary_with.removes);
+    assert_eq!(classified_add_count(&listing_with), 2);
 
     Ok(())
 }

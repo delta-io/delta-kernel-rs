@@ -248,38 +248,28 @@ impl IncrementalScanStream {
     /// set to compute `duplicate_adds` (file keys in the consumer's base listing that the
     /// range re-adds with new metadata, e.g. OPTIMIZE / liquid clustering re-tag).
     ///
-    /// Streaming form: accepts any source of base keys (Vec, lazy iterator, paginated
-    /// cache lookup, etc.). Kernel does not materialize a HashSet of base keys — it
-    /// streams `base_keys` once and tests each against the live-Add set. Use this when
-    /// your cache holds base keys in any shape other than `HashSet<FileActionKey>`:
-    /// constructing a HashSet just to call [`into_summary_against_base_set`] would cost
-    /// `O(|base|)` hashing + allocation, exceeding the work this method does.
+    /// Streaming form: accepts borrowed keys from any source (`&HashSet`, `&Vec`, `&[…]`,
+    /// `map.keys()`, custom iterator). Kernel streams `base_keys` once and probes the
+    /// live-Add set per element. Work is `O(|base|)` with no call-site clones. Use this
+    /// when your cache holds keys in a streamable shape and you don't have a faster
+    /// `contains` lookup.
     ///
-    /// Prefer [`into_summary_against_base_set`] only when your cache *already* holds a
-    /// `HashSet<FileActionKey>` you keep across diffs. That form uses `.intersection()` to
-    /// iterate the (typically much smaller) live-Add set instead of the whole base, so
-    /// the work drops from `O(|base|)` to `O(|live_adds|)`.
-    ///
-    /// # Errors
-    /// Inherits all errors from [`into_summary`]. Two categories:
-    /// - Stream previously yielded `Some(Err(_))` from [`Iterator::next`]: dedup state is
-    ///   incomplete, so this call returns `Err` rather than a partial summary. Not recoverable on
-    ///   this stream — the consumer must rebuild the stream from [`IncrementalScanBuilder`] to
-    ///   retry.
-    /// - Draining the remaining batches produces an `Err` (engine I/O, JSON parse, etc.). The
-    ///   underlying engine error determines retryability; typically retryable by rebuilding the
-    ///   stream.
+    /// Prefer [`into_summary_against_base_with`] when your cache supports
+    /// `contains`-style lookup (HashMap, HashSet, BTreeMap, custom index). That form
+    /// iterates the (typically much smaller) live-Add set and probes your base via the
+    /// supplied closure, dropping work from `O(|base|)` to `O(|live_adds|)`.
     ///
     /// [`into_summary`]: Self::into_summary
-    /// [`into_summary_against_base_set`]: Self::into_summary_against_base_set
-    pub fn into_summary_against_base(
+    /// [`into_summary_against_base_with`]: Self::into_summary_against_base_with
+    pub fn into_summary_against_base<'a>(
         self,
-        base_keys: impl IntoIterator<Item = FileActionKey>,
+        base_keys: impl IntoIterator<Item = &'a FileActionKey>,
     ) -> DeltaResult<IncrementalScanSummaryAgainstBase> {
         let summary = self.into_summary()?;
         let duplicate_adds: HashSet<FileActionKey> = base_keys
             .into_iter()
-            .filter(|k| summary.live_adds.contains(k))
+            .filter(|k| summary.live_adds.contains(*k))
+            .cloned()
             .collect();
         Ok(IncrementalScanSummaryAgainstBase {
             base_version: summary.base_version,
@@ -289,22 +279,28 @@ impl IncrementalScanStream {
         })
     }
 
-    /// HashSet form of [`into_summary_against_base`]: pass a borrowed `&HashSet` directly
-    /// when your cache already holds one and you keep it across diffs. Iterates the
-    /// live-Add set (typically smaller than `base_keys`) and clones only the intersection
-    /// — strictly fewer clones than the streaming form's call-site `iter().cloned()`.
+    /// Predicate form of [`into_summary_against_base`]: pass a closure that answers
+    /// "is this key in your base?" Iterates the live-Add set (typically much smaller than
+    /// the base) and calls `base_contains` once per live-Add key.
     ///
-    /// # Errors
-    /// See [`into_summary_against_base`].
+    /// Works with any base shape that supports membership lookup:
+    /// - `HashMap<FileActionKey, _>` -> `|k| map.contains_key(k)`
+    /// - `HashSet<FileActionKey>` -> `|k| set.contains(k)`
+    /// - `BTreeMap<FileActionKey, _>` -> `|k| map.contains_key(k)`
+    /// - Sorted `Vec<FileActionKey>` -> `|k| vec.binary_search(k).is_ok()`
     ///
     /// [`into_summary_against_base`]: Self::into_summary_against_base
-    pub fn into_summary_against_base_set(
+    pub fn into_summary_against_base_with(
         self,
-        base_keys: &HashSet<FileActionKey>,
+        base_contains: impl Fn(&FileActionKey) -> bool,
     ) -> DeltaResult<IncrementalScanSummaryAgainstBase> {
         let summary = self.into_summary()?;
-        let duplicate_adds: HashSet<FileActionKey> =
-            summary.live_adds.intersection(base_keys).cloned().collect();
+        let duplicate_adds: HashSet<FileActionKey> = summary
+            .live_adds
+            .iter()
+            .filter(|k| base_contains(k))
+            .cloned()
+            .collect();
         Ok(IncrementalScanSummaryAgainstBase {
             base_version: summary.base_version,
             target_version: summary.target_version,
@@ -317,18 +313,15 @@ impl IncrementalScanStream {
     /// [`into_summary_against_base`] against `base_keys`. Returns an
     /// [`IncrementalListingAgainstBase`] with the classified summary.
     ///
-    /// Prefer [`into_listing_against_base_set`] when your cache already holds a
-    /// `HashSet<FileActionKey>` — see [`into_summary_against_base_set`] for the rationale.
-    ///
-    /// # Errors
-    /// See [`into_summary_against_base`].
+    /// Prefer [`into_listing_against_base_with`] when your base supports `contains`-style
+    /// lookup — see [`into_summary_against_base_with`] for the rationale.
     ///
     /// [`into_summary_against_base`]: Self::into_summary_against_base
-    /// [`into_summary_against_base_set`]: Self::into_summary_against_base_set
-    /// [`into_listing_against_base_set`]: Self::into_listing_against_base_set
-    pub fn into_listing_against_base(
+    /// [`into_summary_against_base_with`]: Self::into_summary_against_base_with
+    /// [`into_listing_against_base_with`]: Self::into_listing_against_base_with
+    pub fn into_listing_against_base<'a>(
         mut self,
-        base_keys: impl IntoIterator<Item = FileActionKey>,
+        base_keys: impl IntoIterator<Item = &'a FileActionKey>,
     ) -> DeltaResult<IncrementalListingAgainstBase> {
         let mut add_files: Vec<FilteredEngineData> = Vec::new();
         for item in self.by_ref() {
@@ -338,24 +331,20 @@ impl IncrementalScanStream {
         Ok(IncrementalListingAgainstBase { summary, add_files })
     }
 
-    /// HashSet form of [`into_listing_against_base`]; see
-    /// [`into_summary_against_base_set`] for the rationale.
-    ///
-    /// # Errors
-    /// See [`into_summary_against_base`].
+    /// Predicate form of [`into_listing_against_base`]; see
+    /// [`into_summary_against_base_with`] for the rationale.
     ///
     /// [`into_listing_against_base`]: Self::into_listing_against_base
-    /// [`into_summary_against_base`]: Self::into_summary_against_base
-    /// [`into_summary_against_base_set`]: Self::into_summary_against_base_set
-    pub fn into_listing_against_base_set(
+    /// [`into_summary_against_base_with`]: Self::into_summary_against_base_with
+    pub fn into_listing_against_base_with(
         mut self,
-        base_keys: &HashSet<FileActionKey>,
+        base_contains: impl Fn(&FileActionKey) -> bool,
     ) -> DeltaResult<IncrementalListingAgainstBase> {
         let mut add_files: Vec<FilteredEngineData> = Vec::new();
         for item in self.by_ref() {
             add_files.push(item?);
         }
-        let summary = self.into_summary_against_base_set(base_keys)?;
+        let summary = self.into_summary_against_base_with(base_contains)?;
         Ok(IncrementalListingAgainstBase { summary, add_files })
     }
 }
