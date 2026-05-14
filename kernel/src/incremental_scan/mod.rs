@@ -203,8 +203,13 @@ impl IncrementalScanStream {
     /// data structure they prefer.
     ///
     /// # Errors
-    /// Returns `Err` if the stream previously yielded an error (dedup state is incomplete),
-    /// or if draining produces an error.
+    /// - [`Error::IOError`] / [`Error::ObjectStore`] / [`Error::Reqwest`] -- transient I/O on
+    ///   commit reads; retryable by rebuilding the stream.
+    /// - [`Error::FileNotFound`] -- commit vacuumed mid-scan; rebuilding will likely return
+    ///   `Ok(None)` (commits unavailable), fall back to [`crate::Snapshot::scan_builder`].
+    /// - [`Error::MalformedJson`] -- commit corruption; not retryable.
+    /// - [`Error::Generic`] "cannot finish a stream that previously errored" -- terminal called on
+    ///   a stream whose `next()` already returned `Err`; rebuild to retry.
     pub fn into_summary(mut self) -> DeltaResult<IncrementalScanSummary> {
         if self.errored {
             return Err(Error::generic(
@@ -233,6 +238,9 @@ impl IncrementalScanStream {
     /// batch-size limits). One yielded batch produces at most one `Vec` entry, and a
     /// commit whose Adds were all cancelled by later Removes produces no entry at all.
     ///
+    /// # Errors
+    /// See [`into_summary`].
+    ///
     /// [`into_summary`]: Self::into_summary
     /// [`ActionsBatch`]: crate::log_replay::ActionsBatch
     pub fn into_listing(mut self) -> DeltaResult<IncrementalListing> {
@@ -258,6 +266,9 @@ impl IncrementalScanStream {
     /// `contains`-style lookup (HashMap, HashSet, BTreeMap, custom index). That form
     /// iterates the (typically much smaller) live-Add set and probes your base via the
     /// supplied closure, dropping work from `O(|base|)` to `O(|live_adds|)`.
+    ///
+    /// # Errors
+    /// See [`into_summary`].
     ///
     /// [`into_summary`]: Self::into_summary
     /// [`into_summary_against_base_with`]: Self::into_summary_against_base_with
@@ -289,6 +300,10 @@ impl IncrementalScanStream {
     /// - `BTreeMap<FileActionKey, _>` -> `|k| map.contains_key(k)`
     /// - Sorted `Vec<FileActionKey>` -> `|k| vec.binary_search(k).is_ok()`
     ///
+    /// # Errors
+    /// See [`into_summary`].
+    ///
+    /// [`into_summary`]: Self::into_summary
     /// [`into_summary_against_base`]: Self::into_summary_against_base
     pub fn into_summary_against_base_with(
         self,
@@ -316,6 +331,10 @@ impl IncrementalScanStream {
     /// Prefer [`into_listing_against_base_with`] when your base supports `contains`-style
     /// lookup — see [`into_summary_against_base_with`] for the rationale.
     ///
+    /// # Errors
+    /// See [`into_summary`].
+    ///
+    /// [`into_summary`]: Self::into_summary
     /// [`into_summary_against_base`]: Self::into_summary_against_base
     /// [`into_summary_against_base_with`]: Self::into_summary_against_base_with
     /// [`into_listing_against_base_with`]: Self::into_listing_against_base_with
@@ -334,6 +353,10 @@ impl IncrementalScanStream {
     /// Predicate form of [`into_listing_against_base`]; see
     /// [`into_summary_against_base_with`] for the rationale.
     ///
+    /// # Errors
+    /// See [`into_summary`].
+    ///
+    /// [`into_summary`]: Self::into_summary
     /// [`into_listing_against_base`]: Self::into_listing_against_base
     /// [`into_summary_against_base_with`]: Self::into_summary_against_base_with
     pub fn into_listing_against_base_with(
