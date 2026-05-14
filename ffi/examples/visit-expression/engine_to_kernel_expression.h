@@ -12,6 +12,24 @@
  * functions from KernelExpressionVisitorState.
  */
 
+// Capture buffer for visit_kernel_opaque_predicate_op_name. The kernel's name slice is
+// only valid for the duration of the callback, so we copy it into a stack-owned buffer.
+typedef struct {
+  char* buf;
+  size_t cap;
+  size_t len;
+} OpNameCapture;
+
+static inline void capture_op_name(void* data, KernelStringSlice name) {
+  OpNameCapture* cap = (OpNameCapture*)data;
+  assert(cap->cap > 0);
+  size_t max_copy = cap->cap - 1;
+  size_t copy_len = name.len < max_copy ? name.len : max_copy;
+  memcpy(cap->buf, name.ptr, copy_len);
+  cap->buf[copy_len] = '\0';
+  cap->len = copy_len;
+}
+
 // Forward declarations
 uintptr_t convert_engine_to_kernel_expression_item(
     KernelExpressionVisitorState* state,
@@ -249,10 +267,43 @@ uintptr_t convert_engine_to_kernel_expression_item(
           state, m2s->child_expr.list[0]);
       return visit_expression_map_to_struct(state, child);
     }
+    case OpaquePredicate: {
+      // Round-trip an engine-defined opaque predicate (e.g. STARTS_WITH) by reading the
+      // op name back from the kernel-side handle and re-issuing it through
+      // visit_predicate_opaque. The reconstructed kernel predicate uses
+      // NamedOpaquePredicateOp under the hood; round-trip equality holds when the
+      // original predicate was also built with NamedOpaquePredicateOp (see
+      // get_opaque_kernel_predicate in test_ffi.rs).
+      struct OpaquePredicate* opaque = (struct OpaquePredicate*)item.ref;
+      char name_buf[256];
+      OpNameCapture name_cap = { .buf = name_buf, .cap = sizeof(name_buf), .len = 0 };
+      visit_kernel_opaque_predicate_op_name(opaque->op, &name_cap, capture_op_name);
+      // Loud failure if the op name overflowed the buffer -- silent truncation would
+      // produce a structurally-mismatched round-trip with no diagnostic.
+      assert(name_cap.len + 1 < name_cap.cap);
+      KernelStringSlice name_slice = { .ptr = name_cap.buf, .len = name_cap.len };
+
+      EngineToKernelIteratorState iter_state = {
+          .list = &opaque->exprs,
+          .current_index = 0,
+          .state = state
+      };
+      EngineIterator iterator = {
+          .data = &iter_state,
+          .get_next = convert_engine_to_kernel_next_fn
+      };
+      ExternResultusize result = visit_predicate_opaque(
+          state, name_slice, &iterator, allocate_error);
+      if (result.tag == Errusize) {
+        print_error("visit_predicate_opaque failed", (Error*)result.err);
+        free_error((Error*)result.err);
+        abort();
+      }
+      return result.ok;
+    }
     case Transform:
     case FieldTransform:
     case OpaqueExpression:
-    case OpaquePredicate:
       fprintf(stderr,
           "Warning: Complex expression type not yet supported "
           "for reconstruction\n");

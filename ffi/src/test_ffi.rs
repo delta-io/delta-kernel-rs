@@ -16,7 +16,7 @@ use delta_kernel::kernel_predicates::{
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
 use delta_kernel::DeltaResult;
 
-use crate::expressions::{SharedExpression, SharedPredicate};
+use crate::expressions::{NamedOpaquePredicateOp, SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 
 #[derive(Debug, PartialEq)]
@@ -309,6 +309,23 @@ pub unsafe extern "C" fn get_simple_testing_kernel_predicate() -> Handle<SharedP
         ]),
     ];
     Arc::new(Pred::and_from(sub_preds)).into()
+}
+
+/// Constructs a kernel predicate built from `NamedOpaquePredicateOp("STARTS_WITH")` over
+/// a column reference and a string literal. Engines that route engine-defined ops through
+/// `visit_predicate_opaque` produce predicates of this exact shape, so this helper enables
+/// the example to round-trip an opaque predicate without depending on `OpaqueTestOp` (which
+/// is a different op type and would not survive the round-trip even with matching name).
+///
+/// # Safety
+/// The caller is responsible for freeing the returned memory.
+#[no_mangle]
+pub unsafe extern "C" fn get_opaque_kernel_predicate() -> Handle<SharedPredicate> {
+    Arc::new(Pred::opaque(
+        NamedOpaquePredicateOp::new("STARTS_WITH"),
+        vec![column_expr!("name"), Expr::literal("test")],
+    ))
+    .into()
 }
 
 /// Compare two kernel expressions for equality. Returns true if they are

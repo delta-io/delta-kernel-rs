@@ -221,3 +221,51 @@ And
 
 === Predicate Round-trip Test ===
 SUCCESS: Round-trip predicate matches original!
+
+=== Opaque Predicate Round-trip Test ===
+This test validates the engine-defined opaque-predicate path. The kernel
+predicate STARTS_WITH(col("name"), "test") -- backed by
+NamedOpaquePredicateOp -- is walked back into the engine AST and
+reconstructed via visit_predicate_opaque, exercising the builder added for
+engines that route ops the kernel does not evaluate (STARTS_WITH, LIKE, ...).
+
+StructExpression
+  Column(simple_col)
+  Integer(42)
+  Long(100)
+  Double(2.500000)
+  Boolean(1)
+  Boolean(0)
+  String(test string)
+  Date(19000)
+  Timestamp(1234567890)
+  TimestampNtz(9876543210)
+  Null(Integer)
+  Null(Decimal(10,5))
+  Add
+    Integer(10)
+    Integer(20)
+  Minus
+    Integer(50)
+    Integer(30)
+  Multiply
+    Integer(5)
+    Integer(6)
+  Divide
+    Integer(100)
+    Integer(4)
+  StructExpression
+    Integer(1)
+    Long(2)
+    Double(3.000000)
+  MapToStruct
+    Column(partitionValues)
+
+=== Expression Round-trip Test ===
+SUCCESS: Round-trip expression matches original!
+OpaquePredicate(STARTS_WITH)
+  Column(name)
+  String(test)
+
+=== Predicate Round-trip Test ===
+SUCCESS: Round-trip predicate matches original!
