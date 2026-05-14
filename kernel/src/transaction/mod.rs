@@ -864,6 +864,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
     fn shared_write_state(&self) -> &Arc<SharedWriteState> {
         self.shared_write_state.get_or_init(|| {
             let table_config = &self.effective_table_config;
+            let props = table_config.table_properties();
+            let randomize_file_prefixes = props.should_randomize_file_prefixes();
+            let random_prefix_length = props.random_prefix_length();
             Arc::new(SharedWriteState {
                 table_root: table_config.table_root().clone(),
                 logical_schema: table_config.logical_schema(),
@@ -872,6 +875,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 column_mapping_mode: table_config.column_mapping_mode(),
                 stats_columns: self.stats_columns(),
                 logical_partition_columns: table_config.partition_columns().to_vec(),
+                randomize_file_prefixes,
+                random_prefix_length,
             })
         })
     }
@@ -1552,7 +1557,6 @@ mod tests {
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{MapData, Scalar, StructData};
-    use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -2091,8 +2095,7 @@ mod tests {
             "id",
             DataType::INTEGER,
         )])?);
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(crate::engine::default::DefaultEngineBuilder::new(store).build());
+        let engine = Arc::new(crate::engine::sync::SyncEngine::new());
         let mut txn = create_table(
             tempdir.path().to_str().expect("valid temp path"),
             schema,
@@ -2530,7 +2533,7 @@ mod tests {
     fn disallow_catalog_committer_for_non_catalog_managed_table() {
         let storage = Arc::new(InMemory::new());
         let table_root = url::Url::parse("memory:///").unwrap();
-        let engine = crate::engine::default::DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = crate::engine::sync::SyncEngine::new_with_store(storage.clone());
 
         // Create a non-catalog-managed table (no catalogManaged feature)
         let actions = [
@@ -2562,7 +2565,7 @@ mod tests {
     #[test]
     fn disallow_catalog_committer_for_non_catalog_managed_create_table() {
         let storage = Arc::new(InMemory::new());
-        let engine = crate::engine::default::DefaultEngineBuilder::new(storage).build();
+        let engine = crate::engine::sync::SyncEngine::new_with_store(storage);
 
         // Create a non-catalog-managed table using a catalog committer
         let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![

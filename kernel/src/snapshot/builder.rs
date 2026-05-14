@@ -331,22 +331,17 @@ mod tests {
     use test_utils::{actions_to_string, add_commit, TestAction};
 
     use super::*;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+    use crate::engine::sync::SyncEngine;
     use crate::metrics::MetricEvent;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
-    fn setup_test() -> (
-        Arc<DefaultEngine<TokioBackgroundExecutor>>,
-        Arc<DynObjectStore>,
-        String,
-    ) {
+    fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
         let table_root = String::from("memory:///");
         let store = Arc::new(InMemory::new());
-        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+        let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
         (engine, store, table_root)
     }
 
@@ -638,11 +633,7 @@ mod tests {
 
         /// Creates an in-memory engine, store, and table root with an initial catalog-managed
         /// commit at version 0 (protocol + metadata).
-        async fn setup_catalog_managed_test() -> (
-            Arc<DefaultEngine<TokioBackgroundExecutor>>,
-            Arc<DynObjectStore>,
-            String,
-        ) {
+        async fn setup_catalog_managed_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
             let (engine, store, table_root) = setup_test();
             let actions = vec![TestAction::Metadata];
             add_commit(

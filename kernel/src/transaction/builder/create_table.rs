@@ -25,10 +25,10 @@ use crate::schema::{
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    assign_column_mapping_metadata, get_any_level_column_physical_name,
-    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
-    EnablementCheck, FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
-    SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    assign_column_mapping_metadata, find_max_column_id_in_schema,
+    get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
+    schema_contains_timestamp_ntz, ColumnMappingMode, EnablementCheck, FeatureType, TableFeature,
+    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT,
@@ -635,11 +635,16 @@ fn maybe_apply_column_mapping_for_table_create(
                 &mut validated.writer_features,
             );
 
-            // Transform schema: assign IDs and physical names to all fields. When
-            // IcebergCompatV3 is enabled, allocated nested ids for element/key/value in Array/Map
-            // as well.
+            // Transform schema: preserve any pre-populated `delta.columnMapping.id` /
+            // `delta.columnMapping.physicalName` annotations on input fields, fill in any
+            // missing piece of that pair, and assign fresh metadata to bare fields (matches
+            // delta-spark's `DeltaColumnMapping.assignColumnIdAndPhysicalName`). Seed
+            // `max_id` from the schema's existing max so newly assigned IDs cannot collide
+            // with preserved ones. When IcebergCompatV3 is enabled, also allocate nested ids
+            // for `Array.element` and `Map.key`/`Map.value` and store them under
+            // `delta.columnMapping.nested.ids` on the nearest ancestor `StructField`.
             let assign_nested_field_ids = validated.is_property_true(ENABLE_ICEBERG_COMPAT_V3);
-            let mut max_id = 0i64;
+            let mut max_id = find_max_column_id_in_schema(schema).unwrap_or(0);
             let transformed_schema =
                 assign_column_mapping_metadata(schema, &mut max_id, assign_nested_field_ids)?;
 

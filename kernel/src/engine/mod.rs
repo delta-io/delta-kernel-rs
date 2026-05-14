@@ -57,6 +57,3 @@ pub mod parquet_row_group_skipping;
 
 #[cfg(test)]
 pub(crate) mod tests;
-
-#[cfg(test)]
-mod cross_engine_tests;

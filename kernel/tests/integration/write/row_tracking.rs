@@ -15,7 +15,10 @@ use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-use test_utils::{create_table, engine_store_setup, test_table_setup_mt};
+use test_utils::{
+    begin_transaction, create_table, engine_store_setup, load_and_begin_transaction,
+    test_table_setup_mt,
+};
 use url::Url;
 
 /// Validates that kernel rejects remove actions on row-tracking tables.
@@ -46,9 +49,7 @@ async fn test_row_tracking_blocks_remove_files() -> Result<(), Box<dyn std::erro
     .await?;
 
     // ===== FIRST COMMIT: Add files with row tracking =====
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?
         .with_engine_info("row tracking test")
         .with_data_change(true);
 
@@ -114,9 +115,7 @@ async fn test_row_tracking_blocks_remove_files() -> Result<(), Box<dyn std::erro
 
     // ===== SECOND COMMIT: Remove the file =====
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine_arc.as_ref())?;
-    let mut txn2 = snapshot2
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine_arc.as_ref())?
+    let mut txn2 = begin_transaction(snapshot2.clone(), engine_arc.as_ref())?
         .with_engine_info("row tracking remove test")
         .with_data_change(true);
 

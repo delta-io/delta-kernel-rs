@@ -145,16 +145,15 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+    use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
 
     fn table_root() -> url::Url {
         url::Url::parse("memory:///").unwrap()
     }
 
-    fn test_engine() -> DefaultEngine<TokioBackgroundExecutor> {
-        DefaultEngineBuilder::new(Arc::new(InMemory::new())).build()
+    fn test_engine() -> SyncEngine {
+        SyncEngine::new_with_store(Arc::new(InMemory::new()))
     }
 
     // ===== CrcLoadResult Tests =====
@@ -164,8 +163,6 @@ mod tests {
         let crc = Crc {
             table_size_bytes: 100,
             num_files: 10,
-            num_metadata: 1,
-            num_protocol: 1,
             ..Default::default()
         };
         let loaded = CrcLoadResult::Loaded(Arc::new(crc));
@@ -252,8 +249,6 @@ mod tests {
         Crc {
             table_size_bytes,
             num_files: 1,
-            num_metadata: 1,
-            num_protocol: 1,
             ..Default::default()
         }
     }

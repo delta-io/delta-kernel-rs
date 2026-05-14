@@ -39,7 +39,7 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.22.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.22.1" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
@@ -68,7 +68,7 @@ reqwest = { version = "0.13", default-features = false, optional = true, feature
 tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
 # both arrow versions below are optional and require object_store
 object_store_12 = { package = "object_store", version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
-object_store_13 = { package = "object_store", version = "0.13.1", optional = true, features = ["aws", "azure", "gcp", "http"] }
+object_store_13 = { package = "object_store", version = "0.13.2", optional = true, features = ["aws", "azure", "gcp", "http"] }
 
 # arrow 57
 [dependencies.arrow_57]
@@ -169,3 +169,8 @@ harness = false
 [[test]]
 name = "integration"
 path = "tests/integration/main.rs"
+
+# Declare as an example for access to test_utils
+[[example]]
+name = "metrics-tester"
+path = "tests/integration/metrics_main.rs"

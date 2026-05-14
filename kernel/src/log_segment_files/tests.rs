@@ -5,12 +5,11 @@ use rstest::rstest;
 use url::Url;
 
 use super::*;
-use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-use crate::engine::default::filesystem::ObjectStoreStorageHandler;
+use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
-use crate::FileMeta;
+use crate::{Engine as _, FileMeta};
 
 // size markers used to identify commit sources in tests
 const FILESYSTEM_SIZE_MARKER: u64 = 10;
@@ -54,7 +53,7 @@ fn log_path_for_file_type(version: Version, file_type: &LogPathFileType) -> Stri
 
 async fn create_storage(
     log_files: Vec<(Version, LogPathFileType, CommitSource)>,
-) -> (Box<dyn StorageHandler>, Url) {
+) -> (Arc<dyn StorageHandler>, Url) {
     let store = Arc::new(InMemory::new());
     let log_root = Url::parse("memory:///_delta_log/").unwrap();
 
@@ -70,9 +69,8 @@ async fn create_storage(
             .expect("Failed to put test file");
     }
 
-    let executor = Arc::new(TokioBackgroundExecutor::new());
-    let storage = Box::new(ObjectStoreStorageHandler::new(store, executor));
-    (storage, log_root)
+    let engine = SyncEngine::new_with_store(store);
+    (engine.storage_handler(), log_root)
 }
 
 // helper to create a ParsedLogPath with specific source marker
@@ -122,12 +120,12 @@ fn assert_source(commit: &ParsedLogPath, expected_source: CommitSource) {
 /// Used to verify that `list_with_backward_checkpoint_scan` issues the expected
 /// number of storage listing requests.
 struct CountingStorageHandler {
-    inner: Box<dyn StorageHandler>,
+    inner: Arc<dyn StorageHandler>,
     list_from_count: AtomicU32,
 }
 
 impl CountingStorageHandler {
-    fn new(inner: Box<dyn StorageHandler>) -> Self {
+    fn new(inner: Arc<dyn StorageHandler>) -> Self {
         Self {
             inner,
             list_from_count: AtomicU32::new(0),
@@ -861,7 +859,7 @@ async fn backward_scan_log_tail_defines_latest_version() {
 /// (version, file_type, is_empty). Non-empty files get placeholder content.
 async fn create_storage_with_empty_files(
     log_files: Vec<(Version, LogPathFileType, bool)>,
-) -> (Box<dyn StorageHandler>, Url) {
+) -> (Arc<dyn StorageHandler>, Url) {
     let store = Arc::new(InMemory::new());
     let log_root = Url::parse("memory:///_delta_log/").unwrap();
 
@@ -878,9 +876,8 @@ async fn create_storage_with_empty_files(
             .expect("Failed to put test file");
     }
 
-    let executor = Arc::new(TokioBackgroundExecutor::new());
-    let storage = Box::new(ObjectStoreStorageHandler::new(store, executor));
-    (storage, log_root)
+    let engine = SyncEngine::new_with_store(store);
+    (engine.storage_handler(), log_root)
 }
 
 // v2.json is 0 bytes -> kept in listing (commits are source of truth, not skipped)

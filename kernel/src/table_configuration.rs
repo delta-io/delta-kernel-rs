@@ -74,17 +74,24 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
 ///
 /// - `full`: physical representations of all columns from [`TableConfiguration::logical_schema`].
 /// - `without_partition`: lazily computed variant that excludes partition columns.
+///
+/// Note:
+/// `without_partition` is wrapped in an `Arc` so that the lazily-initialized schema is shared
+/// across clones of this struct (and therefore across clones of [`TableConfiguration`]).  Without
+/// Arc'ing the lock, clones of a [`TableConfiguration`] with an uninitialized schema would clone
+/// the empty `OnceLock`, meaning later schema loads would unnecessarily store independent
+/// copies of the same schema.
 #[derive(Debug, Clone, Eq)]
 struct PhysicalSchemas {
     full: SchemaRef,
-    without_partition: OnceLock<SchemaRef>,
+    without_partition: Arc<OnceLock<SchemaRef>>,
 }
 
 impl PhysicalSchemas {
     fn new(full: SchemaRef) -> Self {
         Self {
             full,
-            without_partition: OnceLock::new(),
+            without_partition: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -2026,6 +2033,82 @@ mod test {
         assert!(
             inner.field("phys_part_b").is_none(),
             "Partition column b should be excluded"
+        );
+    }
+
+    /// Verifies that the lazily-computed physical-without-partition schema is shared across
+    /// clones of `TableConfiguration` (both direct clones and the no-P/M version-bump path in
+    /// `try_new_from`), while configurations built from independent or updated metadata each
+    /// get their own `Arc<OnceLock>` and therefore their own schema allocation. This guards
+    /// against the per-version memory amplification seen when callers retain many adjacent
+    /// versions of a wide table.
+    #[test]
+    fn test_physical_data_schema_without_partition_columns_is_shared_across_clones() {
+        let base = create_partitioned_table_config_with_column_mapping(
+            partitioned_schema_with_column_mapping(),
+            "name",
+            vec!["part_a".to_string(), "part_b".to_string()],
+            [],
+        );
+
+        let clone_direct = base.clone();
+        let clone_bumped = TableConfiguration::try_new_from(&base, None, None, 1).unwrap();
+
+        let schema_from_bumped = clone_bumped.physical_data_schema_without_partition_columns();
+
+        let schema_from_base = base.physical_data_schema_without_partition_columns();
+        let schema_from_direct = clone_direct.physical_data_schema_without_partition_columns();
+        assert!(
+            Arc::ptr_eq(&schema_from_bumped, &schema_from_base),
+            "version-bumped clone and base should share the cached SchemaRef"
+        );
+        assert!(
+            Arc::ptr_eq(&schema_from_bumped, &schema_from_direct),
+            "direct .clone() and base should share the cached SchemaRef"
+        );
+
+        // A separately constructed TableConfiguration with the same logical schema must NOT
+        // share storage -- each construction allocates its own Arc<OnceLock>.
+        let independent = create_partitioned_table_config_with_column_mapping(
+            partitioned_schema_with_column_mapping(),
+            "name",
+            vec!["part_a".to_string(), "part_b".to_string()],
+            [],
+        );
+        let schema_from_independent = independent.physical_data_schema_without_partition_columns();
+        assert_eq!(
+            schema_from_independent.as_ref(),
+            schema_from_base.as_ref(),
+            "independent config should produce an equal schema"
+        );
+        assert!(
+            !Arc::ptr_eq(&schema_from_independent, &schema_from_base),
+            "independent TableConfiguration must not share the cached SchemaRef"
+        );
+
+        // try_new_from that actually changes metadata (here: drop one partition column) must
+        // also build a fresh PhysicalSchemas. The new cached schema differs from the original.
+        let new_schema = partitioned_schema_with_column_mapping();
+        let new_metadata = Metadata::try_new(
+            None,
+            None,
+            new_schema,
+            vec!["part_a".to_string()],
+            0,
+            HashMap::from_iter([(COLUMN_MAPPING_MODE.to_string(), "name".to_string())]),
+        )
+        .unwrap();
+        let updated = TableConfiguration::try_new_from(&base, Some(new_metadata), None, 2).unwrap();
+        let schema_from_updated = updated.physical_data_schema_without_partition_columns();
+        assert!(
+            !Arc::ptr_eq(&schema_from_updated, &schema_from_base),
+            "updated metadata must allocate a fresh OnceLock cell"
+        );
+        assert_ne!(
+            schema_from_updated.as_ref(),
+            schema_from_base.as_ref(),
+            "updated metadata changes which columns are partition columns, so the schemas \
+             must differ"
         );
     }
 

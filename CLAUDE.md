@@ -9,7 +9,8 @@ internals. Kernel never does I/O directly -- it defines _what_ to do via its API
 
 Current capabilities: table reads with predicates, data skipping, deletion vectors, change
 data feed, checkpoints (V1 & V2), log compaction (disabled, #2337), blind append writes, table creation
-(including clustered tables), and catalog-managed table support.
+(including clustered tables), catalog-managed table support, and incremental scan over a
+version range (`incremental_scan`).
 
 ## Build & Test Commands
 
@@ -240,6 +241,14 @@ Keep this list updated when new protocol features are added to kernel.
   column names (defined by the protocol) are not subject to column mapping.
 - **Transforms:** Generic recursive schema and expression transform traits and helpers
   are in `kernel/src/transforms/`.
+- **Tracing layer callbacks must not emit tracing events directly:** Calling `warn!()` or
+  any tracing macro inside a `tracing_subscriber::Layer` callback (`on_event`, `on_record`,
+  `on_close`) while holding a span's `extensions_mut()` write lock will re-enter the layer
+  and deadlock on the same lock. In `on_new_span`, no extension lock is held during
+  `attrs.record()`, so direct `warn!()` is safe there. In `on_event` and `on_record`, store
+  warnings in a `pending_warnings: Vec<String>` field on the visitor, take them out after
+  the extensions block closes, and emit via `warn!()` only then. See
+  `kernel/src/metrics/reporter.rs` for the canonical pattern.
 
 ## Code Style / Documentation
 

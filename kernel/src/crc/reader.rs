@@ -8,8 +8,9 @@ use crate::{DeltaResult, Engine, Error};
 ///
 /// Reads raw bytes via the storage handler and deserializes with serde_json.
 ///
-/// Returns `Ok(Crc)` on success, `Err` on any failure (file not readable, corrupt JSON, missing
-/// required fields). The caller should handle errors gracefully by falling back to log replay.
+/// Returns `Ok(Crc)` on success, `Err` on any failure (file not readable, corrupt JSON,
+/// missing required fields). The caller should handle errors gracefully by falling back to log
+/// replay.
 pub(crate) fn try_read_crc_file(engine: &dyn Engine, crc_path: &ParsedLogPath) -> DeltaResult<Crc> {
     let storage = engine.storage_handler();
     let url = crc_path.location.as_url().clone();
@@ -51,8 +52,6 @@ mod tests {
         // Verify basic fields
         assert_eq!(crc.table_size_bytes, 5259);
         assert_eq!(crc.num_files, 10);
-        assert_eq!(crc.num_metadata, 1);
-        assert_eq!(crc.num_protocol, 1);
         assert_eq!(crc.in_commit_timestamp_opt, Some(1694758257000));
 
         // Verify protocol
@@ -133,7 +132,7 @@ mod tests {
         assert!(hist.file_counts[1..].iter().all(|&c| c == 0));
         assert!(hist.total_bytes[1..].iter().all(|&b| b == 0));
 
-        // Remaining skipped fields are still None (pending serde support on their types)
+        // These fields are on the Crc struct but not yet round-tripped through CrcRaw.
         assert!(crc.txn_id.is_none());
         assert!(crc.all_files.is_none());
         assert!(crc.num_deleted_records_opt.is_none());
