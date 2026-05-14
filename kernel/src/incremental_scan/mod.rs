@@ -203,13 +203,17 @@ impl IncrementalScanStream {
     /// data structure they prefer.
     ///
     /// # Errors
-    /// - [`Error::IOError`] / [`Error::ObjectStore`] / [`Error::Reqwest`] -- transient I/O on
-    ///   commit reads; retryable by rebuilding the stream.
-    /// - [`Error::FileNotFound`] -- commit vacuumed mid-scan; rebuilding will likely return
-    ///   `Ok(None)` (commits unavailable), fall back to [`crate::Snapshot::scan_builder`].
-    /// - [`Error::MalformedJson`] -- commit corruption; not retryable.
-    /// - [`Error::Generic`] "cannot finish a stream that previously errored" -- terminal called on
-    ///   a stream whose `next()` already returned `Err`; rebuild to retry.
+    /// - [`Error::IOError`], [`Error::ObjectStore`], or [`Error::Reqwest`] on transient I/O while
+    ///   reading commit JSONs. Retryable by rebuilding the stream.
+    /// - [`Error::FileNotFound`] if a commit was vacuumed between [`IncrementalScanBuilder::build`]
+    ///   and stream consumption. Rebuilding will likely return `Ok(None)` (commits unavailable);
+    ///   fall back to [`crate::Snapshot::scan_builder`].
+    /// - [`Error::MalformedJson`] or [`Error::Arrow`] (default-engine) on commit JSON corruption.
+    ///   Not retryable.
+    /// - [`Error::Generic`] on malformed `deletionVector` fields in a commit row, or on "cannot
+    ///   finish a stream that previously errored" when a terminal method is called after a prior
+    ///   `next()` returned `Err`. Rebuild to retry the latter; the former indicates table
+    ///   corruption.
     pub fn into_summary(mut self) -> DeltaResult<IncrementalScanSummary> {
         if self.errored {
             return Err(Error::generic(
