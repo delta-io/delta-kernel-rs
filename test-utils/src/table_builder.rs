@@ -65,7 +65,8 @@ use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
@@ -135,6 +136,8 @@ pub struct LogState {
     checkpoints_at: Vec<u64>,
     /// Format applied to every checkpoint in `checkpoints_at`.
     checkpoint_format: CheckpointFormat,
+    /// If `Some(n)`, log files at versions `< n` are deleted after the table is built.
+    cleanup_before: Option<u64>,
 }
 
 impl LogState {
@@ -145,6 +148,7 @@ impl LogState {
             latest_version: n,
             checkpoints_at: Vec::new(),
             checkpoint_format: CheckpointFormat::Default,
+            cleanup_before: None,
         }
     }
 
@@ -194,6 +198,14 @@ impl LogState {
         self
     }
 
+    /// Simulate log cleanup by deleting files at versions `< n`. Files at
+    /// `n..=latest_version` (including the JSON and checkpoint at `v=n`) survive.
+    /// Requires a checkpoint at `v=n` and `n` in `1..=latest_version`.
+    pub fn with_cleanup_commits_before(mut self, n: u64) -> Self {
+        self.cleanup_before = Some(n);
+        self
+    }
+
     /// Canonical log shapes for snapshot reader-path tests. Built against a
     /// 10-version table; each shape exercises a distinct read path.
     pub fn common() -> Vec<Self> {
@@ -208,6 +220,10 @@ impl LogState {
             Self::with_latest_version(N).with_checkpoint_at([N - 5]),
             // multi-checkpoint: newer supersedes older
             Self::with_latest_version(N).with_checkpoint_at([N - 5, N]),
+            // post-cleanup: log truncated at the mid-stream checkpoint
+            Self::with_latest_version(N)
+                .with_checkpoint_at([N - 5])
+                .with_cleanup_commits_before(N - 5),
         ]
     }
 
@@ -228,6 +244,40 @@ impl LogState {
     pub(crate) fn checkpoint_format(&self) -> &CheckpointFormat {
         &self.checkpoint_format
     }
+
+    /// Version below which commits and checkpoints have been cleaned up, if any.
+    pub(crate) fn cleanup_before(&self) -> Option<u64> {
+        self.cleanup_before
+    }
+}
+
+/// Extract the version from a versioned log file. Returns `None` for unversioned
+/// files like `_last_checkpoint`.
+fn log_file_version(location: &Path) -> Option<u64> {
+    let filename = location.filename()?;
+    let (prefix, _) = filename.split_once('.')?;
+    prefix.parse::<u64>().ok()
+}
+
+/// Up-front validation so panics surface on the caller's thread, not through
+/// `block_on_sync`'s worker-thread join boundary.
+fn validate_log_state(log_state: &LogState) {
+    if let Some(n) = log_state.cleanup_before() {
+        assert!(
+            n >= 1,
+            "with_cleanup_commits_before(n) requires n >= 1 (cleanup_before(0) is a no-op)",
+        );
+        assert!(
+            n <= log_state.latest_version(),
+            "with_cleanup_commits_before({n}) exceeds latest_version ({})",
+            log_state.latest_version(),
+        );
+        assert!(
+            log_state.checkpoints_at().contains(&n),
+            "with_cleanup_commits_before({n}) requires a checkpoint at v={n}; \
+             pair with `with_checkpoint_at([{n}, ...])`",
+        );
+    }
 }
 
 impl fmt::Display for LogState {
@@ -235,6 +285,9 @@ impl fmt::Display for LogState {
         write!(f, "v={}", self.latest_version)?;
         for v in &self.checkpoints_at {
             write!(f, "+checkpoint_at({v})")?;
+        }
+        if let Some(n) = self.cleanup_before {
+            write!(f, "+cleanup_before({n})")?;
         }
         match self.checkpoint_format {
             CheckpointFormat::V2WithSidecarsIfEnabled {
@@ -858,6 +911,7 @@ impl TestTableBuilder {
     /// Propagates I/O, create-table, commit, checkpoint, and CRC errors from the
     /// underlying write path.
     pub fn build(self) -> DeltaResult<TestTable> {
+        validate_log_state(&self.log_state);
         block_on_sync(|| self.build_async())
     }
 
@@ -937,6 +991,25 @@ impl TestTableBuilder {
             .unwrap_post_commit_snapshot();
             if checkpoints_at.contains(&v) {
                 snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
+            }
+        }
+
+        // Simulate log cleanup by deleting versioned log files at v < n. Unversioned
+        // files like `_last_checkpoint` are skipped.
+        if let Some(n) = self.log_state.cleanup_before() {
+            let log_dir = Path::from("_delta_log");
+            let resolved_log_dir = crate::resolve_table_path(table_root, &log_dir)?;
+            let listing = store
+                .list_with_delimiter(Some(&resolved_log_dir))
+                .await
+                .map_err(delta_kernel::Error::from)?;
+            for object in listing.objects {
+                if matches!(log_file_version(&object.location), Some(v) if v < n) {
+                    store
+                        .delete(&object.location)
+                        .await
+                        .map_err(delta_kernel::Error::from)?;
+                }
             }
         }
 
@@ -1665,6 +1738,71 @@ mod tests {
         LogState::with_latest_version(2).with_checkpoint_at([3]);
     }
 
+    #[test]
+    fn test_cleanup_commits_before_deletes_old_files_and_rebuilds() -> DeltaResult<()> {
+        // Checkpoints at v=1 (below cutoff), v=3 (at cutoff), v=5 (above cutoff)
+        // exercise both the deletion and preservation paths for checkpoint files.
+        let log_state = LogState::with_latest_version(5)
+            .with_checkpoint_at([1, 3, 5])
+            .with_cleanup_commits_before(3);
+        let table = TestTableBuilder::new()
+            .with_log_state(log_state.clone())
+            .build()?;
+        assert_log_state_files_on_disk(&table, &log_state)?;
+        let entries = list_log_dir_filenames(table.store())?;
+        for v in 0..3 {
+            let json = format!("{v:020}.json");
+            assert!(
+                !entries.iter().any(|name| name == &json),
+                "expected v={v} JSON to be cleaned up, found in {entries:?}",
+            );
+        }
+        for v in 3..=5 {
+            let json = format!("{v:020}.json");
+            assert!(
+                entries.iter().any(|name| name == &json),
+                "expected v={v} JSON to survive cleanup, missing from {entries:?}",
+            );
+        }
+        // Checkpoint files: v=1 deleted, v=3 and v=5 preserved.
+        let v1_prefix = format!("{:020}.checkpoint", 1u64);
+        assert!(
+            !entries.iter().any(|name| name.starts_with(&v1_prefix)),
+            "expected v=1 checkpoint to be cleaned up, found in {entries:?}",
+        );
+        for v in [3u64, 5] {
+            let prefix = format!("{v:020}.checkpoint");
+            assert!(
+                entries.iter().any(|name| name.starts_with(&prefix)),
+                "expected v={v} checkpoint to survive cleanup, missing from {entries:?}",
+            );
+        }
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 5);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::no_checkpoint(LogState::with_latest_version(5))]
+    #[case::checkpoint_at_early_version(
+        LogState::with_latest_version(5).with_checkpoint_at([2]),
+    )]
+    #[should_panic(expected = "requires a checkpoint at v=3")]
+    fn test_cleanup_commits_before_requires_checkpoint_at_n(#[case] base: LogState) {
+        let log_state = base.with_cleanup_commits_before(3);
+        let _ = TestTableBuilder::new().with_log_state(log_state).build();
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds latest_version")]
+    fn test_cleanup_commits_before_rejects_above_latest_version() {
+        let log_state = LogState::with_latest_version(2)
+            .with_checkpoint_at([2])
+            .with_cleanup_commits_before(3);
+        let _ = TestTableBuilder::new().with_log_state(log_state).build();
+    }
+
     #[rstest::rstest]
     #[case(LogState::with_latest_version(3).with_checkpoint_at([2]), 3)]
     #[case(LogState::with_latest_version(3).with_checkpoint_at([1]), 3)]
@@ -1674,21 +1812,33 @@ mod tests {
         assert_eq!(log_state.latest_version(), expected);
     }
 
-    /// Asserts that every checkpoint version in `log_state.checkpoints_at()`
-    /// produced an on-disk checkpoint file. Snapshot rebuilds can silently
-    /// succeed via JSON-replay fallback even when a checkpoint is missing, so
-    /// any LogState-driven test should call this to verify the fixture's
-    /// contract before asserting anything else.
+    /// Asserts the on-disk log directory matches `log_state`: declared checkpoints
+    /// survive iff their version is >= `cleanup_before`, and no versioned log file
+    /// remains below `cleanup_before`. Snapshot rebuilds can silently succeed via
+    /// JSON replay even when these files are wrong.
     fn assert_log_state_files_on_disk(table: &TestTable, log_state: &LogState) -> DeltaResult<()> {
         let entries = list_log_dir_filenames(table.store())?;
+        let cleanup = log_state.cleanup_before().unwrap_or(0);
         for &v in log_state.checkpoints_at() {
             let prefix = format!("{v:020}.checkpoint");
-            assert!(
-                entries
-                    .iter()
-                    .any(|name| name.starts_with(&prefix) && name.ends_with(".parquet")),
-                "no checkpoint file at v={v} for {log_state}: {entries:?}",
+            let surviving = v >= cleanup;
+            let found = entries
+                .iter()
+                .any(|name| name.starts_with(&prefix) && name.ends_with(".parquet"));
+            assert_eq!(
+                found,
+                surviving,
+                "checkpoint at v={v} should be {} for {log_state}: {entries:?}",
+                if surviving { "present" } else { "cleaned up" },
             );
+        }
+        for entry in &entries {
+            if let Some(v) = log_file_version(&Path::from(entry.as_str())) {
+                assert!(
+                    v >= cleanup,
+                    "expected v={v} ({entry}) to be cleaned up (cleanup_before={cleanup}): {entries:?}",
+                );
+            }
         }
         Ok(())
     }
