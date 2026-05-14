@@ -244,13 +244,12 @@ impl IncrementalScanStream {
         Ok(IncrementalListing { summary, add_files })
     }
 
-    /// Drain any unread batches, then intersect `base_keys` against the surviving-Add
-    /// file-key set to compute `duplicate_adds` (file keys in the consumer's base
-    /// listing that the range re-adds with new metadata, e.g. OPTIMIZE / liquid
-    /// clustering re-tag).
+    /// Drain any unread batches, then intersect `base_keys` against the live-Add file-key
+    /// set to compute `duplicate_adds` (file keys in the consumer's base listing that the
+    /// range re-adds with new metadata, e.g. OPTIMIZE / liquid clustering re-tag).
     ///
     /// Sugar over [`into_summary`] plus a single pass over `base_keys`. The iterator is
-    /// consumed exactly once; memory stays `O(surviving_adds)`.
+    /// consumed exactly once; memory stays `O(live_adds)`.
     ///
     /// [`into_summary`]: Self::into_summary
     pub fn into_summary_against_base(
@@ -260,7 +259,7 @@ impl IncrementalScanStream {
         let summary = self.into_summary()?;
         let duplicate_adds: HashSet<FileActionKey> = base_keys
             .into_iter()
-            .filter(|k| summary.surviving_adds.contains(k))
+            .filter(|k| summary.live_adds.contains(k))
             .collect();
         Ok(IncrementalScanSummaryAgainstBase {
             base_version: summary.base_version,
@@ -270,7 +269,7 @@ impl IncrementalScanStream {
         })
     }
 
-    /// Eager classified helper: collect every surviving Add batch and call
+    /// Eager classified helper: collect every live Add batch and call
     /// [`into_summary_against_base`] against `base_keys`. Returns an
     /// [`IncrementalListingAgainstBase`] with the classified summary.
     ///
@@ -358,11 +357,11 @@ pub struct IncrementalScanSummaryAgainstBase {
     pub base_version: Version,
     /// Inclusive upper bound; equals the source snapshot's version.
     pub target_version: Version,
-    /// File keys from the surviving Add stream that also appear in the consumer's base
+    /// File keys from the live Add stream that also appear in the consumer's base
     /// listing (metadata-only re-adds, e.g. OPTIMIZE / liquid clustering re-tag).
     /// The corresponding rows are still in the streamed Adds.
     pub duplicate_adds: HashSet<FileActionKey>,
-    /// File keys of surviving Remove actions. Consumers must union this with
+    /// File keys of Remove actions in the range. Consumers must union this with
     /// `duplicate_adds` when masking the base.
     pub removes: HashSet<FileActionKey>,
 }
@@ -373,7 +372,7 @@ pub struct IncrementalScanSummaryAgainstBase {
 pub struct IncrementalListingAgainstBase {
     /// Classified file-key sets for the range; see [`IncrementalScanSummaryAgainstBase`].
     pub summary: IncrementalScanSummaryAgainstBase,
-    /// All surviving Add batches in descending commit-version order.
+    /// All live Add batches in descending commit-version order.
     pub add_files: Vec<FilteredEngineData>,
 }
 

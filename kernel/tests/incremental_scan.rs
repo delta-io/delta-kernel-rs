@@ -916,7 +916,7 @@ async fn single_commit_split_across_batches_dedups_correctly(
 // === Classification ===
 //
 // `into_summary_against_base(base_keys)` and `into_listing_against_base(base_keys)`
-// intersect the consumer's base file keys (`(path, dv_unique_id)`) against the surviving
+// intersect the consumer's base file keys (`(path, dv_unique_id)`) against the live
 // Adds to surface metadata-only re-adds in `duplicate_adds`. The Add row itself stays in
 // the streamed Adds; the key is also surfaced separately so the consumer can mask the
 // stale base entry.
@@ -956,7 +956,7 @@ fn classified_add_count(listing: &IncrementalListingAgainstBase) -> usize {
 async fn classifies_metadata_only_re_adds(
     #[case] range_adds: Vec<&'static str>,
     #[case] base_paths: Vec<&'static str>,
-    #[case] expected_surviving: usize,
+    #[case] expected_live: usize,
     #[case] expected_duplicates: Vec<&'static str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
@@ -983,7 +983,7 @@ async fn classifies_metadata_only_re_adds(
         base_paths.iter().map(|p| key(p)),
     );
 
-    assert_eq!(classified_add_count(&listing), expected_surviving);
+    assert_eq!(classified_add_count(&listing), expected_live);
     let expected: HashSet<FileActionKey> = expected_duplicates.iter().map(|p| key(p)).collect();
     assert_eq!(listing.summary.duplicate_adds, expected);
     assert!(listing.summary.removes.is_empty());
