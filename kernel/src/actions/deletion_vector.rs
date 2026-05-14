@@ -200,12 +200,27 @@ impl DeletionVectorDescriptor {
                 offset.is_none(),
                 Error::deletion_vector("inline deletion vectors must not carry an offset")
             ),
-            DeletionVectorStorageType::PersistedRelative => require!(
-                path_or_inline_dv.len() >= 20,
-                Error::deletion_vector(
-                    "persisted-relative DV path must be at least 20 chars (z85-encoded UUID)"
-                )
-            ),
+            DeletionVectorStorageType::PersistedRelative => {
+                let path_len = path_or_inline_dv.len();
+                require!(
+                    path_len >= 20,
+                    Error::deletion_vector(format!(
+                        "persisted-relative DV path must be at least 20 chars, got {path_len}"
+                    ))
+                );
+                let suffix = &path_or_inline_dv[path_len - 20..];
+                let decoded = z85::decode(suffix).map_err(|_| {
+                    Error::deletion_vector(
+                        "persisted-relative DV path must end with a z85-encoded UUID",
+                    )
+                })?;
+                require!(
+                    decoded.len() == 16,
+                    Error::deletion_vector(
+                        "persisted-relative DV z85 suffix must decode to a 16-byte UUID"
+                    )
+                );
+            }
             DeletionVectorStorageType::PersistedAbsolute => {
                 Url::parse(&path_or_inline_dv).map_err(|e| {
                     Error::deletion_vector(format!(
@@ -886,6 +901,15 @@ mod tests {
         4,
         1,
         "20 chars"
+    )]
+    #[case::persisted_relative_invalid_z85(
+        DeletionVectorStorageType::PersistedRelative,
+        // 20 chars but `_` is outside the z85 alphabet, so z85::decode fails.
+        "____________________",
+        Some(1),
+        4,
+        1,
+        "z85"
     )]
     #[case::persisted_absolute_non_url(
         DeletionVectorStorageType::PersistedAbsolute,

@@ -199,9 +199,8 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
     // descriptor must remain valid so the caller can free it (otherwise we get a UAF
     // when they retry or clean up).
     let path_result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
-    // Return value is a meaningless placeholder; cbindgen drops `ExternResult<()>` to a
-    // bare `ExternResult` with no tag/payload, which is unusable from C. `bool` is the
-    // existing convention for void-like fallible FFI functions (e.g. `visit_domain_metadata`).
+    // Returns `bool` instead of `()`: cbindgen erases `ExternResult<()>` to a tag/payload-
+    // less type that C can't use. Same convention as `visit_domain_metadata`.
     dv_descriptor_map_insert_impl(map_ref, path_result, descriptor)
         .map(|_| true)
         .into_extern_result(&engine_ref)
@@ -258,7 +257,7 @@ pub unsafe extern "C" fn transaction_update_deletion_vectors(
     let dv_map = unsafe { dv_map.into_inner() };
     let scan_iter_ref = unsafe { scan_iter.as_ref() };
     let engine_ref = unsafe { engine.as_ref() };
-    // See `dv_descriptor_map_insert` for why this returns `bool` instead of `()`.
+    // See `dv_descriptor_map_insert` for the `bool` return convention.
     transaction_update_deletion_vectors_impl(txn_ref, *dv_map, scan_iter_ref)
         .map(|_| true)
         .into_extern_result(&engine_ref)
@@ -311,9 +310,6 @@ mod tests {
 
     #[test]
     fn dv_descriptor_new_round_trips_fields() {
-        // Smoke test that the FFI wrapper forwards fields to the kernel constructor
-        // without dropping or reordering anything. Validation cases live with
-        // `DeletionVectorDescriptor::try_new` in the kernel.
         let handle = dv_descriptor_new_impl(
             KernelDvStorageType::PersistedAbsolute,
             Ok("file:///tmp/dv.bin"),
@@ -337,8 +333,6 @@ mod tests {
 
     #[test]
     fn dv_descriptor_new_surfaces_kernel_validation_error() {
-        // Verify the FFI wrapper propagates errors raised by
-        // `DeletionVectorDescriptor::try_new` instead of producing a handle.
         let err = dv_descriptor_new_impl(KernelDvStorageType::Inline, Ok("ABC"), true, 0, 4, 1)
             .err()
             .expect("expected validation error");
