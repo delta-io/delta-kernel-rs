@@ -279,6 +279,18 @@ impl LogState {
             Self::with_latest_version(N)
                 .with_checkpoint_at([N - 5, N])
                 .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
+            // post-cleanup + missing hint: pruned log with no hint, reader lists
+            // forward to find the surviving checkpoint
+            Self::with_latest_version(N)
+                .with_checkpoint_at([N - 5])
+                .with_cleanup_commits_before(N - 5)
+                .with_last_checkpoint_hint(LastCheckpointHintState::Missing),
+            // post-cleanup + stale hint: pruned log where the hint points at the
+            // lowest surviving checkpoint; reader lists forward to discover latest
+            Self::with_latest_version(N)
+                .with_checkpoint_at([N - 5, N])
+                .with_cleanup_commits_before(N - 5)
+                .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
         ]
     }
 
@@ -1729,6 +1741,18 @@ mod tests {
     #[case::hint_stale_two_checkpoints(
         LogState::with_latest_version(2)
             .with_checkpoint_at([1, 2])
+            .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
+    )]
+    #[case::cleanup_with_hint_missing(
+        LogState::with_latest_version(2)
+            .with_checkpoint_at([1])
+            .with_cleanup_commits_before(1)
+            .with_last_checkpoint_hint(LastCheckpointHintState::Missing),
+    )]
+    #[case::cleanup_with_hint_stale(
+        LogState::with_latest_version(2)
+            .with_checkpoint_at([1, 2])
+            .with_cleanup_commits_before(1)
             .with_last_checkpoint_hint(LastCheckpointHintState::Stale),
     )]
     fn test_log_state_checkpoint_shapes_land_on_disk(
