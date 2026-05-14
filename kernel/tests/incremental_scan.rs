@@ -57,8 +57,8 @@ fn surviving_add_count(listing: &IncrementalListing) -> usize {
 fn unwrap_listing(result: Option<IncrementalScanStream>) -> IncrementalListing {
     result
         .expect("expected Some(stream), got None (commits unavailable)")
-        .collect_listing()
-        .expect("collect_listing succeeded")
+        .into_listing()
+        .expect("into_listing succeeded")
 }
 
 // Cancellation: walking newest-first with `(path, dv_unique_id)` first-seen-wins,
@@ -439,11 +439,11 @@ async fn missing_commit_file_surfaces_error_during_iteration(
     );
 
     let finish_err = stream
-        .finish()
-        .expect_err("finish should error on a previously-errored stream");
+        .into_summary()
+        .expect_err("into_summary should error on a previously-errored stream");
     assert!(
         finish_err.to_string().contains("previously errored"),
-        "unexpected finish error: {finish_err}"
+        "unexpected into_summary error: {finish_err}"
     );
 
     Ok(())
@@ -565,11 +565,11 @@ async fn compaction_file_in_range_is_ignored() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-// `finish` returns the surviving Add and Remove file-key sets directly (without going
+// `into_summary` returns the surviving Add and Remove file-key sets directly (without going
 // through the iterator first). Connectors that don't need per-batch streaming can drain
-// via `finish` and apply their own logic over the surviving keys.
+// via `into_summary` and apply their own logic over the surviving keys.
 #[tokio::test]
-async fn finish_returns_surviving_keys() -> Result<(), Box<dyn std::error::Error>> {
+async fn into_summary_returns_surviving_keys() -> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
@@ -610,7 +610,7 @@ async fn finish_returns_surviving_keys() -> Result<(), Box<dyn std::error::Error
         .build(engine.as_ref())?
         .expect("expected Some(stream)");
 
-    let footer: IncrementalScanSummary = stream.finish()?;
+    let footer: IncrementalScanSummary = stream.into_summary()?;
     assert_eq!(footer.base_version, 0);
     assert_eq!(footer.target_version, 2);
     assert_eq!(footer.surviving_adds, HashSet::from([key("B"), key("C")]),);
@@ -692,7 +692,7 @@ async fn streaming_yields_batches_newest_first_skipping_cancelled_commits(
     let surviving: usize = batches[0].selection_vector().iter().filter(|s| **s).count();
     assert_eq!(surviving, 1, "the single yielded batch contains add(C)");
 
-    let footer = stream.finish()?;
+    let footer = stream.into_summary()?;
     assert_eq!(footer.removes, HashSet::from([key("A"), key("B")]),);
 
     Ok(())

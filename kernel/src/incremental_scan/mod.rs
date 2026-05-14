@@ -142,15 +142,15 @@ impl IncrementalScanBuilder {
 
 /// Streaming output of an incremental scan over `(base_version, target_version]`.
 /// Yields surviving Add batches as [`FilteredEngineData`] in newest-first order via
-/// [`Iterator::next`]; call [`finish`] or [`collect_listing`] to terminate and recover
+/// [`Iterator::next`]; call [`into_summary`] or [`into_listing`] to terminate and recover
 /// the surviving file-key sets.
 ///
 /// On error, `next()` yields `Some(Err(_))` once and returns `None` on every subsequent
 /// call; the stream's dedup state is incomplete, so terminal methods then return `Err`
 /// rather than producing a partial summary.
 ///
-/// [`finish`]: Self::finish
-/// [`collect_listing`]: Self::collect_listing
+/// [`into_summary`]: Self::into_summary
+/// [`into_listing`]: Self::into_listing
 pub struct IncrementalScanStream {
     base_version: Version,
     target_version: Version,
@@ -200,7 +200,7 @@ impl IncrementalScanStream {
     /// # Errors
     /// Returns `Err` if the stream previously yielded an error (dedup state is incomplete),
     /// or if draining produces an error.
-    pub fn finish(mut self) -> DeltaResult<IncrementalScanSummary> {
+    pub fn into_summary(mut self) -> DeltaResult<IncrementalScanSummary> {
         if self.errored {
             return Err(Error::generic(
                 "IncrementalScanStream: cannot finish a stream that previously errored",
@@ -220,22 +220,22 @@ impl IncrementalScanStream {
     }
 
     /// Eager helper: collect every surviving Add batch into a [`Vec`], then call
-    /// [`finish`] to recover the file-key sets. Use this when the diff fits in memory and
-    /// the consumer prefers the simpler eager shape over the iterator pattern.
+    /// [`into_summary`] to recover the file-key sets. Use this when the diff fits in memory
+    /// and the consumer prefers the simpler eager shape over the iterator pattern.
     ///
     /// The returned `Vec` may contain multiple batches per source commit: the engine is
     /// free to split a commit's rows across [`ActionsBatch`] yields (e.g. by JSON-reader
     /// batch-size limits). One yielded batch produces at most one `Vec` entry, and a
     /// commit whose Adds were all cancelled by later Removes produces no entry at all.
     ///
-    /// [`finish`]: Self::finish
+    /// [`into_summary`]: Self::into_summary
     /// [`ActionsBatch`]: crate::log_replay::ActionsBatch
-    pub fn collect_listing(mut self) -> DeltaResult<IncrementalListing> {
+    pub fn into_listing(mut self) -> DeltaResult<IncrementalListing> {
         let mut add_files: Vec<FilteredEngineData> = Vec::new();
         for item in self.by_ref() {
             add_files.push(item?);
         }
-        let summary = self.finish()?;
+        let summary = self.into_summary()?;
         Ok(IncrementalListing { summary, add_files })
     }
 }
@@ -253,7 +253,7 @@ impl std::fmt::Debug for IncrementalScanStream {
 }
 
 /// Surviving file-key sets without cross-snapshot classification, returned by
-/// [`IncrementalScanStream::finish`].
+/// [`IncrementalScanStream::into_summary`].
 ///
 /// Each set element is a [`FileActionKey`] of `(path, dv_unique_id)`. Consumers should match
 /// on the full key rather than just the path: the same path with different DV ids (e.g. an
@@ -272,7 +272,7 @@ pub struct IncrementalScanSummary {
     pub removes: HashSet<FileActionKey>,
 }
 
-/// Eager output of [`IncrementalScanStream::collect_listing`]: the buffered Add
+/// Eager output of [`IncrementalScanStream::into_listing`]: the buffered Add
 /// batches plus the summary (no cross-snapshot classification).
 #[non_exhaustive]
 pub struct IncrementalListing {
