@@ -34,7 +34,7 @@ pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
-pub use state::FileStatsState;
+pub use state::{DomainMetadataState, FileStatsState};
 #[allow(unused)]
 pub(crate) use writer::try_write_crc_file;
 
@@ -82,16 +82,11 @@ pub struct Crc {
     /// Stored as a HashMap keyed by `app_id` for efficient lookup. The CRC JSON format uses
     /// a Vec, which is converted via the `CrcRaw` serde intermediate.
     pub set_transactions: Option<HashMap<String, SetTransaction>>,
-    // TODO: introduce `DomainMetadataState` (Complete / Partial) to disambiguate "no
-    //       observations" from "fully tracked but empty".
-    /// Active (non-removed) [`DomainMetadata`] actions at this version. Tombstones
-    /// (`removed=true`) are never stored. `None` = not tracked (field absent in CRC JSON or not
-    /// computed). `Some(empty_map)` = tracked, no active domain metadata. `Crc::apply`
-    /// skips updates when `None`.
-    ///
-    /// Stored as a HashMap keyed by domain name for efficient lookup. The CRC JSON format uses
-    /// a Vec, which is converted via the `CrcRaw` serde intermediate.
-    pub domain_metadata: Option<HashMap<String, DomainMetadata>>,
+    /// Active (non-removed) [`DomainMetadata`] actions at this version, as a typed
+    /// [`DomainMetadataState`]. Tombstones (`removed=true`) are never stored. `Complete(map)`
+    /// is authoritative for misses; `Partial(map)` carries known-correct entries but requires
+    /// log replay for misses. Only the `Complete` variant is materialized to the file.
+    pub domain_metadata_state: DomainMetadataState,
 
     // ===== Not yet supported fields =====
     /// A unique identifier for the transaction that produced this commit.
@@ -199,9 +194,17 @@ impl TryFrom<CrcRaw> for Crc {
             set_transactions: raw
                 .set_transactions
                 .map(|v| v.into_iter().map(|t| (t.app_id.clone(), t)).collect()),
-            domain_metadata: raw
-                .domain_metadata
-                .map(|v| v.into_iter().map(|d| (d.domain().to_string(), d)).collect()),
+            // Present array (including empty `[]`) deserializes as Complete; absent or null
+            // deserializes as Partial(empty).
+            // TODO: if the table protocol does not support the domainMetadata feature, an
+            //       absent field is equivalent to `Complete(empty)` (no domains can exist),
+            //       so we could deserialize to Complete here too.
+            domain_metadata_state: match raw.domain_metadata {
+                Some(v) => DomainMetadataState::Complete(
+                    v.into_iter().map(|d| (d.domain().to_string(), d)).collect(),
+                ),
+                None => DomainMetadataState::Partial(HashMap::new()),
+            },
             // Not yet round-tripped through CrcRaw; see the "not yet supported" fields on Crc.
             txn_id: None,
             all_files: None,
@@ -234,10 +237,15 @@ impl TryFrom<&Crc> for CrcRaw {
                 .set_transactions
                 .as_ref()
                 .map(|m| m.values().cloned().collect()),
-            domain_metadata: crc
-                .domain_metadata
-                .as_ref()
-                .map(|m| m.values().cloned().collect()),
+            // Only Complete survives the round-trip; Partial drops to absent so the next
+            // read does not mistake it for an authoritative Complete cache.
+            // TODO: if the table protocol does not support the domainMetadata feature,
+            //       `Partial(_)` is equivalent to `Complete(empty)` (no domains can exist),
+            //       so we could serialize an empty `[]` here too.
+            domain_metadata: match &crc.domain_metadata_state {
+                DomainMetadataState::Complete(m) => Some(m.values().cloned().collect()),
+                DomainMetadataState::Partial(_) => None,
+            },
             file_size_histogram: stats.file_size_histogram.clone(),
         })
     }
@@ -297,17 +305,17 @@ mod tests {
 
     use rstest::rstest;
 
-    use super::{Crc, CrcRaw, FileStats, FileStatsState};
+    use super::{Crc, CrcRaw, DomainMetadataState, FileStats, FileStatsState};
     use crate::actions::{DomainMetadata, SetTransaction};
 
     /// Helper to create a minimal `Crc` with only set_transactions and domain_metadata populated.
     fn crc_with(
         txns: Option<HashMap<String, SetTransaction>>,
-        domains: Option<HashMap<String, DomainMetadata>>,
+        domains: DomainMetadataState,
     ) -> Crc {
         Crc {
             set_transactions: txns,
-            domain_metadata: domains,
+            domain_metadata_state: domains,
             ..Default::default()
         }
     }
@@ -353,14 +361,16 @@ mod tests {
         assert_eq!(txn2.version, 7);
         assert_eq!(txn2.last_updated, None);
 
-        let domains = crc.domain_metadata.as_ref().unwrap();
+        // A present `domainMetadata` array deserializes as `Complete` (authoritative).
+        assert!(crc.domain_metadata_state.is_complete());
+        let domains = crc.domain_metadata_state.data();
         assert_eq!(domains.len(), 2);
         assert!(domains.contains_key("delta.rowTracking"));
         assert!(domains.contains_key("delta.clustering"));
     }
 
     #[test]
-    fn de_null_deserializes_to_none() {
+    fn de_null_dm_deserializes_to_partial_empty_and_null_txns_deserializes_to_none() {
         let json = r#"{
             "tableSizeBytes": 0,
             "numFiles": 0,
@@ -380,11 +390,14 @@ mod tests {
         }"#;
         let crc: Crc = serde_json::from_str(json).unwrap();
         assert!(crc.set_transactions.is_none());
-        assert!(crc.domain_metadata.is_none());
+        assert_eq!(
+            crc.domain_metadata_state,
+            DomainMetadataState::Partial(HashMap::new())
+        );
     }
 
     #[test]
-    fn de_missing_field_deserializes_to_none() {
+    fn de_missing_dm_field_deserializes_to_partial_empty_and_missing_txns_to_none() {
         let json = r#"{
             "tableSizeBytes": 0,
             "numFiles": 0,
@@ -402,14 +415,32 @@ mod tests {
         }"#;
         let crc: Crc = serde_json::from_str(json).unwrap();
         assert!(crc.set_transactions.is_none());
-        assert!(crc.domain_metadata.is_none());
+        assert_eq!(
+            crc.domain_metadata_state,
+            DomainMetadataState::Partial(HashMap::new())
+        );
     }
 
     #[test]
-    fn ser_none_serializes_to_null() {
-        let crc = crc_with(None, None);
+    fn ser_partial_dm_and_none_txns_serialize_to_null() {
+        let crc = crc_with(None, DomainMetadataState::default());
         let json = serde_json::to_value(&crc).unwrap();
         assert!(json["setTransactions"].is_null());
+        // Partial is not authoritative for misses; persisting it would falsely promote
+        // to `Complete(empty)` on the next read.
+        assert!(json["domainMetadata"].is_null());
+    }
+
+    #[test]
+    fn ser_non_empty_partial_dm_still_serializes_to_null() {
+        let mut partial = HashMap::new();
+        partial.insert(
+            "delta.rowTracking".to_string(),
+            DomainMetadata::new("delta.rowTracking".to_string(), "{}".to_string()),
+        );
+        let crc = crc_with(None, DomainMetadataState::Partial(partial));
+        let json = serde_json::to_value(&crc).unwrap();
+        // Even non-empty Partial maps drop on serialize.
         assert!(json["domainMetadata"].is_null());
     }
 
@@ -431,7 +462,7 @@ mod tests {
             DomainMetadata::new("delta.rowTracking".to_string(), "{}".to_string()),
         );
 
-        let original = crc_with(Some(txns), Some(domains));
+        let original = crc_with(Some(txns), DomainMetadataState::Complete(domains));
 
         let json_str = serde_json::to_string(&original).unwrap();
         let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
@@ -440,8 +471,11 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_empty_maps() {
-        let original = crc_with(Some(HashMap::new()), Some(HashMap::new()));
+    fn round_trip_empty_complete_dm_and_empty_txns() {
+        let original = crc_with(
+            Some(HashMap::new()),
+            DomainMetadataState::Complete(HashMap::new()),
+        );
 
         let json_str = serde_json::to_string(&original).unwrap();
         let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
@@ -452,6 +486,27 @@ mod tests {
         let json_value = serde_json::to_value(&original).unwrap();
         assert_eq!(json_value["setTransactions"], serde_json::json!([]));
         assert_eq!(json_value["domainMetadata"], serde_json::json!([]));
+    }
+
+    /// Round-tripping a Partial DM through serde drops the field on serialize and produces
+    /// `Partial(empty)` on the next deserialize, regardless of the Partial cache's contents.
+    /// This is the deliberate "Partial is not persisted" contract.
+    #[test]
+    fn round_trip_partial_dm_drops_entries_back_to_empty_partial() {
+        let mut partial = HashMap::new();
+        partial.insert(
+            "delta.rowTracking".to_string(),
+            DomainMetadata::new("delta.rowTracking".to_string(), "{}".to_string()),
+        );
+        let original = crc_with(None, DomainMetadataState::Partial(partial));
+
+        let json_str = serde_json::to_string(&original).unwrap();
+        let deserialized: Crc = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(
+            deserialized.domain_metadata_state,
+            DomainMetadataState::Partial(HashMap::new())
+        );
     }
 
     #[test]
@@ -494,7 +549,7 @@ mod tests {
                 file_size_histogram: None,
             }),
             set_transactions: Some(txns),
-            domain_metadata: Some(domains),
+            domain_metadata_state: DomainMetadataState::Complete(domains),
             ..Default::default()
         };
 
@@ -517,7 +572,8 @@ mod tests {
         assert_eq!(txns["etl-pipeline"].version, 7);
 
         // Verify all domain metadatas
-        let domains = deserialized.domain_metadata.as_ref().unwrap();
+        assert!(deserialized.domain_metadata_state.is_complete());
+        let domains = deserialized.domain_metadata_state.data();
         assert_eq!(domains.len(), 3);
         assert!(domains.contains_key("delta.rowTracking"));
         assert!(domains.contains_key("delta.clustering"));

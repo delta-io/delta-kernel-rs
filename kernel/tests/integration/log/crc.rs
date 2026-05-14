@@ -1,5 +1,6 @@
 //! Integration tests for CRC (version checksum) file-based APIs on Snapshot.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -123,7 +124,8 @@ async fn test_get_current_crc_if_loaded_returns_loaded_crc() -> DeltaResult<()> 
     assert_eq!(crc.metadata, *snapshot.table_configuration().metadata());
 
     // Domain metadata
-    let dms = crc.domain_metadata.as_ref().unwrap();
+    assert!(crc.domain_metadata_state.is_complete());
+    let dms = crc.domain_metadata_state.data();
     assert_eq!(dms.len(), 3);
     assert!(dms.contains_key("delta.clustering"));
     assert!(dms.contains_key("delta.rowTracking"));
@@ -191,7 +193,7 @@ async fn test_create_table_produces_post_commit_crc() -> DeltaResult<()> {
     assert_eq!(file_stats.table_size_bytes(), 0);
     assert_eq!(crc.protocol, *snapshot.table_configuration().protocol());
     assert_eq!(crc.metadata, *snapshot.table_configuration().metadata());
-    let dms = crc.domain_metadata.as_ref().unwrap();
+    let dms = crc.domain_metadata_state.data();
     assert_eq!(dms["zip"].configuration(), "zap0");
 
     Ok(())
@@ -330,7 +332,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
 
     // ===== THEN: should have CRC at v0 with zip -> zap0 =====
     let crc_v0 = write_and_verify_crc(snapshot_v0, &table_path, engine.as_ref());
-    let dms = crc_v0.domain_metadata.as_ref().unwrap();
+    let dms = crc_v0.domain_metadata_state.data();
     assert_eq!(dms["zip"].configuration(), "zap0");
 
     // ===== WHEN: update zip -> zap1, add foo -> bar =====
@@ -343,7 +345,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
     // ===== THEN: should have CRC at v1 with zip -> zap1, foo -> bar =====
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
     let crc_v1 = write_and_verify_crc(snapshot_v1, &table_path, engine.as_ref());
-    let dms = crc_v1.domain_metadata.as_ref().unwrap();
+    let dms = crc_v1.domain_metadata_state.data();
     assert_eq!(dms["zip"].configuration(), "zap1"); // <-- must be zap1
     assert_eq!(dms["foo"].configuration(), "bar"); // <-- must be bar
 
@@ -356,7 +358,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
     // ===== THEN: should have CRC at v2 with zip gone, foo still there =====
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
     let crc_v2 = write_and_verify_crc(snapshot_v2, &table_path, engine.as_ref());
-    let dms = crc_v2.domain_metadata.as_ref().unwrap();
+    let dms = crc_v2.domain_metadata_state.data();
     assert!(!dms.contains_key("zip")); // <-- must be gone
     assert_eq!(dms["foo"].configuration(), "bar"); // <-- must still be bar
 
@@ -639,7 +641,11 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
         .get_all_domain_metadata(engine.as_ref())?
         .is_empty());
     let crc = write_and_verify_crc(snapshot, &table_path, engine.as_ref());
-    assert_eq!(crc.domain_metadata, Some(Default::default()));
+    // CREATE TABLE without any DM actions produces an authoritative empty map.
+    assert_eq!(
+        crc.domain_metadata_state,
+        delta_kernel::crc::DomainMetadataState::Complete(HashMap::new())
+    );
 
     Ok(())
 }
@@ -692,6 +698,11 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
             snapshot.get_domain_metadata("foo", engine).unwrap(),
             Some("bar".to_string())
         );
+        // Miss on a Complete cache: served as authoritative None without log replay.
+        assert_eq!(
+            snapshot.get_domain_metadata("nonexistent", engine).unwrap(),
+            None
+        );
         assert!(snapshot
             .get_domain_metadata_internal("delta.clustering", engine)
             .unwrap()
@@ -729,6 +740,86 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
         .get_current_crc_if_loaded_for_testing()
         .is_some());
     assert_domain_metadata(&fresh_snapshot_with_crc, &FailingEngine);
+
+    Ok(())
+}
+
+/// Rewrites the on-disk CRC at `version` with its `domainMetadata` field stripped, leaving
+/// every other field (notably protocol and metadata) intact.
+fn strip_dm_from_crc(table_path: &str, version: u64) {
+    let crc_path = format!(
+        "{}/_delta_log/{:020}.crc",
+        table_path.trim_end_matches('/'),
+        version
+    );
+    let bytes = std::fs::read(&crc_path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value.as_object_mut().unwrap().remove("domainMetadata");
+    std::fs::write(&crc_path, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // v0: CREATE TABLE with zip -> zap0 (post-commit writes CRC with full DM).
+    let committed = create_table_and_commit(&table_path, engine.as_ref())?;
+    let snapshot_v0_orig = committed.post_commit_snapshot().unwrap();
+    snapshot_v0_orig.write_checksum(engine.as_ref())?;
+
+    // Strip DM from v0 CRC, then reload: base snapshot has `Partial(empty)` DM rather than
+    // the post-commit `Complete(...)` state.
+    strip_dm_from_crc(&table_path, 0);
+    let snapshot_v0 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        snapshot_v0
+            .get_current_crc_if_loaded_for_testing()
+            .unwrap()
+            .domain_metadata_state,
+        delta_kernel::crc::DomainMetadataState::Partial(HashMap::new())
+    );
+
+    // v1: post-commit chain accumulates DM into `Partial(map)`.
+    let committed = begin_transaction(snapshot_v0.clone(), engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_domain_metadata("foo".to_string(), "bar".to_string())
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let snapshot_v1 = committed.post_commit_snapshot().unwrap();
+
+    let crc_v1 = snapshot_v1.get_current_crc_if_loaded_for_testing().unwrap();
+    assert!(matches!(
+        crc_v1.domain_metadata_state,
+        delta_kernel::crc::DomainMetadataState::Partial(_)
+    ));
+    assert!(crc_v1.domain_metadata_state.data().contains_key("foo"));
+
+    // Hit: "foo" is in the Partial cache, so served without log replay.
+    assert_eq!(
+        snapshot_v1.get_domain_metadata("foo", &FailingEngine)?,
+        Some("bar".to_string())
+    );
+
+    // Miss on a domain present in older commits: "zip" is NOT in this Partial cache; falls
+    // through to log replay, which returns the entry from v0.
+    assert_eq!(
+        snapshot_v1.get_domain_metadata("zip", engine.as_ref())?,
+        Some("zap0".to_string())
+    );
+
+    // Miss on a domain that does not exist anywhere: falls through, returns None.
+    assert_eq!(
+        snapshot_v1.get_domain_metadata("nonexistent", engine.as_ref())?,
+        None
+    );
+
+    // "All" queries against Partial always fall through. The replay-derived set must
+    // include BOTH entries.
+    let mut all = snapshot_v1.get_all_domain_metadata(engine.as_ref())?;
+    all.sort_by(|a, b| a.domain().cmp(b.domain()));
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].domain(), "foo");
+    assert_eq!(all[1].domain(), "zip");
 
     Ok(())
 }

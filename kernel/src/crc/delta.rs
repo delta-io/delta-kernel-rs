@@ -16,7 +16,7 @@
 use tracing::warn;
 
 use super::file_stats::FileStatsDelta;
-use super::{Crc, FileSizeHistogram, FileStats, FileStatsState};
+use super::{Crc, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState};
 use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
 
 /// The CRC-relevant changes ("delta") from a single commit. Produced either by reading a
@@ -53,10 +53,9 @@ impl CrcDelta {
     pub(crate) fn into_crc_for_version_zero(self) -> Option<Crc> {
         let protocol = self.protocol?;
         let metadata = self.metadata?;
-        // For CREATE TABLE we always know the full domain metadata state: the transaction
-        // either included domain metadata actions or it didn't. So this is always `Some` --
-        // an empty map means "no domain metadata", not "unknown".
-        let domain_metadata = Some(
+        // For CREATE TABLE we know the full domain metadata state: the transaction either
+        // included domain metadata actions or it didn't. Always Complete.
+        let domain_metadata_state = DomainMetadataState::Complete(
             self.domain_metadata_changes
                 .into_iter()
                 .filter(|dm| !dm.is_removed())
@@ -90,7 +89,7 @@ impl CrcDelta {
             }),
             protocol,
             metadata,
-            domain_metadata,
+            domain_metadata_state,
             set_transactions,
             in_commit_timestamp_opt: self.in_commit_timestamp,
             ..Default::default()
@@ -112,19 +111,17 @@ impl Crc {
             self.metadata = m;
         }
 
-        // Domain metadata: insert or remove by domain name. Only update if the base CRC
-        // tracks domain metadata (Some). If None ("not tracked"), leave it as None --
-        // applying partial changes would create an incomplete map.
-        if !delta.domain_metadata_changes.is_empty() {
-            if let Some(map) = &mut self.domain_metadata {
-                for dm in delta.domain_metadata_changes {
-                    if dm.is_removed() {
-                        map.remove(dm.domain());
-                    } else {
-                        let domain = dm.domain().to_string();
-                        map.insert(domain, dm);
-                    }
-                }
+        // Apply the delta onto the CRC's existing map: upsert each non-removed entry
+        // (newest wins), drop each tombstone. The variant (Complete or Partial) stays the
+        // same since a delta never changes whether the base was authoritative.
+        let map = match &mut self.domain_metadata_state {
+            DomainMetadataState::Complete(m) | DomainMetadataState::Partial(m) => m,
+        };
+        for dm in delta.domain_metadata_changes {
+            if dm.is_removed() {
+                map.remove(dm.domain());
+            } else {
+                map.insert(dm.domain().to_string(), dm);
             }
         }
 
@@ -374,9 +371,9 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_adds_domain_metadata_to_tracked_map() {
+    fn test_apply_adds_domain_metadata_to_complete_map() {
         let mut crc = base_crc();
-        crc.domain_metadata = Some(HashMap::new());
+        crc.domain_metadata_state = DomainMetadataState::Complete(HashMap::new());
         let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
         let delta = CrcDelta {
             domain_metadata_changes: vec![dm],
@@ -384,15 +381,18 @@ mod tests {
         };
         crc.apply(delta);
 
-        let map = crc.domain_metadata.as_ref().unwrap();
+        assert!(crc.domain_metadata_state.is_complete());
+        let map = crc.domain_metadata_state.data();
         assert_eq!(map.len(), 1);
         assert_eq!(map["my.domain"].configuration(), "config1");
     }
 
     #[test]
-    fn test_apply_with_untracked_domain_metadata_skips_changes() {
+    fn test_apply_adds_domain_metadata_to_partial_map_stays_partial() {
+        // Default is Partial(empty). Apply observes entries; map fills but variant stays
+        // Partial (we did not gain authoritative knowledge of older history).
         let mut crc = base_crc();
-        assert!(crc.domain_metadata.is_none()); // Not tracked (default)
+        assert_eq!(crc.domain_metadata_state, DomainMetadataState::default());
         let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
         let delta = CrcDelta {
             domain_metadata_changes: vec![dm],
@@ -400,14 +400,16 @@ mod tests {
         };
         crc.apply(delta);
 
-        // domain_metadata stays None -- apply() must not create a partial map.
-        assert!(crc.domain_metadata.is_none());
+        assert!(!crc.domain_metadata_state.is_complete());
+        let map = crc.domain_metadata_state.data();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["my.domain"].configuration(), "config1");
     }
 
     #[test]
-    fn test_apply_upserts_domain_metadata() {
+    fn test_apply_upserts_domain_metadata_in_complete_map() {
         let mut crc = base_crc();
-        crc.domain_metadata = Some(HashMap::from([(
+        crc.domain_metadata_state = DomainMetadataState::Complete(HashMap::from([(
             "my.domain".to_string(),
             DomainMetadata::new("my.domain".to_string(), "old_config".to_string()),
         )]));
@@ -419,15 +421,37 @@ mod tests {
         };
         crc.apply(delta);
 
-        let map = crc.domain_metadata.as_ref().unwrap();
+        assert!(crc.domain_metadata_state.is_complete());
+        let map = crc.domain_metadata_state.data();
         assert_eq!(map.len(), 1);
         assert_eq!(map["my.domain"].configuration(), "new_config");
     }
 
     #[test]
-    fn test_apply_removes_domain_metadata() {
+    fn test_apply_upserts_domain_metadata_in_partial_map() {
         let mut crc = base_crc();
-        crc.domain_metadata = Some(HashMap::from([(
+        crc.domain_metadata_state = DomainMetadataState::Partial(HashMap::from([(
+            "my.domain".to_string(),
+            DomainMetadata::new("my.domain".to_string(), "old_config".to_string()),
+        )]));
+
+        let dm = DomainMetadata::new("my.domain".to_string(), "new_config".to_string());
+        let delta = CrcDelta {
+            domain_metadata_changes: vec![dm],
+            ..write_delta(0, 0)
+        };
+        crc.apply(delta);
+
+        // Partial stays Partial.
+        assert!(!crc.domain_metadata_state.is_complete());
+        let map = crc.domain_metadata_state.data();
+        assert_eq!(map["my.domain"].configuration(), "new_config");
+    }
+
+    #[test]
+    fn test_apply_removes_domain_metadata_from_complete_map() {
+        let mut crc = base_crc();
+        crc.domain_metadata_state = DomainMetadataState::Complete(HashMap::from([(
             "my.domain".to_string(),
             DomainMetadata::new("my.domain".to_string(), "config1".to_string()),
         )]));
@@ -439,8 +463,8 @@ mod tests {
         };
         crc.apply(delta);
 
-        let map = crc.domain_metadata.as_ref().unwrap();
-        assert!(map.is_empty());
+        assert!(crc.domain_metadata_state.is_complete());
+        assert!(crc.domain_metadata_state.data().is_empty());
     }
 
     #[test]
@@ -496,7 +520,10 @@ mod tests {
         assert_eq!(stats.num_files(), 5);
         assert_eq!(stats.table_size_bytes(), 1000);
         assert!(crc.file_stats_state.is_complete());
-        assert_eq!(crc.domain_metadata, Some(HashMap::new()));
+        assert_eq!(
+            crc.domain_metadata_state,
+            DomainMetadataState::Complete(HashMap::new())
+        );
         assert_eq!(crc.in_commit_timestamp_opt, None);
     }
 
@@ -528,7 +555,8 @@ mod tests {
             ..write_delta(0, 0)
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
-        let map = crc.domain_metadata.as_ref().unwrap();
+        assert!(crc.domain_metadata_state.is_complete());
+        let map = crc.domain_metadata_state.data();
         assert_eq!(map.len(), 1);
         assert_eq!(map["my.domain"].configuration(), "config1");
     }
