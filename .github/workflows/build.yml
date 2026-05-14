@@ -60,6 +60,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false # see https://github.com/Swatinem/rust-cache/issues/341
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
         with:
@@ -80,6 +81,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false # see https://github.com/Swatinem/rust-cache/issues/341
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
         with:
@@ -111,6 +113,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false # see https://github.com/Swatinem/rust-cache/issues/341
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build docs
         run: cargo doc --locked --workspace --all-features --no-deps
@@ -153,6 +156,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false # see https://github.com/Swatinem/rust-cache/issues/341
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build and lint with clippy
         run: cargo clippy --locked --benches --tests --all-features -- -D warnings
@@ -191,6 +195,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false # see https://github.com/Swatinem/rust-cache/issues/341
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: test
@@ -243,6 +248,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false # see https://github.com/Swatinem/rust-cache/issues/341
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Set output on fail
         run: echo "CTEST_OUTPUT_ON_FAILURE=1" >> "$GITHUB_ENV"
@@ -320,6 +326,7 @@ jobs:
           cargo miri setup
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false # see https://github.com/Swatinem/rust-cache/issues/341
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: Test with Miri
@@ -339,6 +346,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false # see https://github.com/Swatinem/rust-cache/issues/341
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@2d15d02e710b40b6332201aba6af30d595b5cd96 # cargo-llvm-cov
