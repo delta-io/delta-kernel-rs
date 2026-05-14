@@ -8,7 +8,7 @@ use crate::{DeltaResult, Engine, Error};
 
 /// Serialize and write a CRC file to storage.
 ///
-/// Serializes the [`Crc`] struct to JSON via serde and writes the raw bytes using the storage
+/// Serializes the [`Crc`] to JSON via serde and writes the raw bytes using the storage
 /// handler. Returns [`Error::ChecksumWriteUnsupported`] if file stats are not valid (a CRC file
 /// on disk must have correct stats). Per the Delta protocol, writers MUST NOT overwrite existing
 /// CRC files, so this always writes with `overwrite = false`. If the file already exists, returns
@@ -75,8 +75,6 @@ mod tests {
         Crc {
             table_size_bytes: 1024,
             num_files: 5,
-            num_metadata: 1,
-            num_protocol: 1,
             protocol,
             txn_id: None,
             in_commit_timestamp_opt: Some(ict),

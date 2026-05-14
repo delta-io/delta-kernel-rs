@@ -85,8 +85,6 @@ impl CrcDelta {
         Some(Crc {
             table_size_bytes: self.file_stats.net_bytes,
             num_files: self.file_stats.net_files,
-            num_metadata: 1,
-            num_protocol: 1,
             protocol,
             metadata,
             domain_metadata,
@@ -215,8 +213,6 @@ mod tests {
         Crc {
             table_size_bytes: 1000,
             num_files: 10,
-            num_metadata: 1,
-            num_protocol: 1,
             ..Default::default()
         }
     }
@@ -527,8 +523,6 @@ mod tests {
         assert_eq!(crc.metadata, metadata);
         assert_eq!(crc.num_files, 5);
         assert_eq!(crc.table_size_bytes, 1000);
-        assert_eq!(crc.num_metadata, 1);
-        assert_eq!(crc.num_protocol, 1);
         assert_eq!(crc.file_stats_validity, FileStatsValidity::Valid);
         assert_eq!(crc.domain_metadata, Some(HashMap::new()));
         assert_eq!(crc.in_commit_timestamp_opt, None);
@@ -681,8 +675,6 @@ mod tests {
         Crc {
             table_size_bytes: file_sizes.iter().sum(),
             num_files: file_sizes.len() as i64,
-            num_metadata: 1,
-            num_protocol: 1,
             file_size_histogram: Some(hist),
             ..Default::default()
         }
@@ -844,8 +836,6 @@ mod tests {
         let mut crc = Crc {
             table_size_bytes: 800,
             num_files: 3,
-            num_metadata: 1,
-            num_protocol: 1,
             file_size_histogram: Some(base_hist),
             ..Default::default()
         };

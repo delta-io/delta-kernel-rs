@@ -3,6 +3,11 @@
 //! A [CRC file] contains a snapshot of table state at a specific version, which can be used to
 //! optimize log replay operations like reading Protocol/Metadata, domain metadata, and ICT.
 //!
+//! [`Crc`] holds the in-memory state using shapes that make kernel queries easy: typed
+//! validity enums and `HashMap`s keyed by id, instead of the flat scalars and arrays of the
+//! on-disk format. It (de)serializes to/from JSON via the private `CrcRaw` serde
+//! intermediate, which mirrors the wire format exactly.
+//!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 
 // Allow unreachable_pub because this module is pub when test-utils is enabled
@@ -27,17 +32,19 @@ pub(crate) use file_stats::FileStatsDelta;
 pub(crate) use lazy::{CrcLoadResult, LazyCrc};
 pub(crate) use reader::try_read_crc_file;
 use serde::de::Deserializer;
-use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 #[allow(unused)]
 pub(crate) use writer::try_write_crc_file;
 
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
+use crate::Error;
 
 /// Tracks whether file stats (`num_files`, `table_size_bytes`) are trustworthy.
 ///
 /// Defaults to [`Valid`](Self::Valid), which is the correct state when deserializing a CRC file
 /// from disk (a CRC file's stats are correct by definition).
+// TODO: replace `FileStatsValidity` with a typed `FileStatsState` enum that carries the
+//       data per variant so reads from a degraded state are a compile error.
 #[allow(dead_code)] // Variants used in follow-up PRs (forward replay, transaction delta).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FileStatsValidity {
@@ -63,21 +70,26 @@ pub enum FileStatsValidity {
     Untrackable,
 }
 
+// ============================================================================
+// Crc: in-memory representation
+// ============================================================================
+
 /// Parsed content of a CRC (version checksum) file.
 ///
-/// A `Crc` is either (a) loaded from disk (deserialized from a `.crc` JSON file) or (b) computed
-/// in memory (built incrementally via `Crc::apply`).
+/// A `Crc` is either (a) loaded from disk (deserialized from a `.crc` JSON file via
+/// the private `CrcRaw` intermediate) or (b) computed in memory (built incrementally via
+/// `Crc::apply`).
 ///
 /// A CRC file must:
 /// 1. Be named `{version}.crc` with version zero-padded to 20 digits: `00000000000000000001.crc`
 /// 2. Be stored directly in the _delta_log directory alongside Delta log files
-/// 3. Contain exactly one JSON object with the schema of this struct.
+/// 3. Contain exactly one JSON object with the schema mirrored by `CrcRaw`.
 ///
 /// This struct and its fields are marked `pub`, but the `crc` module is only re-exported as `pub`
 /// when the `test-utils` feature is enabled (otherwise `pub(crate)`). See `kernel/src/lib.rs`.
-// Deserialized directly from JSON via serde. See `reader::try_read_crc_file`.
+// TODO: rename `Crc` to `CrcState` to align with `FileStatsState`, `SetTransactionState`, etc.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(try_from = "CrcRaw", into = "CrcRaw")]
 pub struct Crc {
     // ===== Required fields =====
     /// Total size of the table in bytes, calculated as the sum of the `size` field of all live
@@ -86,10 +98,6 @@ pub struct Crc {
     /// Number of live [`Add`] actions in this table version after action reconciliation.
     /// Private -- use [`Crc::file_stats()`] to access safely.
     num_files: i64,
-    /// Number of [`Metadata`] actions. Must be 1.
-    pub num_metadata: i64,
-    /// Number of [`Protocol`] actions. Must be 1.
-    pub num_protocol: i64,
     /// The table [`Metadata`] at this version.
     pub metadata: Metadata,
     /// The table [`Protocol`] at this version.
@@ -98,67 +106,44 @@ pub struct Crc {
     /// Not serialized -- this is an in-memory replay concern only. When deserialized from a CRC
     /// file on disk, defaults to [`FileStatsValidity::Valid`] (a CRC file's stats are correct
     /// by definition). A CRC is only safe to write to disk when validity is `Valid`.
-    #[serde(skip)]
     pub file_stats_validity: FileStatsValidity,
 
     // ===== Optional fields =====
-    /// A unique identifier for the transaction that produced this commit.
-    #[serde(skip)]
-    pub txn_id: Option<String>,
     /// The in-commit timestamp of this version. Present iff In-Commit Timestamps are enabled.
     pub in_commit_timestamp_opt: Option<i64>,
+    // TODO: introduce `SetTransactionState` (Complete / Partial) to disambiguate "no
+    //       observations" from "fully tracked but empty".
     /// Live transaction identifier ([`SetTransaction`]) actions at this version. `None` = not
     /// tracked (field absent in CRC JSON or not computed). `Some(empty_map)` = tracked, no
-    /// active set transactions. `apply()` skips updates when `None`.
+    /// active set transactions. `Crc::apply` skips updates when `None`.
     ///
     /// Stored as a HashMap keyed by `app_id` for efficient lookup. The CRC JSON format uses
-    /// a Vec, which is converted via custom serde deserialization.
-    #[serde(
-        default,
-        deserialize_with = "de_opt_vec_to_opt_map",
-        serialize_with = "ser_opt_map_to_opt_vec"
-    )]
+    /// a Vec, which is converted via the `CrcRaw` serde intermediate.
     pub set_transactions: Option<HashMap<String, SetTransaction>>,
+    // TODO: introduce `DomainMetadataState` (Complete / Partial) to disambiguate "no
+    //       observations" from "fully tracked but empty".
     /// Active (non-removed) [`DomainMetadata`] actions at this version. Tombstones
     /// (`removed=true`) are never stored. `None` = not tracked (field absent in CRC JSON or not
-    /// computed). `Some(empty_map)` = tracked, no active domain metadata. `apply()` skips
-    /// updates when `None`.
+    /// computed). `Some(empty_map)` = tracked, no active domain metadata. `Crc::apply`
+    /// skips updates when `None`.
     ///
     /// Stored as a HashMap keyed by domain name for efficient lookup. The CRC JSON format uses
-    /// a Vec, which is converted via custom serde deserialization.
-    #[serde(
-        default,
-        deserialize_with = "de_opt_vec_to_opt_map",
-        serialize_with = "ser_opt_map_to_opt_vec"
-    )]
+    /// a Vec, which is converted via the `CrcRaw` serde intermediate.
     pub domain_metadata: Option<HashMap<String, DomainMetadata>>,
     /// Size distribution information of files remaining after action reconciliation.
-    ///
-    /// The Delta protocol spec names this field `fileSizeHistogram`, but Delta-Spark writers
-    /// historically emit it as `histogramOpt`. To remain compatible with CRC files written by
-    /// those tools, deserialization accepts either name, but not both. If both are present
-    /// deserialization will throw an error. Serialization always emits the spec-correct
-    /// `fileSizeHistogram`. Mirrors the kernel-java fix in
-    /// <https://github.com/delta-io/delta/pull/6281>.
-    #[serde(
-        default,
-        alias = "histogramOpt",
-        deserialize_with = "de_validated_file_size_histogram",
-        skip_serializing_if = "Option::is_none"
-    )]
     pub file_size_histogram: Option<FileSizeHistogram>,
+
+    // ===== Not yet supported fields =====
+    /// A unique identifier for the transaction that produced this commit.
+    pub(crate) txn_id: Option<String>,
     /// All live [`Add`] file actions at this version.
-    #[serde(skip)]
-    pub all_files: Option<Vec<Add>>,
+    pub(crate) all_files: Option<Vec<Add>>,
     /// Number of records deleted through Deletion Vectors in this table version.
-    #[serde(skip)]
-    pub num_deleted_records_opt: Option<i64>,
+    pub(crate) num_deleted_records_opt: Option<i64>,
     /// Number of Deletion Vectors active in this table version.
-    #[serde(skip)]
-    pub num_deletion_vectors_opt: Option<i64>,
-    /// Distribution of deleted record counts across files. See this section for more details.
-    #[serde(skip)]
-    pub deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
+    pub(crate) num_deletion_vectors_opt: Option<i64>,
+    /// Distribution of deleted record counts across files.
+    pub(crate) deleted_record_counts_histogram_opt: Option<DeletedRecordCountsHistogram>,
 }
 
 impl Crc {
@@ -179,37 +164,97 @@ impl Crc {
     }
 }
 
-/// Trait for types that can be stored in a HashMap keyed by a string identifier.
-/// Used by CRC serde helpers to convert between Vec (JSON format) and HashMap (in-memory).
-trait MapKey {
-    fn map_key(&self) -> &str;
+// ============================================================================
+// CrcRaw: serde intermediate
+// ============================================================================
+
+/// The on-disk JSON shape of a CRC file. Serves as the serde intermediate for [`Crc`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CrcRaw {
+    table_size_bytes: i64,
+    num_files: i64,
+    num_metadata: i64,
+    num_protocol: i64,
+    metadata: Metadata,
+    protocol: Protocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    in_commit_timestamp_opt: Option<i64>,
+    #[serde(default)]
+    set_transactions: Option<Vec<SetTransaction>>,
+    #[serde(default)]
+    domain_metadata: Option<Vec<DomainMetadata>>,
+    /// The Delta protocol spec names this field `fileSizeHistogram`, but Delta-Spark writers
+    /// historically emit it as `histogramOpt`. To remain compatible with CRC files written by
+    /// those tools, deserialization accepts either name, but not both. If both are present
+    /// deserialization will throw an error. Serialization always emits the spec-correct
+    /// `fileSizeHistogram`. Mirrors the kernel-java fix in
+    /// <https://github.com/delta-io/delta/pull/6281>.
+    #[serde(
+        default,
+        alias = "histogramOpt",
+        deserialize_with = "de_validated_file_size_histogram",
+        skip_serializing_if = "Option::is_none"
+    )]
+    file_size_histogram: Option<FileSizeHistogram>,
 }
 
-impl MapKey for DomainMetadata {
-    fn map_key(&self) -> &str {
-        self.domain()
+impl TryFrom<CrcRaw> for Crc {
+    type Error = Error;
+
+    fn try_from(raw: CrcRaw) -> Result<Self, Self::Error> {
+        // Per the Delta protocol spec, numMetadata and numProtocol MUST be 1 in any CRC file.
+        // Reject malformed files at the deserialization boundary so callers can trust the value.
+        for (name, value) in [
+            ("numMetadata", raw.num_metadata),
+            ("numProtocol", raw.num_protocol),
+        ] {
+            if value != 1 {
+                return Err(Error::generic(format!(
+                    "CRC file has invalid {name}: expected 1, got {value}"
+                )));
+            }
+        }
+        Ok(Crc {
+            table_size_bytes: raw.table_size_bytes,
+            num_files: raw.num_files,
+            metadata: raw.metadata,
+            protocol: raw.protocol,
+            // A CRC file on disk is by definition valid; we never deserialize a degraded state.
+            file_stats_validity: FileStatsValidity::Valid,
+            in_commit_timestamp_opt: raw.in_commit_timestamp_opt,
+            set_transactions: raw
+                .set_transactions
+                .map(|v| v.into_iter().map(|t| (t.app_id.clone(), t)).collect()),
+            domain_metadata: raw
+                .domain_metadata
+                .map(|v| v.into_iter().map(|d| (d.domain().to_string(), d)).collect()),
+            file_size_histogram: raw.file_size_histogram,
+            // Not yet round-tripped through CrcRaw; see the "not yet supported" fields on Crc.
+            txn_id: None,
+            all_files: None,
+            num_deleted_records_opt: None,
+            num_deletion_vectors_opt: None,
+            deleted_record_counts_histogram_opt: None,
+        })
     }
 }
 
-impl MapKey for SetTransaction {
-    fn map_key(&self) -> &str {
-        &self.app_id
+impl From<Crc> for CrcRaw {
+    fn from(crc: Crc) -> Self {
+        CrcRaw {
+            table_size_bytes: crc.table_size_bytes,
+            num_files: crc.num_files,
+            num_metadata: 1,
+            num_protocol: 1,
+            metadata: crc.metadata,
+            protocol: crc.protocol,
+            in_commit_timestamp_opt: crc.in_commit_timestamp_opt,
+            set_transactions: crc.set_transactions.map(|m| m.into_values().collect()),
+            domain_metadata: crc.domain_metadata.map(|m| m.into_values().collect()),
+            file_size_histogram: crc.file_size_histogram,
+        }
     }
-}
-
-/// Deserialize an `Option<Vec<T>>` from JSON into `Option<HashMap<String, T>>`, using
-/// [`MapKey::map_key`] to derive the HashMap key for each element.
-fn de_opt_vec_to_opt_map<'de, D, T>(deserializer: D) -> Result<Option<HashMap<String, T>>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de> + MapKey,
-{
-    let opt_vec: Option<Vec<T>> = Option::deserialize(deserializer)?;
-    Ok(opt_vec.map(|vec| {
-        vec.into_iter()
-            .map(|item| (item.map_key().to_string(), item))
-            .collect()
-    }))
 }
 
 /// Deserializes an `Option<FileSizeHistogram>` from a CRC JSON file with validation.
@@ -233,22 +278,6 @@ where
         .map(Some)
         .map_err(serde::de::Error::custom),
         None => Ok(None),
-    }
-}
-
-/// Serialize `Option<HashMap<String, T>>` back to `Option<Vec<T>>` so the CRC JSON format
-/// uses an array (matching the Delta protocol spec).
-fn ser_opt_map_to_opt_vec<S, T>(
-    map: &Option<HashMap<String, T>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-    T: Serialize,
-{
-    match map {
-        None => serializer.serialize_none(),
-        Some(m) => m.values().collect::<Vec<_>>().serialize(serializer),
     }
 }
 
@@ -279,6 +308,8 @@ pub struct DeletedRecordCountsHistogram {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use rstest::rstest;
 
     use super::Crc;
     use crate::actions::{DomainMetadata, SetTransaction};
@@ -473,8 +504,6 @@ mod tests {
         let crc = Crc {
             table_size_bytes: 1024 * 1024,
             num_files: 10,
-            num_metadata: 1,
-            num_protocol: 1,
             set_transactions: Some(txns),
             domain_metadata: Some(domains),
             ..Default::default()
@@ -512,6 +541,49 @@ mod tests {
         assert_eq!(crc, deserialized);
     }
 
+    // ===== numMetadata / numProtocol rejection =====
+
+    /// Minimal CRC JSON with the supplied numMetadata / numProtocol values; used to construct
+    /// invalid CRCs and verify rejection.
+    fn crc_json_with_counts(num_metadata: i64, num_protocol: i64) -> String {
+        format!(
+            r#"{{
+                "tableSizeBytes": 0,
+                "numFiles": 0,
+                "numMetadata": {num_metadata},
+                "numProtocol": {num_protocol},
+                "metadata": {{
+                    "id": "test",
+                    "format": {{"provider": "parquet", "options": {{}}}},
+                    "schemaString": "{{\"type\":\"struct\",\"fields\":[]}}",
+                    "partitionColumns": [],
+                    "configuration": {{}},
+                    "createdTime": 0
+                }},
+                "protocol": {{"minReaderVersion": 1, "minWriterVersion": 1}}
+            }}"#
+        )
+    }
+
+    /// Per the Delta protocol spec, both `numMetadata` and `numProtocol` MUST be 1; any other
+    /// value (zero, two, negative) is rejected, and the error names the offending field.
+    #[rstest]
+    #[case::num_metadata("numMetadata", |b| (b, 1))]
+    #[case::num_protocol("numProtocol", |b| (1, b))]
+    fn de_invalid_count_is_rejected(
+        #[case] field: &str,
+        #[case] counts: fn(i64) -> (i64, i64),
+        #[values(0i64, 2, 3, -1)] bad: i64,
+    ) {
+        let (m, p) = counts(bad);
+        let json = crc_json_with_counts(m, p);
+        let err = serde_json::from_str::<Crc>(&json).unwrap_err().to_string();
+        assert!(
+            err.contains(field),
+            "expected error to mention {field} for value {bad}, got: {err}"
+        );
+    }
+
     // ===== File size histogram validation =====
 
     /// Minimal CRC JSON with a file size histogram field spliced in under the given field name
@@ -537,8 +609,6 @@ mod tests {
             }}"#
         )
     }
-
-    use rstest::rstest;
 
     /// Both the Delta spec field name and the legacy Delta-Spark name must deserialize.
     #[rstest]
@@ -605,7 +675,7 @@ mod tests {
     /// "duplicate field" error -- serde's `#[serde(alias)]` treats both names as the same
     /// logical field and refuses to deserialize repeated sets. No real producer emits both
     /// fields today (Delta-Spark writes only `histogramOpt` or only `fileSizeHistogram`,
-    /// kernel-java / kernel-rust write only `fileSizeHistogram`), so this is a defensive guard  
+    /// kernel-java / kernel-rust write only `fileSizeHistogram`), so this is a defensive guard
     /// against malformed CRCs. The error fires regardless of the data carried under each name.
     /// The cases below exercise both matching and mismatched payloads, in both JSON orderings.
     #[rstest]

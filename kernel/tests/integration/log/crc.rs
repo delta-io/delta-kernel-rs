@@ -117,8 +117,6 @@ async fn test_get_current_crc_if_loaded_returns_loaded_crc() -> DeltaResult<()> 
     let file_stats = crc.file_stats().unwrap();
     assert_eq!(file_stats.table_size_bytes(), 5259);
     assert_eq!(file_stats.num_files(), 10);
-    assert_eq!(crc.num_metadata, 1);
-    assert_eq!(crc.num_protocol, 1);
 
     // Protocol and metadata should match the snapshot's table configuration
     assert_eq!(crc.protocol, *snapshot.table_configuration().protocol());
@@ -191,8 +189,6 @@ async fn test_create_table_produces_post_commit_crc() -> DeltaResult<()> {
     let file_stats = crc.file_stats().unwrap();
     assert_eq!(file_stats.num_files(), 0);
     assert_eq!(file_stats.table_size_bytes(), 0);
-    assert_eq!(crc.num_metadata, 1);
-    assert_eq!(crc.num_protocol, 1);
     assert_eq!(crc.protocol, *snapshot.table_configuration().protocol());
     assert_eq!(crc.metadata, *snapshot.table_configuration().metadata());
     let dms = crc.domain_metadata.as_ref().unwrap();
