@@ -11,7 +11,8 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::json::DefaultJsonHandler;
 use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::incremental_scan::{
-    IncrementalListing, IncrementalScanStream, IncrementalScanSummary,
+    IncrementalListing, IncrementalListingAgainstBase, IncrementalScanStream,
+    IncrementalScanSummary,
 };
 use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::object_store::memory::InMemory;
@@ -908,6 +909,258 @@ async fn single_commit_split_across_batches_dedups_correctly(
         7,
         "selection-vector counts must not depend on batch_size (got batch_size={batch_size})"
     );
+
+    Ok(())
+}
+
+// === Classification ===
+//
+// `into_summary_against_base_iter(base_keys)` / `into_listing_against_base_iter(base_keys)`
+// intersect the consumer's base file keys (`(path, dv_unique_id)`) against the live
+// Adds to surface metadata-only re-adds in `duplicate_adds`. The Add row itself stays in
+// the streamed Adds; the key is also surfaced separately so the consumer can mask the
+// stale base entry.
+
+fn unwrap_classified_listing<'a>(
+    result: Option<IncrementalScanStream>,
+    base_keys: impl IntoIterator<Item = &'a FileActionKey>,
+) -> IncrementalListingAgainstBase {
+    result
+        .expect("expected Some(stream), got None (commits unavailable)")
+        .into_listing_against_base_iter(base_keys)
+        .expect("into_listing_against_base_iter succeeded")
+}
+
+fn classified_add_count(listing: &IncrementalListingAgainstBase) -> usize {
+    listing
+        .add_files
+        .iter()
+        .map(|f| f.selection_vector().iter().filter(|s| **s).count())
+        .sum()
+}
+
+#[rstest]
+#[case::all_re_adds(
+    vec!["re-added.parquet"],
+    vec!["re-added.parquet"],
+    1,
+    vec!["re-added.parquet"],
+)]
+#[case::mixed_new_and_re_added(
+    vec!["brand-new.parquet", "re-added.parquet"],
+    vec!["re-added.parquet"],
+    2,
+    vec!["re-added.parquet"],
+)]
+#[tokio::test]
+async fn classifies_metadata_only_re_adds(
+    #[case] range_adds: Vec<&'static str>,
+    #[case] base_paths: Vec<&'static str>,
+    #[case] expected_live: usize,
+    #[case] expected_duplicates: Vec<&'static str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    let actions: Vec<TestAction> = range_adds
+        .iter()
+        .map(|p| TestAction::Add(p.to_string()))
+        .collect();
+    add_commit(table_root, storage.as_ref(), 1, actions_to_string(actions)).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    let base_keys: Vec<FileActionKey> = base_paths.iter().map(|p| key(p)).collect();
+    let listing = unwrap_classified_listing(
+        target.incremental_scan_builder(0).build(engine.as_ref())?,
+        &base_keys,
+    );
+
+    assert_eq!(classified_add_count(&listing), expected_live);
+    let expected: HashSet<FileActionKey> = expected_duplicates.iter().map(|p| key(p)).collect();
+    assert_eq!(listing.summary.duplicate_adds, expected);
+    assert!(listing.summary.removes.is_empty());
+
+    Ok(())
+}
+
+// The pull-then-finalize flow: drive the iterator manually with `next()`, then call
+// `into_summary_against_base_iter(base_keys)`. This is the documented streaming consumer
+// pattern.
+#[tokio::test]
+async fn into_summary_after_manual_streaming_classifies_duplicates(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![
+            TestAction::Add("brand-new.parquet".to_string()),
+            TestAction::Add("re-added.parquet".to_string()),
+        ]),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let mut stream = target
+        .incremental_scan_builder(0)
+        .build(engine.as_ref())?
+        .expect("expected Some(stream)");
+
+    let mut yielded = 0;
+    for item in stream.by_ref() {
+        let _batch = item?;
+        yielded += 1;
+    }
+    assert_eq!(yielded, 1, "v1 produced one Add batch");
+
+    let base_keys = [key("re-added.parquet"), key("not-in-range.parquet")];
+    let summary = stream.into_summary_against_base_iter(&base_keys)?;
+    assert_eq!(
+        summary.duplicate_adds,
+        HashSet::from([key("re-added.parquet")]),
+        "non-matching base key is filtered out"
+    );
+    assert!(summary.removes.is_empty());
+
+    Ok(())
+}
+
+// Predicate variants (`*_with`) take a closure and produce the same `duplicate_adds`
+// as the iterator variants. Asserts that for a fixed (range, base) pair both forms
+// agree on the classified output. Demonstrates HashMap-backed base via closure.
+#[tokio::test]
+async fn predicate_variants_match_iterator_variants() -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::HashMap;
+
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![
+            TestAction::Add("brand-new.parquet".to_string()),
+            TestAction::Add("re-added.parquet".to_string()),
+        ]),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    // Base lives in a HashMap (key -> metadata). Closure does the contains-check.
+    let base_index: HashMap<FileActionKey, i64> = [
+        (key("re-added.parquet"), 100),
+        (key("not-in-range.parquet"), 200),
+    ]
+    .into();
+
+    let stream = target
+        .clone()
+        .incremental_scan_builder(0)
+        .build(engine.as_ref())?
+        .expect("expected Some(stream)");
+    let summary_with = stream.into_summary_against_base_closure(|k| base_index.contains_key(k))?;
+    assert_eq!(
+        summary_with.duplicate_adds,
+        HashSet::from([key("re-added.parquet")]),
+    );
+    assert!(summary_with.removes.is_empty());
+
+    let stream = target
+        .incremental_scan_builder(0)
+        .build(engine.as_ref())?
+        .expect("expected Some(stream)");
+    let listing_with = stream.into_listing_against_base_closure(|k| base_index.contains_key(k))?;
+    assert_eq!(
+        listing_with.summary.duplicate_adds,
+        summary_with.duplicate_adds
+    );
+    assert_eq!(listing_with.summary.removes, summary_with.removes);
+    assert_eq!(classified_add_count(&listing_with), 2);
+
+    Ok(())
+}
+
+// Empty base: `duplicate_adds` is empty (nothing in the range overlaps the empty base),
+// but `removes` still surfaces every range remove. Exercises both against-base forms.
+#[tokio::test]
+async fn empty_base_keys_produces_no_duplicates() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![
+            TestAction::Add("a.parquet".to_string()),
+            TestAction::Remove("gone.parquet".to_string()),
+        ]),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    // By-ref iterator with empty input.
+    let stream = target
+        .clone()
+        .incremental_scan_builder(0)
+        .build(engine.as_ref())?
+        .expect("expected Some(stream)");
+    let empty: [FileActionKey; 0] = [];
+    let summary_iter = stream.into_summary_against_base_iter(&empty)?;
+    assert!(summary_iter.duplicate_adds.is_empty());
+    assert_eq!(summary_iter.removes, HashSet::from([key("gone.parquet")]));
+
+    // Predicate closure that always returns false.
+    let stream = target
+        .incremental_scan_builder(0)
+        .build(engine.as_ref())?
+        .expect("expected Some(stream)");
+    let summary_with = stream.into_summary_against_base_closure(|_| false)?;
+    assert!(summary_with.duplicate_adds.is_empty());
+    assert_eq!(summary_with.removes, HashSet::from([key("gone.parquet")]));
 
     Ok(())
 }

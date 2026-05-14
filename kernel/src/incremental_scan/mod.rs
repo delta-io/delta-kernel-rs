@@ -203,8 +203,17 @@ impl IncrementalScanStream {
     /// data structure they prefer.
     ///
     /// # Errors
-    /// Returns `Err` if the stream previously yielded an error (dedup state is incomplete),
-    /// or if draining produces an error.
+    /// - [`Error::IOError`], [`Error::ObjectStore`], or [`Error::Reqwest`] on transient I/O while
+    ///   reading commit JSONs. Retryable by rebuilding the stream.
+    /// - [`Error::FileNotFound`] if a commit was vacuumed between [`IncrementalScanBuilder::build`]
+    ///   and stream consumption. Rebuilding will likely return `Ok(None)` (commits unavailable);
+    ///   fall back to [`crate::Snapshot::scan_builder`].
+    /// - [`Error::MalformedJson`] or [`Error::Arrow`] (default-engine) on commit JSON corruption.
+    ///   Not retryable.
+    /// - [`Error::Generic`] on malformed `deletionVector` fields in a commit row, or on "cannot
+    ///   finish a stream that previously errored" when a terminal method is called after a prior
+    ///   `next()` returned `Err`. Rebuild to retry the latter; the former indicates table
+    ///   corruption.
     pub fn into_summary(mut self) -> DeltaResult<IncrementalScanSummary> {
         if self.errored {
             return Err(Error::generic(
@@ -233,6 +242,9 @@ impl IncrementalScanStream {
     /// batch-size limits). One yielded batch produces at most one `Vec` entry, and a
     /// commit whose Adds were all cancelled by later Removes produces no entry at all.
     ///
+    /// # Errors
+    /// See [`into_summary`].
+    ///
     /// [`into_summary`]: Self::into_summary
     /// [`ActionsBatch`]: crate::log_replay::ActionsBatch
     pub fn into_listing(mut self) -> DeltaResult<IncrementalListing> {
@@ -242,6 +254,125 @@ impl IncrementalScanStream {
         }
         let summary = self.into_summary()?;
         Ok(IncrementalListing { summary, add_files })
+    }
+
+    /// Drain any unread batches, then intersect `base_keys` against the live-Add file-key
+    /// set to compute `duplicate_adds` (file keys in the consumer's base listing that the
+    /// range re-adds with new metadata, e.g. OPTIMIZE / liquid clustering re-tag).
+    ///
+    /// Streaming form: accepts borrowed keys from any source (`&HashSet`, `&Vec`, `&[…]`,
+    /// `map.keys()`, custom iterator). Kernel streams `base_keys` once and probes the
+    /// live-Add set per element. Work is `O(|base|)` with no call-site clones. Use this
+    /// when your cache holds keys in a streamable shape and you don't have a faster
+    /// `contains` lookup.
+    ///
+    /// Prefer [`into_summary_against_base_closure`] when your cache supports
+    /// `contains`-style lookup (HashMap, HashSet, BTreeMap, custom index). That form
+    /// iterates the (typically much smaller) live-Add set and probes your base via the
+    /// supplied closure, dropping work from `O(|base|)` to `O(|live_adds|)`.
+    ///
+    /// # Errors
+    /// See [`into_summary`].
+    ///
+    /// [`into_summary`]: Self::into_summary
+    /// [`into_summary_against_base_closure`]: Self::into_summary_against_base_closure
+    pub fn into_summary_against_base_iter<'a>(
+        self,
+        base_keys: impl IntoIterator<Item = &'a FileActionKey>,
+    ) -> DeltaResult<IncrementalScanSummaryAgainstBase> {
+        let summary = self.into_summary()?;
+        let duplicate_adds: HashSet<FileActionKey> = base_keys
+            .into_iter()
+            .filter(|k| summary.live_adds.contains(*k))
+            .cloned()
+            .collect();
+        Ok(IncrementalScanSummaryAgainstBase {
+            base_version: summary.base_version,
+            target_version: summary.target_version,
+            duplicate_adds,
+            removes: summary.removes,
+        })
+    }
+
+    /// Predicate form of [`into_summary_against_base_iter`]: pass a closure that answers
+    /// "is this key in your base?" Iterates the live-Add set (typically much smaller than
+    /// the base) and calls `base_contains` once per live-Add key.
+    ///
+    /// Works with any base shape that supports membership lookup:
+    /// - `HashMap<FileActionKey, _>` -> `|k| map.contains_key(k)`
+    /// - `HashSet<FileActionKey>` -> `|k| set.contains(k)`
+    /// - `BTreeMap<FileActionKey, _>` -> `|k| map.contains_key(k)`
+    /// - Sorted `Vec<FileActionKey>` -> `|k| vec.binary_search(k).is_ok()`
+    ///
+    /// # Errors
+    /// See [`into_summary`].
+    ///
+    /// [`into_summary`]: Self::into_summary
+    /// [`into_summary_against_base_iter`]: Self::into_summary_against_base_iter
+    pub fn into_summary_against_base_closure(
+        self,
+        base_contains: impl Fn(&FileActionKey) -> bool,
+    ) -> DeltaResult<IncrementalScanSummaryAgainstBase> {
+        let summary = self.into_summary()?;
+        let duplicate_adds: HashSet<FileActionKey> = summary
+            .live_adds
+            .iter()
+            .filter(|k| base_contains(k))
+            .cloned()
+            .collect();
+        Ok(IncrementalScanSummaryAgainstBase {
+            base_version: summary.base_version,
+            target_version: summary.target_version,
+            duplicate_adds,
+            removes: summary.removes,
+        })
+    }
+
+    /// Eager classified helper: collect every live Add batch and call
+    /// [`into_summary_against_base_iter`] against `base_keys`. Returns an
+    /// [`IncrementalListingAgainstBase`] with the classified summary.
+    ///
+    /// Prefer [`into_listing_against_base_closure`] when your base supports `contains`-style
+    /// lookup — see [`into_summary_against_base_closure`] for the rationale.
+    ///
+    /// # Errors
+    /// See [`into_summary`].
+    ///
+    /// [`into_summary`]: Self::into_summary
+    /// [`into_summary_against_base_iter`]: Self::into_summary_against_base_iter
+    /// [`into_summary_against_base_closure`]: Self::into_summary_against_base_closure
+    /// [`into_listing_against_base_closure`]: Self::into_listing_against_base_closure
+    pub fn into_listing_against_base_iter<'a>(
+        mut self,
+        base_keys: impl IntoIterator<Item = &'a FileActionKey>,
+    ) -> DeltaResult<IncrementalListingAgainstBase> {
+        let mut add_files: Vec<FilteredEngineData> = Vec::new();
+        for item in self.by_ref() {
+            add_files.push(item?);
+        }
+        let summary = self.into_summary_against_base_iter(base_keys)?;
+        Ok(IncrementalListingAgainstBase { summary, add_files })
+    }
+
+    /// Predicate form of [`into_listing_against_base_iter`]; see
+    /// [`into_summary_against_base_closure`] for the rationale.
+    ///
+    /// # Errors
+    /// See [`into_summary`].
+    ///
+    /// [`into_summary`]: Self::into_summary
+    /// [`into_listing_against_base_iter`]: Self::into_listing_against_base_iter
+    /// [`into_summary_against_base_closure`]: Self::into_summary_against_base_closure
+    pub fn into_listing_against_base_closure(
+        mut self,
+        base_contains: impl Fn(&FileActionKey) -> bool,
+    ) -> DeltaResult<IncrementalListingAgainstBase> {
+        let mut add_files: Vec<FilteredEngineData> = Vec::new();
+        for item in self.by_ref() {
+            add_files.push(item?);
+        }
+        let summary = self.into_summary_against_base_closure(base_contains)?;
+        Ok(IncrementalListingAgainstBase { summary, add_files })
     }
 }
 
@@ -293,6 +424,51 @@ pub struct IncrementalListing {
 impl std::fmt::Debug for IncrementalListing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IncrementalListing")
+            .field("summary", &self.summary)
+            .field("add_files_batch_count", &self.add_files.len())
+            .finish()
+    }
+}
+
+/// Cross-snapshot-classified file-key sets, returned by
+/// [`IncrementalScanStream::into_summary_against_base_iter`] (or its closure variant).
+///
+/// To advance a delta-on-base file listing cache, append the streamed Add batches to
+/// the delta layer and use the union `removes U duplicate_adds` as the remove-mask
+/// against the base. Both sets are required: `removes` masks files that left the table;
+/// `duplicate_adds` masks the stale base entry of each file the range re-added with new
+/// metadata. Matching against the full `(path, dv_unique_id)` key (not path alone) keeps
+/// distinct DV-revision entries separate.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct IncrementalScanSummaryAgainstBase {
+    /// Exclusive lower bound of the scan range.
+    pub base_version: Version,
+    /// Inclusive upper bound; equals the source snapshot's version.
+    pub target_version: Version,
+    /// File keys from the live Add stream that also appear in the consumer's base
+    /// listing (metadata-only re-adds, e.g. OPTIMIZE / liquid clustering re-tag).
+    /// The corresponding rows are still in the streamed Adds.
+    pub duplicate_adds: HashSet<FileActionKey>,
+    /// File keys of Remove actions in the range. Consumers must union this with
+    /// `duplicate_adds` when masking the base.
+    pub removes: HashSet<FileActionKey>,
+}
+
+/// Eager output of [`IncrementalScanStream::into_listing_against_base_iter`] (or its
+/// closure variant): the buffered
+/// Add batches plus the classified summary.
+#[non_exhaustive]
+pub struct IncrementalListingAgainstBase {
+    /// Classified file-key sets for the range; see [`IncrementalScanSummaryAgainstBase`].
+    pub summary: IncrementalScanSummaryAgainstBase,
+    /// All live Add batches in descending commit-version order.
+    pub add_files: Vec<FilteredEngineData>,
+}
+
+impl std::fmt::Debug for IncrementalListingAgainstBase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IncrementalListingAgainstBase")
             .field("summary", &self.summary)
             .field("add_files_batch_count", &self.add_files.len())
             .finish()
