@@ -17,6 +17,13 @@ use crate::engine_data::{GetData, TypedGetData};
 use crate::log_replay::FileActionKey;
 use crate::DeltaResult;
 
+/// Information we want to return to the add-dedup about file related actions
+pub(crate) struct FileActionInfo {
+    pub(crate) key: FileActionKey,
+    pub(crate) size: usize,
+    pub(crate) is_add: bool,
+}
+
 pub(crate) trait Deduplicator {
     /// Extracts a file action key from the data. Returns `(key, is_add)` if found.
     ///
@@ -28,7 +35,7 @@ pub(crate) trait Deduplicator {
         i: usize,
         getters: &[&'a dyn GetData<'a>],
         skip_removes: bool,
-    ) -> DeltaResult<Option<(FileActionKey, bool)>>;
+    ) -> DeltaResult<Option<FileActionInfo>>;
 
     /// Checks if this file has been seen. When `is_log_batch() = true`, updates the hashmap
     /// to track new files. Returns `true` if the file should be filtered out.
@@ -104,12 +111,16 @@ impl Deduplicator for CheckpointDeduplicator<'_> {
         i: usize,
         getters: &[&'b dyn GetData<'b>],
         _skip_removes: bool,
-    ) -> DeltaResult<Option<(FileActionKey, bool)>> {
+    ) -> DeltaResult<Option<FileActionInfo>> {
         let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? else {
             return Ok(None);
         };
         let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
-        Ok(Some((FileActionKey::new(path, dv_unique_id), true)))
+        Ok(Some(FileActionInfo {
+            key: FileActionKey::new(path, dv_unique_id),
+            size: 0, // TODO
+            is_add: true,
+        }))
     }
 
     /// Read-only check against seen set. Returns `true` if file should be filtered out.

@@ -20,7 +20,7 @@ use delta_kernel_derive::internal_api;
 use tracing::debug;
 
 use crate::engine_data::GetData;
-use crate::log_replay::deduplicator::Deduplicator;
+use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::{DeltaResult, EngineData};
 
@@ -154,11 +154,15 @@ impl Deduplicator for FileActionDeduplicator<'_> {
         i: usize,
         getters: &[&'a dyn GetData<'a>],
         skip_removes: bool,
-    ) -> DeltaResult<Option<(FileActionKey, bool)>> {
+    ) -> DeltaResult<Option<FileActionInfo>> {
         // Try to extract an add action by the required path column
         if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
             let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
-            return Ok(Some((FileActionKey::new(path, dv_unique_id), true)));
+            return Ok(Some(FileActionInfo {
+                key: FileActionKey::new(path, dv_unique_id),
+                size: 0,
+                is_add: true,
+            }));
         }
 
         // The AddRemoveDedupVisitor skips remove actions when extracting file actions from a
@@ -170,7 +174,11 @@ impl Deduplicator for FileActionDeduplicator<'_> {
         // Try to extract a remove action by the required path column
         if let Some(path) = getters[self.remove_path_index].get_str(i, "remove.path")? {
             let dv_unique_id = self.extract_dv_unique_id(i, getters, self.remove_dv_start_index)?;
-            return Ok(Some((FileActionKey::new(path, dv_unique_id), false)));
+            return Ok(Some(FileActionInfo {
+                key: FileActionKey::new(path, dv_unique_id),
+                size: 0,
+                is_add: false,
+            }));
         }
 
         // No file action found
@@ -480,7 +488,7 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let (key, is_add) = result.unwrap();
+        let FileActionInfo{key, size: _size, is_add} = result.unwrap();
         assert_eq!(key.path, "file1.parquet");
         assert!(key.dv_unique_id.is_none());
         assert!(is_add);
@@ -499,7 +507,7 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let (key, is_add) = result.unwrap();
+        let FileActionInfo{key, size: _size, is_add} = result.unwrap();
         assert_eq!(key.path, "file2.parquet");
         assert!(!is_add);
 
@@ -520,7 +528,7 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let (key, is_add) = result.unwrap();
+        let FileActionInfo{key, size: _size, is_add} = result.unwrap();
         assert!(matches!(
             key.dv_unique_id.as_deref(),
             Some("s3path/to/dv@100")
@@ -641,7 +649,7 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let (key, is_add) = result.unwrap();
+        let FileActionInfo{key, size: _size, is_add} = result.unwrap();
         assert_eq!(key.path, "checkpoint_file.parquet");
         assert!(key.dv_unique_id.is_none());
         assert!(is_add);
@@ -663,7 +671,7 @@ mod tests {
         let result = deduplicator.extract_file_action(0, &getters, false)?;
 
         assert!(result.is_some());
-        let (key, is_add) = result.unwrap();
+        let FileActionInfo{key, size: _size, is_add} = result.unwrap();
         assert_eq!(key.path, "file_with_dv.parquet");
         assert!(matches!(
             key.dv_unique_id.as_deref(),

@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
-use crate::log_replay::deduplicator::Deduplicator as _;
+use crate::log_replay::deduplicator::{Deduplicator as _, FileActionInfo};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector, LogReplayProcessor,
 };
@@ -442,7 +442,7 @@ impl ActionReconciliationVisitor<'_> {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Option<bool>> {
         // Extract the file action and handle errors immediately
-        let Some((file_key, is_add)) = self.deduplicator.extract_file_action(i, getters, false)?
+        let Some(FileActionInfo{key: file_key, size: _size, is_add}) = self.deduplicator.extract_file_action(i, getters, false)?
         else {
             return Ok(None); // No file action found, continue checking other types
         };

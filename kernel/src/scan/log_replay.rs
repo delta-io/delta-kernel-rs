@@ -14,7 +14,7 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
 };
-use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
+use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
     ParallelLogReplayProcessor,
@@ -410,7 +410,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
 
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
     /// is not an Add action, or the file has already been seen previously.
-    fn is_valid_add<'b>(&mut self, i: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<bool> {
+    fn is_valid_add<'b>(&mut self, row: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<bool> {
         // When processing file actions, we extract path and deletion vector information based on
         // action type:
         // - For Add actions: path is at index 0, followed by DV fields at indexes 2-4
@@ -419,8 +419,8 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // The file extraction logic selects the appropriate indexes based on whether we found a
         // valid path. Remove getters are not included when visiting a non-log batch
         // (checkpoint batch), so do not try to extract remove actions in that case.
-        let Some((file_key, is_add)) = self.deduplicator.extract_file_action(
-            i,
+        let Some(FileActionInfo{key: file_key, size: _size, is_add}) = self.deduplicator.extract_file_action(
+            row,
             getters,
             !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
         )?
@@ -441,7 +441,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
-                    .get(i, "add.partitionValues")?;
+                    .get(row, "add.partitionValues")?;
                 parse_partition_values(
                     &self.state_info.logical_schema,
                     transform,
@@ -457,7 +457,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             return Ok(false);
         }
         let base_row_id: Option<i64> =
-            getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
+            getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(row, "add.baseRowId")?;
         let transform = self
             .state_info
             .transform_spec
@@ -473,7 +473,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             .transpose()?;
         if transform.is_some() {
             // fill in any needed `None`s for previous rows
-            self.row_transform_exprs.resize_with(i, Default::default);
+            self.row_transform_exprs.resize_with(row, Default::default);
             self.row_transform_exprs.push(transform);
         }
         self.metrics.incr_active_add_files();
@@ -527,9 +527,9 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
             ))
         );
 
-        for i in 0..row_count {
-            if self.selection_vector[i] {
-                self.selection_vector[i] = self.is_valid_add(i, getters)?;
+        for row in 0..row_count {
+            if self.selection_vector[row] {
+                self.selection_vector[row] = self.is_valid_add(row, getters)?;
             }
         }
 

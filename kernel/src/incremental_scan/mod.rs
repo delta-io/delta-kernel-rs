@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::{Add, Remove, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{column_name, ColumnName};
-use crate::log_replay::deduplicator::Deduplicator;
+use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey};
 use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
@@ -392,7 +392,7 @@ impl RowVisitor for IncrementalDedupVisitor<'_, '_> {
         );
 
         for i in 0..row_count {
-            let Some((key, is_add)) = self.deduplicator.extract_file_action(i, getters, false)?
+            let Some(FileActionInfo{key, size: _size, is_add}) = self.deduplicator.extract_file_action(i, getters, false)?
             else {
                 continue;
             };
