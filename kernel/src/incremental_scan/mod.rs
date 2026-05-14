@@ -251,12 +251,14 @@ impl IncrementalScanStream {
     /// Streaming form: accepts any source of base keys (Vec, lazy iterator, paginated
     /// cache lookup, etc.). Kernel does not materialize a HashSet of base keys — it
     /// streams `base_keys` once and tests each against the live-Add set. Use this when
-    /// your base file-keys are not already held in a HashSet, or are large enough that
-    /// materializing one upfront is wasteful.
+    /// your cache holds base keys in any shape other than `HashSet<FileActionKey>`:
+    /// constructing a HashSet just to call [`into_summary_against_base_set`] would cost
+    /// `O(|base|)` hashing + allocation, exceeding the work this method does.
     ///
-    /// Prefer [`into_summary_against_base_set`] when your cache already holds a
-    /// `HashSet<FileActionKey>` you keep across diffs — it avoids the call-site
-    /// `iter().cloned()` and clones only the intersection.
+    /// Prefer [`into_summary_against_base_set`] only when your cache *already* holds a
+    /// `HashSet<FileActionKey>` you keep across diffs. That form uses `.intersection()` to
+    /// iterate the (typically much smaller) live-Add set instead of the whole base, so
+    /// the work drops from `O(|base|)` to `O(|live_adds|)`.
     ///
     /// # Errors
     /// Inherits all errors from [`into_summary`]. Two categories:
