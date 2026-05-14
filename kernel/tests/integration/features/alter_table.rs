@@ -759,3 +759,268 @@ async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn st
 
     Ok(())
 }
+
+// ============================================================================
+// ALTER TABLE ADD COLUMN preserves / fills pre-populated column mapping metadata
+// (delta-spark parity per `DeltaColumnMapping.assignColumnIdAndPhysicalName`).
+// See https://github.com/delta-io/delta-kernel-rs/issues/2377.
+// ============================================================================
+
+fn cm_id_for_field(field: &StructField) -> i64 {
+    field
+        .column_mapping_id()
+        .expect("field must have a column mapping id")
+}
+
+fn physical_name_for_field(field: &StructField) -> &str {
+    match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+        Some(MetadataValue::String(s)) => s.as_str(),
+        other => panic!("expected physicalName string, got {other:?}"),
+    }
+}
+
+/// ADD COLUMN with both `delta.columnMapping.id` and `delta.columnMapping.physicalName`
+/// pre-populated: the connector-supplied metadata is preserved verbatim. `maxColumnId`
+/// advances to the supplied id when it exceeds the existing max.
+#[rstest]
+#[tokio::test]
+async fn add_column_preserves_complete_cm_metadata(
+    #[values("name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", cm_mode)],
+    )?;
+    let original_max = max_column_id(&snapshot);
+
+    // Supplied id is well above the table's max so we can verify maxColumnId follows it.
+    let supplied_id = original_max + 100;
+    let mut field = StructField::nullable("preserved", DataType::STRING);
+    field.metadata.insert(
+        ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+        MetadataValue::Number(supplied_id),
+    );
+    field.metadata.insert(
+        ColumnMetadataKey::ColumnMappingPhysicalName
+            .as_ref()
+            .to_string(),
+        MetadataValue::String("user-supplied-physical".to_string()),
+    );
+
+    snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    let added = schema.field("preserved").unwrap();
+    assert_eq!(cm_id_for_field(added), supplied_id);
+    assert_eq!(physical_name_for_field(added), "user-supplied-physical");
+    assert_eq!(max_column_id(&reloaded), supplied_id);
+    Ok(())
+}
+
+/// ADD COLUMN with only `delta.columnMapping.physicalName` supplied: kernel allocates
+/// `id = old maxColumnId + 1`, preserves the user-provided physical name, and bumps
+/// `maxColumnId` to the new id.
+#[rstest]
+#[tokio::test]
+async fn add_column_with_only_physical_name_allocates_id(
+    #[values("name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", cm_mode)],
+    )?;
+    let original_max = max_column_id(&snapshot);
+
+    let mut field = StructField::nullable("named_only", DataType::STRING);
+    field.metadata.insert(
+        ColumnMetadataKey::ColumnMappingPhysicalName
+            .as_ref()
+            .to_string(),
+        MetadataValue::String("phys-named-only".to_string()),
+    );
+
+    snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    let added = schema.field("named_only").unwrap();
+    assert_eq!(cm_id_for_field(added), original_max + 1);
+    assert_eq!(physical_name_for_field(added), "phys-named-only");
+    assert_eq!(max_column_id(&reloaded), original_max + 1);
+    Ok(())
+}
+
+/// ADD COLUMN with only `delta.columnMapping.id` supplied: id is preserved, missing
+/// `physicalName` is filled with `col-<uuid>`.
+#[rstest]
+#[tokio::test]
+async fn add_column_with_only_id_fills_physical_name(
+    #[values("name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", cm_mode)],
+    )?;
+    let original_max = max_column_id(&snapshot);
+    let supplied_id = original_max + 7;
+
+    let mut field = StructField::nullable("id_only", DataType::STRING);
+    field.metadata.insert(
+        ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+        MetadataValue::Number(supplied_id),
+    );
+
+    snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    let added = schema.field("id_only").unwrap();
+    assert_eq!(cm_id_for_field(added), supplied_id);
+    assert!(
+        physical_name_for_field(added).starts_with("col-"),
+        "physical name should be filled with col-<uuid>, got {}",
+        physical_name_for_field(added)
+    );
+    assert_eq!(max_column_id(&reloaded), supplied_id);
+    Ok(())
+}
+
+/// ADD COLUMN where the supplied `id` is *less than* the existing `maxColumnId` but does
+/// not collide with any existing field's id: succeeds, with the supplied id preserved
+/// verbatim and `maxColumnId` unchanged. Matches delta-spark; diverges from the Java Kernel
+/// proposal in https://github.com/delta-io/delta/pull/4520, which would reject this.
+#[tokio::test]
+async fn add_column_with_id_below_max_column_id_succeeds() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // Pre-populate the table with sparse ids (1, 100) using the create-table preserve path.
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("a", DataType::INTEGER).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("phys-a".to_string()),
+            ),
+        ]),
+        StructField::nullable("b", DataType::STRING).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(100),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("phys-b".to_string()),
+            ),
+        ]),
+    ])?);
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+    assert_eq!(max_column_id(&snapshot), 100);
+
+    // Now add a new column with id=50, which is well below maxColumnId=100 and not used.
+    let mut field = StructField::nullable("inserted_below_max", DataType::STRING);
+    field.metadata.insert(
+        ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+        MetadataValue::Number(50),
+    );
+    field.metadata.insert(
+        ColumnMetadataKey::ColumnMappingPhysicalName
+            .as_ref()
+            .to_string(),
+        MetadataValue::String("phys-inserted".to_string()),
+    );
+
+    snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    let added = schema.field("inserted_below_max").unwrap();
+    assert_eq!(cm_id_for_field(added), 50);
+    assert_eq!(physical_name_for_field(added), "phys-inserted");
+    // maxColumnId stays at 100 because the supplied id (50) didn't exceed it.
+    assert_eq!(max_column_id(&reloaded), 100);
+    Ok(())
+}
+
+/// ADD COLUMN where the supplied `id` collides with an existing field's id: fails. The
+/// duplicate-id check happens when the alter builder constructs the new
+/// `TableConfiguration` via `make_physical`.
+#[tokio::test]
+async fn add_column_with_id_colliding_existing_field_is_rejected() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+
+    // Pick an id that already exists in the simple_schema (1, 2 typically).
+    let existing_id = snapshot
+        .schema()
+        .field("id")
+        .unwrap()
+        .column_mapping_id()
+        .expect("simple_schema 'id' must have a CM id under name mode");
+
+    let mut field = StructField::nullable("colliding", DataType::STRING);
+    field.metadata.insert(
+        ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+        MetadataValue::Number(existing_id),
+    );
+    field.metadata.insert(
+        ColumnMetadataKey::ColumnMappingPhysicalName
+            .as_ref()
+            .to_string(),
+        MetadataValue::String("phys-colliding".to_string()),
+    );
+
+    let err = snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Duplicate column mapping ID") && err.contains(&existing_id.to_string()),
+        "expected duplicate-id error naming id {existing_id}, got: {err}"
+    );
+    Ok(())
+}
