@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
@@ -14,7 +13,7 @@ use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
-use test_utils::{create_table, engine_store_setup};
+use test_utils::{begin_transaction, create_table, engine_store_setup, load_and_begin_transaction};
 use url::Url;
 
 /// Test that verifies baseRowId and defaultRowCommitVersion are correctly populated
@@ -57,9 +56,7 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
     .await?;
 
     // ===== FIRST COMMIT: Add files with row tracking =====
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?
         .with_engine_info("row tracking test")
         .with_data_change(true);
 
@@ -125,9 +122,7 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
 
     // ===== SECOND COMMIT: Remove the file =====
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine_arc.as_ref())?;
-    let mut txn2 = snapshot2
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine_arc.as_ref())?
+    let mut txn2 = begin_transaction(snapshot2.clone(), engine_arc.as_ref())?
         .with_engine_info("row tracking remove test")
         .with_data_change(true);
 

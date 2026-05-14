@@ -1,4 +1,4 @@
-# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] [![rustc-version-1.88+]][rustc]
+# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] ![Crates.io MSRV](https://img.shields.io/crates/msrv/delta_kernel)
 
 [build-status]: https://img.shields.io/github/actions/workflow/status/delta-io/delta-kernel-rs/build.yml?branch=main
 [actions]: https://github.com/delta-io/delta-kernel-rs/actions/workflows/build.yml?query=branch%3Amain
@@ -52,10 +52,10 @@ consumer's own `Engine` trait, the kernel has a feature flag to enable a default
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.22.0"
+delta_kernel = "0.22.1"
 
 # or turn on the default engine, based on latest arrow
-delta_kernel = { version = "0.22.0", features = ["default-engine-rustls", "arrow"] }
+delta_kernel = { version = "0.22.1", features = ["default-engine-rustls", "arrow"] }
 ```
 
 ### Feature flags

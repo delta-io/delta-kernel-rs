@@ -1485,4 +1485,56 @@ mod tests {
             .unwrap();
         assert_eq!(col.values(), &[1, 2, 3]);
     }
+
+    // === ParquetHandler contract tests ===
+    //
+    // These call the shared contract helpers in `engine::tests` against `DefaultParquetHandler`
+    // (the matching `SyncParquetHandler` invocations live in `engine/sync/parquet.rs`).
+
+    fn default_parquet_handler() -> DefaultParquetHandler<TokioBackgroundExecutor> {
+        DefaultParquetHandler::new(
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(TokioBackgroundExecutor::new()),
+        )
+    }
+
+    #[test]
+    fn parquet_handler_reads_footer() {
+        crate::engine::tests::test_parquet_handler_reads_footer(&default_parquet_handler());
+    }
+
+    #[test]
+    fn parquet_handler_footer_errors_on_missing_file() {
+        crate::engine::tests::test_parquet_handler_footer_errors_on_missing_file(
+            &default_parquet_handler(),
+        );
+    }
+
+    #[test]
+    fn parquet_handler_footer_preserves_field_ids() {
+        crate::engine::tests::test_parquet_handler_footer_preserves_field_ids(
+            &default_parquet_handler(),
+        );
+    }
+
+    #[test]
+    fn parquet_handler_write_always_overwrites() {
+        crate::engine::tests::test_parquet_handler_write_always_overwrites(
+            &default_parquet_handler(),
+        );
+    }
+
+    #[test]
+    fn parquet_handler_write_omits_arrow_schema() {
+        crate::engine::tests::test_parquet_handler_write_omits_arrow_schema(
+            &default_parquet_handler(),
+        );
+    }
+
+    #[test]
+    fn parquet_handler_reads_file_with_arrow_schema() {
+        crate::engine::tests::test_parquet_handler_reads_file_with_arrow_schema(
+            &default_parquet_handler(),
+        );
+    }
 }

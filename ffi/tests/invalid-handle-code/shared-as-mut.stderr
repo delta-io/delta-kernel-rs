@@ -19,7 +19,7 @@ error[E0271]: type mismatch resolving `<SharedFoo as HandleDescriptor>::Mutable 
 note: expected this to be `delta_kernel_ffi::handle::True`
   --> tests/invalid-handle-code/shared-as-mut.rs:6:1
    |
- 6 | #[handle_descriptor(target=Foo, mutable=false, sized=true)]
+6  | #[handle_descriptor(target=Foo, mutable=false, sized=true)]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = note: required for `Handle<SharedFoo>` to implement `From<Box<Foo>>`
    = note: required for `Box<Foo>` to implement `Into<Handle<SharedFoo>>`

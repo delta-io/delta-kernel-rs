@@ -247,7 +247,7 @@ async fn test_no_compaction_staged_commits() {
     use std::sync::Arc;
 
     use crate::actions::Add;
-    use crate::engine::default::DefaultEngineBuilder;
+    use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
@@ -255,7 +255,7 @@ async fn test_no_compaction_staged_commits() {
 
     // Set up in-memory store
     let store = Arc::new(InMemory::new());
-    let engine = DefaultEngineBuilder::new(store.clone()).build();
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // Create basic commits with proper metadata and protocol
     use crate::actions::{Metadata, Protocol};
