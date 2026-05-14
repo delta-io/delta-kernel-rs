@@ -915,11 +915,11 @@ async fn single_commit_split_across_batches_dedups_correctly(
 
 // === Classification ===
 //
-// `finish_against_base(base_keys)` and `collect_listing_against_base(base_keys)` intersect
-// the consumer's base file keys (`(path, dv_unique_id)`) against the surviving Adds to
-// surface metadata-only re-adds in `duplicate_adds`. The Add row itself stays in the
-// streamed Adds; the key is also surfaced separately so the consumer can mask the stale
-// base entry.
+// `into_summary_against_base(base_keys)` and `into_listing_against_base(base_keys)`
+// intersect the consumer's base file keys (`(path, dv_unique_id)`) against the surviving
+// Adds to surface metadata-only re-adds in `duplicate_adds`. The Add row itself stays in
+// the streamed Adds; the key is also surfaced separately so the consumer can mask the
+// stale base entry.
 
 fn unwrap_classified_listing(
     result: Option<IncrementalScanStream>,
@@ -927,8 +927,8 @@ fn unwrap_classified_listing(
 ) -> IncrementalListingAgainstBase {
     result
         .expect("expected Some(stream), got None (commits unavailable)")
-        .collect_listing_against_base(base_keys)
-        .expect("collect_listing_against_base succeeded")
+        .into_listing_against_base(base_keys)
+        .expect("into_listing_against_base succeeded")
 }
 
 fn classified_add_count(listing: &IncrementalListingAgainstBase) -> usize {
@@ -992,9 +992,10 @@ async fn classifies_metadata_only_re_adds(
 }
 
 // The pull-then-finalize flow: drive the iterator manually with `next()`, then call
-// `finish_against_base(base_keys)`. This is the documented streaming consumer pattern.
+// `into_summary_against_base(base_keys)`. This is the documented streaming consumer
+// pattern.
 #[tokio::test]
-async fn finish_after_manual_streaming_classifies_duplicates(
+async fn into_summary_after_manual_streaming_classifies_duplicates(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
@@ -1034,7 +1035,7 @@ async fn finish_after_manual_streaming_classifies_duplicates(
     assert_eq!(yielded, 1, "v1 produced one Add batch");
 
     let summary =
-        stream.finish_against_base([key("re-added.parquet"), key("not-in-range.parquet")])?;
+        stream.into_summary_against_base([key("re-added.parquet"), key("not-in-range.parquet")])?;
     assert_eq!(
         summary.duplicate_adds,
         HashSet::from([key("re-added.parquet")]),

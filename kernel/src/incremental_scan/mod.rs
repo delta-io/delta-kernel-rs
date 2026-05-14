@@ -249,15 +249,15 @@ impl IncrementalScanStream {
     /// listing that the range re-adds with new metadata, e.g. OPTIMIZE / liquid
     /// clustering re-tag).
     ///
-    /// Sugar over [`finish`] plus a single pass over `base_keys`. The iterator is
+    /// Sugar over [`into_summary`] plus a single pass over `base_keys`. The iterator is
     /// consumed exactly once; memory stays `O(surviving_adds)`.
     ///
-    /// [`finish`]: Self::finish
-    pub fn finish_against_base(
+    /// [`into_summary`]: Self::into_summary
+    pub fn into_summary_against_base(
         self,
         base_keys: impl IntoIterator<Item = FileActionKey>,
     ) -> DeltaResult<IncrementalScanSummaryAgainstBase> {
-        let summary = self.finish()?;
+        let summary = self.into_summary()?;
         let duplicate_adds: HashSet<FileActionKey> = base_keys
             .into_iter()
             .filter(|k| summary.surviving_adds.contains(k))
@@ -271,11 +271,11 @@ impl IncrementalScanStream {
     }
 
     /// Eager classified helper: collect every surviving Add batch and call
-    /// [`finish_against_base`] against `base_keys`. Returns an
+    /// [`into_summary_against_base`] against `base_keys`. Returns an
     /// [`IncrementalListingAgainstBase`] with the classified summary.
     ///
-    /// [`finish_against_base`]: Self::finish_against_base
-    pub fn collect_listing_against_base(
+    /// [`into_summary_against_base`]: Self::into_summary_against_base
+    pub fn into_listing_against_base(
         mut self,
         base_keys: impl IntoIterator<Item = FileActionKey>,
     ) -> DeltaResult<IncrementalListingAgainstBase> {
@@ -283,7 +283,7 @@ impl IncrementalScanStream {
         for item in self.by_ref() {
             add_files.push(item?);
         }
-        let summary = self.finish_against_base(base_keys)?;
+        let summary = self.into_summary_against_base(base_keys)?;
         Ok(IncrementalListingAgainstBase { summary, add_files })
     }
 }
@@ -343,7 +343,7 @@ impl std::fmt::Debug for IncrementalListing {
 }
 
 /// Cross-snapshot-classified file-key sets, returned by
-/// [`IncrementalScanStream::finish_against_base`].
+/// [`IncrementalScanStream::into_summary_against_base`].
 ///
 /// To advance a delta-on-base file listing cache, append the streamed Add batches to
 /// the delta layer and use the union `removes U duplicate_adds` as the remove-mask
@@ -367,7 +367,7 @@ pub struct IncrementalScanSummaryAgainstBase {
     pub removes: HashSet<FileActionKey>,
 }
 
-/// Eager output of [`IncrementalScanStream::collect_listing_against_base`]: the buffered
+/// Eager output of [`IncrementalScanStream::into_listing_against_base`]: the buffered
 /// Add batches plus the classified summary.
 #[non_exhaustive]
 pub struct IncrementalListingAgainstBase {
