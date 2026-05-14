@@ -50,6 +50,51 @@ jobs:
       - name: format
         run: cargo +nightly fmt -- --check
 
+  # Enforces the supply-chain policy that every crates.io-sourced package in
+  # Cargo.lock was published more than 7 days ago. This gives malicious uploads
+  # a week to be detected and yanked before they land in the lock. See
+  # scripts/upgrade_lockfile.py for the script (which also has update and
+  # bulk-upgrade modes for local use).
+  #
+  # The job ALWAYS runs (so it appears as a status check on every PR) but the
+  # actual policy check only runs when Cargo.toml or Cargo.lock changed. This
+  # matches the dorny/paths-filter pattern used elsewhere in this file.
+  #
+  # --strict makes the check fail closed: if crates.io is unreachable for any
+  # package, the run fails rather than silently treating it as compliant. If
+  # this starts producing too many false positives due to crates.io flakiness,
+  # remove --strict and accept the lenient default.
+  #
+  # TODO(future optimization): the current invocation does a FULL audit, which
+  # fetches publish dates for every crates.io-sourced package in the lock
+  # (~429 GETs in this workspace). That's well within crates.io's accepted load
+  # but is wasteful, since a PR can only introduce too-new versions for crates
+  # that *changed* in the PR. A `--diff <base-ref>` mode that compares the
+  # PR's Cargo.lock against the base branch and audits only the deltas would
+  # drop the typical CI run to ~5-20 requests. Ship current; revisit if
+  # crates.io load becomes a concern or CI runtime matters more.
+  lockfile-age-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            deps:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '**/Cargo.toml'
+              - 'scripts/upgrade_lockfile.py'
+      - name: Install minimal stable (for cargo metadata)
+        if: steps.filter.outputs.deps == 'true'
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          cache: false
+      - name: Enforce no-newer-than-7-days policy on Cargo.lock
+        if: steps.filter.outputs.deps == 'true'
+        run: python3 scripts/upgrade_lockfile.py --check --strict
+
   msrv:
     runs-on: ubuntu-latest
     steps:
