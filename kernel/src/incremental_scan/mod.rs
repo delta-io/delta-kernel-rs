@@ -145,6 +145,11 @@ impl IncrementalScanBuilder {
 /// [`Iterator::next`]; call [`into_summary`] or [`into_listing`] to terminate and recover
 /// the surviving file-key sets.
 ///
+/// A row "survives" the scan over `(base_version, target_version]` if, walking commits
+/// newest-first and keying by `(path, dv_unique_id)`, it is the first occurrence of that
+/// key (first-seen-wins dedup) and no later commit in the range contains a Remove for the
+/// same key.
+///
 /// On error, `next()` yields `Some(Err(_))` once and returns `None` on every subsequent
 /// call; the stream's dedup state is incomplete, so terminal methods then return `Err`
 /// rather than producing a partial summary.
