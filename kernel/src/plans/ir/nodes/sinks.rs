@@ -1,5 +1,4 @@
-//! Sink IR types — relation piping, [`ConsumeByKdf`], file-reader [`LoadSink`], and
-//! file-writer sinks ([`WriteSink`], [`PartitionedWriteSink`]).
+//! Sink IR types — relation piping, [`ConsumeByKdf`], and file-reader [`LoadSink`].
 
 use super::{FileType, OrderingSpec};
 use crate::expressions::ColumnName;
@@ -213,109 +212,11 @@ impl PartialEq for LoadSink {
 
 impl Eq for LoadSink {}
 
-/// On-disk encoding for [`WriteSink`] and [`PartitionedWriteSink`].
-///
-/// This is intentionally separate from read-side [`super::FileType`]: scans
-/// use `Json` for newline-delimited JSON, while writers name the format
-/// `JsonLines` to match the declarative-plan spec vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum WriteFileFormat {
-    Parquet,
-    /// One JSON object per line (newline-delimited / NDJSON).
-    JsonLines,
-}
-
-/// Non-partitioned file write sink: the engine materializes the upstream row
-/// stream to a single destination (interpretation of `destination` — file vs
-/// directory prefix — is executor-specific).
-///
-/// DataFusion-backed executors interpret `format` and `destination` when
-/// lowering the plan; the default in-process executor does not support this sink.
-///
-/// # Equality
-///
-/// [`PartialEq`] compares `destination` and `format` structurally. This differs from
-/// [`LoadSink`], which keys equality on the process-unique [`RelationHandle`]
-/// because Load materializes into a named relation. [`PartitionedWriteSink`]
-/// applies the same structural rule including its partition-key order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WriteSink {
-    /// Output location (e.g. `file://` / `s3://` URL). Exact file-naming
-    /// semantics are left to the engine.
-    pub destination: url::Url,
-    pub format: WriteFileFormat,
-}
-
-impl WriteSink {
-    /// Construct a write sink with the given destination and format.
-    pub fn new(destination: url::Url, format: WriteFileFormat) -> Self {
-        Self {
-            destination,
-            format,
-        }
-    }
-
-    /// Shorthand for [`WriteFileFormat::Parquet`].
-    pub fn parquet(destination: url::Url) -> Self {
-        Self::new(destination, WriteFileFormat::Parquet)
-    }
-
-    /// Shorthand for [`WriteFileFormat::JsonLines`].
-    pub fn json_lines(destination: url::Url) -> Self {
-        Self::new(destination, WriteFileFormat::JsonLines)
-    }
-}
-
-/// Partitioned file write sink (Hive-style `col=value/` layout under a base URL).
-///
-/// The engine groups upstream rows by [`Self::partition_columns`] and emits files
-/// beneath nested directories rooted at [`Self::destination`]. Exact naming,
-/// commit semantics, and overwrite behavior are executor-defined.
-///
-/// Intended for DataFusion (or similar) lowering; the default in-process
-/// executor does not support this sink.
-///
-/// # Equality
-///
-/// [`PartialEq`] compares `destination`, `format`, and `partition_columns`
-/// structurally (including column order). Same rationale as [`WriteSink`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PartitionedWriteSink {
-    /// Base directory / table prefix for partition subdirectories.
-    pub destination: url::Url,
-    pub format: WriteFileFormat,
-    /// Ordered Hive partition key names; must match columns on the upstream row.
-    pub partition_columns: Vec<String>,
-}
-
-impl PartitionedWriteSink {
-    pub fn new(
-        destination: url::Url,
-        format: WriteFileFormat,
-        partition_columns: Vec<String>,
-    ) -> Self {
-        Self {
-            destination,
-            format,
-            partition_columns,
-        }
-    }
-
-    pub fn parquet(destination: url::Url, partition_columns: Vec<String>) -> Self {
-        Self::new(destination, WriteFileFormat::Parquet, partition_columns)
-    }
-
-    pub fn json_lines(destination: url::Url, partition_columns: Vec<String>) -> Self {
-        Self::new(destination, WriteFileFormat::JsonLines, partition_columns)
-    }
-}
-
 /// What the engine does with the terminal row stream.
 ///
 /// Sink shapes include: `Results` (stream batches to the caller), `Relation`
 /// (pipe into another plan), `ConsumeByKdf` (drain into a [`ConsumerKdf`]),
-/// `Load` (per-row file read), `Write` (single-target file write), and
-/// `PartitionedWrite` (Hive-style partitions under a base URL).
+/// and `Load` (per-row file read).
 #[derive(Debug, Clone)]
 pub enum SinkType {
     /// Stream every output batch to the caller.
@@ -336,10 +237,6 @@ pub enum SinkType {
     /// File-reader sink — for each upstream row, read a file and materialize
     /// the result under [`LoadSink::output_relation`]. See [`LoadSink`].
     Load(LoadSink),
-    /// Stream rows to files at a single [`WriteSink::destination`]. See [`WriteSink`].
-    Write(WriteSink),
-    /// Partitioned writer — nested directories under [`PartitionedWriteSink::destination`].
-    PartitionedWrite(PartitionedWriteSink),
 }
 
 impl PartialEq for SinkType {
@@ -349,8 +246,6 @@ impl PartialEq for SinkType {
             (SinkType::Relation(a), SinkType::Relation(b)) => a == b,
             (SinkType::ConsumeByKdf(a), SinkType::ConsumeByKdf(b)) => a.token == b.token,
             (SinkType::Load(a), SinkType::Load(b)) => a == b,
-            (SinkType::Write(a), SinkType::Write(b)) => a == b,
-            (SinkType::PartitionedWrite(a), SinkType::PartitionedWrite(b)) => a == b,
             _ => false,
         }
     }

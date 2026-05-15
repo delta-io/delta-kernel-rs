@@ -4,13 +4,8 @@
 //! the caller), [`SinkType::Relation`](delta_kernel::plans::ir::nodes::SinkType::Relation)
 //! (materialize into an in-memory registry after draining),
 //! [`SinkType::ConsumeByKdf`](delta_kernel::plans::ir::nodes::SinkType::ConsumeByKdf) (observe
-//! batches via a [`delta_kernel::plans::kdf::ConsumerKdf`]),
-//! [`SinkType::Write`](delta_kernel::plans::ir::nodes::SinkType::Write) (single-target Parquet /
-//! newline-delimited JSON via DataFusion file sinks when the runtime provides object-store access
-//! for the destination URL),
-//! and [`SinkType::PartitionedWrite`](delta_kernel::plans::ir::nodes::SinkType::PartitionedWrite)
-//! (Hive-style directories under a destination prefix),
-//! and [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load) (per-row parquet or JSON
+//! batches via a [`delta_kernel::plans::kdf::ConsumerKdf`]), and
+//! [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load) (per-row parquet or JSON
 //! reads via kernel parquet/json handlers into the relation registry).
 //! Unsupported constructs still return
 //! [`delta_kernel::plans::errors::DeltaError`] via [`error::unsupported`].

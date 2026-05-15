@@ -50,10 +50,6 @@
 //! - [`DeclarativePlanNode::into_load`] — file-reader sink: each upstream row describes a file to
 //!   open and read; optional DV masking via [`LoadSink::dv_ref`]. Materializes under a named
 //!   relation handle.
-//! - [`DeclarativePlanNode::into_write`] — single-destination file write sink ([`WriteSink`]);
-//!   IR-only until a DataFusion-backed executor handles it.
-//! - [`DeclarativePlanNode::into_partitioned_write`] — Hive-partitioned file write
-//!   ([`PartitionedWriteSink`]); IR-only for the same reason.
 //! - [`DeclarativePlanNode::consume`] — typed KDF consumer terminal; returns a `(Plan,
 //!   Extractor<O>)` pair whose plan terminates in
 //!   [`SinkType::ConsumeByKdf`](super::nodes::SinkType::ConsumeByKdf) and whose extractor pulls the
@@ -72,8 +68,6 @@
 //! [`with_row_index`]: DeclarativePlanNode::with_row_index
 //! [`with_ordered`]: DeclarativePlanNode::with_ordered
 //! [`window`]: DeclarativePlanNode::window
-//! [`WriteSink`]: super::nodes::WriteSink
-//! [`PartitionedWriteSink`]: super::nodes::PartitionedWriteSink
 
 use std::sync::Arc;
 
@@ -91,7 +85,7 @@ use crate::{DeltaResult, Error, FileMeta};
 ///
 /// Trees are transforms-only: every complete pipeline terminates in a
 /// [`Plan`] via one of the terminal methods (`into_plan`, `into_results`,
-/// `into_relation`, `into_load`, `into_write`, `into_partitioned_write`, `consume_by_kdf`) or in a
+/// `into_relation`, `into_load`, `consume_by_kdf`) or in a
 /// `(Plan, Extractor<O>)` pair via [`DeclarativePlanNode::consume`].
 #[derive(Debug, Clone)]
 pub enum DeclarativePlanNode {
@@ -532,19 +526,6 @@ impl DeclarativePlanNode {
     pub fn into_load(self, sink: LoadSink) -> Plan {
         self.into_plan(SinkType::Load(sink))
     }
-
-    /// Terminal: single-target file write ([`WriteSink`]). Engines like DataFusion
-    /// lower this to native write operators; the default in-process executor does
-    /// not execute write sinks yet.
-    pub fn into_write(self, sink: WriteSink) -> Plan {
-        self.into_plan(SinkType::Write(sink))
-    }
-
-    /// Terminal: partitioned file write ([`PartitionedWriteSink`]). Same executor contract as
-    /// [`Self::into_write`].
-    pub fn into_partitioned_write(self, sink: PartitionedWriteSink) -> Plan {
-        self.into_plan(SinkType::PartitionedWrite(sink))
-    }
 }
 
 // ============================================================================
@@ -602,8 +583,6 @@ fn node_kind_name(node: &DeclarativePlanNode) -> &'static str {
 mod tests {
     use std::any::Any;
 
-    use url::Url;
-
     use super::*;
     use crate::expressions::{ColumnName, Expression};
     use crate::plans::errors::DeltaError;
@@ -646,89 +625,6 @@ mod tests {
     fn union_zero_children_is_empty_struct() {
         let unioned = DeclarativePlanNode::union(Vec::<DeclarativePlanNode>::new()).unwrap();
         assert!(matches!(unioned, DeclarativePlanNode::Union { .. }));
-    }
-
-    #[test]
-    fn write_sink_terminal_emits_write_sink() {
-        let dest = Url::parse("file:///tmp/out").unwrap();
-        let sink = WriteSink::parquet(dest.clone());
-        let plan = DeclarativePlanNode::scan_json(vec![], simple_schema()).into_write(sink);
-        match plan.sink.sink_type {
-            SinkType::Write(w) => {
-                assert_eq!(w.destination, dest);
-                assert_eq!(w.format, WriteFileFormat::Parquet);
-            }
-            other => panic!("expected Write sink, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn write_sink_equality_is_structural() {
-        let u = Url::parse("s3://bucket/prefix/file.parquet").unwrap();
-        let a = WriteSink::parquet(u.clone());
-        let b = WriteSink::new(u, WriteFileFormat::Parquet);
-        assert_eq!(a, b);
-        assert_eq!(SinkType::Write(a.clone()), SinkType::Write(b.clone()));
-        assert_ne!(
-            SinkType::Write(WriteSink::parquet(Url::parse("file:///a").unwrap())),
-            SinkType::Write(WriteSink::parquet(Url::parse("file:///b").unwrap())),
-        );
-        assert_ne!(
-            SinkType::Write(WriteSink::parquet(Url::parse("file:///x").unwrap())),
-            SinkType::Write(WriteSink::json_lines(Url::parse("file:///x").unwrap())),
-        );
-    }
-
-    #[test]
-    fn partitioned_write_sink_terminal_emits_partitioned_sink() {
-        let dest = Url::parse("file:///tmp/table").unwrap();
-        let sink = PartitionedWriteSink::parquet(dest.clone(), vec!["dt".into(), "region".into()]);
-        let plan =
-            DeclarativePlanNode::scan_json(vec![], simple_schema()).into_partitioned_write(sink);
-        match plan.sink.sink_type {
-            SinkType::PartitionedWrite(p) => {
-                assert_eq!(p.destination, dest);
-                assert_eq!(p.format, WriteFileFormat::Parquet);
-                assert_eq!(
-                    p.partition_columns,
-                    vec!["dt".to_string(), "region".to_string()]
-                );
-            }
-            other => panic!("expected PartitionedWrite sink, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn partitioned_write_sink_equality_is_structural() {
-        let dest = Url::parse("s3://bucket/root").unwrap();
-        let cols = vec!["a".into(), "b".into()];
-        let a = PartitionedWriteSink::parquet(dest.clone(), cols.clone());
-        let b = PartitionedWriteSink::new(dest, WriteFileFormat::Parquet, cols);
-        assert_eq!(a, b);
-        assert_eq!(
-            SinkType::PartitionedWrite(a.clone()),
-            SinkType::PartitionedWrite(b.clone())
-        );
-        assert_ne!(
-            SinkType::PartitionedWrite(PartitionedWriteSink::parquet(
-                Url::parse("file:///x").unwrap(),
-                vec!["p".into()],
-            )),
-            SinkType::PartitionedWrite(PartitionedWriteSink::parquet(
-                Url::parse("file:///x").unwrap(),
-                vec!["q".into()],
-            )),
-        );
-        assert_ne!(
-            SinkType::PartitionedWrite(PartitionedWriteSink::parquet(
-                Url::parse("file:///z").unwrap(),
-                vec![],
-            )),
-            SinkType::PartitionedWrite(PartitionedWriteSink::json_lines(
-                Url::parse("file:///z").unwrap(),
-                vec![],
-            )),
-        );
     }
 
     #[test]

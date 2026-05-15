@@ -2,8 +2,7 @@
 //!
 //! Sinks: [`SinkType::Results`] (collect), [`SinkType::Relation`] (materialize into
 //! [`RelationBatchRegistry`]), [`SinkType::ConsumeByKdf`] (drain via [`KernelConsumeByKdfExec`]),
-//! [`SinkType::Write`] (single-file Parquet / JsonLines), [`SinkType::PartitionedWrite`]
-//! (Hive-style directories), [`SinkType::Load`] (per-row parquet/json kernel-handler reads).
+//! [`SinkType::Load`] (per-row parquet/json kernel-handler reads).
 //!
 //! Leaves: `Values`, `Scan`, `FileListing`, `RelationRef`.
 
@@ -23,7 +22,7 @@ use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::ExecutionPlan;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::{JoinType, RelationHandle, SinkType, WriteSink};
+use delta_kernel::plans::ir::nodes::{JoinType, RelationHandle, SinkType};
 use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
 use delta_kernel::plans::kdf::FinishedHandle;
 use delta_kernel::plans::state_machines::framework::phase_state::PhaseState;
@@ -32,7 +31,7 @@ use delta_kernel::Engine;
 
 use crate::exec::{
     build_literal_exec, build_relation_ref_exec, FileListingExec, KernelAssertExec,
-    KernelConsumeByKdfExec, KernelPartitionedWriteExec, OrderedUnionExec, RelationBatchRegistry,
+    KernelConsumeByKdfExec, OrderedUnionExec, RelationBatchRegistry,
 };
 
 pub mod expr_translator;
@@ -40,7 +39,6 @@ mod json_parse;
 mod load_sink;
 pub mod logical;
 pub mod scan;
-mod write_sink;
 pub(crate) use load_sink::physical_read_schema;
 
 /// Context shared by the compiler for leaf nodes that need runtime side state.
@@ -95,14 +93,6 @@ pub fn compile_plan(
             )?))
         }
         SinkType::Load(_) => load_sink::compile_load_terminal(plan, ctx),
-        SinkType::Write(write) => compile_write_terminal(&plan.root, ctx, write),
-        SinkType::PartitionedWrite(sink) => {
-            let inner = compile_declarative_node(&plan.root, ctx)?;
-            Ok(Arc::new(KernelPartitionedWriteExec::try_new(
-                inner,
-                sink.clone(),
-            )?))
-        }
     }
 }
 
@@ -115,15 +105,6 @@ pub fn compile_plan_logical(
     ctx: &CompileContext,
 ) -> Result<Option<LogicalPlan>, DeltaError> {
     logical::compile_plan_logical(plan, ctx)
-}
-
-fn compile_write_terminal(
-    root: &DeclarativePlanNode,
-    ctx: &CompileContext,
-    sink: &WriteSink,
-) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
-    let inner = compile_declarative_node(root, ctx)?;
-    write_sink::compile_write_sink(inner, sink)
 }
 
 pub(super) fn compile_declarative_node(

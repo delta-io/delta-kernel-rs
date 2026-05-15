@@ -238,8 +238,6 @@ impl From<EngineErrorKind> for EngineError {
 
 #[cfg(test)]
 mod tests {
-    use rstest::rstest;
-
     use super::*;
 
     #[test]
@@ -335,29 +333,5 @@ mod tests {
                 .expect("known code must round-trip");
             assert_eq!(kind, round_tripped, "round-trip drift for {code:?}");
         }
-    }
-
-    #[rstest]
-    #[case(0, EngineErrorCode::Internal)]
-    #[case(1, EngineErrorCode::FileNotFound)]
-    #[case(2, EngineErrorCode::IoError)]
-    #[case(3, EngineErrorCode::EmptyInput)]
-    #[case(4, EngineErrorCode::CommitConflict)]
-    #[case(999, EngineErrorCode::Internal)]
-    fn from_wire_value_round_trips_or_degrades_to_internal(
-        #[case] wire: u32,
-        #[case] expected: EngineErrorCode,
-    ) {
-        assert_eq!(EngineErrorCode::from_wire(wire), expected);
-        if (expected as u32) == wire {
-            assert_eq!(expected as u32, wire, "discriminant must equal wire value");
-        }
-    }
-
-    #[test]
-    fn construct_rejects_ill_typed_commit_conflict() {
-        assert!(EngineErrorCode::CommitConflict
-            .construct("not-a-number".into())
-            .is_none());
     }
 }

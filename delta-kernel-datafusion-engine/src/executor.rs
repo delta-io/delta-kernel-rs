@@ -6,23 +6,12 @@
 //! leaf. [`SinkType::ConsumeByKdf`](delta_kernel::plans::ir::nodes::SinkType::ConsumeByKdf) drains
 //! through a [`KernelConsumeByKdfExec`](crate::exec::KernelConsumeByKdfExec); harvest the finalized
 //! handle with [`DataFusionExecutor::take_last_kdf_finished`] after fully draining the stream.
-//! [`SinkType::Write`](delta_kernel::plans::ir::nodes::SinkType::Write) lowers to DataFusion file
-//! sinks (`ParquetSink` / `JsonSink`) behind `DataSinkExec` in single-file mode. Bridging Parquet
-//! footer statistics into Delta-style `Add.stats` (`numRecords`, min/max, ...) is not implemented
-//! yet.
-//! [`SinkType::PartitionedWrite`](delta_kernel::plans::ir::nodes::SinkType::PartitionedWrite)
-//! (`KernelPartitionedWriteExec`) writes Hive-style partitions under a `file://` URL and yields no
-//! output batches once drained.
 //! [`SinkType::Load`](delta_kernel::plans::ir::nodes::SinkType::Load) materializes per-row parquet
 //! or JSON reads via [`KernelLoadSinkExec`](crate::exec::KernelLoadSinkExec) and the kernel's
 //! parquet/json handlers.
 //!
 //! [`SinkType::ConsumeByKdf`] finalized handles submit into [`PhaseState`] during
 //! [`Self::execute_phase_operation`] using [`crate::compile::CompileContext::phase_state`].
-//! Classic checkpoint parquet materialization is wired via
-//! [`Self::checkpoint_write_classic_parquet_and_finalize`] (kernel
-//! [`delta_kernel::plans::state_machines::df::checkpoint_write`] plans + SM phase
-//! `checkpoint_parquet_write`).
 
 use std::sync::{Arc, Mutex};
 
@@ -200,16 +189,6 @@ impl DataFusionExecutor {
         plan: &Plan,
         ctx: &CompileContext,
     ) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
-        // SinkType::Write / SinkType::PartitionedWrite always go through the physical compile
-        // path: their lowering is bound to DataSinkExec / KernelPartitionedWriteExec which the
-        // logical compiler does not model. Read-path sinks (Results/Relation/ConsumeByKdf/Load)
-        // prefer the logical path.
-        if matches!(
-            plan.sink.sink_type,
-            SinkType::Write(_) | SinkType::PartitionedWrite(_)
-        ) {
-            return self.compile_plan(plan);
-        }
         if let Some(logical) = compile_plan_logical(plan, ctx)? {
             let state = self.session_ctx.state();
             let optimized = state.optimize(&logical).map_err(datafusion_err_to_delta)?;
@@ -281,16 +260,12 @@ impl DataFusionExecutor {
                         physical_read_schema(sink)?,
                     )?))
                 }
-                (_, Ok(_)) => Err(crate::error::unsupported(
-                    "logical compile returned plan for unsupported sink wrapper",
-                )),
                 (_, Err(e)) => Err(e),
             };
         }
-        // Logical compiler doesn't yet cover this plan shape (e.g. ordered Union, certain
-        // Write paths). Fall back to the physical compile path. User directive: Window MUST
-        // be logical-only, and the physical compile arm explicitly errors out for Window —
-        // anything else falls back here.
+        // Logical compiler doesn't yet cover this plan shape (e.g. ordered Union). Fall back to
+        // the physical compile path. User directive: Window MUST be logical-only, and the
+        // physical compile arm explicitly errors out for Window — anything else falls back here.
         self.compile_plan(plan)
     }
 
@@ -493,65 +468,6 @@ impl DataFusionExecutor {
                 AdvanceResult::Done(v) => return Ok(v),
             }
         }
-    }
-
-    /// Drive [`delta_kernel::plans::state_machines::df::insert_write_sm`] to completion.
-    pub async fn drive_insert_write_sm(&self, plan: Plan) -> Result<(), DeltaError> {
-        let sm = delta_kernel::plans::state_machines::df::insert_write_sm(plan)?;
-        self.drive_coroutine_sm(sm).await
-    }
-
-    /// Drive [`delta_kernel::plans::state_machines::df::checkpoint_classic_parquet_write_sm`] to
-    /// completion.
-    pub async fn drive_checkpoint_classic_parquet_write_sm(
-        &self,
-        plan: Plan,
-    ) -> Result<(), DeltaError> {
-        let sm =
-            delta_kernel::plans::state_machines::df::checkpoint_classic_parquet_write_sm(plan)?;
-        self.drive_coroutine_sm(sm).await
-    }
-
-    /// Classic single-file checkpoint parquet via declarative [`Plan`] plus `_last_checkpoint`
-    /// finalize.
-    ///
-    /// Requires this executor's [`Engine`] to match the [`CheckpointWriter`] snapshot storage (same
-    /// as [`Snapshot::checkpoint`](delta_kernel::Snapshot::checkpoint)).
-    ///
-    /// `num_sidecars` stays `0` until multipart checkpoint shard plans land (see kernel
-    /// `plans::state_machines::df::checkpoint_write` module docs).
-    pub async fn checkpoint_write_classic_parquet_and_finalize(
-        &self,
-        writer: delta_kernel::checkpoint::CheckpointWriter,
-    ) -> Result<(), DeltaError> {
-        use delta_kernel::checkpoint::LastCheckpointHintStats;
-        use delta_kernel::plans::state_machines::df::{
-            checkpoint_classic_parquet_write_plan,
-            prepare_classic_checkpoint_parquet_materialization,
-        };
-
-        let engine = self.engine.as_ref();
-        let (handle, batches, dest, state) =
-            prepare_classic_checkpoint_parquet_materialization(engine, &writer)
-                .map_err(|e| crate::error::internal_error(e.to_string()))?;
-        self.relation_registry.register(handle.id, batches);
-        let plan = checkpoint_classic_parquet_write_plan(handle, dest.clone());
-        self.drive_checkpoint_classic_parquet_write_sm(plan).await?;
-        let meta = engine
-            .storage_handler()
-            .head(&dest)
-            .map_err(|e| crate::error::internal_error(e.to_string()))?;
-        let state = std::sync::Arc::into_inner(state).ok_or_else(|| {
-            crate::error::internal_error(
-                "checkpoint reconciliation state Arc still referenced after draining checkpoint iterator",
-            )
-        })?;
-        let stats = LastCheckpointHintStats::from_reconciliation_state(state, meta.size, 0)
-            .map_err(|e| crate::error::internal_error(e.to_string()))?;
-        writer
-            .finalize(engine, &stats)
-            .map_err(|e| crate::error::internal_error(e.to_string()))?;
-        Ok(())
     }
 
     /// Compile and execute partition `0`.

@@ -13,13 +13,5 @@
 
 #![allow(dead_code)]
 
-// DF-specific SMs depend on ArrowEngineData conversion helpers from `crate::engine`,
-// which are only compiled when an Arrow/default-engine feature is enabled.
-#[cfg(any(
-    feature = "default-engine-native-tls",
-    feature = "default-engine-rustls",
-    feature = "arrow-conversion"
-))]
-pub mod df;
 pub mod framework;
 pub mod fsr;
