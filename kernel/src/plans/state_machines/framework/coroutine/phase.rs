@@ -4,8 +4,8 @@
 //! Three pieces, all kernel-internal:
 //!
 //! - [`PhaseYield`] / [`PhaseResume`] / [`PhaseCo`] — the typed protocol flowing through the
-//!   coroutine. Each yield is a single [`PhaseOperation`] (wrapped in [`Arc`] for cheap clones)
-//!   plus a static phase name; each resume is a `Result<PhaseState, EngineError>`.
+//!   [`genawaiter2`] generator. Each yield is a single [`PhaseOperation`] (wrapped in [`Arc`] for
+//!   cheap clones) plus a static phase name; each resume is a `Result<PhaseState, EngineError>`.
 //! - [`Phase`] — the async surface SM authors use. The single entry point is [`Phase::execute`],
 //!   which yields one operation and returns the resulting [`PhaseState`] (or an [`EngineError`]).
 //!
@@ -21,7 +21,8 @@
 
 use std::sync::Arc;
 
-use super::generator::Co;
+use genawaiter2::sync::Co;
+
 use crate::plans::state_machines::framework::engine_error::EngineError;
 use crate::plans::state_machines::framework::phase_operation::PhaseOperation;
 use crate::plans::state_machines::framework::phase_state::PhaseState;
@@ -41,7 +42,19 @@ pub(crate) struct PhaseYield {
 
 /// Value the driver passes back to the coroutine on resume. Wraps the
 /// engine outcome for the most recent [`PhaseYield::operation`].
+///
+/// The initial drive in [`super::driver::CoroutineSM::new`] passes a stub
+/// (`Ok(PhaseState::empty())`) — the body's first `Phase::execute` yields
+/// before awaiting, so that stub is never observed.
 pub(crate) struct PhaseResume(pub Result<PhaseState, EngineError>);
+
+impl PhaseResume {
+    /// Stub used only for the initial drive to the first yield. See
+    /// [`PhaseResume`] for the invariant that makes this safe.
+    pub(crate) fn stub() -> Self {
+        Self(Ok(PhaseState::empty()))
+    }
+}
 
 impl std::fmt::Debug for PhaseResume {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -52,22 +65,23 @@ impl std::fmt::Debug for PhaseResume {
     }
 }
 
-/// Coroutine handle used inside phase bodies. Thin alias over the generic
-/// [`Co`] from the [`generator`](super::generator) shim.
+/// Coroutine handle used inside phase bodies. Thin alias over [`genawaiter2`]'s
+/// sync [`Co`].
 pub(crate) type PhaseCo = Co<PhaseYield, PhaseResume>;
 
 /// Async surface SM authors call. Holds a mutable borrow of the coroutine
 /// handle; lives only for the duration of one phase body.
 pub(crate) struct Phase<'a>(pub(crate) &'a mut PhaseCo);
 
-impl<'a> Phase<'a> {
+impl Phase<'_> {
     /// Hand `operation` to the engine and await its outcome.
     ///
     /// Returns the populated [`PhaseState`] on success or the engine's
     /// [`EngineError`] on failure. Errors are surfaced raw so SM bodies
     /// can pattern-match on
     /// [`EngineError::kind`](super::super::engine_error::EngineError::kind);
-    /// translation to [`DeltaError`] is the SM's responsibility.
+    /// translation to [`DeltaError`](crate::plans::errors::DeltaError) is the
+    /// SM's responsibility.
     pub(crate) async fn execute(
         &mut self,
         operation: PhaseOperation,
