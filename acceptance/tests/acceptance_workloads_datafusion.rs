@@ -275,15 +275,18 @@ fn acceptance_workloads_datafusion_test(spec_path: &Path) -> datatest_stable::Re
         test_utils::create_default_engine(&table_root).expect("Failed to create engine");
 
     // Keep DataFusion comparison scoped to workloads that pass in kernel's default engine harness.
-    // This makes DataFusion ignore the same failing set as kernel.
-    if execute_and_validate_workload(
+    // This makes DataFusion ignore the same failing set as kernel. Log the skip so output remains
+    // diagnosable when DataFusion silently regresses on workloads kernel handles.
+    if let Err(e) = execute_and_validate_workload(
         Arc::clone(&engine),
         &table_root,
         &test_case.spec,
         &test_case.expected_dir(),
-    )
-    .is_err()
-    {
+    ) {
+        eprintln!(
+            "SKIP DataFusion workload '{}': kernel-default-engine also fails ({e})",
+            test_case.workload_name
+        );
         return Ok(());
     }
 
