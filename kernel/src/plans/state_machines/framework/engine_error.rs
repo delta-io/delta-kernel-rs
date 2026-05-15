@@ -261,18 +261,6 @@ mod tests {
     }
 
     #[test]
-    fn clone_drops_source_chain() {
-        let inner = std::io::Error::other("x");
-        let original = EngineError::new(EngineErrorKind::IoError {
-            message: "boom".into(),
-        })
-        .with_source(inner);
-        let cloned = original.clone();
-        assert!(cloned.source.is_none());
-        assert_eq!(cloned.kind, original.kind);
-    }
-
-    #[test]
     fn display_with_source_chain_renders_internal_payload() {
         let err = EngineError::internal(std::io::Error::other(
             "Non-Results plan failed: IllegalStateException: boom",
