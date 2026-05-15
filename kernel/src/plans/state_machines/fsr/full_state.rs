@@ -72,6 +72,7 @@ use crate::actions::{
 use crate::expressions::{BinaryExpressionOp, ColumnName, Expression, Predicate, Scalar};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
+use crate::plans::ir::expr_ext::{any_of, col, lit, ExpressionExt, PredicateExt};
 use crate::plans::ir::nodes::{
     DvRef, FileFormat, FileType, JoinHint, JoinNode, JoinType, LoadSink, OrderingSpec,
     RelationHandle, ScanFileColumns, WindowFunction,
@@ -1105,35 +1106,21 @@ fn checkpoint_manifest_scan_schema(include_sidecar: bool) -> SchemaRef {
 ///
 /// `txn_expiration_cutoff` is `None` when `delta.setTransactionRetentionDuration` is unset — txn
 /// rows are not filtered by age.
-fn retention_filter(
-    min_file_retention_timestamp: i64,
-    txn_expiration_cutoff: Option<i64>,
-) -> Predicate {
-    let removal_ts = Expression::coalesce([
-        Expression::column(["remove", "deletionTimestamp"]),
-        Expression::literal(Scalar::Long(0)),
-    ]);
-    let remove_ok = Predicate::or(
-        Predicate::is_null(Expression::column(["remove"])),
-        Predicate::gt(
-            removal_ts,
-            Expression::literal(Scalar::Long(min_file_retention_timestamp)),
-        ),
-    );
-
-    let txn_ok = match txn_expiration_cutoff {
+fn retention_filter(min_file_ts: i64, txn_expiry: Option<i64>) -> Predicate {
+    let remove_ok = col("remove")
+        .is_null()
+        .or(col(("remove", "deletionTimestamp"))
+            .or_lit(0i64)
+            .gt(lit(min_file_ts)));
+    let txn_ok = match txn_expiry {
         None => Predicate::literal(true),
-        Some(cutoff) => Predicate::or_from([
-            Predicate::is_null(Expression::column(["txn"])),
-            Predicate::is_null(Expression::column(["txn", "lastUpdated"])),
-            Predicate::gt(
-                Expression::column(["txn", "lastUpdated"]),
-                Expression::literal(Scalar::Long(cutoff)),
-            ),
+        Some(cutoff) => any_of([
+            col("txn").is_null(),
+            col(("txn", "lastUpdated")).is_null(),
+            col(("txn", "lastUpdated")).gt(lit(cutoff)),
         ]),
     };
-
-    Predicate::and(remove_ok, txn_ok)
+    remove_ok.and(txn_ok)
 }
 
 fn action_identity_projection() -> Vec<Arc<Expression>> {
@@ -1144,29 +1131,23 @@ fn action_identity_projection() -> Vec<Arc<Expression>> {
 }
 
 fn fsr_dedup_key() -> Expression {
-    let null_str = || Expression::literal(Scalar::Null(DataType::STRING));
+    let null_str = || lit(Scalar::Null(DataType::STRING));
     let arm = |kind: &str, id1: Expression, id2: Expression, id3: Expression| {
-        Expression::array(vec![
-            Expression::literal(Scalar::String(kind.into())),
-            id1,
-            id2,
-            id3,
-        ])
+        Expression::array(vec![lit(kind), id1, id2, id3])
     };
-    let is_not_null =
-        |path: &[&str]| Predicate::is_not_null(Expression::column(path.iter().copied()));
-    let coalesce = |path: &[&str]| {
-        Expression::coalesce([
-            Expression::column(["add"].into_iter().chain(path.iter().copied())),
-            Expression::column(["remove"].into_iter().chain(path.iter().copied())),
-        ])
+    // For file rows, the identity components come from either add or remove (one is non-null per
+    // row); coalesce picks whichever side carries the value.
+    let file_field = |suffix: &[&str]| {
+        let add_path = ["add"].into_iter().chain(suffix.iter().copied());
+        let remove_path = ["remove"].into_iter().chain(suffix.iter().copied());
+        col(ColumnName::new(add_path)).or_else(col(ColumnName::new(remove_path)))
     };
 
     let file_arm = arm(
         "file",
-        coalesce(&["path"]),
-        coalesce(&["deletionVector", "storageType"]),
-        coalesce(&["deletionVector", "pathOrInlineDv"]),
+        file_field(&["path"]),
+        file_field(&["deletionVector", "storageType"]),
+        file_field(&["deletionVector", "pathOrInlineDv"]),
     );
     let proto_arm = arm(PROTOCOL_NAME, null_str(), null_str(), null_str());
     // Metadata is a singleton table state action: latest row wins regardless of prior id.
@@ -1174,18 +1155,18 @@ fn fsr_dedup_key() -> Expression {
     // Domain metadata is keyed by domain; newer rows replace older configs for that domain.
     let domain_arm = arm(
         DOMAIN_METADATA_NAME,
-        Expression::column(["domainMetadata", "domain"]),
+        col(("domainMetadata", "domain")),
         null_str(),
         null_str(),
     );
     let txn_arm = arm(
         SET_TRANSACTION_NAME,
-        Expression::column(["txn", "appId"]),
+        col(("txn", "appId")),
         null_str(),
         null_str(),
     );
 
-    let null_list = Expression::literal(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
+    let null_list = lit(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
         DataType::STRING,
         true,
     )))));
@@ -1193,16 +1174,15 @@ fn fsr_dedup_key() -> Expression {
     Expression::case_when(
         vec![
             (
-                Predicate::or(
-                    is_not_null(&["add", "path"]),
-                    is_not_null(&["remove", "path"]),
-                ),
+                col(("add", "path"))
+                    .is_not_null()
+                    .or(col(("remove", "path")).is_not_null()),
                 file_arm,
             ),
-            (is_not_null(&["protocol"]), proto_arm),
-            (is_not_null(&["metaData", "id"]), meta_arm),
-            (is_not_null(&["domainMetadata"]), domain_arm),
-            (is_not_null(&["txn"]), txn_arm),
+            (col("protocol").is_not_null(), proto_arm),
+            (col(("metaData", "id")).is_not_null(), meta_arm),
+            (col("domainMetadata").is_not_null(), domain_arm),
+            (col("txn").is_not_null(), txn_arm),
         ],
         null_list,
     )
@@ -1520,13 +1500,13 @@ fn augmented_action_schema(with_version: bool) -> Result<SchemaRef, DeltaError> 
 }
 
 fn fsr_row_has_identity_predicate() -> Predicate {
-    Predicate::or_from([
-        Predicate::is_not_null(Expression::column(["add", "path"])),
-        Predicate::is_not_null(Expression::column(["remove", "path"])),
-        Predicate::is_not_null(Expression::column(["protocol", "minReaderVersion"])),
-        Predicate::is_not_null(Expression::column(["metaData", "id"])),
-        Predicate::is_not_null(Expression::column(["domainMetadata", "domain"])),
-        Predicate::is_not_null(Expression::column(["txn", "appId"])),
+    any_of([
+        col(("add", "path")).is_not_null(),
+        col(("remove", "path")).is_not_null(),
+        col(("protocol", "minReaderVersion")).is_not_null(),
+        col(("metaData", "id")).is_not_null(),
+        col(("domainMetadata", "domain")).is_not_null(),
+        col(("txn", "appId")).is_not_null(),
     ])
 }
 
