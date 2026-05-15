@@ -820,37 +820,36 @@ fn path_under_log_root(log_root: &Url, file: &Url) -> Result<String, DeltaError>
     Ok(suffix.trim_start_matches('/').to_string())
 }
 
-fn action_read_schema() -> SchemaRef {
-    // Transport schema used while replaying/unioning action rows from heterogeneous sources
-    // (checkpoint parquet/json, sidecars, commit-json loads). Nested fields are nullable to avoid
-    // planner-time cast failures during engine materialization.
-    let relax_nested =
-        |schema: StructType| schema_with_all_fields_nullable(&schema).unwrap_or(schema);
+/// Action schema for the action-replay stream.
+///
+/// When `relaxed_nesting` is true (transport schema used while replaying / unioning action rows
+/// from heterogeneous sources), nested fields are made all-nullable to avoid planner-time cast
+/// failures during engine materialization. When false, the strict per-action `ToSchema` is used
+/// (kernel-visible output schema).
+fn action_schema(relaxed_nesting: bool) -> SchemaRef {
+    let relax = |s: StructType| {
+        if relaxed_nesting {
+            schema_with_all_fields_nullable(&s).unwrap_or(s)
+        } else {
+            s
+        }
+    };
     Arc::new(StructType::new_unchecked([
-        StructField::nullable(ADD_NAME, relax_nested(Add::to_schema())),
-        StructField::nullable(REMOVE_NAME, relax_nested(Remove::to_schema())),
-        StructField::nullable(PROTOCOL_NAME, relax_nested(Protocol::to_schema())),
-        StructField::nullable(METADATA_NAME, relax_nested(Metadata::to_schema())),
-        StructField::nullable(
-            DOMAIN_METADATA_NAME,
-            relax_nested(DomainMetadata::to_schema()),
-        ),
-        StructField::nullable(
-            SET_TRANSACTION_NAME,
-            relax_nested(SetTransaction::to_schema()),
-        ),
+        StructField::nullable(ADD_NAME, relax(Add::to_schema())),
+        StructField::nullable(REMOVE_NAME, relax(Remove::to_schema())),
+        StructField::nullable(PROTOCOL_NAME, relax(Protocol::to_schema())),
+        StructField::nullable(METADATA_NAME, relax(Metadata::to_schema())),
+        StructField::nullable(DOMAIN_METADATA_NAME, relax(DomainMetadata::to_schema())),
+        StructField::nullable(SET_TRANSACTION_NAME, relax(SetTransaction::to_schema())),
     ]))
 }
 
+fn action_read_schema() -> SchemaRef {
+    action_schema(true)
+}
+
 fn action_output_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable(ADD_NAME, Add::to_schema()),
-        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
-        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
-    ]))
+    action_schema(false)
 }
 
 fn path_size_version_schema() -> SchemaRef {
