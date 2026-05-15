@@ -1,6 +1,6 @@
 //! Integration tests for CRC (version checksum) file-based APIs on Snapshot.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -796,18 +796,31 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> DeltaResu
         Some("bar".to_string())
     );
 
-    // Miss on a domain present in older commits: "zip" is NOT in this Partial cache; falls
-    // through to log replay, which returns the entry from v0.
+    // Miss: "zip" is not in this Partial cache; FailingEngine panics, real engine finds it.
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            snapshot_v1.get_domain_metadata("zip", &FailingEngine).ok()
+        }))
+        .is_err()
+    );
     assert_eq!(
         snapshot_v1.get_domain_metadata("zip", engine.as_ref())?,
         Some("zap0".to_string())
     );
 
-    // Miss on a domain that does not exist anywhere: falls through, returns None.
+    // Miss on a nonexistent domain falls through and returns None.
     assert_eq!(
         snapshot_v1.get_domain_metadata("nonexistent", engine.as_ref())?,
         None
     );
+
+    // Multi-key filter with a mixed hit ("foo") and miss ("zip"): the first miss
+    // short-circuits the cache lookup and the full result comes from log replay.
+    let filter = HashSet::from(["foo", "zip"]);
+    let map = snapshot_v1.get_domain_metadatas_internal(engine.as_ref(), Some(&filter))?;
+    assert_eq!(map.len(), 2);
+    assert_eq!(map["foo"].configuration(), "bar");
+    assert_eq!(map["zip"].configuration(), "zap0");
 
     // "All" queries against Partial always fall through. The replay-derived set must
     // include BOTH entries.
