@@ -94,6 +94,7 @@ impl<'a> CheckpointDeduplicator<'a> {
     pub(crate) fn try_new(
         seen_file_keys: &'a HashSet<FileActionKey>,
         add_path_index: usize,
+        add_size_index: usize,
         add_dv_start_index: usize,
     ) -> DeltaResult<Self> {
         Ok(CheckpointDeduplicator {

@@ -133,10 +133,11 @@ impl ScanLogReplayProcessor {
     // `selected_column_names_and_types()`
     const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
     const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
-    const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
-    const BASE_ROW_ID_INDEX: usize = 5; // Position of add.baseRowId in getters
-    const REMOVE_PATH_INDEX: usize = 6; // Position of "remove.path" in getters
-    const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
+    const ADD_SIZE_INDEX: usize = 2; // Position of "add.size" in getters
+    const ADD_DV_START_INDEX: usize = 3; // Start position of add deletion vector columns
+    const BASE_ROW_ID_INDEX: usize = 6; // Position of add.baseRowId in getters
+    const REMOVE_PATH_INDEX: usize = 7; // Position of "remove.path" in getters
+    const REMOVE_DV_START_INDEX: usize = 8; // Start position of remove deletion vector columns
 
     /// Create a new [`ScanLogReplayProcessor`] instance
     pub(crate) fn new(
@@ -492,6 +493,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
             let types_and_names = vec![
                 (STRING, column_name!("add.path")),
                 (ss_map, column_name!("add.partitionValues")),
+                (LONG, column_name!("add.size")),
                 (STRING, column_name!("add.deletionVector.storageType")),
                 (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
                 (INTEGER, column_name!("add.deletionVector.offset")),
@@ -510,7 +512,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So we only need to examine the adds here.
-            (&names[..6], &types[..6])
+            (&names[..7], &types[..7])
         }
     }
 
@@ -518,7 +520,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         let start = std::time::Instant::now();
 
         let is_log_batch = self.deduplicator.is_log_batch();
-        let expected_getters = if is_log_batch { 10 } else { 6 };
+        let expected_getters = if is_log_batch { 11 } else { 7 };
         require!(
             getters.len() == expected_getters,
             Error::InternalError(format!(
@@ -755,6 +757,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         let deduplicator = CheckpointDeduplicator::try_new(
             &self.seen_file_keys,
             Self::ADD_PATH_INDEX,
+            Self::ADD_SIZE_INDEX,
             Self::ADD_DV_START_INDEX,
         )?;
         let mut visitor = AddRemoveDedupVisitor::new(

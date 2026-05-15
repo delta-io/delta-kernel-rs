@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn test_checkpoint_extract_file_action_add() -> DeltaResult<()> {
         let seen = HashSet::new();
-        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2)?;
+        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3)?;
 
         let mut mock_add = MockGetData::new();
         mock_add.add_string(0, "add.path", "checkpoint_file.parquet");
@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn test_checkpoint_extract_file_action_with_deletion_vector() -> DeltaResult<()> {
         let seen = HashSet::new();
-        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2)?;
+        let deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 1, 2)?;
 
         let mut mock_dv = MockGetData::new();
         mock_dv.add_string(0, "add.path", "file_with_dv.parquet");
@@ -693,7 +693,7 @@ mod tests {
             Some("dv123".to_string()),
         ));
 
-        let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2)?;
+        let mut deduplicator = CheckpointDeduplicator::try_new(&seen, 0, 2, 3)?;
 
         // File modified in commit - should be filtered from checkpoint
         let commit_modified = FileActionKey::new("modified_in_commit.parquet", None);
