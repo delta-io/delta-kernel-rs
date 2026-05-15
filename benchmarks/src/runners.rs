@@ -14,8 +14,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use delta_kernel::actions::{Metadata, Protocol};
-use delta_kernel::arrow::array::{Array, AsArray, Int64Array};
-use delta_kernel::arrow::util::display::array_value_to_string;
+use delta_kernel::arrow::array::{Array, AsArray};
 use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expression;
 use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel::engine::default::DefaultEngine;
@@ -23,7 +22,7 @@ use delta_kernel::expressions::{Expression, PredicateRef, UnaryExpressionOp};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::schema::DataType as KernelDataType;
-use delta_kernel::{DeltaResult, Engine, Error, FileMeta, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use delta_kernel_unity_catalog::UCKernelClient;
 use unity_catalog_delta_client_api::{Error as UcApiError, Operation};
@@ -432,86 +431,6 @@ pub struct ReadDataPlansRunner {
     projected_schema: Option<delta_kernel::schema::SchemaRef>,
 }
 
-async fn collect_fsr_file_metas(
-    snapshot: Arc<Snapshot>,
-    engine: Arc<dyn Engine>,
-    table_root: &Url,
-) -> DeltaResult<Vec<FileMeta>> {
-    let executor = DataFusionExecutor::try_new_with_engine(Arc::clone(&engine))
-        .map_err(|e| Error::generic(format!("create DataFusionExecutor: {e}")))?;
-    let sm = match snapshot.full_state() {
-        Ok(sm) => sm,
-        Err(e) => {
-            let detail = e.to_string();
-            if detail.contains("coroutine completed during start without yielding any work") {
-                return Ok(Vec::new());
-            }
-            return Err(e);
-        }
-    };
-    let ((), fsr_batches) = match executor.drive_coroutine_sm_collecting_results(sm).await {
-        Ok(result) => result,
-        Err(e) => {
-            let detail = e.to_string();
-            if detail.contains("coroutine completed during start without yielding any work") {
-                return Ok(Vec::new());
-            }
-            return Err(Error::generic(format!(
-                "execute full_state via DataFusionExecutor: {e}"
-            )));
-        }
-    };
-
-    let mut files = Vec::new();
-    for batch in fsr_batches {
-        let add_idx = batch
-            .schema()
-            .index_of("add")
-            .map_err(|e| Error::generic(format!("full_state add missing: {e}")))?;
-        let add_col = batch
-            .column(add_idx)
-            .as_struct_opt()
-            .ok_or_else(|| Error::generic("full_state add column was not Struct"))?;
-        let path_col = add_col
-            .column_by_name("path")
-            .cloned()
-            .ok_or_else(|| Error::generic("full_state add.path missing"))?;
-        let size_arr = add_col
-            .column_by_name("size")
-            .cloned()
-            .ok_or_else(|| Error::generic("full_state add.size missing"))?;
-        let size_col = size_arr
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| Error::generic("full_state add.size was not Int64"))?;
-        let mod_time_arr = add_col
-            .column_by_name("modificationTime")
-            .cloned()
-            .ok_or_else(|| Error::generic("full_state add.modificationTime missing"))?;
-        let mod_time_col = mod_time_arr
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| Error::generic("full_state add.modificationTime was not Int64"))?;
-        for i in 0..batch.num_rows() {
-            // Prefer the nested path field as the source of truth for add-file rows.
-            // Some action streams can carry a null parent struct bitmap even when child
-            // values are materialized; requiring add_col validity can drop real files.
-            if !path_col.is_valid(i) {
-                continue;
-            }
-            let rel_path = array_value_to_string(path_col.as_ref(), i)
-                .map_err(|e| Error::generic(format!("stringify scan path row {i}: {e}")))?;
-            let location = table_root
-                .join(&rel_path)
-                .map_err(|e| Error::generic(format!("resolve path '{rel_path}' failed: {e}")))?;
-            let size = u64::try_from(size_col.value(i))
-                .map_err(|_| Error::generic("negative file size in scan metadata"))?;
-            files.push(FileMeta::new(location, mod_time_col.value(i), size));
-        }
-    }
-    Ok(files)
-}
-
 fn evaluate_to_json_column(
     batch: &delta_kernel::arrow::array::RecordBatch,
     col: &'static str,
@@ -598,58 +517,6 @@ impl ReadDataPlansRunner {
     }
 }
 
-pub struct ReadMetadataDatafusionRunner {
-    snapshot: Arc<Snapshot>,
-    engine: Arc<dyn Engine>,
-    runtime: Arc<tokio::runtime::Runtime>,
-    name: String,
-}
-
-impl ReadMetadataDatafusionRunner {
-    pub fn setup(
-        table_info: &TableInfo,
-        case_name: &str,
-        read_spec: &ReadSpec,
-        config: ReadConfig,
-        runtime: Arc<tokio::runtime::Runtime>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let (engine, strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
-        let snapshot =
-            strategy.load_snapshot(engine.as_ref(), &runtime, read_spec.time_travel.as_ref())?;
-        let name = format!(
-            "{}/{}/{}/{}",
-            table_info.name,
-            case_name,
-            ReadOperation::ReadMetadata.as_str(),
-            config.name,
-        );
-        Ok(Self {
-            snapshot,
-            engine,
-            runtime,
-            name,
-        })
-    }
-}
-
-impl WorkloadRunner for ReadMetadataDatafusionRunner {
-    fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let files = self.runtime.block_on(collect_fsr_file_metas(
-            Arc::clone(&self.snapshot),
-            Arc::clone(&self.engine),
-            &self.snapshot.table_root(),
-        ))?;
-        for file in files {
-            black_box(file);
-        }
-        Ok(())
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
 impl WorkloadRunner for ReadDataPlansRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut builder = self.snapshot.clone().scan_builder();
@@ -696,9 +563,9 @@ pub fn create_read_runner(
         (ReadOperation::ReadMetadata, ReadEngine::DefaultEngine) => Ok(Box::new(
             ReadMetadataRunner::setup(table_info, case_name, read_spec, config, runtime)?,
         )),
-        (ReadOperation::ReadMetadata, ReadEngine::Datafusion) => Ok(Box::new(
-            ReadMetadataDatafusionRunner::setup(table_info, case_name, read_spec, config, runtime)?,
-        )),
+        (ReadOperation::ReadMetadata, ReadEngine::Datafusion) => {
+            Err("ReadMetadata with the Datafusion engine is not supported".into())
+        }
         (ReadOperation::ReadData, ReadEngine::DefaultEngine) => Ok(Box::new(
             ReadDataStateMachineRunner::setup(table_info, case_name, read_spec, config, runtime)?,
         )),

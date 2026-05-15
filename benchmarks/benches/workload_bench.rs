@@ -80,19 +80,11 @@ fn build_read_configs(table_name: &str, operation: ReadOperation) -> Vec<ReadCon
             // Metadata benchmark comparison modes:
             // 1) default-engine serial
             // 2) default-engine parallel
-            // 3) datafusion-backed state-machine execution
-            let mut configs = vec![
-                ReadConfig {
-                    name: "default_engine_serial".into(),
-                    read_engine: ReadEngine::DefaultEngine,
-                    parallel_scan: ParallelScan::Disabled,
-                },
-                ReadConfig {
-                    name: "datafusion".into(),
-                    read_engine: ReadEngine::Datafusion,
-                    parallel_scan: ParallelScan::Disabled,
-                },
-            ];
+            let mut configs = vec![ReadConfig {
+                name: "default_engine_serial".into(),
+                read_engine: ReadEngine::DefaultEngine,
+                parallel_scan: ParallelScan::Disabled,
+            }];
             let num_threads = if table_name.contains("V2Chkpt") { 2 } else { 4 };
             configs.push(ReadConfig {
                 name: format!("default_engine_parallel{num_threads}"),
