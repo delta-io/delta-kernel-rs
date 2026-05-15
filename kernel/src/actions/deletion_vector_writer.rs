@@ -184,7 +184,7 @@ impl DeletionVector for KernelDeletionVector {
 /// The writer produces deletion vector files in the Delta Lake format:
 /// - The first byte of the file is a version byte (currently 1)
 /// - Each DV is prefixed with a 4-byte size (big-endian) of the serialized data
-/// - Followed by a 4-byte magic number (0x64485871, little-endian)
+/// - Followed by a 4-byte magic number (0x6439d3d1, little-endian)
 /// - Followed by the serialized 64-bit Roaring Bitmap
 /// - Followed by a 4-byte CRC32 checksum (big-endian) of the serialized data
 ///
@@ -264,6 +264,10 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         &mut self,
         deletion_vector: impl DeletionVector,
     ) -> DeltaResult<DeletionVectorWriteResult> {
+        // Serialize first so a failure leaves the writer state and output untouched.
+        let cardinality = deletion_vector.cardinality();
+        let serialized = deletion_vector.serialize()?;
+
         // Write version byte on first write
         if self.current_offset == 0 {
             // Write header.
@@ -272,10 +276,6 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
                 .map_err(|e| Error::generic(format!("Failed to write version byte: {e}")))?;
             self.current_offset = 1;
         }
-
-        let cardinality = deletion_vector.cardinality();
-        // Serialize the deletion vector to bytes
-        let serialized = deletion_vector.serialize()?;
 
         // Calculate sizes
 

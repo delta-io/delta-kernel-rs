@@ -162,6 +162,80 @@ pub struct DeletionVectorDescriptor {
 }
 
 impl DeletionVectorDescriptor {
+    /// Construct a validated [`DeletionVectorDescriptor`] from its raw fields.
+    ///
+    /// Validates the protocol-level invariants from the "Deletion Vector Descriptor Schema"
+    /// section of the Delta protocol:
+    /// - `size_in_bytes` and `cardinality` must be non-negative.
+    /// - If `offset` is present, it must be non-negative.
+    /// - `Inline` descriptors must not carry an offset.
+    /// - `PersistedRelative` paths carry an optional random prefix followed by a 20-character
+    ///   z85-encoded UUID, so they must be at least 20 characters long.
+    /// - `PersistedAbsolute` paths must parse as a URL.
+    ///
+    /// `Inline` payload bytes are accepted verbatim; the framing of the embedded RoaringBitmap
+    /// is only checked when the DV is later read via [`Self::read`].
+    pub fn try_new(
+        storage_type: DeletionVectorStorageType,
+        path_or_inline_dv: impl Into<String>,
+        offset: Option<i32>,
+        size_in_bytes: i32,
+        cardinality: i64,
+    ) -> DeltaResult<Self> {
+        require!(
+            size_in_bytes >= 0,
+            Error::deletion_vector("size_in_bytes must be non-negative")
+        );
+        require!(
+            cardinality >= 0,
+            Error::deletion_vector("cardinality must be non-negative")
+        );
+        require!(
+            offset.is_none_or(|o| o >= 0),
+            Error::deletion_vector("offset must be non-negative")
+        );
+        let path_or_inline_dv = path_or_inline_dv.into();
+        match storage_type {
+            DeletionVectorStorageType::Inline => require!(
+                offset.is_none(),
+                Error::deletion_vector("inline deletion vectors must not carry an offset")
+            ),
+            DeletionVectorStorageType::PersistedRelative => {
+                // Byte-slice rather than char-slice: z85 is ASCII-only, and string slicing
+                // would panic if a non-ASCII byte boundary fell inside the trailing 20-byte
+                // window. `z85::decode` accepts `&[u8]` and rejects non-z85 bytes.
+                let bytes = path_or_inline_dv.as_bytes();
+                require!(
+                    bytes.len() >= 20,
+                    Error::deletion_vector(format!(
+                        "persisted-relative DV path must be at least 20 bytes, got {}",
+                        bytes.len()
+                    ))
+                );
+                let suffix = &bytes[bytes.len() - 20..];
+                z85::decode(suffix).map_err(|_| {
+                    Error::deletion_vector(
+                        "persisted-relative DV path must end with a z85-encoded UUID",
+                    )
+                })?;
+            }
+            DeletionVectorStorageType::PersistedAbsolute => {
+                Url::parse(&path_or_inline_dv).map_err(|e| {
+                    Error::deletion_vector(format!(
+                        "persisted-absolute DV path must parse as a URL: {e}"
+                    ))
+                })?;
+            }
+        }
+        Ok(Self {
+            storage_type,
+            path_or_inline_dv,
+            offset,
+            size_in_bytes,
+            cardinality,
+        })
+    }
+
     pub fn unique_id(&self) -> String {
         Self::unique_id_from_parts(
             &self.storage_type.to_string(),
@@ -812,5 +886,95 @@ mod tests {
         // Verify the encoded_relative_path is exactly as expected (z85 encoded UUID: 20 chars)
         let encoded = dv_path.encoded_relative_path();
         assert_eq!(encoded, "5<w-%>:JjlQ/G/]6C<1m");
+    }
+
+    #[rstest::rstest]
+    #[case::inline_with_offset(DeletionVectorStorageType::Inline, "ABC", Some(0), 4, 1, "inline")]
+    #[case::persisted_relative_short_path(
+        DeletionVectorStorageType::PersistedRelative,
+        "short",
+        Some(1),
+        4,
+        1,
+        "20 bytes"
+    )]
+    #[case::persisted_relative_invalid_z85(
+        DeletionVectorStorageType::PersistedRelative,
+        // 20 bytes but `_` is outside the z85 alphabet, so z85::decode fails.
+        "____________________",
+        Some(1),
+        4,
+        1,
+        "z85"
+    )]
+    #[case::persisted_relative_non_ascii(
+        DeletionVectorStorageType::PersistedRelative,
+        // 22 bytes (`euro` U+20AC is 3 bytes) with `len - 20 = 2` landing inside the
+        // multi-byte codepoint; byte-slicing keeps this from panicking and z85 rejects
+        // the non-ASCII payload.
+        "a\u{20ac}aaaaaaaaaaaaaaaaaa",
+        Some(1),
+        4,
+        1,
+        "z85"
+    )]
+    #[case::persisted_absolute_non_url(
+        DeletionVectorStorageType::PersistedAbsolute,
+        "not a url",
+        Some(1),
+        4,
+        1,
+        "URL"
+    )]
+    #[case::negative_size(
+        DeletionVectorStorageType::Inline, "ABC", None, -1, 0, "size_in_bytes"
+    )]
+    #[case::negative_cardinality(
+        DeletionVectorStorageType::Inline, "ABC", None, 4, -1, "cardinality"
+    )]
+    #[case::negative_offset(
+        DeletionVectorStorageType::PersistedAbsolute, "file:///tmp/dv.bin", Some(-1), 4, 1, "offset"
+    )]
+    fn dv_descriptor_try_new_rejects_invalid(
+        #[case] storage_type: DeletionVectorStorageType,
+        #[case] path: &str,
+        #[case] offset: Option<i32>,
+        #[case] size_in_bytes: i32,
+        #[case] cardinality: i64,
+        #[case] expected_substr: &str,
+    ) {
+        let err = DeletionVectorDescriptor::try_new(
+            storage_type,
+            path,
+            offset,
+            size_in_bytes,
+            cardinality,
+        )
+        .expect_err("expected validation error");
+        assert!(
+            err.to_string().contains(expected_substr),
+            "expected error containing {expected_substr:?}, got: {err}"
+        );
+    }
+
+    #[test]
+    fn dv_descriptor_try_new_round_trips_fields() {
+        let descriptor = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::PersistedAbsolute,
+            "file:///tmp/dv.bin",
+            Some(7),
+            42,
+            9,
+        )
+        .expect("valid descriptor");
+
+        assert_eq!(
+            descriptor.storage_type,
+            DeletionVectorStorageType::PersistedAbsolute
+        );
+        assert_eq!(descriptor.path_or_inline_dv, "file:///tmp/dv.bin");
+        assert_eq!(descriptor.offset, Some(7));
+        assert_eq!(descriptor.size_in_bytes, 42);
+        assert_eq!(descriptor.cardinality, 9);
     }
 }

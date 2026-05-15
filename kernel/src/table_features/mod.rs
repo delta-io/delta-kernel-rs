@@ -509,8 +509,9 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    // We support writing to tables with DeletionVectors enabled, but we never write DV files
-    // ourselves (no DML). The kernel only performs append operations.
+    // The kernel can read DV-bearing tables and install connector-authored DV descriptors via
+    // `Transaction::update_deletion_vectors`, including through the FFI
+    // `transaction_update_deletion_vectors` path.
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_deletion_vectors == Some(true)

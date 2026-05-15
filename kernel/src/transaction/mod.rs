@@ -1642,6 +1642,44 @@ mod tests {
         (engine, snapshot)
     }
 
+    fn setup_dv_supported_but_disabled_table() -> DeltaResult<(Arc<dyn Engine>, Arc<Snapshot>)> {
+        let storage = Arc::new(InMemory::new());
+        let table_root = url::Url::parse("memory:///").unwrap();
+        let engine =
+            Arc::new(crate::engine::default::DefaultEngineBuilder::new(storage.clone()).build());
+        let schema_json = serde_json::json!({
+            "type": "struct",
+            "fields": [{
+                "name": "id",
+                "type": "integer",
+                "nullable": true,
+                "metadata": {}
+            }]
+        });
+        let actions = [
+            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#.to_string(),
+            serde_json::json!({
+                "metaData": {
+                    "id": "test-id",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": schema_json.to_string(),
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1234567890
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+
+        let commit_path = Path::from("_delta_log/00000000000000000000.json");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(storage.put(&commit_path, actions.into()))?;
+        let engine: Arc<dyn Engine> = engine;
+        let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+        Ok((engine, snapshot))
+    }
+
     /// Creates a test deletion vector descriptor with default values (the DV might not exist on
     /// disk)
     fn create_test_dv_descriptor(path_suffix: &str) -> DeletionVectorDescriptor {
@@ -1967,6 +2005,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_update_deletion_vectors_requires_enablement_property(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup_dv_supported_but_disabled_table()?;
+        let mut txn = create_dv_transaction(snapshot, engine.as_ref())?;
+
+        let err = txn
+            .update_deletion_vectors(HashMap::new(), std::iter::empty())
+            .expect_err("DV updates should require delta.enableDeletionVectors=true");
+
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("delta.enableDeletionVectors"),
+            "error should mention the enablement property, got: {err}"
+        );
+        Ok(())
+    }
+
     /// Tests that update_deletion_vectors validates DV descriptors match scan files.
     /// Validates detection of mismatch between provided DV descriptors and actual files.
     #[test]
@@ -1988,6 +2047,99 @@ mod tests {
         assert!(
             err_msg.contains("matched") && err_msg.contains("does not match"),
             "Expected error about mismatched count (expected 1 descriptor, 0 matched files), got: {err_msg}");
+        Ok(())
+    }
+
+    /// Tests that a mismatch after scanning some files does not leave staged DV updates behind.
+    #[test]
+    fn test_update_deletion_vectors_mismatch_does_not_mutate_transaction(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup_dv_enabled_table();
+        let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
+        let scan = snapshot.scan_builder().build()?;
+        let scan_metadata = scan
+            .scan_metadata(&engine)?
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        let mut paths = Vec::new();
+        for metadata in &scan_metadata {
+            paths =
+                metadata.visit_scan_files(paths, |paths, scan_file| paths.push(scan_file.path))?;
+        }
+        let existing_path = paths
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::generic("expected at least one scan file"))?;
+
+        let mut dv_map = HashMap::new();
+        dv_map.insert(existing_path, create_test_dv_descriptor("matched"));
+        dv_map.insert(
+            "non_existent_file.parquet".to_string(),
+            create_test_dv_descriptor("missing"),
+        );
+
+        let result = txn.update_deletion_vectors(
+            dv_map,
+            scan_metadata
+                .into_iter()
+                .map(|metadata| Ok(metadata.scan_files)),
+        );
+
+        assert!(
+            result.is_err(),
+            "Should fail when only some DV descriptors match scan files"
+        );
+        assert!(
+            txn.dv_matched_files.is_empty(),
+            "Failed DV update should not leave staged file updates"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_deletion_vectors_iter_error_does_not_mutate_transaction(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup_dv_enabled_table();
+        let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
+        txn.dv_matched_files
+            .push(FilteredEngineData::with_all_rows_selected(
+                string_array_to_engine_data(StringArray::from(vec!["sentinel"])),
+            ));
+        let staged_len_before = txn.dv_matched_files.len();
+        let scan = snapshot.scan_builder().build()?;
+        let scan_metadata = scan
+            .scan_metadata(&engine)?
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        let mut paths = Vec::new();
+        for metadata in &scan_metadata {
+            paths =
+                metadata.visit_scan_files(paths, |paths, scan_file| paths.push(scan_file.path))?;
+        }
+        let existing_path = paths
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::generic("expected at least one scan file"))?;
+
+        let mut dv_map = HashMap::new();
+        dv_map.insert(existing_path, create_test_dv_descriptor("matched"));
+
+        let result = txn.update_deletion_vectors(
+            dv_map,
+            scan_metadata
+                .into_iter()
+                .map(|metadata| Ok(metadata.scan_files))
+                .chain(std::iter::once(Err(Error::generic(
+                    "simulated scan metadata failure",
+                )))),
+        );
+
+        assert!(result.is_err(), "iterator error should propagate");
+        assert_eq!(
+            txn.dv_matched_files.len(),
+            staged_len_before,
+            "Failed DV update should not stage additional file updates"
+        );
         Ok(())
     }
 

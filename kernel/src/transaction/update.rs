@@ -215,11 +215,15 @@ impl Transaction {
     ///   new deletion vector descriptor for that file.
     /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata. The
     ///   selected elements of each FilteredEngineData must be a superset of the paths that key
-    ///   `new_dv_descriptors`.
+    ///   `new_dv_descriptors`. Per the Delta protocol, files with deletion vectors must have an
+    ///   accurate `numRecords` statistic, so matched scan metadata must preserve that stat.
     ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The transaction targets table creation instead of an existing table
+    /// - The table does not have deletion vectors enabled via protocol support and the
+    ///   `delta.enableDeletionVectors=true` table property
     /// - A file path in `new_dv_descriptors` is not found in `existing_data_files`
     ///
     /// # Examples
@@ -260,17 +264,10 @@ impl Transaction {
                 "Deletion vector operations require an existing table",
             ));
         }
-        if !self
-            .effective_table_config
-            .is_feature_supported(&TableFeature::DeletionVectors)
-        {
-            return Err(Error::unsupported(
-                "Deletion vector operations require reader version 3, writer version 7, \
-                 and the 'deletionVectors' feature in both reader and writer features",
-            ));
-        }
+        self.ensure_deletion_vectors_enabled()?;
 
         let mut matched_dv_files = 0;
+        let mut matched_files = Vec::new();
         let mut visitor = DvMatchVisitor::new(&new_dv_descriptors);
 
         // Process each batch of scan file metadata to prepare for DV updates:
@@ -293,8 +290,10 @@ impl Transaction {
                     if visitor.matched_file_indexes[current_matched_index] != i {
                         *selected = false;
                     } else {
+                        // `matched_file_indexes` is populated from a FilteredRowVisitor, so every
+                        // matched row was selected in the original scan metadata.
                         current_matched_index += 1;
-                        matched_dv_files += if *selected { 1 } else { 0 };
+                        matched_dv_files += 1;
                     }
                 } else {
                     // Deselect any files after the last matched file
@@ -306,7 +305,7 @@ impl Transaction {
                 struct_deletion_vector_schema().clone(),
                 visitor.new_dv_entries.clone(),
             )?];
-            self.dv_matched_files.push(FilteredEngineData::try_new(
+            matched_files.push(FilteredEngineData::try_new(
                 data.append_columns(new_dv_column_schema().clone(), new_columns)?,
                 selection_vector,
             )?);
@@ -320,6 +319,25 @@ impl Transaction {
             )));
         }
 
+        self.dv_matched_files.extend(matched_files);
+        Ok(())
+    }
+
+    /// Verify the table has deletion vectors *enabled* (feature supported in both reader and
+    /// writer features AND the `delta.enableDeletionVectors` table property set to `true`). Per
+    /// the Delta protocol "Deletion Vectors" section, writers MUST only write new DVs when the
+    /// property is enabled, not merely when the feature is in the protocol.
+    fn ensure_deletion_vectors_enabled(&self) -> DeltaResult<()> {
+        if !self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::DeletionVectors)
+        {
+            return Err(Error::unsupported(
+                "Deletion vector writes require reader version 3, writer version 7, the \
+                 'deletionVectors' feature in both reader and writer features, and the \
+                 `delta.enableDeletionVectors` table property set to `true`",
+            ));
+        }
         Ok(())
     }
 }
@@ -355,7 +373,7 @@ fn intermediate_dv_schema() -> &'static SchemaRef {
 
 /// Schema for scan row data with nullable statistics fields.
 /// Used when generating remove actions to ensure statistics can be null if missing.
-// Safety: The panic here is acceptable because scan_row_schema() is a known valid schema.
+// The panic here is acceptable because scan_row_schema() is a known valid schema.
 // If transformation fails, it indicates a programmer error in schema construction that should be
 // caught during development.
 #[allow(clippy::panic)]
@@ -369,7 +387,7 @@ fn nullable_scan_rows_schema() -> &'static SchemaRef {
 
 /// Schema for restored add actions with nullable statistics fields.
 /// Used when transforming scan data back to add actions with potentially missing statistics.
-// Safety: The panic here is acceptable because restored_add_schema() is a known valid schema.
+// The panic here is acceptable because restored_add_schema() is a known valid schema.
 // If transformation fails, it indicates a programmer error in schema construction that should be
 // caught during development.
 #[allow(clippy::panic)]
@@ -383,7 +401,7 @@ fn nullable_restored_add_schema() -> &'static SchemaRef {
 
 /// Schema for add actions that is nullable for use in transforms as as a workaround to avoid issues
 /// with null values in required fields that aren't selected.
-// Safety: The panic here is acceptable because add_log_schema is a known valid schema.
+// The panic here is acceptable because add_log_schema is a known valid schema.
 // If transformation fails, it indicates a programmer error in schema construction that should be
 // caught during development.
 #[allow(clippy::panic)]
@@ -428,7 +446,7 @@ fn new_dv_column_schema() -> &'static SchemaRef {
 // These methods are generic over the transaction state `S` because they are called from the
 // shared `commit()` path in `mod.rs` (`impl<S> Transaction<S>`). DV updates can only be
 // populated on `ExistingTableTransaction`, so the `is_create_table()` guard below is
-// defence-in-depth against future misuse.
+// defense-in-depth against future misuse.
 impl<S> Transaction<S> {
     /// Generate remove/add action pairs for files with DV updates.
     ///
