@@ -41,7 +41,16 @@ use std::backtrace::Backtrace;
 /// ABI stability. Reassigning or reusing a discriminant is a breaking
 /// change; pick the next unused integer.
 macro_rules! delta_codes {
-    ( $( $( #[$meta:meta] )* $variant:ident = $disc:literal, $name:literal, $sqlstate:literal, $template:literal ),+ $(,)? ) => {
+    (
+        $(
+            $( #[$meta:meta] )*
+            $variant:ident = $disc:literal,
+            $name:literal,
+            $sqlstate:literal,
+            $template:literal
+        ),+
+        $(,)?
+    ) => {
         /// Typed identifier for a Delta error.
         ///
         /// `#[repr(u32)]` pins the integer layout so engines across the FFI
