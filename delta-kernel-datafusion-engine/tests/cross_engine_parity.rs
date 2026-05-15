@@ -272,7 +272,7 @@ async fn parity_window_row_number_matches_ordered_partition_reference() {
         .unwrap()
         .window(
             vec![WindowFunction {
-                                output_col: "_rn".into(),
+                output_col: "_rn".into(),
             }],
             vec![Arc::new(Expression::column(["part"]))],
             vec![OrderingSpec::asc(ColumnName::new(["v"]))],

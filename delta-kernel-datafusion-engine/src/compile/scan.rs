@@ -62,7 +62,7 @@ fn file_meta_to_partitioned(file: &FileMeta) -> Result<PartitionedFile, DeltaErr
     } else {
         StorePath::from(file.location.path())
     };
-    let mut pf = PartitionedFile::new(location, file.size as u64);
+    let mut pf = PartitionedFile::new(location, file.size);
     pf.object_meta.last_modified = Utc
         .timestamp_millis_opt(file.last_modified)
         .single()

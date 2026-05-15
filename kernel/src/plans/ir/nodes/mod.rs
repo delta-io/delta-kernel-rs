@@ -98,9 +98,7 @@ impl ScanNode {
         StructType::try_new(fields)
             .map(std::sync::Arc::new)
             .map_err(|e| {
-                Error::generic(format!(
-                    "scan output schema with row index is invalid: {e}"
-                ))
+                Error::generic(format!("scan output schema with row index is invalid: {e}"))
             })
     }
 }

@@ -101,10 +101,8 @@ fn extract_sorted_non_null_paths_from_results(batches: &[RecordBatch]) -> Vec<St
     let add_col = merged.column(add_idx).as_struct_opt().expect("add struct");
     let path_col = add_col.column_by_name("path").expect("add.path");
     let mut out: Vec<String> = (0..path_col.len())
-        .filter_map(|i| {
-            (add_col.is_valid(i) && path_col.is_valid(i))
-                .then(|| array_value_to_string(path_col.as_ref(), i).expect("stringify path"))
-        })
+        .filter(|&i| add_col.is_valid(i) && path_col.is_valid(i))
+        .map(|i| array_value_to_string(path_col.as_ref(), i).expect("stringify path"))
         .collect();
     out.sort();
     out

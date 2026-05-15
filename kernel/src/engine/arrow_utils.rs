@@ -1580,17 +1580,11 @@ pub fn resolve_field_path(
     path: &[&str],
 ) -> DeltaResult<crate::arrow::datatypes::FieldRef> {
     let Some((first, rest)) = path.split_first() else {
-        return Err(Error::generic(
-            "resolve_field_path: empty path",
-        ));
+        return Err(Error::generic("resolve_field_path: empty path"));
     };
     let mut current = schema
         .field_with_name(first)
-        .map_err(|_| {
-            Error::generic(format!(
-                "resolve_field_path: schema has no field `{first}`"
-            ))
-        })?
+        .map_err(|_| Error::generic(format!("resolve_field_path: schema has no field `{first}`")))?
         .clone();
     let mut current_ref: crate::arrow::datatypes::FieldRef = Arc::new(current.clone());
     let mut traversed: Vec<&str> = vec![first];

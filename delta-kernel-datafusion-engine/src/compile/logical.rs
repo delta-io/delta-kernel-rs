@@ -265,7 +265,7 @@ fn canonicalize_output_to_kernel_schema(
     plan: LogicalPlan,
     kernel_schema: &KernelSchemaRef,
 ) -> Result<LogicalPlan, DeltaError> {
-    let source_cols = plan.schema().columns().iter().cloned().collect::<Vec<_>>();
+    let source_cols = plan.schema().columns().to_vec();
     let target_len = kernel_schema.fields().count();
     if source_cols.len() < target_len {
         return Err(plan_compilation(format!(
@@ -275,7 +275,7 @@ fn canonicalize_output_to_kernel_schema(
     }
     let projection = kernel_schema
         .fields()
-        .zip(source_cols.into_iter())
+        .zip(source_cols)
         .map(|(field, source_col)| Expr::Column(source_col).alias(field.name().to_string()))
         .collect::<Vec<_>>();
     LogicalPlanBuilder::from(plan)
@@ -759,17 +759,15 @@ fn compile_declarative_node_logical(
                     }
                 }
             }
-            let unioned =
-                compiled_children
-                    .into_iter()
-                    .into_iter()
-                    .try_fold(first, |acc, right| {
-                        LogicalPlanBuilder::from(acc)
-                            .union(right)
-                            .map_err(crate::error::datafusion_err_to_delta)?
-                            .build()
-                            .map_err(crate::error::datafusion_err_to_delta)
-                    })?;
+            let unioned = compiled_children
+                .into_iter()
+                .try_fold(first, |acc, right| {
+                    LogicalPlanBuilder::from(acc)
+                        .union(right)
+                        .map_err(crate::error::datafusion_err_to_delta)?
+                        .build()
+                        .map_err(crate::error::datafusion_err_to_delta)
+                })?;
             Ok(Some(unioned))
         }
         DeclarativePlanNode::RelationRef(handle) => {

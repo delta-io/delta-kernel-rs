@@ -128,7 +128,7 @@ impl ExecutionPlan for KernelConsumeByKdfExec {
                 Arc::clone(&self.harvest_slot),
                 self.phase_state.clone(),
             )
-            .map_err(|e| crate::error::wrap_delta_err(e))?,
+            .map_err(crate::error::wrap_delta_err)?,
         ))
     }
 

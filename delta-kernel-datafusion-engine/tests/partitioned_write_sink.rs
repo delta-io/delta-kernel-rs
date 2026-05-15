@@ -37,9 +37,9 @@ fn hive_parquet_path(base: &Path, segments: &[&str]) -> PathBuf {
 fn read_parquet_path(path: &Path) -> Vec<delta_kernel::arrow::array::RecordBatch> {
     let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("parquet reader");
-    let mut reader = builder.build().expect("build reader");
+    let reader = builder.build().expect("build reader");
     let mut out = Vec::new();
-    while let Some(b) = reader.next() {
+    for b in reader {
         out.push(b.expect("batch"));
     }
     out

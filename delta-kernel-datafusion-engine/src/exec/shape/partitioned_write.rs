@@ -121,7 +121,7 @@ impl ExecutionPlan for KernelPartitionedWriteExec {
         let child = super::expect_single_child(children, "KernelPartitionedWriteExec")?;
         Ok(Arc::new(
             KernelPartitionedWriteExec::try_new(child, self.sink.clone())
-                .map_err(|e| crate::error::wrap_delta_err(e))?,
+                .map_err(crate::error::wrap_delta_err)?,
         ))
     }
 
@@ -136,8 +136,8 @@ impl ExecutionPlan for KernelPartitionedWriteExec {
             )));
         }
         let inner = self.child.execute(partition, context)?;
-        let base_dir = destination_base_dir(&self.sink.destination)
-            .map_err(|e| crate::error::wrap_delta_err(e))?;
+        let base_dir =
+            destination_base_dir(&self.sink.destination).map_err(crate::error::wrap_delta_err)?;
         Ok(Box::pin(PartitionedWriteStream {
             inner,
             sink: self.sink.clone(),

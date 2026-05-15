@@ -147,10 +147,11 @@ impl ExecutionPlan for FileListingExec {
     }
 }
 
+type ObjectMetaChunkStream =
+    dyn Stream<Item = Vec<Result<ObjectMeta, delta_kernel::object_store::Error>>> + Send;
+
 struct FileListingStream {
-    inner: Pin<
-        Box<dyn Stream<Item = Vec<Result<ObjectMeta, delta_kernel::object_store::Error>>> + Send>,
-    >,
+    inner: Pin<Box<ObjectMetaChunkStream>>,
     schema: delta_kernel::arrow::datatypes::SchemaRef,
     base_url: url::Url,
 }
@@ -181,7 +182,7 @@ impl Stream for FileListingStream {
                 let metas = chunk
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| crate::error::wrap_delta_err(e))?;
+                    .map_err(crate::error::wrap_delta_err)?;
                 Poll::Ready(Some(metas_to_batch(&metas, &self.schema, &self.base_url)))
             }
             None => Poll::Ready(None),

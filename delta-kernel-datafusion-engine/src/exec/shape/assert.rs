@@ -184,9 +184,7 @@ impl Stream for KernelAssertStream {
                                 row,
                                 failed_null,
                             );
-                            return Poll::Ready(Some(Err(crate::error::wrap_delta_err(
-                                delta_err,
-                            ))));
+                            return Poll::Ready(Some(Err(crate::error::wrap_delta_err(delta_err))));
                         }
                     }
                 }

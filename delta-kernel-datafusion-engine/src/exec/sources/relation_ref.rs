@@ -95,6 +95,6 @@ pub fn build_relation_ref_logical(
         None,
     )
     .map_err(crate::error::datafusion_err_to_delta)?
-        .build()
-        .map_err(crate::error::datafusion_err_to_delta)
+    .build()
+    .map_err(crate::error::datafusion_err_to_delta)
 }

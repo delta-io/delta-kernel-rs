@@ -380,8 +380,10 @@ mod tests {
         #[case] params: Vec<(&'static str, &'static str)>,
         #[case] expected: &str,
     ) {
-        let owned: Vec<(&str, String)> =
-            params.into_iter().map(|(k, v)| (k, v.to_string())).collect();
+        let owned: Vec<(&str, String)> = params
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect();
         let out = render_template(template, &owned);
         assert_eq!(out, expected);
     }

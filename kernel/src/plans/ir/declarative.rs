@@ -708,10 +708,7 @@ mod tests {
         let plan = DeclarativePlanNode::scan_json(vec![], simple_schema()).into_load(load);
         match plan.sink.sink_type {
             SinkType::Load(ls) => {
-                assert_eq!(
-                    ls.dv_ref.as_ref(),
-                    Some(&DvRef::skip(dv_col.clone()))
-                );
+                assert_eq!(ls.dv_ref.as_ref(), Some(&DvRef::skip(dv_col.clone())));
                 assert_eq!(ls.output_relation, out_handle);
             }
             other => panic!("expected Load sink, got {other:?}"),
@@ -882,7 +879,7 @@ mod tests {
     fn window_rejects_empty_order_by() {
         let plan = DeclarativePlanNode::scan_json(vec![], simple_schema());
         let wf = WindowFunction {
-                        output_col: "_rn".into(),
+            output_col: "_rn".into(),
         };
         let err = plan
             .window(
@@ -901,7 +898,7 @@ mod tests {
     #[test]
     fn window_accepts_nonempty_order_by() {
         let wf = WindowFunction {
-                        output_col: "_rn".into(),
+            output_col: "_rn".into(),
         };
         let plan = DeclarativePlanNode::scan_json(vec![], simple_schema())
             .window(

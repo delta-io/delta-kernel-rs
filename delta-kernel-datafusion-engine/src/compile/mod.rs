@@ -223,7 +223,11 @@ pub(crate) fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef
             let input_schema = node_output_schema(child)?;
             let mut fields: Vec<StructField> = input_schema.fields().cloned().collect();
             for wf in &node.functions {
-                fields.push(StructField::new(wf.output_col.clone(), DataType::LONG, false));
+                fields.push(StructField::new(
+                    wf.output_col.clone(),
+                    DataType::LONG,
+                    false,
+                ));
             }
             StructType::try_new(fields)
                 .map(Arc::new)

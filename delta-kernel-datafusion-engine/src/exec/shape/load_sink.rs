@@ -142,7 +142,7 @@ impl ExecutionPlan for KernelLoadSinkExec {
                 Arc::clone(&self.registry),
                 self.physical_read_schema.clone(),
             )
-            .map_err(|e| crate::error::wrap_delta_err(e))?,
+            .map_err(crate::error::wrap_delta_err)?,
         ))
     }
 
@@ -507,12 +507,12 @@ fn read_rows_for_location(
     let mut out = Vec::new();
     match sink.file_type {
         FileType::Parquet => {
-            let mut iter = engine
+            let iter = engine
                 .parquet_handler()
                 .read_parquet_files(&[meta], physical_read_schema.clone(), None)
                 .map_err(kernel_err)?;
             let mut row_offset = 0usize;
-            while let Some(next) = iter.next() {
+            for next in iter {
                 let rb = next
                     .map_err(kernel_err)?
                     .try_into_record_batch()
@@ -521,12 +521,12 @@ fn read_rows_for_location(
             }
         }
         FileType::Json => {
-            let mut iter = engine
+            let iter = engine
                 .json_handler()
                 .read_json_files(&[meta], physical_read_schema.clone(), None)
                 .map_err(kernel_err)?;
             let mut row_offset = 0usize;
-            while let Some(next) = iter.next() {
+            for next in iter {
                 let rb = next
                     .map_err(kernel_err)?
                     .try_into_record_batch()

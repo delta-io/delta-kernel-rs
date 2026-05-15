@@ -1156,7 +1156,8 @@ fn fsr_dedup_key() -> Expression {
             id3,
         ])
     };
-    let is_not_null = |path: &[&str]| Predicate::is_not_null(Expression::column(path.iter().copied()));
+    let is_not_null =
+        |path: &[&str]| Predicate::is_not_null(Expression::column(path.iter().copied()));
     let coalesce = |path: &[&str]| {
         Expression::coalesce([
             Expression::column(["add"].into_iter().chain(path.iter().copied())),
@@ -1195,7 +1196,10 @@ fn fsr_dedup_key() -> Expression {
     Expression::case_when(
         vec![
             (
-                Predicate::or(is_not_null(&["add", "path"]), is_not_null(&["remove", "path"])),
+                Predicate::or(
+                    is_not_null(&["add", "path"]),
+                    is_not_null(&["remove", "path"]),
+                ),
                 file_arm,
             ),
             (is_not_null(&["protocol"]), proto_arm),
@@ -1561,9 +1565,8 @@ mod tests {
     use crate::expressions::UnaryExpressionOp;
     use crate::plans::ir::nodes::SinkType;
     use crate::plans::state_machines::framework::phase_operation::PhaseOperation;
-    use crate::plans::state_machines::framework::state_machine::AdvanceResult;
-    use crate::plans::state_machines::framework::state_machine::StateMachine;
-    use crate::schema::{ColumnMetadataKey, MetadataColumnSpec, MetadataValue};
+    use crate::plans::state_machines::framework::state_machine::{AdvanceResult, StateMachine};
+    use crate::schema::MetadataColumnSpec;
     use crate::utils::test_utils::{load_test_table, string_array_to_engine_data};
     use crate::Engine;
 
@@ -1600,8 +1603,8 @@ mod tests {
     ) -> Result<Scan, DeltaError> {
         let mut builder = ScanBuilder::new(snapshot).with_stats();
         if cfg.with_predicate {
-            builder =
-                builder.with_predicate(Arc::new(Predicate::is_not_null(Expression::column(["id"])).into()));
+            builder = builder
+                .with_predicate(Arc::new(Predicate::is_not_null(Expression::column(["id"]))));
         }
         builder.build_replay()
     }
@@ -1664,7 +1667,12 @@ mod tests {
                 cfg.table
             );
             let data = scan.replay_scan_data_plans(live_actions).unwrap();
-            assert_eq!(data.len(), 2, "data phase should remain two plans for {}", cfg.table);
+            assert_eq!(
+                data.len(),
+                2,
+                "data phase should remain two plans for {}",
+                cfg.table
+            );
             let combined = scan.replay_scan_plans().unwrap();
             assert_eq!(
                 combined.len(),
@@ -1772,13 +1780,10 @@ mod tests {
     #[test]
     fn scan_metadata_with_predicate_materializes_parsed_stats() {
         let (_engine, snapshot, _tmp) = load_test_table("basic_partitioned").unwrap();
-        let predicate = Arc::new(
-            Predicate::gt(
-                Expression::column(["number"]),
-                Expression::literal(Scalar::Long(1)),
-            )
-            .into(),
-        );
+        let predicate = Arc::new(Predicate::gt(
+            Expression::column(["number"]),
+            Expression::literal(Scalar::Long(1)),
+        ));
         let scan = ScanBuilder::new(Arc::clone(&snapshot))
             .with_predicate(predicate)
             .with_stats()
@@ -1813,7 +1818,7 @@ mod tests {
     fn scan_metadata_with_stats_supports_v2_checkpoint() {
         let (_engine, snapshot, _tmp) =
             load_test_table("v2-checkpoints-parquet-without-sidecars").unwrap();
-        let predicate = Arc::new(Predicate::is_not_null(Expression::column(["id"])).into());
+        let predicate = Arc::new(Predicate::is_not_null(Expression::column(["id"])));
         let scan = ScanBuilder::new(Arc::clone(&snapshot))
             .with_predicate(predicate)
             .with_stats()
@@ -1829,7 +1834,7 @@ mod tests {
     fn scan_metadata_with_stats_supports_multipart_checkpoint() {
         let (_engine, snapshot, _tmp) =
             load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
-        let predicate = Arc::new(Predicate::is_not_null(Expression::column(["id"])).into());
+        let predicate = Arc::new(Predicate::is_not_null(Expression::column(["id"])));
         let scan = ScanBuilder::new(Arc::clone(&snapshot))
             .with_predicate(predicate)
             .with_stats()
@@ -2106,5 +2111,4 @@ mod tests {
         assert!(b.value(0));
         assert!(!b.value(1));
     }
-
 }
