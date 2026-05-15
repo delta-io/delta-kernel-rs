@@ -31,7 +31,7 @@ use delta_kernel::Engine;
 
 use crate::exec::{
     build_literal_exec, build_relation_ref_exec, FileListingExec, KernelConsumeByKdfExec,
-    OrderedUnionExec, RelationBatchRegistry,
+    RelationBatchRegistry,
 };
 
 pub mod expr_translator;
@@ -155,10 +155,8 @@ pub(super) fn compile_declarative_node(
                         Arc::new(CoalescePartitionsExec::new(plan)) as Arc<dyn ExecutionPlan>
                     })
                     .collect::<Vec<_>>();
-                Ok(Arc::new(
-                    OrderedUnionExec::try_new(coalesced)
-                        .map_err(crate::error::datafusion_err_to_delta)?,
-                ))
+                scan::compile_ordered_union_via_ordinal(coalesced)
+                    .map_err(crate::error::datafusion_err_to_delta)
             } else {
                 let unioned = UnionExec::try_new(child_plans)
                     .map_err(crate::error::datafusion_err_to_delta)?;

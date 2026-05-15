@@ -1,7 +1,6 @@
 pub(crate) mod consume_kdf;
 pub(crate) mod load_sink;
 pub(crate) mod nullability_validation;
-pub(crate) mod ordered_union;
 
 use std::sync::Arc;
 
@@ -10,7 +9,6 @@ use datafusion_common::DataFusionError;
 use datafusion_physical_plan::ExecutionPlan;
 pub use load_sink::KernelLoadSinkExec;
 pub use nullability_validation::NullabilityValidationExec;
-pub use ordered_union::OrderedUnionExec;
 
 /// Verify that `with_new_children` was called with exactly one replacement child
 /// and return that child. Errors with a `DataFusionError::Plan` carrying `exec_name`

@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
-use datafusion_common::DFSchema;
+use datafusion_common::{DFSchema, ScalarValue};
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::source::DataSourceExec;
@@ -28,9 +28,13 @@ use datafusion_datasource_json::source::JsonSource;
 use datafusion_datasource_parquet::source::ParquetSource;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_expr::execution_props::ExecutionProps;
-use datafusion_physical_expr::create_physical_expr;
+use datafusion_physical_expr::expressions::{Column, Literal};
+use datafusion_physical_expr::{create_physical_expr, LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::filter::FilterExec;
+use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::sorts::sort::SortExec;
+use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::ExecutionPlan;
 use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
@@ -41,7 +45,77 @@ use delta_kernel::FileMeta;
 use parquet::arrow::RowNumber;
 
 use crate::compile::expr_translator;
-use crate::exec::{NullabilityValidationExec, OrderedUnionExec};
+use crate::exec::NullabilityValidationExec;
+
+/// Hidden ordinal column appended to each child of an ordered union; sorted on and then dropped.
+const ORDINAL_COL: &str = "__dk_ord";
+
+/// Build an ordered union over `children` using stock DataFusion operators.
+///
+/// Each child is projected to append a literal i64 [`ORDINAL_COL`] equal to its index in
+/// `children`. The projections are unioned, coalesced to a single partition, sorted ASC by
+/// ordinal, then re-projected to drop the ordinal. This preserves declaration order of children
+/// without a custom executor.
+///
+/// Children must share an identical Arrow output schema (Union semantics already require this).
+pub(crate) fn compile_ordered_union_via_ordinal(
+    children: Vec<Arc<dyn ExecutionPlan>>,
+) -> Result<Arc<dyn ExecutionPlan>, datafusion_common::DataFusionError> {
+    let Some(first) = children.first() else {
+        return Err(datafusion_common::DataFusionError::Plan(
+            "ordered union requires at least one child".into(),
+        ));
+    };
+    let child_schema = first.schema();
+
+    let mut tagged: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(children.len());
+    for (idx, child) in children.iter().enumerate() {
+        let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+            Vec::with_capacity(child.schema().fields().len() + 1);
+        for (col_idx, field) in child.schema().fields().iter().enumerate() {
+            let column = Arc::new(Column::new(field.name(), col_idx)) as Arc<dyn PhysicalExpr>;
+            exprs.push((column, field.name().to_string()));
+        }
+        let ordinal_lit =
+            Arc::new(Literal::new(ScalarValue::Int64(Some(idx as i64)))) as Arc<dyn PhysicalExpr>;
+        exprs.push((ordinal_lit, ORDINAL_COL.to_string()));
+        let projected = ProjectionExec::try_new(exprs, Arc::clone(child))?;
+        tagged.push(Arc::new(projected));
+    }
+
+    let unioned: Arc<dyn ExecutionPlan> = UnionExec::try_new(tagged)?;
+    let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(unioned));
+
+    let ordinal_idx = coalesced.schema().index_of(ORDINAL_COL).map_err(|e| {
+        datafusion_common::DataFusionError::Plan(format!(
+            "ordered union: ordinal column `{ORDINAL_COL}` missing after union: {e}"
+        ))
+    })?;
+    let ordinal_col = Arc::new(Column::new(ORDINAL_COL, ordinal_idx)) as Arc<dyn PhysicalExpr>;
+    let sort_expr = PhysicalSortExpr::new_default(ordinal_col).asc();
+    let lex = LexOrdering::new(std::iter::once(sort_expr)).ok_or_else(|| {
+        datafusion_common::DataFusionError::Plan(
+            "ordered union: failed to build LexOrdering for ordinal column".into(),
+        )
+    })?;
+    let sorted: Arc<dyn ExecutionPlan> =
+        Arc::new(SortExec::new(lex, coalesced as Arc<dyn ExecutionPlan>));
+
+    // Drop the ordinal column by projecting back to the original child schema columns by index.
+    let drop_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = child_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            (
+                Arc::new(Column::new(field.name(), idx)) as Arc<dyn PhysicalExpr>,
+                field.name().to_string(),
+            )
+        })
+        .collect();
+    let final_proj = ProjectionExec::try_new(drop_exprs, sorted)?;
+    Ok(Arc::new(final_proj))
+}
 
 struct PreparedScanFiles {
     file_group: FileGroup,
@@ -306,9 +380,10 @@ fn compile_scan_single_group(
 /// ## Multi-file layout
 ///
 /// When [`ScanNode::row_index_column`] is [`Some`], indices must restart at zero for each file.
-/// That requires one native scan subtree per file (see [`OrderedUnionExec`]), even if
-/// [`ScanNode::ordered`] is `false`. Parallel multi-file grouping is therefore disabled whenever a
-/// row-index column is requested; file emission order still follows [`ScanNode::files`].
+/// That requires one native scan subtree per file (joined with
+/// [`compile_ordered_union_via_ordinal`]), even if [`ScanNode::ordered`] is `false`. Parallel
+/// multi-file grouping is therefore disabled whenever a row-index column is requested; file
+/// emission order still follows [`ScanNode::files`].
 ///
 /// When **both** `ordered == false` **and** `row_index_column.is_none()`, all files share one
 /// native file group so DataFusion may parallelize partition scheduling across files (unordered
@@ -361,9 +436,7 @@ pub fn compile_scan(node: &ScanNode) -> Result<Arc<dyn ExecutionPlan>, DeltaErro
         children.push(Arc::new(CoalescePartitionsExec::new(branch)));
     }
 
-    Ok(Arc::new(
-        OrderedUnionExec::try_new(children).map_err(crate::error::datafusion_err_to_delta)?,
-    ))
+    compile_ordered_union_via_ordinal(children).map_err(crate::error::datafusion_err_to_delta)
 }
 
 fn compile_residual_scan_filter_native(
@@ -630,13 +703,19 @@ mod tests {
         assert_eq!(rids, vec![1, 2]);
     }
 
-    fn plan_has_ordered_union(plan: &dyn datafusion_physical_plan::ExecutionPlan) -> bool {
-        if plan.name() == "OrderedUnionExec" {
+    fn plan_has_ordinal_sort(plan: &dyn datafusion_physical_plan::ExecutionPlan) -> bool {
+        if plan.name() == "SortExec"
+            && plan
+                .schema()
+                .fields()
+                .iter()
+                .any(|f| f.name() == super::ORDINAL_COL)
+        {
             return true;
         }
         plan.children()
             .iter()
-            .any(|c| plan_has_ordered_union(c.as_ref()))
+            .any(|c| plan_has_ordinal_sort(c.as_ref()))
     }
 
     #[test]
@@ -655,7 +734,7 @@ mod tests {
         };
         let physical = compile_scan(&scan).unwrap();
         assert!(
-            !plan_has_ordered_union(physical.as_ref()),
+            !plan_has_ordinal_sort(physical.as_ref()),
             "unordered scan without row index should stay a single native file group"
         );
     }
@@ -677,6 +756,6 @@ mod tests {
             _ => unreachable!(),
         };
         let physical = compile_scan(&scan).unwrap();
-        assert!(plan_has_ordered_union(physical.as_ref()));
+        assert!(plan_has_ordinal_sort(physical.as_ref()));
     }
 }
