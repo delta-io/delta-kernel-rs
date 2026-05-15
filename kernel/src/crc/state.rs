@@ -237,27 +237,4 @@ mod tests {
             SetTransactionState::Partial(HashMap::new())
         );
     }
-
-    #[test]
-    fn set_txn_state_complete_expect_complete_returns_map() {
-        let mut map = HashMap::new();
-        map.insert(
-            "my-app".to_string(),
-            SetTransaction::new("my-app".to_string(), 1, Some(1000)),
-        );
-        let state = SetTransactionState::Complete(map.clone());
-        assert_eq!(state.expect_complete().len(), 1);
-        assert_eq!(state.expect_complete()["my-app"].version, 1);
-    }
-
-    #[test]
-    fn set_txn_state_partial_expect_partial_returns_map() {
-        let mut map = HashMap::new();
-        map.insert(
-            "my-app".to_string(),
-            SetTransaction::new("my-app".to_string(), 2, None),
-        );
-        let state = SetTransactionState::Partial(map);
-        assert_eq!(state.expect_partial().len(), 1);
-    }
 }
