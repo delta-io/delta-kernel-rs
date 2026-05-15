@@ -26,9 +26,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
-use datafusion_common::TableReference;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_optimizer::optimizer::PhysicalOptimizer;
@@ -632,29 +630,7 @@ impl DataFusionExecutor {
         handle: &delta_kernel::plans::ir::nodes::RelationHandle,
         batches: Vec<RecordBatch>,
     ) -> Result<(), DeltaError> {
-        self.relation_registry.register(handle.id, batches.clone());
-        let schema: delta_kernel::arrow::datatypes::SchemaRef =
-            Arc::new(handle.schema.as_ref().try_into_arrow().map_err(|e| {
-                crate::error::plan_compilation(format!(
-                    "relation sink schema conversion failed: {e}"
-                ))
-            })?);
-        let table = Arc::new(
-            MemTable::try_new(schema, vec![batches]).map_err(crate::error::datafusion_err_to_delta)?,
-        );
-        let _ = self
-            .session_ctx
-            .deregister_table(TableReference::Bare {
-                table: handle.name.clone().into(),
-            });
-        self.session_ctx
-            .register_table(
-                TableReference::Bare {
-                    table: handle.name.clone().into(),
-                },
-                table,
-            )
-            .map_err(crate::error::datafusion_err_to_delta)?;
+        self.relation_registry.register(handle.id, batches);
         Ok(())
     }
 
