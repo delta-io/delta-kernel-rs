@@ -755,7 +755,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_drops_histogram_on_missing_file_size() {
+    fn apply_remove_without_size_transitions_to_indeterminate() {
+        // A remove action with missing size makes incremental tracking impossible;
+        // file_stats returns None because Indeterminate carries no data.
         let mut crc = base_crc_with_histogram(&[100, 200]);
         let delta = CrcDelta {
             has_missing_file_size: true,
