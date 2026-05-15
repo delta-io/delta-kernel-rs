@@ -533,6 +533,8 @@ fn node_kind_name(node: &DeclarativePlanNode) -> &'static str {
 mod tests {
     use std::any::Any;
 
+    use url::Url;
+
     use super::*;
     use crate::expressions::{ColumnName, Expression};
     use crate::plans::errors::DeltaError;
