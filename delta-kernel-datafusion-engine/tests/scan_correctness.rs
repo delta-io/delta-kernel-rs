@@ -124,8 +124,6 @@ async fn multi_file_parquet_row_index_resets_each_file_by_value_range() {
         vec![file_meta(&p1), file_meta(&p2)],
         Arc::clone(&schema),
     )
-    .with_ordered()
-    .unwrap()
     .with_row_index("rid")
     .unwrap()
     .into_results();
@@ -163,22 +161,13 @@ async fn unordered_multi_file_scan_with_row_index_keeps_scan_ordered_false_and_r
     write_i64_parquet(&p2, &[20]);
 
     let schema = kernel_schema_one_i64();
-    let node = DeclarativePlanNode::scan_parquet(
+    let plan = DeclarativePlanNode::scan_parquet(
         vec![file_meta(&p1), file_meta(&p2)],
         Arc::clone(&schema),
     )
     .with_row_index("rid")
-    .unwrap();
-
-    match &node {
-        DeclarativePlanNode::Scan(s) => assert!(
-            !s.ordered,
-            "explicit regression guard: unordered SQL scan + row index must leave ordered=false"
-        ),
-        _ => panic!("expected Scan"),
-    }
-
-    let plan = node.into_results();
+    .unwrap()
+    .into_results();
 
     let batches = DataFusionExecutor::try_new()
         .unwrap()
@@ -186,11 +175,12 @@ async fn unordered_multi_file_scan_with_row_index_keeps_scan_ordered_false_and_r
         .await
         .unwrap();
 
-    let rid_concat = flatten_i64_named(&batches, "rid");
+    let mut rids = flatten_i64_named(&batches, "rid");
+    rids.sort();
     assert_eq!(
-        rid_concat,
-        vec![0, 1, 0],
-        "unordered flag must still yield per-file row indices"
+        rids,
+        vec![0, 0, 1],
+        "unordered multi-file scan must still yield per-file row indices (file1 -> 0,1; file2 -> 0)"
     );
 }
 
@@ -225,8 +215,6 @@ async fn scan_predicate_matches_arrow_parquet_reference_multi_file_ordered() {
     let reference_x = flatten_i64_named(&reference_batches, "x");
 
     let plan = DeclarativePlanNode::scan_parquet(metas, Arc::clone(&kernel_schema))
-        .with_ordered()
-        .unwrap()
         .with_predicate(Arc::clone(&pred))
         .unwrap()
         .into_results();
@@ -237,10 +225,13 @@ async fn scan_predicate_matches_arrow_parquet_reference_multi_file_ordered() {
         .await
         .unwrap();
 
-    let df_x = flatten_i64_named(&df_batches, "x");
+    let mut df_x = flatten_i64_named(&df_batches, "x");
+    let mut reference_sorted = reference_x;
+    df_x.sort();
+    reference_sorted.sort();
 
     assert_eq!(
-        df_x, reference_x,
+        df_x, reference_sorted,
         "native residual scan filter output must match parquet iterator + kernel evaluator reference"
     );
     assert_eq!(df_x, vec![12, 25, 30, 100]);

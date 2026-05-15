@@ -33,8 +33,7 @@
 //!
 //! ## Transforms
 //!
-//! - [`DeclarativePlanNode::with_predicate`] / [`with_row_index`] / [`with_ordered`] — scan
-//!   modifiers.
+//! - [`DeclarativePlanNode::with_predicate`] / [`with_row_index`] — scan modifiers.
 //! - [`DeclarativePlanNode::filter`] — predicate filter.
 //! - [`DeclarativePlanNode::project`] — projection.
 //! - [`DeclarativePlanNode::window`] — window functions (`row_number`).
@@ -65,7 +64,6 @@
 //! [`values_row`]: DeclarativePlanNode::values_row
 //! [`union_unordered`]: DeclarativePlanNode::union_unordered
 //! [`with_row_index`]: DeclarativePlanNode::with_row_index
-//! [`with_ordered`]: DeclarativePlanNode::with_ordered
 //! [`window`]: DeclarativePlanNode::window
 
 use std::sync::Arc;
@@ -251,24 +249,6 @@ impl DeclarativePlanNode {
             }
             other => Err(Error::generic(format!(
                 "with_predicate requires a Scan node, got {}",
-                node_kind_name(other),
-            ))),
-        }
-    }
-
-    /// Mark a [`ScanNode`] as ordered (cross-file emission preserves the
-    /// `files` order). See [`ScanNode`]'s ordering doc for the SQL-equivalence
-    /// contract.
-    ///
-    /// Returns an error if `self` is not a scan.
-    pub fn with_ordered(mut self) -> DeltaResult<Self> {
-        match &mut self {
-            Self::Scan(scan) => {
-                scan.ordered = true;
-                Ok(self)
-            }
-            other => Err(Error::generic(format!(
-                "with_ordered requires a Scan node, got {}",
                 node_kind_name(other),
             ))),
         }
@@ -668,25 +648,6 @@ mod tests {
         let base = DeclarativePlanNode::scan_json(vec![], simple_schema());
         let results_plan = base.into_results();
         assert_eq!(results_plan.sink.sink_type, SinkType::Results(None));
-    }
-
-    #[test]
-    fn with_ordered_sets_scan_ordered_bit() {
-        let plan = DeclarativePlanNode::scan_json(vec![], simple_schema())
-            .with_ordered()
-            .unwrap();
-        match plan {
-            DeclarativePlanNode::Scan(s) => assert!(s.ordered),
-            _ => panic!("expected Scan"),
-        }
-    }
-
-    #[test]
-    fn with_ordered_errors_off_scan() {
-        let plan = DeclarativePlanNode::scan_json(vec![], simple_schema())
-            .filter(Arc::new(Expression::literal(true)));
-        let err = plan.with_ordered().unwrap_err();
-        assert!(format!("{err}").contains("requires a Scan node"));
     }
 
     #[test]

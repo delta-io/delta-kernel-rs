@@ -414,7 +414,7 @@ pub fn compile_scan(node: &ScanNode) -> Result<Arc<dyn ExecutionPlan>, DeltaErro
     );
     let source_arrow_schema = relax_nested_nullability_for_scan(target_arrow_schema.as_ref());
 
-    let sequential_files = node.ordered || node.row_index_column.is_some();
+    let sequential_files = node.row_index_column.is_some();
 
     if node.files.len() <= 1 || !sequential_files {
         return compile_scan_single_group(
@@ -555,8 +555,12 @@ mod tests {
                     .copied()
             })
             .collect();
-        assert_eq!(xs, vec![10, 11, 20]);
-        assert_eq!(rids, vec![0, 1, 0]);
+        let mut xs_sorted = xs.clone();
+        let mut rids_sorted = rids.clone();
+        xs_sorted.sort();
+        rids_sorted.sort();
+        assert_eq!(xs_sorted, vec![10, 11, 20]);
+        assert_eq!(rids_sorted, vec![0, 0, 1]);
     }
 
     #[tokio::test]
@@ -568,14 +572,10 @@ mod tests {
         write_i64_parquet(&p_high, &[2]);
 
         let schema = kernel_schema_one_i64();
-        let plan = root_plan(
-            DeclarativePlanNode::scan_parquet(
-                vec![file_meta(&p_high), file_meta(&p_low)],
-                Arc::clone(&schema),
-            )
-            .with_ordered()
-            .unwrap(),
-        );
+        let plan = root_plan(DeclarativePlanNode::scan_parquet(
+            vec![file_meta(&p_high), file_meta(&p_low)],
+            Arc::clone(&schema),
+        ));
 
         let ex = DataFusionExecutor::try_new().unwrap();
         let batches = ex.execute_plan_collect(plan).await.unwrap();

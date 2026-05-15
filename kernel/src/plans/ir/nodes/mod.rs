@@ -49,15 +49,6 @@ pub type FileFormat = FileType;
 /// `predicate` is a pushdown hint: the engine MAY apply it during the read,
 /// but MUST NOT over-filter. Any residual filtering happens via
 /// [`FilterNode`].
-///
-/// # Ordering
-///
-/// `ordered = false` (the default) is standard SQL — files MAY be processed
-/// in any order, in parallel. `ordered = true` is sugar for
-/// `UNION ALL(per-file scans) ORDER BY <synthetic file-ordinal>`: across
-/// arms, order is set by the position in `files`; within each file, rows
-/// remain in natural source order (parquet row group / JSON line). Initial
-/// `ordered = true` consumers: stream-replay log readers (newest-first).
 #[derive(Debug, Clone)]
 pub struct ScanNode {
     pub file_type: FileType,
@@ -65,13 +56,10 @@ pub struct ScanNode {
     pub schema: SchemaRef,
     pub row_index_column: Option<String>,
     pub predicate: Option<Arc<Expression>>,
-    /// Cross-file emission order; see the type-level "Ordering" doc.
-    pub ordered: bool,
 }
 
 impl ScanNode {
-    /// Create a new scan node with no row index column, no predicate, and
-    /// `ordered = false` (the SQL default — engines may parallelize).
+    /// Create a new scan node with no row index column and no predicate.
     pub fn new(file_type: FileType, files: Vec<FileMeta>, schema: SchemaRef) -> Self {
         Self {
             file_type,
@@ -79,7 +67,6 @@ impl ScanNode {
             schema,
             row_index_column: None,
             predicate: None,
-            ordered: false,
         }
     }
 

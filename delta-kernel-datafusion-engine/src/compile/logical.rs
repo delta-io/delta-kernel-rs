@@ -306,7 +306,6 @@ fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaErr
         .try_into_arrow()
         .map_err(|e| plan_compilation(format!("Logical Scan schema conversion failed: {e}")))?;
     let row_index_name = node.row_index_column.clone();
-    let file_ordinal_col = "__dk_file_ordinal";
     let build_listing_scan = |files: &[delta_kernel::FileMeta]| -> Result<LogicalPlan, DeltaError> {
         let file_schema = Arc::new(full_schema.clone());
         let file_schema = if matches!(node.file_type, FileType::Json) {
@@ -344,45 +343,30 @@ fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaErr
             .build()
             .map_err(crate::error::datafusion_err_to_delta)
     };
-    let mut scan_plan = if node.ordered || row_index_name.is_some() {
-        let mut it = node
+    // Row indexes are per-file (0-based position within the originating parquet/json file), so a
+    // scan with `row_index_column = Some(_)` must branch per file, append the row_number window
+    // to each branch, and Union them. Without a row index, a single multi-file ListingTable scan
+    // is enough.
+    let mut scan_plan = if let Some(name) = row_index_name.as_ref() {
+        let mut branches = node
             .files
             .iter()
-            .map(|f| build_listing_scan(std::slice::from_ref(f)))
+            .map(|f| {
+                let plan = build_listing_scan(std::slice::from_ref(f))?;
+                append_row_index_column(plan, name)
+            })
             .collect::<Result<Vec<_>, DeltaError>>()?
             .into_iter();
-        let mut acc = if let Some(first) = it.next() {
-            if let Some(name) = row_index_name.as_ref() {
-                append_constant_i64_column(
-                    append_row_index_column(first, name)?,
-                    file_ordinal_col,
-                    0,
-                )?
-            } else {
-                first
-            }
-        } else {
-            return Err(plan_compilation(
-                "logical scan expected at least one file branch after planning",
-            ));
-        };
-        for (idx, branch) in it.enumerate() {
-            let branch = if let Some(name) = row_index_name.as_ref() {
-                append_constant_i64_column(
-                    append_row_index_column(branch, name)?,
-                    file_ordinal_col,
-                    1 + idx as i64,
-                )?
-            } else {
-                branch
-            };
-            acc = LogicalPlanBuilder::from(acc)
-                .union(branch)
+        let first = branches.next().ok_or_else(|| {
+            plan_compilation("logical scan with row index expected at least one file")
+        })?;
+        branches.try_fold(first, |acc, right| {
+            LogicalPlanBuilder::from(acc)
+                .union(right)
                 .map_err(crate::error::datafusion_err_to_delta)?
                 .build()
-                .map_err(crate::error::datafusion_err_to_delta)?;
-        }
-        acc
+                .map_err(crate::error::datafusion_err_to_delta)
+        })?
     } else {
         build_listing_scan(&node.files)?
     };
@@ -399,19 +383,6 @@ fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaErr
             .map_err(crate::error::datafusion_err_to_delta)?
             .build()
             .map_err(crate::error::datafusion_err_to_delta)?;
-    }
-    if let Some(row_index_name) = row_index_name.as_ref() {
-        let ordinal_col = plan_column_by_name(&scan_plan, file_ordinal_col)?;
-        let rid_col = plan_column_by_name(&scan_plan, row_index_name)?;
-        scan_plan = LogicalPlanBuilder::from(scan_plan)
-            .sort(vec![
-                Expr::Column(ordinal_col).sort(true, true),
-                Expr::Column(rid_col).sort(true, true),
-            ])
-            .map_err(crate::error::datafusion_err_to_delta)?
-            .build()
-            .map_err(crate::error::datafusion_err_to_delta)?;
-        scan_plan = drop_named_column(scan_plan, file_ordinal_col)?;
     }
     Ok(scan_plan)
 }
