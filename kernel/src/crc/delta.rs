@@ -383,125 +383,13 @@ mod tests {
         assert_eq!(crc.metadata, Metadata::default()); // unchanged
     }
 
-    #[test]
-    fn test_apply_adds_domain_metadata_to_complete_map() {
-        let mut crc = base_crc();
-        crc.domain_metadata_state = DomainMetadataState::Complete(HashMap::new());
-        let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
-        let delta = CrcDelta {
-            domain_metadata_changes: vec![dm],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        let map = crc.domain_metadata_state.expect_complete();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["my.domain"].configuration(), "config1");
-    }
-
-    #[test]
-    fn test_apply_does_not_upgrade_partial_to_complete() {
-        let mut crc = base_crc();
-        assert_eq!(
-            crc.domain_metadata_state,
-            DomainMetadataState::Partial(HashMap::new())
-        );
-        let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
-        let delta = CrcDelta {
-            domain_metadata_changes: vec![dm],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        let map = crc.domain_metadata_state.expect_partial();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["my.domain"].configuration(), "config1");
-    }
-
-    #[test]
-    fn test_apply_upserts_domain_metadata_in_complete_map() {
-        let mut crc = base_crc();
-        crc.domain_metadata_state = DomainMetadataState::Complete(HashMap::from([(
-            "my.domain".to_string(),
-            DomainMetadata::new("my.domain".to_string(), "old_config".to_string()),
-        )]));
-
-        let dm = DomainMetadata::new("my.domain".to_string(), "new_config".to_string());
-        let delta = CrcDelta {
-            domain_metadata_changes: vec![dm],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        let map = crc.domain_metadata_state.expect_complete();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["my.domain"].configuration(), "new_config");
-    }
-
-    #[test]
-    fn test_apply_upserts_domain_metadata_in_partial_map_stays_partial() {
-        let mut crc = base_crc();
-        crc.domain_metadata_state = DomainMetadataState::Partial(HashMap::from([(
-            "my.domain".to_string(),
-            DomainMetadata::new("my.domain".to_string(), "old_config".to_string()),
-        )]));
-
-        let dm = DomainMetadata::new("my.domain".to_string(), "new_config".to_string());
-        let delta = CrcDelta {
-            domain_metadata_changes: vec![dm],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        let map = crc.domain_metadata_state.expect_partial();
-        assert_eq!(map["my.domain"].configuration(), "new_config");
-    }
-
-    #[test]
-    fn test_apply_removes_domain_metadata_from_complete_map() {
-        let mut crc = base_crc();
-        crc.domain_metadata_state = DomainMetadataState::Complete(HashMap::from([(
-            "my.domain".to_string(),
-            DomainMetadata::new("my.domain".to_string(), "config1".to_string()),
-        )]));
-
-        let dm = DomainMetadata::remove("my.domain".to_string(), "config1".to_string());
-        let delta = CrcDelta {
-            domain_metadata_changes: vec![dm],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        let map = crc.domain_metadata_state.expect_complete();
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn test_apply_removes_domain_metadata_from_partial_map_stays_partial() {
-        let mut crc = base_crc();
-        crc.domain_metadata_state = DomainMetadataState::Partial(HashMap::from([(
-            "my.domain".to_string(),
-            DomainMetadata::new("my.domain".to_string(), "config1".to_string()),
-        )]));
-
-        let dm = DomainMetadata::remove("my.domain".to_string(), "config1".to_string());
-        let delta = CrcDelta {
-            domain_metadata_changes: vec![dm],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        let map = crc.domain_metadata_state.expect_partial();
-        assert!(map.is_empty());
-    }
-
-    /// A single delta carrying both adds and tombstones is the realistic shape of a commit.
-    /// Applied to either `Complete` or `Partial`, upserts and removals coexist correctly and
-    /// the variant is preserved.
+    /// A delta carrying an upsert, an insert, and a tombstone exercises every apply
+    /// semantic for domain metadata. Applied to either `Complete` or `Partial`, the map
+    /// updates correctly and the variant is preserved.
     #[rstest]
     #[case::complete(DomainMetadataState::Complete(seed_dm_map()))]
     #[case::partial(DomainMetadataState::Partial(seed_dm_map()))]
-    fn test_apply_mixed_changes_upserts_and_drops_in_one_delta(#[case] base: DomainMetadataState) {
+    fn test_apply_dm_upserts_inserts_and_removes(#[case] base: DomainMetadataState) {
         let was_complete = matches!(base, DomainMetadataState::Complete(_));
         let mut crc = base_crc();
         crc.domain_metadata_state = base;
@@ -515,6 +403,7 @@ mod tests {
         };
         crc.apply(delta);
 
+        // Bind the inner map AND panic if the variant flipped during apply.
         let map = match &crc.domain_metadata_state {
             DomainMetadataState::Complete(m) if was_complete => m,
             DomainMetadataState::Partial(m) if !was_complete => m,
