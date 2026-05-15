@@ -36,7 +36,9 @@ mod tests {
     use super::*;
     use crate::actions::{DomainMetadata, Protocol, SetTransaction};
     use crate::crc::reader::try_read_crc_file;
-    use crate::crc::{FileSizeHistogram, FileStats, FileStatsState};
+    use crate::crc::{
+        DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
+    };
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::path::{AsUrl, ParsedLogPath};
@@ -82,8 +84,8 @@ mod tests {
             protocol,
             txn_id: None,
             in_commit_timestamp_opt: Some(ict),
-            set_transactions: Some(set_transactions),
-            domain_metadata: Some(domain_metadata),
+            set_transaction_state: SetTransactionState::Complete(set_transactions),
+            domain_metadata_state: DomainMetadataState::Complete(domain_metadata),
             ..Default::default()
         }
     }
@@ -212,5 +214,27 @@ mod tests {
         crc.file_stats_state = FileStatsState::Indeterminate;
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
         assert!(matches!(result, Err(Error::ChecksumWriteUnsupported(_))));
+    }
+
+    #[test]
+    fn test_write_with_partial_dm_succeeds_and_persists_no_dm_field() {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let table_root = url::Url::parse("memory:///test_table/").unwrap();
+        let path = ParsedLogPath::create_parsed_crc(&table_root, 0);
+
+        let mut crc = test_crc();
+        crc.domain_metadata_state = DomainMetadataState::Partial(HashMap::from([(
+            "k".to_string(),
+            DomainMetadata::new("k".to_string(), "v".to_string()),
+        )]));
+
+        try_write_crc_file(&engine, path.location.as_url(), &crc).unwrap();
+
+        let read_back = try_read_crc_file(&engine, &path).unwrap();
+        assert_eq!(
+            read_back.domain_metadata_state,
+            DomainMetadataState::Partial(HashMap::new())
+        );
     }
 }

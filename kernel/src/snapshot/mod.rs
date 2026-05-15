@@ -18,7 +18,9 @@ use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::crc::Crc;
-use crate::crc::{try_write_crc_file, CrcDelta, FileStats, LazyCrc};
+use crate::crc::{
+    try_write_crc_file, CrcDelta, DomainMetadataState, FileStats, LazyCrc, SetTransactionState,
+};
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
@@ -904,16 +906,27 @@ impl Snapshot {
         let expiration_timestamp =
             calculate_transaction_expiration_timestamp(self.table_properties())?;
 
-        // Fast path: serve from CRC if it tracks set transactions at this version.
+        // Fast path: serve from CRC if available at this version.
         if let Some(crc) = self
             .lazy_crc
             .get_or_load_if_at_version(engine, self.version())
         {
-            if let Some(txn_map) = &crc.set_transactions {
-                return Ok(txn_map
-                    .get(application_id)
-                    .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
-                    .map(|txn| txn.version));
+            match &crc.set_transaction_state {
+                SetTransactionState::Complete(map) => {
+                    // Complete is authoritative: a miss means the app_id has no transaction.
+                    return Ok(map
+                        .get(application_id)
+                        .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
+                        .map(|txn| txn.version));
+                }
+                SetTransactionState::Partial(map) => {
+                    // Hit is authoritative; miss falls through to log replay below.
+                    if let Some(txn) = map.get(application_id) {
+                        let version = (!is_set_txn_expired(expiration_timestamp, txn.last_updated))
+                            .then_some(txn.version);
+                        return Ok(version);
+                    }
+                }
             }
         }
 
@@ -1015,11 +1028,9 @@ impl Snapshot {
         }
     }
 
-    /// Load domain metadata from this snapshot. If `domains` is `Some`, only load the specified
-    /// domains (with early termination). If `None`, load all domains.
-    ///
-    /// This is the single entry point for all domain metadata reads on a snapshot. All public
-    /// and internal domain metadata APIs delegate to this method.
+    /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
+    /// requested domain is in a Partial cache, also answer from the cache; else full log
+    /// replay. `domains == None` means load all.
     #[internal_api]
     pub(crate) fn get_domain_metadatas_internal(
         &self,
@@ -1031,18 +1042,40 @@ impl Snapshot {
             .lazy_crc
             .get_or_load_if_at_version(engine, self.version())
         {
-            if let Some(dm_map) = &crc.domain_metadata {
-                return Ok(match domains {
-                    None => dm_map.clone(),
-                    Some(filter) => dm_map
-                        .iter()
-                        .filter(|(k, _)| filter.contains(k.as_str()))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                });
+            match &crc.domain_metadata_state {
+                DomainMetadataState::Complete(map) => {
+                    return Ok(match domains {
+                        None => map.clone(),
+                        // Look up each filter key. A miss means the domain does not exist
+                        // at this version (Complete is authoritative for misses), so skip
+                        // it and return whatever hits we found.
+                        Some(filter) => filter
+                            .iter()
+                            .filter_map(|&k| map.get(k).map(|v| (k.to_string(), v.clone())))
+                            .collect(),
+                    });
+                }
+                DomainMetadataState::Partial(map) => {
+                    if let Some(filter) = domains {
+                        // Look up each filter key. A miss means we do not know whether the
+                        // domain exists, so abandon the cache and fall through to log
+                        // replay. `collect::<Option<_>>` short-circuits on the first None.
+                        let hits: Option<DomainMetadataMap> = filter
+                            .iter()
+                            .map(|&k| map.get(k).map(|v| (k.to_string(), v.clone())))
+                            .collect();
+                        if let Some(hits) = hits {
+                            return Ok(hits);
+                        }
+                    }
+                }
             }
         }
-        // Fallback: full log replay.
+        // Fallback: scan the log_segment from scratch.
+        // TODO: a Partial cache already covers the commits read during snapshot load. A
+        //       miss search could skip that range and only scan the older commits, then
+        //       union those results with the Partial cache's entries to produce the final
+        //       answer.
         self.log_segment().scan_domain_metadatas(domains, engine)
     }
 
