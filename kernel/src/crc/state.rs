@@ -7,13 +7,12 @@
 //!
 //! - [`FileStatsState`] tracks file-stat validity (Complete / Indeterminate / Untrackable).
 //! - [`DomainMetadataState`] tracks domain-metadata completeness (Complete / Partial).
-//!
-//! TODO: introduce `SetTransactionState` with the same shape as `DomainMetadataState`.
+//! - [`SetTransactionState`] tracks set-transaction completeness (Complete / Partial).
 
 use std::collections::HashMap;
 
 use super::file_stats::FileStats;
-use crate::actions::DomainMetadata;
+use crate::actions::{DomainMetadata, SetTransaction};
 
 /// The state of file statistics for a CRC.
 ///
@@ -114,6 +113,52 @@ impl DomainMetadataState {
     }
 }
 
+// ============================================================================
+// Set transaction state
+// ============================================================================
+
+/// The completeness state of cached set transactions in a CRC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetTransactionState {
+    /// The CRC file had the `setTransactions` field (possibly as an empty array). The map is
+    /// the full set of active transactions at this version; an `app_id` not in the map has no
+    /// active transaction.
+    Complete(HashMap<String, SetTransaction>),
+
+    /// The CRC file did not have the `setTransactions` field. The map starts empty and gets
+    /// populated by incremental CRC replay over the JSON commits after the latest stale CRC.
+    /// Hits are authoritative (definitely present at this version); misses are NOT
+    /// (the app_id may have a transaction in older commits), so callers must do a further log
+    /// scan.
+    Partial(HashMap<String, SetTransaction>),
+}
+
+impl Default for SetTransactionState {
+    fn default() -> Self {
+        Self::Partial(HashMap::new())
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(clippy::panic)]
+impl SetTransactionState {
+    /// Test-only: returns the map if `Complete`, panics otherwise.
+    pub fn expect_complete(&self) -> &HashMap<String, SetTransaction> {
+        match self {
+            Self::Complete(map) => map,
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    /// Test-only: returns the map if `Partial`, panics otherwise.
+    pub fn expect_partial(&self) -> &HashMap<String, SetTransaction> {
+        match self {
+            Self::Partial(map) => map,
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +226,40 @@ mod tests {
             DomainMetadataState::default(),
             DomainMetadataState::Partial(HashMap::new())
         );
+    }
+
+    // ===== SetTransactionState =====
+
+    use crate::actions::SetTransaction;
+
+    #[test]
+    fn set_txn_state_default_is_empty_partial() {
+        assert_eq!(
+            SetTransactionState::default(),
+            SetTransactionState::Partial(HashMap::new())
+        );
+    }
+
+    #[test]
+    fn set_txn_state_complete_expect_complete_returns_map() {
+        let mut map = HashMap::new();
+        map.insert(
+            "my-app".to_string(),
+            SetTransaction::new("my-app".to_string(), 1, Some(1000)),
+        );
+        let state = SetTransactionState::Complete(map.clone());
+        assert_eq!(state.expect_complete().len(), 1);
+        assert_eq!(state.expect_complete()["my-app"].version, 1);
+    }
+
+    #[test]
+    fn set_txn_state_partial_expect_partial_returns_map() {
+        let mut map = HashMap::new();
+        map.insert(
+            "my-app".to_string(),
+            SetTransaction::new("my-app".to_string(), 2, None),
+        );
+        let state = SetTransactionState::Partial(map);
+        assert_eq!(state.expect_partial().len(), 1);
     }
 }
