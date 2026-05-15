@@ -77,8 +77,6 @@
 
 use std::sync::Arc;
 
-use url::Url;
-
 use super::nodes::*;
 use super::plan::Plan;
 use crate::expressions::{Expression, Scalar};
