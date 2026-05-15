@@ -7,6 +7,8 @@
 //!
 //! - [`FileStatsState`] tracks file-stat validity (Complete / Indeterminate / Untrackable).
 //! - [`DomainMetadataState`] tracks domain-metadata completeness (Complete / Partial).
+//!
+//! TODO: introduce `SetTransactionState` with the same shape as `DomainMetadataState`.
 
 use std::collections::HashMap;
 
@@ -89,6 +91,26 @@ pub enum DomainMetadataState {
 impl Default for DomainMetadataState {
     fn default() -> Self {
         Self::Partial(HashMap::new())
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(clippy::panic)]
+impl DomainMetadataState {
+    /// Test-only: returns the map if `Complete`, panics otherwise.
+    pub fn expect_complete(&self) -> &HashMap<String, DomainMetadata> {
+        match self {
+            Self::Complete(map) => map,
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    /// Test-only: returns the map if `Partial`, panics otherwise.
+    pub fn expect_partial(&self) -> &HashMap<String, DomainMetadata> {
+        match self {
+            Self::Partial(map) => map,
+            other => panic!("expected Partial, got {other:?}"),
+        }
     }
 }
 

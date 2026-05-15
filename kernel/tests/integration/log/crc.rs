@@ -124,9 +124,7 @@ async fn test_get_current_crc_if_loaded_returns_loaded_crc() -> DeltaResult<()> 
     assert_eq!(crc.metadata, *snapshot.table_configuration().metadata());
 
     // Domain metadata
-    let DomainMetadataState::Complete(dms) = &crc.domain_metadata_state else {
-        panic!("expected Complete, got {:?}", crc.domain_metadata_state);
-    };
+    let dms = crc.domain_metadata_state.expect_complete();
     assert_eq!(dms.len(), 3);
     assert!(dms.contains_key("delta.clustering"));
     assert!(dms.contains_key("delta.rowTracking"));
@@ -194,9 +192,7 @@ async fn test_create_table_produces_post_commit_crc() -> DeltaResult<()> {
     assert_eq!(file_stats.table_size_bytes(), 0);
     assert_eq!(crc.protocol, *snapshot.table_configuration().protocol());
     assert_eq!(crc.metadata, *snapshot.table_configuration().metadata());
-    let DomainMetadataState::Complete(dms) = &crc.domain_metadata_state else {
-        panic!("expected Complete, got {:?}", crc.domain_metadata_state);
-    };
+    let dms = crc.domain_metadata_state.expect_complete();
     assert_eq!(dms["zip"].configuration(), "zap0");
 
     Ok(())
@@ -335,9 +331,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
 
     // ===== THEN: should have CRC at v0 with zip -> zap0 =====
     let crc_v0 = write_and_verify_crc(snapshot_v0, &table_path, engine.as_ref());
-    let DomainMetadataState::Complete(dms) = &crc_v0.domain_metadata_state else {
-        panic!("expected Complete, got {:?}", crc_v0.domain_metadata_state);
-    };
+    let dms = crc_v0.domain_metadata_state.expect_complete();
     assert_eq!(dms["zip"].configuration(), "zap0");
 
     // ===== WHEN: update zip -> zap1, add foo -> bar =====
@@ -350,9 +344,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
     // ===== THEN: should have CRC at v1 with zip -> zap1, foo -> bar =====
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
     let crc_v1 = write_and_verify_crc(snapshot_v1, &table_path, engine.as_ref());
-    let DomainMetadataState::Complete(dms) = &crc_v1.domain_metadata_state else {
-        panic!("expected Complete, got {:?}", crc_v1.domain_metadata_state);
-    };
+    let dms = crc_v1.domain_metadata_state.expect_complete();
     assert_eq!(dms["zip"].configuration(), "zap1"); // <-- must be zap1
     assert_eq!(dms["foo"].configuration(), "bar"); // <-- must be bar
 
@@ -365,9 +357,7 @@ async fn test_post_commit_crc_tracks_domain_metadata_changes() -> DeltaResult<()
     // ===== THEN: should have CRC at v2 with zip gone, foo still there =====
     let snapshot_v2 = committed.post_commit_snapshot().unwrap();
     let crc_v2 = write_and_verify_crc(snapshot_v2, &table_path, engine.as_ref());
-    let DomainMetadataState::Complete(dms) = &crc_v2.domain_metadata_state else {
-        panic!("expected Complete, got {:?}", crc_v2.domain_metadata_state);
-    };
+    let dms = crc_v2.domain_metadata_state.expect_complete();
     assert!(!dms.contains_key("zip")); // <-- must be gone
     assert_eq!(dms["foo"].configuration(), "bar"); // <-- must still be bar
 
@@ -797,9 +787,7 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> DeltaResu
     let snapshot_v1 = committed.post_commit_snapshot().unwrap();
 
     let crc_v1 = snapshot_v1.get_current_crc_if_loaded_for_testing().unwrap();
-    let DomainMetadataState::Partial(map) = &crc_v1.domain_metadata_state else {
-        panic!("expected Partial, got {:?}", crc_v1.domain_metadata_state);
-    };
+    let map = crc_v1.domain_metadata_state.expect_partial();
     assert!(map.contains_key("foo"));
 
     // Hit: "foo" is in the Partial cache, so served without log replay.

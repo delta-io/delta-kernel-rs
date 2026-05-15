@@ -394,15 +394,11 @@ mod tests {
         };
         crc.apply(delta);
 
-        let DomainMetadataState::Complete(map) = &crc.domain_metadata_state else {
-            panic!("expected Complete, got {:?}", crc.domain_metadata_state);
-        };
+        let map = crc.domain_metadata_state.expect_complete();
         assert_eq!(map.len(), 1);
         assert_eq!(map["my.domain"].configuration(), "config1");
     }
 
-    /// `apply` never upgrades `Partial` to `Complete`: the variant only changes when the
-    /// caller has full knowledge, which a single delta does not provide.
     #[test]
     fn test_apply_does_not_upgrade_partial_to_complete() {
         let mut crc = base_crc();
@@ -414,9 +410,7 @@ mod tests {
         };
         crc.apply(delta);
 
-        let DomainMetadataState::Partial(map) = &crc.domain_metadata_state else {
-            panic!("expected Partial, got {:?}", crc.domain_metadata_state);
-        };
+        let map = crc.domain_metadata_state.expect_partial();
         assert_eq!(map.len(), 1);
         assert_eq!(map["my.domain"].configuration(), "config1");
     }
@@ -436,9 +430,7 @@ mod tests {
         };
         crc.apply(delta);
 
-        let DomainMetadataState::Complete(map) = &crc.domain_metadata_state else {
-            panic!("expected Complete, got {:?}", crc.domain_metadata_state);
-        };
+        let map = crc.domain_metadata_state.expect_complete();
         assert_eq!(map.len(), 1);
         assert_eq!(map["my.domain"].configuration(), "new_config");
     }
@@ -458,9 +450,7 @@ mod tests {
         };
         crc.apply(delta);
 
-        let DomainMetadataState::Partial(map) = &crc.domain_metadata_state else {
-            panic!("expected Partial, got {:?}", crc.domain_metadata_state);
-        };
+        let map = crc.domain_metadata_state.expect_partial();
         assert_eq!(map["my.domain"].configuration(), "new_config");
     }
 
@@ -479,9 +469,7 @@ mod tests {
         };
         crc.apply(delta);
 
-        let DomainMetadataState::Complete(map) = &crc.domain_metadata_state else {
-            panic!("expected Complete, got {:?}", crc.domain_metadata_state);
-        };
+        let map = crc.domain_metadata_state.expect_complete();
         assert!(map.is_empty());
     }
 
@@ -500,9 +488,7 @@ mod tests {
         };
         crc.apply(delta);
 
-        let DomainMetadataState::Partial(map) = &crc.domain_metadata_state else {
-            panic!("expected Partial, got {:?}", crc.domain_metadata_state);
-        };
+        let map = crc.domain_metadata_state.expect_partial();
         assert!(map.is_empty());
     }
 
@@ -625,9 +611,7 @@ mod tests {
             ..write_delta(0, 0)
         };
         let crc = delta.into_crc_for_version_zero().unwrap();
-        let DomainMetadataState::Complete(map) = &crc.domain_metadata_state else {
-            panic!("expected Complete, got {:?}", crc.domain_metadata_state);
-        };
+        let map = crc.domain_metadata_state.expect_complete();
         assert_eq!(map.len(), 1);
         assert_eq!(map["my.domain"].configuration(), "config1");
     }

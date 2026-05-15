@@ -88,8 +88,8 @@ pub struct Crc {
     /// log replay for misses. Only the `Complete` variant is persisted to the CRC file.
     ///
     /// TODO: when the table protocol does not enable the `domainMetadata` feature, no DM
-    /// action can exist, so `Partial(_)` is semantically equivalent to `Complete(empty)` and
-    /// both serde paths could collapse the distinction.
+    ///       action can exist, so `Partial(_)` is semantically equivalent to
+    ///       `Complete(empty)` and both serde paths could collapse the distinction.
     pub domain_metadata_state: DomainMetadataState,
 
     // ===== Not yet supported fields =====
@@ -360,9 +360,7 @@ mod tests {
         assert_eq!(txn2.last_updated, None);
 
         // A present `domainMetadata` array deserializes as `Complete` (authoritative).
-        let DomainMetadataState::Complete(domains) = &crc.domain_metadata_state else {
-            panic!("expected Complete, got {:?}", crc.domain_metadata_state);
-        };
+        let domains = crc.domain_metadata_state.expect_complete();
         assert_eq!(domains.len(), 2);
         assert!(domains.contains_key("delta.rowTracking"));
         assert!(domains.contains_key("delta.clustering"));
@@ -488,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_partial_dm_drops_entries_back_to_empty_partial() {
+    fn round_trip_partial_dm_becomes_empty_partial() {
         let mut partial = HashMap::new();
         partial.insert(
             "delta.rowTracking".to_string(),
@@ -568,12 +566,7 @@ mod tests {
         assert_eq!(txns["etl-pipeline"].version, 7);
 
         // Verify all domain metadatas
-        let DomainMetadataState::Complete(domains) = &deserialized.domain_metadata_state else {
-            panic!(
-                "expected Complete, got {:?}",
-                deserialized.domain_metadata_state
-            );
-        };
+        let domains = deserialized.domain_metadata_state.expect_complete();
         assert_eq!(domains.len(), 3);
         assert!(domains.contains_key("delta.rowTracking"));
         assert!(domains.contains_key("delta.clustering"));
