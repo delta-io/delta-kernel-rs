@@ -52,7 +52,6 @@ mod json_parse;
 mod load_sink;
 pub mod logical;
 pub mod scan;
-mod window;
 mod write_sink;
 pub(crate) use load_sink::physical_read_schema;
 
@@ -174,11 +173,11 @@ pub(super) fn compile_declarative_node(
                 &node.checks,
             )?))
         }
-        DeclarativePlanNode::Window { child, node } => {
-            let child_plan = compile_declarative_node(child, ctx)?;
-            let input_schema = node_output_schema(child)?;
-            window::compile_window_node(child_plan, input_schema, node)
-        }
+        DeclarativePlanNode::Window { .. } => Err(crate::error::unsupported(
+            "compile/mod: physical Window compile is unsupported; compile via the logical path \
+             which uses LogicalPlanBuilder::window_plan(row_number()) — per user directive, \
+             Window MUST be a logical plan",
+        )),
         DeclarativePlanNode::Union { children, node } => {
             if children.is_empty() {
                 return Err(crate::error::unsupported(
@@ -232,8 +231,15 @@ pub(crate) fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef
         DeclarativePlanNode::Filter { child, .. } => node_output_schema(child),
         DeclarativePlanNode::Assert { child, .. } => node_output_schema(child),
         DeclarativePlanNode::Window { child, node } => {
-            let child_schema = node_output_schema(child)?;
-            window::window_output_kernel_schema(&child_schema, node)
+            use delta_kernel::schema::{DataType, StructField, StructType};
+            let input_schema = node_output_schema(child)?;
+            let mut fields: Vec<StructField> = input_schema.fields().cloned().collect();
+            for wf in &node.functions {
+                fields.push(StructField::new(wf.output_col.clone(), DataType::LONG, false));
+            }
+            StructType::try_new(fields)
+                .map(Arc::new)
+                .map_err(|e| crate::error::plan_compilation(format!("window output schema: {e}")))
         }
         DeclarativePlanNode::Join { build, probe, node } => match node.join_type {
             JoinType::LeftAnti => node_output_schema(probe),
