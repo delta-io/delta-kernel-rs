@@ -254,7 +254,7 @@ impl Scan {
             self.physical_schema(),
             &partition_columns,
             self.snapshot().table_configuration().column_mapping_mode(),
-        );
+        )?;
         let f2 = DeclarativePlanNode::relation_ref(data_rows_raw_relation)
             .project(logical_projection, logical_schema.clone())
             .into_results_with_schema(logical_schema);
@@ -1052,7 +1052,7 @@ fn scan_data_projection(
     physical_schema: &SchemaRef,
     partition_columns: &HashSet<String>,
     column_mapping_mode: crate::table_features::ColumnMappingMode,
-) -> Vec<Arc<Expression>> {
+) -> Result<Vec<Arc<Expression>>, DeltaError> {
     let row_index_name = StructField::default_row_index_column().name.clone();
     let mut physical_fields = physical_schema.fields();
     logical_schema
@@ -1075,16 +1075,20 @@ fn scan_data_projection(
                     field.physical_name(column_mapping_mode),
                 ]),
                 None => {
-                    let physical_field = physical_fields.next().unwrap_or_else(|| {
-                        panic!(
-                            "scan_data_projection: missing physical field for logical field `{}`",
-                            field.name()
+                    let physical_field = physical_fields.next().ok_or_else(|| {
+                        delta_error!(
+                            DeltaErrorCode::DeltaCommandInvariantViolation,
+                            operation = "fsr::scan_data_projection",
+                            detail = format!(
+                                "missing physical field for logical field `{}`",
+                                field.name()
+                            ),
                         )
-                    });
+                    })?;
                     Expression::column([physical_field.name().as_str()])
                 }
             };
-            Arc::new(expr)
+            Ok(Arc::new(expr))
         })
         .collect()
 }
@@ -1913,7 +1917,8 @@ mod tests {
             &logical,
             &HashSet::new(),
             crate::table_features::ColumnMappingMode::None,
-        );
+        )
+        .unwrap();
         assert_eq!(projection.len(), 5);
         assert!(matches!(
             projection[0].as_ref(),
