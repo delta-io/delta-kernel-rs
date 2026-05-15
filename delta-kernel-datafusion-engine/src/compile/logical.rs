@@ -849,20 +849,24 @@ fn compile_declarative_node_logical(
                     Ok(expr.sort(!spec.descending, spec.nulls_first))
                 })
                 .collect::<Result<Vec<_>, DeltaError>>()?;
-            let mut window_exprs = Vec::with_capacity(node.functions.len());
-            let mut window_expr_names = Vec::with_capacity(node.functions.len());
-            for wf in &node.functions {
-                let expr = row_number()
-                    .partition_by(partition_by.clone())
-                    .order_by(order_by.clone())
-                    .build()
-                    .map_err(crate::error::datafusion_err_to_delta)?;
-                let expr_name = expr
-                    .name_for_alias()
-                    .map_err(crate::error::datafusion_err_to_delta)?;
-                window_exprs.push(expr);
-                window_expr_names.push((expr_name, wf.output_col.clone()));
-            }
+            // Multiple identical row_number() PARTITION BY / ORDER BY exprs collide on
+            // DataFusion's "windows require unique expression names" validation. Emit a single
+            // window expression and replicate its output to each requested output_col via the
+            // post-window projection below.
+            let row_number_expr = row_number()
+                .partition_by(partition_by.clone())
+                .order_by(order_by.clone())
+                .build()
+                .map_err(crate::error::datafusion_err_to_delta)?;
+            let expr_name = row_number_expr
+                .name_for_alias()
+                .map_err(crate::error::datafusion_err_to_delta)?;
+            let window_exprs = vec![row_number_expr];
+            let window_expr_names: Vec<(String, String)> = node
+                .functions
+                .iter()
+                .map(|wf| (expr_name.clone(), wf.output_col.clone()))
+                .collect();
             let window_plan = LogicalPlanBuilder::window_plan(child_plan.clone(), window_exprs)
                 .map_err(crate::error::datafusion_err_to_delta)?;
             let input_col_count = child_plan.schema().columns().len();
@@ -872,26 +876,26 @@ fn compile_declarative_node_logical(
                 .iter()
                 .map(|col| Expr::Column(col.clone()))
                 .collect::<Vec<_>>();
-            projection.extend(
-                window_expr_names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (_from, to))| {
-                        let window_col_idx = input_col_count + i;
-                        let src_col = window_plan
-                            .schema()
-                            .columns()
-                            .get(window_col_idx)
-                            .cloned()
-                            .ok_or_else(|| {
-                                plan_compilation(format!(
-                                    "logical window: missing computed window output at index {window_col_idx}"
-                                ))
-                            })?;
-                        Ok::<Expr, DeltaError>(Expr::Column(src_col).alias(to.clone()))
-                    })
-                    .collect::<Result<Vec<_>, DeltaError>>()?,
-            );
+            // Single window expression covers all output_cols (see comment above). Each kernel
+            // output_col aliases the same source column, cast to Int64 (kernel WindowFunction emits
+            // LONG; row_number_udf emits UInt64).
+            let src_col = window_plan
+                .schema()
+                .columns()
+                .get(input_col_count)
+                .cloned()
+                .ok_or_else(|| {
+                    plan_compilation(format!(
+                        "logical window: missing computed window output at index {input_col_count}"
+                    ))
+                })?;
+            projection.extend(window_expr_names.iter().map(|(_from, to)| {
+                cast(
+                    Expr::Column(src_col.clone()),
+                    datafusion::arrow::datatypes::DataType::Int64,
+                )
+                .alias(to.clone())
+            }));
             let plan = LogicalPlanBuilder::from(window_plan)
                 .project(projection)
                 .map_err(crate::error::datafusion_err_to_delta)?
