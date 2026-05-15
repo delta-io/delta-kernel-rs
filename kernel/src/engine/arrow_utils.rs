@@ -1572,6 +1572,53 @@ pub(crate) fn json_arrow_schema(schema: &StructType) -> DeltaResult<ArrowSchema>
     Ok(ArrowSchema::try_from_kernel(&json_fields)?)
 }
 
+/// Walks `schema` along a dot-segment column path (e.g. `["add", "stats", "minValues"]`) and
+/// returns the resolved Arrow [`FieldRef`]. Each non-terminal segment must resolve to a struct
+/// type; mismatches or missing names produce a typed error containing the path traversed so far.
+pub fn resolve_field_path(
+    schema: &ArrowSchema,
+    path: &[&str],
+) -> DeltaResult<crate::arrow::datatypes::FieldRef> {
+    let Some((first, rest)) = path.split_first() else {
+        return Err(Error::generic(
+            "resolve_field_path: empty path",
+        ));
+    };
+    let mut current = schema
+        .field_with_name(first)
+        .map_err(|_| {
+            Error::generic(format!(
+                "resolve_field_path: schema has no field `{first}`"
+            ))
+        })?
+        .clone();
+    let mut current_ref: crate::arrow::datatypes::FieldRef = Arc::new(current.clone());
+    let mut traversed: Vec<&str> = vec![first];
+    for segment in rest {
+        let crate::arrow::datatypes::DataType::Struct(fields) = current.data_type() else {
+            return Err(Error::generic(format!(
+                "resolve_field_path: segment `{}` is not a struct at path `{}`",
+                traversed.last().copied().unwrap_or(""),
+                traversed.join(".")
+            )));
+        };
+        let child = fields
+            .iter()
+            .find(|f| f.name() == segment)
+            .ok_or_else(|| {
+                Error::generic(format!(
+                    "resolve_field_path: struct at `{}` has no child `{segment}`",
+                    traversed.join(".")
+                ))
+            })?
+            .clone();
+        traversed.push(segment);
+        current = (*child).clone();
+        current_ref = child;
+    }
+    Ok(current_ref)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
