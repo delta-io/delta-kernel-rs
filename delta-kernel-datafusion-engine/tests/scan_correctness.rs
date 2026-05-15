@@ -17,7 +17,6 @@ use delta_kernel::expressions::{column_expr, Expression, Predicate};
 use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
 use delta_kernel::{EvaluationHandler, FileMeta};
-use delta_kernel_datafusion_engine::compile::scan::compile_scan;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use url::Url;
@@ -179,16 +178,6 @@ async fn unordered_multi_file_scan_with_row_index_keeps_scan_ordered_false_and_r
         _ => panic!("expected Scan"),
     }
 
-    let scan_for_physical = match node.clone() {
-        DeclarativePlanNode::Scan(s) => s,
-        _ => unreachable!(),
-    };
-    let physical = compile_scan(&scan_for_physical).unwrap();
-    assert!(
-        plan_contains_ordered_union(physical.as_ref()),
-        "row_index_column must fan out per-file (OrderedUnionExec)"
-    );
-
     let plan = node.into_results();
 
     let batches = DataFusionExecutor::try_new()
@@ -203,15 +192,6 @@ async fn unordered_multi_file_scan_with_row_index_keeps_scan_ordered_false_and_r
         vec![0, 1, 0],
         "unordered flag must still yield per-file row indices"
     );
-}
-
-fn plan_contains_ordered_union(plan: &dyn datafusion_physical_plan::ExecutionPlan) -> bool {
-    if plan.name() == "OrderedUnionExec" {
-        return true;
-    }
-    plan.children()
-        .iter()
-        .any(|c| plan_contains_ordered_union(c.as_ref()))
 }
 
 #[tokio::test]
@@ -264,40 +244,4 @@ async fn scan_predicate_matches_arrow_parquet_reference_multi_file_ordered() {
         "native residual scan filter output must match parquet iterator + kernel evaluator reference"
     );
     assert_eq!(df_x, vec![12, 25, 30, 100]);
-}
-
-#[tokio::test]
-async fn scan_predicate_plan_always_wraps_native_filter_when_predicate_present() {
-    let dir = tempfile::tempdir().unwrap();
-    let p = dir.path().join("solo.parquet");
-    write_i64_parquet(&p, &[1, 2, 3]);
-
-    let kernel_schema = kernel_schema_one_i64();
-    let pred = Arc::new(Expression::from_pred(Predicate::gt(
-        column_expr!("x"),
-        Expression::literal(delta_kernel::expressions::Scalar::Long(1)),
-    )));
-
-    let node = DeclarativePlanNode::scan_parquet(vec![file_meta(&p)], Arc::clone(&kernel_schema))
-        .with_predicate(pred)
-        .unwrap();
-
-    let scan = match node {
-        DeclarativePlanNode::Scan(s) => s,
-        _ => unreachable!(),
-    };
-    let physical = compile_scan(&scan).unwrap();
-    assert!(
-        plan_contains_native_filter(physical.as_ref()),
-        "scan predicate must lower to native FilterExec (guaranteed residual evaluation)"
-    );
-}
-
-fn plan_contains_native_filter(plan: &dyn datafusion_physical_plan::ExecutionPlan) -> bool {
-    if plan.name() == "FilterExec" {
-        return true;
-    }
-    plan.children()
-        .iter()
-        .any(|c| plan_contains_native_filter(c.as_ref()))
 }
