@@ -14,10 +14,6 @@ members = [
     "unity-catalog-delta-client-api", # WIP: transport-agnostic UC client API traits
     "delta-kernel-datafusion-engine",
 ]
-exclude = [
-    # Patched crates.io snapshot (patched via `[patch.crates-io]`); not a workspace member.
-    "vendor/datafusion-datasource-parquet",
-]
 # note that in addition to the members above, the workspace includes examples:
 # - inspect-table
 # - read-table-changes
@@ -26,10 +22,38 @@ exclude = [
 # - write-table
 resolver = "3"
 
-# Patched fork (additive virtual-column hooks for parquet scans). See
-# `vendor/datafusion-datasource-parquet/README.DELTA_KERNEL_PATCH.md`.
+# Patched DataFusion fork adding virtual-column hooks + parquet field-ID-aware root adaptation
+# to `datafusion-datasource-parquet`. Tracks DataFusion 53.1.0 plus the
+# `delta-kernel-vendor-patch` branch on the fork. Every datafusion crate in our dep graph
+# must come from the fork — otherwise type identity diverges between the fork's parquet
+# crate (which sees fork-built sibling types) and crates.io copies brought in transitively.
 [patch.crates-io]
-datafusion-datasource-parquet = { path = "vendor/datafusion-datasource-parquet" }
+datafusion = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-catalog = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-catalog-listing = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-common = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-common-runtime = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-datasource = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-datasource-json = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-datasource-parquet = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-execution = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-expr = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-expr-common = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-functions = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-functions-aggregate = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-functions-aggregate-common = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-functions-nested = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-functions-window = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-functions-window-common = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-optimizer = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-physical-expr = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-physical-expr-adapter = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-physical-expr-common = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-physical-optimizer = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-physical-plan = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-pruning = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-session = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
+datafusion-sql = { git = "https://github.com/OussamaSaoudi/datafusion.git", rev = "bf8dc9a7b" }
 
 [workspace.package]
 edition = "2021"
