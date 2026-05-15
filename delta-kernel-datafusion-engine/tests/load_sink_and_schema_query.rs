@@ -10,7 +10,7 @@ use delta_kernel::arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::expressions::{ColumnName, Scalar, StructData};
 use delta_kernel::plans::ir::nodes::{
-    DvKind, DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns, ValuesNode,
+    DvRef, FileType, LoadSink, RelationHandle, ScanFileColumns, ValuesNode,
 };
 use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::schema::{DataType, StructField, StructType, ToSchema};
@@ -248,7 +248,7 @@ async fn load_sink_applies_dv_ref_masking_from_descriptor_column() {
             size: None,
             record_count: None,
         },
-        dv_ref: Some(DvRef::skip(dv_cn, DvKind::Descriptor)),
+        dv_ref: Some(DvRef::skip(dv_cn)),
         passthrough_columns: Vec::new(),
         file_type: FileType::Parquet,
     };

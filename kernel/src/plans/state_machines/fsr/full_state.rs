@@ -73,7 +73,7 @@ use crate::expressions::{BinaryExpressionOp, ColumnName, Expression, Predicate, 
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::errors::{DeltaError, DeltaErrorCode, KernelErrAsDelta};
 use crate::plans::ir::nodes::{
-    DvKind, DvRef, FileFormat, FileType, JoinHint, JoinNode, JoinType, LoadSink, OrderingSpec,
+    DvRef, FileFormat, FileType, JoinHint, JoinNode, JoinType, LoadSink, OrderingSpec,
     RelationHandle, ScanFileColumns, WindowFunction,
 };
 use crate::plans::ir::{DeclarativePlanNode, Extractor, Plan};
@@ -240,10 +240,7 @@ impl Scan {
                 size: Some(ColumnName::new(["size"])),
                 record_count: None,
             },
-            dv_ref: Some(DvRef::skip(
-                ColumnName::new(["deletionVector"]),
-                DvKind::Descriptor,
-            )),
+            dv_ref: Some(DvRef::skip(ColumnName::new(["deletionVector"]))),
             passthrough_columns: vec![
                 ColumnName::new([FILE_CONSTANT_VALUES_NAME]),
                 ColumnName::new(["path"]),
@@ -1307,8 +1304,6 @@ fn build_commit_dedup_plan(
     let windowed = projected
         .window(
             vec![WindowFunction {
-                function_name: "row_number".into(),
-                args: vec![],
                 output_col: "__kernel_rn".into(),
             }],
             vec![Arc::new(Expression::column([FSR_JOIN_KEY_COL]))],
@@ -1887,10 +1882,7 @@ mod tests {
         assert_eq!(load.file_meta.size, Some(ColumnName::new(["size"])));
         assert_eq!(
             load.dv_ref,
-            Some(DvRef::skip(
-                ColumnName::new(["deletionVector"]),
-                DvKind::Descriptor
-            ))
+            Some(DvRef::skip(ColumnName::new(["deletionVector"])))
         );
         assert_eq!(
             load.passthrough_columns,

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use datafusion_physical_plan::ExecutionPlan;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::{DvRef, FileType, LoadSink};
+use delta_kernel::plans::ir::nodes::{FileType, LoadSink};
 use delta_kernel::plans::ir::Plan;
 use delta_kernel::schema::{DataType, MetadataColumnSpec, StructField, StructType};
 
@@ -99,14 +99,7 @@ pub(super) fn validate_load_sink(load: &LoadSink, upstream: &StructType) -> Resu
         ensure_column(upstream, rc)?;
     }
     if let Some(ref dv) = load.dv_ref {
-        match dv {
-            DvRef::Skip(v) => ensure_column(upstream, &v.column)?,
-            DvRef::Keep(v) => ensure_column(upstream, &v.column)?,
-            DvRef::KeepDiff(v) => {
-                ensure_column(upstream, &v.dv)?;
-                ensure_column(upstream, &v.subtract)?;
-            }
-        }
+        ensure_column(upstream, &dv.column)?;
     }
     for cn in &load.passthrough_columns {
         ensure_column(upstream, cn)?;

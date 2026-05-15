@@ -848,9 +848,6 @@ fn compile_declarative_node_logical(
             let mut window_exprs = Vec::with_capacity(node.functions.len());
             let mut window_expr_names = Vec::with_capacity(node.functions.len());
             for wf in &node.functions {
-                if wf.function_name != "row_number" || !wf.args.is_empty() {
-                    return Ok(None);
-                }
                 let expr = row_number()
                     .partition_by(partition_by.clone())
                     .order_by(order_by.clone())

@@ -1,27 +1,20 @@
 //! Sink IR types — relation piping, [`ConsumeByKdf`], file-reader [`LoadSink`], and
 //! file-writer sinks ([`WriteSink`], [`PartitionedWriteSink`]).
 
-use std::sync::Arc;
-
 use super::{FileType, OrderingSpec};
-use crate::expressions::{ColumnName, Expression};
+use crate::expressions::ColumnName;
 use crate::plans::kdf::{ConsumerKdf, Handle, KdfStateToken, TraceContext};
 use crate::schema::SchemaRef;
 
 /// Template for draining a row stream into a [`ConsumerKdf`] via
-/// [`SinkType::ConsumeByKdf`].
-///
-/// Fields mirror the former plan-tree `KdfNode<dyn ConsumerKdf>` payload; KDF
-/// lives exclusively under sinks in the IR.
+/// [`SinkType::ConsumeByKdf`]. KDF lives exclusively under sinks in the IR.
 ///
 /// - `initial_state`: cloned per partition via [`DynClone`](dyn_clone::DynClone) into a
 ///   [`Handle`](crate::plans::kdf::Handle).
-/// - `partitionable_by`: optional hash-partition expression (unused by consumers today).
 /// - `requires_ordering`: stamped from [`ConsumerKdf::required_ordering`] at construction.
 /// - `token`: joins finalized state back to the phase's `PhaseState`.
 pub struct ConsumeByKdfSink {
     pub initial_state: Box<dyn ConsumerKdf>,
-    pub partitionable_by: Option<Arc<Expression>>,
     pub requires_ordering: Option<OrderingSpec>,
     pub token: KdfStateToken,
 }
@@ -34,7 +27,6 @@ impl ConsumeByKdfSink {
         let token = KdfStateToken::new(state.kdf_id());
         Self {
             initial_state: Box::new(state),
-            partitionable_by: None,
             requires_ordering,
             token,
         }
@@ -55,7 +47,6 @@ impl Clone for ConsumeByKdfSink {
     fn clone(&self) -> Self {
         Self {
             initial_state: self.initial_state.clone(),
-            partitionable_by: self.partitionable_by.clone(),
             requires_ordering: self.requires_ordering.clone(),
             token: self.token.clone(),
         }
@@ -102,12 +93,6 @@ pub struct RelationHandle {
     /// operators without an external lookup. Not part of equality / hashing.
     pub schema: SchemaRef,
 }
-
-/// Typed relation identity carried across sink/ref boundaries.
-///
-/// `RelationId` is currently an alias of [`RelationHandle`], kept to smooth
-/// migration from id-only wiring to explicit `(name, schema)` contracts.
-pub(crate) type RelationId = RelationHandle;
 
 impl RelationHandle {
     /// Mint a fresh handle with the given diagnostic name and producer
@@ -159,57 +144,25 @@ pub struct ScanFileColumns {
     pub record_count: Option<ColumnName>,
 }
 
-/// Deletion-vector encoding kind for [`DvRef`] variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DvKind {
-    /// Descriptor struct matching
-    /// [`crate::actions::deletion_vector::DeletionVectorDescriptor`].
-    Descriptor,
-}
-
-/// Skip rows present in the deletion vector named by `column`.
+/// Deletion-vector reference attached to a [`LoadSink`]. Rows present in the
+/// referenced DV are skipped from the file read.
+///
+/// `column` is a [`crate::actions::deletion_vector::DeletionVectorDescriptor`]
+/// struct column on the upstream relation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DvSkip {
+pub struct DvRef {
     pub column: ColumnName,
-    pub kind: DvKind,
-}
-
-/// Keep only rows present in the deletion vector named by `column`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DvKeep {
-    pub column: ColumnName,
-    pub kind: DvKind,
-}
-
-/// Keep rows in `dv` minus rows in `subtract`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DvKeepDiff {
-    pub dv: ColumnName,
-    pub subtract: ColumnName,
-    pub kind: DvKind,
-}
-
-/// Deletion-vector reference attached to a [`LoadSink`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DvRef {
-    Skip(DvSkip),
-    Keep(DvKeep),
-    KeepDiff(DvKeepDiff),
 }
 
 impl DvRef {
-    /// Build a skip-style DV reference.
-    pub fn skip(column: ColumnName, kind: DvKind) -> Self {
-        Self::Skip(DvSkip { column, kind })
+    /// Build a skip-style DV reference from a descriptor column.
+    pub fn skip(column: ColumnName) -> Self {
+        Self { column }
     }
 
-    /// Return the primary DV column reference when this variant has one.
+    /// Return the DV column reference.
     pub fn primary_column(&self) -> &ColumnName {
-        match self {
-            Self::Skip(v) => &v.column,
-            Self::Keep(v) => &v.column,
-            Self::KeepDiff(v) => &v.dv,
-        }
+        &self.column
     }
 }
 
@@ -221,8 +174,8 @@ impl DvRef {
 /// downstream plans in the same phase can consume it through
 /// [`crate::plans::ir::declarative::DeclarativePlanNode::relation_ref`].
 ///
-/// Phase 0.7 threads an optional [`Self::dv_ref`] column hint for per-row
-/// deletion-vector masking; pushdown predicate lands with subsequent stack PRs.
+/// An optional [`Self::dv_ref`] column hint enables per-row deletion-vector
+/// masking against a descriptor column on the upstream relation.
 ///
 /// Spec: `declarative_plan_docs/algebra/plan_nodes.md` §5
 /// (`Sink: Load (LoadSinkNode)`).
@@ -230,7 +183,7 @@ impl DvRef {
 pub struct LoadSink {
     /// Where Load's output is materialized. Downstream plans reference this
     /// handle via [`crate::plans::ir::declarative::DeclarativePlanNode::relation_ref`].
-    pub output_relation: RelationId,
+    pub output_relation: RelationHandle,
     /// Desired per-file output columns (nullability follows
     /// [`crate::ParquetHandler::read_parquet_files`] semantics).
     pub file_schema: SchemaRef,
@@ -245,8 +198,7 @@ pub struct LoadSink {
     /// Names of upstream columns to broadcast verbatim onto every output row
     /// (e.g. `add.path` for downstream joins back to the manifest).
     pub passthrough_columns: Vec<ColumnName>,
-    /// Read format. Phase 0.6 supports `Parquet` and `Json`; later stacks
-    /// add the spec's full `FileFormat` tagged union.
+    /// Read format (`Parquet` or `Json`).
     pub file_type: FileType,
 }
 
@@ -277,9 +229,8 @@ pub enum WriteFileFormat {
 /// stream to a single destination (interpretation of `destination` — file vs
 /// directory prefix — is executor-specific).
 ///
-/// This is **IR only** in Phase 0.8: no default in-process executor support.
 /// DataFusion-backed executors interpret `format` and `destination` when
-/// lowering the plan.
+/// lowering the plan; the default in-process executor does not support this sink.
 ///
 /// # Equality
 ///
@@ -321,8 +272,8 @@ impl WriteSink {
 /// beneath nested directories rooted at [`Self::destination`]. Exact naming,
 /// commit semantics, and overwrite behavior are executor-defined.
 ///
-/// **IR only** in Phase 0.9: intended for DataFusion (or similar) lowering, not
-/// the default in-process executor.
+/// Intended for DataFusion (or similar) lowering; the default in-process
+/// executor does not support this sink.
 ///
 /// # Equality
 ///
@@ -375,7 +326,7 @@ pub enum SinkType {
     /// Stream every output batch to the named [`RelationHandle`]. Another
     /// plan in the same phase consumes via
     /// [`crate::plans::ir::declarative::DeclarativePlanNode::relation_ref`].
-    Relation(RelationId),
+    Relation(RelationHandle),
     /// Drain every output batch through the wrapped consumer KDF. The KDF's
     /// finalized per-partition state is harvested by the engine into the
     /// phase's `PhaseState` (and recovered by the typed
@@ -411,55 +362,4 @@ impl Eq for SinkType {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkNode {
     pub sink_type: SinkType,
-}
-
-impl SinkNode {
-    /// `Results`-sink convenience constructor.
-    pub fn results() -> Self {
-        Self {
-            sink_type: SinkType::Results(None),
-        }
-    }
-
-    /// `Results`-sink constructor with explicit output schema.
-    pub fn results_with_schema(schema: SchemaRef) -> Self {
-        Self {
-            sink_type: SinkType::Results(Some(schema)),
-        }
-    }
-
-    /// `Relation`-sink convenience constructor.
-    pub fn relation(handle: RelationId) -> Self {
-        Self {
-            sink_type: SinkType::Relation(handle),
-        }
-    }
-
-    /// `ConsumeByKdf`-sink convenience constructor.
-    pub fn consume_by_kdf(node: ConsumeByKdfSink) -> Self {
-        Self {
-            sink_type: SinkType::ConsumeByKdf(node),
-        }
-    }
-
-    /// `Load`-sink convenience constructor.
-    pub fn load(node: LoadSink) -> Self {
-        Self {
-            sink_type: SinkType::Load(node),
-        }
-    }
-
-    /// `Write`-sink convenience constructor.
-    pub fn write(node: WriteSink) -> Self {
-        Self {
-            sink_type: SinkType::Write(node),
-        }
-    }
-
-    /// `PartitionedWrite`-sink convenience constructor.
-    pub fn partitioned_write(node: PartitionedWriteSink) -> Self {
-        Self {
-            sink_type: SinkType::PartitionedWrite(node),
-        }
-    }
 }

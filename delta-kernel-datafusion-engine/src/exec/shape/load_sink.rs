@@ -29,7 +29,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::{DvKind, DvRef, FileType, LoadSink};
+use delta_kernel::plans::ir::nodes::{FileType, LoadSink};
 use delta_kernel::scan::selection_vector;
 use delta_kernel::schema::SchemaRef as KernelSchemaRef;
 use delta_kernel::{Engine, FileMeta};
@@ -408,29 +408,7 @@ fn optional_selection_vector_for_row(
     let Some(ref dv_cn) = sink.dv_ref else {
         return Ok(None);
     };
-    let dv_column = match dv_cn {
-        DvRef::Skip(v) => {
-            if v.kind != DvKind::Descriptor {
-                return Err(crate::error::unsupported(format!(
-                    "Load sink dv_ref.skip kind {:?} is not supported",
-                    v.kind
-                )));
-            }
-            &v.column
-        }
-        DvRef::Keep(v) => {
-            return Err(crate::error::unsupported(format!(
-                "Load sink dv_ref.keep is not supported yet (column `{}` kind {:?})",
-                v.column, v.kind
-            )));
-        }
-        DvRef::KeepDiff(v) => {
-            return Err(crate::error::unsupported(format!(
-                "Load sink dv_ref.keep_diff is not supported yet (dv `{}`, subtract `{}` kind {:?})",
-                v.dv, v.subtract, v.kind
-            )));
-        }
-    };
+    let dv_column = &dv_cn.column;
     let arr = extract_column_array(batch, dv_column)?;
     if arr.is_null(row) {
         return Ok(None);

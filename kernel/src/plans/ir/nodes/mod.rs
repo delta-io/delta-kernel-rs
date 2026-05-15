@@ -319,16 +319,10 @@ impl OrderingSpec {
 // Window
 // ============================================================================
 
-/// One window function applied within a [`WindowNode`].
-///
-/// Ships `function_name = "row_number"` only — the only window function any
-/// current consumer needs. `args` is empty for `row_number`. Each function
-/// emits exactly one column whose name is `output_col` and whose type is
-/// `LONG NOT NULL` (for `row_number`; documented per future name).
+/// One window function applied within a [`WindowNode`]. Only `row_number()` is
+/// supported; the function emits one `LONG NOT NULL` column named `output_col`.
 #[derive(Debug, Clone)]
 pub struct WindowFunction {
-    pub function_name: String,
-    pub args: Vec<Arc<Expression>>,
     pub output_col: String,
 }
 
@@ -414,6 +408,6 @@ pub struct AssertNode {
 mod sinks;
 
 pub use sinks::{
-    ConsumeByKdfSink, DvKeep, DvKeepDiff, DvKind, DvRef, DvSkip, LoadSink, PartitionedWriteSink,
-    RelationHandle, ScanFileColumns, SinkNode, SinkType, WriteFileFormat, WriteSink,
+    ConsumeByKdfSink, DvRef, LoadSink, PartitionedWriteSink, RelationHandle, ScanFileColumns,
+    SinkNode, SinkType, WriteFileFormat, WriteSink,
 };

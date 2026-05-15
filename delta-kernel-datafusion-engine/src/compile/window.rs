@@ -28,7 +28,7 @@ use delta_kernel::arrow::compute::SortOptions;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, SchemaRef as ArrowSchemaRef};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::{OrderingSpec, WindowFunction, WindowNode};
+use delta_kernel::plans::ir::nodes::{OrderingSpec, WindowNode};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 
 use crate::compile::expr_translator;
@@ -60,10 +60,6 @@ pub(crate) fn compile_window_node(
             "Window node must declare at least one window function",
         ));
     }
-    for f in &node.functions {
-        validate_row_number_function(f)?;
-    }
-
     if node.order_by.is_empty() {
         return Err(crate::error::unsupported(
             "Window(row_number): empty order_by is not supported; add ORDER BY columns for \
@@ -276,17 +272,3 @@ fn kernel_to_arrow_schema(input_schema: &SchemaRef) -> Result<ArrowSchemaRef, De
     Ok(Arc::new(arrow_schema))
 }
 
-fn validate_row_number_function(f: &WindowFunction) -> Result<(), DeltaError> {
-    if !f.function_name.eq_ignore_ascii_case("row_number") {
-        return Err(crate::error::unsupported(format!(
-            "window function '{}' is not supported (only row_number)",
-            f.function_name
-        )));
-    }
-    if !f.args.is_empty() {
-        return Err(crate::error::plan_compilation(
-            "row_number window function expects empty args",
-        ));
-    }
-    Ok(())
-}

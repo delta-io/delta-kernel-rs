@@ -539,7 +539,7 @@ mod tests {
     use super::*;
     use crate::expressions::{ColumnName, Expression};
     use crate::plans::errors::DeltaError;
-    use crate::plans::ir::nodes::{DvKind, DvRef, OrderingSpec, WindowFunction};
+    use crate::plans::ir::nodes::{DvRef, OrderingSpec, WindowFunction};
     use crate::plans::kdf::{ConsumerKdf, Kdf, KdfControl, KdfOutput};
     use crate::schema::{DataType, StructField, StructType};
 
@@ -702,7 +702,7 @@ mod tests {
                 size: None,
                 record_count: None,
             },
-            dv_ref: Some(DvRef::skip(dv_col.clone(), DvKind::Descriptor)),
+            dv_ref: Some(DvRef::skip(dv_col.clone())),
             passthrough_columns: vec![],
             file_type: FileType::Parquet,
         };
@@ -711,7 +711,7 @@ mod tests {
             SinkType::Load(ls) => {
                 assert_eq!(
                     ls.dv_ref.as_ref(),
-                    Some(&DvRef::skip(dv_col.clone(), DvKind::Descriptor))
+                    Some(&DvRef::skip(dv_col.clone()))
                 );
                 assert_eq!(ls.output_relation, out_handle);
             }
