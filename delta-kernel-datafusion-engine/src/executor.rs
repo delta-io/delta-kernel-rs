@@ -17,9 +17,9 @@
 //! or JSON reads via [`KernelLoadSinkExec`](crate::exec::KernelLoadSinkExec) and the kernel's
 //! parquet/json handlers.
 //!
-//! Phase 3.2 submits [`SinkType::ConsumeByKdf`] finalized handles into [`PhaseState`] during
+//! [`SinkType::ConsumeByKdf`] finalized handles submit into [`PhaseState`] during
 //! [`Self::execute_phase_operation`] using [`crate::compile::CompileContext::phase_state`].
-//! Phase 3.3 wires classic checkpoint parquet materialization via
+//! Classic checkpoint parquet materialization is wired via
 //! [`Self::checkpoint_write_classic_parquet_and_finalize`] (kernel
 //! [`delta_kernel::plans::state_machines::df::checkpoint_write`] plans + SM phase
 //! `checkpoint_parquet_write`).
@@ -134,9 +134,6 @@ fn execute_schema_query_phase(
 }
 
 /// Minimal executor: holds a [`TaskContext`] for [`ExecutionPlan::execute`] calls.
-///
-/// Phase 1.1 does not yet wire a full [`SessionContext`](https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html);
-/// literal execution only needs the default task context.
 pub struct DataFusionExecutor {
     task_ctx: Arc<TaskContext>,
     session_ctx: SessionContext,
@@ -196,7 +193,7 @@ impl DataFusionExecutor {
         })
     }
 
-    /// Compile a [`Plan`] into a physical node when Phase 1.1 dispatch accepts it.
+    /// Compile a [`Plan`] into a physical node via the kernel sink dispatch table.
     pub fn compile_plan(&self, plan: &Plan) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
         let physical = compile_plan(
             plan,
@@ -509,15 +506,13 @@ impl DataFusionExecutor {
         }
     }
 
-    /// Phase 3.4 helper — drive
-    /// [`delta_kernel::plans::state_machines::df::insert_write_sm`] to completion.
+    /// Drive [`delta_kernel::plans::state_machines::df::insert_write_sm`] to completion.
     pub async fn drive_insert_write_sm(&self, plan: Plan) -> Result<(), DeltaError> {
         let sm = delta_kernel::plans::state_machines::df::insert_write_sm(plan)?;
         self.drive_coroutine_sm(sm).await
     }
 
-    /// Phase 3.3 helper — drive
-    /// [`delta_kernel::plans::state_machines::df::checkpoint_classic_parquet_write_sm`] to
+    /// Drive [`delta_kernel::plans::state_machines::df::checkpoint_classic_parquet_write_sm`] to
     /// completion.
     pub async fn drive_checkpoint_classic_parquet_write_sm(
         &self,

@@ -1,4 +1,4 @@
-//! Phase 3.1 — [`delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation`]
+//! [`delta_kernel::plans::state_machines::framework::phase_operation::PhaseOperation`]
 //! wiring for [`delta_kernel_datafusion_engine::DataFusionExecutor`] (`execute_phase_operation`).
 
 use std::any::Any;

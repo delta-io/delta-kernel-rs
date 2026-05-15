@@ -1,6 +1,6 @@
-//! Phase 4.3 — explicit **kernel/reference vs DataFusion executor** parity for declarative
-//! state machines wired today (`plans::state_machines::df` insert/checkpoint flows plus framework
-//! phase ops). Real FSR multi-phase execution is covered by dedicated FSR integration tests.
+//! **Kernel/reference vs DataFusion executor** parity for declarative state machines
+//! (`plans::state_machines::df` insert/checkpoint flows plus framework phase ops). Real FSR
+//! multi-phase execution is covered by dedicated FSR integration tests.
 //!
 //! ## Deferred / out of scope (documented here only)
 //!

@@ -6,7 +6,7 @@
 //! set to [`FileOutputMode::SingleFile`] so one object-store path receives all rows (including an
 //! empty Arrow schema via an empty batch when the stream has no rows).
 //!
-//! # Limitations (Phase 2.1)
+//! # Limitations
 //!
 //! - **Post-write metadata**: Parquet footer metadata gathered inside [`ParquetSink::written`] is
 //!   not surfaced to callers (no Delta [`DataFileMetadata`] bridge). Harvesting structured stats

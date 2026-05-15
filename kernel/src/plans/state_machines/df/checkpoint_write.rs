@@ -1,4 +1,4 @@
-//! Classic single-file checkpoint parquet write plans for DataFusion-backed SM drivers (Phase 3.3).
+//! Classic single-file checkpoint parquet write plans for DataFusion-backed SM drivers.
 //!
 //! ## Supported path
 //!

@@ -1,4 +1,4 @@
-//! Phase 3.3 — classic V2 checkpoint parquet via DF SM driving (`checkpoint_parquet_write` phase).
+//! Classic V2 checkpoint parquet via DF SM driving (`checkpoint_parquet_write` phase).
 
 use std::sync::Arc;
 

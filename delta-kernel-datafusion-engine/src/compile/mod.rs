@@ -1,23 +1,11 @@
 //! Declarative [`Plan`] -> DataFusion [`ExecutionPlan`] compilation.
 //!
-//! Phase 1.7 extends sinks beyond [`SinkType::Results`]:
-//! [`SinkType::Relation`] (materialize into [`RelationBatchRegistry`]),
-//! [`SinkType::ConsumeByKdf`] (drain via [`KernelConsumeByKdfExec`]).
+//! Sinks: [`SinkType::Results`] (collect), [`SinkType::Relation`] (materialize into
+//! [`RelationBatchRegistry`]), [`SinkType::ConsumeByKdf`] (drain via [`KernelConsumeByKdfExec`]),
+//! [`SinkType::Write`] (single-file Parquet / JsonLines), [`SinkType::PartitionedWrite`]
+//! (Hive-style directories), [`SinkType::Load`] (per-row parquet/json kernel-handler reads).
 //!
-//! Phase 2.1 adds [`SinkType::Write`] for single-file Parquet / JsonLines via DataFusion
-//! [`DataSinkExec`](datafusion_datasource::sink::DataSinkExec) (see [`write_sink`]).
-//!
-//! Phase 2.2 adds [`SinkType::PartitionedWrite`] ([`KernelPartitionedWriteExec`]): Hive-style
-//! directories under a `file://` destination with Parquet or newline-delimited JSON.
-//!
-//! Phase 2.3 adds [`SinkType::Load`] ([`crate::exec::KernelLoadSinkExec`]): per-row parquet/json
-//! reads via kernel handlers into [`crate::exec::RelationBatchRegistry`].
-//!
-//! Phase 1.2 extends the scaffold with leaf support:
-//! - `Values`
-//! - `Scan`
-//! - `FileListing`
-//! - `RelationRef`
+//! Leaves: `Values`, `Scan`, `FileListing`, `RelationRef`.
 
 use std::sync::{Arc, Mutex};
 
