@@ -104,6 +104,7 @@ mod log_path;
 mod log_reader;
 pub mod metrics;
 pub mod partition;
+pub mod plan;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -182,6 +183,7 @@ pub use error::{DeltaResult, Error};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
+pub use plan::{DeclarativePlanNode, PlanExecutor, PlanResult};
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 
@@ -947,6 +949,15 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+
+    /// Get the connector provided [`PlanExecutor`].
+    ///
+    /// The default implementation panics. Engines that support plan execution should
+    /// override this method to return a concrete [`PlanExecutor`] implementation.
+    #[allow(clippy::panic)]
+    fn plan_executor(&self) -> Arc<dyn PlanExecutor> {
+        unimplemented!("this engine does not provide a PlanExecutor")
+    }
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared

@@ -39,6 +39,8 @@ pub use self::arrow_utils::{parse_json, to_json_bytes};
 
 #[cfg(feature = "default-engine-base")]
 pub mod default;
+#[cfg(feature = "default-engine-base")]
+pub mod plan;
 
 #[cfg(test)]
 pub(crate) mod sync;
