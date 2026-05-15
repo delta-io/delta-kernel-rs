@@ -80,13 +80,9 @@ impl ExecutionPlan for NullabilityValidationExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Plan(
-                "NullabilityValidationExec requires one child".into(),
-            ));
-        }
+        let child = super::expect_single_child(children, "NullabilityValidationExec")?;
         Ok(Arc::new(Self::new(
-            Arc::clone(&children[0]),
+            child,
             self.validations.clone(),
             self.target_schema.clone(),
         )))

@@ -110,21 +110,17 @@ impl ExecutionPlan for KernelAssertExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Plan(
-                "KernelAssertExec requires exactly one child".into(),
-            ));
-        }
+        let child = super::expect_single_child(children, "KernelAssertExec")?;
         Ok(Arc::new(Self {
-            child: Arc::clone(&children[0]),
             schema: self.schema.clone(),
             checks: self.checks.clone(),
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
-                children[0].properties().output_partitioning().clone(),
+                child.properties().output_partitioning().clone(),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             )),
+            child,
         }))
     }
     fn execute(

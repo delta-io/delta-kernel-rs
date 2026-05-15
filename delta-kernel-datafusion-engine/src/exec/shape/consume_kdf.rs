@@ -113,14 +113,10 @@ impl ExecutionPlan for KernelConsumeByKdfExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Plan(
-                "KernelConsumeByKdfExec requires exactly one child".into(),
-            ));
-        }
+        let child = super::expect_single_child(children, "KernelConsumeByKdfExec")?;
         Ok(Arc::new(
             KernelConsumeByKdfExec::try_new(
-                Arc::clone(&children[0]),
+                child,
                 self.sink
                     .lock()
                     .map_err(|_| {

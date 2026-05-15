@@ -118,13 +118,9 @@ impl ExecutionPlan for KernelPartitionedWriteExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Plan(
-                "KernelPartitionedWriteExec requires exactly one child".into(),
-            ));
-        }
+        let child = super::expect_single_child(children, "KernelPartitionedWriteExec")?;
         Ok(Arc::new(
-            KernelPartitionedWriteExec::try_new(Arc::clone(&children[0]), self.sink.clone())
+            KernelPartitionedWriteExec::try_new(child, self.sink.clone())
                 .map_err(|e| DataFusionError::External(Box::new(e)))?,
         ))
     }

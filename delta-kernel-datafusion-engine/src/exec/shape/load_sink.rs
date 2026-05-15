@@ -133,14 +133,10 @@ impl ExecutionPlan for KernelLoadSinkExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Plan(
-                "KernelLoadSinkExec requires exactly one child".into(),
-            ));
-        }
+        let child = super::expect_single_child(children, "KernelLoadSinkExec")?;
         Ok(Arc::new(
             Self::try_new(
-                Arc::clone(&children[0]),
+                child,
                 self.sink.clone(),
                 Arc::clone(&self.engine),
                 Arc::clone(&self.registry),

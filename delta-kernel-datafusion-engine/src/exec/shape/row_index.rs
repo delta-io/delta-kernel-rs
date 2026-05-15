@@ -86,15 +86,8 @@ impl ExecutionPlan for RowIndexExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Plan(
-                "RowIndexExec requires exactly one child".into(),
-            ));
-        }
-        Ok(Arc::new(Self::new(
-            Arc::clone(&children[0]),
-            self.row_index_col.clone(),
-        )))
+        let child = super::expect_single_child(children, "RowIndexExec")?;
+        Ok(Arc::new(Self::new(child, self.row_index_col.clone())))
     }
     fn execute(
         &self,
