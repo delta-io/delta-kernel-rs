@@ -1,12 +1,14 @@
 //! CRC (version checksum) file support.
 //!
 //! A [CRC file] contains a snapshot of table state at a specific version, which can be used to
-//! optimize log replay operations like reading Protocol/Metadata, domain metadata, and ICT.
+//! optimize log replay operations like reading Protocol/Metadata, domain metadata, set
+//! transactions, and ICT.
 //!
 //! [`Crc`] holds the in-memory state using shapes that make kernel queries easy: typed
-//! state enums (`FileStatsState`, `DomainMetadataState`) and `HashMap`s keyed by id, instead
-//! of the flat scalars and arrays of the on-disk format. It (de)serializes to/from JSON via
-//! the private `CrcRaw` serde intermediate, which mirrors the wire format exactly.
+//! state enums (`FileStatsState`, `DomainMetadataState`, `SetTransactionState`) and `HashMap`s
+//! keyed by id, instead of the flat scalars and arrays of the on-disk format. It (de)serializes
+//! to/from JSON via the private `CrcRaw` serde intermediate, which mirrors the wire format
+//! exactly.
 //!
 //! [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 

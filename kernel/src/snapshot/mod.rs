@@ -18,7 +18,9 @@ use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::crc::Crc;
-use crate::crc::{try_write_crc_file, CrcDelta, DomainMetadataState, FileStats, LazyCrc};
+use crate::crc::{
+    try_write_crc_file, CrcDelta, DomainMetadataState, FileStats, LazyCrc, SetTransactionState,
+};
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
@@ -910,21 +912,19 @@ impl Snapshot {
             .get_or_load_if_at_version(engine, self.version())
         {
             match &crc.set_transaction_state {
-                crate::crc::SetTransactionState::Complete(map) => {
+                SetTransactionState::Complete(map) => {
                     // Complete is authoritative: a miss means the app_id has no transaction.
                     return Ok(map
                         .get(application_id)
                         .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
                         .map(|txn| txn.version));
                 }
-                crate::crc::SetTransactionState::Partial(map) => {
-                    // Hit is authoritative; miss requires log replay.
+                SetTransactionState::Partial(map) => {
+                    // Hit is authoritative; miss falls through to log replay below.
                     if let Some(txn) = map.get(application_id) {
-                        return Ok(Some(txn)
-                            .filter(|txn| {
-                                !is_set_txn_expired(expiration_timestamp, txn.last_updated)
-                            })
-                            .map(|txn| txn.version));
+                        let version = (!is_set_txn_expired(expiration_timestamp, txn.last_updated))
+                            .then_some(txn.version);
+                        return Ok(version);
                     }
                 }
             }

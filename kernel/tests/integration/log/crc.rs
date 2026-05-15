@@ -743,9 +743,9 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> DeltaResult<()>
     Ok(())
 }
 
-/// Rewrites the on-disk CRC at `version` with its `domainMetadata` field stripped, leaving
-/// every other field (notably protocol and metadata) intact.
-fn strip_txns_from_crc(table_path: &str, version: u64) {
+/// Rewrites the on-disk CRC at `version` to drop the named top-level field, leaving every
+/// other field intact.
+fn strip_field_from_crc(table_path: &str, version: u64, field: &str) {
     let crc_path = format!(
         "{}/_delta_log/{:020}.crc",
         table_path.trim_end_matches('/'),
@@ -753,19 +753,7 @@ fn strip_txns_from_crc(table_path: &str, version: u64) {
     );
     let bytes = std::fs::read(&crc_path).unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    value.as_object_mut().unwrap().remove("setTransactions");
-    std::fs::write(&crc_path, serde_json::to_vec(&value).unwrap()).unwrap();
-}
-
-fn strip_dm_from_crc(table_path: &str, version: u64) {
-    let crc_path = format!(
-        "{}/_delta_log/{:020}.crc",
-        table_path.trim_end_matches('/'),
-        version
-    );
-    let bytes = std::fs::read(&crc_path).unwrap();
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    value.as_object_mut().unwrap().remove("domainMetadata");
+    value.as_object_mut().unwrap().remove(field);
     std::fs::write(&crc_path, serde_json::to_vec(&value).unwrap()).unwrap();
 }
 
@@ -780,7 +768,7 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> DeltaResu
 
     // Strip DM from v0 CRC, then reload: base snapshot has `Partial(empty)` DM rather than
     // the post-commit `Complete(...)` state.
-    strip_dm_from_crc(&table_path, 0);
+    strip_field_from_crc(&table_path, 0, "domainMetadata");
     let snapshot_v0 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
         snapshot_v0
@@ -980,7 +968,7 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Delt
     snapshot_v1.write_checksum(engine.as_ref())?;
 
     // Strip setTransactions from the v1 CRC so it reloads as Partial(empty).
-    strip_txns_from_crc(&table_path, 1);
+    strip_field_from_crc(&table_path, 1, "setTransactions");
 
     let snapshot_v1_reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(
@@ -1014,12 +1002,12 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> Delt
     );
 
     // Miss: "v1-app" is NOT in the Partial cache; FailingEngine panics, real engine finds it.
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            snapshot_v2.get_app_id_version("v1-app", &FailingEngine).ok()
-        }))
-        .is_err()
-    );
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        snapshot_v2
+            .get_app_id_version("v1-app", &FailingEngine)
+            .ok()
+    }))
+    .is_err());
     assert_eq!(
         snapshot_v2.get_app_id_version("v1-app", engine.as_ref())?,
         Some(1)
@@ -1090,6 +1078,67 @@ async fn test_set_txn_expiration_via_crc_fast_path(
             .get_app_id_version("my-app", &FailingEngine)
             .unwrap(),
         expected
+    );
+
+    Ok(())
+}
+
+/// Mirrors `test_set_txn_expiration_via_crc_fast_path` for the `Partial` branch: a cached
+/// transaction whose `lastUpdated` is older than retention must return `None` via the fast path,
+/// without falling through to log replay.
+#[tokio::test]
+async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+
+    // v0: create the table with zero-second retention so any past lastUpdated expires.
+    let committed = create_table(&table_path, schema, "test_engine")
+        .with_table_properties([(
+            "delta.setTransactionRetentionDuration",
+            "interval 0 seconds",
+        )])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // v1: commit my-app=1, write CRC at v1.
+    let snapshot_v0 = committed.post_commit_snapshot().unwrap().clone();
+    let committed = begin_transaction(snapshot_v0, engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_transaction_id("my-app".to_string(), 1)
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    committed
+        .post_commit_snapshot()
+        .unwrap()
+        .write_checksum(engine.as_ref())?;
+
+    // Strip setTransactions from the v1 CRC so it reloads as Partial(empty).
+    strip_field_from_crc(&table_path, 1, "setTransactions");
+    let snapshot_v1_reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+
+    // v2: commit my-app=2 from the Partial base; post-commit CRC is Partial(map) containing my-app.
+    let committed = begin_transaction(snapshot_v1_reloaded, engine.as_ref())?
+        .with_operation("WRITE".to_string())
+        .with_transaction_id("my-app".to_string(), 2)
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    let snapshot_v2 = committed.post_commit_snapshot().unwrap();
+
+    let map = snapshot_v2
+        .get_current_crc_if_loaded_for_testing()
+        .unwrap()
+        .set_transaction_state
+        .expect_partial();
+    assert!(map.contains_key("my-app"));
+
+    // FailingEngine proves the Partial fast path is used; the expiration filter drops the txn.
+    assert_eq!(
+        snapshot_v2.get_app_id_version("my-app", &FailingEngine)?,
+        None
     );
 
     Ok(())

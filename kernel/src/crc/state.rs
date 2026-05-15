@@ -230,8 +230,6 @@ mod tests {
 
     // ===== SetTransactionState =====
 
-    use crate::actions::SetTransaction;
-
     #[test]
     fn set_txn_state_default_is_empty_partial() {
         assert_eq!(
