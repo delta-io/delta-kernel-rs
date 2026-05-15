@@ -797,12 +797,10 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> DeltaResu
     );
 
     // Miss: "zip" is not in this Partial cache; FailingEngine panics, real engine finds it.
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            snapshot_v1.get_domain_metadata("zip", &FailingEngine).ok()
-        }))
-        .is_err()
-    );
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        snapshot_v1.get_domain_metadata("zip", &FailingEngine).ok()
+    }))
+    .is_err());
     assert_eq!(
         snapshot_v1.get_domain_metadata("zip", engine.as_ref())?,
         Some("zap0".to_string())
