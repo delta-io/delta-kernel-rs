@@ -904,16 +904,29 @@ impl Snapshot {
         let expiration_timestamp =
             calculate_transaction_expiration_timestamp(self.table_properties())?;
 
-        // Fast path: serve from CRC if it tracks set transactions at this version.
+        // Fast path: serve from CRC if available at this version.
         if let Some(crc) = self
             .lazy_crc
             .get_or_load_if_at_version(engine, self.version())
         {
-            if let Some(txn_map) = &crc.set_transactions {
-                return Ok(txn_map
-                    .get(application_id)
-                    .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
-                    .map(|txn| txn.version));
+            match &crc.set_transaction_state {
+                crate::crc::SetTransactionState::Complete(map) => {
+                    // Complete is authoritative: a miss means the app_id has no transaction.
+                    return Ok(map
+                        .get(application_id)
+                        .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
+                        .map(|txn| txn.version));
+                }
+                crate::crc::SetTransactionState::Partial(map) => {
+                    // Hit is authoritative; miss requires log replay.
+                    if let Some(txn) = map.get(application_id) {
+                        return Ok(Some(txn)
+                            .filter(|txn| {
+                                !is_set_txn_expired(expiration_timestamp, txn.last_updated)
+                            })
+                            .map(|txn| txn.version));
+                    }
+                }
             }
         }
 
