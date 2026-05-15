@@ -1047,6 +1047,9 @@ impl Snapshot {
                         // Look up each filter key. A miss means we do not know whether the
                         // domain exists, so abandon the cache and fall through to log
                         // replay. `collect::<Option<_>>` short-circuits on the first None.
+                        // TODO(#2572): track tombstoned domains in `Partial` so removals
+                        //              observed during apply can return authoritative
+                        //              `None` instead of falling through.
                         let hits: Option<DomainMetadataMap> = filter
                             .iter()
                             .map(|&k| map.get(k).map(|v| (k.to_string(), v.clone())))

@@ -5,7 +5,7 @@
 //! invalid reads unrepresentable: the compiler prevents reading an absolute count from a
 //! degraded state because the field does not exist there.
 //!
-//! - [`FileStatsState`] tracks file-stat validity (Complete / Indeterminate / Untrackable).
+//! - [`FileStatsState`] tracks file-stat validity (Complete / Indeterminate).
 //! - [`DomainMetadataState`] tracks domain-metadata completeness (Complete / Partial).
 //!
 //! TODO: introduce `SetTransactionState` with the same shape as `DomainMetadataState`.
