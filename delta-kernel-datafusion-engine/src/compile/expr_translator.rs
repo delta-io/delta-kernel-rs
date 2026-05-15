@@ -261,20 +261,7 @@ fn coalesce_to_df(exprs: &[Expression]) -> Result<Expr, DeltaError> {
         .iter()
         .map(kernel_expr_to_df)
         .collect::<Result<_, _>>()?;
-    Ok(coalesce_chain(translated))
-}
-
-fn coalesce_chain(mut exprs: Vec<Expr>) -> Expr {
-    // Build from the rightmost (final fallback) outward so each layer wraps the previous.
-    let mut acc = exprs.pop().expect("non-empty checked by caller");
-    while let Some(prev) = exprs.pop() {
-        let when_then = vec![(
-            Box::new(Expr::IsNotNull(Box::new(prev.clone()))),
-            Box::new(prev),
-        )];
-        acc = Expr::Case(Case::new(None, when_then, Some(Box::new(acc))));
-    }
-    acc
+    Ok(datafusion_functions::core::expr_fn::coalesce(translated))
 }
 
 fn if_to_df(if_expr: &IfExpression) -> Result<Expr, DeltaError> {
@@ -629,37 +616,10 @@ mod tests {
     }
 
     #[test]
-    fn translates_coalesce_to_nested_case_chain() {
-        // COALESCE(a, b, c) -> CASE WHEN a IS NOT NULL THEN a
-        //                          ELSE CASE WHEN b IS NOT NULL THEN b ELSE c END
-        //                     END
+    fn coalesce_translates_to_datafusion_coalesce() {
         let kernel = Expr_::coalesce([column_expr!("a"), column_expr!("b"), column_expr!("c")]);
         let df = kernel_expr_to_df(&kernel).unwrap();
-        let inner = Expr::Case(Case::new(
-            None,
-            vec![(
-                Box::new(Expr::IsNotNull(Box::new(col("b")))),
-                Box::new(col("b")),
-            )],
-            Some(Box::new(col("c"))),
-        ));
-        let expected = Expr::Case(Case::new(
-            None,
-            vec![(
-                Box::new(Expr::IsNotNull(Box::new(col("a")))),
-                Box::new(col("a")),
-            )],
-            Some(Box::new(inner)),
-        ));
-        assert_eq!(df, expected);
-    }
-
-    #[test]
-    fn coalesce_single_arg_unwraps() {
-        // COALESCE(a) -> a
-        let kernel = Expr_::coalesce([column_expr!("a")]);
-        let df = kernel_expr_to_df(&kernel).unwrap();
-        assert_eq!(df, col("a"));
+        assert_eq!(format!("{df}"), "coalesce(a, b, c)");
     }
 
     #[test]
