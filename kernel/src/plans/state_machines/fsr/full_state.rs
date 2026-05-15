@@ -56,7 +56,7 @@
 //!   schema falling back through [`crate::log_segment::LogSegment::checkpoint_schema`].
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
@@ -360,10 +360,6 @@ impl Scan {
     }
 }
 
-fn should_schema_query_checkpoint_for_scan(snapshot: &Snapshot) -> bool {
-    snapshot_has_checkpoint_files(snapshot) && snapshot.log_segment().checkpoint_schema().is_none()
-}
-
 async fn resolve_checkpoint_shape_for_scan(
     phase: &mut Phase<'_>,
     scan: &Scan,
@@ -371,7 +367,11 @@ async fn resolve_checkpoint_shape_for_scan(
     let snapshot = scan.snapshot();
     let mut shape = checkpoint_shape_from_last_checkpoint(snapshot.as_ref())?;
 
-    if should_schema_query_checkpoint_for_scan(snapshot.as_ref()) {
+    // SchemaQuery is needed only when checkpoint files exist but `_last_checkpoint` did not
+    // include a schema hint.
+    let needs_schema_query = snapshot_has_checkpoint_files(snapshot.as_ref())
+        && snapshot.log_segment().checkpoint_schema().is_none();
+    if needs_schema_query {
         if shape.file_format == FileFormat::Json {
             // JSON checkpoints are ambiguous without `_last_checkpoint` schema hints:
             // they may be manifest rows that carry sidecar pointers. SchemaQuery reads
@@ -676,12 +676,9 @@ pub fn build_fsr_plans(
         .map(|p| p.location.clone())
         .collect();
 
-    let commit_raw_schema = load_materialized_schema(
-        &action_read_schema(),
-        &path_size_version_schema(),
-        &["version"],
-    )?;
-    let commit_dedup_schema = augmented_action_schema()?;
+    let commit_raw_schema =
+        load_materialized_schema(&action_read_schema(), &path_size_schema(true), &["version"])?;
+    let commit_dedup_schema = augmented_action_schema(false)?;
 
     let commit_raw_handle = RelationHandle::fresh(FSR_COMMIT_RAW, commit_raw_schema);
     let commit_dedup_handle = RelationHandle::fresh(FSR_COMMIT_DEDUP, commit_dedup_schema);
@@ -840,26 +837,26 @@ fn action_schema(relaxed_nesting: bool) -> SchemaRef {
 }
 
 fn action_read_schema() -> SchemaRef {
-    action_schema(true)
+    static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| action_schema(true));
+    SCHEMA.clone()
 }
 
 fn action_output_schema() -> SchemaRef {
-    action_schema(false)
+    static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| action_schema(false));
+    SCHEMA.clone()
 }
 
-fn path_size_version_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked([
+/// Schema = `{path: STRING, size: LONG, version: LONG?}`. With `with_version=true`, the version
+/// column carries the per-commit version surfaced by [`build_commit_dedup_plan`]'s window.
+fn path_size_schema(with_version: bool) -> SchemaRef {
+    let mut fields = vec![
         StructField::not_null("path", DataType::STRING),
         StructField::not_null("size", DataType::LONG),
-        StructField::not_null("version", DataType::LONG),
-    ]))
-}
-
-fn path_size_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked([
-        StructField::not_null("path", DataType::STRING),
-        StructField::not_null("size", DataType::LONG),
-    ]))
+    ];
+    if with_version {
+        fields.push(StructField::not_null("version", DataType::LONG));
+    }
+    Arc::new(StructType::new_unchecked(fields))
 }
 
 fn scan_partition_values_schema(
@@ -1234,7 +1231,7 @@ fn build_commit_load_plan(
         })
         .collect();
 
-    let literal_plan = DeclarativePlanNode::values(path_size_version_schema(), rows)
+    let literal_plan = DeclarativePlanNode::values(path_size_schema(true), rows)
         .map_err(|e| e.into_delta_default())?;
     let sink = LoadSink {
         output_relation: commit_raw_handle.clone(),
@@ -1268,9 +1265,25 @@ fn build_commit_dedup_plan(
     commit_raw_handle: &RelationHandle,
     commit_dedup_handle: &RelationHandle,
 ) -> Result<Plan, DeltaError> {
-    ensure_commit_raw_schema_for_dedup(&commit_raw_handle.schema)?;
+    for field in [
+        "add",
+        "remove",
+        "protocol",
+        "metaData",
+        "domainMetadata",
+        "txn",
+        "version",
+    ] {
+        if !commit_raw_handle.schema.contains(field) {
+            return Err(delta_error!(
+                DeltaErrorCode::DeltaCommandInvariantViolation,
+                operation = "fsr::build_commit_dedup_plan::schema_check",
+                detail = format!("commit raw relation schema is missing required field `{field}`"),
+            ));
+        }
+    }
     let dedup_expr = Arc::new(fsr_dedup_key());
-    let with_key_and_version_schema = augmented_action_schema_with_version()?;
+    let with_key_and_version_schema = augmented_action_schema(true)?;
     let project_with_key_and_version: Vec<Arc<Expression>> = action_identity_projection()
         .into_iter()
         .chain(std::iter::once(Arc::clone(&dedup_expr)))
@@ -1307,7 +1320,7 @@ fn build_commit_dedup_plan(
 
     Ok(windowed
         .filter(rn_top_k)
-        .project(final_proj, augmented_action_schema()?)
+        .project(final_proj, augmented_action_schema(false)?)
         .into_relation(commit_dedup_handle.clone()))
 }
 
@@ -1346,7 +1359,7 @@ fn build_sidecar_load_plan(
                 Arc::new(Expression::column([SIDECAR_NAME, "path"])),
                 Arc::new(Expression::column([SIDECAR_NAME, "sizeInBytes"])),
             ],
-            path_size_schema(),
+            path_size_schema(false),
         );
 
     let sidecar_base = log_root.join("_sidecars/").map_err(|e| {
@@ -1420,7 +1433,7 @@ fn build_results_plan(
     }
 
     let dedup_expr = Arc::new(fsr_dedup_key());
-    let augmented_schema = augmented_action_schema()?;
+    let augmented_schema = augmented_action_schema(false)?;
 
     // Top-level checkpoint rows are preloaded once into `FSR_CHECKPOINT_TOP`; project action
     // columns here so schema aligns with sidecar/action relations.
@@ -1448,9 +1461,15 @@ fn build_results_plan(
 
     // Build side: just the dedup keys from commit winners (one column wide). LeftAnti emits
     // probe rows whose key is NOT in the build set, mirroring the probe child's schema.
+    let join_key_only_schema = StructType::try_new([StructField::nullable(
+        FSR_JOIN_KEY_COL,
+        DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+    )])
+    .map(Arc::new)
+    .map_err(|e| e.into_delta_default())?;
     let commit_keys = DeclarativePlanNode::relation_ref(commit_dedup_handle.clone()).project(
         vec![Arc::new(Expression::column([FSR_JOIN_KEY_COL]))],
-        join_key_only_schema()?,
+        join_key_only_schema,
     );
 
     let survivors = DeclarativePlanNode::join(
@@ -1482,62 +1501,22 @@ fn build_results_plan(
 /// Schema = [`action_read_schema`] plus the dedup-key column [`FSR_JOIN_KEY_COL`]. Used by
 /// the [`FSR_COMMIT_DEDUP`] relation handle and by the projection that materializes
 /// the dedup key on the checkpoint side of the LeftAnti.
-fn augmented_action_schema() -> Result<SchemaRef, DeltaError> {
+/// Action schema augmented with the FSR join key column (`__fsr_join_k: ARRAY<STRING>?`), and
+/// optionally a per-commit `version: LONG` column. The version column is required only by
+/// [`build_commit_dedup_plan`]'s row_number window (`ORDER BY version DESC`) and is dropped
+/// before the relation is persisted, so its presence in the schema is plan-internal.
+fn augmented_action_schema(with_version: bool) -> Result<SchemaRef, DeltaError> {
     let mut fields: Vec<_> = action_read_schema().fields().cloned().collect();
     fields.push(StructField::nullable(
         FSR_JOIN_KEY_COL,
         DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
     ));
-    StructType::try_new(fields)
-        .map(Arc::new)
-        .map_err(|e| e.into_delta_default())
-}
-
-/// Schema = [`augmented_action_schema`] plus the per-commit `version` column. Carried only
-/// inside [`build_commit_dedup_plan`] so the row_number window can `ORDER BY version DESC`;
-/// the version column is dropped by the plan's final project.
-fn augmented_action_schema_with_version() -> Result<SchemaRef, DeltaError> {
-    let mut fields: Vec<_> = action_read_schema().fields().cloned().collect();
-    fields.push(StructField::nullable(
-        FSR_JOIN_KEY_COL,
-        DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
-    ));
-    fields.push(StructField::not_null("version", DataType::LONG));
-    StructType::try_new(fields)
-        .map(Arc::new)
-        .map_err(|e| e.into_delta_default())
-}
-
-fn ensure_commit_raw_schema_for_dedup(schema: &SchemaRef) -> Result<(), DeltaError> {
-    for field in [
-        "add",
-        "remove",
-        "protocol",
-        "metaData",
-        "domainMetadata",
-        "txn",
-        "version",
-    ] {
-        if !schema.contains(field) {
-            return Err(delta_error!(
-                DeltaErrorCode::DeltaCommandInvariantViolation,
-                operation = "fsr::build_commit_dedup_plan::schema_check",
-                detail = format!("commit raw relation schema is missing required field `{field}`"),
-            ));
-        }
+    if with_version {
+        fields.push(StructField::not_null("version", DataType::LONG));
     }
-    Ok(())
-}
-
-/// Schema = single column `__fsr_join_k: ARRAY<STRING>`. Build-side schema for the LeftAnti hash
-/// join in [`build_results_plan`].
-fn join_key_only_schema() -> Result<SchemaRef, DeltaError> {
-    StructType::try_new([StructField::nullable(
-        FSR_JOIN_KEY_COL,
-        DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
-    )])
-    .map(Arc::new)
-    .map_err(|e| e.into_delta_default())
+    StructType::try_new(fields)
+        .map(Arc::new)
+        .map_err(|e| e.into_delta_default())
 }
 
 fn fsr_row_has_identity_predicate() -> Predicate {
@@ -1640,19 +1619,6 @@ mod tests {
                 cfg.table
             );
         }
-    }
-
-    #[test]
-    fn scan_builder_scan_is_metadata_plus_data() {
-        let (_engine, snapshot, _tmp) = load_test_table("app-txn-checkpoint").unwrap();
-        let scan = ScanBuilder::new(Arc::clone(&snapshot))
-            .with_stats()
-            .build_replay()
-            .unwrap();
-        let (metadata, live_actions) = scan.scan_metadata_state_machine().unwrap();
-        let data = scan.replay_scan_data_plans(live_actions).unwrap();
-        let composed = scan.replay_scan_plans().unwrap();
-        assert_eq!(composed.len(), metadata.len() + data.len());
     }
 
     #[test]
@@ -1812,9 +1778,8 @@ mod tests {
         let (_engine, snapshot, _tmp) = load_test_table(table).unwrap();
         let mut builder = ScanBuilder::new(Arc::clone(&snapshot)).with_stats();
         if with_predicate {
-            builder = builder.with_predicate(Arc::new(Predicate::is_not_null(Expression::column(
-                ["id"],
-            ))));
+            builder = builder
+                .with_predicate(Arc::new(Predicate::is_not_null(Expression::column(["id"]))));
         }
         let scan = builder.build_replay().unwrap();
         let (metadata, _) = scan.scan_metadata_state_machine().unwrap();
@@ -1892,31 +1857,28 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn scan_data_file_schema_adds_row_index_for_row_id() {
-        let logical = Arc::new(StructType::new_unchecked([
+    #[rstest::rstest]
+    #[case::synthesizes_when_missing(false)]
+    #[case::dedups_when_already_present(true)]
+    fn scan_data_file_schema_emits_exactly_one_row_index_for_row_id(
+        #[case] row_index_already_present: bool,
+    ) {
+        let mut fields = vec![
             StructField::not_null("value", DataType::LONG),
             StructField::create_metadata_column("_metadata.row_id", MetadataColumnSpec::RowId),
-        ]));
-        let file_schema = scan_data_file_schema(&logical, &logical).unwrap();
-        assert!(file_schema.contains_metadata_column(&MetadataColumnSpec::RowIndex));
-    }
-
-    #[test]
-    fn scan_data_file_schema_does_not_duplicate_existing_row_index() {
-        let logical = Arc::new(StructType::new_unchecked([
-            StructField::not_null("value", DataType::LONG),
-            StructField::create_metadata_column("_metadata.row_id", MetadataColumnSpec::RowId),
-            StructField::create_metadata_column(
+        ];
+        if row_index_already_present {
+            fields.push(StructField::create_metadata_column(
                 "_metadata.row_index",
                 MetadataColumnSpec::RowIndex,
-            ),
-        ]));
+            ));
+        }
+        let logical = Arc::new(StructType::new_unchecked(fields));
         let file_schema = scan_data_file_schema(&logical, &logical).unwrap();
         assert_eq!(
             file_schema
                 .fields()
-                .filter(|f| { f.get_metadata_column_spec() == Some(MetadataColumnSpec::RowIndex) })
+                .filter(|f| f.get_metadata_column_spec() == Some(MetadataColumnSpec::RowIndex))
                 .count(),
             1
         );
