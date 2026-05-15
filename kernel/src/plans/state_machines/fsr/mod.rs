@@ -5,6 +5,7 @@
 mod checkpoint_shape;
 pub mod full_state;
 mod plans;
+mod scan_replay;
 mod schemas;
 
 pub use checkpoint_shape::{
