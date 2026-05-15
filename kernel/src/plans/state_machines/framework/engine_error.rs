@@ -237,20 +237,6 @@ impl From<EngineErrorKind> for EngineError {
 }
 
 // === Manual Clone ===
-//
-// `Box<dyn Error>` is not `Clone`, so we can't derive it. Cloning an
-// `EngineError` drops the source chain; the kind is preserved.
-// Callers that need the underlying cause should consume the original
-// (or render it via `display_with_source_chain`) before cloning.
-impl Clone for EngineError {
-    fn clone(&self) -> Self {
-        Self {
-            kind: self.kind.clone(),
-            source: None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
