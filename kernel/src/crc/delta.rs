@@ -402,7 +402,10 @@ mod tests {
     #[test]
     fn test_apply_does_not_upgrade_partial_to_complete() {
         let mut crc = base_crc();
-        assert_eq!(crc.domain_metadata_state, DomainMetadataState::default());
+        assert_eq!(
+            crc.domain_metadata_state,
+            DomainMetadataState::Partial(HashMap::new())
+        );
         let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
         let delta = CrcDelta {
             domain_metadata_changes: vec![dm],

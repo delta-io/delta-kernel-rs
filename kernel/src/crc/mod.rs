@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn ser_partial_dm_and_none_txns_serialize_to_null() {
-        let crc = crc_with(None, DomainMetadataState::default());
+        let crc = crc_with(None, DomainMetadataState::Partial(HashMap::new()));
         let json = serde_json::to_value(&crc).unwrap();
         assert!(json["setTransactions"].is_null());
         // Partial is not authoritative for misses; persisting it would falsely promote
