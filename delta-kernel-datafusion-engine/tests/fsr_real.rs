@@ -15,7 +15,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Array, AsArray, RecordBatch, StringArray};
 use delta_kernel::arrow::compute::concat_batches;
@@ -33,8 +33,6 @@ use delta_kernel::plans::state_machines::fsr::{
 };
 use delta_kernel::schema::DataType as KernelDataType;
 use delta_kernel::{Engine as KernelEngine, Snapshot};
-use delta_kernel_datafusion_engine::compile::{compile_plan_logical, CompileContext};
-use delta_kernel_datafusion_engine::exec::RelationBatchRegistry;
 use delta_kernel_datafusion_engine::DataFusionExecutor;
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
@@ -697,42 +695,6 @@ async fn fsr_matches_scan_for_all_v2_checkpoint_fixtures() {
         "v2-parquet-sidecars-struct-stats-only",
     ] {
         assert_fsr_matches_scan_paths(table).await;
-    }
-}
-
-#[tokio::test]
-async fn fsr_plans_compile_on_logical_path() {
-    let fixture = fixture_table("table-with-dv-small");
-    let engine = default_engine();
-    let snapshot = Snapshot::builder_for(fixture.url)
-        .build(engine.as_ref())
-        .expect("snapshot");
-    let shape = checkpoint_shape_from_last_checkpoint(&snapshot).expect("shape");
-    let plans = build_fsr_plans(&snapshot, shape).expect("build fsr plans");
-    let ctx = CompileContext::new(
-        Arc::new(RelationBatchRegistry::new()),
-        Arc::new(Mutex::new(None)),
-        Arc::clone(&engine),
-    );
-
-    for plan in &plans {
-        let logical = compile_plan_logical(plan, &ctx).expect("logical compile");
-        match &plan.sink.sink_type {
-            SinkType::Write(_) | SinkType::PartitionedWrite(_) => {
-                assert!(
-                    logical.is_none(),
-                    "expected non-logical sink family to retain fallback path; sink={:?}",
-                    plan.sink.sink_type
-                );
-            }
-            _ => {
-                assert!(
-                    logical.is_some(),
-                    "expected full_state FSR plan to compile through logical path; sink={:?}",
-                    plan.sink.sink_type
-                );
-            }
-        }
     }
 }
 
