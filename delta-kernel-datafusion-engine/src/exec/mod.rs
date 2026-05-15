@@ -7,7 +7,7 @@ mod sources;
 pub use literal::build_literal_exec;
 pub use shape::{
     KernelAssertExec, KernelConsumeByKdfExec, KernelLoadSinkExec, KernelPartitionedWriteExec,
-    NullabilityValidationExec, OrderedUnionExec, RelationSinkExec, RowIndexExec,
+    NullabilityValidationExec, OrderedUnionExec, RowIndexExec,
 };
 pub use sources::{
     build_relation_ref_exec, build_relation_ref_logical, FileListingExec, RelationBatchRegistry,
