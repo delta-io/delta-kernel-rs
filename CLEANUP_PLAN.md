@@ -35,6 +35,62 @@ Working plan to ruthlessly simplify the stack/fsr branch. Reduces the branch dif
 
 ---
 
+## Next actions — execution sequence
+
+The 103-task plan is the full inventory. This section is the **focused execution todo** from the current branch state (post-commit `8c3193da25 feat(fsr): logical-compile path + replay-scan SM integration`). Work top-down; each wave unlocks the next.
+
+### Wave A — cheap safety fixes (one PR; merge today)
+| # | Task | What | Why now |
+|---|---|---|---|
+| A.1 | **T18** | Add `fsr_phase_plan_dump.txt`, `plan_dump.txt` to `.gitignore` | Debug artifacts in working tree; two untracked files visible right now |
+| A.2 | **KC13** | Replace `panic!` in `fsr/full_state.rs:1080` with typed `DeltaError` | CLAUDE.md violation in production code; ~5 LOC |
+| A.3 | **EC3** | Replace `unreachable!()` at `executor.rs:209` with typed error | CLAUDE.md violation; nested `if let Assert` artifact (see EC23 for the structural fix) |
+| A.4 | **EC25** | Replace `unreachable!()` at `expr_translator.rs:180` with typed error | Same CLAUDE.md rule, different file |
+
+### Wave B — finish what's already started (one PR each, parallelizable)
+| # | Task | What | Status |
+|---|---|---|---|
+| B.1 | **B6 finish** | Delete `exec/shape/relation_sink.rs` + `exec/mod.rs:9` re-export + `exec/shape/mod.rs:16` | Dispatch already moved; struct is dead code |
+| B.2 | **B15 finish** | Delete `compile/join.rs` entirely | `join_key_to_physical` already uses `kernel_expr_to_df + create_physical_expr`; physical join path dead |
+| B.3 | **KC4** | Sweep `.map_err(|e| delta_error!(...))` → `.or_delta(...)` across `fsr/full_state.rs` | Site count grew with new SMs; ~15 sites now |
+| B.4 | **KC9 finish** | Compact `fsr_dedup_key` 5-arm CASE structure (semantic fixes already done) | Structural compaction only |
+
+### Wave C — unblock the compile path (hard prerequisites for everything in `compile/`)
+| # | Task | What | Why now |
+|---|---|---|---|
+| C.1 | **EC7** | Replace `Result<Option<LogicalPlan>>` with `Result<LogicalPlan, EngineError>` across `compile/mod.rs` + `compile/logical.rs` (~10 sites) | **Hard blocker**: every other `compile/*` task lives behind this anti-pattern, now propagated through fresh code |
+| C.2 | **B12** | Consolidate `drive_coroutine_sm_*` (3 methods) + `execute_phase_operation_*` (3 methods) behind a `ResultsHandler` enum | **Must land before EC26**: prevents 3× duplication of composition logic |
+| C.3 | **EC10 + EC28-folded** | Pick one materialization sink for `Relation` handles; delete `relation_registry` write; switch `RelationRef` compile to `ctx.read_table(...)` | Today writes to both registry AND SessionContext.MemTable; silent-divergence trap |
+
+### Wave D — track upstream + file workarounds
+| # | Task | What |
+|---|---|---|
+| D.1 | **EC27** | File minimal reproducers against `apache/datafusion` for the two bugs: (1) CSE duplicate-`__common_expr_N` requiring `hoist_repeated_column_paths`, (2) leaf-projection-pushdown requiring 3 disabled optimizer rules. Track issue numbers in this task. Until upstream lands, the workarounds stay — but everyone touching `compile/logical.rs` needs to know they are load-bearing. |
+
+### Wave E — kernel restructure (after EC7 lands so compile-path changes don't conflict)
+| # | Task | What |
+|---|---|---|
+| E.1 | **KC6** | Split `fsr/full_state.rs` (2376 LOC after branch work) into `fsr/full_state.rs` (FSR only) + `state_machines/scan/replay.rs` (Scan SMs) + `state_machines/checkpoint_shape.rs` |
+| E.2 | **KC14** | Move `impl ScanBuilder { fn build_replay }` next to `ScanBuilder` (sibling of KC6) |
+| E.3 | **KC8 finish** | Convert `resolve_checkpoint_shape_for_scan` from free fn to method on `Scan` |
+| E.4 | **KC7** | Introduce `FsrContext` to make the 4-stage FSR pipeline visible in `build_fsr_plans` |
+
+### Wave F — sinks-cluster + executor reshape
+| # | Task | What |
+|---|---|---|
+| F.1 | **B8** | Delete `KernelConsumeByKdfExec` + `kdf_harvest_slot` field + `clear_kdf_harvest_slot` + slot threading through `CompileContext` |
+| F.2 | **B13** | Delete `KernelLoadSinkExec`; move Load dispatch to executor |
+| F.3 | **B10 finish** | Delete `RowIndexExec` struct + complete symmetric JSON+row-index rejection |
+| F.4 | **EC12** | Convert `FileListingExec` to `TableProvider` (gated on EC10 from Wave C) |
+| F.5 | **EC22** | Split `executor.rs` into `executor/` subtree (phase-shape decomposition; gated on EC26) |
+| F.6 | **EC26** | Composable-phase execution model: `Relation`/`Results` plans compose into one LogicalPlan; `Load` plans run separately |
+
+Everything after Wave F is the bulk: A1/A2/A4/A5 (pure deletions), the F-series (fluent IR), remaining T-series (test parameterization), and the long tail of EC/KC cleanups. Pick from the relevant Phase section of the main plan based on what you're touching.
+
+---
+
+---
+
 ## Phase A — pure deletions (highest LOC, lowest risk)
 
 ### A1 — Shrink `delta-error-codes.json` to 12 entries
