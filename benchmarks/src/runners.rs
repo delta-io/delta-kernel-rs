@@ -988,16 +988,22 @@ mod tests {
                 let op = sm.get_operation().expect("sm.get_operation");
                 if let PhaseOperation::Plans(plans) = &op {
                     for (idx, plan) in plans.iter().enumerate() {
-                        let physical = runner
-                            .executor
-                            .compile_plan(plan)
-                            .expect("compile fsr phase plan");
-                        println!(
-                            "=== FSR Phase Plan {} ({:?}) ===\n{}",
-                            idx,
-                            plan.sink.sink_type,
-                            displayable(physical.as_ref()).indent(true)
-                        );
+                        // Physical compile is only supported for non-Window shapes (Window must
+                        // be lowered via the logical path per the executor's own dispatch). This
+                        // print loop is a debug helper; skip plans the physical compiler rejects
+                        // rather than failing the test.
+                        match runner.executor.compile_plan(plan) {
+                            Ok(physical) => println!(
+                                "=== FSR Phase Plan {} ({:?}) ===\n{}",
+                                idx,
+                                plan.sink.sink_type,
+                                displayable(physical.as_ref()).indent(true)
+                            ),
+                            Err(e) => println!(
+                                "=== FSR Phase Plan {} ({:?}) — physical compile skipped: {} ===",
+                                idx, plan.sink.sink_type, e
+                            ),
+                        }
                     }
                 }
                 let phase_result = runner.executor.execute_phase_operation(op).await;

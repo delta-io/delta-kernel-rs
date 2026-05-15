@@ -272,6 +272,7 @@ impl ScanBuilder {
 
     /// Build a [`Scan`] for declarative replay, returning a kernel-plans
     /// [`crate::plans::errors::DeltaError`] on failure.
+    #[cfg(feature = "declarative-plans")]
     pub fn build_replay(self) -> Result<Scan, crate::plans::errors::DeltaError> {
         use crate::plans::errors::KernelErrAsDelta;
         self.build().map_err(|e| e.into_delta_default())

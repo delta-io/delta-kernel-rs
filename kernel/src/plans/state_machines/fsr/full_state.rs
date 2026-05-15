@@ -1801,45 +1801,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scan_metadata_with_stats_supports_classic_checkpoint() {
-        let (_engine, snapshot, _tmp) = load_test_table("app-txn-checkpoint").unwrap();
-        let scan = ScanBuilder::new(Arc::clone(&snapshot))
-            .with_stats()
-            .build_replay()
-            .unwrap();
-        let (metadata, _) = scan.scan_metadata_state_machine().unwrap();
-        assert!(!metadata.is_empty());
-        let terminal = metadata.last().expect("metadata plans should be non-empty");
-        assert!(matches!(terminal.sink.sink_type, SinkType::Relation(_)));
-    }
-
-    #[test]
-    fn scan_metadata_with_stats_supports_v2_checkpoint() {
-        let (_engine, snapshot, _tmp) =
-            load_test_table("v2-checkpoints-parquet-without-sidecars").unwrap();
-        let predicate = Arc::new(Predicate::is_not_null(Expression::column(["id"])));
-        let scan = ScanBuilder::new(Arc::clone(&snapshot))
-            .with_predicate(predicate)
-            .with_stats()
-            .build_replay()
-            .unwrap();
-        let (metadata, _) = scan.scan_metadata_state_machine().unwrap();
-        assert!(!metadata.is_empty());
-        let terminal = metadata.last().expect("metadata plans should be non-empty");
-        assert!(matches!(terminal.sink.sink_type, SinkType::Relation(_)));
-    }
-
-    #[test]
-    fn scan_metadata_with_stats_supports_multipart_checkpoint() {
-        let (_engine, snapshot, _tmp) =
-            load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
-        let predicate = Arc::new(Predicate::is_not_null(Expression::column(["id"])));
-        let scan = ScanBuilder::new(Arc::clone(&snapshot))
-            .with_predicate(predicate)
-            .with_stats()
-            .build_replay()
-            .unwrap();
+    #[rstest::rstest]
+    #[case::classic_checkpoint("app-txn-checkpoint", false)]
+    #[case::v2_checkpoint("v2-checkpoints-parquet-without-sidecars", true)]
+    #[case::multipart_checkpoint("v2-checkpoints-parquet-with-sidecars", true)]
+    fn scan_metadata_with_stats_terminates_in_relation_sink(
+        #[case] table: &str,
+        #[case] with_predicate: bool,
+    ) {
+        let (_engine, snapshot, _tmp) = load_test_table(table).unwrap();
+        let mut builder = ScanBuilder::new(Arc::clone(&snapshot)).with_stats();
+        if with_predicate {
+            builder = builder.with_predicate(Arc::new(Predicate::is_not_null(Expression::column(
+                ["id"],
+            ))));
+        }
+        let scan = builder.build_replay().unwrap();
         let (metadata, _) = scan.scan_metadata_state_machine().unwrap();
         assert!(!metadata.is_empty());
         let terminal = metadata.last().expect("metadata plans should be non-empty");
