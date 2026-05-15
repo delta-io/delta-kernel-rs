@@ -383,47 +383,6 @@ impl WindowNode {
     }
 }
 
-// ============================================================================
-// Assert
-// ============================================================================
-
-/// One row-level invariant evaluated by an [`AssertNode`].
-///
-/// `predicate` is a boolean expression evaluated per input row. **NULL ⇒
-/// failure** (matches Spark `AssertNotNull` and Delta CHECK enforcement;
-/// avoids three-valued-logic surprises where missing data silently passes
-/// an invariant).
-///
-/// On failure the executor raises an error carrying `error_code` (a stable
-/// identifier such as `"STATS_CLUSTERING_NOT_NULL"`) and `error_message`
-/// (human-readable; may reference row values).
-///
-/// Spec: `declarative_plan_docs/algebra/plan_nodes.md` §3.2 (`AssertCheck`).
-#[derive(Debug, Clone)]
-pub struct AssertCheck {
-    /// Boolean predicate evaluated per row. NULL ⇒ failure.
-    pub predicate: Arc<Expression>,
-    /// Stable identifier surfaced on failure (e.g. `"STATS_CLUSTERING_NOT_NULL"`).
-    pub error_code: String,
-    /// Human-readable failure message. May reference row values upstream of
-    /// the assert; rendered verbatim by the executor.
-    pub error_message: String,
-}
-
-/// Schema-preserving row-level invariant. For each input row, every
-/// [`AssertCheck`] must hold; otherwise the plan fails with that check's
-/// `(error_code, error_message)`. Multiple checks are evaluated per row;
-/// the first failing check raises.
-///
-/// Output schema = input schema. Initial consumers: clustering-stats
-/// invariants, Delta CHECK enforcement on writes.
-///
-/// Spec: `declarative_plan_docs/algebra/plan_nodes.md` §3.2 (`AssertNode`).
-#[derive(Debug, Clone)]
-pub struct AssertNode {
-    pub checks: Vec<AssertCheck>,
-}
-
 mod sinks;
 
 pub use sinks::{

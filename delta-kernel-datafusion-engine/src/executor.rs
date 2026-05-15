@@ -28,7 +28,7 @@ use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::plans::errors::DeltaError;
 use delta_kernel::plans::ir::nodes::SinkType;
-use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
+use delta_kernel::plans::ir::Plan;
 use delta_kernel::plans::kdf::FinishedHandle;
 use delta_kernel::plans::state_machines::framework::coroutine::driver::CoroutineSM;
 use delta_kernel::plans::state_machines::framework::engine_error::{EngineError, EngineErrorKind};
@@ -46,8 +46,7 @@ use crate::compile::{
 };
 use crate::error::{datafusion_err_to_delta, LiftDeltaErr};
 use crate::exec::{
-    KernelAssertExec, KernelConsumeByKdfExec, KernelLoadSinkExec, NullabilityValidationExec,
-    RelationBatchRegistry,
+    KernelConsumeByKdfExec, KernelLoadSinkExec, NullabilityValidationExec, RelationBatchRegistry,
 };
 
 fn default_kernel_engine() -> Arc<dyn Engine> {
@@ -198,13 +197,6 @@ impl DataFusionExecutor {
                 .map_err(datafusion_err_to_delta);
             return match (&plan.sink.sink_type, physical_root) {
                 (SinkType::Results(result_schema_opt), Ok(root)) => {
-                    let root = if let DeclarativePlanNode::Assert { child, node } = &plan.root {
-                        let input_schema = node_output_schema(child.as_ref())?;
-                        Arc::new(KernelAssertExec::try_new(root, input_schema, &node.checks)?)
-                            as Arc<dyn ExecutionPlan>
-                    } else {
-                        root
-                    };
                     let target_kernel = result_schema_opt
                         .clone()
                         .unwrap_or(node_output_schema(&plan.root)?);

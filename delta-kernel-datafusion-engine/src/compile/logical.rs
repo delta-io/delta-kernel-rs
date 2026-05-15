@@ -567,12 +567,6 @@ fn compile_declarative_node_logical(
                 .map_err(crate::error::datafusion_err_to_delta)?;
             Ok(Some(plan))
         }
-        DeclarativePlanNode::Assert { child, .. } => {
-            let Some(child_plan) = compile_declarative_node_logical(child, ctx)? else {
-                return Ok(None);
-            };
-            Ok(Some(child_plan))
-        }
         DeclarativePlanNode::Project { child, node } => {
             let Some(child_plan) = compile_declarative_node_logical(child, ctx)? else {
                 return Ok(None);

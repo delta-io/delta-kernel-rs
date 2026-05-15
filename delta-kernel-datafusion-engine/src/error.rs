@@ -46,36 +46,10 @@ pub fn internal_error(detail: impl Into<String>) -> DeltaError {
     )
 }
 
-/// Row-level [`AssertCheck`] violation surfaced during execution.
-///
-/// Uses [`DeltaErrorCode::DeltaCommandInvariantViolation`] with `<detail>` carrying the IR
-/// `error_message` (verbatim), `error_code`, row index, and whether the predicate was NULL.
-pub fn assert_violation(
-    error_code: &str,
-    error_message: &str,
-    row_index: usize,
-    predicate_was_null: bool,
-) -> DeltaError {
-    let pred_note = if predicate_was_null {
-        "predicate was NULL"
-    } else {
-        "predicate was false"
-    };
-    let detail = format!(
-        "{} [check `{}`, row {}, {}]",
-        error_message, error_code, row_index, pred_note
-    );
-    delta_kernel::delta_error!(
-        DeltaErrorCode::DeltaCommandInvariantViolation,
-        operation = "DeclarativePlan.Assert",
-        detail = detail,
-    )
-}
-
 /// Best-effort mapping until DataFusion annotates richer categories.
 ///
-/// [`DataFusionError::External`] values that wrap [`DeltaError`] (for example assert violations)
-/// are unwrapped so callers receive the original typed error instead of a nested wrapper.
+/// [`DataFusionError::External`] values that wrap [`DeltaError`] are unwrapped so callers
+/// receive the original typed error instead of a nested wrapper.
 pub fn datafusion_err_to_delta(e: DataFusionError) -> DeltaError {
     match e {
         DataFusionError::External(inner) => match inner.downcast::<DeltaError>() {

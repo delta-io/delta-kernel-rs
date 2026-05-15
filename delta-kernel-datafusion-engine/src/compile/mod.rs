@@ -30,8 +30,8 @@ use delta_kernel::schema::SchemaRef;
 use delta_kernel::Engine;
 
 use crate::exec::{
-    build_literal_exec, build_relation_ref_exec, FileListingExec, KernelAssertExec,
-    KernelConsumeByKdfExec, OrderedUnionExec, RelationBatchRegistry,
+    build_literal_exec, build_relation_ref_exec, FileListingExec, KernelConsumeByKdfExec,
+    OrderedUnionExec, RelationBatchRegistry,
 };
 
 pub mod expr_translator;
@@ -133,15 +133,6 @@ pub(super) fn compile_declarative_node(
                 &node.output_schema,
             )
         }
-        DeclarativePlanNode::Assert { child, node } => {
-            let child_plan = compile_declarative_node(child, ctx)?;
-            let input_schema = node_output_schema(child)?;
-            Ok(Arc::new(KernelAssertExec::try_new(
-                child_plan,
-                input_schema,
-                &node.checks,
-            )?))
-        }
         DeclarativePlanNode::Window { .. } => Err(crate::error::unsupported(
             "compile/mod: physical Window compile is unsupported; compile via the logical path \
              which uses LogicalPlanBuilder::window_plan(row_number()) — per user directive, \
@@ -198,7 +189,6 @@ pub(crate) fn node_output_schema(node: &DeclarativePlanNode) -> Result<SchemaRef
             node_output_schema(first)
         }
         DeclarativePlanNode::Filter { child, .. } => node_output_schema(child),
-        DeclarativePlanNode::Assert { child, .. } => node_output_schema(child),
         DeclarativePlanNode::Window { child, node } => {
             use delta_kernel::schema::{DataType, StructField, StructType};
             let input_schema = node_output_schema(child)?;

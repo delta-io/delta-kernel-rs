@@ -1,8 +1,8 @@
 //! Cross-engine parity: kernel [`ArrowEvaluationHandler`] + expression evaluation vs
 //! [`DataFusionExecutor`] on the same declarative [`Plan`] trees (Results sink).
 //!
-//! Shapes mirror the acceptance / FSR-style declarative slices supported in Phase 1.x (literal,
-//! scan→Results, filter, project, ordered union, window `row_number`, hash join, assert).
+//! Shapes mirror the FSR-style declarative slices: literal, scan→Results, filter, project,
+//! ordered union, window `row_number`, hash join.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -18,9 +18,7 @@ use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::expressions::{
     column_expr, BinaryExpressionOp, ColumnName, Expression, Predicate, Scalar,
 };
-use delta_kernel::plans::ir::nodes::{
-    AssertCheck, JoinHint, JoinNode, JoinType, OrderingSpec, WindowFunction,
-};
+use delta_kernel::plans::ir::nodes::{JoinHint, JoinNode, JoinType, OrderingSpec, WindowFunction};
 use delta_kernel::plans::ir::DeclarativePlanNode;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::{EvaluationHandler, FileMeta};
@@ -411,38 +409,6 @@ async fn parity_left_anti_join_matches_reference_probe_order() {
         .collect();
     let expected_batch = kernel_literal_batch(probe_schema, &expected_probe_rows);
     assert_batches_equal(&expected_batch, std::slice::from_ref(&batch));
-}
-
-#[tokio::test]
-async fn parity_assert_pass_through_matches_kernel_when_checks_pass() {
-    let schema = Arc::new(
-        StructType::try_new([
-            StructField::not_null("a", DataType::BOOLEAN),
-            StructField::not_null("b", DataType::BOOLEAN),
-        ])
-        .unwrap(),
-    );
-    let rows = vec![vec![Scalar::Boolean(true), Scalar::Boolean(true)]];
-    let expected = kernel_literal_batch(Arc::clone(&schema), &rows);
-
-    let plan = DeclarativePlanNode::values(schema, rows)
-        .unwrap()
-        .assert(vec![
-            AssertCheck {
-                predicate: Arc::new(Expression::column(["a"])),
-                error_code: "A".into(),
-                error_message: "fail a".into(),
-            },
-            AssertCheck {
-                predicate: Arc::new(Expression::column(["b"])),
-                error_code: "B".into(),
-                error_message: "fail b".into(),
-            },
-        ])
-        .into_results();
-
-    let got = df_collect(plan).await;
-    assert_batches_equal(&expected, &got);
 }
 
 fn write_i64_parquet(path: &std::path::Path, values: &[i64]) {

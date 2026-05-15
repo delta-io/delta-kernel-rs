@@ -1,4 +1,3 @@
-pub(crate) mod assert;
 pub(crate) mod consume_kdf;
 pub(crate) mod load_sink;
 pub(crate) mod nullability_validation;
@@ -6,7 +5,6 @@ pub(crate) mod ordered_union;
 
 use std::sync::Arc;
 
-pub use assert::KernelAssertExec;
 pub use consume_kdf::KernelConsumeByKdfExec;
 use datafusion_common::DataFusionError;
 use datafusion_physical_plan::ExecutionPlan;
