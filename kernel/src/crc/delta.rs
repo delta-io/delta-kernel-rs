@@ -98,9 +98,12 @@ impl CrcDelta {
 
 /// Commit delta application for [`Crc`]. See the [module-level docs](self) for details.
 impl Crc {
-    /// Apply a commit delta. Protocol, metadata, ICT, domain metadata, and set transactions
-    /// update unconditionally (each preserves its `Complete`/`Partial` variant); file stats
-    /// follow the [`FileStatsState`] state machine.
+    /// Apply a commit delta.
+    /// - Protocol / metadata: replaced when present in the delta, kept otherwise.
+    /// - ICT: unconditional replace (None correctly clears a previously-enabled value).
+    /// - Domain metadata / set transactions: upserted by key into the existing map; the
+    ///   `Complete`/`Partial` variant is preserved.
+    /// - File stats: governed by the [`FileStatsState`] state machine.
     pub(crate) fn apply(&mut self, delta: CrcDelta) {
         // Protocol and metadata: replace if present.
         if let Some(p) = delta.protocol {
