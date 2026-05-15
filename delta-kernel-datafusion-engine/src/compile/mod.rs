@@ -109,14 +109,10 @@ pub fn compile_plan(
     }
 }
 
-/// Attempt to compile a complete [`Plan`] to a DataFusion [`LogicalPlan`].
-///
-/// Returns `Ok(None)` when the logical compiler does not yet support this plan shape and callers
-/// should fall back to [`compile_plan`].
-pub fn compile_plan_logical(
-    plan: &Plan,
-    ctx: &CompileContext,
-) -> Result<Option<LogicalPlan>, DeltaError> {
+/// Compile a complete [`Plan`] to a DataFusion [`LogicalPlan`]. Always succeeds for valid
+/// kernel IR or surfaces a typed [`DeltaError`] — the caller does not need to fall back to a
+/// physical compile path.
+pub fn compile_plan_logical(plan: &Plan, ctx: &CompileContext) -> Result<LogicalPlan, DeltaError> {
     logical::compile_plan_logical(plan, ctx)
 }
 

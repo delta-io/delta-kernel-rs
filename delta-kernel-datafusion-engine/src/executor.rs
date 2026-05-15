@@ -24,10 +24,14 @@ use datafusion::execution::context::SessionContext;
 use datafusion_common::TableReference;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_expr::LogicalPlan;
 use datafusion_physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
+use delta_kernel::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    SchemaRef as ArrowSchemaRef,
+};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::default::DefaultEngineBuilder;
@@ -101,14 +105,30 @@ fn nested_non_null_validations_from_field(
     }
 }
 
-fn nullability_validations_for_target_schema(
-    schema: &delta_kernel::arrow::datatypes::Schema,
-) -> Vec<(String, String)> {
+fn nullability_validations_for_target_schema(schema: &ArrowSchema) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for field in schema.fields() {
         nested_non_null_validations_from_field(field.name().to_string(), field.as_ref(), &mut out);
     }
     out
+}
+
+/// Wrap `root` with a [`NullabilityValidationExec`] that asserts every non-nullable field in
+/// the kernel target schema stays non-null at runtime.
+fn wrap_with_nullability_validation(
+    root: Arc<dyn ExecutionPlan>,
+    target_kernel: &delta_kernel::schema::SchemaRef,
+) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
+    let target_arrow: ArrowSchemaRef =
+        Arc::new(target_kernel.as_ref().try_into_arrow().map_err(|e| {
+            crate::error::plan_compilation(format!("target schema conversion failed: {e}"))
+        })?);
+    let validations = nullability_validations_for_target_schema(target_arrow.as_ref());
+    Ok(Arc::new(NullabilityValidationExec::new(
+        root,
+        validations,
+        target_arrow,
+    )))
 }
 
 fn execute_schema_query_phase(
@@ -178,7 +198,7 @@ impl DataFusionExecutor {
     /// Compile a [`Plan`] into a physical node via the kernel sink dispatch table. Used by
     /// debug/inspection callers (e.g. benchmark plan printers) that do not have any registered
     /// relations to resolve against; production execution goes through
-    /// [`Self::compile_plan_for_execution`].
+    /// [`Self::prepare_execution_plan`].
     pub fn compile_plan(&self, plan: &Plan) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
         let physical = compile_plan(
             plan,
@@ -191,82 +211,69 @@ impl DataFusionExecutor {
         self.optimize_physical_plan(physical)
     }
 
-    async fn compile_plan_for_execution(
+    /// Build the executable [`ExecutionPlan`] for a kernel [`Plan`] by:
+    /// 1. compiling kernel IR to a DataFusion [`LogicalPlan`],
+    /// 2. optimizing + lowering it to a physical plan via [`Self::session_ctx`],
+    /// 3. wrapping the root with the sink-specific [`ExecutionPlan`] envelope
+    ///    (`KernelLoadSinkExec`, `KernelConsumeByKdfExec`, or [`NullabilityValidationExec`]).
+    async fn prepare_execution_plan(
         &self,
         plan: &Plan,
         ctx: &CompileContext,
     ) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
-        if let Some(logical) = compile_plan_logical(plan, ctx)? {
-            let state = self.session_ctx.state();
-            let optimized = state.optimize(&logical).map_err(datafusion_err_to_delta)?;
-            let physical_root = state
-                .create_physical_plan(&optimized)
-                .await
-                .map_err(datafusion_err_to_delta);
-            return match (&plan.sink.sink_type, physical_root) {
-                (SinkType::Results(result_schema_opt), Ok(root)) => {
-                    let target_kernel = result_schema_opt
-                        .clone()
-                        .unwrap_or(node_output_schema(&plan.root)?);
-                    let target_arrow: delta_kernel::arrow::datatypes::SchemaRef =
-                        Arc::new(target_kernel.as_ref().try_into_arrow().map_err(|e| {
-                            crate::error::plan_compilation(format!(
-                                "results target schema conversion failed: {e}"
-                            ))
-                        })?);
-                    let validations =
-                        nullability_validations_for_target_schema(target_arrow.as_ref());
-                    Ok(Arc::new(NullabilityValidationExec::new(
-                        root,
-                        validations,
-                        target_arrow,
-                    )))
-                }
-                (SinkType::Relation(handle), Ok(root)) => {
-                    let target_arrow: delta_kernel::arrow::datatypes::SchemaRef =
-                        Arc::new(handle.schema.as_ref().try_into_arrow().map_err(|e| {
-                            crate::error::plan_compilation(format!(
-                                "relation target schema conversion failed: {e}"
-                            ))
-                        })?);
-                    let validations =
-                        nullability_validations_for_target_schema(target_arrow.as_ref());
-                    let root = Arc::new(NullabilityValidationExec::new(
-                        root,
-                        validations,
-                        target_arrow,
-                    )) as Arc<dyn ExecutionPlan>;
-                    Ok(root)
-                }
-                (SinkType::ConsumeByKdf(sink), Ok(root)) => {
-                    Ok(Arc::new(KernelConsumeByKdfExec::try_new(
-                        root,
-                        sink.clone(),
-                        Arc::clone(&ctx.kdf_harvest_slot),
-                        ctx.phase_state.clone(),
-                    )?))
-                }
-                (SinkType::Load(sink), Ok(root)) => {
-                    let root = if root.output_partitioning().partition_count() > 1 {
-                        Arc::new(CoalescePartitionsExec::new(root)) as Arc<dyn ExecutionPlan>
-                    } else {
-                        root
-                    };
-                    Ok(Arc::new(KernelLoadSinkExec::try_new(
-                        root,
-                        sink.clone(),
-                        Arc::clone(&ctx.engine),
-                        physical_read_schema(sink)?,
-                    )?))
-                }
-                (_, Err(e)) => Err(e),
-            };
+        let logical = compile_plan_logical(plan, ctx)?;
+        let root = self.lower_to_physical(&logical).await?;
+        self.wrap_sink(root, plan, ctx)
+    }
+
+    async fn lower_to_physical(
+        &self,
+        logical: &LogicalPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
+        let state = self.session_ctx.state();
+        let optimized = state.optimize(logical).map_err(datafusion_err_to_delta)?;
+        state
+            .create_physical_plan(&optimized)
+            .await
+            .map_err(datafusion_err_to_delta)
+    }
+
+    fn wrap_sink(
+        &self,
+        root: Arc<dyn ExecutionPlan>,
+        plan: &Plan,
+        ctx: &CompileContext,
+    ) -> Result<Arc<dyn ExecutionPlan>, DeltaError> {
+        match &plan.sink.sink_type {
+            SinkType::Results(result_schema_opt) => {
+                let target_kernel = result_schema_opt
+                    .clone()
+                    .unwrap_or(node_output_schema(&plan.root)?);
+                Ok(wrap_with_nullability_validation(root, &target_kernel)?)
+            }
+            SinkType::Relation(handle) => {
+                Ok(wrap_with_nullability_validation(root, &handle.schema)?)
+            }
+            SinkType::ConsumeByKdf(sink) => Ok(Arc::new(KernelConsumeByKdfExec::try_new(
+                root,
+                sink.clone(),
+                Arc::clone(&ctx.kdf_harvest_slot),
+                ctx.phase_state.clone(),
+            )?)),
+            SinkType::Load(sink) => {
+                let root = if root.output_partitioning().partition_count() > 1 {
+                    Arc::new(CoalescePartitionsExec::new(root)) as Arc<dyn ExecutionPlan>
+                } else {
+                    root
+                };
+                Ok(Arc::new(KernelLoadSinkExec::try_new(
+                    root,
+                    sink.clone(),
+                    Arc::clone(&ctx.engine),
+                    physical_read_schema(sink)?,
+                )?))
+            }
         }
-        // Logical compiler doesn't yet cover this plan shape (e.g. ordered Union). Fall back to
-        // the physical compile path. User directive: Window MUST be logical-only, and the
-        // physical compile arm explicitly errors out for Window — anything else falls back here.
-        let physical = compile_plan(plan, ctx)?;
-        self.optimize_physical_plan(physical)
     }
 
     /// Walk `plan` and return an `Arc<HashMap>` keyed by handle id covering every
@@ -361,7 +368,7 @@ impl DataFusionExecutor {
                         engine: Arc::clone(&self.engine),
                     };
                     let physical = self
-                        .compile_plan_for_execution(&plan, &ctx)
+                        .prepare_execution_plan(&plan, &ctx)
                         .await
                         .map_err(EngineError::internal)?;
                     self.drain_and_register(&plan, physical)
@@ -423,7 +430,7 @@ impl DataFusionExecutor {
                         engine: Arc::clone(&self.engine),
                     };
                     let physical = self
-                        .compile_plan_for_execution(&plan, &ctx)
+                        .prepare_execution_plan(&plan, &ctx)
                         .await
                         .map_err(EngineError::internal)?;
                     if matches!(plan.sink.sink_type, SinkType::Results(_)) {
@@ -545,7 +552,7 @@ impl DataFusionExecutor {
             Arc::clone(&self.kdf_harvest_slot),
             Arc::clone(&self.engine),
         );
-        let mut physical = self.compile_plan_for_execution(&plan, &ctx).await?;
+        let mut physical = self.prepare_execution_plan(&plan, &ctx).await?;
         if physical.output_partitioning().partition_count() > 1 {
             physical = Arc::new(CoalescePartitionsExec::new(physical));
         }
@@ -572,7 +579,7 @@ impl DataFusionExecutor {
             Arc::clone(&self.kdf_harvest_slot),
             Arc::clone(&self.engine),
         );
-        let physical = self.compile_plan_for_execution(&plan, &ctx).await?;
+        let physical = self.prepare_execution_plan(&plan, &ctx).await?;
         let batches = self.collect_all_partitions(physical).await?;
         match &plan.sink.sink_type {
             SinkType::Relation(handle) => {
@@ -688,7 +695,7 @@ impl DataFusionExecutor {
                         engine: Arc::clone(&self.engine),
                     };
                     let physical = self
-                        .compile_plan_for_execution(&plan, &ctx)
+                        .prepare_execution_plan(&plan, &ctx)
                         .await
                         .map_err(EngineError::internal)?;
                     if matches!(plan.sink.sink_type, SinkType::Results(_)) {

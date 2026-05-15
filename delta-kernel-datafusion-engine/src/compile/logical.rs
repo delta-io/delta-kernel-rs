@@ -1,8 +1,11 @@
-//! Logical-plan lowering scaffold for declarative plan nodes.
+//! Declarative-plan -> DataFusion [`LogicalPlan`] lowering.
 //!
-//! This module intentionally starts narrow: it lowers a subset of IR operators to
-//! DataFusion [`LogicalPlan`] and returns `Ok(None)` for unsupported shapes so callers can
-//! fall back to the legacy physical compiler while migration is in progress.
+//! Every kernel IR shape compiles to a [`LogicalPlan`] or surfaces a typed error — there is
+//! no soft `Ok(None)` "unsupported" signal anymore. Invariants the caller is responsible for
+//! (non-Hash join hints, empty Union, empty Window functions, ...) error here rather than
+//! silently bail; long-term those checks belong on the kernel IR constructors per
+//! [F6](https://example.invalid/cleanup#F6) / [B16](https://example.invalid/cleanup#B16) so
+//! engines can rely on a validated input.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
@@ -12,7 +15,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::provider_as_source;
-use datafusion_common::arrow::datatypes::DataType as ArrowDataType;
+use datafusion_common::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use datafusion_common::{Column, DFSchema};
 use datafusion_datasource_json::file_format::JsonFormat;
 use datafusion_datasource_parquet::file_format::ParquetFormat;
@@ -25,8 +28,7 @@ use delta_kernel::expressions::{
     ColumnName, Expression, MapToStructExpression, ParseJsonExpression,
 };
 use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::SinkType::{ConsumeByKdf, Load, Relation, Results};
-use delta_kernel::plans::ir::nodes::{FileType, JoinType as KernelJoinType, ScanNode};
+use delta_kernel::plans::ir::nodes::{FileType, JoinHint, JoinType as KernelJoinType, ScanNode};
 use delta_kernel::plans::ir::{DeclarativePlanNode, Plan};
 use delta_kernel::schema::SchemaRef as KernelSchemaRef;
 use delta_kernel::transforms::ExpressionTransform;
@@ -286,7 +288,7 @@ fn canonicalize_output_to_kernel_schema(
 
 fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaError> {
     if node.files.is_empty() {
-        let arrow_schema: datafusion_common::arrow::datatypes::Schema =
+        let arrow_schema: ArrowSchema =
             node.schema.as_ref().try_into_arrow().map_err(|e| {
                 plan_compilation(format!("Logical Scan schema conversion failed: {e}"))
             })?;
@@ -298,7 +300,7 @@ fn scan_to_listing_logical_plan(node: &ScanNode) -> Result<LogicalPlan, DeltaErr
             schema: df_schema,
         }));
     }
-    let full_schema: datafusion_common::arrow::datatypes::Schema = node
+    let full_schema: ArrowSchema = node
         .schema
         .as_ref()
         .try_into_arrow()
@@ -503,29 +505,20 @@ fn drop_named_column(plan: LogicalPlan, drop_name: &str) -> Result<LogicalPlan, 
         .map_err(crate::error::datafusion_err_to_delta)
 }
 
-/// Attempt to lower an entire plan to a DataFusion logical plan.
-///
-/// Returns `Ok(None)` when this plan shape is not yet supported by the logical compiler.
-pub fn compile_plan_logical(
-    plan: &Plan,
-    ctx: &CompileContext,
-) -> Result<Option<LogicalPlan>, DeltaError> {
-    if !matches!(
-        plan.sink.sink_type,
-        Results(_) | Relation(_) | ConsumeByKdf(_) | Load(_)
-    ) {
-        return Ok(None);
-    }
+/// Lower an entire [`Plan`] to a DataFusion [`LogicalPlan`]. Always succeeds or surfaces a
+/// typed [`DeltaError`].
+pub fn compile_plan_logical(plan: &Plan, ctx: &CompileContext) -> Result<LogicalPlan, DeltaError> {
+    let _ = plan.sink.sink_type; // sink-type dispatch happens at the caller.
     compile_declarative_node_logical(&plan.root, ctx)
 }
 
 fn compile_declarative_node_logical(
     node: &DeclarativePlanNode,
     ctx: &CompileContext,
-) -> Result<Option<LogicalPlan>, DeltaError> {
+) -> Result<LogicalPlan, DeltaError> {
     match node {
         DeclarativePlanNode::Values(values) => {
-            let arrow_schema: datafusion_common::arrow::datatypes::Schema =
+            let arrow_schema: ArrowSchema =
                 values.schema.as_ref().try_into_arrow().map_err(|e| {
                     plan_compilation(format!("Logical Values schema conversion failed: {e}"))
                 })?;
@@ -534,10 +527,10 @@ fn compile_declarative_node_logical(
                     .map_err(|e| plan_compilation(format!("Logical Values DF schema: {e}")))?,
             );
             if values.rows.is_empty() {
-                return Ok(Some(LogicalPlan::EmptyRelation(EmptyRelation {
+                return Ok(LogicalPlan::EmptyRelation(EmptyRelation {
                     produce_one_row: false,
                     schema: df_schema,
-                })));
+                }));
             }
             let rows = values
                 .rows
@@ -552,29 +545,24 @@ fn compile_declarative_node_logical(
                 .map_err(crate::error::datafusion_err_to_delta)?
                 .build()
                 .map_err(crate::error::datafusion_err_to_delta)?;
-            canonicalize_output_to_kernel_schema(plan, &values.schema).map(Some)
+            canonicalize_output_to_kernel_schema(plan, &values.schema)
         }
         DeclarativePlanNode::Filter { child, node } => {
-            let Some(child_plan) = compile_declarative_node_logical(child, ctx)? else {
-                return Ok(None);
-            };
+            let child_plan = compile_declarative_node_logical(child, ctx)?;
             let predicate = kernel_expr_to_df(node.predicate.as_ref())?;
-            let plan = LogicalPlanBuilder::from(child_plan)
+            LogicalPlanBuilder::from(child_plan)
                 .filter(predicate)
                 .map_err(crate::error::datafusion_err_to_delta)?
                 .build()
-                .map_err(crate::error::datafusion_err_to_delta)?;
-            Ok(Some(plan))
+                .map_err(crate::error::datafusion_err_to_delta)
         }
         DeclarativePlanNode::Project { child, node } => {
-            let Some(child_plan) = compile_declarative_node_logical(child, ctx)? else {
-                return Ok(None);
-            };
+            let child_plan = compile_declarative_node_logical(child, ctx)?;
             let expanded_columns = super::expand_projection_columns(
                 &node.columns,
                 node.output_schema.fields().count(),
             )?;
-            let output_arrow_schema: datafusion_common::arrow::datatypes::Schema =
+            let output_arrow_schema: ArrowSchema =
                 node.output_schema.as_ref().try_into_arrow().map_err(|e| {
                     plan_compilation(format!(
                         "Logical projection output schema conversion failed: {e}"
@@ -696,72 +684,37 @@ fn compile_declarative_node_logical(
                     Ok::<Expr, DeltaError>(logical.alias(field.name().to_string()))
                 })
                 .collect::<Result<Vec<_>, DeltaError>>()?;
-            let plan = LogicalPlanBuilder::from(working_plan)
+            LogicalPlanBuilder::from(working_plan)
                 .project(projection)
                 .map_err(crate::error::datafusion_err_to_delta)?
                 .build()
-                .map_err(crate::error::datafusion_err_to_delta)?;
-            Ok(Some(plan))
+                .map_err(crate::error::datafusion_err_to_delta)
         }
         DeclarativePlanNode::Union { children, node } => {
-            if node.ordered || children.is_empty() {
-                return Ok(None);
+            if children.is_empty() {
+                return Err(plan_compilation(
+                    "Union with zero children is not a valid kernel IR shape",
+                ));
             }
-            let mut compiled_children = Vec::with_capacity(children.len());
-            for child in children {
-                let Some(plan) = compile_declarative_node_logical(child, ctx)? else {
-                    return Ok(None);
-                };
-                compiled_children.push(plan);
+            let mut compiled: Vec<LogicalPlan> = children
+                .iter()
+                .map(|child| compile_declarative_node_logical(child, ctx))
+                .collect::<Result<_, DeltaError>>()?;
+            if compiled.len() == 1 {
+                return Ok(compiled.remove(0));
             }
-            let first = compiled_children.remove(0);
-            let target_fields = first.schema().fields().iter().cloned().collect::<Vec<_>>();
-            for (child_idx, plan) in compiled_children.iter().enumerate() {
-                let fields = plan.schema().fields();
-                if fields.len() != target_fields.len() {
-                    return Err(plan_compilation(format!(
-                        "Logical Union schema mismatch: child0 has {} columns but child{} has {} columns",
-                        target_fields.len(),
-                        child_idx + 1,
-                        fields.len()
-                    )));
-                }
-                for (col_idx, (expected, actual)) in
-                    target_fields.iter().zip(fields.iter()).enumerate()
-                {
-                    if expected.name() != actual.name() {
-                        return Err(plan_compilation(format!(
-                            "Logical Union schema mismatch at column {col_idx}: expected name `{}` from child0, got `{}` from child{}",
-                            expected.name(),
-                            actual.name(),
-                            child_idx + 1
-                        )));
-                    }
-                    if expected.data_type() != actual.data_type()
-                        || expected.is_nullable() != actual.is_nullable()
-                    {
-                        return Err(plan_compilation(format!(
-                            "Logical Union schema mismatch at column `{}` (index {col_idx}) between child0 and child{}: expected type {:?} nullable={}, got type {:?} nullable={}",
-                            expected.name(),
-                            child_idx + 1,
-                            expected.data_type(),
-                            expected.is_nullable(),
-                            actual.data_type(),
-                            actual.is_nullable()
-                        )));
-                    }
-                }
-            }
-            let unioned = compiled_children
-                .into_iter()
-                .try_fold(first, |acc, right| {
+            if node.ordered {
+                compile_ordered_union(compiled)
+            } else {
+                let first = compiled.remove(0);
+                compiled.into_iter().try_fold(first, |acc, right| {
                     LogicalPlanBuilder::from(acc)
                         .union(right)
                         .map_err(crate::error::datafusion_err_to_delta)?
                         .build()
                         .map_err(crate::error::datafusion_err_to_delta)
-                })?;
-            Ok(Some(unioned))
+                })
+            }
         }
         DeclarativePlanNode::RelationRef(handle) => {
             let provider = ctx.relation_providers.get(&handle.id).ok_or_else(|| {
@@ -771,33 +724,32 @@ fn compile_declarative_node_logical(
                     handle.id, handle.name
                 ))
             })?;
-            let plan = LogicalPlanBuilder::scan(
+            LogicalPlanBuilder::scan(
                 format!("relation_{}", handle.id),
                 provider_as_source(Arc::clone(provider)),
                 None,
             )
             .map_err(crate::error::datafusion_err_to_delta)?
             .build()
-            .map_err(crate::error::datafusion_err_to_delta)?;
-            Ok(Some(plan))
+            .map_err(crate::error::datafusion_err_to_delta)
         }
-        DeclarativePlanNode::Scan(node) => {
-            let plan = scan_to_listing_logical_plan(node)?;
-            Ok(Some(plan))
-        }
+        DeclarativePlanNode::Scan(node) => scan_to_listing_logical_plan(node),
         DeclarativePlanNode::Join { build, probe, node } => {
-            let Some(build_plan) = compile_declarative_node_logical(build, ctx)? else {
-                return Ok(None);
-            };
-            let Some(probe_plan) = compile_declarative_node_logical(probe, ctx)? else {
-                return Ok(None);
-            };
-            if node.hint != delta_kernel::plans::ir::nodes::JoinHint::Hash {
-                return Ok(None);
+            if node.hint != JoinHint::Hash {
+                return Err(plan_compilation(format!(
+                    "Join hint {:?} is not supported; only Hash joins compile",
+                    node.hint
+                )));
             }
             if node.build_keys.is_empty() || node.build_keys.len() != node.probe_keys.len() {
-                return Ok(None);
+                return Err(plan_compilation(format!(
+                    "Join requires non-empty matched-arity keys; got build={} probe={}",
+                    node.build_keys.len(),
+                    node.probe_keys.len()
+                )));
             }
+            let build_plan = compile_declarative_node_logical(build, ctx)?;
+            let probe_plan = compile_declarative_node_logical(probe, ctx)?;
             let left_keys = node
                 .build_keys
                 .iter()
@@ -833,15 +785,20 @@ fn compile_declarative_node_logical(
                         })?
                 }
             };
-            canonicalize_output_to_kernel_schema(plan, &target_schema).map(Some)
+            canonicalize_output_to_kernel_schema(plan, &target_schema)
         }
         DeclarativePlanNode::Window { child, node } => {
-            if node.functions.is_empty() || node.order_by.is_empty() {
-                return Ok(None);
+            if node.functions.is_empty() {
+                return Err(plan_compilation(
+                    "Window with zero functions is not a valid kernel IR shape",
+                ));
             }
-            let Some(child_plan) = compile_declarative_node_logical(child, ctx)? else {
-                return Ok(None);
-            };
+            if node.order_by.is_empty() {
+                return Err(plan_compilation(
+                    "Window with empty ORDER BY is not a valid kernel IR shape",
+                ));
+            }
+            let child_plan = compile_declarative_node_logical(child, ctx)?;
             let partition_by = node
                 .partition_by
                 .iter()
@@ -896,19 +853,48 @@ fn compile_declarative_node_logical(
                     ))
                 })?;
             projection.extend(window_expr_names.iter().map(|(_from, to)| {
-                cast(
-                    Expr::Column(src_col.clone()),
-                    datafusion::arrow::datatypes::DataType::Int64,
-                )
-                .alias(to.clone())
+                cast(Expr::Column(src_col.clone()), ArrowDataType::Int64).alias(to.clone())
             }));
             let plan = LogicalPlanBuilder::from(window_plan)
                 .project(projection)
                 .map_err(crate::error::datafusion_err_to_delta)?
                 .build()
                 .map_err(crate::error::datafusion_err_to_delta)?;
-            Ok(Some(plan))
+            Ok(plan)
         }
-        _ => Ok(None),
+        DeclarativePlanNode::FileListing(node) => Err(plan_compilation(format!(
+            "FileListing leaves are not supported by the logical compile path (path: {})",
+            node.path
+        ))),
     }
+}
+
+/// Build an ordered union of [`LogicalPlan`]s using stock DataFusion operators: project a
+/// literal i64 ordinal onto each child, [`LogicalPlanBuilder::union`] the lot, sort by ordinal,
+/// then project to drop it. Same recipe as [`super::scan::compile_ordered_union_via_ordinal`]
+/// but emitted at the logical layer so the optimizer sees it.
+fn compile_ordered_union(children: Vec<LogicalPlan>) -> Result<LogicalPlan, DeltaError> {
+    const ORDINAL_COL: &str = "__dk_ord";
+    let mut tagged: Vec<LogicalPlan> = Vec::with_capacity(children.len());
+    for (idx, child) in children.into_iter().enumerate() {
+        tagged.push(append_constant_i64_column(child, ORDINAL_COL, idx as i64)?);
+    }
+    let mut iter = tagged.into_iter();
+    let first = iter
+        .next()
+        .expect("compile_ordered_union: at least one child");
+    let unioned = iter.try_fold(first, |acc, right| {
+        LogicalPlanBuilder::from(acc)
+            .union(right)
+            .map_err(crate::error::datafusion_err_to_delta)?
+            .build()
+            .map_err(crate::error::datafusion_err_to_delta)
+    })?;
+    let ordinal_col = plan_column_by_name(&unioned, ORDINAL_COL)?;
+    let sorted = LogicalPlanBuilder::from(unioned)
+        .sort(vec![Expr::Column(ordinal_col).sort(true, true)])
+        .map_err(crate::error::datafusion_err_to_delta)?
+        .build()
+        .map_err(crate::error::datafusion_err_to_delta)?;
+    drop_named_column(sorted, ORDINAL_COL)
 }
