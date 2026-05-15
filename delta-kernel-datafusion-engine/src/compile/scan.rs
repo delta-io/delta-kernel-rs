@@ -41,7 +41,7 @@ use delta_kernel::FileMeta;
 use parquet::arrow::RowNumber;
 
 use crate::compile::expr_translator;
-use crate::exec::{NullabilityValidationExec, OrderedUnionExec, RowIndexExec};
+use crate::exec::{NullabilityValidationExec, OrderedUnionExec};
 
 struct PreparedScanFiles {
     file_group: FileGroup,
@@ -373,10 +373,12 @@ fn wrap_scan_extensions(
     let native_parquet_row_index =
         node.file_type == FileType::Parquet && node.row_index_column.is_some();
 
-    if let Some(row_index_col) = &node.row_index_column {
-        if !native_parquet_row_index {
-            return Ok(Arc::new(RowIndexExec::new(scan, row_index_col.clone())));
-        }
+    if node.row_index_column.is_some() && !native_parquet_row_index {
+        return Err(crate::error::unsupported(
+            "compile/scan: JSON+row-index combination is not supported by the physical scan \
+             compile path; build the plan via the logical path which uses LogicalPlanBuilder \
+             window_plan(row_number()) instead",
+        ));
     }
     Ok(scan)
 }
