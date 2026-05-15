@@ -363,25 +363,27 @@ mod tests {
 
     // --- render_template ----------------------------------------------------
 
-    #[test]
-    fn render_substitutes_placeholders() {
-        let out = render_template(
-            "hello <name>, version <v>",
-            &[("name", "world".into()), ("v", "42".into())],
-        );
-        assert_eq!(out, "hello world, version 42");
-    }
-
-    #[test]
-    fn render_leaves_unknown_placeholder_verbatim() {
-        let out = render_template("a=<x>, b=<y>", &[("x", "1".into())]);
-        assert_eq!(out, "a=1, b=<y>");
-    }
-
-    #[test]
-    fn render_handles_stray_open_bracket() {
-        let out = render_template("a < b", &[]);
-        assert_eq!(out, "a < b");
+    #[rstest::rstest]
+    #[case::substitutes_known_placeholders(
+        "hello <name>, version <v>",
+        vec![("name", "world"), ("v", "42")],
+        "hello world, version 42"
+    )]
+    #[case::leaves_unknown_placeholder_verbatim(
+        "a=<x>, b=<y>",
+        vec![("x", "1")],
+        "a=1, b=<y>"
+    )]
+    #[case::handles_stray_open_bracket("a < b", vec![], "a < b")]
+    fn render_template_cases(
+        #[case] template: &str,
+        #[case] params: Vec<(&'static str, &'static str)>,
+        #[case] expected: &str,
+    ) {
+        let owned: Vec<(&str, String)> =
+            params.into_iter().map(|(k, v)| (k, v.to_string())).collect();
+        let out = render_template(template, &owned);
+        assert_eq!(out, expected);
     }
 
     // --- DeltaError Display + source ----------------------------------------
