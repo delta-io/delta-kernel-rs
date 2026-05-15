@@ -295,11 +295,11 @@ where
             Transform::new_top_level()
                 .with_inserted_field(
                     Some("modificationTime"),
-                    Expression::literal(data_change).into(),
+                    Expression::literal(data_change),
                 )
                 .with_replaced_field(
                     "stats",
-                    Expression::unary(ToJson, Expression::column(["stats"])).into(),
+                    Expression::unary(ToJson, Expression::column(["stats"])),
                 ),
         );
         let adds_expr = Expression::struct_from([transform]);
@@ -1307,14 +1307,14 @@ fn build_remove_transform(
 ) -> Transform {
     let mut transform = Transform::new_top_level()
         // deletionTimestamp
-        .with_inserted_field(Some("path"), Expression::literal(commit_timestamp).into())
+        .with_inserted_field(Some("path"), Expression::literal(commit_timestamp))
         // dataChange
-        .with_inserted_field(Some("path"), Expression::literal(data_change).into())
+        .with_inserted_field(Some("path"), Expression::literal(data_change))
         // extended_file_metadata
-        .with_inserted_field(Some("path"), Expression::literal(true).into())
+        .with_inserted_field(Some("path"), Expression::literal(true))
         .with_inserted_field(
             Some("path"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
+            Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]),
         );
 
     if coalesce_stats_with_parsed {
@@ -1326,28 +1326,28 @@ fn build_remove_transform(
             Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
         ]);
         transform = transform
-            .with_replaced_field("stats", coalesce_stats.into())
+            .with_replaced_field("stats", coalesce_stats)
             .with_inserted_field(
                 Some("stats"),
-                Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+                Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]),
             )
             .with_dropped_field_if_exists(STATS_PARSED_NAME);
     } else {
         // tags inserted after stats; stats passes through unchanged
         transform = transform.with_inserted_field(
             Some("stats"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]),
         );
     }
 
     transform = transform
         .with_inserted_field(
             Some("deletionVector"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
+            Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]),
         )
         .with_inserted_field(
             Some("deletionVector"),
-            Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into(),
+            Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]),
         )
         .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
         .with_dropped_field("modificationTime")

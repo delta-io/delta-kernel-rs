@@ -482,7 +482,7 @@ impl<S> Transaction<S> {
             Transform::new_top_level()
                 .with_replaced_field(
                     "deletionVector",
-                    Expression::column([NEW_DELETION_VECTOR_NAME]).into(),
+                    Expression::column([NEW_DELETION_VECTOR_NAME]),
                 )
                 .with_dropped_field(NEW_DELETION_VECTOR_NAME),
         );
@@ -500,7 +500,7 @@ impl<S> Transaction<S> {
             Arc::new(Expression::struct_from([Expression::transform(
                 Transform::new_nested(["add"]).with_inserted_field(
                     Some("modificationTime"),
-                    Expression::literal(self.data_change).into(),
+                    Expression::literal(self.data_change),
                 ),
             )]));
         let with_data_change_eval = evaluation_handler.new_expression_evaluator(

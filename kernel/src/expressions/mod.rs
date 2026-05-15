@@ -424,9 +424,17 @@ impl Transform {
     }
 
     /// Specifies an expression to replace a field with.
-    pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
+    ///
+    /// `expr` accepts anything convertible to [`ExpressionRef`] — including a bare [`Expression`]
+    /// (auto-wrapped via [`Arc::new`]). Callers that already have an `Arc<Expression>` can pass
+    /// it directly without re-wrapping.
+    pub fn with_replaced_field(
+        mut self,
+        name: impl Into<String>,
+        expr: impl Into<ExpressionRef>,
+    ) -> Self {
         let field_transform = self.field_transform(name);
-        field_transform.exprs.push(expr);
+        field_transform.exprs.push(expr.into());
         field_transform.is_replace = true;
         self
     }
@@ -434,11 +442,15 @@ impl Transform {
     /// Specifies an expression to insert after an optional predecessor (None = prepend, emit the
     /// expression before the first input field). Multiple fields can be inserted after the same
     /// predecessor, and they will be emitted in the same order they were registered.
+    ///
+    /// `expr` accepts anything convertible to [`ExpressionRef`] — see
+    /// [`Self::with_replaced_field`] for the same ergonomics note.
     pub fn with_inserted_field(
         mut self,
         after: Option<impl Into<String>>,
-        expr: ExpressionRef,
+        expr: impl Into<ExpressionRef>,
     ) -> Self {
+        let expr = expr.into();
         match after {
             Some(field_name) => self.field_transform(field_name).exprs.push(expr),
             None => self.prepended_fields.push(expr),
