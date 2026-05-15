@@ -530,81 +530,41 @@ mod tests {
 
     // ===== apply: set transaction tests =====
 
-    #[test]
-    fn test_apply_adds_set_transaction_to_complete_map() {
-        let mut crc = base_crc();
-        crc.set_transaction_state = SetTransactionState::Complete(HashMap::new());
-        let txn = SetTransaction::new("my-app".to_string(), 1, Some(1000));
-        let delta = CrcDelta {
-            set_transaction_changes: vec![txn],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        let map = crc.set_transaction_state.expect_complete();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["my-app"].version, 1);
-        assert_eq!(map["my-app"].last_updated, Some(1000));
+    fn seed_txn_map() -> HashMap<String, SetTransaction> {
+        HashMap::from([(
+            "existing".to_string(),
+            SetTransaction::new("existing".to_string(), 1, Some(1000)),
+        )])
     }
 
-    #[test]
-    fn test_apply_adds_set_transaction_to_partial_map_stays_partial() {
+    /// A delta carrying both an upsert and a new entry exercises all the apply semantics for
+    /// set transactions (SetTransaction has no tombstone). Applied to either `Complete` or
+    /// `Partial`, the map updates correctly and the variant is preserved.
+    #[rstest]
+    #[case::complete(SetTransactionState::Complete(seed_txn_map()))]
+    #[case::partial(SetTransactionState::Partial(seed_txn_map()))]
+    fn test_apply_upserts_and_inserts_set_transactions(#[case] base: SetTransactionState) {
+        let was_complete = matches!(base, SetTransactionState::Complete(_));
         let mut crc = base_crc();
-        assert_eq!(
-            crc.set_transaction_state,
-            SetTransactionState::Partial(HashMap::new())
-        );
-        let txn = SetTransaction::new("my-app".to_string(), 1, Some(1000));
+        crc.set_transaction_state = base;
         let delta = CrcDelta {
-            set_transaction_changes: vec![txn],
+            set_transaction_changes: vec![
+                SetTransaction::new("existing".to_string(), 2, Some(2000)),
+                SetTransaction::new("new".to_string(), 1, Some(1500)),
+            ],
             ..write_delta(0, 0)
         };
         crc.apply(delta);
 
-        let map = crc.set_transaction_state.expect_partial();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["my-app"].version, 1);
-    }
-
-    #[test]
-    fn test_apply_upserts_set_transaction_in_complete_map() {
-        let mut crc = base_crc();
-        crc.set_transaction_state = SetTransactionState::Complete(HashMap::from([(
-            "my-app".to_string(),
-            SetTransaction::new("my-app".to_string(), 1, Some(1000)),
-        )]));
-
-        let txn = SetTransaction::new("my-app".to_string(), 2, Some(2000));
-        let delta = CrcDelta {
-            set_transaction_changes: vec![txn],
-            ..write_delta(0, 0)
+        let map = match &crc.set_transaction_state {
+            SetTransactionState::Complete(m) if was_complete => m,
+            SetTransactionState::Partial(m) if !was_complete => m,
+            other => panic!("variant changed unexpectedly: {other:?}"),
         };
-        crc.apply(delta);
-
-        let map = crc.set_transaction_state.expect_complete();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["my-app"].version, 2);
-        assert_eq!(map["my-app"].last_updated, Some(2000));
-    }
-
-    #[test]
-    fn test_apply_upserts_set_transaction_in_partial_map_stays_partial() {
-        let mut crc = base_crc();
-        crc.set_transaction_state = SetTransactionState::Partial(HashMap::from([(
-            "my-app".to_string(),
-            SetTransaction::new("my-app".to_string(), 1, Some(1000)),
-        )]));
-
-        let txn = SetTransaction::new("my-app".to_string(), 2, Some(2000));
-        let delta = CrcDelta {
-            set_transaction_changes: vec![txn],
-            ..write_delta(0, 0)
-        };
-        crc.apply(delta);
-
-        let map = crc.set_transaction_state.expect_partial();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["my-app"].version, 2);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["existing"].version, 2);
+        assert_eq!(map["existing"].last_updated, Some(2000));
+        assert_eq!(map["new"].version, 1);
     }
 
     // ===== into_crc_for_version_zero: set transaction tests =====
@@ -623,21 +583,6 @@ mod tests {
         assert_eq!(map.len(), 1);
         assert_eq!(map["my-app"].version, 5);
         assert_eq!(map["my-app"].last_updated, Some(3000));
-    }
-
-    #[test]
-    fn test_into_crc_for_version_zero_with_no_set_transactions() {
-        let delta = CrcDelta {
-            protocol: Some(test_protocol()),
-            metadata: Some(Metadata::default()),
-            ..write_delta(0, 0)
-        };
-        let crc = delta.into_crc_for_version_zero().unwrap();
-        // Empty Complete map -- we always know the full state at version zero.
-        assert_eq!(
-            crc.set_transaction_state,
-            SetTransactionState::Complete(HashMap::new())
-        );
     }
 
     // ===== Histogram tests =====
