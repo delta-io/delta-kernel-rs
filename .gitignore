@@ -32,3 +32,6 @@ ffi/examples/visit-expression/build
 # FSR plan-dump debug artifacts
 fsr_phase_plan_dump.txt
 plan_dump.txt
+
+# Local planning artifact, not committed
+CLEANUP_PLAN.md
