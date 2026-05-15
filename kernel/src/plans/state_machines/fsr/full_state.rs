@@ -118,6 +118,21 @@ pub const FSR_JOIN_KEY_COL: &str = "__fsr_join_k";
 /// Canonical FSR behavior uses `k = 1` (latest action per key).
 const FSR_COMMIT_DEDUP_TOP_K: i64 = 1;
 
+// === Action column paths ===
+//
+// Stable nested column references used by `fsr_dedup_key`, `fsr_row_has_identity_predicate`,
+// `retention_filter`, and the various `scan_*_projection` helpers. Centralizing them means
+// renaming an action field is a one-line change here, not a sweep of string literals across
+// the file (and silently introducing divergence between the helpers).
+const ADD_PATH: &[&str] = &["add", "path"];
+const REMOVE_PATH: &[&str] = &["remove", "path"];
+const REMOVE_DELETION_TIMESTAMP: &[&str] = &["remove", "deletionTimestamp"];
+const PROTOCOL_MIN_READER: &[&str] = &["protocol", "minReaderVersion"];
+const METADATA_ID: &[&str] = &["metaData", "id"];
+const DOMAIN_METADATA_DOMAIN: &[&str] = &["domainMetadata", "domain"];
+const TXN_APP_ID: &[&str] = &["txn", "appId"];
+const TXN_LAST_UPDATED: &[&str] = &["txn", "lastUpdated"];
+
 /// One literal row describing a Delta JSON commit file for [`build_commit_load_plan`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitFileMeta {
@@ -1109,15 +1124,13 @@ fn checkpoint_manifest_scan_schema(include_sidecar: bool) -> SchemaRef {
 fn retention_filter(min_file_ts: i64, txn_expiry: Option<i64>) -> Predicate {
     let remove_ok = col("remove")
         .is_null()
-        .or(col(("remove", "deletionTimestamp"))
-            .or_lit(0i64)
-            .gt(lit(min_file_ts)));
+        .or(col(REMOVE_DELETION_TIMESTAMP).or_lit(0i64).gt(lit(min_file_ts)));
     let txn_ok = match txn_expiry {
         None => Predicate::literal(true),
         Some(cutoff) => any_of([
             col("txn").is_null(),
-            col(("txn", "lastUpdated")).is_null(),
-            col(("txn", "lastUpdated")).gt(lit(cutoff)),
+            col(TXN_LAST_UPDATED).is_null(),
+            col(TXN_LAST_UPDATED).gt(lit(cutoff)),
         ]),
     };
     remove_ok.and(txn_ok)
@@ -1174,13 +1187,11 @@ fn fsr_dedup_key() -> Expression {
     Expression::case_when(
         vec![
             (
-                col(("add", "path"))
-                    .is_not_null()
-                    .or(col(("remove", "path")).is_not_null()),
+                col(ADD_PATH).is_not_null().or(col(REMOVE_PATH).is_not_null()),
                 file_arm,
             ),
             (col("protocol").is_not_null(), proto_arm),
-            (col(("metaData", "id")).is_not_null(), meta_arm),
+            (col(METADATA_ID).is_not_null(), meta_arm),
             (col("domainMetadata").is_not_null(), domain_arm),
             (col("txn").is_not_null(), txn_arm),
         ],
@@ -1501,12 +1512,12 @@ fn augmented_action_schema(with_version: bool) -> Result<SchemaRef, DeltaError> 
 
 fn fsr_row_has_identity_predicate() -> Predicate {
     any_of([
-        col(("add", "path")).is_not_null(),
-        col(("remove", "path")).is_not_null(),
-        col(("protocol", "minReaderVersion")).is_not_null(),
-        col(("metaData", "id")).is_not_null(),
-        col(("domainMetadata", "domain")).is_not_null(),
-        col(("txn", "appId")).is_not_null(),
+        col(ADD_PATH).is_not_null(),
+        col(REMOVE_PATH).is_not_null(),
+        col(PROTOCOL_MIN_READER).is_not_null(),
+        col(METADATA_ID).is_not_null(),
+        col(DOMAIN_METADATA_DOMAIN).is_not_null(),
+        col(TXN_APP_ID).is_not_null(),
     ])
 }
 

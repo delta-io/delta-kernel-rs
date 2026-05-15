@@ -336,6 +336,75 @@ impl DeclarativePlanNode {
         }
     }
 
+    // === Convenience combinators (F7) ===
+    //
+    // These wrap the lower-level `union`/`union_unordered`/`join`/`window` constructors with
+    // common parameter sets seen across plan builders. Use them when they fit; drop down to the
+    // primitives when they don't.
+
+    /// Ordered binary union of `self` (left) and `other` (right). For more than two children, use
+    /// [`Self::union`].
+    pub fn union_with(self, other: Self) -> DeltaResult<Self> {
+        Self::union([self, other])
+    }
+
+    /// LeftAnti hash join: emit rows from `self` (probe) whose `probe_keys` are NOT present in
+    /// `build`'s `build_keys`. Output schema = `self`'s schema.
+    pub fn left_anti_join_on(
+        self,
+        build: Self,
+        probe_keys: Vec<Arc<Expression>>,
+        build_keys: Vec<Arc<Expression>>,
+    ) -> Self {
+        Self::join(
+            JoinNode {
+                build_keys,
+                probe_keys,
+                join_type: JoinType::LeftAnti,
+                hint: JoinHint::Hash,
+            },
+            build,
+            self,
+        )
+    }
+
+    /// Inner hash join: emit one row per `(self, build)` pair matched on the supplied key
+    /// expressions. Output schema = build's schema ++ probe's schema.
+    pub fn inner_join_on(
+        self,
+        build: Self,
+        probe_keys: Vec<Arc<Expression>>,
+        build_keys: Vec<Arc<Expression>>,
+    ) -> Self {
+        Self::join(
+            JoinNode {
+                build_keys,
+                probe_keys,
+                join_type: JoinType::Inner,
+                hint: JoinHint::Hash,
+            },
+            build,
+            self,
+        )
+    }
+
+    /// Single-function window emitting `row_number()` over (`partition_by`, `order_by`) into
+    /// `output_col`. Fails if `order_by` is empty (row_number requires a deterministic ordering).
+    pub fn window_row_number(
+        self,
+        output_col: impl Into<String>,
+        partition_by: Vec<Arc<Expression>>,
+        order_by: Vec<OrderingSpec>,
+    ) -> DeltaResult<Self> {
+        self.window(
+            vec![WindowFunction {
+                output_col: output_col.into(),
+            }],
+            partition_by,
+            order_by,
+        )
+    }
+
     /// Typed KDF consumer terminal. Wraps `self` in a [`Plan`] terminating in
     /// [`SinkType::ConsumeByKdf`] and returns the plan paired with an
     /// [`Extractor<O>`] that pulls the typed output from the resulting

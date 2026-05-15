@@ -81,6 +81,12 @@ impl<A: Into<String>, const N: usize> IntoColumnName for [A; N] {
     }
 }
 
+impl IntoColumnName for &[&str] {
+    fn into_column_name(self) -> ColumnName {
+        ColumnName::new(self.iter().copied())
+    }
+}
+
 impl<A: Into<String>, B: Into<String>> IntoColumnName for (A, B) {
     fn into_column_name(self) -> ColumnName {
         ColumnName::new([self.0.into(), self.1.into()])
