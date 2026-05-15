@@ -1046,20 +1046,20 @@ impl Snapshot {
         self.log_segment().scan_domain_metadatas(domains, engine)
     }
 
-    /// Returns file-level statistics, or `None` if no CRC with valid stats exists at this
-    /// snapshot's version. Attempts to load the CRC from storage if not already cached.
+    /// Returns file-level statistics, or `None` if no CRC at this snapshot's version has
+    /// `Complete` file stats. Attempts to load the CRC from storage if not already cached.
     pub fn get_or_load_file_stats(&self, engine: &dyn Engine) -> Option<FileStats> {
         let crc = self
             .lazy_crc
             .get_or_load_if_at_version(engine, self.version())?;
-        crc.file_stats()
+        crc.file_stats().cloned()
     }
 
     /// Returns file-level statistics if the CRC is already loaded at this snapshot's version.
     /// This method performs no I/O; it returns `None` if the CRC has not already been loaded.
     pub fn get_file_stats_if_loaded(&self) -> Option<FileStats> {
         let crc = self.lazy_crc.get_if_loaded_at_version(self.version())?;
-        crc.file_stats()
+        crc.file_stats().cloned()
     }
 
     /// Returns the CRC if one has been loaded at this snapshot's version (no I/O).
@@ -1096,11 +1096,10 @@ impl Snapshot {
     /// # Errors
     ///
     /// - [`Error::ChecksumWriteUnsupported`] if no in-memory CRC is available at this snapshot's
-    ///   version (e.g. a snapshot loaded from disk that has no CRC file), or if the CRC's file
-    ///   stats are not valid. File stats can be invalid for two reasons: (a) a non-incremental
-    ///   operation like ANALYZE STATS was encountered, which is recoverable with a full state
-    ///   reconstruction in the future; (b) a file action had a missing size (e.g. `remove.size` is
-    ///   null), which is permanently unrecoverable.
+    ///   version (e.g. a snapshot loaded from disk that has no CRC file), or if the CRC's
+    ///   `file_stats_state` is `Indeterminate` (a non-incremental operation like ANALYZE STATS was
+    ///   encountered, or a file action had a missing size). Recoverable with a full state
+    ///   reconstruction in the future.
     /// - I/O errors from the engine's storage handler if the write fails.
     ///
     /// [`CommittedTransaction::post_commit_snapshot`]: crate::transaction::CommittedTransaction::post_commit_snapshot
@@ -1135,7 +1134,7 @@ impl Snapshot {
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
-        // Note: try_write_crc_file validates file stats validity before writing.
+        // Note: try_write_crc_file validates that file_stats_state is Complete before writing.
         match try_write_crc_file(engine, &crc_path.location, crc) {
             Ok(()) => {
                 info!("Wrote CRC file at {}", crc_path.location);

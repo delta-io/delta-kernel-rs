@@ -2,23 +2,24 @@
 
 use url::Url;
 
-use super::{Crc, FileStatsValidity};
+use super::Crc;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error};
 
 /// Serialize and write a CRC file to storage.
 ///
 /// Serializes the [`Crc`] to JSON via serde and writes the raw bytes using the storage
-/// handler. Returns [`Error::ChecksumWriteUnsupported`] if file stats are not valid (a CRC file
-/// on disk must have correct stats). Per the Delta protocol, writers MUST NOT overwrite existing
-/// CRC files, so this always writes with `overwrite = false`. If the file already exists, returns
+/// handler. Returns [`Error::ChecksumWriteUnsupported`] if `file_stats_state` is not
+/// `Complete` (only `Complete` CRCs have a well-defined on-disk representation). Per the
+/// Delta protocol, writers MUST NOT overwrite existing CRC files, so this always writes
+/// with `overwrite = false`. If the file already exists, returns
 /// `Err(Error::FileAlreadyExists)`.
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
     require!(
-        crc.file_stats_validity == FileStatsValidity::Valid,
+        crc.file_stats_state.is_complete(),
         Error::ChecksumWriteUnsupported(format!(
             "Cannot write CRC file with {:?} file stats",
-            crc.file_stats_validity
+            crc.file_stats_state
         ))
     );
     let data = serde_json::to_vec(crc)?;
@@ -35,7 +36,7 @@ mod tests {
     use super::*;
     use crate::actions::{DomainMetadata, Protocol, SetTransaction};
     use crate::crc::reader::try_read_crc_file;
-    use crate::crc::{FileSizeHistogram, FileStatsValidity};
+    use crate::crc::{FileSizeHistogram, FileStats, FileStatsState};
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::path::{AsUrl, ParsedLogPath};
@@ -73,14 +74,16 @@ mod tests {
             histogram.insert(size).unwrap(); // 5 files, 1024 bytes total
         }
         Crc {
-            table_size_bytes: 1024,
-            num_files: 5,
+            file_stats_state: FileStatsState::Complete(FileStats {
+                num_files: 5,
+                table_size_bytes: 1024,
+                file_size_histogram: Some(histogram),
+            }),
             protocol,
             txn_id: None,
             in_commit_timestamp_opt: Some(ict),
             set_transactions: Some(set_transactions),
             domain_metadata: Some(domain_metadata),
-            file_size_histogram: Some(histogram),
             ..Default::default()
         }
     }
@@ -199,24 +202,15 @@ mod tests {
     }
 
     #[test]
-    fn test_write_rejects_invalid_file_stats_with_checksum_write_unsupported() {
+    fn test_write_rejects_indeterminate_file_stats_with_checksum_write_unsupported() {
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store);
         let table_root = url::Url::parse("memory:///test_table/").unwrap();
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
-        for invalid_validity in [
-            FileStatsValidity::RequiresCheckpointRead,
-            FileStatsValidity::Indeterminate,
-            FileStatsValidity::Untrackable,
-        ] {
-            let mut crc = test_crc();
-            crc.file_stats_validity = invalid_validity;
-            let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
-            assert!(
-                matches!(result, Err(Error::ChecksumWriteUnsupported(_))),
-                "should reject {invalid_validity:?} with ChecksumWriteUnsupported"
-            );
-        }
+        let mut crc = test_crc();
+        crc.file_stats_state = FileStatsState::Indeterminate;
+        let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
+        assert!(matches!(result, Err(Error::ChecksumWriteUnsupported(_))));
     }
 }
