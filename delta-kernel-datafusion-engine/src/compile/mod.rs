@@ -48,7 +48,6 @@ use crate::exec::{
 };
 
 pub mod expr_translator;
-mod join;
 mod json_parse;
 mod load_sink;
 pub mod logical;
@@ -207,9 +206,10 @@ pub(super) fn compile_declarative_node(
                 Ok(Arc::new(CoalescePartitionsExec::new(unioned)))
             }
         }
-        DeclarativePlanNode::Join { build, probe, node } => {
-            join::compile_join(build.as_ref(), probe.as_ref(), node, ctx)
-        }
+        DeclarativePlanNode::Join { .. } => Err(crate::error::unsupported(
+            "compile/mod: physical Join compile is unsupported; compile via the logical path \
+             which uses LogicalPlanBuilder::join_with_expr_keys",
+        )),
     }
 }
 
