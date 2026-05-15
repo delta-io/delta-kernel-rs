@@ -371,7 +371,7 @@ fn wrap_scan_extensions(
     };
 
     let native_parquet_row_index =
-        matches!(node.file_type, FileType::Parquet) && node.row_index_column.is_some();
+        node.file_type == FileType::Parquet && node.row_index_column.is_some();
 
     if let Some(row_index_col) = &node.row_index_column {
         if !native_parquet_row_index {
